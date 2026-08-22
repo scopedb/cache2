@@ -116,15 +116,16 @@ to one resource because the current counter combines seven gates and buffer
 pools. Split wait accounting by resource before tuning another concurrency
 constant.
 
-Region reuse also performs a synchronous record/index scrub while holding the
-global state mutex and the victim Region write guard. It does not zero or
-rewrite the Region body, but an offline analysis of the baseline artifact
-estimated about 8.6 GiB of unreported scrub reads during its measurement
-window. The next structural change should move exact scrub/accounting work out
-of the global state critical section while preserving victim ownership,
-namespace live-byte retirement, and the existing header/crash ordering.
+At the time of this run, Region reuse also performed a synchronous record/index
+scrub while holding the global state mutex and the victim Region write guard.
+It did not zero or rewrite the Region body, but an offline analysis of the
+baseline artifact estimated about 8.6 GiB of unreported scrub reads during its
+measurement window. Eager background preclean in `51fce50` improved the local
+benchmark but violated strict FIFO capacity semantics and is retained only as a
+rejected experiment in `LOCAL_TEMPORAL_10G_20260823_FIFO_PRECLEAN.md`. The
+accepted append-demand generation reclaim result is recorded in
+`LOCAL_TEMPORAL_10G_20260823_GENERATION_RECLAIM.md`.
 
 Do not increase write-back workers from 8 to 32 yet: the candidate had zero
 write-back queue wait or rejection, while Region I/O QD already rose to 11.
 Additional consumers would not address the remaining measured bottleneck.
-
