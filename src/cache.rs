@@ -10055,8 +10055,8 @@ mod m1_tests {
             PutOutcome::Stored
         );
 
-        // FIFO rotation owns this mutex across header sync and victim scrub.
-        // Advisory Hybrid index operations must remain independent of it.
+        // A foreground FIFO fallback can own this mutex across header sync and
+        // victim scrub. Advisory Hybrid index operations remain independent.
         let region_manager = cache.inner.state.lock().unwrap();
         let probe = cache.clone();
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
