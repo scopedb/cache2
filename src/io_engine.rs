@@ -2675,6 +2675,7 @@ mod tests {
                 write_queue_depth: 4,
                 read_buffer_slots: 2,
                 write_buffer_slots: 2,
+                control_concurrency: 1,
                 backpressure: BackpressurePolicy::Reject,
                 write_budget_bytes_per_second: None,
             })

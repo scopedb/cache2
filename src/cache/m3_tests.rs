@@ -508,6 +508,79 @@ fn different_append_lanes_overlap_record_io_and_preserve_values() {
 }
 
 #[test]
+fn different_append_lanes_remove_concurrently_and_recover_tombstones() {
+    const REMOVES: usize = 2;
+
+    let file = TestFile::new("parallel-remove-lanes");
+    let config = multi_lane_config(&file.0);
+    let keys: Vec<Vec<u8>> = (0_u64..10_000).map(fixed_key).fold(
+        Vec::<Vec<u8>>::with_capacity(REMOVES),
+        |mut keys, key| {
+            let hash = hash_key(config.hash_seed, &key) as usize;
+            let stripe = hash & (KEY_ORDERING_SHARDS - 1);
+            let lane = hash % config.append_lanes;
+            if keys.iter().all(|existing| {
+                let existing_hash = hash_key(config.hash_seed, existing) as usize;
+                existing_hash & (KEY_ORDERING_SHARDS - 1) != stripe
+                    && existing_hash % config.append_lanes != lane
+            }) {
+                keys.push(key);
+            }
+            keys
+        },
+    );
+    assert_eq!(keys.len(), REMOVES, "test must find one key per lane");
+
+    let (backend, records) = RecordBackend::open(&file.0).unwrap();
+    let cache = DiskCache::open_with_backend(config.clone(), Box::new(backend)).unwrap();
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            cache
+                .put(key, format!("remove-value-{index}"), PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+    }
+    records.arm();
+
+    let start = Arc::new(Barrier::new(REMOVES + 1));
+    let callers = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            let cache = cache.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                cache.remove(&key)
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+
+    let both_entered = records.wait_for_entries(REMOVES, Duration::from_secs(5));
+    records.release();
+    for caller in callers {
+        assert_eq!(caller.join().unwrap().unwrap(), RemoveOutcome::Removed);
+    }
+    assert!(
+        both_entered,
+        "different append lanes did not overlap tombstone record I/O"
+    );
+    assert_eq!(cache.stats().control_queue_depth_peak, REMOVES as u64);
+    for key in &keys {
+        assert_eq!(cache.get(key).unwrap(), None);
+    }
+    cache.close().unwrap();
+
+    let reopened = config.open().unwrap();
+    for key in &keys {
+        assert_eq!(reopened.get(key).unwrap(), None);
+    }
+    reopened.close().unwrap();
+}
+
+#[test]
 fn one_append_lane_coalesces_queued_small_records_and_recovers_them() {
     const PUTS: usize = 6;
 

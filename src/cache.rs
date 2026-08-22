@@ -392,8 +392,8 @@ impl CacheConfig {
 
     /// Set independent read and write admission depths.
     ///
-    /// Both depths must be in `1..=65_536`. Control operations use a separate
-    /// fixed one-slot reserve so ordinary write pressure cannot consume it.
+    /// Both depths must be in `1..=65_536`. Control operations use separate
+    /// per-append-lane reserves so ordinary write pressure cannot consume them.
     pub fn with_submission_queue_depths(mut self, read: usize, write: usize) -> Self {
         self.read_queue_depth = read;
         self.write_queue_depth = write;
@@ -7708,6 +7708,7 @@ fn allocate_resources(config: &CacheConfig, layout: &Layout) -> Result<Arc<Resou
         write_queue_depth: config.write_queue_depth,
         read_buffer_slots,
         write_buffer_slots,
+        control_concurrency: config.append_lanes,
         backpressure: config.backpressure,
         write_budget_bytes_per_second: config.write_budget_bytes_per_second,
     })

@@ -22,7 +22,7 @@ pub(crate) const MAX_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(24 * 6
 const READ_BUFFER_SLOTS: usize = 2;
 #[cfg(test)]
 const WRITE_BUFFER_SLOTS: usize = 2;
-pub(crate) const CONTROL_BUFFER_SLOTS: usize = 2;
+pub(crate) const CONTROL_BUFFERS_PER_REQUEST: usize = 2;
 pub(crate) const METADATA_BUFFER_SLOTS: usize = 1;
 
 /// Behavior when a bounded submission gate or buffer pool is full.
@@ -83,6 +83,7 @@ pub(crate) struct ResourceLimits {
     pub(crate) write_queue_depth: usize,
     pub(crate) read_buffer_slots: usize,
     pub(crate) write_buffer_slots: usize,
+    pub(crate) control_concurrency: usize,
     pub(crate) backpressure: BackpressurePolicy,
     pub(crate) write_budget_bytes_per_second: Option<u64>,
 }
@@ -139,6 +140,18 @@ impl ResourceController {
                 "read/write buffer slots exceed their hard limit",
             ));
         }
+        if limits.control_concurrency == 0 || limits.control_concurrency > MAX_QUEUE_DEPTH {
+            return Err(ResourceBuildError::Invalid(
+                "control concurrency must be within the queue depth hard limit",
+            ));
+        }
+        let control_buffer_slots = limits
+            .control_concurrency
+            .checked_mul(CONTROL_BUFFERS_PER_REQUEST)
+            .filter(|slots| *slots <= MAX_QUEUE_DEPTH)
+            .ok_or(ResourceBuildError::Invalid(
+                "control buffer slots exceed their hard limit",
+            ))?;
         if limits.max_buffer_bytes == 0 || limits.max_buffer_bytes % BUFFER_ALIGNMENT != 0 {
             return Err(ResourceBuildError::Invalid(
                 "maximum buffer size must be a non-zero 4096-byte multiple",
@@ -169,7 +182,7 @@ impl ResourceController {
         Ok(Self {
             read_gate: Arc::new(RequestGate::new(limits.read_queue_depth)),
             write_gate: Arc::new(RequestGate::new(limits.write_queue_depth)),
-            control_gate: Arc::new(RequestGate::new(1)),
+            control_gate: Arc::new(RequestGate::new(limits.control_concurrency)),
             read_pool: Arc::new(BufferPool::try_new(
                 limits.read_buffer_slots,
                 limits.max_buffer_bytes,
@@ -181,7 +194,7 @@ impl ResourceController {
                 Arc::clone(&memory),
             )?),
             control_pool: Arc::new(BufferPool::try_new(
-                CONTROL_BUFFER_SLOTS,
+                control_buffer_slots,
                 limits.max_buffer_bytes,
                 Arc::clone(&memory),
             )?),
@@ -1326,6 +1339,7 @@ mod tests {
             write_queue_depth: 2,
             read_buffer_slots: READ_BUFFER_SLOTS,
             write_buffer_slots: WRITE_BUFFER_SLOTS,
+            control_concurrency: 1,
             backpressure: policy,
             write_budget_bytes_per_second: None,
         }
