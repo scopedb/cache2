@@ -47,11 +47,13 @@
 //!
 //! L1 values use shared immutable storage and [`HybridCache::get_handle`] avoids
 //! payload copies on L1 hits; compatibility `get`/`lookup` APIs copy only after
-//! releasing the memory-shard lock. A dirty victim is detached for background
-//! persistence only when lower-tier membership probes prove absence. Its worker
-//! holds a fine-grained latest-version fence across persistence without waiting
-//! for the coarse foreground ordering lock; queue pressure, a stale version, or
-//! a rejected write may safely leave a miss. Both disk tiers provide bounded
+//! releasing the memory-shard lock. Dirty victims detach through a bounded,
+//! exact-key pending directory that masks any older lower value and makes a
+//! same-key mutation wait without holding the coarse ordering lock. Disposable
+//! lower-absent work uses at most 75% of the executor and may be dropped to a
+//! miss; lower-candidate updates use the complete bounded budget, and admission
+//! failure keeps the victim resident and rejects the incoming cache put instead
+//! of doing foreground device I/O. Both disk tiers provide bounded
 //! sync/`io_uring` runtimes and aligned optional `O_DIRECT` without changing
 //! their respective Format V1 encodings.
 

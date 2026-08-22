@@ -52,10 +52,11 @@ session dirty fence，稳态 mutation 不写 route journal、也不做 durabilit
 但不能复活旧 route。
 
 L1 value 使用 `Arc` 共享不可变 allocation；`get_handle` 的 L1 hit 只复制 handle，兼容
-`get`/`lookup` 在释放 shard lock 后才复制 payload。只有 compact-index/Bloom 明确证明 lower
-不存在旧候选时，dirty victim 才允许 detached background eviction；worker 持有 fine-grained
-latest-version fence 贯穿 persistence，不等待 coarse foreground ordering lock。queue pressure、
-stale version 或 lower reject 可安全退化为 miss。有 lower 候选时仍同步 persistence，避免暴露旧值。
+`get`/`lookup` 在释放 shard lock 后才复制 payload。dirty victim 在进入有界 exact-key pending
+directory 后即可 detached background eviction；pending 期间读取必须 mask 旧 lower value，
+同 key mutation 等待时不持有 coarse ordering lock。lower-absent 任务最多使用 executor 的 75%，
+压力下可 drop 为 miss；lower-candidate 任务可使用完整有界预算，admission 失败时保留 dirty victim
+并拒绝 incoming cache put，不执行前台同步设备 I/O。
 
 ## 1. 结论
 
@@ -720,13 +721,13 @@ Hybrid open/flush-resume 持久化一次 dirty-session fence；稳态 mutation �
 或 miss，不会因丢失 dirty L1 而暴露旧 route。`flush`/`close` 才 drain L1 并发布匹配的
 Region、Bucket 与 global clean checkpoint。
 
-只有 lower membership probe 明确为 absent 的 dirty victim 才可 detached eviction：有界
-background task 取得共享 payload 后，L1 即可释放该 entry。worker 取得对应的 fine-grained
-latest-version fence，并贯穿 lower persistence；foreground 同 key mutation 更新同一 fence，
-无需让 worker 等待 coarse ordering stripe。若任务因 queue/memory pressure 未排入、version
-已经 stale，或 lower 明确 reject，结果允许是 miss；fatal lower I/O 仍会 poison。Bloom/index
-只能回答“可能存在”时使用同步 demotion，失败时保留 victim 或向前台返回错误，不能让旧
-lower value 重新可见。
+dirty victim 先在有界 exact-key pending directory 注册，再由 background task 持有共享
+payload 并脱离 L1。pending fence 贯穿 lower persistence；读取命中 fence 时直接 miss，
+foreground 同 key mutation 先等待 fence 完成，等待期间不持有 coarse ordering stripe。
+lower-absent 任务受 75% slot/byte 子预算限制，queue/memory pressure 下可丢弃为 miss；
+lower-candidate 任务可占用完整有界预算，若 admission 失败则保留 dirty victim、拒绝 incoming
+cache put。后台 lower reject 会先失效旧候选再解除 fence；fatal lower I/O 仍会 poison 并保留
+失败 fence。任何压力路径都不回退到前台同步 demotion。
 
 旧文件或测试注入可能仍包含 journal intent。只有结构有效且非空的 dirty journal 才执行
 touched-route reconciliation；当前正常 steady-state 的 dirty+empty journal，以及 Clear、

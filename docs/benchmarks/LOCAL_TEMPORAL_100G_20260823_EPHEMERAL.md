@@ -32,6 +32,10 @@ as a steady-state throughput regression, but it remains a production gap.
 
 ## Workload and resource evidence
 
+This recorded run predates the schema-v4 measurement/drain split. Host writes,
+demotions, and derived write amplification include final close work and cannot
+be compared directly with a v4 measurement-window counter.
+
 - One million keys in a circular temporal timeline; newest 2% receives 85% of
   reads.
 - Sizes: 256 B (45%), 4 KiB (25%), 64 KiB (20%), 1 MiB (10%).
@@ -84,8 +88,9 @@ waiting for mandatory demotion. All write-back workers could simultaneously
 block acquiring those coarse ordering stripes for detached background
 evictions, leaving no worker to run the mandatory task.
 
-Detached workers now avoid the coarse ordering mutex. They hold a 65,536-way
-latest-version fence across their lower-tier publication; foreground mutations
+In the revision used for this recorded run, detached workers avoided the coarse
+ordering mutex by holding a 65,536-way latest-version fence across lower-tier
+publication; foreground mutations
 hold that fine fence only while publishing a version and release it before any
 Memory eviction can wait for a worker. A deterministic one-worker regression
 test recreates the old starvation topology and proves both background and

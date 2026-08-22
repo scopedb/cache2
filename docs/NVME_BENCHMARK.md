@@ -325,7 +325,9 @@ deadline and its latency samples are excluded from reported throughput and
 percentiles. `--min-capacity-turnovers` uses only host bytes submitted before
 the final close begins; drain host bytes, synchronous demotions, and close time
 are reported separately, so neither prefill nor lifecycle work can satisfy the
-measurement gate. A
+measurement gate. This is a wall-clock completion boundary: up to the bounded
+set of background tasks still in flight at the snapshot can finish in the drain
+window. A
 run that never reaches the Bucket tier, Region tier, and steady-state
 eviction/reclaim is not a mixed Hybrid qualification even if its aggregate
 throughput is high.

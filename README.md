@@ -46,7 +46,8 @@ current record sizes after same-key ordering;
 worst case for capacity planning.
 
 Same-key mutations and lower-tier lookup/publication are linearized by a Hybrid
-ordering stripe; the L1 fast path uses its memory shard plus version fences.
+ordering stripe. The L1 fast path uses only its memory shard; after an L1 miss,
+the exact-key pending directory masks an in-flight older lower candidate.
 `lookup` reports whether a hit came from memory, the small-object disk engine,
 or RegionLog, and absolute TTL is preserved during promotion/demotion.
 
@@ -61,14 +62,13 @@ dirty L1 value. The bounded route-journal decoder remains for compatible recover
 of existing non-empty journal generations, but it is not on the steady-state
 mutation path.
 
-A dirty victim may leave L1 before its SSD write completes only when the
-compact-index/Bloom probes prove that no lower value exists. The background task
-owns the shared payload and holds its fine-grained latest-version fence across
-persistence without waiting for the coarse foreground ordering lock. Queue
-pressure, an obsolete version, or a rejected background write may drop it and
-leave a miss. If a lower candidate might exist, eviction persists the victim
-synchronously so failure keeps it resident or returns an error rather than
-revealing an older value.
+A dirty victim may leave L1 before its SSD write completes after it registers in
+the bounded exact-key pending directory. While pending, reads mask any older
+lower value and same-key mutations wait without holding the coarse ordering
+lock. Lower-absent writes use at most 75% of the executor and may be dropped to
+a miss under pressure. Lower-candidate writes have priority over the complete
+bounded budget; if admission fails, the dirty victim remains resident and the
+incoming cache put is rejected rather than performing foreground device I/O.
 
 Compatible non-empty journal recovery is two-pass and hard-bounded. A first
 streaming pass uses at most 64 KiB scratch to validate structure, CRC, generation, versions,

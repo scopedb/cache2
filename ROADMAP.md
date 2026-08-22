@@ -449,10 +449,10 @@ production-ready。完成上述外部项并保留报告后，才对具体 deploy
 
 ### H4：有界 write-back 与统一 Async API（completed）
 
-- [x] 默认 DRAM write-back、可选 write-through；只有 lower membership 明确 absent 的 dirty
-  victim 可 detached background eviction；worker 持 fine-grained latest-version fence 贯穿
-  persistence，不等待 coarse ordering lock。queue pressure、stale version 或 lower reject 可
-  安全退化为 miss；可能存在 lower 候选时同步 demotion，失败保留 victim 或返回错误。
+- [x] 默认 DRAM write-back、可选 write-through；dirty victim 通过有界 exact-key pending
+  directory detached，pending 期间 mask 旧 lower value，同 key mutation 等待时不持有 coarse
+  ordering lock。lower-absent 任务限用 75% executor、压力下可 drop 为 miss；lower-candidate
+  任务使用完整有界预算，admission 失败保留 victim 并拒绝 incoming put，不做前台同步 I/O。
 - [x] dirty expiry fence、flush/close drain、clear discard、取消/超时和单一 `AsyncHybridCache` executor；
   read-side cleanup 以 CAS 动态提交，cancel 先赢无 mutation，commit 先赢返回 `TooLate` 并
   交付真实 completion。

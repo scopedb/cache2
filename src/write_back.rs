@@ -156,6 +156,7 @@ impl WriteBackExecutor {
     /// Reserve one disposable lower-absent write without waiting. These tasks
     /// may use at most 75% of the shared slots and bytes, leaving capacity for
     /// updates whose pending fence is required to hide an older lower value.
+    /// A one-slot executor therefore drops all disposable lower-absent work.
     pub(crate) fn try_reserve_background(&self, bytes: usize) -> Option<WriteBackReservation> {
         self.gate.try_reserve_background(bytes, false)
     }
@@ -603,6 +604,11 @@ mod tests {
 
     #[test]
     fn background_admission_reserves_capacity_for_lower_candidate_updates() {
+        let single = WriteBackExecutor::try_new(1, 1, 16, BackpressurePolicy::Reject).unwrap();
+        assert!(single.try_reserve_background(1).is_none());
+        let only = single.try_reserve_priority_background(16).unwrap();
+        drop(only);
+
         let executor = WriteBackExecutor::try_new(2, 1, 16, BackpressurePolicy::Reject).unwrap();
         let first = executor.try_reserve_background(8).unwrap();
         assert!(executor.try_reserve_background(1).is_none());

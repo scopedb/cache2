@@ -3934,7 +3934,8 @@ Workload:
   --warmup-secs SECONDS      0..86400 (default 5)
   --steady-state-fill-turnovers N Continue the workload before measurement until
                              pre-measure host writes / disk capacity reach N and
-                             at least one Region reuse is observed (default 0/off)
+                             one complete Region reuse cycle is observed
+                             (default 0/off)
   --steady-state-fill-max-secs S Maximum added fill time (default 3600)
   --duration-secs SECONDS    >0..86400 (default 30)
 

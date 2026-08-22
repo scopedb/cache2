@@ -64,6 +64,11 @@ target/release/cache-bench hybrid \
 
 ## Measurement
 
+This run predates the schema-v4 measurement/drain split. Its host-write,
+demotion, and write-amplification counters were sampled after `close`, so they
+include the final dirty-L1 drain and are not directly comparable with a v4
+measurement-window counter.
+
 | Metric | Result |
 | --- | ---: |
 | Duration | 600.021 s |
@@ -77,7 +82,7 @@ target/release/cache-bench hybrid \
 | p50 / p99 / p99.9 | 4.719 / 62.915 / 167.772 ms |
 | Read p99 / write p99 | 14.680 / 109.052 ms |
 | Maximum request latency | 2.873 s |
-| Measurement host writes | 43.978 GiB |
+| Legacy host writes through close | 43.978 GiB |
 | Measurement admitted values | 43.971 GiB |
 | Observed write amplification | 1.000x |
 | Logical keyspace turnover | 0.429685x |
@@ -85,7 +90,7 @@ target/release/cache-bench hybrid \
 | Complete write-head wraps | 0 |
 | Close and write-back drain | 17.826 s |
 
-Queue peaks stayed bounded and below their configured limits: Bucket 10, Region 8, and write-back 11. All 465,292 measured writes entered the memory-first write-back path; there were no fallbacks, demotion failures, demotion rejections, or worker panics. The measurement completed 405,456 demotions.
+Queue peaks stayed bounded and below their configured limits: Bucket 10, Region 8, and write-back 11. All 465,292 measured writes entered the memory-first write-back path; there were no fallbacks, demotion failures, demotion rejections, or worker panics. The legacy counter through close completed 405,456 demotions.
 
 ## Temporal behavior
 
@@ -137,7 +142,9 @@ were unchanged except for a 10-second warm-up, 5,000 verification samples, and
 the shorter measurement window. This is a scale regression check, not a
 replacement for the 600-second baseline or the target-NVMe qualification.
 
-The implementation under test added proactive bounded write-back, an
+These comparison runs also predate the schema-v4 measurement/drain split; their
+host-write and demotion totals include final close work. The implementation
+under test added proactive bounded write-back, an
 ordering-free live L1-hit path, a fixed 1 ms journal coalescing deadline,
 four-logical-group durability sync waves, buffered append coalescing, and a
 lower-cost deterministic value generator.

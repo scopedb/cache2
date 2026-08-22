@@ -228,18 +228,24 @@ impl HybridCacheConfig {
     }
 
     /// Choose disk-first write-through or memory-first L1 write-back with
-    /// bounded background persistence and a synchronous fallback for victims
-    /// that already have a lower-tier candidate. Write-back values are
-    /// disposable cache data: an unflushed process crash may lose them, and
-    /// the session dirty fence makes an unclean reopen discard the lower tiers
-    /// instead of reviving an older disk value.
+    /// bounded background persistence. An exact-key pending directory masks
+    /// older lower values while detached writes run. Admission failure for an
+    /// existing lower candidate keeps its dirty victim resident and rejects the
+    /// incoming cache put; it never falls back to foreground device I/O.
+    /// Write-back values are disposable cache data: an unflushed process crash
+    /// may lose them, and the session dirty fence makes an unclean reopen
+    /// discard the lower tiers instead of reviving an older disk value.
     pub fn with_write_mode(mut self, mode: HybridWriteMode) -> Self {
         self.write_mode = mode;
         self
     }
 
     /// Configure the reserved dirty-entry demotion executor. Its memory limit
-    /// covers owned key/value copies made before dispatch to worker threads.
+    /// covers the detached entry copy plus the pending owner's duplicate key
+    /// and fixed allocation charge. Pending-directory shard overhead is
+    /// accounted separately by the aggregate Hybrid memory plan. With a
+    /// one-slot queue, that slot is reserved for lower-candidate updates and
+    /// disposable lower-absent evictions are dropped.
     pub fn with_write_back_resources(
         mut self,
         queue_depth: usize,
