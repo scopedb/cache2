@@ -1211,8 +1211,8 @@ fn region_reuse_waits_for_a_reader_of_the_old_incarnation() {
         schedule.wait_for(SchedulePoint::RotateBlockedByReader, Duration::from_secs(5));
 
     // Waiting for a pinned victim reader must not retain the global Region
-    // manager. Other append lanes need this lock to reserve and publish their
-    // independent sequential writes while the FIFO rotation is stalled.
+    // manager. State availability is the invariant that lets unrelated append
+    // lanes reserve and publish while this FIFO rotation is stalled.
     let state_available = cache.inner.state.try_lock().is_ok();
 
     // Always release the reader before assertions and joins.
