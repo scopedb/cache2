@@ -155,8 +155,8 @@ request delivers its real completion after the dirty fence and cleanup finish.
 - committed Format V1 golden fixtures and explicit rejection of unsupported or
   unrecognized non-empty formats without modifying them;
 - an observable `Healthy` / `MissOnly` / `Poisoned` / `Closed` runtime state;
-- independent bounded read/write gates and two reserved control permits per
-  append lane, preserving one queued remove without occupying another lane;
+- independent bounded read/write gates and a shared reserved control gate sized
+  to the append-lane count;
 - dynamically sized, lazily allocated 4 KiB-aligned data-buffer pools, capped
   at 128 read and 128 write slots, plus fixed control and metadata reserves;
 - Linux `MAP_SHARED | MAP_ANONYMOUS` mappings for aligned buffers, with both
@@ -424,7 +424,7 @@ original I/O error; later mutations fail consistently.
 | `max_value_size` | Runtime `put` admission only; may change. Old values remain readable/removable. |
 | `memory_budget_bytes` | Runtime-only logical engine-memory cap, default 1 GiB; open fails before touching the path if the complete resource plan cannot fit. |
 | `append_lanes` | Persistent clean-checkpoint layout; 1–8, default 1, and must match on reopen. Each lane owns an Active Region. |
-| read/write submission depths | Runtime-only; each must be 1–65,536 and defaults to 2/2. Data-buffer slots scale from these depths, capped at 128 per class; control admission reserves two permits and four buffers per append lane. |
+| read/write submission depths | Runtime-only; each must be 1–65,536 and defaults to 2/2. Data-buffer slots scale from these depths, capped at 128 per class; control admission reserves `append_lanes` shared permits and two buffers per admitted control request. |
 | I/O engine | Runtime-only `Sync`, `Auto`, or required `IoUring`; does not change Format V1. |
 | I/O mode | Runtime-only `Buffered`, `Auto`, or required-capability `Direct`; may change on reopen without changing Format V1. |
 | I/O queue depth | Runtime-only, hard limited to 1–4,096; default 128. |
@@ -469,8 +469,8 @@ recovery ordering/workspace and read-plane mirror, sharded index/key-ordering
 metadata, the bounded
 append/async/I/O queues and completion allowance, copied inputs retained by the
 async facade, a small fixed overhead allowance, and the maximum growth of the
-dynamic read/write data pools (at most 128 slots each), four control buffers
-per append lane, and one metadata buffer. Read slots are
+dynamic read/write data pools (at most 128 slots each), two control buffers per
+admitted control request (up to `append_lanes` requests), and one metadata buffer. Read slots are
 `min(read_submission_depth, io_queue_depth, 128)`; write slots are
 `min(write_submission_depth, 128)`. Pool slots are created eagerly, while their
 backing allocations grow lazily and never beyond the validated plan. On Linux,

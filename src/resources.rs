@@ -23,7 +23,6 @@ const READ_BUFFER_SLOTS: usize = 2;
 #[cfg(test)]
 const WRITE_BUFFER_SLOTS: usize = 2;
 pub(crate) const CONTROL_BUFFERS_PER_REQUEST: usize = 2;
-const CONTROL_REQUESTS_PER_LANE: usize = 2;
 pub(crate) const METADATA_BUFFER_SLOTS: usize = 1;
 
 /// Behavior when a bounded submission gate or buffer pool is full.
@@ -108,7 +107,7 @@ pub(crate) struct ResourceController {
     memory: Arc<MemoryTracker>,
     read_gate: Arc<RequestGate>,
     write_gate: Arc<RequestGate>,
-    control_gate: Arc<LaneRequestGate>,
+    control_gate: Arc<RequestGate>,
     read_pool: Arc<BufferPool>,
     write_pool: Arc<BufferPool>,
     control_pool: Arc<BufferPool>,
@@ -148,8 +147,7 @@ impl ResourceController {
         }
         let control_buffer_slots = limits
             .control_concurrency
-            .checked_mul(CONTROL_REQUESTS_PER_LANE)
-            .and_then(|slots| slots.checked_mul(CONTROL_BUFFERS_PER_REQUEST))
+            .checked_mul(CONTROL_BUFFERS_PER_REQUEST)
             .filter(|slots| *slots <= MAX_QUEUE_DEPTH)
             .ok_or(ResourceBuildError::Invalid(
                 "control buffer slots exceed their hard limit",
@@ -184,7 +182,7 @@ impl ResourceController {
         Ok(Self {
             read_gate: Arc::new(RequestGate::new(limits.read_queue_depth)),
             write_gate: Arc::new(RequestGate::new(limits.write_queue_depth)),
-            control_gate: Arc::new(LaneRequestGate::try_new(limits.control_concurrency)?),
+            control_gate: Arc::new(RequestGate::new(limits.control_concurrency)),
             read_pool: Arc::new(BufferPool::try_new(
                 limits.read_buffer_slots,
                 limits.max_buffer_bytes,
@@ -278,25 +276,20 @@ impl ResourceController {
         })
     }
 
-    /// Reserve the representative lane for a global metadata operation.
-    ///
-    /// Callers must already hold the exclusive operation barrier, which proves
-    /// every per-key lane is idle. Reserving lane zero then reports one control
-    /// operation without pretending that a flush occupies every append lane.
-    pub(crate) fn begin_write_control(&self) -> Result<ControlPermit, OverloadReason> {
+    pub(crate) fn begin_write_control(&self) -> Result<QueuePermit, OverloadReason> {
         self.control_gate
-            .enter(0, WaitMode::new(self.backpressure))
+            .enter(WaitMode::new(self.backpressure))
             .map_err(|failure| match failure {
                 WaitFailure::Full => OverloadReason::WriteQueueFull,
                 WaitFailure::TimedOut => OverloadReason::WriteTimeout,
             })
     }
 
-    pub(crate) fn begin_remove(&self, lane_id: usize) -> Result<RemoveResources, OverloadReason> {
+    pub(crate) fn begin_remove(&self) -> Result<RemoveResources, OverloadReason> {
         let wait = WaitMode::new(self.backpressure);
         let queue = self
             .control_gate
-            .enter(lane_id, wait)
+            .enter(wait)
             .map_err(|failure| match failure {
                 WaitFailure::Full => OverloadReason::WriteQueueFull,
                 WaitFailure::TimedOut => OverloadReason::WriteTimeout,
@@ -502,13 +495,13 @@ impl DataResources {
 }
 
 pub(crate) struct RemoveResources {
-    _queue: ControlPermit,
+    _queue: QueuePermit,
     pub(crate) record: BufferLease,
     pub(crate) scratch: BufferLease,
 }
 
 impl RemoveResources {
-    pub(crate) fn into_parts(self) -> (ControlPermit, BufferLease, BufferLease) {
+    pub(crate) fn into_parts(self) -> (QueuePermit, BufferLease, BufferLease) {
         (self._queue, self.record, self.scratch)
     }
 }
@@ -579,25 +572,10 @@ struct GateState {
     current: usize,
 }
 
-struct LaneGateState {
-    current_by_lane: Vec<usize>,
-    current: usize,
-}
-
 struct RequestGate {
     limit: usize,
     state: Mutex<GateState>,
     available: Condvar,
-    current: AtomicUsize,
-    peak: AtomicUsize,
-    rejections: AtomicU64,
-    wait_ns: AtomicU64,
-}
-
-struct LaneRequestGate {
-    limit_per_lane: usize,
-    state: Mutex<LaneGateState>,
-    available: Vec<Condvar>,
     current: AtomicUsize,
     peak: AtomicUsize,
     rejections: AtomicU64,
@@ -668,101 +646,6 @@ impl RequestGate {
     }
 }
 
-impl LaneRequestGate {
-    fn try_new(lanes: usize) -> Result<Self, ResourceBuildError> {
-        let mut current_by_lane = Vec::new();
-        current_by_lane
-            .try_reserve_exact(lanes)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        current_by_lane.resize(lanes, 0);
-        let mut available = Vec::new();
-        available
-            .try_reserve_exact(lanes)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        available.resize_with(lanes, Condvar::new);
-        Ok(Self {
-            limit_per_lane: CONTROL_REQUESTS_PER_LANE,
-            state: Mutex::new(LaneGateState {
-                current_by_lane,
-                current: 0,
-            }),
-            available,
-            current: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            rejections: AtomicU64::new(0),
-            wait_ns: AtomicU64::new(0),
-        })
-    }
-
-    fn enter(
-        self: &Arc<Self>,
-        lane_id: usize,
-        wait: WaitMode,
-    ) -> Result<ControlPermit, WaitFailure> {
-        let Some(available) = self.available.get(lane_id) else {
-            debug_assert!(false, "control lane must be configured");
-            self.rejections.fetch_add(1, Ordering::Relaxed);
-            return Err(WaitFailure::Full);
-        };
-        let mut wait_started = None;
-        let mut state = lock_unpoisoned(&self.state);
-        while state.current_by_lane[lane_id] == self.limit_per_lane {
-            if wait_started.is_none() && !matches!(wait, WaitMode::Reject) {
-                wait_started = Some(Instant::now());
-            }
-            state = match wait {
-                WaitMode::Reject => {
-                    self.rejections.fetch_add(1, Ordering::Relaxed);
-                    return Err(WaitFailure::Full);
-                }
-                WaitMode::Block => wait_unpoisoned(available, state),
-                WaitMode::Deadline(deadline) => {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WaitFailure::TimedOut);
-                    };
-                    let (guard, timed_out) = wait_timeout_unpoisoned(available, state, remaining);
-                    if timed_out && guard.current_by_lane[lane_id] == self.limit_per_lane {
-                        self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WaitFailure::TimedOut);
-                    }
-                    guard
-                }
-            };
-        }
-        state.current_by_lane[lane_id] += 1;
-        state.current += 1;
-        let current = state.current;
-        self.current.store(current, Ordering::Relaxed);
-        update_peak(&self.peak, current);
-        add_wait_duration(&self.wait_ns, wait_started);
-        Ok(ControlPermit {
-            gate: Arc::clone(self),
-            lane_id,
-        })
-    }
-
-    fn release(&self, lane_id: usize) {
-        let mut state = lock_unpoisoned(&self.state);
-        let Some(lane_current) = state.current_by_lane.get_mut(lane_id) else {
-            debug_assert!(false, "released control lane must be configured");
-            return;
-        };
-        debug_assert_ne!(*lane_current, 0);
-        if *lane_current == 0 {
-            return;
-        }
-        *lane_current -= 1;
-        state.current -= 1;
-        self.current.store(state.current, Ordering::Relaxed);
-        if let Some(available) = self.available.get(lane_id) {
-            available.notify_one();
-        }
-    }
-}
-
 pub(crate) struct QueuePermit {
     gate: Arc<RequestGate>,
 }
@@ -770,17 +653,6 @@ pub(crate) struct QueuePermit {
 impl Drop for QueuePermit {
     fn drop(&mut self) {
         self.gate.release();
-    }
-}
-
-pub(crate) struct ControlPermit {
-    gate: Arc<LaneRequestGate>,
-    lane_id: usize,
-}
-
-impl Drop for ControlPermit {
-    fn drop(&mut self) {
-        self.gate.release(self.lane_id);
     }
 }
 
@@ -1625,57 +1497,6 @@ mod tests {
         );
         let mut read = resources.begin_read().unwrap();
         assert_eq!(read.buffer.prepare(4096).unwrap().len(), 4096);
-    }
-
-    #[test]
-    fn control_admission_is_lane_affine_and_bounded() {
-        let mut configured = limits(BackpressurePolicy::Reject);
-        configured.control_concurrency = 2;
-        let resources = ResourceController::try_new(configured).unwrap();
-
-        let lane_zero = resources.begin_remove(0).unwrap();
-        let queued_lane_zero = resources.begin_remove(0).unwrap();
-        assert_eq!(
-            resources.begin_remove(0).err(),
-            Some(OverloadReason::WriteQueueFull)
-        );
-        let lane_one = resources.begin_remove(1).unwrap();
-        let queued_lane_one = resources.begin_remove(1).unwrap();
-        let saturated = resources.snapshot();
-        assert_eq!(saturated.control_queue_depth, 4);
-        assert_eq!(saturated.control_queue_depth_peak, 4);
-        assert_eq!(saturated.control_buffers_in_use, 8);
-        assert_eq!(saturated.queue_rejections, 1);
-
-        drop(lane_zero);
-        let replacement = resources.begin_remove(0).unwrap();
-        assert_eq!(resources.snapshot().control_queue_depth, 4);
-        drop((replacement, queued_lane_zero, lane_one, queued_lane_one));
-        assert_eq!(resources.snapshot().control_queue_depth, 0);
-    }
-
-    #[test]
-    fn control_timeout_is_lane_local_and_attributed() {
-        let mut configured = limits(BackpressurePolicy::Timeout(Duration::from_millis(1)));
-        configured.control_concurrency = 2;
-        let resources = ResourceController::try_new(configured).unwrap();
-
-        let lane_zero = resources.begin_remove(0).unwrap();
-        let queued_lane_zero = resources.begin_remove(0).unwrap();
-        assert_eq!(
-            resources.begin_remove(0).err(),
-            Some(OverloadReason::WriteTimeout)
-        );
-        let lane_one = resources.begin_remove(1).unwrap();
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.control_queue_depth, 3);
-        assert_eq!(snapshot.queue_rejections, 1);
-        assert!(snapshot.control_queue_wait_ns > 0);
-        assert_eq!(
-            snapshot.backpressure_wait_ns,
-            snapshot.control_queue_wait_ns
-        );
-        drop((lane_zero, queued_lane_zero, lane_one));
     }
 
     #[test]

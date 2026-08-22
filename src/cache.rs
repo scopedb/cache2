@@ -2778,8 +2778,7 @@ impl DiskCache {
                 }
                 (record_codec(namespace), encoded_key_len, record_len)
             };
-            let lane_id = self.append_lane(hash);
-            let mut request = match self.inner.resources.begin_remove(lane_id) {
+            let mut request = match self.inner.resources.begin_remove() {
                 Ok(request) => request,
                 Err(reason) => return self.operational_overload(reason),
             };
@@ -2795,7 +2794,7 @@ impl DiskCache {
             )
             .map_err(|()| CacheError::CorruptMetadata("namespace key encoding failed"))?;
 
-            self.submit_append_on_lane(lane_id, |completion| AppendCommand::Remove {
+            self.submit_append(hash, |completion| AppendCommand::Remove {
                 hash,
                 namespace_id: namespace,
                 codec,
@@ -4183,19 +4182,8 @@ impl DiskCache {
         hash: u64,
         command: impl FnOnce(SyncSender<Result<T>>) -> AppendCommand,
     ) -> Result<T> {
-        self.submit_append_on_lane(self.append_lane(hash), command)
-    }
-
-    fn append_lane(&self, hash: u64) -> usize {
-        (hash as usize) % self.inner.append_txs.len()
-    }
-
-    fn submit_append_on_lane<T>(
-        &self,
-        lane_id: usize,
-        command: impl FnOnce(SyncSender<Result<T>>) -> AppendCommand,
-    ) -> Result<T> {
         let (completion, completed) = mpsc::sync_channel(1);
+        let lane_id = (hash as usize) % self.inner.append_txs.len();
         if self.inner.append_txs[lane_id]
             .send(command(completion))
             .is_err()
