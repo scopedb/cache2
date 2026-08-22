@@ -2017,7 +2017,11 @@ impl DiskCache {
         }
         let _barrier = self.lock_shared_operation()?;
         let hash = hash_namespaced_key(self.inner.config.hash_seed, namespace, key);
-        let epoch_start_seqno = self.lock_state()?.superblock.epoch_start_seqno;
+        // Membership is an advisory fast-path query. ReadView publishes the
+        // clear floor independently of the Region-manager mutex, so a FIFO
+        // rotation doing header sync and victim scrub cannot stall foreground
+        // Hybrid admission here.
+        let epoch_start_seqno = self.read_superblock()?.epoch_start_seqno;
         Ok(self.inner.index.get(hash, epoch_start_seqno).is_some())
     }
 
@@ -2037,11 +2041,7 @@ impl DiskCache {
         let _barrier = self.lock_shared_operation()?;
         let hash = hash_namespaced_key(self.inner.config.hash_seed, namespace, key);
         let _key_order = self.inner.key_ordering.lock(hash);
-        let epoch_start_seqno = {
-            let state = self.lock_state()?;
-            ensure_operational(&state)?;
-            state.superblock.epoch_start_seqno
-        };
+        let epoch_start_seqno = self.read_superblock()?.epoch_start_seqno;
         let Some(candidate) = self.inner.index.get(hash, epoch_start_seqno) else {
             return Ok(false);
         };
@@ -2062,7 +2062,7 @@ impl DiskCache {
         }
         let _barrier = self.lock_shared_operation()?;
         let hash = hash_namespaced_key(self.inner.config.hash_seed, namespace, key);
-        let epoch_start_seqno = self.lock_state()?.superblock.epoch_start_seqno;
+        let epoch_start_seqno = self.read_superblock()?.epoch_start_seqno;
         Ok(self
             .inner
             .index
@@ -9977,6 +9977,44 @@ mod m1_tests {
             [usage]
         );
         assert_eq!(cache.scan_live_usage(|_| {}).unwrap(), 0);
+        cache.close().unwrap();
+    }
+
+    #[test]
+    fn hybrid_index_hints_do_not_wait_for_the_region_manager() {
+        let file = TestFile::new("hybrid-index-hints");
+        let cache = config(&file.0).open().unwrap();
+        assert_eq!(
+            cache
+                .put_in(0, b"key", b"value", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+
+        // FIFO rotation owns this mutex across header sync and victim scrub.
+        // Advisory Hybrid index operations must remain independent of it.
+        let region_manager = cache.inner.state.lock().unwrap();
+        let probe = cache.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> Result<_> {
+                let present = probe.may_contain_in(0, b"key")?;
+                let bytes = probe.candidate_record_bytes_in(0, b"key")?;
+                let invalidated = probe.invalidate_in_memory(0, b"key")?;
+                Ok((present, bytes, invalidated))
+            })();
+            completed_tx.send(result).unwrap();
+        });
+        let completed = completed_rx.recv_timeout(Duration::from_secs(2));
+        drop(region_manager);
+        worker.join().unwrap();
+
+        let (present, bytes, invalidated) = completed
+            .expect("Hybrid index hints waited for the Region-manager mutex")
+            .unwrap();
+        assert!(present);
+        assert!(bytes.is_some());
+        assert!(invalidated);
         cache.close().unwrap();
     }
 
