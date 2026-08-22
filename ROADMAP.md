@@ -393,8 +393,9 @@ production-ready。完成上述外部项并保留报告后，才对具体 deploy
   有界暂停；v1.1 已把 payload syscall 从 4 KiB 聚合为 256 KiB，但没有消除 exclusive
   barrier。若实测不满足 checkpoint pause SLA，后续实现分段 copy-on-write/incremental
   checkpoint；本版本不以提高常量掩盖该边界。
-- [ ] FIFO Region turnover 仍在全局 Region-manager State 锁内执行 header barrier 与 victim
-  scrub，会短暂停顿其他 append lane；后续改成两阶段 reservation。`SecondChance` 已把 scrub
+- [ ] FIFO Region turnover 仍在全局 Region-manager State 锁内执行 header write 与 victim
+  scrub，会短暂停顿其他 append lane；owner-fenced Hybrid 已把 rotation sync 推迟到 clean
+  boundary，standalone 仍保留 barrier。后续改成两阶段 reservation。`SecondChance` 已把 scrub
   移到维护线程，但当前只有一个 ready Region，持续满盘写需用低水位 ready queue 消除周期性
   `ReclaimBacklog`。
 - [ ] `stats()` 仍持 State 锁按 Region 数量汇总 valid ratio；百万 Region 部署应降低抓取频率，

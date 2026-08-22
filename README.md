@@ -314,12 +314,14 @@ rotation.
 
 The scalable fast path is steady-state record I/O: independent reads and
 hash-selected append lanes overlap. Two turnover boundaries remain explicit in
-v1.1. FIFO rotation still performs its header barriers and victim scrub while
-holding the global Region-manager state lock, so all append lanes pause at that
-boundary; `SecondChance` moves the scrub off the foreground path but currently
-maintains only one ready Region and can return `ReclaimBacklog` under sustained
-full-cache writes. Checkpoint publication is also an exclusive O(index slots)
-operation. Payload I/O is aggregated into fixed 256 KiB writes, but a
+v1.1. FIFO rotation still writes its headers and scrubs the victim while holding
+the global Region-manager state lock, so append lanes pause at that boundary.
+Standalone Region preserves both rotation durability barriers; owner-fenced
+Hybrid defers those syncs to `flush`/`close`, because an unclean session already
+reopens safe-empty. `SecondChance` moves the scrub off the foreground path but
+currently maintains only one ready Region and can return `ReclaimBacklog` under
+sustained full-cache writes. Checkpoint publication is also an exclusive
+O(index slots) operation. Payload I/O is aggregated into fixed 256 KiB writes, but a
 100M-entry checkpoint is still a planned maintenance pause, not a transparent
 background snapshot.
 

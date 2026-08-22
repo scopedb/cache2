@@ -687,9 +687,10 @@ checkpoint extension 本身损坏不会改变 Format V1 data extent 的识别或
 - 一个通过 CRC 的完整新 record 可能在恢复时被重新发现，即使调用者未收到成功响应；缓存 API 不提供 exactly-once 语义。
 - checkpoint payload/header 的任意中断只能留下旧有效 generation 或无效新槽；clean
   Superblock 只有在新槽完整持久化后才发布。
-- dirty marker、Region rotation 和 `clear` epoch barrier 都有独立 durability point；
-  checkpoint 后的完整 record 由增量 scan 发现，损坏/截断 tombstone 只能导致 miss/安全
-  清空，不能使更旧 value 复活。
+- standalone dirty marker、Region rotation 和 `clear` epoch barrier 都有独立 durability
+  point；owner-fenced Hybrid 把 rotation sync 推迟到 flush/close，未 clean session 依靠全局
+  dirty fence 安全清空。checkpoint 后的完整 record 由增量 scan 发现，损坏/截断 tombstone
+  只能导致 miss/安全清空，不能使更旧 value 复活。
 - 若业务不能接受崩溃后短暂读到源数据的旧版本，应把源数据 version/epoch 编入 cache key；缓存本身不替代源数据版本控制。
 
 M6 保留 9 个聚焦行为测试：首次 baseline、dirty put/remove replay、`clear` barrier、双槽轮换与损坏、
