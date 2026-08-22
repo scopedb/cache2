@@ -63,6 +63,10 @@ use crate::policy::{
     NamespaceConfig, NamespaceController, NamespaceId, NamespaceRejectReason, NamespaceSnapshot,
     NamespaceUsage, NamespaceWriteReservation, NvmeHealthSample, NvmeHealthStats, PolicyController,
 };
+use crate::region_staging::{
+    FlushCommand as StagingFlushCommand, MAX_STAGING_CHUNK_BYTES, RegionStaging, ResidentLookup,
+    StageAppend, StagedFlush, StagedRecord, StagingError,
+};
 use crate::resources::{
     BackpressurePolicy, BufferLease, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_READ_QUEUE_DEPTH,
     DEFAULT_WRITE_QUEUE_DEPTH, DataResources, OverloadReason, QueuePermit, RemoveResources,
@@ -955,6 +959,8 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     append_txs: Vec<SyncSender<AppendCommand>>,
     append_workers: Mutex<Vec<JoinHandle<()>>>,
+    staging: Option<Arc<RegionStaging>>,
+    staging_workers: Mutex<Vec<JoinHandle<()>>>,
     reinsert_tx: SyncSender<ReinsertCommand>,
     reinsert_worker: Mutex<Option<JoinHandle<()>>>,
     reinsert_queued: AtomicU64,
@@ -1768,6 +1774,22 @@ impl DiskCache {
                 return Err(error);
             }
         };
+        let (staging, staging_receivers) = if owner_dirty.is_some() && !engine.direct_active() {
+            let usable = config.region_size - REGION_HEADER_SIZE as u64;
+            let chunk_bytes = usable.min(MAX_STAGING_CHUNK_BYTES as u64) as usize;
+            match RegionStaging::try_new(config.append_lanes, chunk_bytes, resources.as_ref()) {
+                Ok((staging, receivers)) => (Some(Arc::new(staging)), receivers),
+                Err(error) => {
+                    let _ = engine.shutdown();
+                    let _ = unlock_file(io.as_ref());
+                    return Err(CacheError::InvalidConfig(format!(
+                        "Region staging cannot be allocated: {error}"
+                    )));
+                }
+            }
+        } else {
+            (None, Vec::new())
+        };
         let append_lanes = config.append_lanes;
         let channel_capacity = config.write_queue_depth + 1;
         let mut append_txs = Vec::with_capacity(append_lanes);
@@ -1805,6 +1827,8 @@ impl DiskCache {
             state: Mutex::new(state),
             append_txs,
             append_workers: Mutex::new(Vec::new()),
+            staging,
+            staging_workers: Mutex::new(Vec::new()),
             reinsert_tx,
             reinsert_worker: Mutex::new(None),
             reinsert_queued: AtomicU64::new(0),
@@ -1866,6 +1890,37 @@ impl DiskCache {
                 return Err(error);
             }
         }
+        let mut staging_workers: Vec<JoinHandle<()>> = Vec::with_capacity(staging_receivers.len());
+        for (lane_id, staging_rx) in staging_receivers.into_iter().enumerate() {
+            let weak = Arc::downgrade(&inner);
+            let worker = match std::thread::Builder::new()
+                .name(format!("cache-rs-stage-flush-{lane_id}"))
+                .spawn(move || staging_flush_worker(weak, staging_rx))
+            {
+                Ok(worker) => worker,
+                Err(error) => {
+                    if let Some(staging) = &inner.staging {
+                        let _ = staging.shutdown();
+                    }
+                    for worker in staging_workers {
+                        let _ = worker.join();
+                    }
+                    let mut state = inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let _ = inner.engine.shutdown();
+                    let _ = unlock_file(inner.io.as_ref());
+                    state.lock_held = false;
+                    return Err(CacheError::Io(error));
+                }
+            };
+            staging_workers.push(worker);
+        }
+        *inner
+            .staging_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = staging_workers;
         let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(append_lanes);
         for (lane_id, append_rx) in append_receivers.into_iter().enumerate() {
             let weak = Arc::downgrade(&inner);
@@ -1879,6 +1934,17 @@ impl DiskCache {
                         let _ = append_tx.send(AppendCommand::Shutdown);
                     }
                     for worker in workers {
+                        let _ = worker.join();
+                    }
+                    if let Some(staging) = &inner.staging {
+                        let _ = staging.shutdown();
+                    }
+                    for worker in inner
+                        .staging_workers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .drain(..)
+                    {
                         let _ = worker.join();
                     }
                     let mut state = inner
@@ -1909,6 +1975,7 @@ impl DiskCache {
                         inner: Arc::clone(&inner),
                     };
                     let _ = cache.stop_and_join_append_workers();
+                    let _ = cache.stop_and_join_staging_workers();
                     let _ = inner.engine.shutdown();
                     let _ = unlock_file(inner.io.as_ref());
                     inner
@@ -1938,6 +2005,7 @@ impl DiskCache {
                 };
                 let _ = cache.stop_and_join_reinsert_worker();
                 let _ = cache.stop_and_join_append_workers();
+                let _ = cache.stop_and_join_staging_workers();
                 let _ = inner.engine.shutdown();
                 let _ = unlock_file(inner.io.as_ref());
                 inner
@@ -1972,6 +2040,7 @@ impl DiskCache {
                     let _ = cache.stop_and_join_maintenance_worker();
                     let _ = cache.stop_and_join_reinsert_worker();
                     let _ = cache.stop_and_join_append_workers();
+                    let _ = cache.stop_and_join_staging_workers();
                     let _ = inner.engine.shutdown();
                     let _ = unlock_file(inner.io.as_ref());
                     inner
@@ -2998,6 +3067,7 @@ impl DiskCache {
             Ok(permit) => permit,
             Err(reason) => return self.operational_overload(reason),
         };
+        self.drain_staging()?;
         let mut state = self.lock_state()?;
         ensure_operational(&state)?;
         if !state.superblock.clean {
@@ -3121,7 +3191,12 @@ impl DiskCache {
         // second-chance candidate. Stop all now-idle workers before the final
         // checkpoint so none can touch the file after publication.
         let reinsert_failed = self.stop_and_join_reinsert_worker();
-        let workers_failed = self.stop_and_join_append_workers()
+        let append_failed = self.stop_and_join_append_workers();
+        let staging_drain_failed = !already_closed && self.drain_staging().is_err();
+        let staging_worker_failed = self.stop_and_join_staging_workers();
+        let workers_failed = append_failed
+            || staging_drain_failed
+            || staging_worker_failed
             || maintenance_failed
             || recovery_failed
             || reinsert_failed;
@@ -3559,13 +3634,32 @@ impl DiskCache {
     }
 
     fn enter_miss_only(&self, state: &mut State) {
+        let target = if state.status == CacheStatus::Healthy {
+            CacheStatus::MissOnly
+        } else {
+            state.status
+        };
+        // Publish the sticky fence before clearing any candidate. Hybrid may
+        // otherwise observe a missing newer Region entry while this tier
+        // still appears Healthy and fall back to an older Bucket value.
+        self.set_lifecycle(target);
         enter_miss_only(state);
-        self.set_lifecycle(state.status);
     }
 
     fn enter_failure_state(&self, state: &mut State, error: &CacheError) {
+        let target = match state.status {
+            CacheStatus::Closed => CacheStatus::Closed,
+            CacheStatus::Poisoned => CacheStatus::Poisoned,
+            CacheStatus::Healthy | CacheStatus::MissOnly => {
+                if matches!(error, CacheError::Io(_)) {
+                    CacheStatus::MissOnly
+                } else {
+                    CacheStatus::Poisoned
+                }
+            }
+        };
+        self.set_lifecycle(target);
         enter_failure_state(state, error);
-        self.set_lifecycle(state.status);
     }
 
     fn fail_append(&self, error: &CacheError) {
@@ -4328,9 +4422,9 @@ impl DiskCache {
             Err(poisoned) => poisoned.into_inner(),
         };
         if state.status != CacheStatus::Closed {
+            self.set_lifecycle(CacheStatus::Poisoned);
             state.index.clear();
             state.status = CacheStatus::Poisoned;
-            self.set_lifecycle(CacheStatus::Poisoned);
         }
     }
 
@@ -4353,6 +4447,79 @@ impl DiskCache {
             failed |= worker.join().is_err();
         }
         failed
+    }
+
+    fn stop_and_join_staging_workers(&self) -> bool {
+        let mut workers = self
+            .inner
+            .staging_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if workers.is_empty() {
+            return false;
+        }
+        let Some(staging) = &self.inner.staging else {
+            return true;
+        };
+        let mut failed = staging.shutdown();
+        for worker in workers.drain(..) {
+            failed |= worker.join().is_err();
+        }
+        staging.close();
+        failed
+    }
+
+    fn drain_staging(&self) -> Result<()> {
+        let Some(staging) = &self.inner.staging else {
+            return Ok(());
+        };
+        staging
+            .drain_all()
+            .map_err(|error| self.fail_staging(error))
+    }
+
+    fn drain_staging_lane(&self, lane_id: usize) -> Result<()> {
+        let Some(staging) = &self.inner.staging else {
+            return Ok(());
+        };
+        staging
+            .drain_lane(lane_id)
+            .map_err(|error| self.fail_staging(error))
+    }
+
+    fn fail_staging(&self, error: StagingError) -> CacheError {
+        match error {
+            StagingError::Invariant(message) => {
+                let error = CacheError::CorruptMetadata(message);
+                self.fail_append(&error);
+                error
+            }
+            StagingError::Failed => match self.runtime_status() {
+                // The completion worker has already published the physical
+                // I/O failure and cleared the index. Preserve MissOnly rather
+                // than escalating an expected cache-device failure to poison.
+                CacheStatus::MissOnly | CacheStatus::Poisoned => CacheError::Poisoned,
+                CacheStatus::Closed => CacheError::Closed,
+                CacheStatus::Healthy => {
+                    let error = CacheError::CorruptMetadata(
+                        "Region staging worker failed without publishing a cause",
+                    );
+                    self.fail_append(&error);
+                    error
+                }
+            },
+            StagingError::Closed => {
+                if !self.inner.accepting.load(Ordering::Acquire) {
+                    CacheError::Closed
+                } else {
+                    let error = CacheError::CorruptMetadata(
+                        "Region staging closed while the cache was accepting requests",
+                    );
+                    self.fail_append(&error);
+                    error
+                }
+            }
+        }
     }
 
     fn stop_and_join_reinsert_worker(&self) -> bool {
@@ -4673,6 +4840,9 @@ impl DiskCache {
             Ok(permit) => permit,
             Err(_) => return,
         };
+        if self.drain_staging().is_err() {
+            return;
+        }
         let mut state = match self.inner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -4966,6 +5136,7 @@ impl DiskCache {
             }
             let mut batch = accepted.drain(..plan.records).collect::<Vec<_>>();
             if let Err(error) = self.write_reserved_put_batch(
+                lane_id,
                 &mut batch,
                 &plan,
                 &reservations,
@@ -5015,6 +5186,7 @@ impl DiskCache {
     #[allow(clippy::too_many_arguments)]
     fn write_reserved_put_batch(
         &self,
+        lane_id: usize,
         puts: &mut [PreparedPut],
         plan: &BatchPlan,
         reservations: &[AppendReservation],
@@ -5130,27 +5302,82 @@ impl DiskCache {
             PutSource::Foreground | PutSource::ManagedForeground => HostWriteKind::ForegroundRecord,
             PutSource::Reinsertion => HostWriteKind::Reinsertion,
         };
-        let (write_result, completed) = self.engine_write_with_kind(
-            WritePoint::Record,
-            write_kind,
-            target,
-            plan.write_len,
-            absolute,
-        );
-        if completed.is_none() {
-            let error = match write_result {
-                Err(error) => CacheError::Io(error),
-                Ok(_) => {
-                    CacheError::CorruptMetadata("successful batch write completion lost its buffer")
+        let staged = source == PutSource::ManagedForeground
+            && self
+                .inner
+                .staging
+                .as_ref()
+                .is_some_and(|staging| plan.write_len <= staging.chunk_bytes());
+        if staged {
+            let staging = self
+                .inner
+                .staging
+                .as_ref()
+                .expect("checked managed Region staging");
+            let encoded = match target.prepared(plan.write_len) {
+                Ok(encoded) => encoded,
+                Err(()) => {
+                    let error = CacheError::CorruptMetadata("staged batch lost its encoded buffer");
+                    self.fail_append(&error);
+                    return Err(error);
                 }
             };
-            self.fail_append(&error);
-            return Err(error);
-        }
-        if let Err(error) = write_result {
-            let error = CacheError::Io(error);
-            self.fail_append(&error);
-            return Err(error);
+            let staged_records = puts
+                .iter()
+                .zip(reservations)
+                .map(|(put, reservation)| StagedRecord {
+                    hash: put.hash,
+                    entry: IndexEntry {
+                        location: reservation.location,
+                        seqno: reservation.seqno,
+                        namespace_id: put.namespace_id,
+                        flags: INDEX_FLAG_VOLATILE,
+                    },
+                })
+                .collect::<Vec<_>>();
+            loop {
+                match staging.append_batch(
+                    lane_id,
+                    reservations[0].location.region_id(),
+                    reservations[0].region_incarnation,
+                    reservations[0].epoch,
+                    reservations[0].location.offset(),
+                    reservations[0].absolute,
+                    encoded,
+                    &staged_records,
+                ) {
+                    Ok(StageAppend::Appended) => break,
+                    Ok(StageAppend::NeedsSeal) => {
+                        staging
+                            .seal_lane(lane_id)
+                            .map_err(|error| self.fail_staging(error))?;
+                    }
+                    Err(error) => return Err(self.fail_staging(error)),
+                }
+            }
+        } else {
+            let (write_result, completed) = self.engine_write_with_kind(
+                WritePoint::Record,
+                write_kind,
+                target,
+                plan.write_len,
+                absolute,
+            );
+            if completed.is_none() {
+                let error = match write_result {
+                    Err(error) => CacheError::Io(error),
+                    Ok(_) => CacheError::CorruptMetadata(
+                        "successful batch write completion lost its buffer",
+                    ),
+                };
+                self.fail_append(&error);
+                return Err(error);
+            }
+            if let Err(error) = write_result {
+                let error = CacheError::Io(error);
+                self.fail_append(&error);
+                return Err(error);
+            }
         }
 
         let mut state = self.lock_state()?;
@@ -5162,7 +5389,9 @@ impl DiskCache {
             .zip(capacity_guards)
             .zip(namespace_write_guards)
         {
-            let flags = if put.source == PutSource::Reinsertion {
+            let flags = if staged {
+                INDEX_FLAG_VOLATILE
+            } else if put.source == PutSource::Reinsertion {
                 INDEX_FLAG_SECOND_CHANCE_USED
             } else {
                 0
@@ -5229,11 +5458,13 @@ impl DiskCache {
                 .reinsert_completed
                 .fetch_add(puts.len() as u64, Ordering::Relaxed);
         }
-        state.stats.write_batches = state.stats.write_batches.saturating_add(1);
-        state.stats.records_coalesced = state
-            .stats
-            .records_coalesced
-            .saturating_add(puts.len().saturating_sub(1) as u64);
+        if !staged {
+            state.stats.write_batches = state.stats.write_batches.saturating_add(1);
+            state.stats.records_coalesced = state
+                .stats
+                .records_coalesced
+                .saturating_add(puts.len().saturating_sub(1) as u64);
+        }
         drop(state);
         self.request_periodic_checkpoint(plan.write_len as u64);
         self.request_background_reclaim(false);
@@ -5376,12 +5607,14 @@ impl DiskCache {
     }
 
     fn flush_on_append_lane(&self) -> Result<()> {
+        self.drain_staging()?;
         let mut state = self.lock_state()?;
         ensure_operational(&state)?;
         self.checkpoint_clean(&mut state)
     }
 
     fn clear_on_append_lane(&self) -> Result<()> {
+        self.drain_staging()?;
         let mut state = self.lock_state()?;
         ensure_operational(&state)?;
         self.mark_dirty(&mut state)?;
@@ -5540,6 +5773,7 @@ impl DiskCache {
         let mut state = self.lock_state()?;
         ensure_operational(&state)?;
         self.mark_dirty(&mut state)?;
+        let mut staging_drained = false;
         let plan = loop {
             let active_region =
                 *state
@@ -5554,6 +5788,14 @@ impl DiskCache {
             )?;
             if let Some(plan) = plan_batch(minimum_lengths, start, remaining, align_for_direct) {
                 break plan;
+            }
+            if !staging_drained && self.inner.staging.is_some() {
+                drop(state);
+                self.drain_staging_lane(lane_id)?;
+                state = self.lock_state()?;
+                ensure_operational(&state)?;
+                staging_drained = true;
+                continue;
             }
             if self.inner.config.reclaim_mode == ReclaimMode::Fifo {
                 drop(state);
@@ -6119,6 +6361,81 @@ impl DiskCache {
         }
     }
 
+    fn write_staged_flush(&self, job: StagedFlush) {
+        let lane_id = job.lane_id;
+        let span_id = job.span_id;
+        let length = job.length;
+        let records = job.records;
+        let (write_result, completed) = self.engine_write_with_kind(
+            WritePoint::Record,
+            HostWriteKind::ForegroundRecord,
+            job.buffer,
+            length,
+            job.absolute,
+        );
+        let write_error = match (write_result, completed) {
+            (Ok(written), Some(buffer)) if written == length => {
+                drop(buffer);
+                None
+            }
+            (Ok(_), completed) => {
+                drop(completed);
+                Some(CacheError::CorruptMetadata(
+                    "staged Region write completed with a short length",
+                ))
+            }
+            (Err(error), completed) => {
+                drop(completed);
+                Some(CacheError::Io(error))
+            }
+        };
+        let Some(staging) = &self.inner.staging else {
+            self.fail_append(&CacheError::CorruptMetadata(
+                "staging flush completed without a staging directory",
+            ));
+            return;
+        };
+        if let Some(error) = write_error {
+            // Publish the sticky failure and clear every index entry before
+            // resident bytes disappear. A completed cache put may be lost,
+            // but it can never reveal a stale on-device record.
+            self.fail_append(&error);
+            if let Err(staging_error) = staging.finish_failure(lane_id, span_id) {
+                let _ = self.fail_staging(staging_error);
+            }
+            return;
+        }
+        let completed = staging.finish_success(lane_id, span_id, |record| {
+            let _ = self.inner.index.clear_flags_if_entry(
+                record.hash,
+                record.entry,
+                INDEX_FLAG_VOLATILE,
+                INDEX_FLAG_VOLATILE,
+            );
+        });
+        if let Err(error) = completed {
+            let _ = self.fail_staging(error);
+            if let Err(staging_error) = staging.finish_failure(lane_id, span_id) {
+                let _ = self.fail_staging(staging_error);
+            }
+            return;
+        }
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => {
+                self.fail_append(&error);
+                return;
+            }
+        };
+        if state.status == CacheStatus::Healthy {
+            state.stats.write_batches = state.stats.write_batches.saturating_add(1);
+            state.stats.records_coalesced = state
+                .stats
+                .records_coalesced
+                .saturating_add(records.saturating_sub(1) as u64);
+        }
+    }
+
     fn engine_sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()> {
         let request = match self.inner.engine.flush(point, mode) {
             Ok(request) => request,
@@ -6180,6 +6497,67 @@ impl DiskCache {
             return Err(CacheError::CorruptMetadata(
                 "record scratch length does not match index",
             ));
+        }
+        if entry.flags & INDEX_FLAG_VOLATILE != 0 {
+            let hash = hash_namespaced_key(snapshot.superblock.hash_seed, namespace, expected_key);
+            let Some(staging) = &self.inner.staging else {
+                return Err(CacheError::CorruptMetadata(
+                    "volatile index entry has no resident staging directory",
+                ));
+            };
+            let output = buffer.prepared_mut(len).map_err(|()| {
+                CacheError::CorruptMetadata("volatile record scratch buffer is unavailable")
+            })?;
+            match staging
+                .copy_record(
+                    hash,
+                    snapshot.superblock.epoch,
+                    snapshot.region.header.incarnation,
+                    entry,
+                    output,
+                )
+                .map_err(|error| self.fail_staging(error))?
+            {
+                ResidentLookup::Found => {
+                    let encoded = buffer.prepared(len).map_err(|()| {
+                        CacheError::CorruptMetadata("resident read lost its copied record")
+                    })?;
+                    return Ok((
+                        self.decode_loaded_record(
+                            snapshot,
+                            entry,
+                            namespace,
+                            expected_key,
+                            encoded,
+                        ),
+                        buffer,
+                    ));
+                }
+                ResidentLookup::NotFound => {
+                    let current = self
+                        .inner
+                        .index
+                        .get(hash, snapshot.superblock.epoch_start_seqno);
+                    match current {
+                        Some(current)
+                            if current.same_record_identity(entry)
+                                && current.flags & INDEX_FLAG_VOLATILE == 0 =>
+                        {
+                            // The CQE made the physical bytes safe to read
+                            // before clearing the bit and retiring residency.
+                        }
+                        Some(current)
+                            if current.same_record_identity(entry)
+                                && current.flags & INDEX_FLAG_VOLATILE != 0 =>
+                        {
+                            return Err(CacheError::CorruptMetadata(
+                                "volatile index entry is missing its resident record",
+                            ));
+                        }
+                        _ => return Ok((LoadedRecord::KeyMismatch, buffer)),
+                    }
+                }
+            }
         }
         let (read_result, completed) = self.engine_read(buffer, len, absolute, context);
         let Some(completed) = completed else {
@@ -6643,6 +7021,20 @@ impl DiskCache {
             });
         }
         result.map(|_| ()).map_err(CacheError::Io)
+    }
+}
+
+fn staging_flush_worker(inner: Weak<Inner>, commands: Receiver<StagingFlushCommand>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            StagingFlushCommand::Write(job) => {
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                DiskCache { inner }.write_staged_flush(job);
+            }
+            StagingFlushCommand::Shutdown => break,
+        }
     }
 }
 
@@ -9705,11 +10097,13 @@ fn enter_failure_state(state: &mut State, error: &CacheError) {
         return;
     }
     state.index.clear();
-    state.status = if matches!(error, CacheError::Io(_)) {
-        CacheStatus::MissOnly
-    } else {
-        CacheStatus::Poisoned
-    };
+    if state.status != CacheStatus::Poisoned {
+        state.status = if matches!(error, CacheError::Io(_)) {
+            CacheStatus::MissOnly
+        } else {
+            CacheStatus::Poisoned
+        };
+    }
 }
 
 fn context_stop_error(context: Option<&TaskContext>) -> CacheError {
@@ -10225,6 +10619,26 @@ mod m1_tests {
             .with_append_lanes(2)
     }
 
+    fn open_managed_fault_cache(config: CacheConfig, backend: FaultBackend) -> DiskCache {
+        DiskCache::open_with_backend_and_owner_hooks(
+            config,
+            Box::new(backend),
+            Arc::new(HostWriteTracker::try_new(None, None).unwrap()),
+            Arc::new(NamespaceController::try_new(&[]).unwrap()),
+            Arc::new(|_| true),
+            Arc::new(|| Ok(())),
+        )
+        .unwrap()
+    }
+
+    fn record_write_count(handle: &FaultHandle) -> usize {
+        handle
+            .events()
+            .into_iter()
+            .filter(|event| *event == FaultEvent::Write(WritePoint::Record))
+            .count()
+    }
+
     #[test]
     fn managed_region_delegates_policy_and_tracks_writes_in_shared_tracker() {
         let file = TestFile::new("managed-policy");
@@ -10284,6 +10698,95 @@ mod m1_tests {
             0
         );
         cache.close().unwrap();
+    }
+
+    #[test]
+    fn managed_buffered_puts_stay_resident_until_one_batched_flush() {
+        let file = TestFile::new("managed-resident-batch");
+        let cache_config = config(&file.0);
+        let (backend, faults) = FaultBackend::open(&file.0).unwrap();
+        let cache = open_managed_fault_cache(cache_config.clone(), backend);
+        let before_writes = record_write_count(&faults);
+        let before_batches = cache.stats().write_batches;
+
+        assert_eq!(
+            cache
+                .put_in_managed(0, b"removed", b"first", PutOptions::default())
+                .unwrap()
+                .outcome,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            cache
+                .put_in_managed(0, b"survivor", b"second", PutOptions::default())
+                .unwrap()
+                .outcome,
+            PutOutcome::Stored
+        );
+        assert_eq!(record_write_count(&faults), before_writes);
+        assert_eq!(cache.stats().write_batches, before_batches);
+        assert_eq!(
+            cache.get(b"removed").unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            cache.get(b"survivor").unwrap().as_deref(),
+            Some(b"second".as_slice())
+        );
+
+        assert!(cache.invalidate_in_memory(0, b"removed").unwrap());
+        assert_eq!(cache.get(b"removed").unwrap(), None);
+        cache.flush().unwrap();
+        assert_eq!(record_write_count(&faults), before_writes + 1);
+        assert_eq!(cache.stats().write_batches, before_batches + 1);
+        cache.close().unwrap();
+        cache.close().unwrap();
+
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"removed").unwrap(), None);
+        assert_eq!(
+            reopened.get(b"survivor").unwrap().as_deref(),
+            Some(b"second".as_slice())
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn failed_managed_staging_write_stays_miss_only_and_clears_runtime_index() {
+        let file = TestFile::new("managed-staging-eio");
+        let cache_config = config(&file.0);
+        let initial = cache_config.clone().open().unwrap();
+        assert_eq!(
+            initial.put(b"key", b"old", PutOptions::default()).unwrap(),
+            PutOutcome::Stored
+        );
+        initial.flush().unwrap();
+        initial.close().unwrap();
+
+        let (backend, faults) = FaultBackend::open(&file.0).unwrap();
+        let cache = open_managed_fault_cache(cache_config.clone(), backend);
+        assert_eq!(
+            cache
+                .put_in_managed(0, b"key", b"new", PutOptions::default())
+                .unwrap()
+                .outcome,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            cache.get(b"key").unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
+
+        faults.arm(
+            FaultEvent::Write(WritePoint::Record),
+            1,
+            FaultAction::Error(EIO),
+        );
+        assert!(matches!(cache.flush(), Err(CacheError::Poisoned)));
+        assert_eq!(cache.status(), CacheStatus::MissOnly);
+        assert_eq!(cache.get(b"key").unwrap(), None);
+        assert_eq!(cache.stats().entries, 0);
+        assert!(matches!(cache.close(), Err(CacheError::Poisoned)));
     }
 
     #[test]

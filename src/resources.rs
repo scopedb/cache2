@@ -117,6 +117,20 @@ pub(crate) struct ResourceController {
     put_rejections: AtomicU64,
 }
 
+/// A fixed runtime allocation charged to the same hard memory budget as the
+/// request pools. The owner keeps this guard for exactly as long as the
+/// associated bounded structure exists.
+pub(crate) struct RuntimeMemoryReservation {
+    memory: Arc<MemoryTracker>,
+    bytes: usize,
+}
+
+impl Drop for RuntimeMemoryReservation {
+    fn drop(&mut self) {
+        self.memory.release(self.bytes);
+    }
+}
+
 impl ResourceController {
     pub(crate) fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
         if limits.read_queue_depth == 0 || limits.write_queue_depth == 0 {
@@ -209,6 +223,19 @@ impl ResourceController {
                 .map(|rate| Mutex::new(TokenBucket::new(rate))),
             put_rejections: AtomicU64::new(0),
             memory,
+        })
+    }
+
+    pub(crate) fn reserve_runtime_memory(
+        &self,
+        bytes: usize,
+    ) -> Result<RuntimeMemoryReservation, ResourceBuildError> {
+        if !self.memory.try_reserve(bytes) {
+            return Err(ResourceBuildError::Allocation);
+        }
+        Ok(RuntimeMemoryReservation {
+            memory: Arc::clone(&self.memory),
+            bytes,
         })
     }
 

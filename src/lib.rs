@@ -84,6 +84,7 @@ mod metrics;
 mod miss_guard;
 mod pending_write;
 mod policy;
+mod region_staging;
 mod resources;
 mod write_back;
 mod write_batch;
