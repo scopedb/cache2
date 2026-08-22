@@ -104,6 +104,14 @@ waker registration is capped at 64 removable slots and overload is explicit;
 synchronous waiters do not consume those slots. `HybridHealthSnapshot` keeps
 manifest, Bucket, and Region degradation visible independently.
 
+A no-deadline async read that finds a live L1 value completes on the caller's
+L1 completion lane: it remains charged to the shared Hybrid request slot/byte
+budget but does not copy the key, allocate a runnable, consume the slow read
+queue, or wake a worker. L1 misses, expired entries, lock contention, and every
+request with a deadline retain the bounded cancelable read-queue path. Thus
+read-queue saturation rejects lower-tier work without rejecting an otherwise
+admissible live L1 hit.
+
 An async read remains cancellable only until it needs an irreversible cleanup.
 Dirty-L1 expiry, Bucket expiry/corruption, and Region expiry/corruption first
 atomically claim a read-side commit point. If cancellation wins, no mutation or

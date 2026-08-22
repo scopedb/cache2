@@ -733,7 +733,7 @@ fn release_reservation_locked(state: &mut QueueState, class: QueueClass) {
     }
 }
 
-struct QueueReservation {
+pub(crate) struct QueueReservation {
     pool: Arc<PoolInner>,
     class: QueueClass,
     active: bool,
@@ -998,7 +998,8 @@ impl AsyncExecutor {
         })
     }
 
-    pub(crate) fn submit_read<T, F, M>(
+    #[cfg(test)]
+    fn submit_read<T, F, M>(
         &self,
         options: AsyncRequestOptions,
         map_failure: M,
@@ -1018,7 +1019,8 @@ impl AsyncExecutor {
         )
     }
 
-    pub(crate) fn submit_mutation<T, F, M>(
+    #[cfg(test)]
+    fn submit_mutation<T, F, M>(
         &self,
         options: AsyncRequestOptions,
         map_failure: M,
@@ -1079,11 +1081,11 @@ impl AsyncExecutor {
         )
     }
 
-    fn reserve_read(&self) -> Result<QueueReservation, AsyncFailure> {
+    pub(crate) fn reserve_read(&self) -> Result<QueueReservation, AsyncFailure> {
         self.reads.inner.try_reserve(QueueClass::Ordinary)
     }
 
-    fn reserve_mutation(&self) -> Result<QueueReservation, AsyncFailure> {
+    pub(crate) fn reserve_mutation(&self) -> Result<QueueReservation, AsyncFailure> {
         self.mutations.inner.try_reserve(QueueClass::Ordinary)
     }
 
@@ -1097,7 +1099,7 @@ impl AsyncExecutor {
         self.mutations.inner.try_reserve(QueueClass::Control)
     }
 
-    fn submit_read_reserved<T, F, M>(
+    pub(crate) fn submit_read_reserved<T, F, M>(
         &self,
         reservation: QueueReservation,
         options: AsyncRequestOptions,
@@ -1118,7 +1120,7 @@ impl AsyncExecutor {
         )
     }
 
-    fn submit_mutation_reserved<T, F, M>(
+    pub(crate) fn submit_mutation_reserved<T, F, M>(
         &self,
         reservation: QueueReservation,
         options: AsyncRequestOptions,

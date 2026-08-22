@@ -1,8 +1,9 @@
 //! Single bounded asynchronous facade for the mixed-object Hybrid cache.
 //!
-//! Queue reservations and the Hybrid byte gate are both acquired before
-//! caller inputs are copied. Mutation cancellation becomes advisory once a
-//! worker starts, matching the synchronous commit contract.
+//! Slow-path queue reservations and the Hybrid byte gate are both acquired
+//! before caller inputs are copied. A no-deadline live L1 hit completes on the
+//! caller without consuming a read-worker slot. Mutation cancellation becomes
+//! advisory once a worker starts, matching the synchronous commit contract.
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -147,21 +148,38 @@ impl AsyncHybridCache {
             Ok(permit) => permit,
             Err(error) => return ready_future(Err(error)),
         };
+        let mut permit = permit;
+        if options.deadline().is_none() {
+            match cache.lookup_memory_in_admitted(namespace, key, &mut permit) {
+                Ok(Some(HybridLookupOutcome::Hit { value, .. })) => {
+                    return ready_future(Ok(Some(value)));
+                }
+                Ok(Some(HybridLookupOutcome::Miss(_))) => return ready_future(Ok(None)),
+                Ok(None) => {}
+                Err(error) => return ready_future(Err(error)),
+            }
+        }
+        let reservation = match self.inner.executor.reserve_read() {
+            Ok(reservation) => reservation,
+            Err(failure) => return ready_future(map_read_failure(failure)),
+        };
         let key = match copy_input(key, OverloadReason::ReadBufferUnavailable) {
             Ok(key) => key,
             Err(error) => return ready_future(Err(error)),
         };
-        self.inner
-            .executor
-            .submit_read(options, map_read_failure, move |context| {
-                let mut permit = permit;
+        self.inner.executor.submit_read_reserved(
+            reservation,
+            options,
+            map_read_failure,
+            move |context| {
                 cache
                     .lookup_in_admitted_with_task_context(namespace, &key, &mut permit, &context)
                     .map(|outcome| match outcome {
                         HybridLookupOutcome::Hit { value, .. } => Some(value),
                         HybridLookupOutcome::Miss(_) => None,
                     })
-            })
+            },
+        )
     }
 
     pub fn lookup(&self, key: impl AsRef<[u8]>) -> CacheFuture<Result<HybridLookupOutcome>> {
@@ -186,16 +204,30 @@ impl AsyncHybridCache {
             Ok(permit) => permit,
             Err(error) => return ready_future(Err(error)),
         };
+        let mut permit = permit;
+        if options.deadline().is_none() {
+            match cache.lookup_memory_in_admitted(namespace, key, &mut permit) {
+                Ok(Some(outcome)) => return ready_future(Ok(outcome)),
+                Ok(None) => {}
+                Err(error) => return ready_future(Err(error)),
+            }
+        }
+        let reservation = match self.inner.executor.reserve_read() {
+            Ok(reservation) => reservation,
+            Err(failure) => return ready_future(map_read_failure(failure)),
+        };
         let key = match copy_input(key, OverloadReason::ReadBufferUnavailable) {
             Ok(key) => key,
             Err(error) => return ready_future(Err(error)),
         };
-        self.inner
-            .executor
-            .submit_read(options, map_read_failure, move |context| {
-                let mut permit = permit;
+        self.inner.executor.submit_read_reserved(
+            reservation,
+            options,
+            map_read_failure,
+            move |context| {
                 cache.lookup_in_admitted_with_task_context(namespace, &key, &mut permit, &context)
-            })
+            },
+        )
     }
 
     pub fn put(
@@ -254,6 +286,10 @@ impl AsyncHybridCache {
             }
             Err(error) => return ready_future(Err(error)),
         };
+        let reservation = match self.inner.executor.reserve_mutation() {
+            Ok(reservation) => reservation,
+            Err(failure) => return ready_future(map_put_failure(failure)),
+        };
         let key = match copy_input(key, OverloadReason::WriteBufferUnavailable) {
             Ok(key) => key,
             Err(_) => {
@@ -266,12 +302,15 @@ impl AsyncHybridCache {
                 return ready_future(Ok(PutOutcome::Rejected(RejectReason::BufferUnavailable)));
             }
         };
-        self.inner
-            .executor
-            .submit_mutation(request_options, map_put_failure, move |_| {
+        self.inner.executor.submit_mutation_reserved(
+            reservation,
+            request_options,
+            map_put_failure,
+            move |_| {
                 let _permit = permit;
                 cache.put_in_admitted(namespace, &key, &value, put_options)
-            })
+            },
+        )
     }
 
     pub fn remove(&self, key: impl AsRef<[u8]>) -> CacheFuture<Result<RemoveOutcome>> {
@@ -301,16 +340,23 @@ impl AsyncHybridCache {
             Ok(permit) => permit,
             Err(error) => return ready_future(Err(error)),
         };
+        let reservation = match self.inner.executor.reserve_mutation() {
+            Ok(reservation) => reservation,
+            Err(failure) => return ready_future(map_write_failure(failure)),
+        };
         let key = match copy_input(key, OverloadReason::WriteBufferUnavailable) {
             Ok(key) => key,
             Err(error) => return ready_future(Err(error)),
         };
-        self.inner
-            .executor
-            .submit_mutation(options, map_write_failure, move |_| {
+        self.inner.executor.submit_mutation_reserved(
+            reservation,
+            options,
+            map_write_failure,
+            move |_| {
                 let _permit = permit;
                 cache.remove_in_admitted(namespace, &key)
-            })
+            },
+        )
     }
 
     pub fn flush(&self) -> CacheFuture<Result<()>> {

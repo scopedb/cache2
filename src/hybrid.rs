@@ -1731,6 +1731,72 @@ impl HybridCache {
         self.lookup_in_admitted_with_context(namespace, key, request, Some(context))
     }
 
+    /// Try to complete only an unexpired L1 hit. Lock contention or a miss has
+    /// no Hybrid-visible side effects, so an async caller can hand the same
+    /// admitted request to the cancelable lower-tier worker path.
+    pub(crate) fn lookup_memory_in_admitted(
+        &self,
+        namespace: NamespaceId,
+        key: &[u8],
+        request: &mut HybridRequestPermit,
+    ) -> Result<Option<HybridLookupOutcome>> {
+        let started = Instant::now();
+        let result = (|| -> Result<Option<HybridLookupOutcome>> {
+            let Some(_operation) = self.try_read_operation_admitted()? else {
+                return Ok(None);
+            };
+            match self.status() {
+                CacheStatus::Healthy | CacheStatus::MissOnly => {}
+                CacheStatus::Poisoned => return Err(CacheError::Poisoned),
+                CacheStatus::Closed => return Err(CacheError::Closed),
+            }
+            if !self.inner.policy.namespaces().contains(namespace) {
+                return Ok(None);
+            }
+            let hash = hybrid_hash(namespace, key);
+            let hit = self
+                .inner
+                .memory
+                .get_live_with_reservation(namespace, key, |bytes| {
+                    request.try_grow_read(bytes).is_ok()
+                });
+            match hit {
+                Ok(Some(hit)) => {
+                    self.inner.policy.admission().observe(hash);
+                    self.inner
+                        .counters
+                        .memory_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    let value = try_clone_bytes(
+                        hit.value.as_slice(),
+                        OverloadReason::ReadBufferUnavailable,
+                    )?;
+                    Ok(Some(HybridLookupOutcome::Hit {
+                        value,
+                        tier: CacheTier::Memory,
+                    }))
+                }
+                Ok(None) => Ok(None),
+                Err(error) => {
+                    self.inner.policy.admission().observe(hash);
+                    Err(map_memory_error(error))
+                }
+            }
+        })();
+        if !matches!(&result, Ok(None)) {
+            self.record_operation(
+                CacheOperation::Get,
+                &result,
+                |outcome| match outcome {
+                    Some(HybridLookupOutcome::Hit { .. }) => RequestResultClass::Hit,
+                    Some(HybridLookupOutcome::Miss(_)) | None => RequestResultClass::Miss,
+                },
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
     fn lookup_in_admitted_with_context(
         &self,
         namespace: NamespaceId,
@@ -2983,6 +3049,18 @@ impl HybridCache {
             return Err(CacheError::Closed);
         }
         Ok(guard)
+    }
+
+    fn try_read_operation_admitted(&self) -> Result<Option<RwLockReadGuard<'_, ()>>> {
+        let guard = match self.inner.operation.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(CacheError::Poisoned),
+        };
+        if lock_mutex(&self.inner.state).status == CacheStatus::Closed {
+            return Err(CacheError::Closed);
+        }
+        Ok(Some(guard))
     }
 
     fn ensure_accepting(&self) -> Result<()> {
@@ -6305,6 +6383,67 @@ mod tests {
         let reopened = config(&files, 8 * 1024).open().unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn async_live_l1_hit_bypasses_a_saturated_read_queue() {
+        let files = TestFiles::new("async-l1-direct");
+        let mut cache_config = config(&files, 64 * 1024)
+            .with_request_slots(8)
+            .with_async_queue_depths(1, 2)
+            .with_async_workers(1, 1);
+        cache_config.bucket = cache_config.bucket.clone().with_buffer_slots(1);
+        let cache = cache_config.open().unwrap();
+        cache
+            .put(b"cold-a", b"first", PutOptions::default())
+            .unwrap();
+        cache
+            .put(b"cold-b", b"second", PutOptions::default())
+            .unwrap();
+        cache.flush().unwrap();
+        cache.inner.memory.clear();
+        cache.put(b"hot", b"memory", PutOptions::default()).unwrap();
+
+        let held_page = cache.inner.disk.bucket.hold_page_for_test().unwrap();
+        let asynchronous = cache.async_handle().unwrap();
+        let blocked = asynchronous.get(b"cold-a");
+        assert!(wait_until(Duration::from_secs(1), || {
+            cache.inner.disk.bucket.page_waiters_for_test() == 1
+        }));
+        let queued = asynchronous.get(b"cold-b");
+        assert!(wait_until(Duration::from_secs(1), || {
+            let queue = asynchronous.queue_stats();
+            queue.read_in_flight == 1 && queue.read_queued == 1
+        }));
+
+        assert!(matches!(
+            asynchronous
+                .get_with_options(
+                    b"hot",
+                    crate::AsyncRequestOptions::with_timeout(Duration::from_secs(1)),
+                )
+                .wait(),
+            Err(CacheError::Overloaded(OverloadReason::ReadQueueFull))
+        ));
+        let hits_before = cache.stats().memory_hits;
+        let direct = asynchronous.lookup(b"hot");
+        assert_eq!(direct.cancel(), crate::CancelOutcome::Completed);
+        assert_eq!(
+            direct.wait().unwrap(),
+            HybridLookupOutcome::Hit {
+                value: b"memory".to_vec(),
+                tier: CacheTier::Memory,
+            }
+        );
+        assert_eq!(cache.stats().memory_hits - hits_before, 1);
+        let queue = asynchronous.queue_stats();
+        assert_eq!(queue.read_in_flight, 1);
+        assert_eq!(queue.read_queued, 1);
+
+        drop(held_page);
+        assert_eq!(blocked.wait().unwrap(), Some(b"first".to_vec()));
+        assert_eq!(queued.wait().unwrap(), Some(b"second".to_vec()));
+        cache.close().unwrap();
     }
 
     #[test]
