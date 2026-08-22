@@ -637,20 +637,32 @@ impl PoolInner {
         let waker = {
             let mut state = lock_unpoisoned(&self.state);
             debug_assert!(state.pending != 0);
+            let release_control;
             match class {
                 QueueClass::Ordinary | QueueClass::ReservedOrdinary => {
                     debug_assert!(state.ordinary_in_flight != 0);
                     state.ordinary_in_flight = state.ordinary_in_flight.saturating_sub(1);
+                    release_control = state.ordinary_in_flight == 0
+                        && matches!(
+                            state.queue.front().map(|task| task.class),
+                            Some(QueueClass::Control)
+                        );
                 }
                 QueueClass::Control => {
                     debug_assert!(state.control_in_flight);
                     state.control_in_flight = false;
+                    release_control = false;
                 }
             }
             state.pending = state.pending.saturating_sub(1);
-            // A completed ordinary task may release the control at the head;
-            // a completed control releases every task queued behind it.
-            self.changed.notify_all();
+            if state.pending == 0 || class == QueueClass::Control {
+                // Draining workers must all observe an empty stopped pool. A
+                // completed control releases a concurrent ordinary prefix.
+                self.changed.notify_all();
+            } else if release_control {
+                // Only one worker may claim the newly runnable control.
+                self.changed.notify_one();
+            }
             if state.pending == 0 {
                 state.drain_waker.take()
             } else {
@@ -2505,6 +2517,58 @@ mod tests {
         assert!(control_started);
         assert!(!later_started_before_control);
         assert!(later_started);
+        executor.begin_drain().wait();
+        assert!(!executor.join());
+    }
+
+    #[test]
+    fn control_completion_wakes_the_concurrent_ordinary_prefix() {
+        let executor = AsyncExecutor::try_new(1, 8, 1, 3).unwrap();
+        let (control_release_tx, control_release_rx) = mpsc::channel();
+        let (control_started_tx, control_started_rx) = mpsc::channel();
+        let control = executor.submit_control(AsyncRequestOptions::default(), failure, move |_| {
+            control_started_tx.send(()).unwrap();
+            control_release_rx.recv().unwrap();
+            Ok(0)
+        });
+        control_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut requests = Vec::new();
+        for value in 1..=3 {
+            let gate = Arc::clone(&gate);
+            let started_tx = started_tx.clone();
+            requests.push(executor.submit_mutation(
+                AsyncRequestOptions::default(),
+                failure,
+                move |_| {
+                    started_tx.send(()).unwrap();
+                    let (released, changed) = &*gate;
+                    let mut released = lock_unpoisoned(released);
+                    while !*released {
+                        released = wait_unpoisoned(changed, released);
+                    }
+                    Ok(value)
+                },
+            ));
+        }
+
+        control_release_tx.send(()).unwrap();
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        {
+            let (released, changed) = &*gate;
+            *lock_unpoisoned(released) = true;
+            changed.notify_all();
+        }
+        assert_eq!(control.wait(), Ok(0));
+        for (request, expected) in requests.into_iter().zip(1..=3) {
+            assert_eq!(request.wait(), Ok(expected));
+        }
         executor.begin_drain().wait();
         assert!(!executor.join());
     }
