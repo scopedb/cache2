@@ -289,6 +289,8 @@ cache-bench hybrid \
   --write-mode write-back --write-back-queue-depth 128 \
   --write-back-workers 8 --write-back-memory 256MiB \
   --journal-capacity 64MiB --min-journal-rollovers 1 \
+  --warmup-secs 60 --steady-state-fill-turnovers 2 \
+  --steady-state-fill-max-secs 3600 \
   --min-capacity-turnovers 2 --min-disk-qd-peak 8 \
   --min-write-back-qd-peak 8 \
   --queue-depth 128 --engine uring --mode direct \
@@ -301,3 +303,7 @@ Its JSON always states `hardware_qualification=false`, requires external
 hardware sign-off, and leaves the target-NVMe, soak, power-loss, and thermal
 fields false. The line is one software scale-gate artifact, never an automatic
 production, endurance, or soak certification.
+The steady-state fill is a bounded pre-measure phase: it must observe both the
+requested physical turnover and one complete Region reuse cycle before
+latency/throughput samples are retained. `--min-capacity-turnovers`
+independently gates the subsequent measurement window.

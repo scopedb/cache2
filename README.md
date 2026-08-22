@@ -655,7 +655,8 @@ target/release/cache-bench hybrid \
   --write-mode write-back --write-back-queue-depth 128 \
   --write-back-workers 8 --write-back-memory 256MiB \
   --journal-capacity 64MiB --engine uring --mode direct \
-  --warmup-secs 60 --duration-secs 600 \
+  --warmup-secs 60 --steady-state-fill-turnovers 2 \
+  --steady-state-fill-max-secs 3600 --duration-secs 600 \
   --min-ops-per-sec <agreed-throughput> --max-p99-us <agreed-p99> \
   --min-hit-percent <agreed-hit-percent> \
   --min-capacity-turnovers 2 --min-disk-qd-peak 8 \
@@ -673,6 +674,16 @@ requires three empty paths plus `--yes`. JSON always records
 `hardware_qualification=false`, `target_nvme_matrix_passed=false`, and the
 external soak/power-loss/thermal fields as false: meeting the software gate is
 evidence for that run, not a substitute for the target-NVMe release matrix.
+
+`--steady-state-fill-turnovers 2` applies the same mixed temporal workload
+before latency/throughput accounting starts. It advances until pre-measure host
+writes reach two combined lower-tier capacities and the Region reuse count
+reaches the configured Region count (a complete reuse cycle), then drains
+the phase boundary and snapshots fresh measurement counters.
+`--steady-state-fill-max-secs` bounds this preparation; failure to reach either
+condition exits non-zero instead of publishing a fresh-cache
+result. `--min-capacity-turnovers` remains a separate requirement on the
+measurement window itself.
 
 For v1.1 production qualification, also retain the M6 TB-scale recovery SLA
 report, the M7 FIFO/second-chance and always/second-hit A/B results with the

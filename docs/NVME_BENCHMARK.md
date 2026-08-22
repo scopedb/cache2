@@ -266,7 +266,9 @@ target/release/cache-bench hybrid \
   --write-mode write-back --write-back-queue-depth 128 \
   --write-back-workers 8 --write-back-memory 256MiB \
   --journal-capacity 64MiB \
-  --engine uring --mode direct --warmup-secs 60 --duration-secs 600 \
+  --engine uring --mode direct --warmup-secs 60 \
+  --steady-state-fill-turnovers 2 --steady-state-fill-max-secs 3600 \
+  --duration-secs 600 \
   --min-ops-per-sec <agreed-throughput> \
   --max-p99-us <agreed-p99> \
   --min-hit-percent <agreed-hit-percent> \
@@ -315,8 +317,14 @@ offline `cachectl hybrid-verify` report. The gate fails on a stale per-key
 version, a missing Bucket or Region I/O submission, an insufficient QD peak,
 or (in write-back mode) no completed demotion. The configured rollover,
 rollover-latency, and close-latency thresholds are also enforced;
-`--min-capacity-turnovers` uses host bytes submitted after warmup through final
-drain, so prefill cannot satisfy the 2× measurement gate. A
+`--steady-state-fill-turnovers` runs the same workload before measurement until
+host writes since the pre-measure baseline reach the requested combined disk
+capacity multiple and the Region reuse count reaches the configured Region
+count, proving one complete reuse cycle. The fill has a separate bounded
+deadline and its latency samples are excluded from reported throughput and
+percentiles. After a drain boundary, `--min-capacity-turnovers`
+uses only host bytes submitted during measurement through final drain, so
+prefill and steady-state preparation cannot satisfy the measurement gate. A
 run that never reaches the Bucket tier, Region tier, and steady-state
 eviction/reclaim is not a mixed Hybrid qualification even if its aggregate
 throughput is high.

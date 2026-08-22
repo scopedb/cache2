@@ -26,6 +26,8 @@ const DEFAULT_CONCURRENCY: usize = 16;
 const DEFAULT_QUEUE_DEPTH: usize = 128;
 const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_WARMUP_SECS: u64 = 5;
+const DEFAULT_STEADY_STATE_FILL_MAX_SECS: u64 = 60 * 60;
+const STEADY_STATE_FILL_POLL_SECS: u64 = 10;
 const DEFAULT_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const DEFAULT_GENERATOR_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_VERIFY_SAMPLES: usize = 10_000;
@@ -134,6 +136,8 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         options.temporal_hot_read_percent,
     );
 
+    let premeasure_before = cache.cache().stats();
+    let premeasure_started = Instant::now();
     if !options.warmup.is_zero() {
         eprintln!(
             "cache-bench hybrid: warmup {:.3}s",
@@ -167,11 +171,93 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
                 warmup_phase.first_error.as_deref().unwrap_or("none")
             ));
         }
-        cache
-            .flush()
-            .map_err(|error| format!("warmup drain/flush failed: {error}"))?;
     }
+
+    let mut steady_state_fill_phase = Phase::default();
+    if options.steady_state_fill_turnovers > 0.0 {
+        let required_region_reuses = steady_state_required_region_reuses(&options);
+        eprintln!(
+            "cache-bench hybrid: filling to steady state {:.3}x physical turnover and {} Region reuses (max {:.3}s)",
+            options.steady_state_fill_turnovers,
+            required_region_reuses,
+            options.steady_state_fill_max.as_secs_f64(),
+        );
+        let deadline = Instant::now()
+            .checked_add(options.steady_state_fill_max)
+            .unwrap_or_else(Instant::now);
+        let mut round = 0_u64;
+        loop {
+            let progress = StatsDelta::between(premeasure_before, cache.cache().stats());
+            if steady_state_gate_ready(&options, &progress) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "steady-state fill timed out after {:.3}s: physical turnover {:.3}x/{:.3}x, Region reuse={}/{}",
+                    options.steady_state_fill_max.as_secs_f64(),
+                    capacity_turnovers_for(&options, progress.host_write_bytes),
+                    options.steady_state_fill_turnovers,
+                    progress.region_reuses,
+                    required_region_reuses,
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let duration = remaining.min(Duration::from_secs(STEADY_STATE_FILL_POLL_SECS));
+            eprintln!(
+                "cache-bench hybrid: steady-state fill {:.3}x/{:.3}x Region reuse={}/{} elapsed={:.1}s",
+                capacity_turnovers_for(&options, progress.host_write_bytes),
+                options.steady_state_fill_turnovers,
+                progress.region_reuses,
+                required_region_reuses,
+                steady_state_fill_phase.elapsed.as_secs_f64(),
+            );
+            let fill = run_phase(
+                &cache,
+                PhaseWorkload {
+                    keys: Arc::clone(&keys),
+                    states: Arc::clone(&states),
+                    mix: options.mix.clone(),
+                    read_percent: options.read_percent,
+                    remove_percent: options.remove_percent,
+                    ttl_percent: options.ttl_percent,
+                    cross_tier_percent: options.cross_tier_percent,
+                    small_object_max: options.small_object_max,
+                    ttl_ms: options.ttl_ms,
+                    concurrency: options.concurrency,
+                    duration,
+                    seed: options.seed ^ 0x1319_8a2e_0370_7344 ^ mix64(round),
+                    temporal: temporal.clone(),
+                },
+            )?;
+            if fill.errors != 0 || fill.stale_values != 0 || fill.rejected != 0 {
+                return Err(format!(
+                    "steady-state fill failed: errors={} stale={} rejected={} first_error={}",
+                    fill.errors,
+                    fill.stale_values,
+                    fill.rejected,
+                    fill.first_error.as_deref().unwrap_or("none")
+                ));
+            }
+            steady_state_fill_phase.merge_sequential(&fill);
+            round = round.saturating_add(1);
+        }
+    }
+    cache
+        .flush()
+        .map_err(|error| format!("pre-measure drain/flush failed: {error}"))?;
     let before = cache.cache().stats();
+    let premeasure_stats = StatsDelta::between(premeasure_before, before);
+    if !steady_state_gate_ready(&options, &premeasure_stats) {
+        return Err(format!(
+            "steady-state fill boundary did not satisfy its gate: physical turnover {:.3}x/{:.3}x, Region reuse={}/{}",
+            capacity_turnovers_for(&options, premeasure_stats.host_write_bytes),
+            options.steady_state_fill_turnovers,
+            premeasure_stats.region_reuses,
+            steady_state_required_region_reuses(&options),
+        ));
+    }
+    let premeasure_elapsed = premeasure_started.elapsed();
     eprintln!(
         "cache-bench hybrid: measuring {:.3}s concurrency={} Region/Bucket QD={}",
         options.duration.as_secs_f64(),
@@ -210,9 +296,12 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         phase,
         stats: StatsDelta::between(before, after),
         total_stats: StatsDelta::between(initial_stats, after),
+        premeasure_stats,
         final_stats: after,
         generator_planned_memory,
         prefill_elapsed,
+        premeasure_elapsed,
+        steady_state_fill_phase,
         drain,
     };
     match options.output {
@@ -564,6 +653,8 @@ struct Options {
     max_p99_us: Option<f64>,
     min_hit_percent: Option<f64>,
     min_journal_rollovers: u64,
+    steady_state_fill_turnovers: f64,
+    steady_state_fill_max: Duration,
     min_capacity_turnovers: f64,
     min_logical_keyspace_turnovers: f64,
     min_disk_qd_peak: u64,
@@ -625,6 +716,8 @@ impl Options {
         let mut max_p99_us = None;
         let mut min_hit_percent = None;
         let mut min_journal_rollovers = 0;
+        let mut steady_state_fill_turnovers = 0.0;
+        let mut steady_state_fill_max = Duration::from_secs(DEFAULT_STEADY_STATE_FILL_MAX_SECS);
         let mut min_capacity_turnovers = 0.0;
         let mut min_logical_keyspace_turnovers = 0.0;
         let mut min_disk_qd_peak = 1;
@@ -742,6 +835,12 @@ impl Options {
                 "--max-p99-us" => max_p99_us = Some(parse_positive(value, name)?),
                 "--min-hit-percent" => min_hit_percent = Some(parse_percent(value, name)?),
                 "--min-journal-rollovers" => min_journal_rollovers = parse_number(value, name)?,
+                "--steady-state-fill-turnovers" => {
+                    steady_state_fill_turnovers = parse_non_negative(value, name)?
+                }
+                "--steady-state-fill-max-secs" => {
+                    steady_state_fill_max = parse_duration(value, name, false)?
+                }
                 "--min-capacity-turnovers" => {
                     min_capacity_turnovers = parse_non_negative(value, name)?
                 }
@@ -913,6 +1012,8 @@ impl Options {
             max_p99_us,
             min_hit_percent,
             min_journal_rollovers,
+            steady_state_fill_turnovers,
+            steady_state_fill_max,
             min_capacity_turnovers,
             min_logical_keyspace_turnovers,
             min_disk_qd_peak,
@@ -2177,6 +2278,15 @@ impl Phase {
         self.historical_read_latency
             .merge(&other.historical_read_latency);
     }
+
+    fn merge_sequential(&mut self, other: &Self) {
+        if self.elapsed.is_zero() {
+            self.timeline_start = other.timeline_start;
+        }
+        self.merge(other);
+        self.elapsed = self.elapsed.saturating_add(other.elapsed);
+        self.timeline_end = other.timeline_end;
+    }
 }
 
 struct Histogram {
@@ -2259,8 +2369,11 @@ struct StatsDelta {
     bucket_io_errors: u64,
     region_bytes_read: u64,
     region_bytes_written: u64,
+    region_write_batches: u64,
+    region_records_coalesced: u64,
     region_io_submitted: u64,
     region_io_errors: u64,
+    region_reuses: u64,
     host_write_bytes: u64,
     admitted_value_bytes: u64,
     write_amplification_milli: u64,
@@ -2281,11 +2394,23 @@ struct StatsDelta {
     write_back_demoted_entries: u64,
     write_back_demoted_bytes: u64,
     write_back_demotion_failures: u64,
+    write_back_lower_absent_evictions: u64,
+    write_back_lower_candidate_evictions: u64,
+    write_back_synchronous_demotions: u64,
+    write_back_dropped_evictions: u64,
     write_back_proactive_scheduled: u64,
     write_back_proactive_skipped: u64,
     write_back_proactive_persisted: u64,
     write_back_proactive_rejected: u64,
     write_back_proactive_fatal: u64,
+    write_back_proactive_invalidated: u64,
+    write_back_pending_entries: u64,
+    write_back_pending_entries_peak: u64,
+    write_back_pending_bytes: u64,
+    write_back_pending_bytes_peak: u64,
+    write_back_pending_lookup_misses: u64,
+    write_back_pending_same_key_waits: u64,
+    write_back_pending_same_key_wait_ns: u64,
     write_back_queue_rejections: u64,
     write_back_worker_panics: u64,
     write_back_queue_peak: u64,
@@ -2328,6 +2453,14 @@ impl StatsDelta {
                 .region
                 .bytes_written
                 .saturating_sub(before.region.bytes_written),
+            region_write_batches: after
+                .region
+                .write_batches
+                .saturating_sub(before.region.write_batches),
+            region_records_coalesced: after
+                .region
+                .records_coalesced
+                .saturating_sub(before.region.records_coalesced),
             region_io_submitted: after
                 .region
                 .io_submitted
@@ -2336,6 +2469,10 @@ impl StatsDelta {
                 .region
                 .io_errors
                 .saturating_sub(before.region.io_errors),
+            region_reuses: after
+                .region
+                .regions_reused
+                .saturating_sub(before.region.regions_reused),
             host_write_bytes: after
                 .host_writes
                 .host_write_bytes
@@ -2406,6 +2543,22 @@ impl StatsDelta {
                 .write_back
                 .demotion_failures
                 .saturating_sub(before.write_back.demotion_failures),
+            write_back_lower_absent_evictions: after
+                .write_back
+                .lower_absent_evictions
+                .saturating_sub(before.write_back.lower_absent_evictions),
+            write_back_lower_candidate_evictions: after
+                .write_back
+                .lower_candidate_evictions
+                .saturating_sub(before.write_back.lower_candidate_evictions),
+            write_back_synchronous_demotions: after
+                .write_back
+                .synchronous_demotions
+                .saturating_sub(before.write_back.synchronous_demotions),
+            write_back_dropped_evictions: after
+                .write_back
+                .dropped_evictions
+                .saturating_sub(before.write_back.dropped_evictions),
             write_back_proactive_scheduled: after
                 .write_back
                 .proactive_scheduled
@@ -2426,6 +2579,26 @@ impl StatsDelta {
                 .write_back
                 .proactive_fatal
                 .saturating_sub(before.write_back.proactive_fatal),
+            write_back_proactive_invalidated: after
+                .write_back
+                .proactive_invalidated
+                .saturating_sub(before.write_back.proactive_invalidated),
+            write_back_pending_entries: after.write_back.pending_entries,
+            write_back_pending_entries_peak: after.write_back.pending_entries_peak,
+            write_back_pending_bytes: after.write_back.pending_bytes,
+            write_back_pending_bytes_peak: after.write_back.pending_bytes_peak,
+            write_back_pending_lookup_misses: after
+                .write_back
+                .pending_lookup_misses
+                .saturating_sub(before.write_back.pending_lookup_misses),
+            write_back_pending_same_key_waits: after
+                .write_back
+                .pending_same_key_waits
+                .saturating_sub(before.write_back.pending_same_key_waits),
+            write_back_pending_same_key_wait_ns: after
+                .write_back
+                .pending_same_key_wait_ns
+                .saturating_sub(before.write_back.pending_same_key_wait_ns),
             write_back_queue_rejections: after
                 .write_back
                 .queue_rejections
@@ -2439,14 +2612,39 @@ impl StatsDelta {
     }
 }
 
+fn capacity_turnovers_for(options: &Options, host_write_bytes: u64) -> f64 {
+    let capacity = options
+        .bucket_capacity
+        .saturating_add(options.region_capacity);
+    if capacity == 0 {
+        0.0
+    } else {
+        host_write_bytes as f64 / capacity as f64
+    }
+}
+
+fn steady_state_gate_ready(options: &Options, progress: &StatsDelta) -> bool {
+    options.steady_state_fill_turnovers == 0.0
+        || (capacity_turnovers_for(options, progress.host_write_bytes)
+            >= options.steady_state_fill_turnovers
+            && progress.region_reuses >= steady_state_required_region_reuses(options))
+}
+
+fn steady_state_required_region_reuses(options: &Options) -> u64 {
+    options.region_capacity.div_ceil(options.region_size).max(1)
+}
+
 struct Report<'a> {
     options: &'a Options,
     phase: Phase,
     stats: StatsDelta,
     total_stats: StatsDelta,
+    premeasure_stats: StatsDelta,
     final_stats: HybridCacheStats,
     generator_planned_memory: usize,
     prefill_elapsed: Duration,
+    premeasure_elapsed: Duration,
+    steady_state_fill_phase: Phase,
     drain: Duration,
 }
 
@@ -2521,31 +2719,27 @@ impl Report<'_> {
     }
 
     fn capacity_turnovers(&self) -> f64 {
-        let capacity = self
-            .options
-            .bucket_capacity
-            .saturating_add(self.options.region_capacity);
-        if capacity == 0 {
-            0.0
-        } else {
-            self.stats.host_write_bytes as f64 / capacity as f64
-        }
+        capacity_turnovers_for(self.options, self.stats.host_write_bytes)
     }
 
     fn total_capacity_turnovers(&self) -> f64 {
-        let capacity = self
-            .options
-            .bucket_capacity
-            .saturating_add(self.options.region_capacity);
-        if capacity == 0 {
-            0.0
-        } else {
-            self.total_stats.host_write_bytes as f64 / capacity as f64
-        }
+        capacity_turnovers_for(self.options, self.total_stats.host_write_bytes)
+    }
+
+    fn premeasure_capacity_turnovers(&self) -> f64 {
+        capacity_turnovers_for(self.options, self.premeasure_stats.host_write_bytes)
     }
 
     fn acceptance_failures(&self) -> Vec<String> {
         let mut failures = Vec::new();
+        if !steady_state_gate_ready(self.options, &self.premeasure_stats) {
+            failures.push(format!(
+                "steady-state pre-measure gate {:.3}x/{:.3}x with {} Region reuses",
+                self.premeasure_capacity_turnovers(),
+                self.options.steady_state_fill_turnovers,
+                self.premeasure_stats.region_reuses
+            ));
+        }
         if self.phase.errors != 0 {
             failures.push(format!("{} correctness/I/O errors", self.phase.errors));
         }
@@ -2704,7 +2898,7 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 3);
+        number_field!("schema_version", 4);
         string_field!("cache", "hybrid");
         raw_field!("hardware_qualification", false);
         raw_field!("external_hardware_signoff_required", true);
@@ -2778,6 +2972,39 @@ impl Report<'_> {
         number_field!("write_back_workers", self.options.write_back_workers);
         number_field!("write_back_memory_bytes", self.options.write_back_memory);
         number_field!("prefill_seconds", self.prefill_elapsed.as_secs_f64());
+        number_field!(
+            "steady_state_fill_target_turnovers",
+            self.options.steady_state_fill_turnovers
+        );
+        number_field!(
+            "steady_state_fill_max_seconds",
+            self.options.steady_state_fill_max.as_secs_f64()
+        );
+        number_field!(
+            "steady_state_fill_seconds",
+            self.steady_state_fill_phase.elapsed.as_secs_f64()
+        );
+        number_field!(
+            "steady_state_fill_operations",
+            self.steady_state_fill_phase.operations()
+        );
+        number_field!("premeasure_seconds", self.premeasure_elapsed.as_secs_f64());
+        number_field!(
+            "premeasure_host_write_bytes",
+            self.premeasure_stats.host_write_bytes
+        );
+        number_field!(
+            "premeasure_capacity_turnovers",
+            self.premeasure_capacity_turnovers()
+        );
+        number_field!(
+            "premeasure_region_reuses",
+            self.premeasure_stats.region_reuses
+        );
+        raw_field!(
+            "steady_state_gate_passed",
+            steady_state_gate_ready(self.options, &self.premeasure_stats)
+        );
         number_field!("elapsed_seconds", self.phase.elapsed.as_secs_f64());
         number_field!("operations", self.phase.operations());
         number_field!("operations_per_second", self.ops_per_sec());
@@ -2902,6 +3129,12 @@ impl Report<'_> {
         number_field!("bucket_bytes_written", self.stats.bucket_bytes_written);
         number_field!("region_bytes_read", self.stats.region_bytes_read);
         number_field!("region_bytes_written", self.stats.region_bytes_written);
+        number_field!("region_write_batches", self.stats.region_write_batches);
+        number_field!(
+            "region_records_coalesced",
+            self.stats.region_records_coalesced
+        );
+        number_field!("region_reuses", self.stats.region_reuses);
         number_field!("host_write_bytes", self.stats.host_write_bytes);
         number_field!("admitted_value_bytes", self.stats.admitted_value_bytes);
         number_field!("admitted_disk_turnovers", self.admitted_disk_turnovers());
@@ -2929,6 +3162,22 @@ impl Report<'_> {
             self.stats.write_back_demotion_failures
         );
         number_field!(
+            "write_back_lower_absent_evictions",
+            self.stats.write_back_lower_absent_evictions
+        );
+        number_field!(
+            "write_back_lower_candidate_evictions",
+            self.stats.write_back_lower_candidate_evictions
+        );
+        number_field!(
+            "write_back_synchronous_demotions",
+            self.stats.write_back_synchronous_demotions
+        );
+        number_field!(
+            "write_back_dropped_evictions",
+            self.stats.write_back_dropped_evictions
+        );
+        number_field!(
             "write_back_proactive_scheduled",
             self.stats.write_back_proactive_scheduled
         );
@@ -2947,6 +3196,38 @@ impl Report<'_> {
         number_field!(
             "write_back_proactive_fatal",
             self.stats.write_back_proactive_fatal
+        );
+        number_field!(
+            "write_back_proactive_invalidated",
+            self.stats.write_back_proactive_invalidated
+        );
+        number_field!(
+            "write_back_pending_entries",
+            self.stats.write_back_pending_entries
+        );
+        number_field!(
+            "write_back_pending_entries_peak",
+            self.stats.write_back_pending_entries_peak
+        );
+        number_field!(
+            "write_back_pending_bytes",
+            self.stats.write_back_pending_bytes
+        );
+        number_field!(
+            "write_back_pending_bytes_peak",
+            self.stats.write_back_pending_bytes_peak
+        );
+        number_field!(
+            "write_back_pending_lookup_misses",
+            self.stats.write_back_pending_lookup_misses
+        );
+        number_field!(
+            "write_back_pending_same_key_waits",
+            self.stats.write_back_pending_same_key_waits
+        );
+        number_field!(
+            "write_back_pending_same_key_wait_ns",
+            self.stats.write_back_pending_same_key_wait_ns
         );
         number_field!(
             "write_back_queue_rejections",
@@ -2970,6 +3251,7 @@ impl Report<'_> {
         );
         number_field!("total_bucket_io_errors", self.total_stats.bucket_io_errors);
         number_field!("total_region_io_errors", self.total_stats.region_io_errors);
+        number_field!("total_region_reuses", self.total_stats.region_reuses);
         number_field!("total_bucket_io_qd_peak", self.total_stats.bucket_io_peak);
         number_field!("total_region_io_qd_peak", self.total_stats.region_io_peak);
         number_field!(
@@ -3042,6 +3324,10 @@ impl Report<'_> {
         );
         number_field!("min_journal_rollovers", self.options.min_journal_rollovers);
         number_field!(
+            "steady_state_fill_turnovers",
+            self.options.steady_state_fill_turnovers
+        );
+        number_field!(
             "min_capacity_turnovers",
             self.options.min_capacity_turnovers
         );
@@ -3083,6 +3369,24 @@ impl Report<'_> {
             output,
             "# TYPE cache_rs_hybrid_bench_capacity_turnovers gauge\ncache_rs_hybrid_bench_capacity_turnovers {:.6}",
             self.capacity_turnovers()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_premeasure_capacity_turnovers gauge\ncache_rs_hybrid_bench_premeasure_capacity_turnovers {:.6}",
+            self.premeasure_capacity_turnovers()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_premeasure_region_reuses gauge\ncache_rs_hybrid_bench_premeasure_region_reuses {}",
+            self.premeasure_stats.region_reuses
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_steady_state_gate_passed gauge\ncache_rs_hybrid_bench_steady_state_gate_passed {}",
+            u8::from(steady_state_gate_ready(self.options, &self.premeasure_stats))
         )
         .expect("writing OpenMetrics into a String cannot fail");
         writeln!(
@@ -3139,6 +3443,19 @@ impl Report<'_> {
             "  prefill workers/time:   {} / {:.3}s",
             self.options.prefill_concurrency,
             self.prefill_elapsed.as_secs_f64()
+        );
+        println!(
+            "  premeasure fill/gate:    {:.3}s + {:.3}s / {:.3}x target, {:.3}x observed, Region reuse={} ({})",
+            self.options.warmup.as_secs_f64(),
+            self.steady_state_fill_phase.elapsed.as_secs_f64(),
+            self.options.steady_state_fill_turnovers,
+            self.premeasure_capacity_turnovers(),
+            self.premeasure_stats.region_reuses,
+            if steady_state_gate_ready(self.options, &self.premeasure_stats) {
+                "pass"
+            } else {
+                "FAIL"
+            }
         );
         println!(
             "  read/concurrency/QD/BP:  {}% / {} / {} / {}",
@@ -3245,6 +3562,37 @@ impl Report<'_> {
             self.stats.write_back_proactive_fatal
         );
         println!(
+            "  eviction absent/candidate/sync/drop: {}/{}/{}/{}",
+            self.stats.write_back_lower_absent_evictions,
+            self.stats.write_back_lower_candidate_evictions,
+            self.stats.write_back_synchronous_demotions,
+            self.stats.write_back_dropped_evictions
+        );
+        println!(
+            "  pending current/peak/masked/waits: {}/{} entries; {} misses; {} waits ({:.3} ms)",
+            self.stats.write_back_pending_entries,
+            self.stats.write_back_pending_entries_peak,
+            self.stats.write_back_pending_lookup_misses,
+            self.stats.write_back_pending_same_key_waits,
+            self.stats.write_back_pending_same_key_wait_ns as f64 / 1_000_000.0
+        );
+        let region_records = self
+            .stats
+            .region_write_batches
+            .saturating_add(self.stats.region_records_coalesced);
+        println!(
+            "  Region batches/records/avg: {}/{} / {:.1} KiB per write",
+            self.stats.region_write_batches,
+            region_records,
+            if self.stats.region_write_batches == 0 {
+                0.0
+            } else {
+                self.stats.region_bytes_written as f64
+                    / self.stats.region_write_batches as f64
+                    / 1024.0
+            }
+        );
+        println!(
             "  total WB demotion/QD:    {} entries / {}",
             self.total_stats.write_back_demoted_entries, self.total_stats.write_back_queue_peak
         );
@@ -3261,6 +3609,10 @@ impl Report<'_> {
             "  physical measured/total: {:.3}x / {:.3}x",
             self.capacity_turnovers(),
             self.total_capacity_turnovers()
+        );
+        println!(
+            "  Region reuse measure/total: {} / {}",
+            self.stats.region_reuses, self.total_stats.region_reuses
         );
         println!(
             "  logical/admitted turn:   {:.3}x / {:.3}x",
@@ -3550,6 +3902,10 @@ Workload:
   --queue-depth 1..4096      Both lower I/O queue bounds (default 128)
   --backpressure block|reject Bounded saturation policy (default block)
   --warmup-secs SECONDS      0..86400 (default 5)
+  --steady-state-fill-turnovers N Continue the workload before measurement until
+                             pre-measure host writes / disk capacity reach N and
+                             at least one Region reuse is observed (default 0/off)
+  --steady-state-fill-max-secs S Maximum added fill time (default 3600)
   --duration-secs SECONDS    >0..86400 (default 30)
 
 Engine/layout:
@@ -3574,7 +3930,7 @@ Output/gates:
   --max-p99-us N
   --min-hit-percent N
   --min-journal-rollovers N  Require journal rollover activity
-  --min-capacity-turnovers N Require post-warmup host writes / disk capacity (use 2 for scale)
+  --min-capacity-turnovers N Require measured host writes / disk capacity
   --min-logical-keyspace-turnovers N Require temporal write-head advances / key count
   --min-disk-qd-peak N       Required on both Bucket and Region (default 1)
   --min-write-back-qd-peak N Required for write-back runs (default 1)
@@ -3584,7 +3940,8 @@ Output/gates:
 Temporal mode treats the key population as a ring: successful put classes advance
 a shared write head while reads select the recent or historical generation window.
 All outputs record version-stale checks, age-window/tier hits, logical and physical
-turnover, disk-tier I/O, write-back demotion/QD, journal rollover/max latency, and
+turnover, pre-measure steady-state gate/Region reuse, disk-tier I/O,
+write-back demotion/QD, journal rollover/max latency, and
 drain/close latency. JSON
 deliberately records hardware_qualification=false and every external hardware
 sign-off field false. A passing run is not NVMe soak, thermal, DWPD, power-loss,
@@ -3685,6 +4042,8 @@ mod tests {
             "--temporal-window-percent=2",
             "--temporal-hot-read-percent=85",
             "--backpressure=block",
+            "--steady-state-fill-turnovers=2",
+            "--steady-state-fill-max-secs=900",
             "--min-logical-keyspace-turnovers=1.5",
             "--yes",
         ];
@@ -3697,6 +4056,8 @@ mod tests {
         assert_eq!(options.temporal_window_percent, 2);
         assert_eq!(options.temporal_hot_read_percent, 85);
         assert_eq!(options.backpressure, Backpressure::Block);
+        assert_eq!(options.steady_state_fill_turnovers, 2.0);
+        assert_eq!(options.steady_state_fill_max, Duration::from_secs(900));
         assert_eq!(options.min_logical_keyspace_turnovers, 1.5);
 
         let uniform = base
@@ -3705,6 +4066,61 @@ mod tests {
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>();
         assert!(Options::parse(uniform).is_err());
+    }
+
+    #[test]
+    fn steady_state_gate_requires_physical_turnover_and_region_reuse() {
+        let arguments = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=16KiB",
+            "--region-path=region",
+            "--region-capacity=96MiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--steady-state-fill-turnovers=2",
+            "--yes",
+        ];
+        let ParseOutcome::Run(options) =
+            Options::parse(arguments.iter().map(|value| (*value).to_owned())).unwrap()
+        else {
+            panic!("expected runnable options");
+        };
+        let capacity = options
+            .bucket_capacity
+            .saturating_add(options.region_capacity);
+        assert!(!steady_state_gate_ready(
+            &options,
+            &StatsDelta {
+                host_write_bytes: capacity.saturating_mul(2),
+                ..StatsDelta::default()
+            }
+        ));
+        assert!(!steady_state_gate_ready(
+            &options,
+            &StatsDelta {
+                host_write_bytes: capacity,
+                region_reuses: steady_state_required_region_reuses(&options),
+                ..StatsDelta::default()
+            }
+        ));
+        let required_reuses = steady_state_required_region_reuses(&options);
+        assert_eq!(required_reuses, 3);
+        assert!(!steady_state_gate_ready(
+            &options,
+            &StatsDelta {
+                host_write_bytes: capacity.saturating_mul(2),
+                region_reuses: required_reuses - 1,
+                ..StatsDelta::default()
+            }
+        ));
+        assert!(steady_state_gate_ready(
+            &options,
+            &StatsDelta {
+                host_write_bytes: capacity.saturating_mul(2),
+                region_reuses: required_reuses,
+                ..StatsDelta::default()
+            }
+        ));
     }
 
     #[test]
@@ -3753,6 +4169,7 @@ mod tests {
             "--memory-capacity=1MiB",
             "--write-mode=write-back",
             "--min-journal-rollovers=1",
+            "--steady-state-fill-turnovers=2",
             "--min-capacity-turnovers=2",
             "--min-disk-qd-peak=2",
             "--min-write-back-qd-peak=2",
@@ -3770,6 +4187,11 @@ mod tests {
             .saturating_add(options.region_capacity);
         let measured = StatsDelta {
             host_write_bytes: capacity.saturating_mul(2),
+            ..StatsDelta::default()
+        };
+        let qualifying_premeasure = StatsDelta {
+            host_write_bytes: capacity.saturating_mul(2),
+            region_reuses: steady_state_required_region_reuses(&options),
             ..StatsDelta::default()
         };
         let qualifying_total = StatsDelta {
@@ -3795,9 +4217,12 @@ mod tests {
             phase,
             stats: measured,
             total_stats: qualifying_total,
+            premeasure_stats: qualifying_premeasure,
             final_stats: HybridCacheStats::default(),
             generator_planned_memory: 1,
             prefill_elapsed: Duration::ZERO,
+            premeasure_elapsed: Duration::ZERO,
+            steady_state_fill_phase: Phase::default(),
             drain: Duration::from_millis(1),
         };
         assert!(report.acceptance_failures().is_empty());
@@ -3810,6 +4235,8 @@ mod tests {
         assert!(json.contains("\"bucket_read_latency_p99_us\":22"));
         assert!(json.contains("\"region_read_latency_p99_us\":33"));
         assert!(json.contains("\"miss_read_latency_p99_us\":44"));
+        assert!(json.contains("\"steady_state_gate_passed\":true"));
+        assert!(json.contains("\"premeasure_capacity_turnovers\":2"));
 
         let failed = Report {
             options: &options,
@@ -3822,15 +4249,19 @@ mod tests {
                 bucket_io_submitted: 0,
                 ..qualifying_total
             },
+            premeasure_stats: StatsDelta::default(),
             final_stats: HybridCacheStats::default(),
             generator_planned_memory: 1,
             prefill_elapsed: Duration::ZERO,
+            premeasure_elapsed: Duration::ZERO,
+            steady_state_fill_phase: Phase::default(),
             drain: Duration::from_millis(20),
         };
         let failures = failed.acceptance_failures().join("; ");
         assert!(failures.contains("stale or corrupt"));
         assert!(failures.contains("both disk tiers"));
         assert!(failures.contains("drain/close"));
+        assert!(failures.contains("steady-state pre-measure gate"));
     }
 
     #[test]

@@ -6,11 +6,13 @@ Date: 2026-08-23
 
 The 12 GiB Bucket + 88 GiB Region + 8 GiB L1 configuration completed a
 120-second mixed-size temporal run with no request error, rejection, stale
-read, deadlock, or worker panic. Steady-state Hybrid mutations issued no route
+read, deadlock, or worker panic. Normal Hybrid mutations issued no route
 journal record and no durability sync.
 
 This is a local software scale result on the internal APFS SSD with buffered
 I/O. It is not target-NVMe, power-loss, thermal, or production sign-off.
+It is also a fresh-cache throughput result: total physical turnover was only
+0.349x and no complete Region-reuse cycle was required before measurement.
 
 | Metric | Previous 120 s check | Performance-first run |
 | --- | ---: | ---: |
@@ -102,8 +104,23 @@ Release-mode `cachectl hybrid-verify` passed the closed files:
 ## Remaining gates
 
 The next architecture work should target the 31.2-second close/checkpoint, the
-9.95-second maximum request tail, and the coarse 65,536-way detached-version
-table, whose collisions deliberately convert some background writes to misses.
+9.95-second maximum request tail, and a true Active Region write buffer. The
+coarse 65,536-way detached-version table from this recorded run has since been
+replaced by a bounded exact-key pending directory.
 Target Linux NVMe qualification still requires `io_uring`, `O_DIRECT`, at least
 one complete Region reuse cycle, device latency/utilization telemetry, and a
 long soak.
+
+The next comparable 100 GiB run must add:
+
+```text
+--steady-state-fill-turnovers 2 --steady-state-fill-max-secs 3600
+```
+
+The CLI will apply the same temporal mixed workload before measurement, require
+both 2x combined lower-tier host-write turnover and a reuse count equal to the
+configured Region count, drain the phase boundary, and only then reset the
+measurement baseline. The
+JSON report records pre-measure time, operations, host bytes, turnover, Region
+reuse, and `steady_state_gate_passed`; a timeout exits non-zero without
+publishing a misleading steady-state result.
