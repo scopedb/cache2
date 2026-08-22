@@ -1,4 +1,4 @@
-# 10 GiB temporal Hybrid remove-lane A/B
+# 10 GiB temporal Hybrid remove-concurrency A/B
 
 Date: 2026-08-23
 
@@ -11,18 +11,20 @@ the command to one of four append lanes. Explicit removes and Hybrid
 cross-tier cleanup therefore serialized even when their keys belonged to
 different lanes.
 
-The candidate sizes the reserved control permits to `append_lanes` and keeps
-two bounded scratch buffers per admitted control request. The existing shared
-operation barrier remains held for the complete remove, so `flush`, `clear`,
-and `close` retain exclusive fencing semantics. Memory allocation remains
-subject to the configured `MemoryTracker` hard limit.
+The candidate sizes one shared control gate to `append_lanes` permits and keeps
+two bounded scratch buffers per admitted control request. It does not yet bind
+those permits to individual lanes; the later true-wait benchmark identifies
+that remaining head-of-line blocking. The existing shared operation barrier
+remains held for the complete remove, so `flush`, `clear`, and `close` retain
+exclusive fencing semantics. Memory allocation remains subject to the
+configured `MemoryTracker` hard limit.
 
 With identical workload and cache parameters, the observed throughput rose by
 27.1%, aggregate Region backpressure wait fell by 93.8%, overall p99 fell by
 35.7%, and write/remove p99 fell by 53.3%. Both runs passed their software
 acceptance gates with zero errors, rejections, or stale values.
 
-| Metric | Global control permit | Per-lane control permits | Change |
+| Metric | One shared permit | Four shared permits | Change |
 | --- | ---: | ---: | ---: |
 | Operations | 5,338,049 | 6,786,985 | +27.1% |
 | Throughput | 44,482.9 ops/s | 56,557.4 ops/s | +27.1% |

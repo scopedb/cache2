@@ -581,6 +581,50 @@ fn different_append_lanes_remove_concurrently_and_recover_tombstones() {
 }
 
 #[test]
+fn lane_affine_remove_admission_does_not_block_an_idle_lane() {
+    let file = TestFile::new("lane-affine-remove-admission");
+    let config = multi_lane_config(&file.0);
+    let key_for_lane = |target| {
+        (0_u64..10_000)
+            .map(fixed_key)
+            .find(|key| hash_key(config.hash_seed, key) as usize % config.append_lanes == target)
+            .expect("test must find a key for each append lane")
+    };
+    let lane_zero_key = key_for_lane(0);
+    let lane_one_key = key_for_lane(1);
+    let cache = config.open().unwrap();
+    assert_eq!(
+        cache
+            .put(&lane_zero_key, b"zero", PutOptions::default())
+            .unwrap(),
+        PutOutcome::Stored
+    );
+    assert_eq!(
+        cache
+            .put(&lane_one_key, b"one", PutOptions::default())
+            .unwrap(),
+        PutOutcome::Stored
+    );
+
+    let held_lane_zero = cache.inner.resources.begin_remove(0).unwrap();
+    assert!(matches!(
+        cache.remove(&lane_zero_key),
+        Err(CacheError::Overloaded(OverloadReason::WriteQueueFull))
+    ));
+    assert_eq!(
+        cache.remove(&lane_one_key).unwrap(),
+        RemoveOutcome::Removed,
+        "an occupied lane must not consume another lane's control permit"
+    );
+    drop(held_lane_zero);
+    assert_eq!(
+        cache.remove(&lane_zero_key).unwrap(),
+        RemoveOutcome::Removed
+    );
+    cache.close().unwrap();
+}
+
+#[test]
 fn one_append_lane_coalesces_queued_small_records_and_recovers_them() {
     const PUTS: usize = 6;
 

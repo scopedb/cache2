@@ -155,7 +155,8 @@ request delivers its real completion after the dirty fence and cleanup finish.
 - committed Format V1 golden fixtures and explicit rejection of unsupported or
   unrecognized non-empty formats without modifying them;
 - an observable `Healthy` / `MissOnly` / `Poisoned` / `Closed` runtime state;
-- independent bounded read, write, and reserved control admission gates;
+- independent bounded read/write gates and one reserved control permit per
+  append lane, preventing same-lane work from occupying another lane's slot;
 - dynamically sized, lazily allocated 4 KiB-aligned data-buffer pools, capped
   at 128 read and 128 write slots, plus fixed control and metadata reserves;
 - Linux `MAP_SHARED | MAP_ANONYMOUS` mappings for aligned buffers, with both
@@ -423,7 +424,7 @@ original I/O error; later mutations fail consistently.
 | `max_value_size` | Runtime `put` admission only; may change. Old values remain readable/removable. |
 | `memory_budget_bytes` | Runtime-only logical engine-memory cap, default 1 GiB; open fails before touching the path if the complete resource plan cannot fit. |
 | `append_lanes` | Persistent clean-checkpoint layout; 1–8, default 1, and must match on reopen. Each lane owns an Active Region. |
-| read/write submission depths | Runtime-only; each must be 1–65,536 and defaults to 2/2. Data-buffer slots scale from these depths, capped at 128 per class; control admission has a separate fixed one-slot reserve. |
+| read/write submission depths | Runtime-only; each must be 1–65,536 and defaults to 2/2. Data-buffer slots scale from these depths, capped at 128 per class; control admission reserves one permit and two buffers per append lane. |
 | I/O engine | Runtime-only `Sync`, `Auto`, or required `IoUring`; does not change Format V1. |
 | I/O mode | Runtime-only `Buffered`, `Auto`, or required-capability `Direct`; may change on reopen without changing Format V1. |
 | I/O queue depth | Runtime-only, hard limited to 1–4,096; default 128. |
