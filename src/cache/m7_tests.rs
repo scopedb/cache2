@@ -1156,3 +1156,31 @@ fn second_chance_background_reclaim_prepares_the_strict_fifo_victim() {
 fn fifo_background_reclaim_prepares_a_victim_before_rotation() {
     assert_background_reclaim_prepares_fifo_victim("fifo-background-reclaim", ReclaimMode::Fifo);
 }
+
+#[test]
+fn minimum_fifo_layout_keeps_its_only_victim_on_the_synchronous_path() {
+    let file = TestFile::new("minimum-fifo-background-reserve");
+    let config = CacheConfig::new(&file.0, DATA_OFFSET + 2 * 16 * 1024)
+        .with_region_size(16 * 1024)
+        .with_index_slots(64)
+        .with_max_key_size(64)
+        .with_max_value_size(2 * 1024)
+        .with_submission_queue_depths(2, 2)
+        .with_checkpoint_interval_bytes(0);
+    let cache = config.clone().open().unwrap();
+    let value = vec![b'x'; 1536];
+    for index in 0..24 {
+        cache
+            .put(format!("key-{index:02}"), &value, PutOptions::default())
+            .unwrap();
+    }
+    let stats = cache.stats();
+    assert!(stats.regions_reused > 0);
+    assert_eq!(stats.background_regions_reclaimed, 0);
+    assert_eq!(stats.reclaim_backlog_rejections, 0);
+    cache.close().unwrap();
+
+    let reopened = config.open().unwrap();
+    assert_eq!(reopened.get(b"key-23").unwrap(), Some(value));
+    reopened.close().unwrap();
+}
