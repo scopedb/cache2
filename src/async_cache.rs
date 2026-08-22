@@ -452,10 +452,7 @@ impl<T> RequestCore<T> {
         let mut queued_in = lock_unpoisoned(&self.queued_in);
         if self.phase.load(Ordering::Acquire) == PHASE_QUEUED {
             *queued_in = Some(Arc::downgrade(pool));
-            return;
         }
-        drop(queued_in);
-        pool.remove_cancelled();
     }
 
     fn remove_from_queue(&self) {
@@ -563,7 +560,6 @@ struct PoolInner {
 
 impl PoolInner {
     fn try_reserve(self: &Arc<Self>, class: QueueClass) -> Result<QueueReservation, AsyncFailure> {
-        self.remove_cancelled();
         let mut state = lock_unpoisoned(&self.state);
         if !state.accepting {
             return Err(AsyncFailure::Closed);
