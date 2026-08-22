@@ -4406,32 +4406,54 @@ mod tests {
 
     #[test]
     fn stats_delta_preserves_every_wait_path_as_a_counter() {
-        let mut before = HybridCacheStats::default();
-        before.request_wait_ns = 10;
-        before.write_back.queue_submitted = 10;
-        before.write_back.queue_completed = 10;
-        before.write_back.queue_wait_ns = 10;
-        before.bucket.io_completed = 10;
-        before.bucket.io_submit_wait_ns = 10;
-        before.bucket.io_completion_ns = 10;
-        before.bucket.page_buffer_wait_ns = 10;
-        before.region.backpressure_wait_ns = 10;
-        before.region.io_completed = 10;
-        before.region.io_submit_wait_ns = 10;
-        before.region.io_completion_ns = 10;
-        let mut after = before;
-        after.request_wait_ns = 17;
-        after.write_back.queue_submitted = 17;
-        after.write_back.queue_completed = 17;
-        after.write_back.queue_wait_ns = 17;
-        after.bucket.io_completed = 17;
-        after.bucket.io_submit_wait_ns = 17;
-        after.bucket.io_completion_ns = 17;
-        after.bucket.page_buffer_wait_ns = 17;
-        after.region.backpressure_wait_ns = 17;
-        after.region.io_completed = 17;
-        after.region.io_submit_wait_ns = 17;
-        after.region.io_completion_ns = 17;
+        let before = HybridCacheStats {
+            request_wait_ns: 10,
+            write_back: cache_rs::HybridWriteBackStats {
+                queue_submitted: 10,
+                queue_completed: 10,
+                queue_wait_ns: 10,
+                ..cache_rs::HybridWriteBackStats::default()
+            },
+            bucket: cache_rs::BucketCacheStats {
+                io_completed: 10,
+                io_submit_wait_ns: 10,
+                io_completion_ns: 10,
+                page_buffer_wait_ns: 10,
+                ..cache_rs::BucketCacheStats::default()
+            },
+            region: cache_rs::CacheStats {
+                backpressure_wait_ns: 10,
+                io_completed: 10,
+                io_submit_wait_ns: 10,
+                io_completion_ns: 10,
+                ..cache_rs::CacheStats::default()
+            },
+            ..HybridCacheStats::default()
+        };
+        let after = HybridCacheStats {
+            request_wait_ns: 17,
+            write_back: cache_rs::HybridWriteBackStats {
+                queue_submitted: 17,
+                queue_completed: 17,
+                queue_wait_ns: 17,
+                ..before.write_back
+            },
+            bucket: cache_rs::BucketCacheStats {
+                io_completed: 17,
+                io_submit_wait_ns: 17,
+                io_completion_ns: 17,
+                page_buffer_wait_ns: 17,
+                ..before.bucket
+            },
+            region: cache_rs::CacheStats {
+                backpressure_wait_ns: 17,
+                io_completed: 17,
+                io_submit_wait_ns: 17,
+                io_completion_ns: 17,
+                ..before.region
+            },
+            ..before
+        };
 
         let delta = StatsDelta::between(before, after);
         assert_eq!(delta.request_wait_ns, 7);
