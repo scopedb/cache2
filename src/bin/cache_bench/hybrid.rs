@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cache_rs::{
     AsyncHybridCache, BackpressurePolicy, BucketCacheConfig, CacheConfig, CacheError, CacheTier,
     HybridCache, HybridCacheConfig, HybridCacheStats, HybridLookupOutcome, HybridWriteMode,
-    IoEngineKind, IoMode, PutOptions, PutOutcome, RemoveOutcome,
+    IoEngineKind, IoMode, PutOptions, PutOutcome, RejectReason, RemoveOutcome,
 };
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
@@ -74,6 +74,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         diagnostics.bucket.file_len_bytes,
         diagnostics.region.data_file_len_bytes
     );
+    let required_region_reuses = u64::from(diagnostics.region.region_count);
     let keys = Arc::new(KeySpace::new(options.keys, options.seed));
     let states = Arc::new(KeyStateTable::try_new(
         options.keys,
@@ -164,18 +165,19 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         if warmup_phase.errors != 0 || warmup_phase.stale_values != 0 || warmup_phase.rejected != 0
         {
             return Err(format!(
-                "warmup failed: errors={} stale={} rejected={} first_error={}",
+                "warmup failed: errors={} stale={} rejected={} first_rejection={:?} first_error={} {}",
                 warmup_phase.errors,
                 warmup_phase.stale_values,
                 warmup_phase.rejected,
-                warmup_phase.first_error.as_deref().unwrap_or("none")
+                warmup_phase.first_rejection,
+                warmup_phase.first_error.as_deref().unwrap_or("none"),
+                overload_diagnostics(&cache),
             ));
         }
     }
 
     let mut steady_state_fill_phase = Phase::default();
     if options.steady_state_fill_turnovers > 0.0 {
-        let required_region_reuses = steady_state_required_region_reuses(&options);
         eprintln!(
             "cache-bench hybrid: filling to steady state {:.3}x physical turnover and {} Region reuses (max {:.3}s)",
             options.steady_state_fill_turnovers,
@@ -188,7 +190,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         let mut round = 0_u64;
         loop {
             let progress = StatsDelta::between(premeasure_before, cache.cache().stats());
-            if steady_state_gate_ready(&options, &progress) {
+            if steady_state_gate_ready(&options, &progress, required_region_reuses) {
                 break;
             }
             let now = Instant::now();
@@ -232,11 +234,13 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
             )?;
             if fill.errors != 0 || fill.stale_values != 0 || fill.rejected != 0 {
                 return Err(format!(
-                    "steady-state fill failed: errors={} stale={} rejected={} first_error={}",
+                    "steady-state fill failed: errors={} stale={} rejected={} first_rejection={:?} first_error={} {}",
                     fill.errors,
                     fill.stale_values,
                     fill.rejected,
-                    fill.first_error.as_deref().unwrap_or("none")
+                    fill.first_rejection,
+                    fill.first_error.as_deref().unwrap_or("none"),
+                    overload_diagnostics(&cache),
                 ));
             }
             steady_state_fill_phase.merge_sequential(&fill);
@@ -248,13 +252,13 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         .map_err(|error| format!("pre-measure drain/flush failed: {error}"))?;
     let before = cache.cache().stats();
     let premeasure_stats = StatsDelta::between(premeasure_before, before);
-    if !steady_state_gate_ready(&options, &premeasure_stats) {
+    if !steady_state_gate_ready(&options, &premeasure_stats, required_region_reuses) {
         return Err(format!(
             "steady-state fill boundary did not satisfy its gate: physical turnover {:.3}x/{:.3}x, Region reuse={}/{}",
             capacity_turnovers_for(&options, premeasure_stats.host_write_bytes),
             options.steady_state_fill_turnovers,
             premeasure_stats.region_reuses,
-            steady_state_required_region_reuses(&options),
+            required_region_reuses,
         ));
     }
     let premeasure_elapsed = premeasure_started.elapsed();
@@ -304,6 +308,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         prefill_elapsed,
         premeasure_elapsed,
         steady_state_fill_phase,
+        required_region_reuses,
         drain,
     };
     match options.output {
@@ -317,6 +322,27 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     } else {
         Err(format!("acceptance failed: {}", failures.join("; ")))
     }
+}
+
+fn overload_diagnostics(cache: &BenchCache) -> String {
+    let stats = cache.cache().stats();
+    format!(
+        "request_rejections={} memory={}/{} write_back_failures={} lower_candidates={} skipped={} queue={}/{}/{} write_back_memory={}/{}/{} Bucket_buffer_rejections={} Region_rejected={}",
+        stats.request_rejections,
+        stats.memory_charged_bytes,
+        stats.memory_capacity_bytes,
+        stats.write_back.demotion_failures,
+        stats.write_back.lower_candidate_evictions,
+        stats.write_back.proactive_skipped,
+        stats.write_back.queue_in_flight,
+        stats.write_back.queue_in_flight_peak,
+        stats.write_back.queue_capacity,
+        stats.write_back.memory_in_use_bytes,
+        stats.write_back.memory_peak_bytes,
+        stats.write_back.memory_capacity_bytes,
+        stats.bucket.page_buffer_rejections,
+        stats.region.rejected,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2090,8 +2116,8 @@ fn perform_put(
             phase.write_bytes = phase.write_bytes.saturating_add(value.len() as u64);
             Ok(())
         }
-        Ok(PutOutcome::Rejected(_)) => {
-            phase.rejected = phase.rejected.saturating_add(1);
+        Ok(PutOutcome::Rejected(reason)) => {
+            phase.record_rejection(reason);
             Ok(())
         }
         Err(error) => {
@@ -2105,6 +2131,7 @@ fn perform_put(
 struct Phase {
     elapsed: Duration,
     first_error: Option<String>,
+    first_rejection: Option<RejectReason>,
     timeline_start: u64,
     timeline_end: u64,
     reads: u64,
@@ -2159,6 +2186,11 @@ impl Phase {
         if self.first_error.is_none() {
             self.first_error = Some(error);
         }
+    }
+
+    fn record_rejection(&mut self, reason: RejectReason) {
+        self.rejected = self.rejected.saturating_add(1);
+        self.first_rejection.get_or_insert(reason);
     }
 
     fn record_temporal_read(&mut self, band: Option<TemporalBand>) {
@@ -2227,6 +2259,9 @@ impl Phase {
     fn merge(&mut self, other: &Self) {
         if self.first_error.is_none() {
             self.first_error.clone_from(&other.first_error);
+        }
+        if self.first_rejection.is_none() {
+            self.first_rejection = other.first_rejection;
         }
         self.reads = self.reads.saturating_add(other.reads);
         self.writes = self.writes.saturating_add(other.writes);
@@ -2625,15 +2660,15 @@ fn capacity_turnovers_for(options: &Options, host_write_bytes: u64) -> f64 {
     }
 }
 
-fn steady_state_gate_ready(options: &Options, progress: &StatsDelta) -> bool {
+fn steady_state_gate_ready(
+    options: &Options,
+    progress: &StatsDelta,
+    required_region_reuses: u64,
+) -> bool {
     options.steady_state_fill_turnovers == 0.0
         || (capacity_turnovers_for(options, progress.host_write_bytes)
             >= options.steady_state_fill_turnovers
-            && progress.region_reuses >= steady_state_required_region_reuses(options))
-}
-
-fn steady_state_required_region_reuses(options: &Options) -> u64 {
-    options.region_capacity.div_ceil(options.region_size).max(1)
+            && progress.region_reuses >= required_region_reuses)
 }
 
 struct Report<'a> {
@@ -2648,6 +2683,7 @@ struct Report<'a> {
     prefill_elapsed: Duration,
     premeasure_elapsed: Duration,
     steady_state_fill_phase: Phase,
+    required_region_reuses: u64,
     drain: Duration,
 }
 
@@ -2735,7 +2771,11 @@ impl Report<'_> {
 
     fn acceptance_failures(&self) -> Vec<String> {
         let mut failures = Vec::new();
-        if !steady_state_gate_ready(self.options, &self.premeasure_stats) {
+        if !steady_state_gate_ready(
+            self.options,
+            &self.premeasure_stats,
+            self.required_region_reuses,
+        ) {
             failures.push(format!(
                 "steady-state pre-measure gate {:.3}x/{:.3}x with {} Region reuses",
                 self.premeasure_capacity_turnovers(),
@@ -3004,9 +3044,17 @@ impl Report<'_> {
             "premeasure_region_reuses",
             self.premeasure_stats.region_reuses
         );
+        number_field!(
+            "steady_state_required_region_reuses",
+            self.required_region_reuses
+        );
         raw_field!(
             "steady_state_gate_passed",
-            steady_state_gate_ready(self.options, &self.premeasure_stats)
+            steady_state_gate_ready(
+                self.options,
+                &self.premeasure_stats,
+                self.required_region_reuses,
+            )
         );
         number_field!("elapsed_seconds", self.phase.elapsed.as_secs_f64());
         number_field!("operations", self.phase.operations());
@@ -3021,6 +3069,10 @@ impl Report<'_> {
         number_field!("hit_percent", self.hit_percent());
         number_field!("stored", self.phase.stored);
         number_field!("rejected", self.phase.rejected);
+        match self.phase.first_rejection {
+            Some(reason) => string_field!("first_rejection", &format!("{reason:?}")),
+            None => raw_field!("first_rejection", "null"),
+        }
         number_field!("errors", self.phase.errors);
         match &self.phase.first_error {
             Some(error) => string_field!("first_error", error),
@@ -3413,8 +3465,18 @@ impl Report<'_> {
         .expect("writing OpenMetrics into a String cannot fail");
         writeln!(
             output,
+            "# TYPE cache_rs_hybrid_bench_steady_state_required_region_reuses gauge\ncache_rs_hybrid_bench_steady_state_required_region_reuses {}",
+            self.required_region_reuses
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
             "# TYPE cache_rs_hybrid_bench_steady_state_gate_passed gauge\ncache_rs_hybrid_bench_steady_state_gate_passed {}",
-            u8::from(steady_state_gate_ready(self.options, &self.premeasure_stats))
+            u8::from(steady_state_gate_ready(
+                self.options,
+                &self.premeasure_stats,
+                self.required_region_reuses,
+            ))
         )
         .expect("writing OpenMetrics into a String cannot fail");
         writeln!(
@@ -3473,13 +3535,18 @@ impl Report<'_> {
             self.prefill_elapsed.as_secs_f64()
         );
         println!(
-            "  premeasure fill/gate:    {:.3}s + {:.3}s / {:.3}x target, {:.3}x observed, Region reuse={} ({})",
+            "  premeasure fill/gate:    {:.3}s + {:.3}s / {:.3}x target, {:.3}x observed, Region reuse={}/{} ({})",
             self.options.warmup.as_secs_f64(),
             self.steady_state_fill_phase.elapsed.as_secs_f64(),
             self.options.steady_state_fill_turnovers,
             self.premeasure_capacity_turnovers(),
             self.premeasure_stats.region_reuses,
-            if steady_state_gate_ready(self.options, &self.premeasure_stats) {
+            self.required_region_reuses,
+            if steady_state_gate_ready(
+                self.options,
+                &self.premeasure_stats,
+                self.required_region_reuses,
+            ) {
                 "pass"
             } else {
                 "FAIL"
@@ -4108,6 +4175,7 @@ mod tests {
             "--region-capacity=96MiB",
             "--manifest-path=manifest",
             "--memory-capacity=1MiB",
+            "--append-lanes=1",
             "--steady-state-fill-turnovers=2",
             "--yes",
         ];
@@ -4119,30 +4187,40 @@ mod tests {
         let capacity = options
             .bucket_capacity
             .saturating_add(options.region_capacity);
+        let required_reuses = u64::from(
+            build_config(&options)
+                .unwrap()
+                .diagnostics()
+                .unwrap()
+                .region
+                .region_count,
+        );
+        assert_eq!(required_reuses, 2);
         assert!(!steady_state_gate_ready(
             &options,
             &StatsDelta {
                 host_write_bytes: capacity.saturating_mul(2),
                 ..StatsDelta::default()
-            }
+            },
+            required_reuses,
         ));
         assert!(!steady_state_gate_ready(
             &options,
             &StatsDelta {
                 host_write_bytes: capacity,
-                region_reuses: steady_state_required_region_reuses(&options),
+                region_reuses: required_reuses,
                 ..StatsDelta::default()
-            }
+            },
+            required_reuses,
         ));
-        let required_reuses = steady_state_required_region_reuses(&options);
-        assert_eq!(required_reuses, 3);
         assert!(!steady_state_gate_ready(
             &options,
             &StatsDelta {
                 host_write_bytes: capacity.saturating_mul(2),
                 region_reuses: required_reuses - 1,
                 ..StatsDelta::default()
-            }
+            },
+            required_reuses,
         ));
         assert!(steady_state_gate_ready(
             &options,
@@ -4150,7 +4228,8 @@ mod tests {
                 host_write_bytes: capacity.saturating_mul(2),
                 region_reuses: required_reuses,
                 ..StatsDelta::default()
-            }
+            },
+            required_reuses,
         ));
     }
 
@@ -4216,13 +4295,21 @@ mod tests {
         let capacity = options
             .bucket_capacity
             .saturating_add(options.region_capacity);
+        let required_reuses = u64::from(
+            build_config(&options)
+                .unwrap()
+                .diagnostics()
+                .unwrap()
+                .region
+                .region_count,
+        );
         let measured = StatsDelta {
             host_write_bytes: capacity.saturating_mul(2),
             ..StatsDelta::default()
         };
         let qualifying_premeasure = StatsDelta {
             host_write_bytes: capacity.saturating_mul(2),
-            region_reuses: steady_state_required_region_reuses(&options),
+            region_reuses: required_reuses,
             ..StatsDelta::default()
         };
         let qualifying_total = StatsDelta {
@@ -4255,6 +4342,7 @@ mod tests {
             prefill_elapsed: Duration::ZERO,
             premeasure_elapsed: Duration::ZERO,
             steady_state_fill_phase: Phase::default(),
+            required_region_reuses: required_reuses,
             drain: Duration::from_millis(1),
         };
         assert!(report.acceptance_failures().is_empty());
@@ -4288,6 +4376,7 @@ mod tests {
             prefill_elapsed: Duration::ZERO,
             premeasure_elapsed: Duration::ZERO,
             steady_state_fill_phase: Phase::default(),
+            required_region_reuses: required_reuses,
             drain: Duration::from_millis(20),
         };
         let failures = failed.acceptance_failures().join("; ");
