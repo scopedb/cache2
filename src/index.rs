@@ -35,6 +35,12 @@ pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32) * RECORD_LEN_ALI
 pub(crate) const MAX_INDEX_SLOTS: usize = 256 * 1024 * 1024;
 pub(crate) const INDEX_FLAG_SECOND_CHANCE_PENDING: u32 = 1;
 pub(crate) const INDEX_FLAG_SECOND_CHANCE_USED: u32 = 1 << 1;
+/// The indexed record has been published from bounded process memory but its
+/// target device write has not yet reached completion.
+pub(crate) const INDEX_FLAG_VOLATILE: u32 = 1 << 2;
+/// Flags which describe only this process and must never enter Format V1.
+pub(crate) const INDEX_RUNTIME_ONLY_FLAGS: u32 =
+    INDEX_FLAG_SECOND_CHANCE_PENDING | INDEX_FLAG_VOLATILE;
 
 /// A record location packed into one machine word.
 ///

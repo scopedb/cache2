@@ -26,9 +26,9 @@ use crate::format::{
     SUPERBLOCK_B_OFFSET, SUPERBLOCK_COUNT, SUPERBLOCK_SIZE, Superblock, SuperblockProbe,
 };
 use crate::index::{
-    ApplyResult, INDEX_FLAG_SECOND_CHANCE_PENDING, INDEX_FLAG_SECOND_CHANCE_USED, IndexEntry,
-    IndexSnapshotEntry, MAX_INDEX_SLOTS, MAX_RECORD_LEN, MAX_REGION_OFFSET, PackedLocation,
-    RegionGeneration, ShardedIndex,
+    ApplyResult, INDEX_FLAG_SECOND_CHANCE_PENDING, INDEX_FLAG_SECOND_CHANCE_USED,
+    INDEX_RUNTIME_ONLY_FLAGS, IndexEntry, IndexSnapshotEntry, MAX_INDEX_SLOTS, MAX_RECORD_LEN,
+    MAX_REGION_OFFSET, PackedLocation, RegionGeneration, ShardedIndex,
 };
 use crate::io_backend::{
     DIRECT_IO_ALIGNMENT, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
@@ -6202,53 +6202,69 @@ impl DiskCache {
         let encoded = buffer
             .prepared(len)
             .map_err(|()| CacheError::CorruptMetadata("read completion lost its buffer"))?;
-        let loaded = (|| -> LoadedRecord {
-            let Some(header) = RecordHeader::decode(&encoded[..RECORD_HEADER_SIZE]) else {
-                return LoadedRecord::Corrupt;
-            };
-            if header.record_len != location.record_len()
-                || header.region_incarnation != region.header.incarnation
-                || header.epoch != snapshot.superblock.epoch
-                || header.seqno != entry.seqno
-                || entry.namespace_id != namespace
-                || !record_codec_matches_namespace(header.codec, namespace)
-                || header.key_hash
-                    != hash_namespaced_key(snapshot.superblock.hash_seed, namespace, expected_key)
-                || header.value_len != header.stored_len
-            {
-                return LoadedRecord::Corrupt;
-            }
-            let key_len = header.key_len as usize;
-            let stored_len = header.stored_len as usize;
-            let Some(payload_len) = key_len.checked_add(stored_len) else {
-                return LoadedRecord::Corrupt;
-            };
-            let Some(payload_end) = RECORD_HEADER_SIZE.checked_add(payload_len) else {
-                return LoadedRecord::Corrupt;
-            };
-            if payload_end > encoded.len() {
-                return LoadedRecord::Corrupt;
-            }
-            let payload = &encoded[RECORD_HEADER_SIZE..payload_end];
-            if crc32c(payload) != header.payload_crc {
-                return LoadedRecord::Corrupt;
-            }
-            let key = &payload[..key_len];
-            if !namespaced_key_matches(key, namespace, expected_key) {
-                return LoadedRecord::KeyMismatch;
-            }
-            if header.kind == RecordKind::Tombstone {
-                return LoadedRecord::Tombstone;
-            }
-            if header.expires_at != 0 && header.expires_at <= now_unix_ms() {
-                return LoadedRecord::Expired;
-            }
-            LoadedRecord::Value {
-                start: RECORD_HEADER_SIZE + key_len,
-                len: stored_len,
-            }
-        })();
+        let loaded = self.decode_loaded_record(snapshot, entry, namespace, expected_key, encoded);
         Ok((loaded, buffer))
+    }
+
+    /// Validate one complete record independently of where its bytes reside.
+    /// The staged managed-write path uses the same checks as an on-device read
+    /// so publishing a record from memory cannot weaken collision, epoch, TTL,
+    /// namespace, or checksum validation.
+    fn decode_loaded_record(
+        &self,
+        snapshot: ReadSnapshot,
+        entry: IndexEntry,
+        namespace: NamespaceId,
+        expected_key: &[u8],
+        encoded: &[u8],
+    ) -> LoadedRecord {
+        if encoded.len() < RECORD_HEADER_SIZE {
+            return LoadedRecord::Corrupt;
+        }
+        let Some(header) = RecordHeader::decode(&encoded[..RECORD_HEADER_SIZE]) else {
+            return LoadedRecord::Corrupt;
+        };
+        if header.record_len != entry.location.record_len()
+            || header.region_incarnation != snapshot.region.header.incarnation
+            || header.epoch != snapshot.superblock.epoch
+            || header.seqno != entry.seqno
+            || entry.namespace_id != namespace
+            || !record_codec_matches_namespace(header.codec, namespace)
+            || header.key_hash
+                != hash_namespaced_key(snapshot.superblock.hash_seed, namespace, expected_key)
+            || header.value_len != header.stored_len
+        {
+            return LoadedRecord::Corrupt;
+        }
+        let key_len = header.key_len as usize;
+        let stored_len = header.stored_len as usize;
+        let Some(payload_len) = key_len.checked_add(stored_len) else {
+            return LoadedRecord::Corrupt;
+        };
+        let Some(payload_end) = RECORD_HEADER_SIZE.checked_add(payload_len) else {
+            return LoadedRecord::Corrupt;
+        };
+        if payload_end > encoded.len() {
+            return LoadedRecord::Corrupt;
+        }
+        let payload = &encoded[RECORD_HEADER_SIZE..payload_end];
+        if crc32c(payload) != header.payload_crc {
+            return LoadedRecord::Corrupt;
+        }
+        let key = &payload[..key_len];
+        if !namespaced_key_matches(key, namespace, expected_key) {
+            return LoadedRecord::KeyMismatch;
+        }
+        if header.kind == RecordKind::Tombstone {
+            return LoadedRecord::Tombstone;
+        }
+        if header.expires_at != 0 && header.expires_at <= now_unix_ms() {
+            return LoadedRecord::Expired;
+        }
+        LoadedRecord::Value {
+            start: RECORD_HEADER_SIZE + key_len,
+            len: stored_len,
+        }
     }
 
     fn persist_active_headers(&self, state: &mut State) -> Result<()> {
@@ -6426,10 +6442,10 @@ impl DiskCache {
                                 location,
                                 seqno: entry.seqno,
                                 namespace_id: entry.namespace_id,
-                                // A queued copy is process-local and may not have
-                                // written a record yet. Only the durable USED bit
-                                // is meaningful after restart.
-                                flags: entry.flags & !INDEX_FLAG_SECOND_CHANCE_PENDING,
+                                // Queue and DRAM-residency state belongs to this
+                                // process. Preserve only restart-stable policy
+                                // metadata in Format V1.
+                                flags: persisted_index_flags(entry.flags),
                                 physical_slot: Some(physical_slot),
                             },
                             checkpoint_region(owner, None),
@@ -9769,6 +9785,10 @@ fn namespace_usage(entry: IndexEntry) -> Option<NamespaceUsage> {
     })
 }
 
+const fn persisted_index_flags(flags: u32) -> u32 {
+    flags & !INDEX_RUNTIME_ONLY_FLAGS
+}
+
 fn namespace_reject_reason(reason: NamespaceRejectReason) -> RejectReason {
     match reason {
         NamespaceRejectReason::UnknownNamespace => RejectReason::NamespaceNotConfigured,
@@ -9952,6 +9972,18 @@ mod m8_tests;
 #[cfg(test)]
 mod scale_config_tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_flags_drop_every_process_local_state() {
+        assert_eq!(
+            persisted_index_flags(
+                INDEX_FLAG_SECOND_CHANCE_PENDING
+                    | crate::index::INDEX_FLAG_VOLATILE
+                    | INDEX_FLAG_SECOND_CHANCE_USED
+            ),
+            INDEX_FLAG_SECOND_CHANCE_USED
+        );
+    }
 
     #[test]
     fn expected_entry_sizing_supports_a_hundred_million_live_entries() {
