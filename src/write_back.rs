@@ -1,10 +1,11 @@
 //! Bounded executor for Hybrid dirty-entry persistence.
 //!
-//! A caller reserves both one submission slot and the complete owned-copy
-//! charge before cloning a dirty L1 entry. Foreground eviction waits for its
-//! positioned-I/O task; best-effort proactive work uses only the background
-//! share. This keeps the L1-miss/L2-stale window closed while allowing
-//! independent memory shards to drive several NVMe writes concurrently.
+//! A caller reserves both one submission slot and the owned task charge before
+//! cloning a dirty L1 entry or its smaller invalidation key. Priority work
+//! preserves lower-candidate ordering; optional lower-absent work uses only its
+//! reserved background share. This keeps the L1-miss/L2-stale window closed
+//! while allowing independent memory shards to drive several NVMe operations
+//! concurrently.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -106,6 +107,21 @@ pub(crate) struct WriteBackReservation {
     active: bool,
 }
 
+/// Admission decision for a detached lower-candidate eviction. Persist keeps
+/// the new value; Invalidate schedules only the smaller stale-value removal.
+pub(crate) enum LowerCandidateReservation {
+    Persist(WriteBackReservation),
+    Invalidate(WriteBackReservation),
+}
+
+impl LowerCandidateReservation {
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        match self {
+            Self::Persist(reservation) | Self::Invalidate(reservation) => reservation.bytes,
+        }
+    }
+}
+
 pub(crate) struct WriteBackBackgroundPause {
     gate: Arc<WriteBackGate>,
     active: bool,
@@ -185,14 +201,31 @@ impl WriteBackExecutor {
         self.gate.try_reserve_background(bytes, false)
     }
 
-    /// Reserve a lower-candidate detached write from the complete bounded
-    /// budget. Failure rejects the incoming cache put while retaining its dirty
-    /// victim; it never falls back to foreground device I/O.
+    /// Test helper that reserves a full-size priority background task.
+    #[cfg(test)]
     pub(crate) fn try_reserve_priority_background(
         &self,
         bytes: usize,
     ) -> Option<WriteBackReservation> {
-        self.gate.try_reserve_background(bytes, true)
+        let selected = self.try_reserve_lower_candidate(bytes, bytes)?;
+        debug_assert_eq!(selected.reserved_bytes(), bytes);
+        Some(match selected {
+            LowerCandidateReservation::Persist(reservation)
+            | LowerCandidateReservation::Invalidate(reservation) => reservation,
+        })
+    }
+
+    /// Prefer preserving a lower-candidate value when the resulting executor
+    /// occupancy stays at or below 75%. Otherwise reserve only the smaller
+    /// invalidation task, preserving hard-cap headroom for stale-value fences.
+    /// Both modes use the priority queue and share the same absolute bounds.
+    pub(crate) fn try_reserve_lower_candidate(
+        &self,
+        persist_bytes: usize,
+        invalidate_bytes: usize,
+    ) -> Option<LowerCandidateReservation> {
+        self.gate
+            .try_reserve_lower_candidate(persist_bytes, invalidate_bytes)
     }
 
     /// Stop proactive admission and drain every already accepted background
@@ -504,6 +537,50 @@ impl WriteBackGate {
         })
     }
 
+    fn try_reserve_lower_candidate(
+        self: &Arc<Self>,
+        persist_bytes: usize,
+        invalidate_bytes: usize,
+    ) -> Option<LowerCandidateReservation> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.closed || state.background_pauses != 0 || state.in_flight >= self.max_in_flight {
+            return None;
+        }
+        let remaining_bytes = self.max_bytes.saturating_sub(state.bytes_in_use);
+        let persist_slot_limit = self.max_in_flight.saturating_mul(3) / 4;
+        let persist_byte_limit = self.max_bytes.saturating_mul(3) / 4;
+        let persist_stays_below_pressure = state.in_flight < persist_slot_limit
+            && persist_bytes <= persist_byte_limit.saturating_sub(state.bytes_in_use);
+        let invalidate = !persist_stays_below_pressure;
+        let bytes = if invalidate {
+            invalidate_bytes
+        } else {
+            persist_bytes
+        };
+        if bytes > self.max_bytes || bytes > remaining_bytes {
+            return None;
+        }
+
+        state.in_flight += 1;
+        state.background_in_flight += 1;
+        state.bytes_in_use += bytes;
+        state.background_bytes_in_use += bytes;
+        update_peak(&self.in_flight_peak, state.in_flight as u64);
+        update_peak(&self.bytes_peak, state.bytes_in_use as u64);
+        let reservation = WriteBackReservation {
+            gate: Arc::clone(self),
+            bytes,
+            background: true,
+            priority: TaskPriority::Priority,
+            active: true,
+        };
+        Some(if invalidate {
+            LowerCandidateReservation::Invalidate(reservation)
+        } else {
+            LowerCandidateReservation::Persist(reservation)
+        })
+    }
+
     fn release(&self, bytes: usize, background: bool) {
         let mut state = lock_unpoisoned(&self.state);
         debug_assert!(state.in_flight != 0 && state.bytes_in_use >= bytes);
@@ -710,6 +787,60 @@ mod tests {
         let foreground = executor.reserve(16).unwrap();
         drop(foreground);
         assert!(executor.shutdown());
+    }
+
+    #[test]
+    fn lower_candidate_degrades_to_smaller_invalidation_under_pressure() {
+        let executor = WriteBackExecutor::try_new(4, 1, 64, BackpressurePolicy::Reject).unwrap();
+
+        let low_pressure = executor.try_reserve_lower_candidate(16, 4).unwrap();
+        assert!(matches!(
+            &low_pressure,
+            LowerCandidateReservation::Persist(_)
+        ));
+        assert_eq!(low_pressure.reserved_bytes(), 16);
+        assert_eq!(executor.snapshot().bytes_in_use, 16);
+        drop(low_pressure);
+
+        let occupied = executor.reserve(40).unwrap();
+        let projected_pressure = executor.try_reserve_lower_candidate(24, 8).unwrap();
+        assert!(matches!(
+            &projected_pressure,
+            LowerCandidateReservation::Invalidate(_)
+        ));
+        assert_eq!(projected_pressure.reserved_bytes(), 8);
+        assert_eq!(executor.snapshot().bytes_in_use, 48);
+        drop(occupied);
+        drop(projected_pressure);
+
+        let first = executor.try_reserve_background(16).unwrap();
+        let second = executor.try_reserve_background(16).unwrap();
+        let third = executor.try_reserve_background(16).unwrap();
+        let under_pressure = executor.try_reserve_lower_candidate(16, 4).unwrap();
+        assert!(matches!(
+            &under_pressure,
+            LowerCandidateReservation::Invalidate(_)
+        ));
+        assert_eq!(under_pressure.reserved_bytes(), 4);
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.in_flight, 4);
+        assert_eq!(snapshot.bytes_in_use, 52);
+
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(under_pressure);
+        assert!(executor.shutdown());
+
+        let small = WriteBackExecutor::try_new(3, 1, 64, BackpressurePolicy::Reject).unwrap();
+        let first = small.try_reserve_lower_candidate(8, 2).unwrap();
+        let second = small.try_reserve_lower_candidate(8, 2).unwrap();
+        let third = small.try_reserve_lower_candidate(8, 2).unwrap();
+        assert!(matches!(&first, LowerCandidateReservation::Persist(_)));
+        assert!(matches!(&second, LowerCandidateReservation::Persist(_)));
+        assert!(matches!(&third, LowerCandidateReservation::Invalidate(_)));
+        drop((first, second, third));
+        assert!(small.shutdown());
     }
 
     #[test]

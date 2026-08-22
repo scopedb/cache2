@@ -62,7 +62,9 @@ use crate::policy::{
 use crate::resources::{
     BackpressurePolicy, MAX_BACKPRESSURE_TIMEOUT, MAX_QUEUE_DEPTH, OverloadReason,
 };
-use crate::write_back::{WriteBackExecutor, WriteBackRunError, WriteBackSnapshot};
+use crate::write_back::{
+    LowerCandidateReservation, WriteBackExecutor, WriteBackRunError, WriteBackSnapshot,
+};
 
 const DEFAULT_MEMORY_SHARDS: usize = 256;
 const MAX_MEMORY_SHARDS: usize = 4_096;
@@ -229,9 +231,13 @@ impl HybridCacheConfig {
 
     /// Choose disk-first write-through or memory-first L1 write-back with
     /// bounded background persistence. An exact-key pending directory masks
-    /// older lower values while detached writes run. Admission failure for an
-    /// existing lower candidate keeps its dirty victim resident and rejects the
-    /// incoming cache put; it never falls back to foreground device I/O.
+    /// older lower values while detached writes run. When a full-value task
+    /// would push projected executor occupancy above 75%, a lower-candidate
+    /// eviction schedules a smaller durable deletion and may lose its dirty
+    /// value to a miss. If even that deletion cannot be reserved,
+    /// allocated, registered, or submitted, the dirty victim remains resident
+    /// and the incoming cache put is rejected. The eviction path never falls
+    /// back to foreground device I/O.
     /// Write-back values are disposable cache data: an unflushed process crash
     /// may lose them, and the session dirty fence makes an unclean reopen
     /// discard the lower tiers instead of reviving an older disk value.
@@ -3085,8 +3091,10 @@ impl HybridCache {
     /// Transfer a dirty victim to a bounded exact-key owner before it leaves
     /// L1. The pending directory hides any older lower-tier value, allowing
     /// both fresh and update-heavy workloads to use the same asynchronous path.
-    /// Under pressure, a proven lower absence may be dropped; an existing
-    /// lower candidate keeps the victim resident and rejects the incoming put.
+    /// Under pressure, a proven lower absence may be dropped immediately. An
+    /// existing lower candidate first degrades to a smaller durable deletion;
+    /// failure to establish or admit that work keeps the victim resident and
+    /// rejects the incoming put.
     fn prepare_dirty_eviction(
         &self,
         entry: &MemoryEntry,
@@ -3158,24 +3166,86 @@ impl HybridCache {
         else {
             return Ok(false);
         };
-        let reservation = if lower_candidate {
-            executor.try_reserve_priority_background(reservation_bytes)
-        } else {
-            executor.try_reserve_background(reservation_bytes)
-        };
-        let Some(reservation) = reservation else {
-            return Ok(false);
-        };
-        let owned = match try_clone_memory_entry(entry) {
-            Ok(entry) => entry,
-            Err(CacheError::Overloaded(_)) => {
-                drop(reservation);
+        let (reservation, reserved_bytes, work) = if lower_candidate {
+            let Some(invalidation_bytes) = entry
+                .key
+                .len()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(MEMORY_ENTRY_OVERHEAD_BYTES))
+                .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES))
+            else {
                 return Ok(false);
+            };
+            let Some(admission) =
+                executor.try_reserve_lower_candidate(reservation_bytes, invalidation_bytes)
+            else {
+                return Ok(false);
+            };
+            let reserved_bytes = admission.reserved_bytes();
+            match admission {
+                LowerCandidateReservation::Persist(reservation) => {
+                    let owned = match try_clone_memory_entry(entry) {
+                        Ok(entry) => entry,
+                        Err(CacheError::Overloaded(_)) => {
+                            drop(reservation);
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            drop(reservation);
+                            return Err(DirtyPersistFailure::Fatal(error));
+                        }
+                    };
+                    (
+                        reservation,
+                        reserved_bytes,
+                        DetachedDirtyWork::Persist(owned),
+                    )
+                }
+                LowerCandidateReservation::Invalidate(reservation) => {
+                    let key =
+                        match try_clone_bytes(&entry.key, OverloadReason::WriteBufferUnavailable) {
+                            Ok(key) => key,
+                            Err(CacheError::Overloaded(_)) => {
+                                drop(reservation);
+                                return Ok(false);
+                            }
+                            Err(error) => {
+                                drop(reservation);
+                                return Err(DirtyPersistFailure::Fatal(error));
+                            }
+                        };
+                    (
+                        reservation,
+                        reserved_bytes,
+                        DetachedDirtyWork::Invalidate(DirtyInvalidation {
+                            namespace: entry.namespace,
+                            key,
+                            version: entry.version,
+                            pending_disk_bytes: entry.pending_disk_bytes,
+                        }),
+                    )
+                }
             }
-            Err(error) => {
-                drop(reservation);
-                return Err(DirtyPersistFailure::Fatal(error));
-            }
+        } else {
+            let Some(reservation) = executor.try_reserve_background(reservation_bytes) else {
+                return Ok(false);
+            };
+            let owned = match try_clone_memory_entry(entry) {
+                Ok(entry) => entry,
+                Err(CacheError::Overloaded(_)) => {
+                    drop(reservation);
+                    return Ok(false);
+                }
+                Err(error) => {
+                    drop(reservation);
+                    return Err(DirtyPersistFailure::Fatal(error));
+                }
+            };
+            (
+                reservation,
+                reservation_bytes,
+                DetachedDirtyWork::Persist(owned),
+            )
         };
         let hash = hybrid_hash(entry.namespace, &entry.key);
         let pending = match self.inner.pending_writes.try_register(
@@ -3183,7 +3253,7 @@ impl HybridCache {
             &entry.key,
             hash,
             entry.version,
-            reservation_bytes,
+            reserved_bytes,
         ) {
             Ok(pending) => pending,
             Err(PendingRegisterError::AlreadyPending | PendingRegisterError::AllocationFailed) => {
@@ -3197,7 +3267,7 @@ impl HybridCache {
         let panic_pending = Arc::clone(&pending);
         match executor.submit_background(
             reservation,
-            move || worker.run_async_eviction(owned, worker_pending),
+            move || worker.run_async_eviction(work, worker_pending),
             move || {
                 panic_owner
                     .inner
@@ -3227,52 +3297,49 @@ impl HybridCache {
         }
     }
 
-    fn run_async_eviction(&self, entry: MemoryEntry, pending: Arc<PendingWriteSlot>) {
+    fn run_async_eviction(&self, work: DetachedDirtyWork, pending: Arc<PendingWriteSlot>) {
         let result = (|| -> std::result::Result<(), DirtyPersistFailure> {
             let _operation = self
                 .inner
                 .operation
                 .read()
                 .map_err(|_| DirtyPersistFailure::Fatal(CacheError::Poisoned))?;
-            debug_assert_eq!(pending.version(), entry.version);
-            match self.persist_dirty_entry(&entry) {
-                Ok(_) => {
-                    self.inner
-                        .counters
-                        .demoted_entries
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.inner
-                        .counters
-                        .demoted_bytes
-                        .fetch_add(entry.charged_bytes().unwrap_or(0) as u64, Ordering::Relaxed);
-                    self.inner
-                        .counters
-                        .proactive_persisted
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                }
-                Err(DirtyPersistFailure::Rejected(_)) => {
-                    self.inner
-                        .disk
-                        .remove(
+            debug_assert_eq!(pending.version(), work.version());
+            match work {
+                DetachedDirtyWork::Persist(entry) => match self.persist_dirty_entry(&entry) {
+                    Ok(_) => {
+                        self.inner
+                            .counters
+                            .demoted_entries
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.inner.counters.demoted_bytes.fetch_add(
+                            entry.charged_bytes().unwrap_or(0) as u64,
+                            Ordering::Relaxed,
+                        );
+                        self.inner
+                            .counters
+                            .proactive_persisted
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Err(DirtyPersistFailure::Rejected(_)) => {
+                        self.inner
+                            .counters
+                            .proactive_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.invalidate_detached_dirty(
                             entry.namespace,
                             &entry.key,
-                            Some(self.inner.policy.as_ref()),
+                            entry.pending_disk_bytes,
                         )
-                        .map_err(|error| DirtyPersistFailure::Fatal(error.error))?;
-                    self.retire_dirty_memory_usage(&entry)
-                        .map_err(DirtyPersistFailure::Fatal)?;
-                    self.inner
-                        .counters
-                        .proactive_rejected
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.inner
-                        .counters
-                        .proactive_invalidated
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                }
-                Err(failure) => Err(failure),
+                    }
+                    Err(failure) => Err(failure),
+                },
+                DetachedDirtyWork::Invalidate(entry) => self.invalidate_detached_dirty(
+                    entry.namespace,
+                    &entry.key,
+                    entry.pending_disk_bytes,
+                ),
             }
         })();
         match result {
@@ -3286,6 +3353,32 @@ impl HybridCache {
                 self.inner.pending_writes.fail(&pending);
             }
         }
+    }
+
+    fn invalidate_detached_dirty(
+        &self,
+        namespace: NamespaceId,
+        key: &[u8],
+        pending_disk_bytes: u64,
+    ) -> std::result::Result<(), DirtyPersistFailure> {
+        self.inner
+            .disk
+            .remove(namespace, key, Some(self.inner.policy.as_ref()))
+            .map_err(dirty_persist_failure)?;
+        self.retire_pending_namespace_usage(NamespaceUsage {
+            namespace,
+            live_bytes: pending_disk_bytes,
+        })
+        .map_err(DirtyPersistFailure::Fatal)?;
+        self.inner
+            .counters
+            .proactive_invalidated
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .dropped_evictions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn persist_dirty_entry(
@@ -3604,6 +3697,27 @@ enum LowerUsageCommit {
 enum DirtyPersistFailure {
     Rejected(RejectReason),
     Fatal(CacheError),
+}
+
+enum DetachedDirtyWork {
+    Persist(MemoryEntry),
+    Invalidate(DirtyInvalidation),
+}
+
+struct DirtyInvalidation {
+    namespace: NamespaceId,
+    key: Vec<u8>,
+    version: HybridVersion,
+    pending_disk_bytes: u64,
+}
+
+impl DetachedDirtyWork {
+    fn version(&self) -> HybridVersion {
+        match self {
+            Self::Persist(entry) => entry.version,
+            Self::Invalidate(entry) => entry.version,
+        }
+    }
 }
 
 impl HybridPolicyReservation {
@@ -6496,6 +6610,73 @@ mod tests {
     }
 
     #[test]
+    fn saturated_lower_update_invalidates_in_background_without_reviving_old_l2() {
+        let files = TestFiles::new("write-back-overload-invalidation");
+        let cache_config = config(&files, 300)
+            .with_memory_shards(1)
+            .with_write_mode(HybridWriteMode::WriteBack)
+            .with_write_back_resources(4, 1, 1024)
+            .with_backpressure(BackpressurePolicy::Block);
+        let cache = cache_config.clone().open().unwrap();
+
+        cache.put(b"key", b"old", PutOptions::default()).unwrap();
+        cache.flush().unwrap();
+        cache.put(b"key", b"new", PutOptions::default()).unwrap();
+
+        let executor = cache.inner.write_back.as_ref().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = executor.try_reserve_background(1).unwrap();
+        executor
+            .submit_background(
+                blocker,
+                move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {},
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..2 {
+            let queued = executor.try_reserve_background(1).unwrap();
+            executor.submit_background(queued, || {}, || {}).unwrap();
+        }
+
+        let before = cache.stats().write_back;
+        assert_eq!(
+            cache
+                .put(b"evictor", b"force-eviction", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+        assert_eq!(cache.stats().write_back.pending_entries, 1);
+        assert_eq!(
+            cache.lookup(b"key").unwrap(),
+            HybridLookupOutcome::Miss(HybridMissKind::NotResident)
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            let stats = cache.stats().write_back;
+            stats.pending_entries == 0 && stats.proactive_invalidated > before.proactive_invalidated
+        }));
+        assert_eq!(cache.get(b"key").unwrap(), None);
+        let after = cache.stats().write_back;
+        assert_eq!(after.demotion_failures - before.demotion_failures, 0);
+        assert_eq!(
+            after.proactive_invalidated - before.proactive_invalidated,
+            1
+        );
+        assert_eq!(after.dropped_evictions - before.dropped_evictions, 1);
+
+        cache.close().unwrap();
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn remove_waits_for_exact_pending_write_and_cannot_be_resurrected() {
         let files = TestFiles::new("write-back-pending-remove");
         let mut cache_config = config(&files, 300)
@@ -6612,7 +6793,10 @@ mod tests {
         executor
             .submit_background(
                 background,
-                move || background_cache.run_async_eviction(first, background_pending),
+                move || {
+                    background_cache
+                        .run_async_eviction(DetachedDirtyWork::Persist(first), background_pending)
+                },
                 move || {
                     panic_cache.poison();
                     panic_cache.inner.pending_writes.fail(&panic_pending);
