@@ -282,6 +282,26 @@ impl HybridCacheStats {
         )?;
         counter(
             output,
+            "write_back_lower_absent_evictions",
+            self.write_back.lower_absent_evictions,
+        )?;
+        counter(
+            output,
+            "write_back_lower_candidate_evictions",
+            self.write_back.lower_candidate_evictions,
+        )?;
+        counter(
+            output,
+            "write_back_synchronous_demotions",
+            self.write_back.synchronous_demotions,
+        )?;
+        counter(
+            output,
+            "write_back_dropped_evictions",
+            self.write_back.dropped_evictions,
+        )?;
+        counter(
+            output,
             "write_back_proactive_scheduled",
             self.write_back.proactive_scheduled,
         )?;
@@ -304,6 +324,46 @@ impl HybridCacheStats {
             output,
             "write_back_proactive_fatal",
             self.write_back.proactive_fatal,
+        )?;
+        counter(
+            output,
+            "write_back_proactive_invalidated",
+            self.write_back.proactive_invalidated,
+        )?;
+        metric(
+            output,
+            "write_back_pending_entries",
+            self.write_back.pending_entries,
+        )?;
+        metric(
+            output,
+            "write_back_pending_entries_peak",
+            self.write_back.pending_entries_peak,
+        )?;
+        metric(
+            output,
+            "write_back_pending_bytes",
+            self.write_back.pending_bytes,
+        )?;
+        metric(
+            output,
+            "write_back_pending_bytes_peak",
+            self.write_back.pending_bytes_peak,
+        )?;
+        counter(
+            output,
+            "write_back_pending_lookup_misses",
+            self.write_back.pending_lookup_misses,
+        )?;
+        counter(
+            output,
+            "write_back_pending_same_key_waits",
+            self.write_back.pending_same_key_waits,
+        )?;
+        counter(
+            output,
+            "write_back_pending_same_key_wait_ns",
+            self.write_back.pending_same_key_wait_ns,
         )?;
         metric(
             output,
@@ -458,6 +518,35 @@ impl HybridCacheStats {
         counter(output, "region_misses", self.region.misses)?;
         counter(output, "region_bytes_read", self.region.bytes_read)?;
         counter(output, "region_bytes_written", self.region.bytes_written)?;
+        counter(output, "region_write_batches", self.region.write_batches)?;
+        counter(
+            output,
+            "region_records_coalesced",
+            self.region.records_coalesced,
+        )?;
+        counter(output, "region_regions_reused", self.region.regions_reused)?;
+        counter(output, "region_io_submitted", self.region.io_submitted)?;
+        counter(output, "region_io_completed", self.region.io_completed)?;
+        counter(
+            output,
+            "region_buffered_io_operations",
+            self.region.buffered_io_operations,
+        )?;
+        counter(
+            output,
+            "region_buffered_io_bytes",
+            self.region.buffered_io_bytes,
+        )?;
+        counter(
+            output,
+            "region_direct_io_operations",
+            self.region.direct_io_operations,
+        )?;
+        counter(
+            output,
+            "region_direct_io_bytes",
+            self.region.direct_io_bytes,
+        )?;
         counter(output, "region_io_errors", self.region.io_errors)?;
         metric(output, "region_io_in_flight", self.region.io_in_flight)?;
         metric(

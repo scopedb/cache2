@@ -49,6 +49,10 @@ use crate::metrics::{
     CacheErrorClass, CacheOperation, OperationMetricsSnapshot, RequestResultClass,
     RequestTelemetry, StateChangeReason, StateTransition,
 };
+use crate::pending_write::{
+    PENDING_WRITE_OWNED_OVERHEAD_BYTES, PendingRegisterError, PendingWaitOutcome,
+    PendingWriteDirectory, PendingWriteSlot, allocation_bytes as pending_write_allocation_bytes,
+};
 use crate::policy::{
     AdmissionDecision, AdmissionMode, AdmissionPolicy, AdmissionSnapshot, DailyWriteReservation,
     DeviceHealthPolicy, HostWriteSnapshot, NamespaceCapacityReservation, NamespaceConfig,
@@ -62,7 +66,6 @@ use crate::write_back::{WriteBackExecutor, WriteBackRunError, WriteBackSnapshot}
 
 const DEFAULT_MEMORY_SHARDS: usize = 256;
 const MAX_MEMORY_SHARDS: usize = 4_096;
-const LATEST_VERSION_STRIPES: usize = 65_536;
 const DEFAULT_SMALL_OBJECT_MAX_BYTES: usize = 1024;
 const DEFAULT_REQUEST_SLOTS: usize = 256;
 const DEFAULT_REQUEST_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -556,7 +559,11 @@ impl HybridCacheConfig {
                 disk,
                 operation: RwLock::new(()),
                 ordering: lock_tables.ordering,
-                latest_versions: lock_tables.latest_versions,
+                pending_writes: lock_tables.pending_writes.ok_or_else(|| {
+                    CacheError::InvalidConfig(
+                        "hybrid pending-write directory was not allocated".into(),
+                    )
+                })?,
                 state: Mutex::new(HybridState {
                     status: CacheStatus::Healthy,
                 }),
@@ -754,11 +761,13 @@ impl HybridCacheConfig {
             .memory_shards
             .checked_mul(size_of::<Mutex<()>>())
             .ok_or_else(|| CacheError::InvalidConfig("hybrid ordering memory overflow".into()))?;
-        let latest_version_bytes = LATEST_VERSION_STRIPES
-            .checked_mul(size_of::<Mutex<HybridVersion>>())
-            .ok_or_else(|| {
-                CacheError::InvalidConfig("hybrid version table memory overflow".into())
-            })?;
+        let pending_write_overhead_bytes =
+            pending_write_allocation_bytes(self.memory_shards, self.write_back_queue_depth)
+                .ok_or_else(|| {
+                    CacheError::InvalidConfig(
+                        "hybrid pending-write directory memory overflow".into(),
+                    )
+                })?;
         let async_queue_bytes = self
             .async_read_queue_depth
             .checked_add(self.async_write_queue_depth)
@@ -789,7 +798,7 @@ impl HybridCacheConfig {
             .checked_add(bucket.memory_budget_bytes)
             .and_then(|bytes| bytes.checked_add(region.memory_budget_bytes as usize))
             .and_then(|bytes| bytes.checked_add(ordering_bytes))
-            .and_then(|bytes| bytes.checked_add(latest_version_bytes))
+            .and_then(|bytes| bytes.checked_add(pending_write_overhead_bytes))
             .and_then(|bytes| bytes.checked_add(journal_recovery_bytes))
             .and_then(|bytes| bytes.checked_add(journal_commit_overhead_bytes))
             .and_then(|bytes| bytes.checked_add(self.request_memory_bytes))
@@ -803,7 +812,7 @@ impl HybridCacheConfig {
             .checked_add(bucket.planned_memory_bytes)
             .and_then(|bytes| bytes.checked_add(region.planned_memory_bytes as usize))
             .and_then(|bytes| bytes.checked_add(ordering_bytes))
-            .and_then(|bytes| bytes.checked_add(latest_version_bytes))
+            .and_then(|bytes| bytes.checked_add(pending_write_overhead_bytes))
             .and_then(|bytes| bytes.checked_add(journal_recovery_bytes))
             .and_then(|bytes| bytes.checked_add(journal_commit_overhead_bytes))
             .and_then(|bytes| bytes.checked_add(self.request_memory_bytes))
@@ -826,7 +835,7 @@ impl HybridCacheConfig {
         let _memory = MemoryEngine::new(self.memory_capacity_bytes, self.memory_shards)
             .map_err(map_memory_open_error)?;
         let mut ordering = Vec::new();
-        let mut latest_versions = Vec::new();
+        let mut pending_writes = None;
         if allocate_locks {
             ordering
                 .try_reserve_exact(self.memory_shards)
@@ -834,14 +843,13 @@ impl HybridCacheConfig {
                     CacheError::InvalidConfig("hybrid ordering table cannot be allocated".into())
                 })?;
             ordering.resize_with(self.memory_shards, || Mutex::new(()));
-            latest_versions
-                .try_reserve_exact(LATEST_VERSION_STRIPES)
-                .map_err(|_| {
+            pending_writes = Some(PendingWriteDirectory::try_new(self.memory_shards).map_err(
+                |_| {
                     CacheError::InvalidConfig(
-                        "hybrid latest-version table cannot be allocated".into(),
+                        "hybrid pending-write directory cannot be allocated".into(),
                     )
-                })?;
-            latest_versions.resize_with(LATEST_VERSION_STRIPES, || Mutex::new(HybridVersion::ZERO));
+                },
+            )?);
         }
         Ok((
             HybridConfigDiagnostics {
@@ -873,6 +881,7 @@ impl HybridCacheConfig {
                 write_back_workers: self.write_back_workers,
                 write_back_memory_bytes: self.write_back_memory_bytes,
                 write_back_overhead_bytes,
+                pending_write_overhead_bytes,
                 policy_memory_bytes,
                 admission_mode: self.admission_mode,
                 namespace_count,
@@ -883,7 +892,7 @@ impl HybridCacheConfig {
             },
             HybridLockTables {
                 ordering,
-                latest_versions,
+                pending_writes,
             },
         ))
     }
@@ -924,6 +933,9 @@ pub struct HybridConfigDiagnostics {
     pub write_back_workers: usize,
     pub write_back_memory_bytes: usize,
     pub write_back_overhead_bytes: usize,
+    /// Fixed exact-key pending-directory allocation. Owned detached values and
+    /// their duplicate fence keys are charged to `write_back_memory_bytes`.
+    pub pending_write_overhead_bytes: usize,
     pub policy_memory_bytes: usize,
     pub admission_mode: AdmissionMode,
     pub namespace_count: usize,
@@ -1091,11 +1103,23 @@ pub struct HybridWriteBackStats {
     pub demoted_entries: u64,
     pub demoted_bytes: u64,
     pub dirty_expiry_fences: u64,
+    pub lower_absent_evictions: u64,
+    pub lower_candidate_evictions: u64,
+    pub synchronous_demotions: u64,
+    pub dropped_evictions: u64,
     pub proactive_scheduled: u64,
     pub proactive_skipped: u64,
     pub proactive_persisted: u64,
     pub proactive_rejected: u64,
     pub proactive_fatal: u64,
+    pub proactive_invalidated: u64,
+    pub pending_entries: u64,
+    pub pending_entries_peak: u64,
+    pub pending_bytes: u64,
+    pub pending_bytes_peak: u64,
+    pub pending_lookup_misses: u64,
+    pub pending_same_key_waits: u64,
+    pub pending_same_key_wait_ns: u64,
     pub queue_capacity: u64,
     pub queue_in_flight: u64,
     pub queue_in_flight_peak: u64,
@@ -1144,11 +1168,19 @@ struct HybridCounters {
     demoted_entries: AtomicU64,
     demoted_bytes: AtomicU64,
     dirty_expiry_fences: AtomicU64,
+    lower_absent_evictions: AtomicU64,
+    lower_candidate_evictions: AtomicU64,
+    synchronous_demotions: AtomicU64,
+    dropped_evictions: AtomicU64,
     proactive_scheduled: AtomicU64,
     proactive_skipped: AtomicU64,
     proactive_persisted: AtomicU64,
     proactive_rejected: AtomicU64,
     proactive_fatal: AtomicU64,
+    proactive_invalidated: AtomicU64,
+    pending_lookup_misses: AtomicU64,
+    pending_same_key_waits: AtomicU64,
+    pending_same_key_wait_ns: AtomicU64,
     journal_rollovers: AtomicU64,
     journal_rollover_wait_ns: AtomicU64,
     journal_rollover_max_ns: AtomicU64,
@@ -1160,7 +1192,7 @@ struct HybridState {
 
 struct HybridLockTables {
     ordering: Vec<Mutex<()>>,
-    latest_versions: Vec<Mutex<HybridVersion>>,
+    pending_writes: Option<PendingWriteDirectory>,
 }
 
 #[derive(Clone, Copy)]
@@ -1178,7 +1210,7 @@ pub(crate) struct HybridInner {
     disk: DiskPair,
     operation: RwLock<()>,
     ordering: Vec<Mutex<()>>,
-    latest_versions: Vec<Mutex<HybridVersion>>,
+    pending_writes: PendingWriteDirectory,
     state: Mutex<HybridState>,
     close_changed: Condvar,
     requests: Arc<HybridRequestGate>,
@@ -1817,6 +1849,18 @@ impl HybridCache {
                 MemoryLookup::Miss => {}
             }
 
+            if let Some(pending) = self.inner.pending_writes.find(namespace, key, hash) {
+                if pending.failed() {
+                    return Err(CacheError::Poisoned);
+                }
+                self.inner
+                    .counters
+                    .pending_lookup_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.counters.misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(HybridLookupOutcome::Miss(HybridMissKind::NotResident));
+            }
+
             if context.is_some_and(TaskContext::is_stopped) {
                 return Err(hybrid_context_stop_error(context));
             }
@@ -2019,7 +2063,9 @@ impl HybridCache {
         // before publishing a journal intent or dirty value.
         let minimum_dirty_bytes = MEMORY_ENTRY_OVERHEAD_BYTES
             .checked_add(key.len())
-            .and_then(|bytes| bytes.checked_add(value.len()));
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .and_then(|bytes| bytes.checked_add(key.len()))
+            .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES));
         if minimum_dirty_bytes.is_none_or(|bytes| bytes > write_back_memory_bytes) {
             self.inner
                 .counters
@@ -2040,7 +2086,9 @@ impl HybridCache {
         };
         let owned_dirty_bytes = MEMORY_ENTRY_OVERHEAD_BYTES
             .checked_add(memory_key.capacity())
-            .and_then(|bytes| bytes.checked_add(memory_value.capacity()));
+            .and_then(|bytes| bytes.checked_add(memory_value.capacity()))
+            .and_then(|bytes| bytes.checked_add(memory_key.capacity()))
+            .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES));
         if owned_dirty_bytes.is_none_or(|bytes| bytes > write_back_memory_bytes) {
             self.inner
                 .counters
@@ -2051,7 +2099,7 @@ impl HybridCache {
         let hash = hybrid_hash(namespace, key);
         let _operation = self.read_operation_admitted()?;
         self.ensure_mutation_healthy()?;
-        let _ordering = self.lock_key(hash);
+        let _ordering = self.lock_key_after_pending(namespace, key, hash)?;
         let memory_usage = self.inner.memory.entry_usage(namespace, key);
         let previous_live_bytes = memory_usage
             .filter(|usage| !usage.expired && !usage.disk_clean)
@@ -2079,7 +2127,6 @@ impl HybridCache {
             Err(reason) => return Ok(PutOutcome::Rejected(reason)),
         };
         let (manifest, version) = self.inner.manifest.allocate_volatile_version()?;
-        self.publish_latest_version(hash, version);
 
         let pending_disk_bytes = policy_reservation.pending_live_bytes();
         let memory_entry = MemoryEntry::new_versioned_with_pending_disk_bytes(
@@ -2179,7 +2226,7 @@ impl HybridCache {
         let hash = hybrid_hash(namespace, key);
         let _operation = self.read_operation_admitted()?;
         self.ensure_mutation_healthy()?;
-        let _ordering = self.lock_key(hash);
+        let _ordering = self.lock_key_after_pending(namespace, key, hash)?;
         let memory_usage = self.inner.memory.entry_usage(namespace, key);
         let is_update = memory_usage.is_some_and(|usage| !usage.expired)
             || self.inner.disk.may_contain_for_admission(namespace, key)?;
@@ -2200,7 +2247,6 @@ impl HybridCache {
             Err(reason) => return Ok(PutOutcome::Rejected(reason)),
         };
         let (manifest, version) = self.inner.manifest.allocate_volatile_version()?;
-        self.publish_latest_version(hash, version);
         let usage_commit = policy_reservation.take_lower_commit()?;
         let receipt = match self.inner.disk.put(DiskPutRequest {
             namespace,
@@ -2310,9 +2356,8 @@ impl HybridCache {
             let hash = hybrid_hash(namespace, key);
             let _operation = self.read_operation_admitted()?;
             self.ensure_mutation_healthy()?;
-            let _ordering = self.lock_key(hash);
-            let (_, version) = self.inner.manifest.allocate_volatile_version()?;
-            self.publish_latest_version(hash, version);
+            let _ordering = self.lock_key_after_pending(namespace, key, hash)?;
+            let _ = self.inner.manifest.allocate_volatile_version()?;
             let disk =
                 match self
                     .inner
@@ -2772,6 +2817,7 @@ impl HybridCache {
     }
 
     fn write_back_stats(&self, queue: WriteBackSnapshot) -> HybridWriteBackStats {
+        let pending = self.inner.pending_writes.snapshot();
         HybridWriteBackStats {
             enabled: self.inner.write_mode == HybridWriteMode::WriteBack,
             memory_only_puts: self.inner.counters.write_back_puts.load(Ordering::Relaxed),
@@ -2797,6 +2843,26 @@ impl HybridCache {
                 .counters
                 .dirty_expiry_fences
                 .load(Ordering::Relaxed),
+            lower_absent_evictions: self
+                .inner
+                .counters
+                .lower_absent_evictions
+                .load(Ordering::Relaxed),
+            lower_candidate_evictions: self
+                .inner
+                .counters
+                .lower_candidate_evictions
+                .load(Ordering::Relaxed),
+            synchronous_demotions: self
+                .inner
+                .counters
+                .synchronous_demotions
+                .load(Ordering::Relaxed),
+            dropped_evictions: self
+                .inner
+                .counters
+                .dropped_evictions
+                .load(Ordering::Relaxed),
             proactive_scheduled: self
                 .inner
                 .counters
@@ -2818,6 +2884,30 @@ impl HybridCache {
                 .proactive_rejected
                 .load(Ordering::Relaxed),
             proactive_fatal: self.inner.counters.proactive_fatal.load(Ordering::Relaxed),
+            proactive_invalidated: self
+                .inner
+                .counters
+                .proactive_invalidated
+                .load(Ordering::Relaxed),
+            pending_entries: pending.entries,
+            pending_entries_peak: pending.entries_peak,
+            pending_bytes: pending.bytes,
+            pending_bytes_peak: pending.bytes_peak,
+            pending_lookup_misses: self
+                .inner
+                .counters
+                .pending_lookup_misses
+                .load(Ordering::Relaxed),
+            pending_same_key_waits: self
+                .inner
+                .counters
+                .pending_same_key_waits
+                .load(Ordering::Relaxed),
+            pending_same_key_wait_ns: self
+                .inner
+                .counters
+                .pending_same_key_wait_ns
+                .load(Ordering::Relaxed),
             queue_capacity: queue.queue_capacity,
             queue_in_flight: queue.in_flight,
             queue_in_flight_peak: queue.in_flight_peak,
@@ -2882,10 +2972,32 @@ impl HybridCache {
         lock_mutex(&self.inner.ordering[hash as usize & (self.inner.ordering.len() - 1)])
     }
 
-    fn publish_latest_version(&self, hash: u64, version: HybridVersion) {
-        let index = hash as usize & (self.inner.latest_versions.len() - 1);
-        let mut latest = lock_mutex(&self.inner.latest_versions[index]);
-        *latest = (*latest).max(version);
+    /// Serialize a foreground mutation behind only an exact same-key detached
+    /// write. Waiting never retains the coarse ordering stripe, so unrelated
+    /// keys sharing a shard continue to make progress.
+    fn lock_key_after_pending<'a>(
+        &'a self,
+        namespace: NamespaceId,
+        key: &[u8],
+        hash: u64,
+    ) -> Result<MutexGuard<'a, ()>> {
+        loop {
+            let ordering = self.lock_key(hash);
+            let Some(pending) = self.inner.pending_writes.find(namespace, key, hash) else {
+                return Ok(ordering);
+            };
+            drop(ordering);
+            self.inner
+                .counters
+                .pending_same_key_waits
+                .fetch_add(1, Ordering::Relaxed);
+            let (outcome, elapsed) = pending.wait_finished();
+            add_request_wait(&self.inner.counters.pending_same_key_wait_ns, elapsed);
+            if outcome == PendingWaitOutcome::Failed {
+                return Err(CacheError::Poisoned);
+            }
+            self.ensure_mutation_healthy()?;
+        }
     }
 
     fn ensure_mutation_healthy(&self) -> Result<()> {
@@ -2919,6 +3031,10 @@ impl HybridCache {
         self.inner
             .counters
             .demotion_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .synchronous_demotions
             .fetch_add(1, Ordering::Relaxed);
         let persisted_bytes = entry.charged_bytes().unwrap_or(0);
         let outcome = (|| {
@@ -2960,11 +3076,11 @@ impl HybridCache {
         outcome
     }
 
-    /// Keep the common append-style workload off the foreground I/O path. A
-    /// negative compact-index/Bloom probe proves there is no lower value to
-    /// revive, so the victim may leave L1 as soon as a bounded background task
-    /// owns its shared payload. Existing lower candidates still use the
-    /// synchronous path until per-key pending fences cover that case too.
+    /// Transfer a dirty victim to a bounded exact-key owner before it leaves
+    /// L1. The pending directory hides any older lower-tier value, allowing
+    /// both fresh and update-heavy workloads to use the same asynchronous path.
+    /// Under pressure, a proven lower absence may be dropped; an existing
+    /// lower candidate keeps the victim resident and rejects the incoming put.
     fn prepare_dirty_eviction(
         &self,
         entry: &MemoryEntry,
@@ -2975,7 +3091,15 @@ impl HybridCache {
             .may_contain_for_admission(entry.namespace, &entry.key)
             .map_err(DirtyPersistFailure::Fatal)?;
         if lower_candidate {
-            return self.demote_dirty_entry_with_usage(entry);
+            self.inner
+                .counters
+                .lower_candidate_evictions
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .counters
+                .lower_absent_evictions
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         self.inner
@@ -2986,14 +3110,27 @@ impl HybridCache {
             return Ok(0);
         }
 
-        // The lower membership probes above proved absence while the L1 shard
-        // still protected this victim. Dropping it therefore exposes only a
-        // miss, never an older value.
+        self.inner
+            .counters
+            .proactive_skipped
+            .fetch_add(1, Ordering::Relaxed);
+        if lower_candidate {
+            self.inner
+                .counters
+                .demotion_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(DirtyPersistFailure::Rejected(
+                RejectReason::BufferUnavailable,
+            ));
+        }
+
+        // Absence was proven while the L1 shard still protected the victim, so
+        // dropping it exposes only a miss. This is the cache-loss overload path.
         self.retire_dirty_memory_usage(entry)
             .map_err(DirtyPersistFailure::Fatal)?;
         self.inner
             .counters
-            .proactive_skipped
+            .dropped_evictions
             .fetch_add(1, Ordering::Relaxed);
         Ok(0)
     }
@@ -3005,10 +3142,16 @@ impl HybridCache {
         let Some(executor) = self.inner.write_back.as_ref() else {
             return Ok(false);
         };
-        let Some(bytes) = entry.charged_bytes() else {
+        let Some(owned_bytes) = entry.charged_bytes() else {
             return Ok(false);
         };
-        let Some(reservation) = executor.try_reserve_background(bytes) else {
+        let Some(reservation_bytes) = owned_bytes
+            .checked_add(entry.key.len())
+            .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES))
+        else {
+            return Ok(false);
+        };
+        let Some(reservation) = executor.try_reserve_background(reservation_bytes) else {
             return Ok(false);
         };
         let owned = match try_clone_memory_entry(entry) {
@@ -3022,11 +3165,27 @@ impl HybridCache {
                 return Err(DirtyPersistFailure::Fatal(error));
             }
         };
+        let hash = hybrid_hash(entry.namespace, &entry.key);
+        let pending = match self.inner.pending_writes.try_register(
+            entry.namespace,
+            &entry.key,
+            hash,
+            entry.version,
+            reservation_bytes,
+        ) {
+            Ok(pending) => pending,
+            Err(PendingRegisterError::AlreadyPending | PendingRegisterError::AllocationFailed) => {
+                drop(reservation);
+                return Ok(false);
+            }
+        };
         let worker = self.clone();
         let panic_owner = self.clone();
+        let worker_pending = Arc::clone(&pending);
+        let panic_pending = Arc::clone(&pending);
         match executor.submit_background(
             reservation,
-            move || worker.run_async_eviction(owned),
+            move || worker.run_async_eviction(owned, worker_pending),
             move || {
                 panic_owner
                     .inner
@@ -3034,6 +3193,7 @@ impl HybridCache {
                     .proactive_fatal
                     .fetch_add(1, Ordering::Relaxed);
                 panic_owner.poison();
+                panic_owner.inner.pending_writes.fail(&panic_pending);
             },
         ) {
             Ok(()) => {
@@ -3043,41 +3203,27 @@ impl HybridCache {
                     .fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
-            Err(WriteBackRunError::Overloaded(_) | WriteBackRunError::Closed) => Ok(false),
+            Err(WriteBackRunError::Overloaded(_) | WriteBackRunError::Closed) => {
+                self.inner.pending_writes.finish(&pending);
+                Ok(false)
+            }
             Err(WriteBackRunError::WorkerPanicked) => {
+                self.poison();
+                self.inner.pending_writes.fail(&pending);
                 Err(DirtyPersistFailure::Fatal(CacheError::Poisoned))
             }
         }
     }
 
-    fn run_async_eviction(&self, entry: MemoryEntry) {
+    fn run_async_eviction(&self, entry: MemoryEntry, pending: Arc<PendingWriteSlot>) {
         let result = (|| -> std::result::Result<(), DirtyPersistFailure> {
             let _operation = self
                 .inner
                 .operation
                 .read()
                 .map_err(|_| DirtyPersistFailure::Fatal(CacheError::Poisoned))?;
-            let hash = hybrid_hash(entry.namespace, &entry.key);
-            // Serialize only against version publication, not the coarse
-            // business ordering stripe. Foreground mutation releases this
-            // fine guard before it can enter MemoryEngine demotion and wait
-            // for a write-back worker, so background I/O cannot close a worker
-            // starvation cycle. Holding the guard through persistence makes
-            // the version check stable: a newer foreground version publishes
-            // strictly before this task (and makes it retire) or strictly
-            // after its lower-tier publication.
-            let version_index = hash as usize & (self.inner.latest_versions.len() - 1);
-            let latest = lock_mutex(&self.inner.latest_versions[version_index]);
-            if *latest != entry.version {
-                self.retire_dirty_memory_usage(&entry)
-                    .map_err(DirtyPersistFailure::Fatal)?;
-                self.inner
-                    .counters
-                    .proactive_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            let result = match self.persist_dirty_entry(&entry) {
+            debug_assert_eq!(pending.version(), entry.version);
+            match self.persist_dirty_entry(&entry) {
                 Ok(_) => {
                     self.inner
                         .counters
@@ -3094,25 +3240,39 @@ impl HybridCache {
                     Ok(())
                 }
                 Err(DirtyPersistFailure::Rejected(_)) => {
+                    self.inner
+                        .disk
+                        .remove(
+                            entry.namespace,
+                            &entry.key,
+                            Some(self.inner.policy.as_ref()),
+                        )
+                        .map_err(|error| DirtyPersistFailure::Fatal(error.error))?;
                     self.retire_dirty_memory_usage(&entry)
                         .map_err(DirtyPersistFailure::Fatal)?;
                     self.inner
                         .counters
                         .proactive_rejected
                         .fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .proactive_invalidated
+                        .fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 }
                 Err(failure) => Err(failure),
-            };
-            drop(latest);
-            result
+            }
         })();
-        if let Err(DirtyPersistFailure::Fatal(_)) = result {
-            self.inner
-                .counters
-                .proactive_fatal
-                .fetch_add(1, Ordering::Relaxed);
-            self.poison();
+        match result {
+            Ok(()) => self.inner.pending_writes.finish(&pending),
+            Err(_) => {
+                self.inner
+                    .counters
+                    .proactive_fatal
+                    .fetch_add(1, Ordering::Relaxed);
+                self.poison();
+                self.inner.pending_writes.fail(&pending);
+            }
         }
     }
 
@@ -5868,6 +6028,9 @@ mod tests {
                 cache
                     .put(b"evictor", b"force-eviction", PutOptions::default())
                     .unwrap();
+                // Dirty eviction is detached. Drain it so this subprocess
+                // reaches the requested persistence failpoint deterministically.
+                cache.flush().unwrap();
             }
         }
         panic!("combined Hybrid crash point was not reached");
@@ -6260,6 +6423,123 @@ mod tests {
     }
 
     #[test]
+    fn existing_lower_dirty_eviction_is_async_and_masks_stale_l2() {
+        let files = TestFiles::new("write-back-pending-mask");
+        let mut cache_config = config(&files, 300)
+            .with_memory_shards(1)
+            .with_write_mode(HybridWriteMode::WriteBack)
+            .with_write_back_resources(2, 1, 1024)
+            .with_backpressure(BackpressurePolicy::Block);
+        cache_config.bucket = cache_config
+            .bucket
+            .clone()
+            .with_buffer_slots(1)
+            .with_io_queue_depth(1);
+        let cache = cache_config.open().unwrap();
+
+        cache.put(b"key", b"old", PutOptions::default()).unwrap();
+        cache.flush().unwrap();
+        let before = cache.stats().write_back;
+        cache.put(b"key", b"new", PutOptions::default()).unwrap();
+
+        let held_page = cache.inner.disk.bucket.hold_page_for_test().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            cache
+                .put(b"evictor", b"force-eviction", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(wait_until(Duration::from_secs(1), || {
+            cache.stats().write_back.pending_entries == 1
+                && cache.inner.disk.bucket.page_waiters_for_test() == 1
+        }));
+
+        let lookup_started = Instant::now();
+        assert_eq!(
+            cache.lookup(b"key").unwrap(),
+            HybridLookupOutcome::Miss(HybridMissKind::NotResident)
+        );
+        assert!(lookup_started.elapsed() < Duration::from_millis(250));
+        assert_eq!(cache.inner.disk.bucket.page_waiters_for_test(), 1);
+
+        drop(held_page);
+        assert!(wait_until(Duration::from_secs(2), || {
+            cache.stats().write_back.pending_entries == 0
+                && cache.stats().write_back.proactive_persisted == 1
+        }));
+        assert_eq!(cache.get(b"key").unwrap(), Some(b"new".to_vec()));
+        let after = cache.stats().write_back;
+        assert_eq!(
+            after.lower_candidate_evictions - before.lower_candidate_evictions,
+            1
+        );
+        assert_eq!(
+            after.synchronous_demotions - before.synchronous_demotions,
+            0
+        );
+        assert_eq!(after.pending_lookup_misses, 1);
+        cache.close().unwrap();
+    }
+
+    #[test]
+    fn remove_waits_for_exact_pending_write_and_cannot_be_resurrected() {
+        let files = TestFiles::new("write-back-pending-remove");
+        let mut cache_config = config(&files, 300)
+            .with_memory_shards(1)
+            .with_write_mode(HybridWriteMode::WriteBack)
+            .with_write_back_resources(2, 1, 1024)
+            .with_backpressure(BackpressurePolicy::Block);
+        cache_config.bucket = cache_config
+            .bucket
+            .clone()
+            .with_buffer_slots(1)
+            .with_io_queue_depth(1);
+        let cache = cache_config.clone().open().unwrap();
+
+        cache.put(b"key", b"old", PutOptions::default()).unwrap();
+        cache.flush().unwrap();
+        cache.put(b"key", b"new", PutOptions::default()).unwrap();
+        let held_page = cache.inner.disk.bucket.hold_page_for_test().unwrap();
+        cache
+            .put(b"evictor", b"force-eviction", PutOptions::default())
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(1), || {
+            cache.stats().write_back.pending_entries == 1
+                && cache.inner.disk.bucket.page_waiters_for_test() == 1
+        }));
+
+        let remover = cache.clone();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let thread = thread::spawn(move || removed_tx.send(remover.remove(b"key")).unwrap());
+        assert!(wait_until(Duration::from_secs(1), || {
+            cache.stats().write_back.pending_same_key_waits == 1
+        }));
+        assert!(matches!(
+            removed_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(held_page);
+        assert_eq!(
+            removed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            RemoveOutcome::Removed
+        );
+        thread.join().unwrap();
+        assert_eq!(cache.get(b"key").unwrap(), None);
+        cache.flush().unwrap();
+        cache.close().unwrap();
+
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn background_eviction_cannot_starve_a_synchronous_demotion_worker() {
         let files = TestFiles::new("write-back-ordering-starvation");
         let cache = config(&files, 8 * 1024)
@@ -6295,15 +6575,36 @@ mod tests {
         assert!(!first.disk_clean && !second.disk_clean);
 
         let executor = cache.inner.write_back.as_ref().unwrap();
-        let background = executor
-            .try_reserve_background(first.charged_bytes().unwrap())
+        let background_bytes = first
+            .charged_bytes()
+            .unwrap()
+            .checked_add(first.key.len())
+            .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES))
+            .unwrap();
+        let background = executor.try_reserve_background(background_bytes).unwrap();
+        let pending = cache
+            .inner
+            .pending_writes
+            .try_register(
+                first.namespace,
+                &first.key,
+                first_hash,
+                first.version,
+                background_bytes,
+            )
             .unwrap();
         let background_cache = cache.clone();
+        let background_pending = Arc::clone(&pending);
+        let panic_cache = cache.clone();
+        let panic_pending = Arc::clone(&pending);
         executor
             .submit_background(
                 background,
-                move || background_cache.run_async_eviction(first),
-                || panic!("background eviction panicked"),
+                move || background_cache.run_async_eviction(first, background_pending),
+                move || {
+                    panic_cache.poison();
+                    panic_cache.inner.pending_writes.fail(&panic_pending);
+                },
             )
             .unwrap();
 
@@ -6457,7 +6758,7 @@ mod tests {
             .with_memory_shards(1)
             .with_small_object_max(1)
             .with_write_mode(HybridWriteMode::WriteBack)
-            .with_write_back_resources(2, 1, 320)
+            .with_write_back_resources(2, 1, 768)
             .with_namespace(NamespaceConfig::new(7).with_capacity_bytes(16 * 1024));
         let cache = cache_config.clone().open().unwrap();
         let region = &cache.inner.disk.region;

@@ -76,6 +76,7 @@ mod management;
 mod memory_engine;
 mod metrics;
 mod miss_guard;
+mod pending_write;
 mod policy;
 mod resources;
 mod write_back;

@@ -153,9 +153,9 @@ impl WriteBackExecutor {
         self.gate.reserve(bytes)
     }
 
-    /// Reserve one bounded background-cleaner task without waiting behind
-    /// foreground pressure. Failure deliberately leaves the L1 entry dirty so
-    /// the existing synchronous eviction fallback can preserve correctness.
+    /// Reserve one bounded detached write without waiting. Explicit flush
+    /// pauses and drains these tasks before using the synchronous path, so the
+    /// full configured queue and byte budget are available during steady state.
     pub(crate) fn try_reserve_background(&self, bytes: usize) -> Option<WriteBackReservation> {
         self.gate.try_reserve_background(bytes)
     }
@@ -380,23 +380,9 @@ impl WriteBackGate {
             return None;
         }
         let mut state = lock_unpoisoned(&self.state);
-        // Best-effort cleaning may use at most half the copy budget and must
-        // leave one submission slot for mandatory eviction demotion. This
-        // bounds optional interference; a depth of one disables proactive work.
-        let background_slot_limit = self.max_in_flight.saturating_sub(1);
-        let background_byte_limit = self.max_bytes / 2;
         let slots_full = state.in_flight >= self.max_in_flight;
         let bytes_full = bytes > self.max_bytes.saturating_sub(state.bytes_in_use);
-        let background_slots_full = state.background_in_flight >= background_slot_limit;
-        let background_bytes_full =
-            bytes > background_byte_limit.saturating_sub(state.background_bytes_in_use);
-        if state.closed
-            || state.background_pauses != 0
-            || slots_full
-            || bytes_full
-            || background_slots_full
-            || background_bytes_full
-        {
+        if state.closed || state.background_pauses != 0 || slots_full || bytes_full {
             return None;
         }
         state.in_flight += 1;
@@ -596,19 +582,24 @@ mod tests {
     }
 
     #[test]
-    fn background_admission_reserves_foreground_slot_and_memory() {
+    fn background_admission_can_use_the_full_steady_state_budget() {
         let executor = WriteBackExecutor::try_new(2, 1, 16, BackpressurePolicy::Reject).unwrap();
-        let background = executor.try_reserve_background(8).unwrap();
+        let first = executor.try_reserve_background(8).unwrap();
+        let second = executor.try_reserve_background(8).unwrap();
         assert!(executor.try_reserve_background(1).is_none());
-
-        let foreground = executor.reserve(8).unwrap();
+        assert!(matches!(
+            executor.reserve(1),
+            Err(WriteBackRunError::Overloaded(_))
+        ));
         let snapshot = executor.snapshot();
         assert_eq!(snapshot.in_flight, 2);
         assert_eq!(snapshot.bytes_in_use, 16);
-        assert_eq!(snapshot.rejected, 0);
+        assert_eq!(snapshot.rejected, 1);
 
+        drop(first);
+        drop(second);
+        let foreground = executor.reserve(16).unwrap();
         drop(foreground);
-        drop(background);
         assert!(executor.shutdown());
     }
 }
