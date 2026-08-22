@@ -6,6 +6,7 @@
 //! location safe. No structure grows beyond the configured chunk capacity.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
@@ -55,6 +56,19 @@ pub(crate) enum StagingError {
     Failed,
     Closed,
     Invariant(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RegionStagingSnapshot {
+    pub(crate) chunk_bytes: u64,
+    pub(crate) resident_bytes: u64,
+    pub(crate) flushing_bytes: u64,
+    pub(crate) sealed_spans: u64,
+    pub(crate) sealed_bytes: u64,
+    pub(crate) completion_live_records: u64,
+    pub(crate) completion_live_bytes: u64,
+    pub(crate) completion_obsolete_records: u64,
+    pub(crate) completion_obsolete_bytes: u64,
 }
 
 impl fmt::Display for StagingError {
@@ -141,9 +155,20 @@ struct StagingLane {
     flush_tx: SyncSender<FlushCommand>,
 }
 
+#[derive(Default)]
+struct StagingCounters {
+    sealed_spans: AtomicU64,
+    sealed_bytes: AtomicU64,
+    completion_live_records: AtomicU64,
+    completion_live_bytes: AtomicU64,
+    completion_obsolete_records: AtomicU64,
+    completion_obsolete_bytes: AtomicU64,
+}
+
 pub(crate) struct RegionStaging {
     lanes: Vec<StagingLane>,
     chunk_bytes: usize,
+    counters: StagingCounters,
     _memory: RuntimeMemoryReservation,
 }
 
@@ -211,6 +236,7 @@ impl RegionStaging {
             Self {
                 lanes,
                 chunk_bytes,
+                counters: StagingCounters::default(),
                 _memory: memory,
             },
             receivers,
@@ -219,6 +245,43 @@ impl RegionStaging {
 
     pub(crate) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
+    }
+
+    pub(crate) fn snapshot(&self) -> RegionStagingSnapshot {
+        let mut resident_bytes = 0_u64;
+        let mut flushing_bytes = 0_u64;
+        for lane in &self.lanes {
+            let state = lock_unpoisoned(&lane.state);
+            let active = usize_to_u64(state.active.bytes.len());
+            let flushing = state
+                .flushing
+                .as_ref()
+                .map_or(0, |chunk| usize_to_u64(chunk.bytes.len()));
+            resident_bytes = resident_bytes
+                .saturating_add(active)
+                .saturating_add(flushing);
+            flushing_bytes = flushing_bytes.saturating_add(flushing);
+        }
+        RegionStagingSnapshot {
+            chunk_bytes: usize_to_u64(self.chunk_bytes),
+            resident_bytes,
+            flushing_bytes,
+            sealed_spans: self.counters.sealed_spans.load(Ordering::Relaxed),
+            sealed_bytes: self.counters.sealed_bytes.load(Ordering::Relaxed),
+            completion_live_records: self
+                .counters
+                .completion_live_records
+                .load(Ordering::Relaxed),
+            completion_live_bytes: self.counters.completion_live_bytes.load(Ordering::Relaxed),
+            completion_obsolete_records: self
+                .counters
+                .completion_obsolete_records
+                .load(Ordering::Relaxed),
+            completion_obsolete_bytes: self
+                .counters
+                .completion_obsolete_bytes
+                .load(Ordering::Relaxed),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -318,6 +381,8 @@ impl RegionStaging {
             records: sealed.records.len(),
         };
         state.flushing = Some(sealed);
+        atomic_saturating_add(&self.counters.sealed_spans, 1);
+        atomic_saturating_add(&self.counters.sealed_bytes, usize_to_u64(length));
         drop(state);
         if lane.flush_tx.send(FlushCommand::Write(job)).is_err() {
             let mut state = lock_unpoisoned(&lane.state);
@@ -366,7 +431,7 @@ impl RegionStaging {
         &self,
         lane_id: usize,
         span_id: u64,
-        mut make_on_device: impl FnMut(StagedRecord),
+        mut make_on_device: impl FnMut(StagedRecord) -> bool,
     ) -> Result<(), StagingError> {
         let lane = self.lane(lane_id)?;
         let mut state = lock_unpoisoned(&lane.state);
@@ -378,8 +443,19 @@ impl RegionStaging {
                 "staging completion span identity mismatch",
             ));
         }
+        let mut live_records = 0_u64;
+        let mut live_bytes = 0_u64;
+        let mut obsolete_records = 0_u64;
+        let mut obsolete_bytes = 0_u64;
         for record in flushing.records.iter().copied() {
-            make_on_device(record);
+            let bytes = u64::from(record.entry.location.record_len());
+            if make_on_device(record) {
+                live_records = live_records.saturating_add(1);
+                live_bytes = live_bytes.saturating_add(bytes);
+            } else {
+                obsolete_records = obsolete_records.saturating_add(1);
+                obsolete_bytes = obsolete_bytes.saturating_add(bytes);
+            }
         }
         let mut finished = state
             .flushing
@@ -391,6 +467,10 @@ impl RegionStaging {
                 "staging completion found an occupied spare chunk",
             ));
         }
+        atomic_saturating_add(&self.counters.completion_live_records, live_records);
+        atomic_saturating_add(&self.counters.completion_live_bytes, live_bytes);
+        atomic_saturating_add(&self.counters.completion_obsolete_records, obsolete_records);
+        atomic_saturating_add(&self.counters.completion_obsolete_bytes, obsolete_bytes);
         lane.changed.notify_all();
         Ok(())
     }
@@ -493,4 +573,14 @@ fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexG
     condvar
         .wait(guard)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }

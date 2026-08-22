@@ -917,6 +917,21 @@ pub struct RegionStats {
     pub second_chance_pending_requests: u64,
 }
 
+/// Bounded staging residency and append-efficiency accounting.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegionStagingStats {
+    pub chunk_bytes: u64,
+    pub resident_bytes: u64,
+    pub flushing_bytes: u64,
+    pub sealed_spans: u64,
+    pub sealed_bytes: u64,
+    pub completion_live_records: u64,
+    pub completion_live_bytes: u64,
+    pub completion_obsolete_records: u64,
+    pub completion_obsolete_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct DiskCache {
     pub(crate) inner: Arc<Inner>,
@@ -3505,6 +3520,30 @@ impl DiskCache {
 
     pub fn nvme_health(&self) -> Option<NvmeHealthStats> {
         self.inner.policy.nvme_health()
+    }
+
+    /// Snapshot the managed buffered append staging path.
+    ///
+    /// Standalone, direct-I/O, and unstaged caches return an all-zero snapshot.
+    pub fn staging_stats(&self) -> RegionStagingStats {
+        self.inner
+            .staging
+            .as_ref()
+            .map(|staging| {
+                let staging = staging.snapshot();
+                RegionStagingStats {
+                    chunk_bytes: staging.chunk_bytes,
+                    resident_bytes: staging.resident_bytes,
+                    flushing_bytes: staging.flushing_bytes,
+                    sealed_spans: staging.sealed_spans,
+                    sealed_bytes: staging.sealed_bytes,
+                    completion_live_records: staging.completion_live_records,
+                    completion_live_bytes: staging.completion_live_bytes,
+                    completion_obsolete_records: staging.completion_obsolete_records,
+                    completion_obsolete_bytes: staging.completion_obsolete_bytes,
+                }
+            })
+            .unwrap_or_default()
     }
 
     pub fn region_stats(&self) -> Result<Vec<RegionStats>> {
@@ -6406,12 +6445,15 @@ impl DiskCache {
             return;
         }
         let completed = staging.finish_success(lane_id, span_id, |record| {
-            let _ = self.inner.index.clear_flags_if_entry(
-                record.hash,
-                record.entry,
-                INDEX_FLAG_VOLATILE,
-                INDEX_FLAG_VOLATILE,
-            );
+            self.inner
+                .index
+                .clear_flags_if_entry(
+                    record.hash,
+                    record.entry,
+                    INDEX_FLAG_VOLATILE,
+                    INDEX_FLAG_VOLATILE,
+                )
+                .is_some()
         });
         if let Err(error) = completed {
             let _ = self.fail_staging(error);
@@ -10725,6 +10767,11 @@ mod m1_tests {
         );
         assert_eq!(record_write_count(&faults), before_writes);
         assert_eq!(cache.stats().write_batches, before_batches);
+        let resident = cache.staging_stats();
+        assert!(resident.chunk_bytes > 0);
+        assert!(resident.resident_bytes > 0);
+        assert_eq!(resident.flushing_bytes, 0);
+        assert_eq!(resident.sealed_spans, 0);
         assert_eq!(
             cache.get(b"removed").unwrap().as_deref(),
             Some(b"first".as_slice())
@@ -10739,6 +10786,21 @@ mod m1_tests {
         cache.flush().unwrap();
         assert_eq!(record_write_count(&faults), before_writes + 1);
         assert_eq!(cache.stats().write_batches, before_batches + 1);
+        let completed = cache.staging_stats();
+        assert_eq!(completed.resident_bytes, 0);
+        assert_eq!(completed.flushing_bytes, 0);
+        assert_eq!(completed.sealed_spans, 1);
+        assert!(completed.sealed_bytes > 0);
+        assert_eq!(completed.completion_live_records, 1);
+        assert_eq!(completed.completion_obsolete_records, 1);
+        assert!(completed.completion_live_bytes > 0);
+        assert!(completed.completion_obsolete_bytes > 0);
+        assert_eq!(
+            completed
+                .completion_live_bytes
+                .saturating_add(completed.completion_obsolete_bytes),
+            completed.sealed_bytes
+        );
         cache.close().unwrap();
         cache.close().unwrap();
 
@@ -10786,6 +10848,11 @@ mod m1_tests {
         assert_eq!(cache.status(), CacheStatus::MissOnly);
         assert_eq!(cache.get(b"key").unwrap(), None);
         assert_eq!(cache.stats().entries, 0);
+        let staging = cache.staging_stats();
+        assert_eq!(staging.completion_live_records, 0);
+        assert_eq!(staging.completion_obsolete_records, 0);
+        assert_eq!(staging.completion_live_bytes, 0);
+        assert_eq!(staging.completion_obsolete_bytes, 0);
         assert!(matches!(cache.close(), Err(CacheError::Poisoned)));
     }
 

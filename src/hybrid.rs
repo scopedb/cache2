@@ -22,7 +22,7 @@ use crate::bucket_engine::{
 };
 use crate::cache::{
     CacheConfig, CacheError, CacheStats, CacheStatus, DiskCache, ManagedPutCommit, PutOptions,
-    PutOutcome, RecoveryMode, RejectReason, RemoveOutcome, Result,
+    PutOutcome, RecoveryMode, RegionStagingStats, RejectReason, RemoveOutcome, Result,
 };
 use crate::diagnostics::ConfigDiagnostics;
 #[cfg(test)]
@@ -2840,6 +2840,11 @@ impl HybridCache {
             bucket: self.inner.disk.bucket.stats(),
             region: self.inner.disk.region.stats(),
         }
+    }
+
+    /// Snapshot the large-object Region append staging path.
+    pub fn region_staging_stats(&self) -> RegionStagingStats {
+        self.inner.disk.region.staging_stats()
     }
 
     /// Fixed-cardinality end-to-end request telemetry plus bounded lifecycle

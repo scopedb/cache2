@@ -99,7 +99,8 @@ pub use bucket_engine::{
 };
 pub use cache::{
     CacheConfig, CacheError, CacheStats, CacheStatus, DiskCache, IoEngineKind, IoMode, PutOptions,
-    PutOutcome, ReclaimMode, RecoveryMode, RegionStats, RejectReason, RemoveOutcome, Result,
+    PutOutcome, ReclaimMode, RecoveryMode, RegionStagingStats, RegionStats, RejectReason,
+    RemoveOutcome, Result,
 };
 pub use diagnostics::{ConfigDiagnostics, HealthSnapshot, StartupDiagnostics};
 pub use hybrid::{

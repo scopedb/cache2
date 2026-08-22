@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cache_rs::{
     AsyncHybridCache, BackpressurePolicy, BucketCacheConfig, CacheConfig, CacheError, CacheTier,
     HybridCache, HybridCacheConfig, HybridCacheStats, HybridLookupOutcome, HybridWriteMode,
-    IoEngineKind, IoMode, PutOptions, PutOutcome, RejectReason, RemoveOutcome,
+    IoEngineKind, IoMode, PutOptions, PutOutcome, RegionStagingStats, RejectReason, RemoveOutcome,
 };
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
@@ -89,8 +89,8 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
             .open()
             .map_err(|error| format!("cannot format/open Hybrid cache: {error}"))?,
     );
-    let initial_stats = cache.stats();
     let cache = BenchCache::new(cache, options.api)?;
+    let initial_stats = cache.stats();
     let prefill_count = percentage_count(options.keys, options.prefill_percent);
     eprintln!(
         "cache-bench hybrid: generator={} B, preloading {prefill_count}/{} objects with {} bounded workers",
@@ -138,7 +138,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         options.temporal_hot_read_percent,
     );
 
-    let premeasure_before = cache.cache().stats();
+    let premeasure_before = cache.stats();
     let premeasure_started = Instant::now();
     if !options.warmup.is_zero() {
         eprintln!(
@@ -190,7 +190,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
             .unwrap_or_else(Instant::now);
         let mut round = 0_u64;
         loop {
-            let progress = StatsDelta::between(premeasure_before, cache.cache().stats());
+            let progress = StatsDelta::between(premeasure_before, cache.stats());
             if steady_state_gate_ready(&options, &progress, required_region_reuses) {
                 break;
             }
@@ -252,7 +252,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     cache
         .flush()
         .map_err(|error| format!("pre-measure drain/flush failed: {error}"))?;
-    let before = cache.cache().stats();
+    let before = cache.stats();
     let premeasure_stats = StatsDelta::between(premeasure_before, before);
     if !steady_state_gate_ready(&options, &premeasure_stats, required_region_reuses) {
         return Err(format!(
@@ -292,13 +292,13 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     if let Some(error) = &phase.first_error {
         eprintln!("cache-bench hybrid: first measured error: {error}");
     }
-    let measured_after = cache.cache().stats();
+    let measured_after = cache.stats();
     let drain_start = Instant::now();
     cache
         .close()
         .map_err(|error| format!("Hybrid drain/close failed: {error}"))?;
     let drain = drain_start.elapsed();
-    let after = cache.cache().stats();
+    let after = cache.stats();
     let report = Report {
         options: &options,
         phase,
@@ -306,7 +306,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         drain_stats: StatsDelta::between(measured_after, after),
         total_stats: StatsDelta::between(initial_stats, after),
         premeasure_stats,
-        final_stats: after,
+        final_stats: after.hybrid,
         generator_planned_memory,
         prefill_elapsed,
         premeasure_elapsed,
@@ -328,7 +328,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
 }
 
 fn overload_diagnostics(cache: &BenchCache) -> String {
-    let stats = cache.cache().stats();
+    let stats = cache.stats().hybrid;
     format!(
         "request_rejections={} memory={}/{} write_back_failures={} lower_candidates={} skipped={} queue={}/{}/{} write_back_memory={}/{}/{} Bucket_buffer_rejections={} Region_rejected={} waits_ns(req/WB/Bbuf/Rbp)={}/{}/{}/{} io_submitted(B/R)={}/{} io_completion_ns(B/R)={}/{}",
         stats.request_rejections,
@@ -1156,6 +1156,12 @@ enum BenchCache {
     },
 }
 
+#[derive(Clone, Copy, Default)]
+struct ObservationStats {
+    hybrid: HybridCacheStats,
+    region_staging: RegionStagingStats,
+}
+
 impl BenchCache {
     fn new(cache: Arc<HybridCache>, api: Api) -> Result<Self, String> {
         match api {
@@ -1172,6 +1178,14 @@ impl BenchCache {
     fn cache(&self) -> &HybridCache {
         match self {
             Self::Sync(cache) | Self::Async { cache, .. } => cache,
+        }
+    }
+
+    fn stats(&self) -> ObservationStats {
+        let cache = self.cache();
+        ObservationStats {
+            hybrid: cache.stats(),
+            region_staging: cache.region_staging_stats(),
         }
     }
 
@@ -2465,6 +2479,15 @@ struct StatsDelta {
     region_bytes_written: u64,
     region_write_batches: u64,
     region_records_coalesced: u64,
+    region_staging_chunk_bytes: u64,
+    region_staging_resident_bytes: u64,
+    region_staging_flushing_bytes: u64,
+    region_staging_sealed_spans: u64,
+    region_staging_sealed_bytes: u64,
+    region_staging_completion_live_records: u64,
+    region_staging_completion_live_bytes: u64,
+    region_staging_completion_obsolete_records: u64,
+    region_staging_completion_obsolete_bytes: u64,
     region_io_submitted: u64,
     region_io_completed: u64,
     region_io_errors: u64,
@@ -2529,7 +2552,11 @@ struct StatsDelta {
 }
 
 impl StatsDelta {
-    fn between(before: HybridCacheStats, after: HybridCacheStats) -> Self {
+    fn between(before: ObservationStats, after: ObservationStats) -> Self {
+        let before_staging = before.region_staging;
+        let after_staging = after.region_staging;
+        let before = before.hybrid;
+        let after = after.hybrid;
         Self {
             memory_hits: after.memory_hits.saturating_sub(before.memory_hits),
             bucket_hits: after.small_disk_hits.saturating_sub(before.small_disk_hits),
@@ -2590,6 +2617,27 @@ impl StatsDelta {
                 .region
                 .records_coalesced
                 .saturating_sub(before.region.records_coalesced),
+            region_staging_chunk_bytes: after_staging.chunk_bytes,
+            region_staging_resident_bytes: after_staging.resident_bytes,
+            region_staging_flushing_bytes: after_staging.flushing_bytes,
+            region_staging_sealed_spans: after_staging
+                .sealed_spans
+                .saturating_sub(before_staging.sealed_spans),
+            region_staging_sealed_bytes: after_staging
+                .sealed_bytes
+                .saturating_sub(before_staging.sealed_bytes),
+            region_staging_completion_live_records: after_staging
+                .completion_live_records
+                .saturating_sub(before_staging.completion_live_records),
+            region_staging_completion_live_bytes: after_staging
+                .completion_live_bytes
+                .saturating_sub(before_staging.completion_live_bytes),
+            region_staging_completion_obsolete_records: after_staging
+                .completion_obsolete_records
+                .saturating_sub(before_staging.completion_obsolete_records),
+            region_staging_completion_obsolete_bytes: after_staging
+                .completion_obsolete_bytes
+                .saturating_sub(before_staging.completion_obsolete_bytes),
             region_io_submitted: after
                 .region
                 .io_submitted
@@ -3117,7 +3165,7 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 7);
+        number_field!("schema_version", 8);
         string_field!("cache", "hybrid");
         string_field!("latency_scope", "individual_cache_api_calls");
         string_field!("write_value_generation", "prebuilt_worker_template");
@@ -3392,6 +3440,69 @@ impl Report<'_> {
             "region_records_coalesced",
             self.stats.region_records_coalesced
         );
+        number_field!(
+            "region_staging_chunk_bytes",
+            self.stats.region_staging_chunk_bytes
+        );
+        number_field!(
+            "region_staging_resident_bytes",
+            self.stats.region_staging_resident_bytes
+        );
+        number_field!(
+            "region_staging_flushing_bytes",
+            self.stats.region_staging_flushing_bytes
+        );
+        number_field!(
+            "region_staging_sealed_spans",
+            self.stats.region_staging_sealed_spans
+        );
+        number_field!(
+            "region_staging_sealed_bytes",
+            self.stats.region_staging_sealed_bytes
+        );
+        number_field!(
+            "region_staging_completion_live_records",
+            self.stats.region_staging_completion_live_records
+        );
+        number_field!(
+            "region_staging_completion_live_bytes",
+            self.stats.region_staging_completion_live_bytes
+        );
+        number_field!(
+            "region_staging_completion_obsolete_records",
+            self.stats.region_staging_completion_obsolete_records
+        );
+        number_field!(
+            "region_staging_completion_obsolete_bytes",
+            self.stats.region_staging_completion_obsolete_bytes
+        );
+        number_field!(
+            "region_staging_seal_fill_percent",
+            percent_of(
+                self.stats.region_staging_sealed_bytes,
+                self.stats
+                    .region_staging_sealed_spans
+                    .saturating_mul(self.stats.region_staging_chunk_bytes),
+            )
+        );
+        number_field!(
+            "region_staging_obsolete_record_percent",
+            percent_of(
+                self.stats.region_staging_completion_obsolete_records,
+                self.stats
+                    .region_staging_completion_live_records
+                    .saturating_add(self.stats.region_staging_completion_obsolete_records),
+            )
+        );
+        number_field!(
+            "region_staging_obsolete_byte_percent",
+            percent_of(
+                self.stats.region_staging_completion_obsolete_bytes,
+                self.stats
+                    .region_staging_completion_live_bytes
+                    .saturating_add(self.stats.region_staging_completion_obsolete_bytes),
+            )
+        );
         number_field!("region_io_submitted", self.stats.region_io_submitted);
         number_field!("region_io_completed", self.stats.region_io_completed);
         number_field!(
@@ -3591,6 +3702,42 @@ impl Report<'_> {
         number_field!(
             "total_region_io_completed",
             self.total_stats.region_io_completed
+        );
+        number_field!(
+            "total_region_staging_chunk_bytes",
+            self.total_stats.region_staging_chunk_bytes
+        );
+        number_field!(
+            "total_region_staging_resident_bytes",
+            self.total_stats.region_staging_resident_bytes
+        );
+        number_field!(
+            "total_region_staging_flushing_bytes",
+            self.total_stats.region_staging_flushing_bytes
+        );
+        number_field!(
+            "total_region_staging_sealed_spans",
+            self.total_stats.region_staging_sealed_spans
+        );
+        number_field!(
+            "total_region_staging_sealed_bytes",
+            self.total_stats.region_staging_sealed_bytes
+        );
+        number_field!(
+            "total_region_staging_completion_live_records",
+            self.total_stats.region_staging_completion_live_records
+        );
+        number_field!(
+            "total_region_staging_completion_live_bytes",
+            self.total_stats.region_staging_completion_live_bytes
+        );
+        number_field!(
+            "total_region_staging_completion_obsolete_records",
+            self.total_stats.region_staging_completion_obsolete_records
+        );
+        number_field!(
+            "total_region_staging_completion_obsolete_bytes",
+            self.total_stats.region_staging_completion_obsolete_bytes
         );
         number_field!("total_bucket_io_errors", self.total_stats.bucket_io_errors);
         number_field!("total_region_io_errors", self.total_stats.region_io_errors);
@@ -4110,6 +4257,30 @@ impl Report<'_> {
             }
         );
         println!(
+            "  Region staging spans/fill/obsolete: {} / {:.1}% / {:.1}% records, {:.1}% bytes (resident/flushing={}/{} KiB)",
+            self.stats.region_staging_sealed_spans,
+            percent_of(
+                self.stats.region_staging_sealed_bytes,
+                self.stats
+                    .region_staging_sealed_spans
+                    .saturating_mul(self.stats.region_staging_chunk_bytes),
+            ),
+            percent_of(
+                self.stats.region_staging_completion_obsolete_records,
+                self.stats
+                    .region_staging_completion_live_records
+                    .saturating_add(self.stats.region_staging_completion_obsolete_records),
+            ),
+            percent_of(
+                self.stats.region_staging_completion_obsolete_bytes,
+                self.stats
+                    .region_staging_completion_live_bytes
+                    .saturating_add(self.stats.region_staging_completion_obsolete_bytes),
+            ),
+            self.stats.region_staging_resident_bytes / 1024,
+            self.stats.region_staging_flushing_bytes / 1024,
+        );
+        println!(
             "  total WB demotion/QD:    {} entries / {}",
             self.total_stats.write_back_demoted_entries, self.total_stats.write_back_queue_peak
         );
@@ -4553,7 +4724,7 @@ mod tests {
 
     #[test]
     fn stats_delta_preserves_every_wait_path_as_a_counter() {
-        let before = HybridCacheStats {
+        let before_hybrid = HybridCacheStats {
             request_wait_ns: 10,
             write_back: cache_rs::HybridWriteBackStats {
                 queue_submitted: 10,
@@ -4587,20 +4758,20 @@ mod tests {
             },
             ..HybridCacheStats::default()
         };
-        let after = HybridCacheStats {
+        let after_hybrid = HybridCacheStats {
             request_wait_ns: 17,
             write_back: cache_rs::HybridWriteBackStats {
                 queue_submitted: 17,
                 queue_completed: 17,
                 queue_wait_ns: 17,
-                ..before.write_back
+                ..before_hybrid.write_back
             },
             bucket: cache_rs::BucketCacheStats {
                 io_completed: 17,
                 io_submit_wait_ns: 17,
                 io_completion_ns: 17,
                 page_buffer_wait_ns: 17,
-                ..before.bucket
+                ..before_hybrid.bucket
             },
             region: cache_rs::CacheStats {
                 read_queue_wait_ns: 11,
@@ -4617,9 +4788,37 @@ mod tests {
                 background_regions_reclaimed: 17,
                 reclaim_records_scanned: 17,
                 reclaim_index_fallbacks: 17,
-                ..before.region
+                ..before_hybrid.region
             },
-            ..before
+            ..before_hybrid
+        };
+        let mut before_staging = RegionStagingStats::default();
+        before_staging.chunk_bytes = 4_096;
+        before_staging.resident_bytes = 100;
+        before_staging.flushing_bytes = 50;
+        before_staging.sealed_spans = 10;
+        before_staging.sealed_bytes = 1_000;
+        before_staging.completion_live_records = 10;
+        before_staging.completion_live_bytes = 500;
+        before_staging.completion_obsolete_records = 10;
+        before_staging.completion_obsolete_bytes = 500;
+        let mut after_staging = RegionStagingStats::default();
+        after_staging.chunk_bytes = 8_192;
+        after_staging.resident_bytes = 300;
+        after_staging.flushing_bytes = 200;
+        after_staging.sealed_spans = 17;
+        after_staging.sealed_bytes = 1_700;
+        after_staging.completion_live_records = 17;
+        after_staging.completion_live_bytes = 1_200;
+        after_staging.completion_obsolete_records = 13;
+        after_staging.completion_obsolete_bytes = 900;
+        let before = ObservationStats {
+            hybrid: before_hybrid,
+            region_staging: before_staging,
+        };
+        let after = ObservationStats {
+            hybrid: after_hybrid,
+            region_staging: after_staging,
         };
 
         let delta = StatsDelta::between(before, after);
@@ -4645,6 +4844,15 @@ mod tests {
         assert_eq!(delta.region_background_reclaims, 7);
         assert_eq!(delta.region_reclaim_records_scanned, 7);
         assert_eq!(delta.region_reclaim_index_fallbacks, 7);
+        assert_eq!(delta.region_staging_chunk_bytes, 8_192);
+        assert_eq!(delta.region_staging_resident_bytes, 300);
+        assert_eq!(delta.region_staging_flushing_bytes, 200);
+        assert_eq!(delta.region_staging_sealed_spans, 7);
+        assert_eq!(delta.region_staging_sealed_bytes, 700);
+        assert_eq!(delta.region_staging_completion_live_records, 7);
+        assert_eq!(delta.region_staging_completion_live_bytes, 700);
+        assert_eq!(delta.region_staging_completion_obsolete_records, 3);
+        assert_eq!(delta.region_staging_completion_obsolete_bytes, 400);
     }
 
     #[test]
@@ -4903,7 +5111,7 @@ mod tests {
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
         let json = report.to_json();
-        assert!(json.contains("\"schema_version\":7"));
+        assert!(json.contains("\"schema_version\":8"));
         assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
         assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
         assert!(json.contains("\"latency_samples\":0"));
@@ -4926,10 +5134,31 @@ mod tests {
             "total_region_write_buffer_wait_ns",
             "total_region_control_buffer_wait_ns",
             "total_region_metadata_buffer_wait_ns",
+            "region_staging_chunk_bytes",
+            "region_staging_resident_bytes",
+            "region_staging_flushing_bytes",
+            "region_staging_sealed_spans",
+            "region_staging_sealed_bytes",
+            "region_staging_completion_live_records",
+            "region_staging_completion_live_bytes",
+            "region_staging_completion_obsolete_records",
+            "region_staging_completion_obsolete_bytes",
+            "region_staging_seal_fill_percent",
+            "region_staging_obsolete_record_percent",
+            "region_staging_obsolete_byte_percent",
+            "total_region_staging_chunk_bytes",
+            "total_region_staging_resident_bytes",
+            "total_region_staging_flushing_bytes",
+            "total_region_staging_sealed_spans",
+            "total_region_staging_sealed_bytes",
+            "total_region_staging_completion_live_records",
+            "total_region_staging_completion_live_bytes",
+            "total_region_staging_completion_obsolete_records",
+            "total_region_staging_completion_obsolete_bytes",
         ] {
             assert!(
                 json.contains(&format!("\"{field}\":0")),
-                "missing split Region wait field {field}"
+                "missing zero-valued metric {field}"
             );
         }
         assert!(json.contains("\"hardware_qualification\":false"));

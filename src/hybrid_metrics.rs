@@ -4,14 +4,17 @@ use std::fmt;
 
 use crate::{
     CacheErrorClass, CacheStatus, HybridCache, HybridCacheStats, HybridHealthSnapshot,
-    HybridMetricsSnapshot, LATENCY_BUCKET_COUNT, LATENCY_BUCKET_UPPER_US, RequestResultClass,
+    HybridMetricsSnapshot, LATENCY_BUCKET_COUNT, LATENCY_BUCKET_UPPER_US, RegionStagingStats,
+    RequestResultClass,
 };
 
 impl HybridCache {
     /// Write a bounded OpenMetrics snapshot for Memory, Bucket, Region, and
     /// global Hybrid policy state. The caller owns transport/export lifetime.
     pub fn write_openmetrics(&self, output: &mut impl fmt::Write) -> fmt::Result {
-        self.metrics_snapshot().write_openmetrics(output)
+        let snapshot = self.metrics_snapshot();
+        let staging = self.region_staging_stats();
+        snapshot.write_openmetrics_with_staging(output, &staging)
     }
 
     /// Materialize [`HybridCache::write_openmetrics`] into an owned string.
@@ -590,8 +593,27 @@ impl HybridCacheStats {
 
 impl HybridMetricsSnapshot {
     pub fn write_openmetrics(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        self.write_openmetrics_inner(output, None)
+    }
+
+    fn write_openmetrics_with_staging(
+        &self,
+        output: &mut impl fmt::Write,
+        staging: &RegionStagingStats,
+    ) -> fmt::Result {
+        self.write_openmetrics_inner(output, Some(staging))
+    }
+
+    fn write_openmetrics_inner(
+        &self,
+        output: &mut impl fmt::Write,
+        staging: Option<&RegionStagingStats>,
+    ) -> fmt::Result {
         self.stats
             .write_openmetrics_with_health(output, self.health)?;
+        if let Some(staging) = staging {
+            write_region_staging_openmetrics(output, staging)?;
+        }
         output.write_str("# TYPE cache_rs_hybrid_requests_total counter\n")?;
         for operation in &self.operations {
             for class in RequestResultClass::ALL {
@@ -724,6 +746,46 @@ impl HybridMetricsSnapshot {
     }
 }
 
+fn write_region_staging_openmetrics(
+    output: &mut impl fmt::Write,
+    staging: &RegionStagingStats,
+) -> fmt::Result {
+    metric(output, "region_staging_chunk_bytes", staging.chunk_bytes)?;
+    metric(
+        output,
+        "region_staging_resident_bytes",
+        staging.resident_bytes,
+    )?;
+    metric(
+        output,
+        "region_staging_flushing_bytes",
+        staging.flushing_bytes,
+    )?;
+    counter(output, "region_staging_sealed_spans", staging.sealed_spans)?;
+    counter(output, "region_staging_sealed_bytes", staging.sealed_bytes)?;
+    output.write_str("# TYPE cache_rs_hybrid_region_staging_completion_records_total counter\n")?;
+    for (state, records) in [
+        ("live", staging.completion_live_records),
+        ("obsolete", staging.completion_obsolete_records),
+    ] {
+        writeln!(
+            output,
+            "cache_rs_hybrid_region_staging_completion_records_total{{state=\"{state}\"}} {records}"
+        )?;
+    }
+    output.write_str("# TYPE cache_rs_hybrid_region_staging_completion_bytes_total counter\n")?;
+    for (state, bytes) in [
+        ("live", staging.completion_live_bytes),
+        ("obsolete", staging.completion_obsolete_bytes),
+    ] {
+        writeln!(
+            output,
+            "cache_rs_hybrid_region_staging_completion_bytes_total{{state=\"{state}\"}} {bytes}"
+        )?;
+    }
+    Ok(())
+}
+
 fn counter(output: &mut impl fmt::Write, name: &str, value: u64) -> fmt::Result {
     writeln!(output, "# TYPE cache_rs_hybrid_{name}_total counter")?;
     writeln!(output, "cache_rs_hybrid_{name}_total {value}")
@@ -778,6 +840,41 @@ mod tests {
         assert!(output.contains(
             "cache_rs_hybrid_region_backpressure_wait_ns_total{resource=\"control_queue\"} 23"
         ));
+        assert!(!output.contains("cache_rs_hybrid_region_staging_"));
         assert!(output.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn staging_writer_uses_the_separate_live_snapshot() {
+        let staging = RegionStagingStats {
+            chunk_bytes: 4_194_304,
+            resident_bytes: 3_145_728,
+            flushing_bytes: 2_097_152,
+            sealed_spans: 7,
+            sealed_bytes: 11_534_336,
+            completion_live_records: 11,
+            completion_live_bytes: 9_437_184,
+            completion_obsolete_records: 2,
+            completion_obsolete_bytes: 2_097_152,
+        };
+        let mut output = String::new();
+        write_region_staging_openmetrics(&mut output, &staging).unwrap();
+        assert!(output.contains("cache_rs_hybrid_region_staging_chunk_bytes 4194304"));
+        assert!(output.contains("cache_rs_hybrid_region_staging_resident_bytes 3145728"));
+        assert!(output.contains("cache_rs_hybrid_region_staging_flushing_bytes 2097152"));
+        assert!(output.contains("cache_rs_hybrid_region_staging_sealed_spans_total 7"));
+        assert!(output.contains("cache_rs_hybrid_region_staging_sealed_bytes_total 11534336"));
+        assert!(output.contains(
+            "cache_rs_hybrid_region_staging_completion_records_total{state=\"live\"} 11"
+        ));
+        assert!(output.contains(
+            "cache_rs_hybrid_region_staging_completion_records_total{state=\"obsolete\"} 2"
+        ));
+        assert!(output.contains(
+            "cache_rs_hybrid_region_staging_completion_bytes_total{state=\"live\"} 9437184"
+        ));
+        assert!(output.contains(
+            "cache_rs_hybrid_region_staging_completion_bytes_total{state=\"obsolete\"} 2097152"
+        ));
     }
 }
