@@ -8648,6 +8648,11 @@ fn validate_recovery_topology(
             .checked_add(1)
             .is_some_and(|count| count == expected_append_lanes);
     if active_count != expected_append_lanes && !interrupted_rotation {
+        if allow_interrupted_rotation {
+            return Err(CacheError::CorruptMetadata(
+                "dirty Region topology has multiple interrupted rotations",
+            ));
+        }
         return Err(CacheError::InvalidConfig(format!(
             "existing cache has {active_count} active append lanes, configured {expected_append_lanes}"
         )));
@@ -10106,6 +10111,64 @@ mod m1_tests {
             reopened.get(b"key-23").unwrap().as_deref(),
             Some(value.as_slice())
         );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn dirty_reopen_formats_multiple_interrupted_rotations_empty() {
+        let file = TestFile::new("multiple-interrupted-rotations");
+        let cache_config = multi_lane_config(&file.0);
+        let cache = cache_config.clone().open().unwrap();
+        assert_eq!(
+            cache.put(b"old", b"value", PutOptions::default()).unwrap(),
+            PutOutcome::Stored
+        );
+        cache.flush().unwrap();
+        assert_eq!(
+            cache
+                .put(b"dirty", b"value", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+
+        // Deferred owner-fenced rotations can make several seal writes durable
+        // while their replacement Active headers remain volatile. Persist that
+        // valid crash image directly: the clean checkpoint still proves the
+        // configured lane count, but the current dirty topology has no Active
+        // Regions and cannot be repaired one lane at a time.
+        let sealed = {
+            let state = cache.inner.state.lock().unwrap();
+            state
+                .active_regions
+                .iter()
+                .map(|region_id| {
+                    let mut header = state.regions[*region_id as usize].header;
+                    header.state = RegionState::Sealed;
+                    header
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sealed.len(), 2);
+        for header in sealed {
+            write_all_at(
+                cache.inner.io.as_ref(),
+                WritePoint::RegionHeader,
+                &header.encode(),
+                region_base(&cache.read_superblock().unwrap(), header.region_id).unwrap(),
+            )
+            .unwrap();
+        }
+        cache
+            .inner
+            .io
+            .sync(SyncPoint::RegionRotation, SyncMode::Data)
+            .unwrap();
+        drop(cache);
+
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.status(), CacheStatus::Healthy);
+        assert_eq!(reopened.get(b"old").unwrap(), None);
+        assert_eq!(reopened.get(b"dirty").unwrap(), None);
         reopened.close().unwrap();
     }
 
