@@ -106,12 +106,14 @@ The implementation also passed `cargo test --all-targets --all-features`,
 `cargo clippy --all-targets --all-features -- -D warnings`, and
 `cargo +1.85 check --all-targets --all-features`.
 
-## Next target
+## Follow-up
 
-Replace the shared control gate with lane-affine admission so a request can
-reserve only its actual append lane and cannot consume another lane's permit.
-This preserves the total four-request/eight-buffer hard bounds. After that
-local fix, the larger throughput milestone remains Navy-style lane-local Region
-staging buffers: publish from bounded DRAM and flush large sequential chunks in
-the background instead of waiting for every small write batch.
+Two lane-partitioned admission variants were implemented and measured. A
+strict one-request-per-lane gate regressed throughput by 6.21%; allowing one
+queued request per lane still regressed it by 4.43%. The shared gate is retained
+because its dynamically shared capacity outperformed lane isolation for this
+workload. See `LOCAL_TEMPORAL_10G_20260823_LANE_ADMISSION_REJECTED.md`.
 
+The next architecture target is Navy-style bounded lane-local Region staging:
+publish from DRAM and flush large sequential chunks in the background instead
+of waiting for every small write batch.
