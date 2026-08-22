@@ -153,11 +153,21 @@ impl WriteBackExecutor {
         self.gate.reserve(bytes)
     }
 
-    /// Reserve one bounded detached write without waiting. Explicit flush
-    /// pauses and drains these tasks before using the synchronous path, so the
-    /// full configured queue and byte budget are available during steady state.
+    /// Reserve one disposable lower-absent write without waiting. These tasks
+    /// may use at most 75% of the shared slots and bytes, leaving capacity for
+    /// updates whose pending fence is required to hide an older lower value.
     pub(crate) fn try_reserve_background(&self, bytes: usize) -> Option<WriteBackReservation> {
-        self.gate.try_reserve_background(bytes)
+        self.gate.try_reserve_background(bytes, false)
+    }
+
+    /// Reserve a lower-candidate detached write from the complete bounded
+    /// budget. Failure rejects the incoming cache put while retaining its dirty
+    /// victim; it never falls back to foreground device I/O.
+    pub(crate) fn try_reserve_priority_background(
+        &self,
+        bytes: usize,
+    ) -> Option<WriteBackReservation> {
+        self.gate.try_reserve_background(bytes, true)
     }
 
     /// Stop proactive admission and drain every already accepted background
@@ -375,14 +385,24 @@ impl WriteBackGate {
         })
     }
 
-    fn try_reserve_background(self: &Arc<Self>, bytes: usize) -> Option<WriteBackReservation> {
+    fn try_reserve_background(
+        self: &Arc<Self>,
+        bytes: usize,
+        priority: bool,
+    ) -> Option<WriteBackReservation> {
         if bytes > self.max_bytes {
             return None;
         }
         let mut state = lock_unpoisoned(&self.state);
         let slots_full = state.in_flight >= self.max_in_flight;
         let bytes_full = bytes > self.max_bytes.saturating_sub(state.bytes_in_use);
-        if state.closed || state.background_pauses != 0 || slots_full || bytes_full {
+        let optional_slots = self.max_in_flight.saturating_mul(3) / 4;
+        let optional_bytes = self.max_bytes.saturating_mul(3) / 4;
+        let optional_full = !priority
+            && (state.background_in_flight >= optional_slots
+                || bytes > optional_bytes.saturating_sub(state.background_bytes_in_use));
+        if state.closed || state.background_pauses != 0 || slots_full || bytes_full || optional_full
+        {
             return None;
         }
         state.in_flight += 1;
@@ -582,11 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn background_admission_can_use_the_full_steady_state_budget() {
+    fn background_admission_reserves_capacity_for_lower_candidate_updates() {
         let executor = WriteBackExecutor::try_new(2, 1, 16, BackpressurePolicy::Reject).unwrap();
         let first = executor.try_reserve_background(8).unwrap();
-        let second = executor.try_reserve_background(8).unwrap();
         assert!(executor.try_reserve_background(1).is_none());
+        let second = executor.try_reserve_priority_background(8).unwrap();
+        assert!(executor.try_reserve_background(1).is_none());
+        assert!(executor.try_reserve_priority_background(1).is_none());
         assert!(matches!(
             executor.reserve(1),
             Err(WriteBackRunError::Overloaded(_))

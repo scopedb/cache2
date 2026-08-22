@@ -3106,7 +3106,7 @@ impl HybridCache {
             .counters
             .demotion_attempts
             .fetch_add(1, Ordering::Relaxed);
-        if self.schedule_async_eviction(entry)? {
+        if self.schedule_async_eviction(entry, lower_candidate)? {
             return Ok(0);
         }
 
@@ -3138,6 +3138,7 @@ impl HybridCache {
     fn schedule_async_eviction(
         &self,
         entry: &MemoryEntry,
+        lower_candidate: bool,
     ) -> std::result::Result<bool, DirtyPersistFailure> {
         let Some(executor) = self.inner.write_back.as_ref() else {
             return Ok(false);
@@ -3151,7 +3152,12 @@ impl HybridCache {
         else {
             return Ok(false);
         };
-        let Some(reservation) = executor.try_reserve_background(reservation_bytes) else {
+        let reservation = if lower_candidate {
+            executor.try_reserve_priority_background(reservation_bytes)
+        } else {
+            executor.try_reserve_background(reservation_bytes)
+        };
+        let Some(reservation) = reservation else {
             return Ok(false);
         };
         let owned = match try_clone_memory_entry(entry) {
