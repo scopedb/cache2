@@ -342,6 +342,15 @@ in memory and do not write journal records or issue metadata syncs. A dirty
 Hybrid reopen may safely clear both lower tiers. Standalone `DiskCache` retains
 its checkpoint-plus-incremental-tail recovery behavior described below.
 
+Hybrid Region deletion uses that disposable-session contract directly. It
+validates the exact key, publishes an in-memory index retirement, and does not
+append a tombstone; moving a value from Region to Bucket may conservatively
+retire the Region hash candidate without reading it. The owner dirty fence is
+established before either retirement. A normal `flush`/`close` persists the
+updated Region index, while an unclean reopen discards the lower tiers, so an
+older physical record cannot become visible again. Standalone `DiskCache`
+continues to append tombstones for incremental dirty recovery.
+
 Clean checkpoint loading rebuilds per-Region index counters and standalone
 namespace live bytes during the same streamed entry-decode pass. It accounts
 only entries actually applied after compact-index collision/replacement rules;

@@ -2093,10 +2093,119 @@ impl DiskCache {
         let hash = hash_namespaced_key(self.inner.config.hash_seed, namespace, key);
         let _key_order = self.inner.key_ordering.lock(hash);
         let epoch_start_seqno = self.read_superblock()?.epoch_start_seqno;
-        let Some(candidate) = self.inner.index.get(hash, epoch_start_seqno) else {
+        let Some(candidate) = self
+            .inner
+            .index
+            .get(hash, epoch_start_seqno)
+            .filter(|entry| !entry.location.is_tombstone())
+        else {
             return Ok(false);
         };
+        self.mark_dirty_for_managed_retirement()?;
         self.remove_index_entry_accounted(hash, candidate)
+    }
+
+    /// Remove an exact managed-cache key without appending a tombstone.
+    ///
+    /// The composing Hybrid cache keeps a durable dirty-session fence, so an
+    /// unclean restart discards all lower-tier state. A clean flush publishes
+    /// this updated Region index before making the Hybrid manifest clean. We
+    /// still read and validate the candidate because the compact index stores
+    /// only a hash and a collision must not make `remove` report success.
+    pub(crate) fn remove_in_memory_managed(
+        &self,
+        namespace: NamespaceId,
+        key: &[u8],
+    ) -> Result<RemoveOutcome> {
+        let started = Instant::now();
+        let result = (|| -> Result<RemoveOutcome> {
+            self.ensure_accepting()?;
+            let _barrier = self.lock_shared_operation()?;
+            let hash = hash_namespaced_key(self.inner.config.hash_seed, namespace, key);
+            let _key_order = self.inner.key_ordering.lock(hash);
+            {
+                let state = self.lock_state()?;
+                ensure_operational(&state)?;
+            }
+            if key.len() > MAX_KEY_SIZE {
+                self.record_in_memory_remove()?;
+                return Ok(RemoveOutcome::NotFound);
+            }
+
+            let superblock = self.read_superblock()?;
+            let Some(entry) = self
+                .inner
+                .index
+                .get(hash, superblock.epoch_start_seqno)
+                .filter(|entry| entry.namespace_id == namespace && !entry.location.is_tombstone())
+            else {
+                self.record_in_memory_remove()?;
+                return Ok(RemoveOutcome::NotFound);
+            };
+            let mut request = match self.inner.resources.begin_read() {
+                Ok(request) => request,
+                Err(reason) => return self.operational_overload(reason),
+            };
+            request
+                .buffer
+                .prepare(entry.location.record_len() as usize)
+                .map_err(|()| CacheError::Overloaded(OverloadReason::ReadBufferUnavailable))?;
+            let region = self.lock_read_region(entry.location.region_id())?;
+            let snapshot = ReadSnapshot {
+                superblock,
+                region: *region,
+            };
+            let (_permit, buffer) = request.into_parts();
+            let (loaded, _buffer) =
+                match self.load_entry(snapshot, entry, namespace, key, buffer, None) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        drop(region);
+                        let mut state = self.lock_state()?;
+                        self.enter_failure_state(&mut state, &error);
+                        return Err(error);
+                    }
+                };
+            let (remove_candidate, found) = match loaded {
+                LoadedRecord::Value { .. } => (true, true),
+                LoadedRecord::Expired | LoadedRecord::Corrupt => (true, false),
+                LoadedRecord::KeyMismatch | LoadedRecord::Tombstone => (false, false),
+                LoadedRecord::Unavailable(error) => {
+                    drop(region);
+                    let mut state = self.lock_state()?;
+                    self.enter_miss_only(&mut state);
+                    return Err(CacheError::Io(error));
+                }
+                LoadedRecord::Cancelled => {
+                    return Err(CacheError::CorruptMetadata(
+                        "uncancellable managed remove was cancelled",
+                    ));
+                }
+            };
+            drop(region);
+            let removed = if remove_candidate {
+                self.mark_dirty_for_managed_retirement()?;
+                self.remove_index_entry_accounted(hash, entry)?
+            } else {
+                false
+            };
+            self.record_in_memory_remove()?;
+            Ok(if found && removed {
+                RemoveOutcome::Removed
+            } else {
+                RemoveOutcome::NotFound
+            })
+        })();
+        self.record_operation(
+            CacheOperation::Remove,
+            &result,
+            |outcome| match outcome {
+                RemoveOutcome::Removed => RequestResultClass::Removed,
+                RemoveOutcome::NotFound => RequestResultClass::NotFound,
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     /// Return a conservative upper bound for the current candidate's decoded
@@ -3578,6 +3687,13 @@ impl DiskCache {
         }
     }
 
+    fn record_in_memory_remove(&self) -> Result<()> {
+        let mut state = self.lock_state()?;
+        ensure_operational(&state)?;
+        state.stats.removes = state.stats.removes.saturating_add(1);
+        Ok(())
+    }
+
     fn mark_dirty_for_managed_retirement(&self) -> Result<()> {
         if !self.inner.delegated_policy {
             return Ok(());
@@ -3981,9 +4097,10 @@ impl DiskCache {
             buffer
                 .prepared(record.minimum_record_len as usize)
                 .map_err(|()| CacheError::Overloaded(OverloadReason::WriteBufferUnavailable))?;
-            // Only serialize the publication handoff. The potentially slow
-            // NVMe read above never holds an ordering shard needed by a
-            // foreground key that merely collides in the shard table.
+            // Serialize through completion. Once the reinsertion command is
+            // accepted, an index-only managed remove must run after its new
+            // publication rather than return and let this older value reappear.
+            // The potentially slow source read above remains outside the lock.
             let key_order = self
                 .inner
                 .key_ordering
@@ -4027,11 +4144,12 @@ impl DiskCache {
             self.inner.append_txs[lane]
                 .try_send(command)
                 .map_err(|_| CacheError::Overloaded(OverloadReason::WriteQueueFull))?;
-            drop(key_order);
-            completion_rx
+            let outcome = completion_rx
                 .recv()
                 .map_err(|_| CacheError::Poisoned)?
-                .map(|receipt| receipt.outcome)
+                .map(|receipt| receipt.outcome);
+            drop(key_order);
+            outcome
         })();
 
         if !matches!(failed, Ok(PutOutcome::Stored)) {
@@ -10212,7 +10330,7 @@ mod m1_tests {
     }
 
     #[test]
-    fn volatile_invalidation_retires_one_candidate_without_device_io() {
+    fn volatile_invalidation_retires_one_candidate_without_record_io() {
         let file = TestFile::new("volatile-invalidation");
         let shared = Arc::new(HostWriteTracker::try_new(None, None).unwrap());
         let retired = Arc::new(Mutex::new(Vec::<NamespaceUsage>::new()));
@@ -10270,7 +10388,8 @@ mod m1_tests {
         assert_eq!(shared.snapshot(), before_host_writes);
         assert_eq!(
             owner_dirty_calls.load(Ordering::Relaxed),
-            before_owner_dirty
+            before_owner_dirty + 1,
+            "the owner fence must precede a checkpoint-visible index retirement"
         );
         assert_eq!(
             retired
@@ -10281,6 +10400,44 @@ mod m1_tests {
         );
         assert_eq!(cache.scan_live_usage(|_| {}).unwrap(), 0);
         cache.close().unwrap();
+    }
+
+    #[test]
+    fn volatile_invalidation_preserves_an_existing_tombstone_fence() {
+        let file = TestFile::new("volatile-invalidation-tombstone");
+        let cache_config = config(&file.0);
+        let cache = cache_config.clone().open().unwrap();
+        assert_eq!(
+            cache.put(b"key", b"value", PutOptions::default()).unwrap(),
+            PutOutcome::Stored
+        );
+        assert_eq!(cache.remove(b"key").unwrap(), RemoveOutcome::Removed);
+        let hash = hash_namespaced_key(cache.inner.config.hash_seed, 0, b"key");
+        let before = {
+            let state = cache.lock_state().unwrap();
+            cache
+                .inner
+                .index
+                .get(hash, state.superblock.epoch_start_seqno)
+                .unwrap()
+        };
+        assert!(before.location.is_tombstone());
+
+        assert!(!cache.invalidate_in_memory(0, b"key").unwrap());
+        let after = {
+            let state = cache.lock_state().unwrap();
+            cache
+                .inner
+                .index
+                .get(hash, state.superblock.epoch_start_seqno)
+                .unwrap()
+        };
+        assert_eq!(after, before);
+        cache.close().unwrap();
+
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+        reopened.close().unwrap();
     }
 
     #[test]

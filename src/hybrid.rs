@@ -2384,7 +2384,9 @@ impl HybridCache {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.poison();
+                        if error.phase == DiskMutationPhase::CommittedOrUncertain {
+                            self.poison();
+                        }
                         return Err(error.error);
                     }
                 };
@@ -4033,13 +4035,9 @@ impl DiskPair {
             if receipt.outcome == PutOutcome::Stored && source_present {
                 #[cfg(test)]
                 crash_hit(HybridCrashPoint::BeforeSourceRemove);
-                let removed = self
-                    .region
-                    .remove_in_managed(namespace, key)
+                self.region
+                    .invalidate_in_memory(namespace, key)
                     .map_err(DiskPairError::after_commit)?;
-                if let Some(usage) = removed.previous_usage {
-                    record_region_retirement(policy, usage).map_err(DiskPairError::after_commit)?;
-                }
                 #[cfg(test)]
                 crash_hit(HybridCrashPoint::AfterSourceRemove);
             }
@@ -4089,13 +4087,25 @@ impl DiskPair {
         key: &[u8],
         policy: Option<&PolicyController>,
     ) -> DiskMutationResult<RemoveOutcome> {
-        let region = self
-            .region
-            .remove_in_managed(namespace, key)
-            .map_err(DiskPairError::before_commit)?;
-        if let (Some(policy), Some(usage)) = (policy, region.previous_usage) {
-            record_region_retirement(policy, usage).map_err(DiskPairError::after_commit)?;
-        }
+        let region = if policy.is_some() {
+            // The Hybrid dirty-session fence makes a Region tombstone
+            // redundant. Verify the exact compact-index candidate, retire it
+            // in memory, and let the next clean checkpoint publish the miss.
+            match self.region.remove_in_memory_managed(namespace, key) {
+                Ok(outcome) => outcome,
+                Err(error @ CacheError::Overloaded(_)) => {
+                    return Err(DiskPairError::before_commit(error));
+                }
+                Err(error) => return Err(DiskPairError::after_commit(error)),
+            }
+        } else {
+            // Dirty-journal recovery runs before normal traffic and must leave
+            // a physical fence that survives its own recovery process.
+            self.region
+                .remove_in_managed(namespace, key)
+                .map_err(DiskPairError::before_commit)?
+                .outcome
+        };
         #[cfg(test)]
         crash_hit(HybridCrashPoint::AfterFirstRemove);
         let bucket = self
@@ -4109,8 +4119,7 @@ impl DiskPair {
         #[cfg(test)]
         crash_hit(HybridCrashPoint::AfterAllRemoves);
         Ok(
-            if region.outcome == RemoveOutcome::Removed || bucket.outcome == RemoveOutcome::Removed
-            {
+            if region == RemoveOutcome::Removed || bucket.outcome == RemoveOutcome::Removed {
                 RemoveOutcome::Removed
             } else {
                 RemoveOutcome::NotFound
@@ -4532,17 +4541,6 @@ fn record_bucket_retirements(
     removed: Vec<BucketEntryUsage>,
 ) -> Result<()> {
     record_bucket_retirements_slice(policy, &removed)
-}
-
-fn record_region_retirement(policy: &PolicyController, usage: NamespaceUsage) -> Result<()> {
-    if policy.namespaces().contains(usage.namespace)
-        && !policy.namespaces().record_removal_exact(usage)
-    {
-        return Err(CacheError::CorruptMetadata(
-            "managed Region retirement exceeded namespace live usage",
-        ));
-    }
-    Ok(())
 }
 
 fn record_bucket_retirements_slice(
@@ -5007,9 +5005,15 @@ mod tests {
         let large = vec![3_u8; 2048];
         cache.put(b"key", &large, PutOptions::default()).unwrap();
         assert_eq!(cache.get(b"key").unwrap(), Some(large));
+        let region_batches = cache.stats().region.write_batches;
         cache
             .put(b"key", b"small-again", PutOptions::default())
             .unwrap();
+        assert_eq!(
+            cache.stats().region.write_batches,
+            region_batches,
+            "moving into Bucket must invalidate the old Region index without a tombstone"
+        );
         assert_eq!(cache.get(b"key").unwrap(), Some(b"small-again".to_vec()));
         assert_eq!(cache.remove(b"key").unwrap(), RemoveOutcome::Removed);
         assert_eq!(cache.get(b"key").unwrap(), None);
@@ -5018,6 +5022,32 @@ mod tests {
 
         let reopened = config(&files, 8 * 1024).open().unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), None);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn managed_region_remove_avoids_a_tombstone_and_survives_checkpoint() {
+        let files = TestFiles::new("volatile-region-remove");
+        let cache_config = config(&files, 8 * 1024);
+        let cache = cache_config.clone().open().unwrap();
+        let value = vec![7_u8; 2048];
+        assert_eq!(
+            cache.put(b"large", &value, PutOptions::default()).unwrap(),
+            PutOutcome::Stored
+        );
+        let before = cache.stats().region;
+
+        assert_eq!(cache.remove(b"large").unwrap(), RemoveOutcome::Removed);
+        let after = cache.stats().region;
+        assert_eq!(after.write_batches, before.write_batches);
+        assert_eq!(after.bytes_written, before.bytes_written);
+        assert_eq!(after.removes, before.removes + 1);
+        assert_eq!(cache.get(b"large").unwrap(), None);
+
+        cache.flush().unwrap();
+        cache.close().unwrap();
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"large").unwrap(), None);
         reopened.close().unwrap();
     }
 

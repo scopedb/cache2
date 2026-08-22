@@ -258,6 +258,48 @@ fn complete_second_chance(cache: &DiskCache, key: &[u8], value: &[u8], hash: u64
         .unwrap()
 }
 
+#[test]
+fn managed_index_remove_orders_after_an_accepted_reinsertion() {
+    let file = TestFile::new("managed-remove-reinsertion-order");
+    let cache_config = config(&file.0).with_reclaim_mode(ReclaimMode::SecondChance);
+    let (backend, gate) = GatedRecordBackend::open(&file.0).unwrap();
+    let cache = DiskCache::open_with_backend(cache_config, Box::new(backend)).unwrap();
+    assert_eq!(
+        cache.put(b"key", b"value", PutOptions::default()).unwrap(),
+        PutOutcome::Stored
+    );
+
+    gate.arm();
+    let reinsert_cache = cache.clone();
+    let reinsert = std::thread::spawn(move || reinsert_cache.reinsert_current_for_test(0, b"key"));
+    assert!(gate.wait_for_entries(1, Duration::from_secs(2)));
+
+    let remove_cache = cache.clone();
+    let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+    let remove = std::thread::spawn(move || {
+        removed_tx
+            .send(remove_cache.remove_in_memory_managed(0, b"key"))
+            .unwrap();
+    });
+    assert!(matches!(
+        removed_rx.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    gate.release();
+    assert!(reinsert.join().unwrap().unwrap());
+    assert_eq!(
+        removed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(),
+        RemoveOutcome::Removed
+    );
+    remove.join().unwrap();
+    assert_eq!(cache.get(b"key").unwrap(), None);
+    cache.close().unwrap();
+}
+
 fn open_fault_cache(config: CacheConfig) -> (DiskCache, crate::io_backend::testing::FaultHandle) {
     let (backend, handle) = FaultBackend::open(&config.path).unwrap();
     let cache = DiskCache::open_with_backend(config, Box::new(backend)).unwrap();
