@@ -282,12 +282,16 @@ target/release/cache-bench hybrid \
 `--sizes` accepts at most 16 `SIZE:WEIGHT` classes and caps each object at
 64 MiB. The generator derives fixed-size keys on demand instead of retaining a
 key vector. Its bounded 8-byte-per-key state records the latest version, route
-class, presence, and TTL deadline; scratch values and explicit 512 KiB worker
-stacks are included in `--generator-memory-budget`. Key count (up to 100
-million), command input, concurrency, queue depth, worker counts, durations,
-and every engine configuration retain hard validation bounds. Prefill uses at
-most `--prefill-concurrency` workers and verification samples do not scale with
-the key count. The command refuses all non-empty targets, including valid old
+class, presence, and TTL deadline. Before timing starts, each worker prepares
+one maximum-sized deterministic payload template; the hot loop patches only its
+32-byte key/version header and passes the selected size prefix. Each cache API
+call, including both legs of a cross-tier update, receives one independent
+latency sample. Scratch templates and explicit 512 KiB worker stacks are
+included in `--generator-memory-budget`. Key count (up to 100 million), command
+input, concurrency, queue depth, worker counts, durations, and every engine
+configuration retain hard validation bounds. Prefill uses at most
+`--prefill-concurrency` workers and verification samples do not scale with the
+key count. The command refuses all non-empty targets, including valid old
 caches; this prevents benchmark automation from erasing a warm production
 Hybrid cache.
 
