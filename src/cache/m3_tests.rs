@@ -1210,6 +1210,11 @@ fn region_reuse_waits_for_a_reader_of_the_old_incarnation() {
     let reuse_waiting =
         schedule.wait_for(SchedulePoint::RotateBlockedByReader, Duration::from_secs(5));
 
+    // Waiting for a pinned victim reader must not retain the global Region
+    // manager. Other append lanes need this lock to reserve and publish their
+    // independent sequential writes while the FIFO rotation is stalled.
+    let state_available = cache.inner.state.try_lock().is_ok();
+
     // Always release the reader before assertions and joins.
     reads.release();
     let reader_result = reader.join().unwrap();
@@ -1217,6 +1222,10 @@ fn region_reuse_waits_for_a_reader_of_the_old_incarnation() {
 
     assert!(read_entered, "the victim read did not reach positioned I/O");
     assert!(reuse_waiting, "the writer did not reach region reuse");
+    assert!(
+        state_available,
+        "FIFO rotation waited for a victim reader while holding State"
+    );
     assert_eq!(reader_result.unwrap(), Some(victim_value.to_vec()));
     assert_eq!(writer_result.unwrap(), PutOutcome::Stored);
     let events = schedule.events();

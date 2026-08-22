@@ -313,19 +313,19 @@ The data path and reclaim path no longer perform a full-index scan per Region
 rotation.
 
 The scalable fast path is steady-state record I/O: independent reads and
-hash-selected append lanes overlap. FIFO and `SecondChance` both prepare one
-oldest sealed Region on the maintenance worker once unused Regions are
-exhausted and an Active Region approaches rotation. This moves the normal
-victim scrub out of the global Region-manager state lock. FIFO retains one
-sealed Region for its original synchronous fallback, so background work does
-not introduce a new `ReclaimBacklog` result. Standalone Region preserves the
-rotation durability barrier; owner-fenced Hybrid defers it to `flush`/`close`,
-because an unclean session already reopens safe-empty. `SecondChance` requires
-the prepared Region and can still return `ReclaimBacklog` under sustained
-full-cache writes. Checkpoint publication remains an exclusive O(index slots)
-operation. Payload I/O is aggregated into fixed 256 KiB writes, but a 100M-entry
-checkpoint is still a planned maintenance pause, not a transparent background
-snapshot.
+hash-selected append lanes overlap. FIFO selects the exact oldest victim only
+after a concrete append batch no longer fits, preserving the original capacity
+and eviction contract. A short global rotation gate fixes selection order, but
+the reader drain, Region Header I/O, and exact victim scrub run without the
+global Region-manager state lock, so unrelated lanes can continue reserving
+and publishing writes. `SecondChance` instead prepares one oldest sealed Region
+on the maintenance worker and can return `ReclaimBacklog` when no prepared
+victim is ready. Standalone Region preserves the rotation durability barrier;
+owner-fenced Hybrid defers it to `flush`/`close`, because an unclean session
+already reopens safe-empty. Checkpoint publication remains an exclusive
+O(index slots) operation. Payload I/O is aggregated into fixed 256 KiB writes,
+but a 100M-entry checkpoint is still a planned maintenance pause, not a
+transparent background snapshot.
 
 The path must be dedicated to the cache. A completed Hybrid `put` is immediately
 visible in the running process but, in default write-back mode, may exist only in

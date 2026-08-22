@@ -959,8 +959,8 @@ pub(crate) struct Inner {
     reinsert_completed: AtomicU64,
     maintenance_tx: SyncSender<MaintenanceCommand>,
     maintenance_worker: Mutex<Option<JoinHandle<()>>>,
-    reclaim_eligible: AtomicBool,
     reclaim_forced: AtomicBool,
+    rotation_gate: Mutex<()>,
     reclaim_records_scanned: AtomicU64,
     reclaim_index_fallbacks: AtomicU64,
     checkpoint_bytes: AtomicU64,
@@ -1053,11 +1053,19 @@ struct State {
     runtime_accounting_restored: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegionMeta {
     header: RegionHeader,
     used: u64,
     max_seqno: u64,
+}
+
+struct FifoRotationPlan {
+    superblock: Superblock,
+    lane_id: usize,
+    old_active: RegionMeta,
+    victim: RegionMeta,
+    next_header: RegionHeader,
 }
 
 struct ReadView {
@@ -1735,7 +1743,6 @@ impl DiskCache {
             return Err(error);
         }
         let initial_status = state.status;
-        let reclaim_eligible = state.free_regions.is_empty();
         debug_assert!(read_regions.capacity() >= state.regions.len());
         read_regions.extend(state.regions.iter().copied().map(RwLock::new));
         let read_view = ReadView {
@@ -1794,8 +1801,8 @@ impl DiskCache {
             reinsert_completed: AtomicU64::new(0),
             maintenance_tx,
             maintenance_worker: Mutex::new(None),
-            reclaim_eligible: AtomicBool::new(reclaim_eligible),
             reclaim_forced: AtomicBool::new(false),
+            rotation_gate: Mutex::new(()),
             reclaim_records_scanned: AtomicU64::new(0),
             reclaim_index_fallbacks: AtomicU64::new(0),
             checkpoint_bytes: AtomicU64::new(0),
@@ -4266,11 +4273,8 @@ impl DiskCache {
     }
 
     fn request_background_reclaim(&self, force: bool) {
-        if !self.inner.accepting.load(Ordering::Acquire) {
-            return;
-        }
-        if self.inner.config.reclaim_mode == ReclaimMode::Fifo
-            && !self.inner.reclaim_eligible.load(Ordering::Acquire)
+        if self.inner.config.reclaim_mode != ReclaimMode::SecondChance
+            || !self.inner.accepting.load(Ordering::Acquire)
         {
             return;
         }
@@ -4284,7 +4288,9 @@ impl DiskCache {
     }
 
     fn run_background_reclaim(&self) {
-        if !self.inner.accepting.load(Ordering::Acquire) {
+        if self.inner.config.reclaim_mode != ReclaimMode::SecondChance
+            || !self.inner.accepting.load(Ordering::Acquire)
+        {
             return;
         }
         let forced = self.inner.reclaim_forced.swap(false, Ordering::AcqRel);
@@ -4303,10 +4309,6 @@ impl DiskCache {
                 || state.reclaiming_region.is_some()
                 || state.reclaim_ready_region.is_some()
                 || !state.free_regions.is_empty()
-                // FIFO must retain one synchronous victim so background
-                // precleaning cannot introduce a new ReclaimBacklog outcome.
-                || (self.inner.config.reclaim_mode == ReclaimMode::Fifo
-                    && state.sealed_regions.len() <= 1)
             {
                 return;
             }
@@ -5382,7 +5384,14 @@ impl DiskCache {
             if let Some(plan) = plan_batch(minimum_lengths, start, remaining, align_for_direct) {
                 break plan;
             }
-            if let Err(error) = self.rotate_region(&mut state, lane_id) {
+            if self.inner.config.reclaim_mode == ReclaimMode::Fifo {
+                drop(state);
+                self.rotate_fifo_on_demand(lane_id)?;
+                state = self.lock_state()?;
+                ensure_operational(&state)?;
+                continue;
+            }
+            if let Err(error) = self.rotate_region_locked(&mut state, lane_id) {
                 if !matches!(error, CacheError::ReclaimBacklog) {
                     self.enter_failure_state(&mut state, &error);
                 }
@@ -5465,7 +5474,9 @@ impl DiskCache {
             .checked_add(u64::from(record_len))
             .ok_or(CacheError::CorruptMetadata("active region cursor overflow"))?;
         if end > self.inner.config.region_size {
-            self.rotate_region(state, lane_id)?;
+            return Err(CacheError::CorruptMetadata(
+                "batch reservation crossed its preplanned active Region",
+            ));
         }
 
         let seqno = take_seqno(state)?;
@@ -5503,21 +5514,210 @@ impl DiskCache {
         })
     }
 
-    fn rotate_region(&self, state: &mut State, lane_id: usize) -> Result<()> {
+    fn rotate_fifo_on_demand(&self, lane_id: usize) -> Result<()> {
+        // Every FIFO rotation must complete in selection order. Never wait for
+        // this gate while holding State: the winning lane performs the slow
+        // reader drain, metadata I/O, and victim scrub without monopolizing
+        // unrelated append lanes' Region-manager access.
+        let _rotation = self
+            .inner
+            .rotation_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = self.rotate_fifo_on_demand_inner(lane_id);
+        if let Err(error) = &result {
+            // Phase A removes a victim from the FIFO queues. Any later error
+            // therefore makes the in-memory topology unpublishable; do not
+            // leave the cache Healthy with an orphaned Region.
+            self.fail_append(error);
+        }
+        result
+    }
+
+    fn plan_fifo_rotation(&self, lane_id: usize) -> Result<FifoRotationPlan> {
+        let mut state = self.lock_state()?;
+        ensure_operational(&state)?;
+        if self.inner.config.reclaim_mode != ReclaimMode::Fifo {
+            return Err(CacheError::CorruptMetadata(
+                "on-demand FIFO rotation used by another reclaim mode",
+            ));
+        }
+        if state.reclaiming_region.is_some() || state.reclaim_ready_region.is_some() {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO rotation found an unexpected reclaim owner",
+            ));
+        }
+
+        let old_active_id =
+            *state
+                .active_regions
+                .get(lane_id)
+                .ok_or(CacheError::CorruptMetadata(
+                    "append lane id is out of bounds",
+                ))?;
+        let old_active =
+            *state
+                .regions
+                .get(old_active_id as usize)
+                .ok_or(CacheError::CorruptMetadata(
+                    "active Region is out of bounds",
+                ))?;
+        if old_active.header.region_id != old_active_id
+            || old_active.header.state != RegionState::Active
+            || old_active.header.used != old_active.used
+        {
+            return Err(CacheError::CorruptMetadata(
+                "append lane points to an invalid Active Region",
+            ));
+        }
+
+        let (victim_id, victim_state) = if let Some(victim) = state.free_regions.front() {
+            (*victim, RegionState::Free)
+        } else if let Some(victim) = state.sealed_regions.front() {
+            (*victim, RegionState::Sealed)
+        } else {
+            return Err(CacheError::CorruptMetadata(
+                "no non-Active Region is available for FIFO rotation",
+            ));
+        };
+        if victim_id == old_active_id {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO rotation selected its current Active Region",
+            ));
+        }
+        let victim = *state
+            .regions
+            .get(victim_id as usize)
+            .ok_or(CacheError::CorruptMetadata(
+                "FIFO victim Region is out of bounds",
+            ))?;
+        if victim.header.region_id != victim_id
+            || victim.header.state != victim_state
+            || victim.header.used != victim.used
+        {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO victim queue is inconsistent",
+            ));
+        }
+        let incarnation = victim
+            .header
+            .incarnation
+            .checked_add(1)
+            .ok_or(CacheError::CorruptMetadata("region incarnation overflow"))?;
+        let created_seqno = take_seqno(&mut state)?;
+        let removed = if victim_state == RegionState::Free {
+            state.free_regions.pop_front()
+        } else {
+            state.sealed_regions.pop_front()
+        };
+        if removed != Some(victim_id) {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO victim changed during rotation planning",
+            ));
+        }
+        state.reclaiming_region = Some(victim_id);
+        Ok(FifoRotationPlan {
+            superblock: state.superblock,
+            lane_id,
+            old_active,
+            victim,
+            next_header: RegionHeader {
+                region_id: victim_id,
+                incarnation,
+                state: RegionState::Active,
+                created_seqno,
+                used: REGION_HEADER_SIZE as u64,
+            },
+        })
+    }
+
+    fn rotate_fifo_on_demand_inner(&self, lane_id: usize) -> Result<()> {
+        let plan = self.plan_fifo_rotation(lane_id)?;
+
+        // Reuse changes the meaning of every physical offset in this Region.
+        // Keep the old generation write-fenced from the first scrubbed index
+        // entry through publication of the replacement generation.
+        let victim_id = plan.next_header.region_id;
+        let mut victim_view = self.lock_read_region_for_rotation(victim_id);
+        #[cfg(test)]
+        self.observe_schedule(SchedulePoint::RotateReadersDrained);
+
+        let mut sealed = plan.old_active.header;
+        sealed.state = RegionState::Sealed;
+        sealed.used = plan.old_active.used;
+        self.write_region_header(&plan.superblock, sealed)?;
+        // The previous owner must be durably non-Active before its replacement
+        // can become durable. A Hybrid owner has already fenced the complete
+        // lower cache as dirty and may defer these barriers to flush/close.
+        if self.inner.owner_dirty.is_none() {
+            self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        }
+        self.write_region_header(&plan.superblock, plan.next_header)?;
+        if self.inner.owner_dirty.is_none() {
+            self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        }
+        self.scrub_or_fallback_region_index(
+            &plan.superblock,
+            plan.victim,
+            plan.superblock.epoch_start_seqno,
+        )?;
+        self.publish_scrubbed_region_generation(plan.next_header)?;
+
+        // Acquire both Region views before State, following the read-view ->
+        // State publication order. The operation barrier excludes clear,
+        // flush, and close while this accepted append is completing.
+        let old_active_id = plan.old_active.header.region_id;
+        let mut old_active_view = self.inner.read_view.regions[old_active_id as usize]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_state()?;
+        ensure_operational(&state)?;
+        let plan_still_owned = state.reclaiming_region == Some(victim_id)
+            && state.active_regions.get(plan.lane_id) == Some(&old_active_id)
+            && state.regions.get(old_active_id as usize) == Some(&plan.old_active)
+            && state.regions.get(victim_id as usize) == Some(&plan.victim)
+            && state.superblock.epoch == plan.superblock.epoch
+            && state.superblock.epoch_start_seqno == plan.superblock.epoch_start_seqno
+            && state.superblock.hash_seed == plan.superblock.hash_seed;
+        if !plan_still_owned {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO rotation ownership changed before publication",
+            ));
+        }
+
+        let old_active_index = old_active_id as usize;
+        state.regions[old_active_index].header = sealed;
+        state.sealed_regions.push_back(old_active_id);
+        *old_active_view = state.regions[old_active_index];
+
+        let victim_index = victim_id as usize;
+        let reused = plan.victim.header.state != RegionState::Free;
+        let replacement = RegionMeta {
+            header: plan.next_header,
+            used: REGION_HEADER_SIZE as u64,
+            max_seqno: 0,
+        };
+        state.regions[victim_index] = replacement;
+        state.active_regions[plan.lane_id] = victim_id;
+        state.reclaiming_region = None;
+        if reused {
+            state.stats.regions_reused = state.stats.regions_reused.saturating_add(1);
+        }
+        *victim_view = replacement;
+        Ok(())
+    }
+
+    fn rotate_region_locked(&self, state: &mut State, lane_id: usize) -> Result<()> {
+        debug_assert_eq!(self.inner.config.reclaim_mode, ReclaimMode::SecondChance);
         let old_active = *state
             .active_regions
             .get(lane_id)
             .ok_or(CacheError::CorruptMetadata(
                 "append lane id is out of bounds",
             ))?;
-        // Prefer unused capacity, then a Region that maintenance has already
-        // fenced, scrubbed, and emptied. SecondChance requires that prepared
-        // victim; FIFO retains synchronous reclaim as a fallback when the
-        // maintenance worker has not completed in time.
+        // Prefer unused capacity. Once it is exhausted, SecondChance requires
+        // a Region that the maintenance worker has fenced and emptied.
         let free = state.free_regions.pop_front();
-        if free.is_some() && state.free_regions.is_empty() {
-            self.inner.reclaim_eligible.store(true, Ordering::Release);
-        }
         let victim = if let Some(free) = free {
             if state.regions[free as usize].header.state != RegionState::Free {
                 return Err(CacheError::CorruptMetadata(
@@ -5534,22 +5734,11 @@ impl DiskCache {
                 ));
             }
             ready
-        } else if self.inner.config.reclaim_mode == ReclaimMode::SecondChance {
+        } else {
             state.stats.reclaim_backlog_rejections =
                 state.stats.reclaim_backlog_rejections.saturating_add(1);
             self.request_background_reclaim(true);
             return Err(CacheError::ReclaimBacklog);
-        } else if state.reclaiming_region.is_some() && state.sealed_regions.is_empty() {
-            state.stats.reclaim_backlog_rejections =
-                state.stats.reclaim_backlog_rejections.saturating_add(1);
-            return Err(CacheError::ReclaimBacklog);
-        } else {
-            state
-                .sealed_regions
-                .pop_front()
-                .ok_or(CacheError::CorruptMetadata(
-                    "no non-Active region is available for rotation",
-                ))?
         };
 
         // Reuse changes the meaning of an on-disk location. Wait for every
@@ -5960,6 +6149,11 @@ impl DiskCache {
     /// Order record/header durability before publishing a clean superblock.
     fn checkpoint_clean(&self, state: &mut State) -> Result<()> {
         let result = (|| -> Result<(Superblock, usize)> {
+            if state.reclaiming_region.is_some() {
+                return Err(CacheError::CorruptMetadata(
+                    "clean checkpoint overlapped Region reclaim",
+                ));
+            }
             self.persist_active_headers(state)?;
             self.engine_sync(SyncPoint::CheckpointData, SyncMode::Data)?;
             let mut candidate = state.superblock;
@@ -10055,8 +10249,8 @@ mod m1_tests {
             PutOutcome::Stored
         );
 
-        // A foreground FIFO fallback can own this mutex across header sync and
-        // victim scrub. Advisory Hybrid index operations remain independent.
+        // Hybrid index hints remain independent of the Region-manager mutex,
+        // including while another append lane plans a FIFO rotation.
         let region_manager = cache.inner.state.lock().unwrap();
         let probe = cache.clone();
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
