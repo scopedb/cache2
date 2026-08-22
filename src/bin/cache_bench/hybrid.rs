@@ -1,14 +1,11 @@
 //! Mixed-size benchmark path for the complete Hybrid cache.
 
 use std::fmt::Write as _;
-use std::future::Future;
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -430,6 +427,13 @@ impl Api {
         match self {
             Self::Sync => "sync",
             Self::Async => "async",
+        }
+    }
+
+    const fn client_completion_model(self) -> &'static str {
+        match self {
+            Self::Sync => "direct_call",
+            Self::Async => "blocking_wait_one_outstanding",
         }
     }
 }
@@ -1192,14 +1196,14 @@ impl BenchCache {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, CacheError> {
         match self {
             Self::Sync(cache) => cache.get(key),
-            Self::Async { facade, .. } => block_on(facade.get(key)),
+            Self::Async { facade, .. } => facade.get(key).wait(),
         }
     }
 
     fn lookup(&self, key: &[u8]) -> Result<HybridLookupOutcome, CacheError> {
         match self {
             Self::Sync(cache) => cache.lookup(key),
-            Self::Async { facade, .. } => block_on(facade.lookup(key)),
+            Self::Async { facade, .. } => facade.lookup(key).wait(),
         }
     }
 
@@ -1215,65 +1219,28 @@ impl BenchCache {
     ) -> Result<PutOutcome, CacheError> {
         match self {
             Self::Sync(cache) => cache.put(key, value, options),
-            Self::Async { facade, .. } => block_on(facade.put(key, value, options)),
+            Self::Async { facade, .. } => facade.put(key, value, options).wait(),
         }
     }
 
     fn remove(&self, key: &[u8]) -> Result<RemoveOutcome, CacheError> {
         match self {
             Self::Sync(cache) => cache.remove(key),
-            Self::Async { facade, .. } => block_on(facade.remove(key)),
+            Self::Async { facade, .. } => facade.remove(key).wait(),
         }
     }
 
     fn flush(&self) -> Result<(), CacheError> {
         match self {
             Self::Sync(cache) => cache.flush(),
-            Self::Async { facade, .. } => block_on(facade.flush()),
+            Self::Async { facade, .. } => facade.flush().wait(),
         }
     }
 
     fn close(&self) -> Result<(), CacheError> {
         match self {
             Self::Sync(cache) => cache.close(),
-            Self::Async { facade, .. } => block_on(facade.close()),
-        }
-    }
-}
-
-struct ThreadWaker {
-    thread: thread::Thread,
-    notified: AtomicBool,
-}
-
-impl Wake for ThreadWaker {
-    fn wake(self: Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
-        self.thread.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
-        self.thread.unpark();
-    }
-}
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let notifier = Arc::new(ThreadWaker {
-        thread: thread::current(),
-        notified: AtomicBool::new(false),
-    });
-    let waker = Waker::from(Arc::clone(&notifier));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::as_mut(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => {
-                while !notifier.notified.swap(false, Ordering::Acquire) {
-                    thread::park();
-                }
-            }
+            Self::Async { facade, .. } => facade.close().wait(),
         }
     }
 }
@@ -3165,7 +3132,7 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 8);
+        number_field!("schema_version", 9);
         string_field!("cache", "hybrid");
         string_field!("latency_scope", "individual_cache_api_calls");
         string_field!("write_value_generation", "prebuilt_worker_template");
@@ -3231,6 +3198,10 @@ impl Report<'_> {
         number_field!("queue_depth", self.options.queue_depth);
         string_field!("backpressure", self.options.backpressure.as_str());
         string_field!("api", self.options.api.as_str());
+        string_field!(
+            "client_completion_model",
+            self.options.api.client_completion_model()
+        );
         string_field!("engine_requested", self.options.engine.as_str());
         string_field!("io_mode_requested", self.options.mode.as_str());
         string_field!("write_mode", write_mode_name(self.options.write_mode));
@@ -4092,6 +4063,10 @@ impl Report<'_> {
             self.options.mode.as_str(),
             write_mode_name(self.options.write_mode)
         );
+        println!(
+            "  client completion:       {}",
+            self.options.api.client_completion_model()
+        );
         println!("  throughput:              {:.0} ops/s", self.ops_per_sec());
         println!(
             "  latency p50/p99/p99.9:   {:.1}/{:.1}/{:.1} us",
@@ -4626,7 +4601,7 @@ Engine/layout:
   --write-back-queue-depth 1..4096 (default 64)
   --write-back-workers 1..128 (default 4; must not exceed queue depth)
   --write-back-memory BYTES  Reserved demotion bytes (default 32MiB)
-  --api sync|async           Default async
+  --api sync|async           Default async; one blocking request/client
   --engine sync|auto|uring   Applied to both disk tiers (default auto)
   --mode buffered|auto|direct Applied to both disk tiers (default buffered)
 
@@ -5111,7 +5086,8 @@ mod tests {
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
         let json = report.to_json();
-        assert!(json.contains("\"schema_version\":8"));
+        assert!(json.contains("\"schema_version\":9"));
+        assert!(json.contains("\"client_completion_model\":\"blocking_wait_one_outstanding\""));
         assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
         assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
         assert!(json.contains("\"latency_samples\":0"));

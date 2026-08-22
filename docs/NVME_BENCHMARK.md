@@ -9,8 +9,12 @@ reopens for an isolated measurement window. A configurable
 hot/cold distribution supplies real cold-key churn instead of updating only
 pre-existing keys. `--api sync` makes every client thread call `DiskCache`
 directly; `--api async` creates and reuses one `AsyncDiskCache` handle per
-phase and waits each request to completion. Both modes exercise append-lane
-routing and the configured `IoEngine` queue depth.
+phase and blocks on each request's native completion before issuing the next.
+It does not add an async runtime scheduler or pipeline multiple requests from
+one client. Both modes exercise append-lane routing and the configured
+`IoEngine` queue depth. JSON records this distinction in
+`client_completion_model`; results from older schemas that used a benchmark-side
+waker loop are not directly comparable as engine-only A/B measurements.
 
 M5 implementation and behavior testing are complete, as are the M7 policy
 switches and counters. Target-NVMe throughput/p99/profile, target-workload
@@ -388,7 +392,7 @@ machine.
 The single-line JSON contains:
 
 - operation/read/write throughput and bounded latency histogram percentiles;
-- selected `sync` or `async` public API;
+- selected `sync` or `async` public API and its client completion model;
 - measured hits/misses/hit percentage and all three requested acceptance gates;
 - selected admission/reclaim policy, rejection/reinsertion activity, and
   victim-scan/full-index-fallback counters;

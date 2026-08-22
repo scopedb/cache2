@@ -7,14 +7,11 @@
 
 use std::env;
 use std::fmt::Write as _;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -252,64 +249,28 @@ impl BenchmarkCache {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, CacheError> {
         match self {
             Self::Sync(cache) => cache.get(key),
-            Self::Async { facade, .. } => block_on(facade.get(key)),
+            Self::Async { facade, .. } => facade.get(key).wait(),
         }
     }
 
     fn put(&self, key: &[u8], value: &[u8], options: PutOptions) -> Result<PutOutcome, CacheError> {
         match self {
             Self::Sync(cache) => cache.put(key, value, options),
-            Self::Async { facade, .. } => block_on(facade.put(key, value, options)),
+            Self::Async { facade, .. } => facade.put(key, value, options).wait(),
         }
     }
 
     fn flush(&self) -> Result<(), CacheError> {
         match self {
             Self::Sync(cache) => cache.flush(),
-            Self::Async { facade, .. } => block_on(facade.flush()),
+            Self::Async { facade, .. } => facade.flush().wait(),
         }
     }
 
     fn close(&self) -> Result<(), CacheError> {
         match self {
             Self::Sync(cache) => cache.close(),
-            Self::Async { facade, .. } => block_on(facade.close()),
-        }
-    }
-}
-
-struct ThreadWaker {
-    thread: thread::Thread,
-    notified: AtomicBool,
-}
-
-impl Wake for ThreadWaker {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
-        self.thread.unpark();
-    }
-}
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let notifier = Arc::new(ThreadWaker {
-        thread: thread::current(),
-        notified: AtomicBool::new(false),
-    });
-    let waker = Waker::from(Arc::clone(&notifier));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::as_mut(&mut future).poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => {
-                while !notifier.notified.swap(false, Ordering::Acquire) {
-                    thread::park();
-                }
-            }
+            Self::Async { facade, .. } => facade.close().wait(),
         }
     }
 }
@@ -598,6 +559,13 @@ impl ApiArg {
         match self {
             Self::Sync => "sync",
             Self::Async => "async",
+        }
+    }
+
+    const fn client_completion_model(self) -> &'static str {
+        match self {
+            Self::Sync => "direct_call",
+            Self::Async => "blocking_wait_one_outstanding",
         }
     }
 }
@@ -1913,7 +1881,7 @@ impl<'a> Report<'a> {
         write!(
             output,
             concat!(
-                "{{\"schema_version\":2,",
+                "{{\"schema_version\":3,",
                 "\"path\":\"{}\",",
                 "\"capacity_bytes\":{},\"region_size_bytes\":{},",
                 "\"object_size_bytes\":{},\"keys\":{},",
@@ -1924,6 +1892,7 @@ impl<'a> Report<'a> {
                 "\"admission\":\"{}\",\"reclaim\":\"{}\",",
                 "\"require_policy_activity\":{},",
                 "\"api\":\"{}\",",
+                "\"client_completion_model\":\"{}\",",
                 "\"engine_requested\":\"{}\",\"engine_actual\":\"{}\",",
                 "\"io_mode_requested\":\"{}\",\"direct_io_active\":{},",
                 "\"elapsed_seconds\":{:.6},\"operations\":{},",
@@ -1955,6 +1924,7 @@ impl<'a> Report<'a> {
             self.options.reclaim.as_str(),
             self.options.require_policy_activity,
             self.options.api.as_str(),
+            self.options.api.client_completion_model(),
             self.options.engine.as_str(),
             self.actual_engine(),
             self.options.io_mode.as_str(),
@@ -2132,6 +2102,10 @@ impl<'a> Report<'a> {
             self.options.io_mode.as_str(),
             self.actual_engine(),
             self.stats.direct_io_active
+        );
+        println!(
+            "  client completion: {}",
+            self.options.api.client_completion_model()
         );
         println!(
             "  workload:          {} byte objects, {} keys, {}% reads",
@@ -2409,7 +2383,7 @@ Cache and device:
   --region-size BYTES         Region size (default: 32MiB)
   --queue-depth 1..4096       Cache and device queue depth (default: 128)
   --append-lanes 1..8         Independent Active Regions (default: 2)
-  --api sync|async           Public API exercised (default: sync)
+  --api sync|async           Public API; async blocks one request/client
   --engine sync|auto|uring    I/O engine (default: auto)
   --mode buffered|auto|direct File I/O mode (default: buffered)
   --admission always|second-hit
@@ -2431,7 +2405,9 @@ Output:
   -h, --help                  Show this help
 
 Each client thread calls the selected public API. Async mode reuses one
-AsyncDiskCache handle per benchmark phase and waits each request to completion.
+AsyncDiskCache handle per benchmark phase and blocks on each request's native
+completion before issuing the next; it does not model an async runtime or
+multiple outstanding requests per client.
 Measured latency spans the complete cache call, including device I/O.
 Process CPU uses Linux /proc/self/stat. Linux block stat sectors are reported
 using the kernel ABI's 512-byte sector unit; unavailable metrics are explicit.
@@ -2784,8 +2760,9 @@ mod tests {
         assert_eq!(report.acceptance_failures().len(), 3);
         assert!(!report.acceptance_passed());
         let json = report.to_json();
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("\"api\":\"sync\""));
+        assert!(json.contains("\"client_completion_model\":\"direct_call\""));
         assert!(json.contains("\"acceptance_passed\":false"));
         assert!(json.contains("\"hit_percent\":80.000"));
         assert!(json.contains("\"memory_budget_bytes\":1024"));

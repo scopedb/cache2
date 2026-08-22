@@ -681,6 +681,12 @@ work is complete; staging
 sign-off remains pending until that matrix and matching CPU/device profiles are
 captured on the target NVMe host.
 
+The benchmark's async clients use the facade's native blocking completion and
+keep one outstanding request per client. They exercise the bounded async engine
+without adding a runtime scheduler; JSON records this as
+`client_completion_model=blocking_wait_one_outstanding` so harness revisions
+cannot be mistaken for engine-only performance changes.
+
 `cache-bench hybrid` adds deterministic weighted object sizes such as
 `--sizes 256:50,4KiB:30,64KiB:20` and exercises both SSD routes behind the
 bounded memory engine. Keys are generated on demand (no `Vec<Vec<u8>>`), while
