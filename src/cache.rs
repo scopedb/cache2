@@ -68,7 +68,7 @@ use crate::resources::{
     DEFAULT_WRITE_QUEUE_DEPTH, DataResources, OverloadReason, QueuePermit, RemoveResources,
     ResourceController, ResourceLimits, WriteBudgetReservation, aligned_buffer_capacity,
 };
-use crate::write_batch::{BatchPlan, MAX_BATCH_RECORDS, plan_batch};
+use crate::write_batch::{BatchPlan, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, plan_batch};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_MAX_KEY_SIZE: usize = 64 * 1024;
@@ -6278,11 +6278,12 @@ fn append_worker(inner: Weak<Inner>, lane_id: usize, commands: Receiver<AppendCo
                     resources,
                     completion,
                 });
-                let coalesce_deadline = if cache.direct_append_active() {
-                    None
-                } else {
-                    Instant::now().checked_add(cache.append_coalesce_delay())
-                };
+                let coalesce_deadline =
+                    if cache.direct_append_active() || record_len as usize >= MAX_BATCH_BYTES {
+                        None
+                    } else {
+                        Instant::now().checked_add(cache.append_coalesce_delay())
+                    };
                 while batch.len() < MAX_BATCH_RECORDS {
                     let next = match commands.try_recv() {
                         Ok(command) => command,

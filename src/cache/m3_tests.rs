@@ -628,6 +628,45 @@ fn buffered_append_window_coalesces_staggered_small_records() {
 }
 
 #[test]
+fn buffered_append_window_skips_wait_for_a_full_size_record() {
+    let file = TestFile::new("full-size-record-no-coalesce-wait");
+    let region_size = 512 * 1024;
+    let config = CacheConfig::new(&file.0, DATA_OFFSET + 2 * region_size)
+        .with_region_size(region_size)
+        .with_index_slots(64)
+        .with_max_key_size(64)
+        .with_max_value_size(MAX_BATCH_BYTES)
+        .with_io_mode(IoMode::Buffered);
+    let cache = config.open().unwrap();
+    cache.set_append_coalesce_delay_for_test(Duration::from_millis(250));
+
+    let schedule = ScheduleLog::default();
+    let observed = schedule.clone();
+    *cache.inner.schedule_observer.lock().unwrap() =
+        Some(Arc::new(move |point| observed.record(point)));
+
+    let key = b"large";
+    let value_len = MAX_BATCH_BYTES - RECORD_HEADER_SIZE - key.len();
+    assert_eq!(
+        RecordHeader::aligned_len(key.len(), value_len),
+        Some(MAX_BATCH_BYTES as u32)
+    );
+    let value = vec![b'x'; value_len];
+    assert_eq!(
+        cache.put(key, &value, PutOptions::default()).unwrap(),
+        PutOutcome::Stored
+    );
+    assert!(
+        !schedule
+            .events()
+            .contains(&SchedulePoint::AppendCoalesceWaiting),
+        "a record at the batch byte limit waited for an impossible follower"
+    );
+    assert_eq!(cache.get(key).unwrap(), Some(value));
+    cache.close().unwrap();
+}
+
+#[test]
 fn buffered_and_auto_direct_modes_share_format_v1_records() {
     let file = TestFile::new("buffered-direct-compatibility");
     let buffered = config(&file.0).with_io_mode(IoMode::Buffered);
