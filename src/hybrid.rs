@@ -1,10 +1,11 @@
 //! Inclusive hybrid cache coordinator for mixed small and large objects.
 //!
 //! The default mode is a performance-first write-back cache. Mutations publish
-//! to L1 after allocating an in-memory version; dirty victims reach SSD only on
-//! eviction or an explicit flush. One session-level dirty fence makes an
-//! unclean restart cold-start the disposable lower tiers, so mutations never
-//! pay a per-key journal write or durability sync.
+//! to L1 after allocating an in-memory version. Dirty victims normally reach
+//! SSD on eviction or flush; under executor pressure they may instead invalidate
+//! lower visibility in memory and become misses. One session-level dirty fence
+//! makes an unclean restart, or the next clean boundary after such loss, start
+//! from an empty cache without per-key journal writes or durability syncs.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt;
@@ -63,7 +64,7 @@ use crate::resources::{
     BackpressurePolicy, MAX_BACKPRESSURE_TIMEOUT, MAX_QUEUE_DEPTH, OverloadReason,
 };
 use crate::write_back::{
-    LowerCandidateReservation, WriteBackExecutor, WriteBackRunError, WriteBackSnapshot,
+    LowerCandidateAdmission, WriteBackExecutor, WriteBackRunError, WriteBackSnapshot,
 };
 
 const DEFAULT_MEMORY_SHARDS: usize = 256;
@@ -233,11 +234,10 @@ impl HybridCacheConfig {
     /// bounded background persistence. An exact-key pending directory masks
     /// older lower values while detached writes run. When a full-value task
     /// would push projected executor occupancy above 75%, a lower-candidate
-    /// eviction schedules a smaller durable deletion and may lose its dirty
-    /// value to a miss. If even that deletion cannot be reserved,
-    /// allocated, registered, or submitted, the dirty victim remains resident
-    /// and the incoming cache put is rejected. The eviction path never falls
-    /// back to foreground device I/O.
+    /// eviction synchronously hides its Region candidate and complete Bucket
+    /// page in memory, then loses the dirty value to a miss without queueing
+    /// device I/O. A following flush/close publishes a safe-empty cache
+    /// boundary. The eviction path never falls back to foreground device I/O.
     /// Write-back values are disposable cache data: an unflushed process crash
     /// may lose them, and the session dirty fence makes an unclean reopen
     /// discard the lower tiers instead of reviving an older disk value.
@@ -250,8 +250,9 @@ impl HybridCacheConfig {
     /// covers the detached entry copy plus the pending owner's duplicate key
     /// and fixed allocation charge. Pending-directory shard overhead is
     /// accounted separately by the aggregate Hybrid memory plan. With a
-    /// one-slot queue, that slot is reserved for lower-candidate updates and
-    /// disposable lower-absent evictions are dropped.
+    /// one-slot queue, the 75% proactive budget rounds to zero: disposable
+    /// lower-absent evictions are dropped and lower-candidate updates use the
+    /// slot-free volatile invalidation path.
     pub fn with_write_back_resources(
         mut self,
         queue_depth: usize,
@@ -594,6 +595,7 @@ impl HybridCacheConfig {
                 async_handle: Mutex::new(None),
                 async_close_completion: Arc::new(HybridCloseCompletion::new()),
                 accepting: AtomicBool::new(true),
+                volatile_lower_loss: AtomicBool::new(false),
                 write_mode: self.write_mode,
                 write_back,
                 policy,
@@ -1125,6 +1127,9 @@ pub struct HybridWriteBackStats {
     pub proactive_rejected: u64,
     pub proactive_fatal: u64,
     pub proactive_invalidated: u64,
+    /// True after a volatile pressure invalidation and until flush/close
+    /// publishes a safe-empty lower boundary.
+    pub volatile_loss_pending: bool,
     pub pending_entries: u64,
     pub pending_entries_peak: u64,
     pub pending_bytes: u64,
@@ -1230,6 +1235,7 @@ pub(crate) struct HybridInner {
     async_handle: Mutex<Option<std::sync::Weak<crate::async_hybrid::AsyncHybridInner>>>,
     pub(crate) async_close_completion: Arc<HybridCloseCompletion>,
     accepting: AtomicBool,
+    volatile_lower_loss: AtomicBool,
     write_mode: HybridWriteMode,
     write_back: Option<WriteBackExecutor>,
     policy: Arc<PolicyController>,
@@ -2442,12 +2448,24 @@ impl HybridCache {
             return Err(error);
         }
         after_checkpoint()?;
+        self.discard_volatile_lower_state()
+    }
+
+    /// Publish empty lower generations and forget every L1/policy charge. The
+    /// caller owns the exclusive Hybrid operation lock. No manifest version is
+    /// allocated here so close can use it after the compatibility journal has
+    /// stopped; the session dirty fence already makes any interrupted clear a
+    /// safe-empty restart.
+    fn discard_volatile_lower_state(&self) -> Result<()> {
         if let Err(error) = self.inner.disk.clear() {
             self.poison();
             return Err(error.error);
         }
         self.inner.memory.clear();
         self.inner.policy.namespaces().reset_live_bytes();
+        self.inner
+            .volatile_lower_loss
+            .store(false, Ordering::Release);
         Ok(())
     }
 
@@ -2472,11 +2490,20 @@ impl HybridCache {
     }
 
     /// Publish one complete global checkpoint while the exclusive operation
-    /// lock is held: dirty L1 values first, then both lower engines, and only
-    /// then the clean Hybrid manifest generation.
+    /// lock is held. Normally dirty L1 values drain first; pending volatile
+    /// loss instead clears L1/L2. Both lower boundaries precede the clean
+    /// Hybrid manifest generation.
     fn checkpoint_locked(&self) -> Result<()> {
         self.ensure_mutation_healthy()?;
-        self.flush_dirty_entries()?;
+        if self.inner.volatile_lower_loss.load(Ordering::Acquire) {
+            // Bucket invalidation is intentionally process-local. Once any
+            // pressure drop occurs, a clean boundary discards the complete
+            // cache instead of scanning hidden buckets or risking old-value
+            // revival. This is constant metadata work, not per-key cleanup.
+            self.discard_volatile_lower_state()?;
+        } else {
+            self.flush_dirty_entries()?;
+        }
         // Never allow a crash to observe a newer clean lower checkpoint with
         // an older clean Hybrid usage extension. An empty dirty journal is a
         // deliberate safe-miss fence during recovery.
@@ -2489,10 +2516,10 @@ impl HybridCache {
             .disk
             .with_mutations_frozen_after_flush(|| self.publish_manifest_clean_with_policy_usage())
         {
-            // `flush` drains the current dirty set, but the cache remains open.
-            // Re-arm the one session-level dirty fence here so the next put is
-            // still metadata-I/O free. A normal `close` publishes its own final
-            // clean manifest after all request admission has stopped.
+            // The cache remains open after either a dirty drain or safe-empty
+            // boundary. Re-arm the one session-level dirty fence here so the
+            // next put is still metadata-I/O free. A normal `close` publishes
+            // its final clean manifest after request admission has stopped.
             Ok(()) => self
                 .inner
                 .manifest
@@ -2622,7 +2649,11 @@ impl HybridCache {
         let journal = self.inner.journal.shutdown();
         let status = self.status();
         let dirty = if status == CacheStatus::Healthy && journal.is_ok() {
-            self.flush_dirty_entries()
+            if self.inner.volatile_lower_loss.load(Ordering::Acquire) {
+                self.discard_volatile_lower_state()
+            } else {
+                self.flush_dirty_entries()
+            }
         } else {
             Err(CacheError::Poisoned)
         };
@@ -2901,6 +2932,7 @@ impl HybridCache {
                 .counters
                 .proactive_invalidated
                 .load(Ordering::Relaxed),
+            volatile_loss_pending: self.inner.volatile_lower_loss.load(Ordering::Acquire),
             pending_entries: pending.entries,
             pending_entries_peak: pending.entries_peak,
             pending_bytes: pending.bytes,
@@ -3088,13 +3120,11 @@ impl HybridCache {
         outcome
     }
 
-    /// Transfer a dirty victim to a bounded exact-key owner before it leaves
-    /// L1. The pending directory hides any older lower-tier value, allowing
-    /// both fresh and update-heavy workloads to use the same asynchronous path.
-    /// Under pressure, a proven lower absence may be dropped immediately. An
-    /// existing lower candidate first degrades to a smaller durable deletion;
-    /// failure to establish or admit that work keeps the victim resident and
-    /// rejects the incoming put.
+    /// Prepare a dirty victim before L1 releases it. Asynchronous persistence
+    /// transfers ownership through the bounded exact-key pending directory.
+    /// Under pressure, a proven lower absence may be dropped immediately; a
+    /// lower candidate is synchronously hidden in memory, so it needs neither a
+    /// pending owner nor an SSD mutation.
     fn prepare_dirty_eviction(
         &self,
         entry: &MemoryEntry,
@@ -3166,86 +3196,35 @@ impl HybridCache {
         else {
             return Ok(false);
         };
-        let (reservation, reserved_bytes, work) = if lower_candidate {
-            let Some(invalidation_bytes) = entry
-                .key
-                .len()
-                .checked_mul(2)
-                .and_then(|bytes| bytes.checked_add(MEMORY_ENTRY_OVERHEAD_BYTES))
-                .and_then(|bytes| bytes.checked_add(PENDING_WRITE_OWNED_OVERHEAD_BYTES))
-            else {
-                return Ok(false);
-            };
-            let Some(admission) =
-                executor.try_reserve_lower_candidate(reservation_bytes, invalidation_bytes)
-            else {
-                return Ok(false);
-            };
-            let reserved_bytes = admission.reserved_bytes();
-            match admission {
-                LowerCandidateReservation::Persist(reservation) => {
-                    let owned = match try_clone_memory_entry(entry) {
-                        Ok(entry) => entry,
-                        Err(CacheError::Overloaded(_)) => {
-                            drop(reservation);
-                            return Ok(false);
-                        }
-                        Err(error) => {
-                            drop(reservation);
-                            return Err(DirtyPersistFailure::Fatal(error));
-                        }
-                    };
-                    (
-                        reservation,
-                        reserved_bytes,
-                        DetachedDirtyWork::Persist(owned),
-                    )
+        let reservation = if lower_candidate {
+            match executor.try_reserve_lower_candidate(reservation_bytes) {
+                Some(LowerCandidateAdmission::Persist(reservation)) => reservation,
+                Some(LowerCandidateAdmission::Invalidate) => {
+                    self.invalidate_dirty_in_memory(
+                        entry.namespace,
+                        &entry.key,
+                        entry.pending_disk_bytes,
+                    )?;
+                    return Ok(true);
                 }
-                LowerCandidateReservation::Invalidate(reservation) => {
-                    let key =
-                        match try_clone_bytes(&entry.key, OverloadReason::WriteBufferUnavailable) {
-                            Ok(key) => key,
-                            Err(CacheError::Overloaded(_)) => {
-                                drop(reservation);
-                                return Ok(false);
-                            }
-                            Err(error) => {
-                                drop(reservation);
-                                return Err(DirtyPersistFailure::Fatal(error));
-                            }
-                        };
-                    (
-                        reservation,
-                        reserved_bytes,
-                        DetachedDirtyWork::Invalidate(DirtyInvalidation {
-                            namespace: entry.namespace,
-                            key,
-                            version: entry.version,
-                            pending_disk_bytes: entry.pending_disk_bytes,
-                        }),
-                    )
-                }
+                None => return Ok(false),
             }
         } else {
             let Some(reservation) = executor.try_reserve_background(reservation_bytes) else {
                 return Ok(false);
             };
-            let owned = match try_clone_memory_entry(entry) {
-                Ok(entry) => entry,
-                Err(CacheError::Overloaded(_)) => {
-                    drop(reservation);
-                    return Ok(false);
-                }
-                Err(error) => {
-                    drop(reservation);
-                    return Err(DirtyPersistFailure::Fatal(error));
-                }
-            };
-            (
-                reservation,
-                reservation_bytes,
-                DetachedDirtyWork::Persist(owned),
-            )
+            reservation
+        };
+        let owned = match try_clone_memory_entry(entry) {
+            Ok(entry) => entry,
+            Err(CacheError::Overloaded(_)) => {
+                drop(reservation);
+                return Ok(false);
+            }
+            Err(error) => {
+                drop(reservation);
+                return Err(DirtyPersistFailure::Fatal(error));
+            }
         };
         let hash = hybrid_hash(entry.namespace, &entry.key);
         let pending = match self.inner.pending_writes.try_register(
@@ -3253,7 +3232,7 @@ impl HybridCache {
             &entry.key,
             hash,
             entry.version,
-            reserved_bytes,
+            reservation_bytes,
         ) {
             Ok(pending) => pending,
             Err(PendingRegisterError::AlreadyPending | PendingRegisterError::AllocationFailed) => {
@@ -3267,7 +3246,7 @@ impl HybridCache {
         let panic_pending = Arc::clone(&pending);
         match executor.submit_background(
             reservation,
-            move || worker.run_async_eviction(work, worker_pending),
+            move || worker.run_async_eviction(owned, worker_pending),
             move || {
                 panic_owner
                     .inner
@@ -3297,49 +3276,42 @@ impl HybridCache {
         }
     }
 
-    fn run_async_eviction(&self, work: DetachedDirtyWork, pending: Arc<PendingWriteSlot>) {
+    fn run_async_eviction(&self, entry: MemoryEntry, pending: Arc<PendingWriteSlot>) {
         let result = (|| -> std::result::Result<(), DirtyPersistFailure> {
             let _operation = self
                 .inner
                 .operation
                 .read()
                 .map_err(|_| DirtyPersistFailure::Fatal(CacheError::Poisoned))?;
-            debug_assert_eq!(pending.version(), work.version());
-            match work {
-                DetachedDirtyWork::Persist(entry) => match self.persist_dirty_entry(&entry) {
-                    Ok(_) => {
-                        self.inner
-                            .counters
-                            .demoted_entries
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.inner.counters.demoted_bytes.fetch_add(
-                            entry.charged_bytes().unwrap_or(0) as u64,
-                            Ordering::Relaxed,
-                        );
-                        self.inner
-                            .counters
-                            .proactive_persisted
-                            .fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    }
-                    Err(DirtyPersistFailure::Rejected(_)) => {
-                        self.inner
-                            .counters
-                            .proactive_rejected
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.invalidate_detached_dirty(
-                            entry.namespace,
-                            &entry.key,
-                            entry.pending_disk_bytes,
-                        )
-                    }
-                    Err(failure) => Err(failure),
-                },
-                DetachedDirtyWork::Invalidate(entry) => self.invalidate_detached_dirty(
-                    entry.namespace,
-                    &entry.key,
-                    entry.pending_disk_bytes,
-                ),
+            debug_assert_eq!(pending.version(), entry.version);
+            match self.persist_dirty_entry(&entry) {
+                Ok(_) => {
+                    self.inner
+                        .counters
+                        .demoted_entries
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .demoted_bytes
+                        .fetch_add(entry.charged_bytes().unwrap_or(0) as u64, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .proactive_persisted
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(DirtyPersistFailure::Rejected(_)) => {
+                    self.inner
+                        .counters
+                        .proactive_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.invalidate_dirty_in_memory(
+                        entry.namespace,
+                        &entry.key,
+                        entry.pending_disk_bytes,
+                    )
+                }
+                Err(failure) => Err(failure),
             }
         })();
         match result {
@@ -3355,16 +3327,22 @@ impl HybridCache {
         }
     }
 
-    fn invalidate_detached_dirty(
+    fn invalidate_dirty_in_memory(
         &self,
         namespace: NamespaceId,
         key: &[u8],
         pending_disk_bytes: u64,
     ) -> std::result::Result<(), DirtyPersistFailure> {
+        // A crash already sees the session dirty fence and reopens empty. Keep
+        // this flag before changing volatile lower visibility so an orderly
+        // flush/close also publishes only a safe empty checkpoint.
+        self.inner
+            .volatile_lower_loss
+            .store(true, Ordering::Release);
         self.inner
             .disk
-            .remove(namespace, key, Some(self.inner.policy.as_ref()))
-            .map_err(dirty_persist_failure)?;
+            .invalidate_in_memory(namespace, key)
+            .map_err(DirtyPersistFailure::Fatal)?;
         self.retire_pending_namespace_usage(NamespaceUsage {
             namespace,
             live_bytes: pending_disk_bytes,
@@ -3699,27 +3677,6 @@ enum DirtyPersistFailure {
     Fatal(CacheError),
 }
 
-enum DetachedDirtyWork {
-    Persist(MemoryEntry),
-    Invalidate(DirtyInvalidation),
-}
-
-struct DirtyInvalidation {
-    namespace: NamespaceId,
-    key: Vec<u8>,
-    version: HybridVersion,
-    pending_disk_bytes: u64,
-}
-
-impl DetachedDirtyWork {
-    fn version(&self) -> HybridVersion {
-        match self {
-            Self::Persist(entry) => entry.version,
-            Self::Invalidate(entry) => entry.version,
-        }
-    }
-}
-
 impl HybridPolicyReservation {
     fn pending_live_bytes(&self) -> u64 {
         self.capacity
@@ -3875,6 +3832,16 @@ impl DiskPair {
     fn may_contain_for_admission(&self, namespace: NamespaceId, key: &[u8]) -> Result<bool> {
         Ok(self.region.may_contain_in(namespace, key)?
             || self.bucket.may_contain_in(namespace, key)?)
+    }
+
+    /// Forget every lower candidate reachable by this key without device I/O.
+    /// Region retirement is exact; Bucket invalidation deliberately hides the
+    /// complete fixed bucket until a later put rebuilds it. The Hybrid owner
+    /// keeps its dirty-session fence and publishes an empty checkpoint before
+    /// any orderly restart can trust these volatile mutations.
+    fn invalidate_in_memory(&self, namespace: NamespaceId, key: &[u8]) -> Result<()> {
+        self.region.invalidate_in_memory(namespace, key)?;
+        self.bucket.invalidate_bucket_in_memory(namespace, key)
     }
 
     fn route_put(
@@ -6610,7 +6577,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_lower_update_invalidates_in_background_without_reviving_old_l2() {
+    fn saturated_lower_update_invalidates_without_io_and_clean_reopen_is_empty() {
         let files = TestFiles::new("write-back-overload-invalidation");
         let cache_config = config(&files, 300)
             .with_memory_shards(1)
@@ -6643,14 +6610,27 @@ mod tests {
             executor.submit_background(queued, || {}, || {}).unwrap();
         }
 
-        let before = cache.stats().write_back;
+        let before = cache.stats();
         assert_eq!(
             cache
                 .put(b"evictor", b"force-eviction", PutOptions::default())
                 .unwrap(),
             PutOutcome::Stored
         );
-        assert_eq!(cache.stats().write_back.pending_entries, 1);
+        let after_put = cache.stats();
+        assert_eq!(after_put.write_back.pending_entries, 0);
+        assert_eq!(after_put.write_back.queue_in_flight, 3);
+        assert_eq!(after_put.bucket.io_submitted, before.bucket.io_submitted);
+        assert_eq!(after_put.region.io_submitted, before.region.io_submitted);
+        assert_eq!(
+            after_put.write_back.proactive_invalidated - before.write_back.proactive_invalidated,
+            1
+        );
+        assert_eq!(
+            after_put.write_back.dropped_evictions - before.write_back.dropped_evictions,
+            1
+        );
+        assert!(after_put.write_back.volatile_loss_pending);
         assert_eq!(
             cache.lookup(b"key").unwrap(),
             HybridLookupOutcome::Miss(HybridMissKind::NotResident)
@@ -6658,21 +6638,76 @@ mod tests {
 
         release_tx.send(()).unwrap();
         assert!(wait_until(Duration::from_secs(2), || {
-            let stats = cache.stats().write_back;
-            stats.pending_entries == 0 && stats.proactive_invalidated > before.proactive_invalidated
+            cache.stats().write_back.queue_in_flight == 0
         }));
         assert_eq!(cache.get(b"key").unwrap(), None);
-        let after = cache.stats().write_back;
-        assert_eq!(after.demotion_failures - before.demotion_failures, 0);
+        let after = cache.stats();
         assert_eq!(
-            after.proactive_invalidated - before.proactive_invalidated,
-            1
+            after.write_back.demotion_failures - before.write_back.demotion_failures,
+            0
         );
-        assert_eq!(after.dropped_evictions - before.dropped_evictions, 1);
+        assert_eq!(after.bucket.io_submitted, before.bucket.io_submitted);
+        assert_eq!(after.region.io_submitted, before.region.io_submitted);
 
         cache.close().unwrap();
         let reopened = cache_config.open().unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), None);
+        assert_eq!(reopened.get(b"evictor").unwrap(), None);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn flush_after_volatile_pressure_loss_publishes_an_empty_boundary() {
+        let files = TestFiles::new("write-back-volatile-loss-flush");
+        let cache_config = config(&files, 300)
+            .with_memory_shards(1)
+            .with_write_mode(HybridWriteMode::WriteBack)
+            .with_write_back_resources(4, 1, 1024)
+            .with_backpressure(BackpressurePolicy::Block);
+        let cache = cache_config.clone().open().unwrap();
+
+        cache.put(b"key", b"old", PutOptions::default()).unwrap();
+        cache.flush().unwrap();
+        cache.put(b"key", b"new", PutOptions::default()).unwrap();
+        let executor = cache.inner.write_back.as_ref().unwrap();
+        let first = executor.try_reserve_background(1).unwrap();
+        let second = executor.try_reserve_background(1).unwrap();
+        let third = executor.try_reserve_background(1).unwrap();
+        assert_eq!(
+            cache
+                .put(b"evictor", b"force-eviction", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+        assert!(cache.stats().write_back.volatile_loss_pending);
+        drop((first, second, third));
+
+        cache.flush().unwrap();
+        let flushed = cache.stats();
+        assert!(!flushed.write_back.volatile_loss_pending);
+        assert_eq!(flushed.memory_entries, 0);
+        assert_eq!(cache.get(b"key").unwrap(), None);
+        assert_eq!(cache.get(b"evictor").unwrap(), None);
+        let namespace = cache
+            .policy_snapshot()
+            .unwrap()
+            .namespaces
+            .into_iter()
+            .find(|namespace| namespace.namespace == 0)
+            .unwrap();
+        assert_eq!(namespace.live_bytes, 0);
+        assert_eq!(namespace.reserved_bytes, 0);
+
+        cache
+            .put(b"survivor", b"after-flush", PutOptions::default())
+            .unwrap();
+        cache.close().unwrap();
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+        assert_eq!(
+            reopened.get(b"survivor").unwrap().as_deref(),
+            Some(b"after-flush".as_slice())
+        );
         reopened.close().unwrap();
     }
 
@@ -6793,10 +6828,7 @@ mod tests {
         executor
             .submit_background(
                 background,
-                move || {
-                    background_cache
-                        .run_async_eviction(DetachedDirtyWork::Persist(first), background_pending)
-                },
+                move || background_cache.run_async_eviction(first, background_pending),
                 move || {
                     panic_cache.poison();
                     panic_cache.inner.pending_writes.fail(&panic_pending);

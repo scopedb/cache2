@@ -332,6 +332,11 @@ impl HybridCacheStats {
         )?;
         metric(
             output,
+            "write_back_volatile_loss_pending",
+            u64::from(self.write_back.volatile_loss_pending),
+        )?;
+        metric(
+            output,
             "write_back_pending_entries",
             self.write_back.pending_entries,
         )?;
