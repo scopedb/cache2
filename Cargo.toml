@@ -1,0 +1,29 @@
+[package]
+name = "cache-rs"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Bounded memory, bucket, and region-log cache engines for NVMe"
+license = "Apache-2.0"
+
+[lib]
+name = "cache_rs"
+path = "src/lib.rs"
+
+[dependencies]
+
+[features]
+default = ["io-uring"]
+io-uring = ["dep:io-uring"]
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
+io-uring = { version = "=0.7.14", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.189"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"

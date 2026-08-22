@@ -1,0 +1,3912 @@
+//! Mixed-size benchmark path for the complete Hybrid cache.
+
+use std::fmt::Write as _;
+use std::future::Future;
+use std::mem::size_of;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cache_rs::{
+    AsyncHybridCache, BackpressurePolicy, BucketCacheConfig, CacheConfig, CacheError, CacheTier,
+    HybridCache, HybridCacheConfig, HybridCacheStats, HybridLookupOutcome, HybridWriteMode,
+    IoEngineKind, IoMode, PutOptions, PutOutcome, RemoveOutcome,
+};
+
+const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
+const DEFAULT_KEYS: usize = 100_000;
+const DEFAULT_READ_PERCENT: u8 = 80;
+const DEFAULT_PREFILL_PERCENT: u8 = 100;
+const DEFAULT_CONCURRENCY: usize = 16;
+const DEFAULT_QUEUE_DEPTH: usize = 128;
+const DEFAULT_DURATION_SECS: u64 = 30;
+const DEFAULT_WARMUP_SECS: u64 = 5;
+const DEFAULT_SEED: u64 = 0x243f_6a88_85a3_08d3;
+const DEFAULT_GENERATOR_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_VERIFY_SAMPLES: usize = 10_000;
+const DEFAULT_TTL_MS: u64 = 100;
+const DEFAULT_JOURNAL_CAPACITY: u64 = 16 * 1024 * 1024;
+const DEFAULT_TEMPORAL_WINDOW_PERCENT: u8 = 5;
+const DEFAULT_TEMPORAL_HOT_READ_PERCENT: u8 = 90;
+const MAX_KEYS: usize = 100_000_000;
+const MAX_CONCURRENCY: usize = 4096;
+const MAX_QUEUE_DEPTH: usize = 4096;
+const MAX_WORKERS: usize = 128;
+const MAX_SIZE_CLASSES: usize = 16;
+const MAX_OBJECT_SIZE: usize = 64 * 1024 * 1024;
+const MAX_SIZE_WEIGHT: u64 = 1_000_000_000;
+const MAX_CACHE_CAPACITY: u64 = 64 * 1024_u64.pow(4);
+const MAX_TOOL_MEMORY_BYTES: u64 = 16 * 1024_u64.pow(4);
+const MAX_VERIFY_SAMPLES: usize = 1_000_000;
+const MAX_TTL_MS: u64 = 60_000;
+const MAX_STATE_LOCKS: usize = 65_536;
+const MAX_ARGUMENTS: usize = 128;
+const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+const WORKER_STACK_BYTES: usize = 512 * 1024;
+const KEY_BYTES: usize = 32;
+const VALUE_HEADER_BYTES: usize = 32;
+const VALUE_MAGIC: [u8; 8] = *b"CRHBVAL1";
+const HISTOGRAM_BUCKETS: usize = 512;
+
+pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let options = match Options::parse(arguments)? {
+        ParseOutcome::Help => {
+            print_help();
+            return Ok(());
+        }
+        ParseOutcome::Run(options) => options,
+    };
+    ensure_empty_targets(&options)?;
+    let config = build_config(&options)?;
+    let diagnostics = config
+        .diagnostics()
+        .map_err(|error| format!("Hybrid configuration is invalid: {error}"))?;
+    eprintln!(
+        "cache-bench hybrid: planned memory={} B, Bucket={} B, Region={} B",
+        diagnostics.planned_memory_bytes,
+        diagnostics.bucket.file_len_bytes,
+        diagnostics.region.data_file_len_bytes
+    );
+    let keys = Arc::new(KeySpace::new(options.keys, options.seed));
+    let states = Arc::new(KeyStateTable::try_new(
+        options.keys,
+        options.concurrency.max(options.prefill_concurrency),
+        options.generator_memory_budget,
+        options.mix.maximum_bytes(),
+    )?);
+    let generator_planned_memory = states.planned_memory_bytes();
+    let cache = Arc::new(
+        config
+            .open()
+            .map_err(|error| format!("cannot format/open Hybrid cache: {error}"))?,
+    );
+    let initial_stats = cache.stats();
+    let cache = BenchCache::new(cache, options.api)?;
+    let prefill_count = percentage_count(options.keys, options.prefill_percent);
+    eprintln!(
+        "cache-bench hybrid: generator={} B, preloading {prefill_count}/{} objects with {} bounded workers",
+        states.planned_memory_bytes(),
+        options.keys,
+        options.prefill_concurrency,
+    );
+    let prefill_started = Instant::now();
+    prefill(
+        &cache,
+        Arc::clone(&keys),
+        Arc::clone(&states),
+        prefill_count,
+        options.prefill_concurrency,
+        &options.mix,
+    )?;
+    let prefill_elapsed = prefill_started.elapsed();
+    cache
+        .flush()
+        .map_err(|error| format!("prefill flush failed: {error}"))?;
+    verify_prefill(
+        &cache,
+        &keys,
+        &states,
+        prefill_count,
+        options.verify_samples,
+        &options.mix,
+    )?;
+    exercise_mixed_semantics(&cache, &keys, &states, &options)?;
+    cache
+        .flush()
+        .map_err(|error| format!("mixed semantic gate flush failed: {error}"))?;
+    let temporal = (options.access_pattern == AccessPattern::Temporal).then(|| {
+        TemporalAccess::new(
+            options.keys,
+            percentage_count(options.keys, options.temporal_window_percent).max(1),
+            options.temporal_hot_read_percent,
+            prefill_count as u64,
+        )
+    });
+    eprintln!(
+        "cache-bench hybrid: access pattern={} temporal window={} keys hot reads={}%",
+        options.access_pattern.as_str(),
+        temporal.as_ref().map_or(0, TemporalAccess::window_keys),
+        options.temporal_hot_read_percent,
+    );
+
+    if !options.warmup.is_zero() {
+        eprintln!(
+            "cache-bench hybrid: warmup {:.3}s",
+            options.warmup.as_secs_f64()
+        );
+        let warmup_phase = run_phase(
+            &cache,
+            PhaseWorkload {
+                keys: Arc::clone(&keys),
+                states: Arc::clone(&states),
+                mix: options.mix.clone(),
+                read_percent: options.read_percent,
+                remove_percent: options.remove_percent,
+                ttl_percent: options.ttl_percent,
+                cross_tier_percent: options.cross_tier_percent,
+                small_object_max: options.small_object_max,
+                ttl_ms: options.ttl_ms,
+                concurrency: options.concurrency,
+                duration: options.warmup,
+                seed: options.seed ^ 0xa409_3822_299f_31d0,
+                temporal: temporal.clone(),
+            },
+        )?;
+        if warmup_phase.errors != 0 || warmup_phase.stale_values != 0 || warmup_phase.rejected != 0
+        {
+            return Err(format!(
+                "warmup failed: errors={} stale={} rejected={} first_error={}",
+                warmup_phase.errors,
+                warmup_phase.stale_values,
+                warmup_phase.rejected,
+                warmup_phase.first_error.as_deref().unwrap_or("none")
+            ));
+        }
+        cache
+            .flush()
+            .map_err(|error| format!("warmup drain/flush failed: {error}"))?;
+    }
+    let before = cache.cache().stats();
+    eprintln!(
+        "cache-bench hybrid: measuring {:.3}s concurrency={} Region/Bucket QD={}",
+        options.duration.as_secs_f64(),
+        options.concurrency,
+        options.queue_depth
+    );
+    let phase = run_phase(
+        &cache,
+        PhaseWorkload {
+            keys,
+            states,
+            mix: options.mix.clone(),
+            read_percent: options.read_percent,
+            remove_percent: options.remove_percent,
+            ttl_percent: options.ttl_percent,
+            cross_tier_percent: options.cross_tier_percent,
+            small_object_max: options.small_object_max,
+            ttl_ms: options.ttl_ms,
+            concurrency: options.concurrency,
+            duration: options.duration,
+            seed: options.seed,
+            temporal,
+        },
+    )?;
+    if let Some(error) = &phase.first_error {
+        eprintln!("cache-bench hybrid: first measured error: {error}");
+    }
+    let drain_start = Instant::now();
+    cache
+        .close()
+        .map_err(|error| format!("Hybrid drain/close failed: {error}"))?;
+    let drain = drain_start.elapsed();
+    let after = cache.cache().stats();
+    let report = Report {
+        options: &options,
+        phase,
+        stats: StatsDelta::between(before, after),
+        total_stats: StatsDelta::between(initial_stats, after),
+        final_stats: after,
+        generator_planned_memory,
+        prefill_elapsed,
+        drain,
+    };
+    match options.output {
+        Output::Human => report.print_human(),
+        Output::Json => println!("{}", report.to_json()),
+        Output::OpenMetrics => print!("{}", report.to_openmetrics()),
+    }
+    let failures = report.acceptance_failures();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("acceptance failed: {}", failures.join("; ")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Api {
+    Sync,
+    Async,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AccessPattern {
+    #[default]
+    Uniform,
+    Temporal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Backpressure {
+    Reject,
+    #[default]
+    Block,
+}
+
+impl Backpressure {
+    const fn cache(self) -> BackpressurePolicy {
+        match self {
+            Self::Reject => BackpressurePolicy::Reject,
+            Self::Block => BackpressurePolicy::Block,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Block => "block",
+        }
+    }
+}
+
+impl FromStr for Backpressure {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "reject" => Ok(Self::Reject),
+            "block" => Ok(Self::Block),
+            _ => Err("--backpressure must be reject or block".into()),
+        }
+    }
+}
+
+impl AccessPattern {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Temporal => "temporal",
+        }
+    }
+}
+
+impl FromStr for AccessPattern {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "uniform" => Ok(Self::Uniform),
+            "temporal" => Ok(Self::Temporal),
+            _ => Err("--access-pattern must be uniform or temporal".into()),
+        }
+    }
+}
+
+impl Api {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
+impl FromStr for Api {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sync" => Ok(Self::Sync),
+            "async" => Ok(Self::Async),
+            _ => Err("--api must be sync or async".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Output {
+    Human,
+    Json,
+    OpenMetrics,
+}
+
+impl FromStr for Output {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "human" => Ok(Self::Human),
+            "json" => Ok(Self::Json),
+            "openmetrics" => Ok(Self::OpenMetrics),
+            _ => Err("--output must be human, json, or openmetrics".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Engine {
+    Sync,
+    Auto,
+    IoUring,
+}
+
+impl Engine {
+    const fn cache(self) -> IoEngineKind {
+        match self {
+            Self::Sync => IoEngineKind::Sync,
+            Self::Auto => IoEngineKind::Auto,
+            Self::IoUring => IoEngineKind::IoUring,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Auto => "auto",
+            Self::IoUring => "io_uring",
+        }
+    }
+}
+
+impl FromStr for Engine {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sync" => Ok(Self::Sync),
+            "auto" => Ok(Self::Auto),
+            "uring" | "io_uring" | "io-uring" => Ok(Self::IoUring),
+            _ => Err("--engine must be sync, auto, or uring".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Buffered,
+    Auto,
+    Direct,
+}
+
+impl Mode {
+    const fn cache(self) -> IoMode {
+        match self {
+            Self::Buffered => IoMode::Buffered,
+            Self::Auto => IoMode::Auto,
+            Self::Direct => IoMode::Direct,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+impl FromStr for Mode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "buffered" => Ok(Self::Buffered),
+            "auto" => Ok(Self::Auto),
+            "direct" => Ok(Self::Direct),
+            _ => Err("--mode must be buffered, auto, or direct".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SizeClass {
+    bytes: usize,
+    cumulative_weight: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SizeMix {
+    classes: Vec<SizeClass>,
+    total_weight: u64,
+}
+
+impl SizeMix {
+    fn parse(value: &str) -> Result<Self, String> {
+        let mut classes = Vec::new();
+        let mut total = 0_u64;
+        for item in value.split(',') {
+            let (size, weight) = item
+                .split_once(':')
+                .ok_or_else(|| format!("invalid size class {item:?}; expected SIZE:WEIGHT"))?;
+            let bytes = parse_usize_bytes(size, "--sizes")?;
+            if !(VALUE_HEADER_BYTES..=MAX_OBJECT_SIZE).contains(&bytes) {
+                return Err(format!(
+                    "each --sizes object must be in {VALUE_HEADER_BYTES}..={MAX_OBJECT_SIZE} bytes so values carry the key/version integrity header"
+                ));
+            }
+            let weight = parse_number::<u64>(weight, "--sizes weight")?;
+            if weight == 0 || weight > MAX_SIZE_WEIGHT {
+                return Err(format!("--sizes weights must be in 1..={MAX_SIZE_WEIGHT}"));
+            }
+            total = total
+                .checked_add(weight)
+                .ok_or_else(|| "--sizes total weight is too large".to_owned())?;
+            classes.push(SizeClass {
+                bytes,
+                cumulative_weight: total,
+            });
+            if classes.len() > MAX_SIZE_CLASSES {
+                return Err(format!(
+                    "--sizes accepts at most {MAX_SIZE_CLASSES} classes"
+                ));
+            }
+        }
+        if classes.is_empty() {
+            return Err("--sizes requires at least one class".into());
+        }
+        Ok(Self {
+            classes,
+            total_weight: total,
+        })
+    }
+
+    fn class_for_key(&self, key_index: usize) -> usize {
+        self.class_for_sample(mix64(key_index as u64))
+    }
+
+    fn class_for_version(&self, key_index: usize, version: u32) -> usize {
+        self.class_for_sample(mix64((key_index as u64) ^ (u64::from(version) << 32)))
+    }
+
+    fn class_for_sample(&self, sample: u64) -> usize {
+        let sample = sample % self.total_weight;
+        self.classes
+            .iter()
+            .position(|class| sample < class.cumulative_weight)
+            .unwrap_or(self.classes.len() - 1)
+    }
+
+    fn routing_classes(&self, small_object_max: usize) -> Option<(usize, usize)> {
+        let small = self
+            .classes
+            .iter()
+            .position(|class| KEY_BYTES.saturating_add(class.bytes) <= small_object_max)?;
+        let large = self
+            .classes
+            .iter()
+            .position(|class| KEY_BYTES.saturating_add(class.bytes) > small_object_max)?;
+        Some((small, large))
+    }
+
+    fn maximum_bytes(&self) -> usize {
+        self.classes
+            .iter()
+            .map(|class| class.bytes)
+            .max()
+            .unwrap_or(1)
+    }
+
+    fn as_spec(&self) -> String {
+        let mut previous = 0_u64;
+        self.classes
+            .iter()
+            .map(|class| {
+                let weight = class.cumulative_weight - previous;
+                previous = class.cumulative_weight;
+                format!("{}:{}", class.bytes, weight)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Options {
+    bucket_path: PathBuf,
+    region_path: PathBuf,
+    manifest_path: PathBuf,
+    bucket_capacity: u64,
+    region_capacity: u64,
+    memory_capacity: usize,
+    bucket_size: usize,
+    region_size: u64,
+    bucket_memory_budget: usize,
+    region_memory_budget: usize,
+    aggregate_memory_budget: Option<usize>,
+    small_object_max: usize,
+    mix: SizeMix,
+    keys: usize,
+    read_percent: u8,
+    access_pattern: AccessPattern,
+    temporal_window_percent: u8,
+    temporal_hot_read_percent: u8,
+    prefill_percent: u8,
+    prefill_concurrency: usize,
+    verify_samples: usize,
+    concurrency: usize,
+    queue_depth: usize,
+    backpressure: Backpressure,
+    append_lanes: usize,
+    write_mode: HybridWriteMode,
+    write_back_queue_depth: usize,
+    write_back_workers: usize,
+    write_back_memory: usize,
+    generator_memory_budget: usize,
+    journal_capacity: u64,
+    remove_percent: u8,
+    ttl_percent: u8,
+    cross_tier_percent: u8,
+    ttl_ms: u64,
+    api: Api,
+    engine: Engine,
+    mode: Mode,
+    warmup: Duration,
+    duration: Duration,
+    seed: u64,
+    output: Output,
+    min_ops_per_sec: Option<f64>,
+    max_p99_us: Option<f64>,
+    min_hit_percent: Option<f64>,
+    min_journal_rollovers: u64,
+    min_capacity_turnovers: f64,
+    min_logical_keyspace_turnovers: f64,
+    min_disk_qd_peak: u64,
+    min_write_back_qd_peak: u64,
+    max_journal_rollover_ms: Option<f64>,
+    max_close_ms: Option<f64>,
+}
+
+enum ParseOutcome {
+    Help,
+    Run(Box<Options>),
+}
+
+impl Options {
+    fn parse(arguments: impl IntoIterator<Item = String>) -> Result<ParseOutcome, String> {
+        let mut bucket_path = None;
+        let mut region_path = None;
+        let mut manifest_path = None;
+        let mut bucket_capacity = None;
+        let mut region_capacity = None;
+        let mut memory_capacity = None;
+        let mut bucket_size = 4096;
+        let mut region_size = DEFAULT_REGION_SIZE;
+        let mut bucket_memory_budget = 1024 * 1024 * 1024;
+        let mut region_memory_budget = 1024 * 1024 * 1024;
+        let mut aggregate_memory_budget = None;
+        let mut small_object_max = 1024;
+        let mut mix = SizeMix::parse("256:50,4KiB:30,64KiB:20")?;
+        let mut keys = DEFAULT_KEYS;
+        let mut read_percent = DEFAULT_READ_PERCENT;
+        let mut access_pattern = AccessPattern::Uniform;
+        let mut temporal_window_percent = DEFAULT_TEMPORAL_WINDOW_PERCENT;
+        let mut temporal_hot_read_percent = DEFAULT_TEMPORAL_HOT_READ_PERCENT;
+        let mut prefill_percent = DEFAULT_PREFILL_PERCENT;
+        let mut prefill_concurrency = None;
+        let mut verify_samples = DEFAULT_VERIFY_SAMPLES;
+        let mut concurrency = DEFAULT_CONCURRENCY;
+        let mut queue_depth = DEFAULT_QUEUE_DEPTH;
+        let mut backpressure = Backpressure::Block;
+        let mut append_lanes = 2;
+        let mut write_mode = HybridWriteMode::WriteBack;
+        let mut write_back_queue_depth = 64;
+        let mut write_back_workers = 4;
+        let mut write_back_memory = 32 * 1024 * 1024;
+        let mut generator_memory_budget = DEFAULT_GENERATOR_MEMORY_BYTES;
+        let mut journal_capacity = DEFAULT_JOURNAL_CAPACITY;
+        let mut remove_percent = 10;
+        let mut ttl_percent = 5;
+        let mut cross_tier_percent = 20;
+        let mut ttl_ms = DEFAULT_TTL_MS;
+        let mut api = Api::Async;
+        let mut engine = Engine::Auto;
+        let mut mode = Mode::Buffered;
+        let mut warmup = Duration::from_secs(DEFAULT_WARMUP_SECS);
+        let mut duration = Duration::from_secs(DEFAULT_DURATION_SECS);
+        let mut seed = DEFAULT_SEED;
+        let mut output = Output::Json;
+        let mut min_ops_per_sec = None;
+        let mut max_p99_us = None;
+        let mut min_hit_percent = None;
+        let mut min_journal_rollovers = 0;
+        let mut min_capacity_turnovers = 0.0;
+        let mut min_logical_keyspace_turnovers = 0.0;
+        let mut min_disk_qd_peak = 1;
+        let mut min_write_back_qd_peak = 1;
+        let mut max_journal_rollover_ms = None;
+        let mut max_close_ms = None;
+        let mut confirmed = false;
+        let mut bounded_arguments = Vec::new();
+        let mut argument_bytes = 0_usize;
+        for argument in arguments {
+            if bounded_arguments.len() == MAX_ARGUMENTS {
+                return Err(format!(
+                    "Hybrid benchmark accepts at most {MAX_ARGUMENTS} arguments"
+                ));
+            }
+            argument_bytes = argument_bytes
+                .checked_add(argument.len())
+                .ok_or_else(|| "Hybrid benchmark argument bytes overflow".to_owned())?;
+            if argument_bytes > MAX_ARGUMENT_BYTES {
+                return Err(format!(
+                    "Hybrid benchmark accepts at most {MAX_ARGUMENT_BYTES} argument bytes"
+                ));
+            }
+            bounded_arguments.push(argument);
+        }
+        let arguments = bounded_arguments;
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            if matches!(argument.as_str(), "--help" | "-h") {
+                return Ok(ParseOutcome::Help);
+            }
+            let (name, inline) = argument
+                .split_once('=')
+                .map_or((argument.as_str(), None), |(name, value)| {
+                    (name, Some(value))
+                });
+            if name == "--yes" {
+                if inline.is_some() {
+                    return Err("--yes does not take a value".into());
+                }
+                confirmed = true;
+                index += 1;
+                continue;
+            }
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    arguments
+                        .get(index)
+                        .filter(|value| !value.starts_with('-'))
+                        .map(String::as_str)
+                        .ok_or_else(|| format!("missing value for {name}"))?
+                }
+            };
+            match name {
+                "--bucket-path" => bucket_path = Some(PathBuf::from(value)),
+                "--region-path" => region_path = Some(PathBuf::from(value)),
+                "--manifest-path" => manifest_path = Some(PathBuf::from(value)),
+                "--bucket-capacity" => bucket_capacity = Some(parse_bytes(value, name)?),
+                "--region-capacity" => region_capacity = Some(parse_bytes(value, name)?),
+                "--memory-capacity" => memory_capacity = Some(parse_usize_bytes(value, name)?),
+                "--bucket-size" => bucket_size = parse_usize_bytes(value, name)?,
+                "--region-size" => region_size = parse_bytes(value, name)?,
+                "--bucket-memory-budget" => bucket_memory_budget = parse_usize_bytes(value, name)?,
+                "--region-memory-budget" => region_memory_budget = parse_usize_bytes(value, name)?,
+                "--hybrid-memory-budget" => {
+                    aggregate_memory_budget = Some(parse_usize_bytes(value, name)?)
+                }
+                "--small-object-max" => small_object_max = parse_usize_bytes(value, name)?,
+                "--sizes" => mix = SizeMix::parse(value)?,
+                "--keys" => keys = parse_number(value, name)?,
+                "--read-percent" => read_percent = parse_number(value, name)?,
+                "--access-pattern" => access_pattern = value.parse()?,
+                "--temporal-window-percent" => temporal_window_percent = parse_number(value, name)?,
+                "--temporal-hot-read-percent" => {
+                    temporal_hot_read_percent = parse_number(value, name)?
+                }
+                "--prefill-percent" => prefill_percent = parse_number(value, name)?,
+                "--prefill-concurrency" => prefill_concurrency = Some(parse_number(value, name)?),
+                "--verify-samples" => verify_samples = parse_number(value, name)?,
+                "--concurrency" => concurrency = parse_number(value, name)?,
+                "--queue-depth" => queue_depth = parse_number(value, name)?,
+                "--backpressure" => backpressure = value.parse()?,
+                "--append-lanes" => append_lanes = parse_number(value, name)?,
+                "--write-mode" => {
+                    write_mode = match value {
+                        "write-through" | "write_through" | "through" => {
+                            HybridWriteMode::WriteThrough
+                        }
+                        "write-back" | "write_back" | "back" => HybridWriteMode::WriteBack,
+                        _ => return Err("--write-mode must be write-through or write-back".into()),
+                    }
+                }
+                "--write-back-queue-depth" => write_back_queue_depth = parse_number(value, name)?,
+                "--write-back-workers" => write_back_workers = parse_number(value, name)?,
+                "--write-back-memory" => write_back_memory = parse_usize_bytes(value, name)?,
+                "--generator-memory-budget" => {
+                    generator_memory_budget = parse_usize_bytes(value, name)?
+                }
+                "--journal-capacity" => journal_capacity = parse_bytes(value, name)?,
+                "--remove-percent" => remove_percent = parse_number(value, name)?,
+                "--ttl-percent" => ttl_percent = parse_number(value, name)?,
+                "--cross-tier-percent" => cross_tier_percent = parse_number(value, name)?,
+                "--ttl-ms" => ttl_ms = parse_number(value, name)?,
+                "--api" => api = value.parse()?,
+                "--engine" => engine = value.parse()?,
+                "--mode" => mode = value.parse()?,
+                "--warmup-secs" => warmup = parse_duration(value, name, true)?,
+                "--duration-secs" => duration = parse_duration(value, name, false)?,
+                "--seed" => seed = parse_seed(value)?,
+                "--output" => output = value.parse()?,
+                "--min-ops-per-sec" => min_ops_per_sec = Some(parse_positive(value, name)?),
+                "--max-p99-us" => max_p99_us = Some(parse_positive(value, name)?),
+                "--min-hit-percent" => min_hit_percent = Some(parse_percent(value, name)?),
+                "--min-journal-rollovers" => min_journal_rollovers = parse_number(value, name)?,
+                "--min-capacity-turnovers" => {
+                    min_capacity_turnovers = parse_non_negative(value, name)?
+                }
+                "--min-logical-keyspace-turnovers" => {
+                    min_logical_keyspace_turnovers = parse_non_negative(value, name)?
+                }
+                "--min-disk-qd-peak" => min_disk_qd_peak = parse_number(value, name)?,
+                "--min-write-back-qd-peak" => min_write_back_qd_peak = parse_number(value, name)?,
+                "--max-journal-rollover-ms" => {
+                    max_journal_rollover_ms = Some(parse_positive(value, name)?)
+                }
+                "--max-close-ms" => max_close_ms = Some(parse_positive(value, name)?),
+                _ => return Err(format!("unknown Hybrid benchmark option {name}")),
+            }
+            index += 1;
+        }
+        if !confirmed {
+            return Err("Hybrid benchmark requires --yes and three empty dedicated paths".into());
+        }
+        let bucket_path = required(bucket_path, "--bucket-path")?;
+        let region_path = required(region_path, "--region-path")?;
+        let manifest_path = required(manifest_path, "--manifest-path")?;
+        if bucket_path == region_path
+            || bucket_path == manifest_path
+            || region_path == manifest_path
+        {
+            return Err("Bucket, Region, and manifest paths must be distinct".into());
+        }
+        let bucket_capacity = required(bucket_capacity, "--bucket-capacity")?;
+        let region_capacity = required(region_capacity, "--region-capacity")?;
+        let memory_capacity = required(memory_capacity, "--memory-capacity")?;
+        validate_range("--bucket-capacity", bucket_capacity, 1, MAX_CACHE_CAPACITY)?;
+        validate_range("--region-capacity", region_capacity, 1, MAX_CACHE_CAPACITY)?;
+        validate_memory("--memory-capacity", memory_capacity)?;
+        validate_memory("--bucket-memory-budget", bucket_memory_budget)?;
+        validate_memory("--region-memory-budget", region_memory_budget)?;
+        if let Some(bytes) = aggregate_memory_budget {
+            validate_memory("--hybrid-memory-budget", bytes)?;
+        }
+        validate_range("--keys", keys, 1, MAX_KEYS)?;
+        validate_range("--read-percent", read_percent, 0, 100)?;
+        validate_range("--temporal-window-percent", temporal_window_percent, 1, 100)?;
+        validate_range(
+            "--temporal-hot-read-percent",
+            temporal_hot_read_percent,
+            0,
+            100,
+        )?;
+        if access_pattern == AccessPattern::Uniform && min_logical_keyspace_turnovers > 0.0 {
+            return Err(
+                "--min-logical-keyspace-turnovers requires --access-pattern temporal".into(),
+            );
+        }
+        validate_range("--prefill-percent", prefill_percent, 0, 100)?;
+        let prefill_concurrency = prefill_concurrency.unwrap_or(concurrency.min(MAX_WORKERS));
+        validate_range("--prefill-concurrency", prefill_concurrency, 1, MAX_WORKERS)?;
+        validate_range("--verify-samples", verify_samples, 1, MAX_VERIFY_SAMPLES)?;
+        validate_range("--concurrency", concurrency, 1, MAX_CONCURRENCY)?;
+        if concurrency > keys {
+            return Err("--concurrency must not exceed --keys".into());
+        }
+        validate_range("--queue-depth", queue_depth, 1, MAX_QUEUE_DEPTH)?;
+        validate_range("--append-lanes", append_lanes, 1, 8)?;
+        validate_range(
+            "--write-back-queue-depth",
+            write_back_queue_depth,
+            1,
+            MAX_QUEUE_DEPTH,
+        )?;
+        validate_range("--write-back-workers", write_back_workers, 1, MAX_WORKERS)?;
+        if write_back_workers > write_back_queue_depth {
+            return Err("--write-back-workers must not exceed --write-back-queue-depth".into());
+        }
+        validate_memory("--write-back-memory", write_back_memory)?;
+        validate_memory("--generator-memory-budget", generator_memory_budget)?;
+        if !(64 * 1024..=MAX_CACHE_CAPACITY).contains(&journal_capacity)
+            || journal_capacity % 4096 != 0
+        {
+            return Err("--journal-capacity must be a 4096-byte multiple in 64KiB..=64TiB".into());
+        }
+        validate_range("--remove-percent", remove_percent, 0, 100)?;
+        validate_range("--ttl-percent", ttl_percent, 0, 100)?;
+        validate_range("--cross-tier-percent", cross_tier_percent, 0, 100)?;
+        if u16::from(remove_percent) + u16::from(ttl_percent) + u16::from(cross_tier_percent) > 100
+        {
+            return Err(
+                "--remove-percent + --ttl-percent + --cross-tier-percent must not exceed 100"
+                    .into(),
+            );
+        }
+        validate_range("--ttl-ms", ttl_ms, 1, MAX_TTL_MS)?;
+        validate_range(
+            "--min-disk-qd-peak",
+            min_disk_qd_peak,
+            1,
+            MAX_QUEUE_DEPTH as u64,
+        )?;
+        validate_range(
+            "--min-write-back-qd-peak",
+            min_write_back_qd_peak,
+            1,
+            MAX_QUEUE_DEPTH as u64,
+        )?;
+        if small_object_max == 0 || small_object_max > MAX_OBJECT_SIZE {
+            return Err(format!(
+                "--small-object-max must be in 1..={MAX_OBJECT_SIZE}"
+            ));
+        }
+        if mix.routing_classes(small_object_max).is_none() {
+            return Err(
+                "--sizes must include at least one Bucket-routed and one Region-routed value class after accounting for the generated key"
+                    .into(),
+            );
+        }
+        let generator_memory = generator_memory_plan(
+            keys,
+            concurrency.max(prefill_concurrency),
+            mix.maximum_bytes(),
+        )?;
+        if generator_memory > generator_memory_budget {
+            return Err(format!(
+                "benchmark generator needs {generator_memory} bytes, exceeding --generator-memory-budget {generator_memory_budget}"
+            ));
+        }
+        Ok(ParseOutcome::Run(Box::new(Self {
+            bucket_path,
+            region_path,
+            manifest_path,
+            bucket_capacity,
+            region_capacity,
+            memory_capacity,
+            bucket_size,
+            region_size,
+            bucket_memory_budget,
+            region_memory_budget,
+            aggregate_memory_budget,
+            small_object_max,
+            mix,
+            keys,
+            read_percent,
+            access_pattern,
+            temporal_window_percent,
+            temporal_hot_read_percent,
+            prefill_percent,
+            prefill_concurrency,
+            verify_samples,
+            concurrency,
+            queue_depth,
+            backpressure,
+            append_lanes,
+            write_mode,
+            write_back_queue_depth,
+            write_back_workers,
+            write_back_memory,
+            generator_memory_budget,
+            journal_capacity,
+            remove_percent,
+            ttl_percent,
+            cross_tier_percent,
+            ttl_ms,
+            api,
+            engine,
+            mode,
+            warmup,
+            duration,
+            seed,
+            output,
+            min_ops_per_sec,
+            max_p99_us,
+            min_hit_percent,
+            min_journal_rollovers,
+            min_capacity_turnovers,
+            min_logical_keyspace_turnovers,
+            min_disk_qd_peak,
+            min_write_back_qd_peak,
+            max_journal_rollover_ms,
+            max_close_ms,
+        })))
+    }
+}
+
+fn build_config(options: &Options) -> Result<HybridCacheConfig, String> {
+    let maximum_value = options
+        .mix
+        .maximum_bytes()
+        .checked_add(256)
+        .ok_or_else(|| "maximum Hybrid value size overflow".to_owned())?;
+    let index_slots = default_index_slots(options.keys)?;
+    let bucket = BucketCacheConfig::new(&options.bucket_path, options.bucket_capacity)
+        .with_bucket_size(options.bucket_size)
+        .with_memory_budget(options.bucket_memory_budget)
+        .with_buffer_slots(options.concurrency.min(128))
+        .with_io_engine(options.engine.cache())
+        .with_io_mode(options.mode.cache())
+        .with_io_queue_depth(options.queue_depth);
+    let region = CacheConfig::new(&options.region_path, options.region_capacity)
+        .with_region_size(options.region_size)
+        .with_index_slots(index_slots)
+        .with_max_key_size(64)
+        .with_max_value_size(maximum_value)
+        .with_append_lanes(options.append_lanes)
+        .with_memory_budget(options.region_memory_budget)
+        .with_submission_queue_depths(options.queue_depth, options.queue_depth)
+        .with_backpressure(options.backpressure.cache())
+        .with_io_queue_depth(options.queue_depth)
+        .with_io_engine(options.engine.cache())
+        .with_io_mode(options.mode.cache());
+    let request_memory = options
+        .mix
+        .maximum_bytes()
+        .checked_add(512)
+        .and_then(|bytes| bytes.checked_mul(options.concurrency))
+        .map(|bytes| bytes.max(64 * 1024 * 1024))
+        .ok_or_else(|| "Hybrid request-memory plan overflow".to_owned())?;
+    let mut hybrid = HybridCacheConfig::new(options.memory_capacity, bucket, region)
+        .with_manifest_path(&options.manifest_path)
+        .with_journal_capacity(options.journal_capacity)
+        .with_small_object_max(options.small_object_max)
+        .with_request_slots(options.concurrency.min(MAX_QUEUE_DEPTH))
+        .with_request_memory(request_memory)
+        .with_async_queue_depths(options.queue_depth, options.queue_depth)
+        .with_async_workers(options.concurrency.min(128), options.concurrency.min(128))
+        .with_backpressure(options.backpressure.cache())
+        .with_write_mode(options.write_mode)
+        .with_write_back_resources(
+            options.write_back_queue_depth,
+            options.write_back_workers,
+            options.write_back_memory,
+        );
+    if let Some(bytes) = options.aggregate_memory_budget {
+        hybrid = hybrid.with_memory_budget(bytes);
+    }
+    Ok(hybrid)
+}
+
+fn ensure_empty_targets(options: &Options) -> Result<(), String> {
+    for (name, path) in [
+        ("Bucket", &options.bucket_path),
+        ("Region", &options.region_path),
+        ("manifest", &options.manifest_path),
+    ] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("{name} path {} is a symlink", path.display()));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "{name} path {} is not a regular file",
+                    path.display()
+                ));
+            }
+            Ok(metadata) if metadata.len() != 0 => {
+                return Err(format!(
+                    "Hybrid benchmark refuses non-empty {name} path {}; use three dedicated empty paths",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+enum BenchCache {
+    Sync(Arc<HybridCache>),
+    Async {
+        cache: Arc<HybridCache>,
+        facade: AsyncHybridCache,
+    },
+}
+
+impl BenchCache {
+    fn new(cache: Arc<HybridCache>, api: Api) -> Result<Self, String> {
+        match api {
+            Api::Sync => Ok(Self::Sync(cache)),
+            Api::Async => {
+                let facade = cache
+                    .async_handle()
+                    .map_err(|error| format!("cannot create Hybrid async handle: {error}"))?;
+                Ok(Self::Async { cache, facade })
+            }
+        }
+    }
+
+    fn cache(&self) -> &HybridCache {
+        match self {
+            Self::Sync(cache) | Self::Async { cache, .. } => cache,
+        }
+    }
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, CacheError> {
+        match self {
+            Self::Sync(cache) => cache.get(key),
+            Self::Async { facade, .. } => block_on(facade.get(key)),
+        }
+    }
+
+    fn lookup(&self, key: &[u8]) -> Result<HybridLookupOutcome, CacheError> {
+        match self {
+            Self::Sync(cache) => cache.lookup(key),
+            Self::Async { facade, .. } => block_on(facade.lookup(key)),
+        }
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<PutOutcome, CacheError> {
+        self.put_with_options(key, value, PutOptions::default())
+    }
+
+    fn put_with_options(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        options: PutOptions,
+    ) -> Result<PutOutcome, CacheError> {
+        match self {
+            Self::Sync(cache) => cache.put(key, value, options),
+            Self::Async { facade, .. } => block_on(facade.put(key, value, options)),
+        }
+    }
+
+    fn remove(&self, key: &[u8]) -> Result<RemoveOutcome, CacheError> {
+        match self {
+            Self::Sync(cache) => cache.remove(key),
+            Self::Async { facade, .. } => block_on(facade.remove(key)),
+        }
+    }
+
+    fn flush(&self) -> Result<(), CacheError> {
+        match self {
+            Self::Sync(cache) => cache.flush(),
+            Self::Async { facade, .. } => block_on(facade.flush()),
+        }
+    }
+
+    fn close(&self) -> Result<(), CacheError> {
+        match self {
+            Self::Sync(cache) => cache.close(),
+            Self::Async { facade, .. } => block_on(facade.close()),
+        }
+    }
+}
+
+struct ThreadWaker {
+    thread: thread::Thread,
+    notified: AtomicBool,
+}
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let notifier = Arc::new(ThreadWaker {
+        thread: thread::current(),
+        notified: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&notifier));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match Pin::as_mut(&mut future).poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => {
+                while !notifier.notified.swap(false, Ordering::Acquire) {
+                    thread::park();
+                }
+            }
+        }
+    }
+}
+
+struct KeySpace {
+    count: usize,
+    seed: u64,
+}
+
+impl KeySpace {
+    const fn new(count: usize, seed: u64) -> Self {
+        Self { count, seed }
+    }
+
+    fn key(&self, index: usize) -> [u8; KEY_BYTES] {
+        debug_assert!(index < self.count);
+        let mut key = [0_u8; KEY_BYTES];
+        key[..8].copy_from_slice(b"CRHBKEY1");
+        key[8..16].copy_from_slice(&(index as u64).to_le_bytes());
+        key[16..24].copy_from_slice(&mix64((index as u64) ^ self.seed).to_le_bytes());
+        key[24..32]
+            .copy_from_slice(&mix64((index as u64).rotate_left(17) ^ !self.seed).to_le_bytes());
+        key
+    }
+}
+
+const STATE_PRESENT: u64 = 1_u64 << 63;
+const STATE_VERSION_MASK: u64 = u32::MAX as u64;
+const STATE_CLASS_SHIFT: u32 = 32;
+const STATE_CLASS_MASK: u64 = 0x0f;
+const STATE_EXPIRY_SHIFT: u32 = 36;
+const STATE_EXPIRY_MASK: u64 = (1_u64 << 27) - 1;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExpectedState {
+    present: bool,
+    version: u32,
+    class: usize,
+    expiry_delta_ms: u32,
+}
+
+impl ExpectedState {
+    fn decode(encoded: u64) -> Self {
+        Self {
+            present: encoded & STATE_PRESENT != 0,
+            version: (encoded & STATE_VERSION_MASK) as u32,
+            class: ((encoded >> STATE_CLASS_SHIFT) & STATE_CLASS_MASK) as usize,
+            expiry_delta_ms: ((encoded >> STATE_EXPIRY_SHIFT) & STATE_EXPIRY_MASK) as u32,
+        }
+    }
+
+    fn encode(self) -> u64 {
+        u64::from(self.version)
+            | ((self.class as u64 & STATE_CLASS_MASK) << STATE_CLASS_SHIFT)
+            | ((u64::from(self.expiry_delta_ms) & STATE_EXPIRY_MASK) << STATE_EXPIRY_SHIFT)
+            | if self.present { STATE_PRESENT } else { 0 }
+    }
+
+    fn next_version(self) -> Result<u32, String> {
+        self.version
+            .checked_add(1)
+            .ok_or_else(|| "per-key benchmark version exhausted u32".to_owned())
+    }
+
+    fn without_value(self) -> Self {
+        Self {
+            present: false,
+            expiry_delta_ms: 0,
+            ..self
+        }
+    }
+}
+
+struct KeyStateTable {
+    states: Box<[AtomicU64]>,
+    locks: Box<[Mutex<()>]>,
+    base_unix_ms: u64,
+    planned_memory_bytes: usize,
+}
+
+impl KeyStateTable {
+    fn try_new(
+        keys: usize,
+        concurrency: usize,
+        memory_budget: usize,
+        maximum_value_bytes: usize,
+    ) -> Result<Self, String> {
+        let planned_memory_bytes = generator_memory_plan(keys, concurrency, maximum_value_bytes)?;
+        if planned_memory_bytes > memory_budget {
+            return Err(format!(
+                "benchmark generator needs {planned_memory_bytes} bytes, exceeding budget {memory_budget}"
+            ));
+        }
+        let mut states = Vec::new();
+        states
+            .try_reserve_exact(keys)
+            .map_err(|_| "cannot allocate bounded per-key version table".to_owned())?;
+        states.resize_with(keys, || AtomicU64::new(0));
+        let lock_count = state_lock_count(concurrency);
+        let mut locks = Vec::new();
+        locks
+            .try_reserve_exact(lock_count)
+            .map_err(|_| "cannot allocate bounded key ordering locks".to_owned())?;
+        locks.resize_with(lock_count, || Mutex::new(()));
+        Ok(Self {
+            states: states.into_boxed_slice(),
+            locks: locks.into_boxed_slice(),
+            base_unix_ms: now_unix_ms(),
+            planned_memory_bytes,
+        })
+    }
+
+    const fn planned_memory_bytes(&self) -> usize {
+        self.planned_memory_bytes
+    }
+
+    fn lock(&self, index: usize) -> MutexGuard<'_, ()> {
+        lock_mutex(&self.locks[index & (self.locks.len() - 1)])
+    }
+
+    fn load(&self, index: usize) -> ExpectedState {
+        ExpectedState::decode(self.states[index].load(Ordering::Acquire))
+    }
+
+    fn store(&self, index: usize, state: ExpectedState) {
+        self.states[index].store(state.encode(), Ordering::Release);
+    }
+
+    fn expiry_delta(&self, expires_at_unix_ms: u64) -> Result<u32, String> {
+        let delta = expires_at_unix_ms
+            .saturating_sub(self.base_unix_ms)
+            .saturating_add(1);
+        if delta > STATE_EXPIRY_MASK {
+            return Err("TTL deadline exceeds packed generator state range".into());
+        }
+        Ok(delta as u32)
+    }
+
+    fn normalize_expiry(&self, index: usize, mut state: ExpectedState) -> ExpectedState {
+        if state.present
+            && state.expiry_delta_ms != 0
+            && now_unix_ms()
+                .saturating_sub(self.base_unix_ms)
+                .saturating_add(1)
+                >= u64::from(state.expiry_delta_ms)
+        {
+            state = state.without_value();
+            self.store(index, state);
+        }
+        state
+    }
+}
+
+fn state_lock_count(concurrency: usize) -> usize {
+    concurrency
+        .saturating_mul(16)
+        .clamp(1, MAX_STATE_LOCKS)
+        .next_power_of_two()
+        .min(MAX_STATE_LOCKS)
+}
+
+fn generator_memory_plan(
+    keys: usize,
+    concurrency: usize,
+    maximum_value_bytes: usize,
+) -> Result<usize, String> {
+    keys.checked_mul(size_of::<AtomicU64>())
+        .and_then(|bytes| {
+            state_lock_count(concurrency)
+                .checked_mul(size_of::<Mutex<()>>())
+                .and_then(|locks| bytes.checked_add(locks))
+        })
+        .and_then(|bytes| {
+            maximum_value_bytes
+                .checked_add(WORKER_STACK_BYTES)
+                .and_then(|per_worker| per_worker.checked_add(size_of::<Phase>()))
+                .and_then(|per_worker| per_worker.checked_mul(concurrency))
+                .and_then(|workers| bytes.checked_add(workers))
+        })
+        .and_then(|bytes| bytes.checked_add(1024 * 1024))
+        .ok_or_else(|| "benchmark generator memory plan overflow".to_owned())
+}
+
+fn fill_value(
+    output: &mut Vec<u8>,
+    mix: &SizeMix,
+    class: usize,
+    key_index: usize,
+    version: u32,
+) -> Result<(), String> {
+    let length = mix.classes[class].bytes;
+    output.clear();
+    if output.capacity() < length {
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| format!("cannot allocate {length} byte benchmark scratch value"))?;
+    }
+    output.resize(length, 0);
+    output[..8].copy_from_slice(&VALUE_MAGIC);
+    output[8..16].copy_from_slice(&(key_index as u64).to_le_bytes());
+    output[16..20].copy_from_slice(&version.to_le_bytes());
+    output[20..22].copy_from_slice(&(class as u16).to_le_bytes());
+    output[22..24].copy_from_slice(&(VALUE_HEADER_BYTES as u16).to_le_bytes());
+    output[24..28].copy_from_slice(&(length as u32).to_le_bytes());
+    let pattern_seed = value_pattern_seed(key_index, version, class);
+    output[28..32].copy_from_slice(&(pattern_seed as u32).to_le_bytes());
+    for (block_index, block) in output[VALUE_HEADER_BYTES..].chunks_mut(8).enumerate() {
+        let pattern = mix64(pattern_seed ^ block_index as u64).to_le_bytes();
+        block.copy_from_slice(&pattern[..block.len()]);
+    }
+    Ok(())
+}
+
+fn validate_value(
+    value: &[u8],
+    mix: &SizeMix,
+    class: usize,
+    key_index: usize,
+    version: u32,
+) -> bool {
+    let expected_len = mix.classes[class].bytes;
+    if value.len() != expected_len
+        || value.get(..8) != Some(VALUE_MAGIC.as_slice())
+        || value.get(8..16) != Some((key_index as u64).to_le_bytes().as_slice())
+        || value.get(16..20) != Some(version.to_le_bytes().as_slice())
+        || value.get(20..22) != Some((class as u16).to_le_bytes().as_slice())
+        || value.get(22..24) != Some((VALUE_HEADER_BYTES as u16).to_le_bytes().as_slice())
+        || value.get(24..28) != Some((expected_len as u32).to_le_bytes().as_slice())
+    {
+        return false;
+    }
+    let pattern_seed = value_pattern_seed(key_index, version, class);
+    if value.get(28..32) != Some((pattern_seed as u32).to_le_bytes().as_slice()) {
+        return false;
+    }
+    let payload_len = value.len() - VALUE_HEADER_BYTES;
+    if payload_len == 0 {
+        return true;
+    }
+    [0, payload_len / 2, payload_len - 1]
+        .into_iter()
+        .all(|offset| {
+            value[VALUE_HEADER_BYTES + offset] == value_pattern_byte(pattern_seed, offset)
+        })
+}
+
+fn value_pattern_seed(key_index: usize, version: u32, class: usize) -> u64 {
+    mix64((key_index as u64) ^ (u64::from(version) << 32) ^ class as u64)
+}
+
+fn value_pattern_byte(seed: u64, offset: usize) -> u8 {
+    mix64(seed ^ (offset / 8) as u64).to_le_bytes()[offset % 8]
+}
+
+fn prefill(
+    cache: &BenchCache,
+    keys: Arc<KeySpace>,
+    states: Arc<KeyStateTable>,
+    count: usize,
+    concurrency: usize,
+    mix: &SizeMix,
+) -> Result<(), String> {
+    let next = Arc::new(AtomicUsize::new(0));
+    let abort = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(Mutex::new(None));
+    let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+    workers
+        .try_reserve_exact(concurrency)
+        .map_err(|_| "cannot allocate bounded prefill worker table".to_owned())?;
+    for worker_id in 0..concurrency {
+        let worker_cache = cache.clone();
+        let worker_keys = Arc::clone(&keys);
+        let worker_states = Arc::clone(&states);
+        let worker_next = Arc::clone(&next);
+        let worker_abort = Arc::clone(&abort);
+        let worker_error = Arc::clone(&error);
+        let worker_mix = mix.clone();
+        let worker = thread::Builder::new()
+            .name(format!("hybrid-prefill-{worker_id}"))
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || {
+                let mut value = Vec::new();
+                while !worker_abort.load(Ordering::Acquire) {
+                    let start = worker_next.fetch_add(64, Ordering::Relaxed);
+                    if start >= count {
+                        break;
+                    }
+                    for index in start..start.saturating_add(64).min(count) {
+                        let class = worker_mix.class_for_key(index);
+                        if let Err(message) = fill_value(&mut value, &worker_mix, class, index, 1) {
+                            *lock_mutex(&worker_error) = Some(message);
+                            worker_abort.store(true, Ordering::Release);
+                            return;
+                        }
+                        let key = worker_keys.key(index);
+                        match worker_cache.put(&key, &value) {
+                            Ok(PutOutcome::Stored) => worker_states.store(
+                                index,
+                                ExpectedState {
+                                    present: true,
+                                    version: 1,
+                                    class,
+                                    expiry_delta_ms: 0,
+                                },
+                            ),
+                            Ok(PutOutcome::Rejected(reason)) => {
+                                *lock_mutex(&worker_error) =
+                                    Some(format!("prefill rejected key {index}: {reason:?}"));
+                                worker_abort.store(true, Ordering::Release);
+                                return;
+                            }
+                            Err(error) => {
+                                *lock_mutex(&worker_error) =
+                                    Some(format!("prefill failed for key {index}: {error}"));
+                                worker_abort.store(true, Ordering::Release);
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(spawn_error) => {
+                abort.store(true, Ordering::Release);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(format!("cannot spawn prefill worker: {spawn_error}"));
+            }
+        }
+    }
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| "a Hybrid prefill worker panicked".to_owned())?;
+    }
+    lock_mutex(&error).take().map_or(Ok(()), Err)
+}
+
+fn verify_prefill(
+    cache: &BenchCache,
+    keys: &KeySpace,
+    states: &KeyStateTable,
+    prefill_count: usize,
+    samples: usize,
+    mix: &SizeMix,
+) -> Result<(), String> {
+    let samples = samples.min(prefill_count);
+    for sample in 0..samples {
+        let index = ((sample as u128 * prefill_count as u128) / samples as u128) as usize;
+        let _ordering = states.lock(index);
+        let state = states.normalize_expiry(index, states.load(index));
+        let key = keys.key(index);
+        if let Some(value) = cache
+            .get(&key)
+            .map_err(|error| format!("prefill sample read failed for key {index}: {error}"))?
+        {
+            if !state.present || !validate_value(&value, mix, state.class, index, state.version) {
+                return Err(format!("stale/corrupt prefill sample for key {index}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exercise_mixed_semantics(
+    cache: &BenchCache,
+    keys: &KeySpace,
+    states: &KeyStateTable,
+    options: &Options,
+) -> Result<(), String> {
+    let index = keys.count - 1;
+    let _ordering = states.lock(index);
+    let key = keys.key(index);
+    let (small, large) = options
+        .mix
+        .routing_classes(options.small_object_max)
+        .expect("options validated mixed routing classes");
+    let mut state = states.normalize_expiry(index, states.load(index));
+    let mut value = Vec::new();
+    for class in [small, large, small] {
+        let version = state.next_version()?;
+        fill_value(&mut value, &options.mix, class, index, version)?;
+        match cache.put(&key, &value) {
+            Ok(PutOutcome::Stored) => {
+                state = ExpectedState {
+                    present: true,
+                    version,
+                    class,
+                    expiry_delta_ms: 0,
+                };
+                states.store(index, state);
+            }
+            Ok(PutOutcome::Rejected(reason)) => {
+                return Err(format!("cross-tier semantic put rejected: {reason:?}"));
+            }
+            Err(error) => return Err(format!("cross-tier semantic put failed: {error}")),
+        }
+        cache
+            .flush()
+            .map_err(|error| format!("cross-tier semantic flush failed: {error}"))?;
+        require_current_hit(cache, &key, &options.mix, index, state)?;
+    }
+    cache
+        .remove(&key)
+        .map_err(|error| format!("semantic remove failed: {error}"))?;
+    state = state.without_value();
+    states.store(index, state);
+    require_absent(cache, &key, "remove")?;
+
+    let version = state.next_version()?;
+    let expires_at = now_unix_ms().saturating_add(options.ttl_ms);
+    fill_value(&mut value, &options.mix, small, index, version)?;
+    match cache.put_with_options(
+        &key,
+        &value,
+        PutOptions {
+            expires_at_unix_ms: Some(expires_at),
+        },
+    ) {
+        Ok(PutOutcome::Stored) => {}
+        Ok(PutOutcome::Rejected(reason)) => {
+            return Err(format!("semantic TTL put rejected: {reason:?}"));
+        }
+        Err(error) => return Err(format!("semantic TTL put failed: {error}")),
+    }
+    state = ExpectedState {
+        present: true,
+        version,
+        class: small,
+        expiry_delta_ms: states.expiry_delta(expires_at)?,
+    };
+    states.store(index, state);
+    cache
+        .flush()
+        .map_err(|error| format!("semantic TTL flush failed: {error}"))?;
+    thread::sleep(Duration::from_millis(options.ttl_ms.saturating_add(10)));
+    states.store(index, state.without_value());
+    require_absent(cache, &key, "TTL expiry")
+}
+
+fn require_current_hit(
+    cache: &BenchCache,
+    key: &[u8],
+    mix: &SizeMix,
+    index: usize,
+    state: ExpectedState,
+) -> Result<(), String> {
+    match cache.get(key) {
+        Ok(Some(value)) if validate_value(&value, mix, state.class, index, state.version) => Ok(()),
+        Ok(Some(_)) => Err(format!(
+            "stale value after cross-tier update for key {index}"
+        )),
+        Ok(None) => Err(format!("immediate cross-tier update miss for key {index}")),
+        Err(error) => Err(format!("cross-tier verification failed: {error}")),
+    }
+}
+
+fn require_absent(cache: &BenchCache, key: &[u8], operation: &str) -> Result<(), String> {
+    match cache.get(key) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(format!("{operation} revived a stale value")),
+        Err(error) => Err(format!("{operation} verification failed: {error}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemporalBand {
+    Recent,
+    Historical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadLatencyTier {
+    Memory,
+    Bucket,
+    Region,
+    Miss,
+}
+
+impl ReadLatencyTier {
+    fn from_cache_tier(tier: CacheTier) -> Option<Self> {
+        match tier {
+            CacheTier::Memory => Some(Self::Memory),
+            CacheTier::SmallObjectDisk => Some(Self::Bucket),
+            CacheTier::RegionLogDisk => Some(Self::Region),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TemporalAccess {
+    head: Arc<AtomicU64>,
+    key_count: usize,
+    window_keys: usize,
+    hot_read_percent: u8,
+}
+
+impl TemporalAccess {
+    fn new(key_count: usize, window_keys: usize, hot_read_percent: u8, head: u64) -> Self {
+        debug_assert!(key_count > 0);
+        debug_assert!((1..=key_count).contains(&window_keys));
+        Self {
+            head: Arc::new(AtomicU64::new(head)),
+            key_count,
+            window_keys,
+            hot_read_percent,
+        }
+    }
+
+    const fn window_keys(&self) -> usize {
+        self.window_keys
+    }
+
+    fn head(&self) -> u64 {
+        self.head.load(Ordering::Acquire)
+    }
+
+    fn next_write(&self) -> usize {
+        let sequence = self.head.fetch_add(1, Ordering::AcqRel);
+        (sequence % self.key_count as u64) as usize
+    }
+
+    fn select_read(&self, random: &mut XorShift64) -> (usize, TemporalBand) {
+        let head = self.head();
+        let populated = usize::try_from(head.min(self.key_count as u64)).unwrap_or(self.key_count);
+        if populated == 0 {
+            return (
+                (random.next() % self.key_count as u64) as usize,
+                TemporalBand::Historical,
+            );
+        }
+        let recent = self.window_keys.min(populated);
+        let historical = populated - recent;
+        let choose_recent =
+            historical == 0 || random.next() % 100 < u64::from(self.hot_read_percent);
+        let (age, band) = if choose_recent {
+            (
+                (random.next() % recent as u64) as usize,
+                TemporalBand::Recent,
+            )
+        } else {
+            (
+                recent + (random.next() % historical as u64) as usize,
+                TemporalBand::Historical,
+            )
+        };
+        let sequence = head - 1 - age as u64;
+        ((sequence % self.key_count as u64) as usize, band)
+    }
+}
+
+struct PhaseWorkload {
+    keys: Arc<KeySpace>,
+    states: Arc<KeyStateTable>,
+    mix: SizeMix,
+    read_percent: u8,
+    remove_percent: u8,
+    ttl_percent: u8,
+    cross_tier_percent: u8,
+    small_object_max: usize,
+    ttl_ms: u64,
+    concurrency: usize,
+    duration: Duration,
+    seed: u64,
+    temporal: Option<TemporalAccess>,
+}
+
+fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, String> {
+    let PhaseWorkload {
+        keys,
+        states,
+        mix,
+        read_percent,
+        remove_percent,
+        ttl_percent,
+        cross_tier_percent,
+        small_object_max,
+        ttl_ms,
+        concurrency,
+        duration,
+        seed,
+        temporal,
+    } = workload;
+    let timeline_start = temporal.as_ref().map_or(0, TemporalAccess::head);
+    let start = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(AtomicBool::new(false));
+    let mut workers: Vec<thread::JoinHandle<Phase>> = Vec::new();
+    workers
+        .try_reserve_exact(concurrency)
+        .map_err(|_| "cannot allocate Hybrid benchmark worker table".to_owned())?;
+    for worker_id in 0..concurrency {
+        let worker_cache = cache.clone();
+        let worker_keys = Arc::clone(&keys);
+        let worker_states = Arc::clone(&states);
+        let worker_mix = mix.clone();
+        let worker_start = Arc::clone(&start);
+        let worker_abort = Arc::clone(&abort);
+        let worker_temporal = temporal.clone();
+        let worker = thread::Builder::new()
+            .name(format!("hybrid-bench-{worker_id}"))
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || {
+                while !worker_start.load(Ordering::Acquire) {
+                    if worker_abort.load(Ordering::Acquire) {
+                        return Phase::default();
+                    }
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                let deadline = Instant::now()
+                    .checked_add(duration)
+                    .unwrap_or_else(Instant::now);
+                let mut random = XorShift64::new(seed ^ mix64(worker_id as u64));
+                let mut phase = Phase::default();
+                let mut value = Vec::new();
+                let owned_keys = (worker_keys.count - worker_id).div_ceil(concurrency);
+                while !worker_abort.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let is_read = random.next() % 100 < u64::from(read_percent);
+                    let mutation = (!is_read).then(|| random.next() % 100);
+                    let (key_index, temporal_band) = match &worker_temporal {
+                        Some(temporal) if is_read => {
+                            let (index, band) = temporal.select_read(&mut random);
+                            (index, Some(band))
+                        }
+                        Some(temporal)
+                            if mutation.expect("non-read operation has a mutation class")
+                                < u64::from(remove_percent) =>
+                        {
+                            let (index, _) = temporal.select_read(&mut random);
+                            (index, None)
+                        }
+                        Some(temporal) => (temporal.next_write(), None),
+                        None => {
+                            let local = (random.next() as usize) % owned_keys;
+                            (worker_id + local * concurrency, None)
+                        }
+                    };
+                    let key = worker_keys.key(key_index);
+                    let _ordering = worker_states.lock(key_index);
+                    let mut state =
+                        worker_states.normalize_expiry(key_index, worker_states.load(key_index));
+                    let started = Instant::now();
+                    if is_read {
+                        phase.reads = phase.reads.saturating_add(1);
+                        phase.record_temporal_read(temporal_band);
+                        let latency_tier = match worker_cache.lookup(&key) {
+                            Ok(HybridLookupOutcome::Hit { value: found, tier })
+                                if state.present
+                                    && validate_value(
+                                        &found,
+                                        &worker_mix,
+                                        state.class,
+                                        key_index,
+                                        state.version,
+                                    ) =>
+                            {
+                                phase.hits = phase.hits.saturating_add(1);
+                                phase.read_bytes =
+                                    phase.read_bytes.saturating_add(found.len() as u64);
+                                phase.record_temporal_hit(temporal_band, tier);
+                                ReadLatencyTier::from_cache_tier(tier)
+                            }
+                            Ok(HybridLookupOutcome::Hit { tier, .. }) => {
+                                phase.record_error(format!(
+                                    "stale/corrupt value returned for key {key_index}"
+                                ));
+                                phase.stale_values = phase.stale_values.saturating_add(1);
+                                worker_abort.store(true, Ordering::Release);
+                                ReadLatencyTier::from_cache_tier(tier)
+                            }
+                            Ok(HybridLookupOutcome::Miss(_)) => {
+                                phase.misses = phase.misses.saturating_add(1);
+                                phase.record_temporal_miss(temporal_band);
+                                Some(ReadLatencyTier::Miss)
+                            }
+                            Err(error) => {
+                                phase.record_error(format!(
+                                    "lookup failed for key {key_index}: {error}"
+                                ));
+                                None
+                            }
+                        };
+                        let elapsed = started.elapsed();
+                        phase.read_latency.record(elapsed);
+                        phase.record_temporal_latency(temporal_band, elapsed);
+                        if let Some(tier) = latency_tier {
+                            phase.record_read_tier_latency(tier, elapsed);
+                        }
+                    } else {
+                        let mutation = mutation.expect("non-read operation has a mutation class");
+                        if mutation < u64::from(remove_percent) {
+                            phase.removes = phase.removes.saturating_add(1);
+                            match worker_cache.remove(&key) {
+                                Ok(_) => {
+                                    state = state.without_value();
+                                    worker_states.store(key_index, state);
+                                }
+                                Err(error) => phase.record_error(format!(
+                                    "remove failed for key {key_index}: {error}"
+                                )),
+                            }
+                        } else if mutation < u64::from(remove_percent) + u64::from(ttl_percent) {
+                            phase.ttl_puts = phase.ttl_puts.saturating_add(1);
+                            phase.writes = phase.writes.saturating_add(1);
+                            if perform_put(
+                                &worker_cache,
+                                &worker_keys,
+                                &worker_states,
+                                &worker_mix,
+                                key_index,
+                                worker_mix
+                                    .class_for_version(key_index, state.version.saturating_add(1)),
+                                Some(now_unix_ms().saturating_add(ttl_ms)),
+                                &mut state,
+                                &mut value,
+                                &mut phase,
+                            )
+                            .is_err()
+                            {
+                                worker_abort.store(true, Ordering::Release);
+                            }
+                        } else if mutation
+                            < u64::from(remove_percent)
+                                + u64::from(ttl_percent)
+                                + u64::from(cross_tier_percent)
+                        {
+                            phase.cross_tier_updates = phase.cross_tier_updates.saturating_add(1);
+                            let (small, large) = worker_mix
+                                .routing_classes(small_object_max)
+                                .expect("validated mixed routing classes");
+                            let routes = if state.version & 1 == 0 {
+                                [small, large]
+                            } else {
+                                [large, small]
+                            };
+                            for class in routes {
+                                phase.writes = phase.writes.saturating_add(1);
+                                if perform_put(
+                                    &worker_cache,
+                                    &worker_keys,
+                                    &worker_states,
+                                    &worker_mix,
+                                    key_index,
+                                    class,
+                                    None,
+                                    &mut state,
+                                    &mut value,
+                                    &mut phase,
+                                )
+                                .is_err()
+                                {
+                                    worker_abort.store(true, Ordering::Release);
+                                    break;
+                                }
+                            }
+                        } else {
+                            phase.writes = phase.writes.saturating_add(1);
+                            let class = worker_mix
+                                .class_for_version(key_index, state.version.saturating_add(1));
+                            if perform_put(
+                                &worker_cache,
+                                &worker_keys,
+                                &worker_states,
+                                &worker_mix,
+                                key_index,
+                                class,
+                                None,
+                                &mut state,
+                                &mut value,
+                                &mut phase,
+                            )
+                            .is_err()
+                            {
+                                worker_abort.store(true, Ordering::Release);
+                            }
+                        }
+                        phase.write_latency.record(started.elapsed());
+                    }
+                    phase.latency.record(started.elapsed());
+                }
+                phase
+            });
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(spawn_error) => {
+                abort.store(true, Ordering::Release);
+                start.store(true, Ordering::Release);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(format!(
+                    "cannot spawn Hybrid benchmark worker: {spawn_error}"
+                ));
+            }
+        }
+    }
+    let started = Instant::now();
+    start.store(true, Ordering::Release);
+    let mut phase = Phase::default();
+    for worker in workers {
+        let worker = worker
+            .join()
+            .map_err(|_| "a Hybrid benchmark worker panicked".to_owned())?;
+        phase.merge(&worker);
+    }
+    phase.elapsed = started.elapsed();
+    phase.timeline_start = timeline_start;
+    phase.timeline_end = temporal.as_ref().map_or(0, TemporalAccess::head);
+    Ok(phase)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_put(
+    cache: &BenchCache,
+    keys: &KeySpace,
+    states: &KeyStateTable,
+    mix: &SizeMix,
+    key_index: usize,
+    class: usize,
+    expires_at: Option<u64>,
+    state: &mut ExpectedState,
+    value: &mut Vec<u8>,
+    phase: &mut Phase,
+) -> Result<(), ()> {
+    let version = match state.next_version() {
+        Ok(version) => version,
+        Err(_) => {
+            phase.record_error(format!("version exhausted for key {key_index}"));
+            return Err(());
+        }
+    };
+    if fill_value(value, mix, class, key_index, version).is_err() {
+        phase.record_error(format!("cannot generate value for key {key_index}"));
+        return Err(());
+    }
+    let key = keys.key(key_index);
+    match cache.put_with_options(
+        &key,
+        value,
+        PutOptions {
+            expires_at_unix_ms: expires_at,
+        },
+    ) {
+        Ok(PutOutcome::Stored) => {
+            let expiry_delta_ms = match expires_at {
+                Some(expires_at) => match states.expiry_delta(expires_at) {
+                    Ok(delta) => delta,
+                    Err(_) => {
+                        phase.record_error(format!("TTL delta overflow for key {key_index}"));
+                        return Err(());
+                    }
+                },
+                None => 0,
+            };
+            *state = ExpectedState {
+                present: true,
+                version,
+                class,
+                expiry_delta_ms,
+            };
+            states.store(key_index, *state);
+            phase.stored = phase.stored.saturating_add(1);
+            phase.write_bytes = phase.write_bytes.saturating_add(value.len() as u64);
+            Ok(())
+        }
+        Ok(PutOutcome::Rejected(_)) => {
+            phase.rejected = phase.rejected.saturating_add(1);
+            Ok(())
+        }
+        Err(error) => {
+            phase.record_error(format!("put failed for key {key_index}: {error}"));
+            Err(())
+        }
+    }
+}
+
+#[derive(Default)]
+struct Phase {
+    elapsed: Duration,
+    first_error: Option<String>,
+    timeline_start: u64,
+    timeline_end: u64,
+    reads: u64,
+    writes: u64,
+    removes: u64,
+    ttl_puts: u64,
+    cross_tier_updates: u64,
+    hits: u64,
+    misses: u64,
+    stored: u64,
+    rejected: u64,
+    errors: u64,
+    stale_values: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    recent_reads: u64,
+    recent_hits: u64,
+    recent_misses: u64,
+    recent_memory_hits: u64,
+    recent_bucket_hits: u64,
+    recent_region_hits: u64,
+    historical_reads: u64,
+    historical_hits: u64,
+    historical_misses: u64,
+    historical_memory_hits: u64,
+    historical_bucket_hits: u64,
+    historical_region_hits: u64,
+    latency: Histogram,
+    read_latency: Histogram,
+    write_latency: Histogram,
+    memory_read_latency: Histogram,
+    bucket_read_latency: Histogram,
+    region_read_latency: Histogram,
+    miss_read_latency: Histogram,
+    recent_read_latency: Histogram,
+    historical_read_latency: Histogram,
+}
+
+impl Phase {
+    fn operations(&self) -> u64 {
+        self.reads
+            .saturating_add(self.writes)
+            .saturating_add(self.removes)
+    }
+
+    fn timeline_advances(&self) -> u64 {
+        self.timeline_end.saturating_sub(self.timeline_start)
+    }
+
+    fn record_error(&mut self, error: String) {
+        self.errors = self.errors.saturating_add(1);
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+    }
+
+    fn record_temporal_read(&mut self, band: Option<TemporalBand>) {
+        match band {
+            Some(TemporalBand::Recent) => self.recent_reads = self.recent_reads.saturating_add(1),
+            Some(TemporalBand::Historical) => {
+                self.historical_reads = self.historical_reads.saturating_add(1)
+            }
+            None => {}
+        }
+    }
+
+    fn record_temporal_hit(&mut self, band: Option<TemporalBand>, tier: CacheTier) {
+        let (hits, memory, bucket, region) = match band {
+            Some(TemporalBand::Recent) => (
+                &mut self.recent_hits,
+                &mut self.recent_memory_hits,
+                &mut self.recent_bucket_hits,
+                &mut self.recent_region_hits,
+            ),
+            Some(TemporalBand::Historical) => (
+                &mut self.historical_hits,
+                &mut self.historical_memory_hits,
+                &mut self.historical_bucket_hits,
+                &mut self.historical_region_hits,
+            ),
+            None => return,
+        };
+        *hits = hits.saturating_add(1);
+        let tier_hits = match tier {
+            CacheTier::Memory => memory,
+            CacheTier::SmallObjectDisk => bucket,
+            CacheTier::RegionLogDisk => region,
+            _ => return,
+        };
+        *tier_hits = tier_hits.saturating_add(1);
+    }
+
+    fn record_temporal_miss(&mut self, band: Option<TemporalBand>) {
+        match band {
+            Some(TemporalBand::Recent) => self.recent_misses = self.recent_misses.saturating_add(1),
+            Some(TemporalBand::Historical) => {
+                self.historical_misses = self.historical_misses.saturating_add(1)
+            }
+            None => {}
+        }
+    }
+
+    fn record_temporal_latency(&mut self, band: Option<TemporalBand>, elapsed: Duration) {
+        match band {
+            Some(TemporalBand::Recent) => self.recent_read_latency.record(elapsed),
+            Some(TemporalBand::Historical) => self.historical_read_latency.record(elapsed),
+            None => {}
+        }
+    }
+
+    fn record_read_tier_latency(&mut self, tier: ReadLatencyTier, elapsed: Duration) {
+        match tier {
+            ReadLatencyTier::Memory => self.memory_read_latency.record(elapsed),
+            ReadLatencyTier::Bucket => self.bucket_read_latency.record(elapsed),
+            ReadLatencyTier::Region => self.region_read_latency.record(elapsed),
+            ReadLatencyTier::Miss => self.miss_read_latency.record(elapsed),
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if self.first_error.is_none() {
+            self.first_error.clone_from(&other.first_error);
+        }
+        self.reads = self.reads.saturating_add(other.reads);
+        self.writes = self.writes.saturating_add(other.writes);
+        self.removes = self.removes.saturating_add(other.removes);
+        self.ttl_puts = self.ttl_puts.saturating_add(other.ttl_puts);
+        self.cross_tier_updates = self
+            .cross_tier_updates
+            .saturating_add(other.cross_tier_updates);
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.stored = self.stored.saturating_add(other.stored);
+        self.rejected = self.rejected.saturating_add(other.rejected);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.stale_values = self.stale_values.saturating_add(other.stale_values);
+        self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
+        self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
+        self.recent_reads = self.recent_reads.saturating_add(other.recent_reads);
+        self.recent_hits = self.recent_hits.saturating_add(other.recent_hits);
+        self.recent_misses = self.recent_misses.saturating_add(other.recent_misses);
+        self.recent_memory_hits = self
+            .recent_memory_hits
+            .saturating_add(other.recent_memory_hits);
+        self.recent_bucket_hits = self
+            .recent_bucket_hits
+            .saturating_add(other.recent_bucket_hits);
+        self.recent_region_hits = self
+            .recent_region_hits
+            .saturating_add(other.recent_region_hits);
+        self.historical_reads = self.historical_reads.saturating_add(other.historical_reads);
+        self.historical_hits = self.historical_hits.saturating_add(other.historical_hits);
+        self.historical_misses = self
+            .historical_misses
+            .saturating_add(other.historical_misses);
+        self.historical_memory_hits = self
+            .historical_memory_hits
+            .saturating_add(other.historical_memory_hits);
+        self.historical_bucket_hits = self
+            .historical_bucket_hits
+            .saturating_add(other.historical_bucket_hits);
+        self.historical_region_hits = self
+            .historical_region_hits
+            .saturating_add(other.historical_region_hits);
+        self.latency.merge(&other.latency);
+        self.read_latency.merge(&other.read_latency);
+        self.write_latency.merge(&other.write_latency);
+        self.memory_read_latency.merge(&other.memory_read_latency);
+        self.bucket_read_latency.merge(&other.bucket_read_latency);
+        self.region_read_latency.merge(&other.region_read_latency);
+        self.miss_read_latency.merge(&other.miss_read_latency);
+        self.recent_read_latency.merge(&other.recent_read_latency);
+        self.historical_read_latency
+            .merge(&other.historical_read_latency);
+    }
+}
+
+struct Histogram {
+    buckets: [u64; HISTOGRAM_BUCKETS],
+    count: u64,
+    maximum_ns: u64,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0; HISTOGRAM_BUCKETS],
+            count: 0,
+            maximum_ns: 0,
+        }
+    }
+}
+
+impl Histogram {
+    fn record(&mut self, duration: Duration) {
+        let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let exponent = if ns <= 1 {
+            0
+        } else {
+            (u64::BITS - 1 - ns.leading_zeros()) as usize
+        };
+        let base = 1_u64 << exponent;
+        let sub = if ns <= 1 {
+            0
+        } else {
+            (((ns - base) as u128 * 8) / base as u128).min(7) as usize
+        };
+        let bucket = (exponent * 8 + sub).min(HISTOGRAM_BUCKETS - 1);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        self.maximum_ns = self.maximum_ns.max(ns);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (target, source) in self.buckets.iter_mut().zip(other.buckets) {
+            *target = target.saturating_add(source);
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.maximum_ns = self.maximum_ns.max(other.maximum_ns);
+    }
+
+    fn percentile(&self, permille: u64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = self.count.saturating_mul(permille).saturating_add(999) / 1000;
+        let mut seen = 0_u64;
+        for (index, count) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= target.max(1) {
+                let exponent = index / 8;
+                let sub = index % 8;
+                let base = 1_u128 << exponent;
+                let upper = base + ((sub + 1) as u128 * base).div_ceil(8);
+                return u64::try_from(upper.saturating_sub(1))
+                    .unwrap_or(u64::MAX)
+                    .min(self.maximum_ns.max(1));
+            }
+        }
+        self.maximum_ns
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StatsDelta {
+    memory_hits: u64,
+    bucket_hits: u64,
+    region_hits: u64,
+    misses: u64,
+    promotions: u64,
+    request_rejections: u64,
+    bucket_bytes_read: u64,
+    bucket_bytes_written: u64,
+    bucket_io_submitted: u64,
+    bucket_io_errors: u64,
+    region_bytes_read: u64,
+    region_bytes_written: u64,
+    region_io_submitted: u64,
+    region_io_errors: u64,
+    host_write_bytes: u64,
+    admitted_value_bytes: u64,
+    write_amplification_milli: u64,
+    bucket_io_peak: u64,
+    region_io_peak: u64,
+    journal_rollovers: u64,
+    journal_rollover_max_ns: u64,
+    journal_commit_batches: u64,
+    journal_commit_records: u64,
+    journal_durability_syncs: u64,
+    journal_sync_elapsed_ns_total: u64,
+    journal_sync_elapsed_ns_max: u64,
+    journal_commit_rejected: u64,
+    journal_commit_worker_panics: u64,
+    journal_commit_queue_peak: u64,
+    write_back_memory_only_puts: u64,
+    write_back_fallbacks: u64,
+    write_back_demoted_entries: u64,
+    write_back_demoted_bytes: u64,
+    write_back_demotion_failures: u64,
+    write_back_proactive_scheduled: u64,
+    write_back_proactive_skipped: u64,
+    write_back_proactive_persisted: u64,
+    write_back_proactive_rejected: u64,
+    write_back_proactive_fatal: u64,
+    write_back_queue_rejections: u64,
+    write_back_worker_panics: u64,
+    write_back_queue_peak: u64,
+}
+
+impl StatsDelta {
+    fn between(before: HybridCacheStats, after: HybridCacheStats) -> Self {
+        Self {
+            memory_hits: after.memory_hits.saturating_sub(before.memory_hits),
+            bucket_hits: after.small_disk_hits.saturating_sub(before.small_disk_hits),
+            region_hits: after
+                .region_disk_hits
+                .saturating_sub(before.region_disk_hits),
+            misses: after.misses.saturating_sub(before.misses),
+            promotions: after.promotions.saturating_sub(before.promotions),
+            request_rejections: after
+                .request_rejections
+                .saturating_sub(before.request_rejections),
+            bucket_bytes_read: after
+                .bucket
+                .bytes_read
+                .saturating_sub(before.bucket.bytes_read),
+            bucket_bytes_written: after
+                .bucket
+                .bytes_written
+                .saturating_sub(before.bucket.bytes_written),
+            bucket_io_submitted: after
+                .bucket
+                .io_submitted
+                .saturating_sub(before.bucket.io_submitted),
+            bucket_io_errors: after
+                .bucket
+                .io_errors
+                .saturating_sub(before.bucket.io_errors),
+            region_bytes_read: after
+                .region
+                .bytes_read
+                .saturating_sub(before.region.bytes_read),
+            region_bytes_written: after
+                .region
+                .bytes_written
+                .saturating_sub(before.region.bytes_written),
+            region_io_submitted: after
+                .region
+                .io_submitted
+                .saturating_sub(before.region.io_submitted),
+            region_io_errors: after
+                .region
+                .io_errors
+                .saturating_sub(before.region.io_errors),
+            host_write_bytes: after
+                .host_writes
+                .host_write_bytes
+                .saturating_sub(before.host_writes.host_write_bytes),
+            admitted_value_bytes: after
+                .host_writes
+                .admitted_value_bytes
+                .saturating_sub(before.host_writes.admitted_value_bytes),
+            write_amplification_milli: amplification_milli(
+                after
+                    .host_writes
+                    .host_write_bytes
+                    .saturating_sub(before.host_writes.host_write_bytes),
+                after
+                    .host_writes
+                    .admitted_value_bytes
+                    .saturating_sub(before.host_writes.admitted_value_bytes),
+            ),
+            bucket_io_peak: after.bucket.io_in_flight_peak,
+            region_io_peak: after.region.io_in_flight_peak,
+            journal_rollovers: after
+                .journal_rollovers
+                .saturating_sub(before.journal_rollovers),
+            journal_rollover_max_ns: after.journal_rollover_max_ns,
+            journal_commit_batches: after
+                .journal_group_commit
+                .committed_batches
+                .saturating_sub(before.journal_group_commit.committed_batches),
+            journal_commit_records: after
+                .journal_group_commit
+                .committed_records
+                .saturating_sub(before.journal_group_commit.committed_records),
+            journal_durability_syncs: after
+                .journal_group_commit
+                .durability_syncs
+                .saturating_sub(before.journal_group_commit.durability_syncs),
+            journal_sync_elapsed_ns_total: after
+                .journal_group_commit
+                .sync_elapsed_ns_total
+                .saturating_sub(before.journal_group_commit.sync_elapsed_ns_total),
+            journal_sync_elapsed_ns_max: after.journal_group_commit.sync_elapsed_ns_max,
+            journal_commit_rejected: after
+                .journal_group_commit
+                .rejected
+                .saturating_sub(before.journal_group_commit.rejected),
+            journal_commit_worker_panics: after
+                .journal_group_commit
+                .worker_panics
+                .saturating_sub(before.journal_group_commit.worker_panics),
+            journal_commit_queue_peak: after.journal_group_commit.in_flight_peak,
+            write_back_memory_only_puts: after
+                .write_back
+                .memory_only_puts
+                .saturating_sub(before.write_back.memory_only_puts),
+            write_back_fallbacks: after
+                .write_back
+                .write_through_fallbacks
+                .saturating_sub(before.write_back.write_through_fallbacks),
+            write_back_demoted_entries: after
+                .write_back
+                .demoted_entries
+                .saturating_sub(before.write_back.demoted_entries),
+            write_back_demoted_bytes: after
+                .write_back
+                .demoted_bytes
+                .saturating_sub(before.write_back.demoted_bytes),
+            write_back_demotion_failures: after
+                .write_back
+                .demotion_failures
+                .saturating_sub(before.write_back.demotion_failures),
+            write_back_proactive_scheduled: after
+                .write_back
+                .proactive_scheduled
+                .saturating_sub(before.write_back.proactive_scheduled),
+            write_back_proactive_skipped: after
+                .write_back
+                .proactive_skipped
+                .saturating_sub(before.write_back.proactive_skipped),
+            write_back_proactive_persisted: after
+                .write_back
+                .proactive_persisted
+                .saturating_sub(before.write_back.proactive_persisted),
+            write_back_proactive_rejected: after
+                .write_back
+                .proactive_rejected
+                .saturating_sub(before.write_back.proactive_rejected),
+            write_back_proactive_fatal: after
+                .write_back
+                .proactive_fatal
+                .saturating_sub(before.write_back.proactive_fatal),
+            write_back_queue_rejections: after
+                .write_back
+                .queue_rejections
+                .saturating_sub(before.write_back.queue_rejections),
+            write_back_worker_panics: after
+                .write_back
+                .worker_panics
+                .saturating_sub(before.write_back.worker_panics),
+            write_back_queue_peak: after.write_back.queue_in_flight_peak,
+        }
+    }
+}
+
+struct Report<'a> {
+    options: &'a Options,
+    phase: Phase,
+    stats: StatsDelta,
+    total_stats: StatsDelta,
+    final_stats: HybridCacheStats,
+    generator_planned_memory: usize,
+    prefill_elapsed: Duration,
+    drain: Duration,
+}
+
+impl Report<'_> {
+    fn ops_per_sec(&self) -> f64 {
+        rate(self.phase.operations(), self.phase.elapsed)
+    }
+
+    fn hit_percent(&self) -> f64 {
+        let lookups = self.phase.hits.saturating_add(self.phase.misses);
+        if lookups == 0 {
+            0.0
+        } else {
+            self.phase.hits as f64 * 100.0 / lookups as f64
+        }
+    }
+
+    fn p99_us(&self) -> f64 {
+        self.phase.latency.percentile(990) as f64 / 1000.0
+    }
+
+    fn logical_keyspace_turnovers(&self) -> f64 {
+        self.phase.timeline_advances() as f64 / self.options.keys as f64
+    }
+
+    fn timeline_wraps_crossed(&self) -> u64 {
+        let keys = self.options.keys as u64;
+        self.phase
+            .timeline_end
+            .checked_div(keys)
+            .unwrap_or(0)
+            .saturating_sub(self.phase.timeline_start.checked_div(keys).unwrap_or(0))
+    }
+
+    fn logical_ingest_turnovers(&self) -> f64 {
+        self.bytes_per_capacity(self.phase.write_bytes)
+    }
+
+    fn admitted_disk_turnovers(&self) -> f64 {
+        self.bytes_per_capacity(self.stats.admitted_value_bytes)
+    }
+
+    fn bytes_per_capacity(&self, bytes: u64) -> f64 {
+        let capacity = self
+            .options
+            .bucket_capacity
+            .saturating_add(self.options.region_capacity);
+        if capacity == 0 {
+            0.0
+        } else {
+            bytes as f64 / capacity as f64
+        }
+    }
+
+    fn recent_hit_percent(&self) -> f64 {
+        hit_percent(self.phase.recent_hits, self.phase.recent_misses)
+    }
+
+    fn historical_hit_percent(&self) -> f64 {
+        hit_percent(self.phase.historical_hits, self.phase.historical_misses)
+    }
+
+    fn recent_memory_read_percent(&self) -> f64 {
+        percent_of(self.phase.recent_memory_hits, self.phase.recent_reads)
+    }
+
+    fn historical_memory_read_percent(&self) -> f64 {
+        percent_of(
+            self.phase.historical_memory_hits,
+            self.phase.historical_reads,
+        )
+    }
+
+    fn capacity_turnovers(&self) -> f64 {
+        let capacity = self
+            .options
+            .bucket_capacity
+            .saturating_add(self.options.region_capacity);
+        if capacity == 0 {
+            0.0
+        } else {
+            self.stats.host_write_bytes as f64 / capacity as f64
+        }
+    }
+
+    fn total_capacity_turnovers(&self) -> f64 {
+        let capacity = self
+            .options
+            .bucket_capacity
+            .saturating_add(self.options.region_capacity);
+        if capacity == 0 {
+            0.0
+        } else {
+            self.total_stats.host_write_bytes as f64 / capacity as f64
+        }
+    }
+
+    fn acceptance_failures(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        if self.phase.errors != 0 {
+            failures.push(format!("{} correctness/I/O errors", self.phase.errors));
+        }
+        if self.phase.stale_values != 0 {
+            failures.push(format!(
+                "{} stale or corrupt versioned values",
+                self.phase.stale_values
+            ));
+        }
+        if self.phase.rejected != 0 {
+            failures.push(format!(
+                "{} puts were rejected by bounded admission/resources",
+                self.phase.rejected
+            ));
+        }
+        if self.total_stats.write_back_demotion_failures != 0
+            || self.total_stats.write_back_queue_rejections != 0
+            || self.total_stats.write_back_worker_panics != 0
+        {
+            failures.push(format!(
+                "write-back demotion failures/rejections/panics = {}/{}/{}",
+                self.total_stats.write_back_demotion_failures,
+                self.total_stats.write_back_queue_rejections,
+                self.total_stats.write_back_worker_panics
+            ));
+        }
+        if self.total_stats.bucket_io_errors != 0 || self.total_stats.region_io_errors != 0 {
+            failures.push(format!(
+                "Bucket/Region I/O errors = {}/{}",
+                self.total_stats.bucket_io_errors, self.total_stats.region_io_errors
+            ));
+        }
+        if self.total_stats.bucket_io_submitted == 0 || self.total_stats.region_io_submitted == 0 {
+            failures.push(format!(
+                "both disk tiers must submit I/O; Bucket/Region = {}/{}",
+                self.total_stats.bucket_io_submitted, self.total_stats.region_io_submitted
+            ));
+        }
+        if self.total_stats.bucket_io_peak < self.options.min_disk_qd_peak
+            || self.total_stats.region_io_peak < self.options.min_disk_qd_peak
+        {
+            failures.push(format!(
+                "Bucket/Region I/O QD peaks {}/{} below required {}",
+                self.total_stats.bucket_io_peak,
+                self.total_stats.region_io_peak,
+                self.options.min_disk_qd_peak
+            ));
+        }
+        if self.options.write_mode == HybridWriteMode::WriteBack {
+            if self.total_stats.write_back_demoted_entries == 0 {
+                failures.push("write-back run observed no completed demotion".into());
+            }
+            if self.total_stats.write_back_queue_peak < self.options.min_write_back_qd_peak {
+                failures.push(format!(
+                    "write-back QD peak {} below required {}",
+                    self.total_stats.write_back_queue_peak, self.options.min_write_back_qd_peak
+                ));
+            }
+        }
+        if self.total_stats.journal_commit_rejected != 0
+            || self.total_stats.journal_commit_worker_panics != 0
+        {
+            failures.push(format!(
+                "journal group-commit rejections/panics = {}/{}",
+                self.total_stats.journal_commit_rejected,
+                self.total_stats.journal_commit_worker_panics
+            ));
+        }
+        if self.total_stats.journal_rollovers < self.options.min_journal_rollovers {
+            failures.push(format!(
+                "journal rollovers {} below required {}",
+                self.total_stats.journal_rollovers, self.options.min_journal_rollovers
+            ));
+        }
+        if self.capacity_turnovers() < self.options.min_capacity_turnovers {
+            failures.push(format!(
+                "capacity turnover {:.3}x below required {:.3}x",
+                self.capacity_turnovers(),
+                self.options.min_capacity_turnovers
+            ));
+        }
+        if self.logical_keyspace_turnovers() < self.options.min_logical_keyspace_turnovers {
+            failures.push(format!(
+                "logical keyspace turnover {:.3}x below required {:.3}x",
+                self.logical_keyspace_turnovers(),
+                self.options.min_logical_keyspace_turnovers
+            ));
+        }
+        if let Some(maximum) = self.options.max_journal_rollover_ms {
+            let observed = self.total_stats.journal_rollover_max_ns as f64 / 1_000_000.0;
+            if observed > maximum {
+                failures.push(format!(
+                    "journal rollover max {observed:.3} ms exceeds {maximum:.3} ms"
+                ));
+            }
+        }
+        if let Some(maximum) = self.options.max_close_ms {
+            let observed = self.drain.as_secs_f64() * 1000.0;
+            if observed > maximum {
+                failures.push(format!(
+                    "drain/close {observed:.3} ms exceeds {maximum:.3} ms"
+                ));
+            }
+        }
+        if self.final_stats.memory_dirty_entries != 0
+            || self.final_stats.write_back.queue_in_flight != 0
+        {
+            failures.push(format!(
+                "close left dirty entries/in-flight demotions = {}/{}",
+                self.final_stats.memory_dirty_entries, self.final_stats.write_back.queue_in_flight
+            ));
+        }
+        if let Some(minimum) = self.options.min_ops_per_sec {
+            if self.ops_per_sec() < minimum {
+                failures.push(format!(
+                    "ops/s {:.3} below {minimum:.3}",
+                    self.ops_per_sec()
+                ));
+            }
+        }
+        if let Some(maximum) = self.options.max_p99_us {
+            if self.p99_us() > maximum {
+                failures.push(format!("p99 {:.3} us exceeds {maximum:.3}", self.p99_us()));
+            }
+        }
+        if let Some(minimum) = self.options.min_hit_percent {
+            if self.hit_percent() < minimum {
+                failures.push(format!(
+                    "hit rate {:.3}% below {minimum:.3}%",
+                    self.hit_percent()
+                ));
+            }
+        }
+        failures
+    }
+
+    fn to_json(&self) -> String {
+        let mut output = String::with_capacity(8192);
+        output.push('{');
+        macro_rules! number_field {
+            ($name:literal, $value:expr) => {
+                write!(output, "\"{}\":{},", $name, $value)
+                    .expect("writing JSON into a String cannot fail")
+            };
+        }
+        macro_rules! string_field {
+            ($name:literal, $value:expr) => {
+                write!(output, "\"{}\":\"{}\",", $name, json_escape($value))
+                    .expect("writing JSON into a String cannot fail")
+            };
+        }
+        macro_rules! raw_field {
+            ($name:literal, $value:expr) => {
+                write!(output, "\"{}\":{},", $name, $value)
+                    .expect("writing JSON into a String cannot fail")
+            };
+        }
+
+        number_field!("schema_version", 3);
+        string_field!("cache", "hybrid");
+        raw_field!("hardware_qualification", false);
+        raw_field!("external_hardware_signoff_required", true);
+        raw_field!("target_nvme_matrix_passed", false);
+        raw_field!("external_nvme_soak_passed", false);
+        raw_field!("external_power_loss_passed", false);
+        raw_field!("external_thermal_passed", false);
+        string_field!("qualification_scope", "software_scale_gate_single_run");
+        string_field!(
+            "bucket_path",
+            self.options.bucket_path.to_string_lossy().as_ref()
+        );
+        string_field!(
+            "region_path",
+            self.options.region_path.to_string_lossy().as_ref()
+        );
+        string_field!(
+            "manifest_path",
+            self.options.manifest_path.to_string_lossy().as_ref()
+        );
+        number_field!("bucket_capacity_bytes", self.options.bucket_capacity);
+        number_field!("region_capacity_bytes", self.options.region_capacity);
+        number_field!("memory_capacity_bytes", self.options.memory_capacity);
+        string_field!("size_mix", &self.options.mix.as_spec());
+        number_field!("small_object_max_bytes", self.options.small_object_max);
+        number_field!("keys", self.options.keys);
+        number_field!(
+            "generator_memory_budget_bytes",
+            self.options.generator_memory_budget
+        );
+        number_field!(
+            "generator_planned_memory_bytes",
+            self.generator_planned_memory
+        );
+        number_field!("prefill_concurrency", self.options.prefill_concurrency);
+        number_field!("verify_samples", self.options.verify_samples);
+        number_field!("journal_capacity_bytes", self.options.journal_capacity);
+        number_field!("read_percent", self.options.read_percent);
+        string_field!("access_pattern", self.options.access_pattern.as_str());
+        number_field!(
+            "temporal_window_percent",
+            self.options.temporal_window_percent
+        );
+        number_field!(
+            "temporal_window_keys",
+            percentage_count(self.options.keys, self.options.temporal_window_percent).max(1)
+        );
+        number_field!(
+            "temporal_hot_read_percent",
+            self.options.temporal_hot_read_percent
+        );
+        number_field!("prefill_percent", self.options.prefill_percent);
+        number_field!("remove_percent_of_mutations", self.options.remove_percent);
+        number_field!("ttl_percent_of_mutations", self.options.ttl_percent);
+        number_field!(
+            "cross_tier_percent_of_mutations",
+            self.options.cross_tier_percent
+        );
+        number_field!("ttl_ms", self.options.ttl_ms);
+        number_field!("concurrency", self.options.concurrency);
+        number_field!("queue_depth", self.options.queue_depth);
+        string_field!("backpressure", self.options.backpressure.as_str());
+        string_field!("api", self.options.api.as_str());
+        string_field!("engine_requested", self.options.engine.as_str());
+        string_field!("io_mode_requested", self.options.mode.as_str());
+        string_field!("write_mode", write_mode_name(self.options.write_mode));
+        number_field!(
+            "write_back_queue_depth",
+            self.options.write_back_queue_depth
+        );
+        number_field!("write_back_workers", self.options.write_back_workers);
+        number_field!("write_back_memory_bytes", self.options.write_back_memory);
+        number_field!("prefill_seconds", self.prefill_elapsed.as_secs_f64());
+        number_field!("elapsed_seconds", self.phase.elapsed.as_secs_f64());
+        number_field!("operations", self.phase.operations());
+        number_field!("operations_per_second", self.ops_per_sec());
+        number_field!("reads", self.phase.reads);
+        number_field!("writes", self.phase.writes);
+        number_field!("removes", self.phase.removes);
+        number_field!("ttl_puts", self.phase.ttl_puts);
+        number_field!("cross_tier_updates", self.phase.cross_tier_updates);
+        number_field!("hits", self.phase.hits);
+        number_field!("misses", self.phase.misses);
+        number_field!("hit_percent", self.hit_percent());
+        number_field!("stored", self.phase.stored);
+        number_field!("rejected", self.phase.rejected);
+        number_field!("errors", self.phase.errors);
+        match &self.phase.first_error {
+            Some(error) => string_field!("first_error", error),
+            None => raw_field!("first_error", "null"),
+        }
+        number_field!("stale_values", self.phase.stale_values);
+        number_field!("read_bytes", self.phase.read_bytes);
+        number_field!("write_bytes", self.phase.write_bytes);
+        number_field!(
+            "read_mib_per_second",
+            rate(self.phase.read_bytes, self.phase.elapsed) / (1024.0 * 1024.0)
+        );
+        number_field!(
+            "write_mib_per_second",
+            rate(self.phase.write_bytes, self.phase.elapsed) / (1024.0 * 1024.0)
+        );
+        number_field!("timeline_start", self.phase.timeline_start);
+        number_field!("timeline_end", self.phase.timeline_end);
+        number_field!("timeline_advances", self.phase.timeline_advances());
+        number_field!("timeline_wraps_crossed", self.timeline_wraps_crossed());
+        number_field!(
+            "logical_keyspace_turnovers",
+            self.logical_keyspace_turnovers()
+        );
+        number_field!("logical_ingest_turnovers", self.logical_ingest_turnovers());
+        number_field!("recent_reads", self.phase.recent_reads);
+        number_field!(
+            "observed_recent_read_percent",
+            percent_of(
+                self.phase.recent_reads,
+                self.phase
+                    .recent_reads
+                    .saturating_add(self.phase.historical_reads)
+            )
+        );
+        number_field!("recent_hits", self.phase.recent_hits);
+        number_field!("recent_misses", self.phase.recent_misses);
+        number_field!("recent_hit_percent", self.recent_hit_percent());
+        number_field!("recent_memory_hits", self.phase.recent_memory_hits);
+        number_field!("recent_bucket_hits", self.phase.recent_bucket_hits);
+        number_field!("recent_region_hits", self.phase.recent_region_hits);
+        number_field!(
+            "recent_memory_read_percent",
+            self.recent_memory_read_percent()
+        );
+        number_field!("historical_reads", self.phase.historical_reads);
+        number_field!("historical_hits", self.phase.historical_hits);
+        number_field!("historical_misses", self.phase.historical_misses);
+        number_field!("historical_hit_percent", self.historical_hit_percent());
+        number_field!("historical_memory_hits", self.phase.historical_memory_hits);
+        number_field!("historical_bucket_hits", self.phase.historical_bucket_hits);
+        number_field!("historical_region_hits", self.phase.historical_region_hits);
+        number_field!(
+            "historical_memory_read_percent",
+            self.historical_memory_read_percent()
+        );
+        number_field!(
+            "latency_p50_us",
+            self.phase.latency.percentile(500) as f64 / 1000.0
+        );
+        number_field!("latency_p99_us", self.p99_us());
+        number_field!(
+            "latency_p999_us",
+            self.phase.latency.percentile(999) as f64 / 1000.0
+        );
+        number_field!(
+            "latency_max_us",
+            self.phase.latency.maximum_ns as f64 / 1000.0
+        );
+        number_field!(
+            "read_latency_p99_us",
+            self.phase.read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "write_latency_p99_us",
+            self.phase.write_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "memory_read_latency_p99_us",
+            self.phase.memory_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "bucket_read_latency_p99_us",
+            self.phase.bucket_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "region_read_latency_p99_us",
+            self.phase.region_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "miss_read_latency_p99_us",
+            self.phase.miss_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "recent_read_latency_p99_us",
+            self.phase.recent_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!(
+            "historical_read_latency_p99_us",
+            self.phase.historical_read_latency.percentile(990) as f64 / 1000.0
+        );
+        number_field!("memory_hits", self.stats.memory_hits);
+        number_field!("bucket_hits", self.stats.bucket_hits);
+        number_field!("region_hits", self.stats.region_hits);
+        number_field!("hybrid_misses", self.stats.misses);
+        number_field!("promotions", self.stats.promotions);
+        number_field!("request_rejections", self.stats.request_rejections);
+        number_field!("bucket_bytes_read", self.stats.bucket_bytes_read);
+        number_field!("bucket_bytes_written", self.stats.bucket_bytes_written);
+        number_field!("region_bytes_read", self.stats.region_bytes_read);
+        number_field!("region_bytes_written", self.stats.region_bytes_written);
+        number_field!("host_write_bytes", self.stats.host_write_bytes);
+        number_field!("admitted_value_bytes", self.stats.admitted_value_bytes);
+        number_field!("admitted_disk_turnovers", self.admitted_disk_turnovers());
+        number_field!(
+            "write_amplification_milli",
+            self.stats.write_amplification_milli
+        );
+        number_field!("bucket_io_in_flight_peak", self.stats.bucket_io_peak);
+        number_field!("region_io_in_flight_peak", self.stats.region_io_peak);
+        number_field!(
+            "write_back_memory_only_puts",
+            self.stats.write_back_memory_only_puts
+        );
+        number_field!("write_back_fallbacks", self.stats.write_back_fallbacks);
+        number_field!(
+            "write_back_demoted_entries",
+            self.stats.write_back_demoted_entries
+        );
+        number_field!(
+            "write_back_demoted_bytes",
+            self.stats.write_back_demoted_bytes
+        );
+        number_field!(
+            "write_back_demotion_failures",
+            self.stats.write_back_demotion_failures
+        );
+        number_field!(
+            "write_back_proactive_scheduled",
+            self.stats.write_back_proactive_scheduled
+        );
+        number_field!(
+            "write_back_proactive_skipped",
+            self.stats.write_back_proactive_skipped
+        );
+        number_field!(
+            "write_back_proactive_persisted",
+            self.stats.write_back_proactive_persisted
+        );
+        number_field!(
+            "write_back_proactive_rejected",
+            self.stats.write_back_proactive_rejected
+        );
+        number_field!(
+            "write_back_proactive_fatal",
+            self.stats.write_back_proactive_fatal
+        );
+        number_field!(
+            "write_back_queue_rejections",
+            self.stats.write_back_queue_rejections
+        );
+        number_field!(
+            "write_back_worker_panics",
+            self.stats.write_back_worker_panics
+        );
+        number_field!(
+            "write_back_queue_in_flight_peak",
+            self.stats.write_back_queue_peak
+        );
+        number_field!(
+            "total_bucket_io_submitted",
+            self.total_stats.bucket_io_submitted
+        );
+        number_field!(
+            "total_region_io_submitted",
+            self.total_stats.region_io_submitted
+        );
+        number_field!("total_bucket_io_errors", self.total_stats.bucket_io_errors);
+        number_field!("total_region_io_errors", self.total_stats.region_io_errors);
+        number_field!("total_bucket_io_qd_peak", self.total_stats.bucket_io_peak);
+        number_field!("total_region_io_qd_peak", self.total_stats.region_io_peak);
+        number_field!(
+            "total_write_back_demoted_entries",
+            self.total_stats.write_back_demoted_entries
+        );
+        number_field!(
+            "total_write_back_demoted_bytes",
+            self.total_stats.write_back_demoted_bytes
+        );
+        number_field!(
+            "total_write_back_queue_qd_peak",
+            self.total_stats.write_back_queue_peak
+        );
+        number_field!("total_host_write_bytes", self.total_stats.host_write_bytes);
+        number_field!("capacity_turnovers", self.capacity_turnovers());
+        number_field!("total_capacity_turnovers", self.total_capacity_turnovers());
+        number_field!("journal_rollovers", self.total_stats.journal_rollovers);
+        number_field!(
+            "journal_rollover_max_ms",
+            self.total_stats.journal_rollover_max_ns as f64 / 1_000_000.0
+        );
+        number_field!(
+            "journal_group_commit_batches",
+            self.total_stats.journal_commit_batches
+        );
+        number_field!(
+            "journal_group_commit_records",
+            self.total_stats.journal_commit_records
+        );
+        number_field!(
+            "journal_durability_syncs",
+            self.total_stats.journal_durability_syncs
+        );
+        number_field!(
+            "journal_sync_elapsed_ms_total",
+            self.total_stats.journal_sync_elapsed_ns_total as f64 / 1_000_000.0
+        );
+        number_field!(
+            "journal_sync_elapsed_ms_max",
+            self.total_stats.journal_sync_elapsed_ns_max as f64 / 1_000_000.0
+        );
+        number_field!(
+            "journal_group_commit_rejected",
+            self.total_stats.journal_commit_rejected
+        );
+        number_field!(
+            "journal_group_commit_worker_panics",
+            self.total_stats.journal_commit_worker_panics
+        );
+        number_field!(
+            "journal_group_commit_qd_peak",
+            self.total_stats.journal_commit_queue_peak
+        );
+        number_field!("final_dirty_entries", self.final_stats.memory_dirty_entries);
+        number_field!("final_dirty_bytes", self.final_stats.memory_dirty_bytes);
+        number_field!(
+            "final_journal_used_bytes",
+            self.final_stats.journal_used_bytes
+        );
+        number_field!("drain_close_ms", self.drain.as_secs_f64() * 1000.0);
+        raw_field!(
+            "min_ops_per_sec",
+            optional_f64(self.options.min_ops_per_sec)
+        );
+        raw_field!("max_p99_us", optional_f64(self.options.max_p99_us));
+        raw_field!(
+            "min_hit_percent",
+            optional_f64(self.options.min_hit_percent)
+        );
+        number_field!("min_journal_rollovers", self.options.min_journal_rollovers);
+        number_field!(
+            "min_capacity_turnovers",
+            self.options.min_capacity_turnovers
+        );
+        number_field!(
+            "min_logical_keyspace_turnovers",
+            self.options.min_logical_keyspace_turnovers
+        );
+        number_field!("min_disk_qd_peak", self.options.min_disk_qd_peak);
+        number_field!(
+            "min_write_back_qd_peak",
+            self.options.min_write_back_qd_peak
+        );
+        raw_field!(
+            "max_journal_rollover_ms",
+            optional_f64(self.options.max_journal_rollover_ms)
+        );
+        raw_field!("max_close_ms", optional_f64(self.options.max_close_ms));
+        write!(
+            output,
+            "\"acceptance_passed\":{}}}",
+            self.acceptance_failures().is_empty()
+        )
+        .expect("writing JSON into a String cannot fail");
+        output
+    }
+
+    fn to_openmetrics(&self) -> String {
+        let mut output = self.final_stats.to_openmetrics();
+        if let Some(prefix) = output.strip_suffix("# EOF\n") {
+            output.truncate(prefix.len());
+        }
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_acceptance_passed gauge\ncache_rs_hybrid_bench_acceptance_passed {}",
+            u8::from(self.acceptance_failures().is_empty())
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_capacity_turnovers gauge\ncache_rs_hybrid_bench_capacity_turnovers {:.6}",
+            self.capacity_turnovers()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_logical_keyspace_turnovers gauge\ncache_rs_hybrid_bench_logical_keyspace_turnovers {:.6}",
+            self.logical_keyspace_turnovers()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_recent_memory_read_percent gauge\ncache_rs_hybrid_bench_recent_memory_read_percent {:.6}",
+            self.recent_memory_read_percent()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_historical_memory_read_percent gauge\ncache_rs_hybrid_bench_historical_memory_read_percent {:.6}",
+            self.historical_memory_read_percent()
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_journal_rollover_max_milliseconds gauge\ncache_rs_hybrid_bench_journal_rollover_max_milliseconds {:.6}",
+            self.total_stats.journal_rollover_max_ns as f64 / 1_000_000.0
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_drain_close_milliseconds gauge\ncache_rs_hybrid_bench_drain_close_milliseconds {:.6}",
+            self.drain.as_secs_f64() * 1000.0
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        output.push_str(
+            "# TYPE cache_rs_hybrid_bench_hardware_qualification gauge\ncache_rs_hybrid_bench_hardware_qualification 0\n# EOF\n",
+        );
+        output
+    }
+
+    fn print_human(&self) {
+        println!("cache-rs Hybrid mixed-object benchmark");
+        println!("  hardware qualification: no (single run; target sign-off external)");
+        println!("  size mix:               {}", self.options.mix.as_spec());
+        println!(
+            "  access/window/hot reads: {}/{} keys/{}%",
+            self.options.access_pattern.as_str(),
+            percentage_count(self.options.keys, self.options.temporal_window_percent).max(1),
+            self.options.temporal_hot_read_percent
+        );
+        println!(
+            "  keys/generator memory:  {} / {}/{} B",
+            self.options.keys, self.generator_planned_memory, self.options.generator_memory_budget
+        );
+        println!(
+            "  prefill workers/time:   {} / {:.3}s",
+            self.options.prefill_concurrency,
+            self.prefill_elapsed.as_secs_f64()
+        );
+        println!(
+            "  read/concurrency/QD/BP:  {}% / {} / {} / {}",
+            self.options.read_percent,
+            self.options.concurrency,
+            self.options.queue_depth,
+            self.options.backpressure.as_str()
+        );
+        println!(
+            "  API/engine/mode/write:   {}/{}/{}/{}",
+            self.options.api.as_str(),
+            self.options.engine.as_str(),
+            self.options.mode.as_str(),
+            write_mode_name(self.options.write_mode)
+        );
+        println!("  throughput:              {:.0} ops/s", self.ops_per_sec());
+        println!(
+            "  latency p50/p99/p99.9:   {:.1}/{:.1}/{:.1} us",
+            self.phase.latency.percentile(500) as f64 / 1000.0,
+            self.p99_us(),
+            self.phase.latency.percentile(999) as f64 / 1000.0
+        );
+        println!(
+            "  read/write p99:          {:.1}/{:.1} us; {:.1}/{:.1} MiB/s",
+            self.phase.read_latency.percentile(990) as f64 / 1000.0,
+            self.phase.write_latency.percentile(990) as f64 / 1000.0,
+            rate(self.phase.read_bytes, self.phase.elapsed) / (1024.0 * 1024.0),
+            rate(self.phase.write_bytes, self.phase.elapsed) / (1024.0 * 1024.0)
+        );
+        println!(
+            "  tier read p99 M/B/R/miss:{:.1}/{:.1}/{:.1}/{:.1} us",
+            self.phase.memory_read_latency.percentile(990) as f64 / 1000.0,
+            self.phase.bucket_read_latency.percentile(990) as f64 / 1000.0,
+            self.phase.region_read_latency.percentile(990) as f64 / 1000.0,
+            self.phase.miss_read_latency.percentile(990) as f64 / 1000.0
+        );
+        println!(
+            "  hit rate/tier hits:      {:.3}% / memory={} bucket={} Region={}",
+            self.hit_percent(),
+            self.stats.memory_hits,
+            self.stats.bucket_hits,
+            self.stats.region_hits
+        );
+        if self.options.access_pattern == AccessPattern::Temporal {
+            println!(
+                "  recent hit/memory read:  {:.3}%/{:.3}% (reads={})",
+                self.recent_hit_percent(),
+                self.recent_memory_read_percent(),
+                self.phase.recent_reads
+            );
+            println!(
+                "  history hit/memory read: {:.3}%/{:.3}% (reads={})",
+                self.historical_hit_percent(),
+                self.historical_memory_read_percent(),
+                self.phase.historical_reads
+            );
+            println!(
+                "  timeline start/end/turn: {}/{} / {:.3}x (wraps={})",
+                self.phase.timeline_start,
+                self.phase.timeline_end,
+                self.logical_keyspace_turnovers(),
+                self.timeline_wraps_crossed()
+            );
+        }
+        println!(
+            "  outcomes:                stored={} remove={} ttl={} cross={} rejected={} stale={} errors={}",
+            self.phase.stored,
+            self.phase.removes,
+            self.phase.ttl_puts,
+            self.phase.cross_tier_updates,
+            self.phase.rejected,
+            self.phase.stale_values,
+            self.phase.errors
+        );
+        if let Some(error) = &self.phase.first_error {
+            println!("  first error:             {error}");
+        }
+        println!(
+            "  host write/value/WA:     {}/{} B / {:.3}x",
+            self.stats.host_write_bytes,
+            self.stats.admitted_value_bytes,
+            self.stats.write_amplification_milli as f64 / 1000.0
+        );
+        println!(
+            "  total Bucket/Region I/O: {}/{} submitted; QD peak {}/{}",
+            self.total_stats.bucket_io_submitted,
+            self.total_stats.region_io_submitted,
+            self.total_stats.bucket_io_peak,
+            self.total_stats.region_io_peak
+        );
+        println!(
+            "  write-back put/fallback/demotion/reject: {}/{}/{}/{}",
+            self.stats.write_back_memory_only_puts,
+            self.stats.write_back_fallbacks,
+            self.stats.write_back_demoted_entries,
+            self.stats.write_back_queue_rejections
+        );
+        println!(
+            "  proactive scheduled/skipped/persisted/rejected/fatal: {}/{}/{}/{}/{}",
+            self.stats.write_back_proactive_scheduled,
+            self.stats.write_back_proactive_skipped,
+            self.stats.write_back_proactive_persisted,
+            self.stats.write_back_proactive_rejected,
+            self.stats.write_back_proactive_fatal
+        );
+        println!(
+            "  total WB demotion/QD:    {} entries / {}",
+            self.total_stats.write_back_demoted_entries, self.total_stats.write_back_queue_peak
+        );
+        println!(
+            "  journal rollover/max:    {} / {:.3} ms (groups/sync={}/{} records={} QD={})",
+            self.total_stats.journal_rollovers,
+            self.total_stats.journal_rollover_max_ns as f64 / 1_000_000.0,
+            self.total_stats.journal_commit_batches,
+            self.total_stats.journal_durability_syncs,
+            self.total_stats.journal_commit_records,
+            self.total_stats.journal_commit_queue_peak
+        );
+        println!(
+            "  physical measured/total: {:.3}x / {:.3}x",
+            self.capacity_turnovers(),
+            self.total_capacity_turnovers()
+        );
+        println!(
+            "  logical/admitted turn:   {:.3}x / {:.3}x",
+            self.logical_ingest_turnovers(),
+            self.admitted_disk_turnovers()
+        );
+        println!(
+            "  drain/close:             {:.3} ms",
+            self.drain.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  acceptance:              {}",
+            if self.acceptance_failures().is_empty() {
+                "pass"
+            } else {
+                "FAIL"
+            }
+        );
+    }
+}
+
+fn required<T>(value: Option<T>, name: &str) -> Result<T, String> {
+    value.ok_or_else(|| format!("{name} is required"))
+}
+
+fn validate_range<T>(name: &str, value: T, minimum: T, maximum: T) -> Result<(), String>
+where
+    T: Copy + PartialOrd + std::fmt::Display,
+{
+    if value < minimum || value > maximum {
+        Err(format!("{name} must be in {minimum}..={maximum}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_memory(name: &str, value: usize) -> Result<(), String> {
+    let value = u64::try_from(value).map_err(|_| format!("{name} does not fit u64"))?;
+    validate_range(name, value, 1, MAX_TOOL_MEMORY_BYTES)
+}
+
+fn parse_bytes(value: &str, name: &str) -> Result<u64, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit() && character != '_')
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split);
+    if number.is_empty() {
+        return Err(format!("invalid byte value {value:?} for {name}"));
+    }
+    let number = number
+        .replace('_', "")
+        .parse::<u64>()
+        .map_err(|_| format!("invalid byte value {value:?} for {name}"))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024_u64 * 1024 * 1024 * 1024,
+        _ => return Err(format!("invalid byte suffix in {value:?} for {name}")),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte value for {name} is too large"))
+}
+
+fn parse_usize_bytes(value: &str, name: &str) -> Result<usize, String> {
+    usize::try_from(parse_bytes(value, name)?)
+        .map_err(|_| format!("byte value for {name} does not fit this platform"))
+}
+
+fn parse_number<T: FromStr>(value: &str, name: &str) -> Result<T, String> {
+    value
+        .replace('_', "")
+        .parse()
+        .map_err(|_| format!("invalid value {value:?} for {name}"))
+}
+
+fn parse_duration(value: &str, name: &str, allow_zero: bool) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid seconds {value:?} for {name}"))?;
+    if !seconds.is_finite() || seconds < 0.0 || (!allow_zero && seconds == 0.0) {
+        return Err(format!(
+            "{name} must be {}",
+            if allow_zero {
+                "non-negative"
+            } else {
+                "positive"
+            }
+        ));
+    }
+    if seconds > 24.0 * 60.0 * 60.0 {
+        return Err(format!("{name} must not exceed 24 hours"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_seed(value: &str) -> Result<u64, String> {
+    let compact = value.replace('_', "");
+    if let Some(hex) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("invalid --seed {value:?}"))
+    } else {
+        compact
+            .parse()
+            .map_err(|_| format!("invalid --seed {value:?}"))
+    }
+}
+
+fn parse_positive(value: &str, name: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid value for {name}"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be a finite positive number"))
+    }
+}
+
+fn parse_non_negative(value: &str, name: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid value for {name}"))?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be a finite non-negative number"))
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn lock_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn parse_percent(value: &str, name: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid value for {name}"))?;
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be in 0..=100"))
+    }
+}
+
+fn default_index_slots(keys: usize) -> Result<usize, String> {
+    let doubled = keys
+        .checked_mul(2)
+        .ok_or_else(|| "--keys is too large to size the Region index".to_owned())?;
+    Ok(doubled
+        .checked_next_power_of_two()
+        .unwrap_or(256 * 1024 * 1024)
+        .clamp(1024, 256 * 1024 * 1024))
+}
+
+fn percentage_count(total: usize, percent: u8) -> usize {
+    ((total as u128 * u128::from(percent)) / 100) as usize
+}
+
+fn rate(value: u64, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        value as f64 / elapsed.as_secs_f64()
+    }
+}
+
+fn percent_of(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
+}
+
+fn hit_percent(hits: u64, misses: u64) -> f64 {
+    percent_of(hits, hits.saturating_add(misses))
+}
+
+fn amplification_milli(host_bytes: u64, admitted_bytes: u64) -> u64 {
+    if admitted_bytes == 0 {
+        return 0;
+    }
+    let scaled = u128::from(host_bytes).saturating_mul(1000) / u128::from(admitted_bytes);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+fn write_mode_name(mode: HybridWriteMode) -> &'static str {
+    match mode {
+        HybridWriteMode::WriteThrough => "write_through",
+        HybridWriteMode::WriteBack => "write_back",
+    }
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value.map_or_else(|| "null".into(), |value| format!("{value:.3}"))
+}
+
+fn json_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                write!(output, "\\u{:04x}", character as u32)
+                    .expect("writing JSON into a String cannot fail");
+            }
+            character => output.push(character),
+        }
+    }
+    output
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { DEFAULT_SEED } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"cache-bench hybrid — mixed-size Memory + Bucket + Region benchmark
+
+Usage:
+  cache-bench hybrid --bucket-path PATH --bucket-capacity BYTES \
+    --region-path PATH --region-capacity BYTES --manifest-path PATH \
+    --memory-capacity BYTES --yes [options]
+
+Safety: all three paths must be distinct, missing or empty regular files.
+The benchmark never resets an existing cache. --yes is mandatory.
+
+Workload:
+  --sizes SIZE:WEIGHT,...     Up to 16 classes (default 256:50,4KiB:30,64KiB:20)
+  --small-object-max BYTES    Bucket routing threshold (default 1KiB)
+  --keys 1..100000000        Streamed key population (default 100000)
+  --generator-memory-budget B Hard bound for version state, scratch, worker stacks (default 2GiB)
+  --read-percent 0..100      Read ratio (default 80)
+  --access-pattern uniform|temporal (default uniform)
+  --temporal-window-percent 1..100 Recent key window (default 5)
+  --temporal-hot-read-percent 0..100 Reads aimed at recent window (default 90)
+  --prefill-percent 0..100   Initial population (default 100)
+  --prefill-concurrency 1..128 Bounded prefill workers (default min(concurrency,128))
+  --verify-samples 1..1000000 Sampled prefill version checks (default 10000)
+  --remove-percent 0..100    Share of mutations (default 10)
+  --ttl-percent 0..100       Share of mutations (default 5)
+  --cross-tier-percent 0..100 Same-key small/large update share (default 20)
+  --ttl-ms 1..60000          TTL mutation lifetime (default 100)
+  --concurrency 1..4096      Caller concurrency (default 16)
+  --queue-depth 1..4096      Both lower I/O queue bounds (default 128)
+  --backpressure block|reject Bounded saturation policy (default block)
+  --warmup-secs SECONDS      0..86400 (default 5)
+  --duration-secs SECONDS    >0..86400 (default 30)
+
+Engine/layout:
+  --bucket-size BYTES        4KiB..64KiB power of two
+  --region-size BYTES        Region size (default 32MiB)
+  --bucket-memory-budget B   Default 1GiB
+  --region-memory-budget B   Default 1GiB
+  --hybrid-memory-budget B   Optional aggregate bound
+  --journal-capacity BYTES   4KiB-aligned, 64KiB..64TiB (default 16MiB)
+  --append-lanes 1..8        Default 2
+  --write-mode write-through|write-back (default write-back)
+  --write-back-queue-depth 1..4096 (default 64)
+  --write-back-workers 1..128 (default 4; must not exceed queue depth)
+  --write-back-memory BYTES  Reserved demotion bytes (default 32MiB)
+  --api sync|async           Default async
+  --engine sync|auto|uring   Applied to both disk tiers (default auto)
+  --mode buffered|auto|direct Applied to both disk tiers (default buffered)
+
+Output/gates:
+  --output human|json|openmetrics (default json)
+  --min-ops-per-sec N
+  --max-p99-us N
+  --min-hit-percent N
+  --min-journal-rollovers N  Require journal rollover activity
+  --min-capacity-turnovers N Require post-warmup host writes / disk capacity (use 2 for scale)
+  --min-logical-keyspace-turnovers N Require temporal write-head advances / key count
+  --min-disk-qd-peak N       Required on both Bucket and Region (default 1)
+  --min-write-back-qd-peak N Required for write-back runs (default 1)
+  --max-journal-rollover-ms N
+  --max-close-ms N
+
+Temporal mode treats the key population as a ring: successful put classes advance
+a shared write head while reads select the recent or historical generation window.
+All outputs record version-stale checks, age-window/tier hits, logical and physical
+turnover, disk-tier I/O, write-back demotion/QD, journal rollover/max latency, and
+drain/close latency. JSON
+deliberately records hardware_qualification=false and every external hardware
+sign-off field false. A passing run is not NVMe soak, thermal, DWPD, power-loss,
+or canary sign-off.
+"#
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_mix_is_deterministic_and_bounded() {
+        let mix = SizeMix::parse("128:1,4KiB:2,64KiB:3").unwrap();
+        assert_eq!(mix.maximum_bytes(), 64 * 1024);
+        assert_eq!(mix.class_for_key(42), mix.class_for_key(42));
+        assert_eq!(mix.routing_classes(1024), Some((0, 1)));
+        assert!(SizeMix::parse("0:1").is_err());
+        assert!(SizeMix::parse("1:0").is_err());
+    }
+
+    #[test]
+    fn streamed_keys_and_versioned_values_detect_stale_data() {
+        let keys = KeySpace::new(MAX_KEYS, DEFAULT_SEED);
+        assert_eq!(keys.key(99_999_999), keys.key(99_999_999));
+        assert_ne!(keys.key(0), keys.key(99_999_999));
+        assert!(size_of::<KeySpace>() <= 2 * size_of::<u64>());
+
+        let mix = SizeMix::parse("256:1,4KiB:1").unwrap();
+        let mut value = Vec::new();
+        fill_value(&mut value, &mix, 1, 41, 7).unwrap();
+        assert!(validate_value(&value, &mix, 1, 41, 7));
+        assert!(!validate_value(&value, &mix, 1, 41, 6));
+        assert!(!validate_value(&value, &mix, 1, 42, 7));
+        value[VALUE_HEADER_BYTES] ^= 1;
+        assert!(!validate_value(&value, &mix, 1, 41, 7));
+    }
+
+    #[test]
+    fn block_value_fill_preserves_the_byte_pattern_through_a_partial_tail() {
+        let mix = SizeMix::parse("53:1").unwrap();
+        let mut value = Vec::new();
+        fill_value(&mut value, &mix, 0, 41, 7).unwrap();
+
+        let seed = value_pattern_seed(41, 7, 0);
+        for (offset, byte) in value[VALUE_HEADER_BYTES..].iter().copied().enumerate() {
+            assert_eq!(byte, value_pattern_byte(seed, offset));
+        }
+        assert!(validate_value(&value, &mix, 0, 41, 7));
+    }
+
+    #[test]
+    fn temporal_access_moves_the_recent_window_and_wraps_the_ring() {
+        let access = TemporalAccess::new(10, 2, 100, 5);
+        let mut random = XorShift64::new(7);
+        for _ in 0..32 {
+            let (index, band) = access.select_read(&mut random);
+            assert_eq!(band, TemporalBand::Recent);
+            assert!([3, 4].contains(&index));
+        }
+
+        assert_eq!(access.next_write(), 5);
+        assert_eq!(access.next_write(), 6);
+        assert_eq!(access.head(), 7);
+        for _ in 0..8 {
+            let _ = access.next_write();
+        }
+        assert_eq!(access.head(), 15);
+        assert_eq!(access.next_write(), 5);
+
+        let (index, band) = access.select_read(&mut random);
+        assert_eq!(band, TemporalBand::Recent);
+        assert!([4, 5].contains(&index));
+    }
+
+    #[test]
+    fn temporal_access_keeps_historical_reads_outside_the_recent_window() {
+        let access = TemporalAccess::new(10, 2, 0, 10);
+        let mut random = XorShift64::new(11);
+        for _ in 0..64 {
+            let (index, band) = access.select_read(&mut random);
+            assert_eq!(band, TemporalBand::Historical);
+            assert!(index < 8);
+        }
+    }
+
+    #[test]
+    fn parser_accepts_temporal_workload_and_requires_it_for_logical_turnover_gate() {
+        let base = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=16KiB",
+            "--region-path=region",
+            "--region-capacity=1GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--access-pattern=temporal",
+            "--temporal-window-percent=2",
+            "--temporal-hot-read-percent=85",
+            "--backpressure=block",
+            "--min-logical-keyspace-turnovers=1.5",
+            "--yes",
+        ];
+        let ParseOutcome::Run(options) =
+            Options::parse(base.iter().map(|value| (*value).to_owned())).unwrap()
+        else {
+            panic!("expected runnable options");
+        };
+        assert_eq!(options.access_pattern, AccessPattern::Temporal);
+        assert_eq!(options.temporal_window_percent, 2);
+        assert_eq!(options.temporal_hot_read_percent, 85);
+        assert_eq!(options.backpressure, Backpressure::Block);
+        assert_eq!(options.min_logical_keyspace_turnovers, 1.5);
+
+        let uniform = base
+            .iter()
+            .filter(|value| !value.starts_with("--access-pattern="))
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        assert!(Options::parse(uniform).is_err());
+    }
+
+    #[test]
+    fn parser_supports_one_hundred_million_keys_with_a_hard_generator_budget() {
+        let base = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=16KiB",
+            "--region-path=region",
+            "--region-capacity=1GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--yes",
+            "--keys=100000000",
+        ];
+        let parsed = Options::parse(base.iter().map(|value| (*value).to_owned())).unwrap();
+        let ParseOutcome::Run(options) = parsed else {
+            panic!("expected runnable options");
+        };
+        assert_eq!(options.keys, MAX_KEYS);
+        assert!(
+            generator_memory_plan(
+                options.keys,
+                options.concurrency.max(options.prefill_concurrency),
+                options.mix.maximum_bytes(),
+            )
+            .unwrap()
+                <= options.generator_memory_budget
+        );
+
+        let mut under_budget = base
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        under_budget.push("--generator-memory-budget=64MiB".into());
+        assert!(Options::parse(under_budget).is_err());
+    }
+
+    #[test]
+    fn production_acceptance_enforces_tier_writeback_rollover_and_turnover_gates() {
+        let arguments = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=16KiB",
+            "--region-path=region",
+            "--region-capacity=1GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--write-mode=write-back",
+            "--min-journal-rollovers=1",
+            "--min-capacity-turnovers=2",
+            "--min-disk-qd-peak=2",
+            "--min-write-back-qd-peak=2",
+            "--max-journal-rollover-ms=10",
+            "--max-close-ms=10",
+            "--yes",
+        ];
+        let ParseOutcome::Run(options) =
+            Options::parse(arguments.iter().map(|value| (*value).to_owned())).unwrap()
+        else {
+            panic!("expected runnable options");
+        };
+        let capacity = options
+            .bucket_capacity
+            .saturating_add(options.region_capacity);
+        let measured = StatsDelta {
+            host_write_bytes: capacity.saturating_mul(2),
+            ..StatsDelta::default()
+        };
+        let qualifying_total = StatsDelta {
+            bucket_io_submitted: 1,
+            region_io_submitted: 1,
+            bucket_io_peak: 2,
+            region_io_peak: 2,
+            host_write_bytes: capacity.saturating_mul(3),
+            journal_rollovers: 1,
+            journal_rollover_max_ns: 1_000_000,
+            journal_commit_records: 1,
+            write_back_demoted_entries: 1,
+            write_back_queue_peak: 2,
+            ..StatsDelta::default()
+        };
+        let mut phase = Phase::default();
+        phase.record_read_tier_latency(ReadLatencyTier::Memory, Duration::from_micros(11));
+        phase.record_read_tier_latency(ReadLatencyTier::Bucket, Duration::from_micros(22));
+        phase.record_read_tier_latency(ReadLatencyTier::Region, Duration::from_micros(33));
+        phase.record_read_tier_latency(ReadLatencyTier::Miss, Duration::from_micros(44));
+        let report = Report {
+            options: &options,
+            phase,
+            stats: measured,
+            total_stats: qualifying_total,
+            final_stats: HybridCacheStats::default(),
+            generator_planned_memory: 1,
+            prefill_elapsed: Duration::ZERO,
+            drain: Duration::from_millis(1),
+        };
+        assert!(report.acceptance_failures().is_empty());
+        assert_eq!(report.capacity_turnovers(), 2.0);
+        let json = report.to_json();
+        assert!(json.contains("\"hardware_qualification\":false"));
+        assert!(json.contains("\"target_nvme_matrix_passed\":false"));
+        assert!(json.contains("\"journal_rollover_max_ms\":1"));
+        assert!(json.contains("\"memory_read_latency_p99_us\":11"));
+        assert!(json.contains("\"bucket_read_latency_p99_us\":22"));
+        assert!(json.contains("\"region_read_latency_p99_us\":33"));
+        assert!(json.contains("\"miss_read_latency_p99_us\":44"));
+
+        let failed = Report {
+            options: &options,
+            phase: Phase {
+                stale_values: 1,
+                ..Phase::default()
+            },
+            stats: measured,
+            total_stats: StatsDelta {
+                bucket_io_submitted: 0,
+                ..qualifying_total
+            },
+            final_stats: HybridCacheStats::default(),
+            generator_planned_memory: 1,
+            prefill_elapsed: Duration::ZERO,
+            drain: Duration::from_millis(20),
+        };
+        let failures = failed.acceptance_failures().join("; ");
+        assert!(failures.contains("stale or corrupt"));
+        assert!(failures.contains("both disk tiers"));
+        assert!(failures.contains("drain/close"));
+    }
+
+    #[test]
+    fn parser_requires_confirmation_empty_path_contract_and_hard_bounds() {
+        let base = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=16KiB",
+            "--region-path=region",
+            "--region-capacity=1GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+        ];
+        assert!(Options::parse(base.iter().map(|value| (*value).to_owned())).is_err());
+        let mut confirmed = base
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        confirmed.extend(["--yes".into(), "--concurrency=4097".into()]);
+        assert!(Options::parse(confirmed).is_err());
+
+        let mut write_back = base
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        write_back.extend([
+            "--yes".into(),
+            "--write-mode=write-back".into(),
+            "--write-back-queue-depth=2".into(),
+            "--write-back-workers=3".into(),
+        ]);
+        assert!(Options::parse(write_back).is_err());
+    }
+
+    #[test]
+    fn histogram_percentiles_are_monotonic() {
+        let mut histogram = Histogram::default();
+        for micros in [1, 2, 10, 100, 1000] {
+            histogram.record(Duration::from_micros(micros));
+        }
+        assert!(histogram.percentile(500) <= histogram.percentile(990));
+        assert!(histogram.percentile(990) <= histogram.percentile(999));
+    }
+
+    #[test]
+    fn tier_read_latency_histograms_classify_and_merge_worker_results() {
+        assert_eq!(
+            ReadLatencyTier::from_cache_tier(CacheTier::Memory),
+            Some(ReadLatencyTier::Memory)
+        );
+        assert_eq!(
+            ReadLatencyTier::from_cache_tier(CacheTier::SmallObjectDisk),
+            Some(ReadLatencyTier::Bucket)
+        );
+        assert_eq!(
+            ReadLatencyTier::from_cache_tier(CacheTier::RegionLogDisk),
+            Some(ReadLatencyTier::Region)
+        );
+
+        let mut first = Phase::default();
+        first.record_read_tier_latency(ReadLatencyTier::Memory, Duration::from_micros(10));
+        first.record_read_tier_latency(ReadLatencyTier::Bucket, Duration::from_micros(20));
+        first.record_read_tier_latency(ReadLatencyTier::Region, Duration::from_micros(30));
+        first.record_read_tier_latency(ReadLatencyTier::Miss, Duration::from_micros(40));
+        let mut second = Phase::default();
+        second.record_read_tier_latency(ReadLatencyTier::Memory, Duration::from_micros(50));
+        second.record_read_tier_latency(ReadLatencyTier::Miss, Duration::from_micros(60));
+
+        first.merge(&second);
+
+        assert_eq!(first.memory_read_latency.count, 2);
+        assert_eq!(first.bucket_read_latency.count, 1);
+        assert_eq!(first.region_read_latency.count, 1);
+        assert_eq!(first.miss_read_latency.count, 2);
+        assert_eq!(first.memory_read_latency.percentile(990), 50_000);
+        assert_eq!(first.bucket_read_latency.percentile(990), 20_000);
+        assert_eq!(first.region_read_latency.percentile(990), 30_000);
+        assert_eq!(first.miss_read_latency.percentile(990), 60_000);
+    }
+}
