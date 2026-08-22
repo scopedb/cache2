@@ -2472,6 +2472,9 @@ struct StatsDelta {
     region_io_submit_wait_ns: u64,
     region_io_completion_ns: u64,
     region_reuses: u64,
+    region_background_reclaims: u64,
+    region_reclaim_records_scanned: u64,
+    region_reclaim_index_fallbacks: u64,
     host_write_bytes: u64,
     admitted_value_bytes: u64,
     write_amplification_milli: u64,
@@ -2608,6 +2611,18 @@ impl StatsDelta {
                 .region
                 .regions_reused
                 .saturating_sub(before.region.regions_reused),
+            region_background_reclaims: after
+                .region
+                .background_regions_reclaimed
+                .saturating_sub(before.region.background_regions_reclaimed),
+            region_reclaim_records_scanned: after
+                .region
+                .reclaim_records_scanned
+                .saturating_sub(before.region.reclaim_records_scanned),
+            region_reclaim_index_fallbacks: after
+                .region
+                .reclaim_index_fallbacks
+                .saturating_sub(before.region.reclaim_index_fallbacks),
             host_write_bytes: after
                 .host_writes
                 .host_write_bytes
@@ -3067,7 +3082,7 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 5);
+        number_field!("schema_version", 6);
         string_field!("cache", "hybrid");
         string_field!("latency_scope", "individual_cache_api_calls");
         string_field!("write_value_generation", "prebuilt_worker_template");
@@ -3364,6 +3379,18 @@ impl Report<'_> {
             )
         );
         number_field!("region_reuses", self.stats.region_reuses);
+        number_field!(
+            "region_background_reclaims",
+            self.stats.region_background_reclaims
+        );
+        number_field!(
+            "region_reclaim_records_scanned",
+            self.stats.region_reclaim_records_scanned
+        );
+        number_field!(
+            "region_reclaim_index_fallbacks",
+            self.stats.region_reclaim_index_fallbacks
+        );
         number_field!("host_write_bytes", self.stats.host_write_bytes);
         number_field!("admitted_value_bytes", self.stats.admitted_value_bytes);
         number_field!("admitted_disk_turnovers", self.admitted_disk_turnovers());
@@ -3556,6 +3583,18 @@ impl Report<'_> {
             self.total_stats.write_back_queue_wait_ns
         );
         number_field!("total_region_reuses", self.total_stats.region_reuses);
+        number_field!(
+            "total_region_background_reclaims",
+            self.total_stats.region_background_reclaims
+        );
+        number_field!(
+            "total_region_reclaim_records_scanned",
+            self.total_stats.region_reclaim_records_scanned
+        );
+        number_field!(
+            "total_region_reclaim_index_fallbacks",
+            self.total_stats.region_reclaim_index_fallbacks
+        );
         number_field!("total_bucket_io_qd_peak", self.total_stats.bucket_io_peak);
         number_field!("total_region_io_qd_peak", self.total_stats.region_io_peak);
         number_field!(
@@ -3992,6 +4031,13 @@ impl Report<'_> {
             self.stats.region_reuses, self.total_stats.region_reuses
         );
         println!(
+            "  Region background reclaim: {} / {} (records={} fallback={})",
+            self.stats.region_background_reclaims,
+            self.total_stats.region_background_reclaims,
+            self.stats.region_reclaim_records_scanned,
+            self.stats.region_reclaim_index_fallbacks,
+        );
+        println!(
             "  logical/admitted turn:   {:.3}x / {:.3}x",
             self.logical_ingest_turnovers(),
             self.admitted_disk_turnovers()
@@ -4426,6 +4472,9 @@ mod tests {
                 io_completed: 10,
                 io_submit_wait_ns: 10,
                 io_completion_ns: 10,
+                background_regions_reclaimed: 10,
+                reclaim_records_scanned: 10,
+                reclaim_index_fallbacks: 10,
                 ..cache_rs::CacheStats::default()
             },
             ..HybridCacheStats::default()
@@ -4450,6 +4499,9 @@ mod tests {
                 io_completed: 17,
                 io_submit_wait_ns: 17,
                 io_completion_ns: 17,
+                background_regions_reclaimed: 17,
+                reclaim_records_scanned: 17,
+                reclaim_index_fallbacks: 17,
                 ..before.region
             },
             ..before
@@ -4468,6 +4520,9 @@ mod tests {
         assert_eq!(delta.region_io_completed, 7);
         assert_eq!(delta.region_io_submit_wait_ns, 7);
         assert_eq!(delta.region_io_completion_ns, 7);
+        assert_eq!(delta.region_background_reclaims, 7);
+        assert_eq!(delta.region_reclaim_records_scanned, 7);
+        assert_eq!(delta.region_reclaim_index_fallbacks, 7);
     }
 
     #[test]
@@ -4726,7 +4781,7 @@ mod tests {
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
         let json = report.to_json();
-        assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"schema_version\":6"));
         assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
         assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
         assert!(json.contains("\"latency_samples\":0"));
