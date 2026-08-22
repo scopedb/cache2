@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +53,7 @@ const WORKER_STACK_BYTES: usize = 512 * 1024;
 const KEY_BYTES: usize = 32;
 const VALUE_HEADER_BYTES: usize = 32;
 const VALUE_MAGIC: [u8; 8] = *b"CRHBVAL1";
+const VALUE_PATTERN_SEED: u64 = 0x7bf8_4a91_2d63_c5e0;
 const HISTOGRAM_BUCKETS: usize = 512;
 
 pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
@@ -1438,25 +1439,31 @@ fn fill_value(
     class: usize,
     key_index: usize,
     version: u32,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let length = mix.classes[class].bytes;
-    output.clear();
-    if output.capacity() < length {
-        output
-            .try_reserve_exact(length)
-            .map_err(|_| format!("cannot allocate {length} byte benchmark scratch value"))?;
-    }
-    output.resize(length, 0);
+    prepare_value_buffer(output, length)?;
     output[..8].copy_from_slice(&VALUE_MAGIC);
     output[8..16].copy_from_slice(&(key_index as u64).to_le_bytes());
     output[16..20].copy_from_slice(&version.to_le_bytes());
     output[20..22].copy_from_slice(&(class as u16).to_le_bytes());
     output[22..24].copy_from_slice(&(VALUE_HEADER_BYTES as u16).to_le_bytes());
     output[24..28].copy_from_slice(&(length as u32).to_le_bytes());
-    let pattern_seed = value_pattern_seed(key_index, version, class);
-    output[28..32].copy_from_slice(&(pattern_seed as u32).to_le_bytes());
+    output[28..32].copy_from_slice(&(VALUE_PATTERN_SEED as u32).to_le_bytes());
+    Ok(length)
+}
+
+fn prepare_value_buffer(output: &mut Vec<u8>, length: usize) -> Result<(), String> {
+    if output.len() >= length {
+        return Ok(());
+    }
+    if output.capacity() < length {
+        output
+            .try_reserve_exact(length - output.len())
+            .map_err(|_| format!("cannot allocate {length} byte benchmark scratch value"))?;
+    }
+    output.resize(length, 0);
     for (block_index, block) in output[VALUE_HEADER_BYTES..].chunks_mut(8).enumerate() {
-        let pattern = mix64(pattern_seed ^ block_index as u64).to_le_bytes();
+        let pattern = mix64(VALUE_PATTERN_SEED ^ block_index as u64).to_le_bytes();
         block.copy_from_slice(&pattern[..block.len()]);
     }
     Ok(())
@@ -1480,8 +1487,7 @@ fn validate_value(
     {
         return false;
     }
-    let pattern_seed = value_pattern_seed(key_index, version, class);
-    if value.get(28..32) != Some((pattern_seed as u32).to_le_bytes().as_slice()) {
+    if value.get(28..32) != Some((VALUE_PATTERN_SEED as u32).to_le_bytes().as_slice()) {
         return false;
     }
     let payload_len = value.len() - VALUE_HEADER_BYTES;
@@ -1491,12 +1497,8 @@ fn validate_value(
     [0, payload_len / 2, payload_len - 1]
         .into_iter()
         .all(|offset| {
-            value[VALUE_HEADER_BYTES + offset] == value_pattern_byte(pattern_seed, offset)
+            value[VALUE_HEADER_BYTES + offset] == value_pattern_byte(VALUE_PATTERN_SEED, offset)
         })
-}
-
-fn value_pattern_seed(key_index: usize, version: u32, class: usize) -> u64 {
-    mix64((key_index as u64) ^ (u64::from(version) << 32) ^ class as u64)
 }
 
 fn value_pattern_byte(seed: u64, offset: usize) -> u8 {
@@ -1538,13 +1540,16 @@ fn prefill(
                     }
                     for index in start..start.saturating_add(64).min(count) {
                         let class = worker_mix.class_for_key(index);
-                        if let Err(message) = fill_value(&mut value, &worker_mix, class, index, 1) {
-                            *lock_mutex(&worker_error) = Some(message);
-                            worker_abort.store(true, Ordering::Release);
-                            return;
-                        }
+                        let length = match fill_value(&mut value, &worker_mix, class, index, 1) {
+                            Ok(length) => length,
+                            Err(message) => {
+                                *lock_mutex(&worker_error) = Some(message);
+                                worker_abort.store(true, Ordering::Release);
+                                return;
+                            }
+                        };
                         let key = worker_keys.key(index);
-                        match worker_cache.put(&key, &value) {
+                        match worker_cache.put(&key, &value[..length]) {
                             Ok(PutOutcome::Stored) => worker_states.store(
                                 index,
                                 ExpectedState {
@@ -1632,8 +1637,8 @@ fn exercise_mixed_semantics(
     let mut value = Vec::new();
     for class in [small, large, small] {
         let version = state.next_version()?;
-        fill_value(&mut value, &options.mix, class, index, version)?;
-        match cache.put(&key, &value) {
+        let length = fill_value(&mut value, &options.mix, class, index, version)?;
+        match cache.put(&key, &value[..length]) {
             Ok(PutOutcome::Stored) => {
                 state = ExpectedState {
                     present: true,
@@ -1662,10 +1667,10 @@ fn exercise_mixed_semantics(
 
     let version = state.next_version()?;
     let expires_at = now_unix_ms().saturating_add(options.ttl_ms);
-    fill_value(&mut value, &options.mix, small, index, version)?;
+    let length = fill_value(&mut value, &options.mix, small, index, version)?;
     match cache.put_with_options(
         &key,
-        &value,
+        &value[..length],
         PutOptions {
             expires_at_unix_ms: Some(expires_at),
         },
@@ -1838,6 +1843,7 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
     let timeline_start = temporal.as_ref().map_or(0, TemporalAccess::head);
     let start = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = mpsc::sync_channel(concurrency);
     let mut workers: Vec<thread::JoinHandle<Phase>> = Vec::new();
     workers
         .try_reserve_exact(concurrency)
@@ -1849,14 +1855,24 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
         let worker_mix = mix.clone();
         let worker_start = Arc::clone(&start);
         let worker_abort = Arc::clone(&abort);
+        let worker_ready = ready_tx.clone();
         let worker_temporal = temporal.clone();
         let worker = thread::Builder::new()
             .name(format!("hybrid-bench-{worker_id}"))
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
+                let mut phase = Phase::default();
+                let mut value = Vec::new();
+                if let Err(error) = prepare_value_buffer(&mut value, worker_mix.maximum_bytes()) {
+                    phase.record_error(error);
+                    worker_abort.store(true, Ordering::Release);
+                }
+                if worker_ready.send(()).is_err() {
+                    return phase;
+                }
                 while !worker_start.load(Ordering::Acquire) {
                     if worker_abort.load(Ordering::Acquire) {
-                        return Phase::default();
+                        return phase;
                     }
                     thread::park_timeout(Duration::from_millis(1));
                 }
@@ -1864,8 +1880,6 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                     .checked_add(duration)
                     .unwrap_or_else(Instant::now);
                 let mut random = XorShift64::new(seed ^ mix64(worker_id as u64));
-                let mut phase = Phase::default();
-                let mut value = Vec::new();
                 let owned_keys = (worker_keys.count - worker_id).div_ceil(concurrency);
                 while !worker_abort.load(Ordering::Acquire) && Instant::now() < deadline {
                     let is_read = random.next() % 100 < u64::from(read_percent);
@@ -1892,11 +1906,13 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                     let _ordering = worker_states.lock(key_index);
                     let mut state =
                         worker_states.normalize_expiry(key_index, worker_states.load(key_index));
-                    let started = Instant::now();
                     if is_read {
                         phase.reads = phase.reads.saturating_add(1);
                         phase.record_temporal_read(temporal_band);
-                        let latency_tier = match worker_cache.lookup(&key) {
+                        let started = Instant::now();
+                        let outcome = worker_cache.lookup(&key);
+                        let elapsed = started.elapsed();
+                        let latency_tier = match outcome {
                             Ok(HybridLookupOutcome::Hit { value: found, tier })
                                 if state.present
                                     && validate_value(
@@ -1933,8 +1949,8 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                                 None
                             }
                         };
-                        let elapsed = started.elapsed();
                         phase.read_latency.record(elapsed);
+                        phase.latency.record(elapsed);
                         phase.record_temporal_latency(temporal_band, elapsed);
                         if let Some(tier) = latency_tier {
                             phase.record_read_tier_latency(tier, elapsed);
@@ -1943,7 +1959,12 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                         let mutation = mutation.expect("non-read operation has a mutation class");
                         if mutation < u64::from(remove_percent) {
                             phase.removes = phase.removes.saturating_add(1);
-                            match worker_cache.remove(&key) {
+                            let started = Instant::now();
+                            let outcome = worker_cache.remove(&key);
+                            let elapsed = started.elapsed();
+                            phase.write_latency.record(elapsed);
+                            phase.latency.record(elapsed);
+                            match outcome {
                                 Ok(_) => {
                                     state = state.without_value();
                                     worker_states.store(key_index, state);
@@ -2027,9 +2048,7 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                                 worker_abort.store(true, Ordering::Release);
                             }
                         }
-                        phase.write_latency.record(started.elapsed());
                     }
-                    phase.latency.record(started.elapsed());
                 }
                 phase
             });
@@ -2045,6 +2064,17 @@ fn run_phase(cache: &BenchCache, workload: PhaseWorkload) -> Result<Phase, Strin
                     "cannot spawn Hybrid benchmark worker: {spawn_error}"
                 ));
             }
+        }
+    }
+    drop(ready_tx);
+    for _ in 0..concurrency {
+        if ready_rx.recv().is_err() {
+            abort.store(true, Ordering::Release);
+            start.store(true, Ordering::Release);
+            for worker in workers {
+                let _ = worker.join();
+            }
+            return Err("a Hybrid benchmark worker failed during startup".to_owned());
         }
     }
     let started = Instant::now();
@@ -2082,18 +2112,26 @@ fn perform_put(
             return Err(());
         }
     };
-    if fill_value(value, mix, class, key_index, version).is_err() {
-        phase.record_error(format!("cannot generate value for key {key_index}"));
-        return Err(());
-    }
+    let length = match fill_value(value, mix, class, key_index, version) {
+        Ok(length) => length,
+        Err(_) => {
+            phase.record_error(format!("cannot generate value for key {key_index}"));
+            return Err(());
+        }
+    };
     let key = keys.key(key_index);
-    match cache.put_with_options(
+    let started = Instant::now();
+    let outcome = cache.put_with_options(
         &key,
-        value,
+        &value[..length],
         PutOptions {
             expires_at_unix_ms: expires_at,
         },
-    ) {
+    );
+    let elapsed = started.elapsed();
+    phase.write_latency.record(elapsed);
+    phase.latency.record(elapsed);
+    match outcome {
         Ok(PutOutcome::Stored) => {
             let expiry_delta_ms = match expires_at {
                 Some(expires_at) => match states.expiry_delta(expires_at) {
@@ -2112,8 +2150,7 @@ fn perform_put(
                 expiry_delta_ms,
             };
             states.store(key_index, *state);
-            phase.stored = phase.stored.saturating_add(1);
-            phase.write_bytes = phase.write_bytes.saturating_add(value.len() as u64);
+            phase.record_stored_write(length);
             Ok(())
         }
         Ok(PutOutcome::Rejected(reason)) => {
@@ -2175,6 +2212,11 @@ impl Phase {
         self.reads
             .saturating_add(self.writes)
             .saturating_add(self.removes)
+    }
+
+    fn record_stored_write(&mut self, bytes: usize) {
+        self.stored = self.stored.saturating_add(1);
+        self.write_bytes = self.write_bytes.saturating_add(bytes as u64);
     }
 
     fn timeline_advances(&self) -> u64 {
@@ -2788,6 +2830,21 @@ impl Report<'_> {
         if self.phase.errors != 0 {
             failures.push(format!("{} correctness/I/O errors", self.phase.errors));
         }
+        if self.phase.latency.count != self.phase.operations()
+            || self.phase.read_latency.count != self.phase.reads
+            || self.phase.write_latency.count
+                != self.phase.writes.saturating_add(self.phase.removes)
+        {
+            failures.push(format!(
+                "latency sample mismatch overall={}/{} read={}/{} write={}/{}",
+                self.phase.latency.count,
+                self.phase.operations(),
+                self.phase.read_latency.count,
+                self.phase.reads,
+                self.phase.write_latency.count,
+                self.phase.writes.saturating_add(self.phase.removes)
+            ));
+        }
         if self.phase.stale_values != 0 {
             failures.push(format!(
                 "{} stale or corrupt versioned values",
@@ -2943,8 +3000,10 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 4);
+        number_field!("schema_version", 5);
         string_field!("cache", "hybrid");
+        string_field!("latency_scope", "individual_cache_api_calls");
+        string_field!("write_value_generation", "prebuilt_worker_template");
         raw_field!("hardware_qualification", false);
         raw_field!("external_hardware_signoff_required", true);
         raw_field!("target_nvme_matrix_passed", false);
@@ -3144,6 +3203,9 @@ impl Report<'_> {
             "latency_max_us",
             self.phase.latency.maximum_ns as f64 / 1000.0
         );
+        number_field!("latency_samples", self.phase.latency.count);
+        number_field!("read_latency_samples", self.phase.read_latency.count);
+        number_field!("write_latency_samples", self.phase.write_latency.count);
         number_field!(
             "read_latency_p99_us",
             self.phase.read_latency.percentile(990) as f64 / 1000.0
@@ -4082,25 +4144,47 @@ mod tests {
 
         let mix = SizeMix::parse("256:1,4KiB:1").unwrap();
         let mut value = Vec::new();
-        fill_value(&mut value, &mix, 1, 41, 7).unwrap();
-        assert!(validate_value(&value, &mix, 1, 41, 7));
-        assert!(!validate_value(&value, &mix, 1, 41, 6));
-        assert!(!validate_value(&value, &mix, 1, 42, 7));
+        prepare_value_buffer(&mut value, mix.maximum_bytes()).unwrap();
+        let length = fill_value(&mut value, &mix, 1, 41, 7).unwrap();
+        assert!(validate_value(&value[..length], &mix, 1, 41, 7));
+        assert!(!validate_value(&value[..length], &mix, 1, 41, 6));
+        assert!(!validate_value(&value[..length], &mix, 1, 42, 7));
         value[VALUE_HEADER_BYTES] ^= 1;
-        assert!(!validate_value(&value, &mix, 1, 41, 7));
+        assert!(!validate_value(&value[..length], &mix, 1, 41, 7));
     }
 
     #[test]
-    fn block_value_fill_preserves_the_byte_pattern_through_a_partial_tail() {
+    fn prepared_value_template_preserves_the_pattern_through_a_partial_tail() {
         let mix = SizeMix::parse("53:1").unwrap();
         let mut value = Vec::new();
-        fill_value(&mut value, &mix, 0, 41, 7).unwrap();
+        let length = fill_value(&mut value, &mix, 0, 41, 7).unwrap();
 
-        let seed = value_pattern_seed(41, 7, 0);
-        for (offset, byte) in value[VALUE_HEADER_BYTES..].iter().copied().enumerate() {
-            assert_eq!(byte, value_pattern_byte(seed, offset));
+        for (offset, byte) in value[VALUE_HEADER_BYTES..length]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            assert_eq!(byte, value_pattern_byte(VALUE_PATTERN_SEED, offset));
         }
-        assert!(validate_value(&value, &mix, 0, 41, 7));
+        assert!(validate_value(&value[..length], &mix, 0, 41, 7));
+    }
+
+    #[test]
+    fn mixed_size_write_bytes_use_the_selected_prefix_not_the_template() {
+        let mix = SizeMix::parse("256:1,4KiB:1").unwrap();
+        let mut value = Vec::new();
+        prepare_value_buffer(&mut value, mix.maximum_bytes()).unwrap();
+        let small = fill_value(&mut value, &mix, 0, 1, 1).unwrap();
+        assert_eq!(small, 256);
+        assert_eq!(value.len(), 4 * 1024);
+
+        let mut phase = Phase::default();
+        phase.record_stored_write(small);
+        let large = fill_value(&mut value, &mix, 1, 2, 1).unwrap();
+        phase.record_stored_write(large);
+
+        assert_eq!(phase.stored, 2);
+        assert_eq!(phase.write_bytes, (256 + 4 * 1024) as u64);
     }
 
     #[test]
@@ -4359,6 +4443,10 @@ mod tests {
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
         let json = report.to_json();
+        assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
+        assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
+        assert!(json.contains("\"latency_samples\":0"));
         assert!(json.contains("\"hardware_qualification\":false"));
         assert!(json.contains("\"target_nvme_matrix_passed\":false"));
         assert!(json.contains("\"journal_rollover_max_ms\":1"));
