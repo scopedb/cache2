@@ -6,10 +6,10 @@
 //! share. This keeps the L1-miss/L2-stale window closed while allowing
 //! independent memory shards to drive several NVMe writes concurrently.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,6 +17,30 @@ use std::time::{Duration, Instant};
 use crate::resources::{BackpressurePolicy, OverloadReason};
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskPriority {
+    Priority,
+    Optional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskSubmitError {
+    Full,
+    Closed,
+}
+
+struct TaskQueueState {
+    priority: VecDeque<Task>,
+    optional: VecDeque<Task>,
+    closed: bool,
+}
+
+struct TaskQueue {
+    capacity: usize,
+    state: Mutex<TaskQueueState>,
+    available: Condvar,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WriteBackSnapshot {
@@ -78,6 +102,7 @@ pub(crate) struct WriteBackReservation {
     gate: Arc<WriteBackGate>,
     bytes: usize,
     background: bool,
+    priority: TaskPriority,
     active: bool,
 }
 
@@ -87,7 +112,7 @@ pub(crate) struct WriteBackBackgroundPause {
 }
 
 pub(crate) struct WriteBackExecutor {
-    sender: Mutex<Option<SyncSender<Task>>>,
+    queue: Arc<TaskQueue>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     gate: Arc<WriteBackGate>,
 }
@@ -99,21 +124,20 @@ impl WriteBackExecutor {
         memory_bytes: usize,
         backpressure: BackpressurePolicy,
     ) -> std::io::Result<Self> {
-        let (sender, receiver) = sync_channel(queue_depth);
-        let receiver = Arc::new(Mutex::new(receiver));
+        let queue = Arc::new(TaskQueue::try_new(queue_depth)?);
         let mut handles = Vec::new();
         handles.try_reserve_exact(workers).map_err(|_| {
             std::io::Error::other("write-back worker bookkeeping allocation failed")
         })?;
         for index in 0..workers {
-            let receiver = Arc::clone(&receiver);
+            let worker_queue = Arc::clone(&queue);
             match thread::Builder::new()
                 .name(format!("cache-rs-hybrid-writeback-{index}"))
-                .spawn(move || worker_loop(receiver))
+                .spawn(move || worker_loop(worker_queue))
             {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
-                    drop(sender);
+                    queue.close();
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -122,7 +146,7 @@ impl WriteBackExecutor {
             }
         }
         Ok(Self {
-            sender: Mutex::new(Some(sender)),
+            queue,
             workers: Mutex::new(handles),
             gate: Arc::new(WriteBackGate {
                 max_in_flight: queue_depth,
@@ -198,6 +222,7 @@ impl WriteBackExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        debug_assert_eq!(reservation.priority, TaskPriority::Priority);
         let completion = Arc::new(Completion::new());
         let worker_completion = Arc::clone(&completion);
         let gate = Arc::clone(&self.gate);
@@ -209,22 +234,16 @@ impl WriteBackExecutor {
             } else {
                 gate.completed.fetch_add(1, Ordering::Relaxed);
             }
-            worker_completion.complete(outcome);
             drop(reservation);
+            worker_completion.complete(outcome);
         });
-        let sender_guard = lock_unpoisoned(&self.sender);
-        let Some(sender) = sender_guard.as_ref() else {
-            drop(task);
-            return Err(WriteBackRunError::Closed);
-        };
-        match sender.try_send(task) {
+        match self.queue.submit(task, TaskPriority::Priority) {
             Ok(()) => {
                 self.gate.submitted.fetch_add(1, Ordering::Relaxed);
-                drop(sender_guard);
                 completion.wait()
             }
-            Err(TrySendError::Full(task)) => {
-                // The gate covers queued and executing jobs, so a full channel
+            Err((TaskSubmitError::Full, task)) => {
+                // The gate covers queued and executing jobs, so a full queue
                 // here can only be a shutdown/race invariant violation. Fail
                 // closed and keep the dirty victim resident.
                 drop(task);
@@ -233,7 +252,7 @@ impl WriteBackExecutor {
                     OverloadReason::WriteQueueFull,
                 ))
             }
-            Err(TrySendError::Disconnected(task)) => {
+            Err((TaskSubmitError::Closed, task)) => {
                 drop(task);
                 Err(WriteBackRunError::Closed)
             }
@@ -251,6 +270,7 @@ impl WriteBackExecutor {
         P: FnOnce() + Send + 'static,
     {
         debug_assert!(reservation.background);
+        let priority = reservation.priority;
         let gate = Arc::clone(&self.gate);
         let task: Task = Box::new(move || {
             if catch_unwind(AssertUnwindSafe(operation)).is_err() {
@@ -261,17 +281,12 @@ impl WriteBackExecutor {
             }
             drop(reservation);
         });
-        let sender_guard = lock_unpoisoned(&self.sender);
-        let Some(sender) = sender_guard.as_ref() else {
-            drop(task);
-            return Err(WriteBackRunError::Closed);
-        };
-        match sender.try_send(task) {
+        match self.queue.submit(task, priority) {
             Ok(()) => {
                 self.gate.submitted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(TrySendError::Full(task)) => {
+            Err((TaskSubmitError::Full, task)) => {
                 // A background reservation consumes one of the same bounded
                 // slots as the queue. Full is therefore only a shutdown race or
                 // invariant failure, never ordinary backpressure.
@@ -280,7 +295,7 @@ impl WriteBackExecutor {
                     OverloadReason::WriteQueueFull,
                 ))
             }
-            Err(TrySendError::Disconnected(task)) => {
+            Err((TaskSubmitError::Closed, task)) => {
                 drop(task);
                 Err(WriteBackRunError::Closed)
             }
@@ -291,11 +306,11 @@ impl WriteBackExecutor {
         self.gate.snapshot()
     }
 
-    /// Stop new reservations, close the channel, and join every worker.
+    /// Stop new reservations, close and drain both queues, and join every worker.
     /// Returns false if a worker escaped the per-task panic boundary.
     pub(crate) fn shutdown(&self) -> bool {
         self.gate.close();
-        drop(lock_unpoisoned(&self.sender).take());
+        self.queue.close();
         let handles = std::mem::take(&mut *lock_unpoisoned(&self.workers));
         let mut healthy = true;
         for handle in handles {
@@ -308,6 +323,69 @@ impl WriteBackExecutor {
 impl Drop for WriteBackExecutor {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+impl TaskQueue {
+    fn try_new(capacity: usize) -> std::io::Result<Self> {
+        let mut priority = VecDeque::new();
+        priority
+            .try_reserve_exact(capacity)
+            .map_err(|_| std::io::Error::other("write-back priority queue allocation failed"))?;
+        let mut optional = VecDeque::new();
+        optional
+            .try_reserve_exact(capacity)
+            .map_err(|_| std::io::Error::other("write-back optional queue allocation failed"))?;
+        Ok(Self {
+            capacity,
+            state: Mutex::new(TaskQueueState {
+                priority,
+                optional,
+                closed: false,
+            }),
+            available: Condvar::new(),
+        })
+    }
+
+    fn submit(&self, task: Task, priority: TaskPriority) -> Result<(), (TaskSubmitError, Task)> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.closed {
+            return Err((TaskSubmitError::Closed, task));
+        }
+        if state.priority.len().saturating_add(state.optional.len()) >= self.capacity {
+            return Err((TaskSubmitError::Full, task));
+        }
+        match priority {
+            TaskPriority::Priority => state.priority.push_back(task),
+            TaskPriority::Optional => state.optional.push_back(task),
+        }
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn take(&self) -> Option<Task> {
+        let mut state = lock_unpoisoned(&self.state);
+        loop {
+            if let Some(task) = state.priority.pop_front() {
+                return Some(task);
+            }
+            if let Some(task) = state.optional.pop_front() {
+                return Some(task);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.closed = true;
+        self.available.notify_all();
     }
 }
 
@@ -382,6 +460,7 @@ impl WriteBackGate {
             gate: Arc::clone(self),
             bytes,
             background: false,
+            priority: TaskPriority::Priority,
             active: true,
         })
     }
@@ -416,6 +495,11 @@ impl WriteBackGate {
             gate: Arc::clone(self),
             bytes,
             background: true,
+            priority: if priority {
+                TaskPriority::Priority
+            } else {
+                TaskPriority::Optional
+            },
             active: true,
         })
     }
@@ -533,13 +617,9 @@ impl<T> Completion<T> {
     }
 }
 
-fn worker_loop(receiver: Arc<Mutex<Receiver<Task>>>) {
-    loop {
-        let task = lock_unpoisoned(&receiver).recv();
-        match task {
-            Ok(task) => task(),
-            Err(_) => return,
-        }
+fn worker_loop(queue: Arc<TaskQueue>) {
+    while let Some(task) = queue.take() {
+        task();
     }
 }
 
@@ -566,6 +646,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     #[test]
     fn reservations_bound_owned_bytes_and_shutdown_joins_workers() {
@@ -629,5 +710,61 @@ mod tests {
         let foreground = executor.reserve(16).unwrap();
         drop(foreground);
         assert!(executor.shutdown());
+    }
+
+    #[test]
+    fn queued_priority_overtakes_earlier_optional_work() {
+        let executor = WriteBackExecutor::try_new(4, 1, 64, BackpressurePolicy::Reject).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+
+        let blocker = executor.try_reserve_background(1).unwrap();
+        executor
+            .submit_background(
+                blocker,
+                move || {
+                    started_sender.send(()).unwrap();
+                    let (lock, changed) = &*worker_release;
+                    let mut released = lock_unpoisoned(lock);
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                },
+                || {},
+            )
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let optional_order = Arc::clone(&order);
+        let optional = executor.try_reserve_background(1).unwrap();
+        executor
+            .submit_background(
+                optional,
+                move || lock_unpoisoned(&optional_order).push("optional"),
+                || {},
+            )
+            .unwrap();
+
+        let priority_order = Arc::clone(&order);
+        let priority = executor.try_reserve_priority_background(1).unwrap();
+        executor
+            .submit_background(
+                priority,
+                move || lock_unpoisoned(&priority_order).push("priority"),
+                || {},
+            )
+            .unwrap();
+
+        let (lock, changed) = &*release;
+        *lock_unpoisoned(lock) = true;
+        changed.notify_one();
+        assert!(executor.shutdown());
+        assert_eq!(*lock_unpoisoned(&order), ["priority", "optional"]);
     }
 }
