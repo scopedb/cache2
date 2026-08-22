@@ -322,9 +322,10 @@ host writes since the pre-measure baseline reach the requested combined disk
 capacity multiple and the Region reuse count reaches the configured Region
 count, proving one complete reuse cycle. The fill has a separate bounded
 deadline and its latency samples are excluded from reported throughput and
-percentiles. After a drain boundary, `--min-capacity-turnovers`
-uses only host bytes submitted during measurement through final drain, so
-prefill and steady-state preparation cannot satisfy the measurement gate. A
+percentiles. `--min-capacity-turnovers` uses only host bytes submitted before
+the final close begins; drain host bytes, synchronous demotions, and close time
+are reported separately, so neither prefill nor lifecycle work can satisfy the
+measurement gate. A
 run that never reaches the Bucket tier, Region tier, and steady-state
 eviction/reclaim is not a mixed Hybrid qualification even if its aggregate
 throughput is high.

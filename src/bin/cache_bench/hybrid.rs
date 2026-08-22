@@ -285,6 +285,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     if let Some(error) = &phase.first_error {
         eprintln!("cache-bench hybrid: first measured error: {error}");
     }
+    let measured_after = cache.cache().stats();
     let drain_start = Instant::now();
     cache
         .close()
@@ -294,7 +295,8 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     let report = Report {
         options: &options,
         phase,
-        stats: StatsDelta::between(before, after),
+        stats: StatsDelta::between(before, measured_after),
+        drain_stats: StatsDelta::between(measured_after, after),
         total_stats: StatsDelta::between(initial_stats, after),
         premeasure_stats,
         final_stats: after,
@@ -2638,6 +2640,7 @@ struct Report<'a> {
     options: &'a Options,
     phase: Phase,
     stats: StatsDelta,
+    drain_stats: StatsDelta,
     total_stats: StatsDelta,
     premeasure_stats: StatsDelta,
     final_stats: HybridCacheStats,
@@ -3312,6 +3315,19 @@ impl Report<'_> {
             "final_journal_used_bytes",
             self.final_stats.journal_used_bytes
         );
+        number_field!("drain_host_write_bytes", self.drain_stats.host_write_bytes);
+        number_field!(
+            "drain_region_bytes_written",
+            self.drain_stats.region_bytes_written
+        );
+        number_field!(
+            "drain_write_back_demoted_entries",
+            self.drain_stats.write_back_demoted_entries
+        );
+        number_field!(
+            "drain_synchronous_demotions",
+            self.drain_stats.write_back_synchronous_demotions
+        );
         number_field!("drain_close_ms", self.drain.as_secs_f64() * 1000.0);
         raw_field!(
             "min_ops_per_sec",
@@ -3363,6 +3379,18 @@ impl Report<'_> {
             output,
             "# TYPE cache_rs_hybrid_bench_acceptance_passed gauge\ncache_rs_hybrid_bench_acceptance_passed {}",
             u8::from(self.acceptance_failures().is_empty())
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_drain_host_write_bytes gauge\ncache_rs_hybrid_bench_drain_host_write_bytes {}",
+            self.drain_stats.host_write_bytes
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_drain_synchronous_demotions gauge\ncache_rs_hybrid_bench_drain_synchronous_demotions {}",
+            self.drain_stats.write_back_synchronous_demotions
         )
         .expect("writing OpenMetrics into a String cannot fail");
         writeln!(
@@ -3620,8 +3648,10 @@ impl Report<'_> {
             self.admitted_disk_turnovers()
         );
         println!(
-            "  drain/close:             {:.3} ms",
-            self.drain.as_secs_f64() * 1000.0
+            "  drain/close:             {:.3} ms; {} MiB host writes; {} sync demotions",
+            self.drain.as_secs_f64() * 1000.0,
+            self.drain_stats.host_write_bytes / (1024 * 1024),
+            self.drain_stats.write_back_synchronous_demotions,
         );
         println!(
             "  acceptance:              {}",
@@ -4216,6 +4246,7 @@ mod tests {
             options: &options,
             phase,
             stats: measured,
+            drain_stats: StatsDelta::default(),
             total_stats: qualifying_total,
             premeasure_stats: qualifying_premeasure,
             final_stats: HybridCacheStats::default(),
@@ -4245,6 +4276,7 @@ mod tests {
                 ..Phase::default()
             },
             stats: measured,
+            drain_stats: StatsDelta::default(),
             total_stats: StatsDelta {
                 bucket_io_submitted: 0,
                 ..qualifying_total
