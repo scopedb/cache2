@@ -295,6 +295,16 @@ key count. The command refuses all non-empty targets, including valid old
 caches; this prevents benchmark automation from erasing a warm production
 Hybrid cache.
 
+JSON and human output split accumulated waiting across the Hybrid request
+budget, write-back gate, Bucket page-buffer pool, Region backpressure, and each
+disk tier's submit/completion path. I/O completion time runs from the submission
+attempt to published completion and therefore includes admission, engine
+queueing, and device time. A request that crosses the measurement boundary
+completes in the separate drain or total counters rather than the measurement
+average;
+the other wait counters also include the small lock cost of uncontended fast
+paths, so a non-zero total alone does not prove saturation.
+
 At minimum run these distributions under both synchronous and asynchronous
 public APIs, write-through/write-back policies, buffered/direct modes, and
 queue depths 1/8/32/64/128:
