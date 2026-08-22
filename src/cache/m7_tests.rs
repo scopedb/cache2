@@ -1073,9 +1073,8 @@ fn fresh_format_metadata_counts_against_the_daily_host_write_budget() {
     cache.close().unwrap();
 }
 
-#[test]
-fn background_reclaim_prepares_the_strict_fifo_victim_before_rotation() {
-    let file = TestFile::new("background-reclaim");
+fn assert_background_reclaim_prepares_fifo_victim(name: &str, reclaim_mode: ReclaimMode) {
+    let file = TestFile::new(name);
     let config = CacheConfig::new(&file.0, DATA_OFFSET + 3 * 16 * 1024)
         .with_region_size(16 * 1024)
         .with_index_slots(64)
@@ -1083,7 +1082,7 @@ fn background_reclaim_prepares_the_strict_fifo_victim_before_rotation() {
         .with_max_value_size(9 * 1024)
         .with_submission_queue_depths(2, 2)
         .with_checkpoint_interval_bytes(0)
-        .with_reclaim_mode(ReclaimMode::SecondChance);
+        .with_reclaim_mode(reclaim_mode);
     let cache = config.open().unwrap();
 
     assert_eq!(
@@ -1143,4 +1142,17 @@ fn background_reclaim_prepares_the_strict_fifo_victim_before_rotation() {
     assert_eq!(stats.reclaim_backlog_rejections, 0);
     assert!(stats.regions_reused >= 1);
     cache.close().unwrap();
+}
+
+#[test]
+fn second_chance_background_reclaim_prepares_the_strict_fifo_victim() {
+    assert_background_reclaim_prepares_fifo_victim(
+        "second-chance-background-reclaim",
+        ReclaimMode::SecondChance,
+    );
+}
+
+#[test]
+fn fifo_background_reclaim_prepares_a_victim_before_rotation() {
+    assert_background_reclaim_prepares_fifo_victim("fifo-background-reclaim", ReclaimMode::Fifo);
 }

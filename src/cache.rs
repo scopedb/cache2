@@ -959,6 +959,7 @@ pub(crate) struct Inner {
     reinsert_completed: AtomicU64,
     maintenance_tx: SyncSender<MaintenanceCommand>,
     maintenance_worker: Mutex<Option<JoinHandle<()>>>,
+    reclaim_eligible: AtomicBool,
     reclaim_forced: AtomicBool,
     reclaim_records_scanned: AtomicU64,
     reclaim_index_fallbacks: AtomicU64,
@@ -1734,6 +1735,7 @@ impl DiskCache {
             return Err(error);
         }
         let initial_status = state.status;
+        let reclaim_eligible = state.free_regions.is_empty();
         debug_assert!(read_regions.capacity() >= state.regions.len());
         read_regions.extend(state.regions.iter().copied().map(RwLock::new));
         let read_view = ReadView {
@@ -1792,6 +1794,7 @@ impl DiskCache {
             reinsert_completed: AtomicU64::new(0),
             maintenance_tx,
             maintenance_worker: Mutex::new(None),
+            reclaim_eligible: AtomicBool::new(reclaim_eligible),
             reclaim_forced: AtomicBool::new(false),
             reclaim_records_scanned: AtomicU64::new(0),
             reclaim_index_fallbacks: AtomicU64::new(0),
@@ -3604,11 +3607,12 @@ impl DiskCache {
 
     /// Remove the index identities physically owned by one old Region
     /// incarnation. Work is bounded by the Region contents, not total index
-    /// capacity. A malformed header returns `false` so the caller can use the
-    /// full-table corruption fallback before changing the generation floor.
-    fn scrub_region_index(&self, superblock: &Superblock, region: RegionMeta) -> bool {
+    /// capacity. A malformed header returns `Ok(false)` so the caller can use
+    /// the full-table corruption fallback; exact-accounting failures are
+    /// returned and must stop Region publication.
+    fn scrub_region_index(&self, superblock: &Superblock, region: RegionMeta) -> Result<bool> {
         if region.header.state == RegionState::Free {
-            return true;
+            return Ok(true);
         }
         // A per-record positioned read makes a dense small-object Region issue
         // hundreds of thousands of syscalls. Keep one fixed sequential window
@@ -3616,7 +3620,7 @@ impl DiskCache {
         // it. Large records simply advance to the next header/window.
         let region_base = match region_base(superblock, region.header.region_id) {
             Ok(base) => base,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         let mut scan = [0_u8; RECLAIM_SCAN_CHUNK_BYTES];
         let mut scan_start = 0_u64;
@@ -3626,48 +3630,48 @@ impl DiskCache {
             let scan_end = scan_start.saturating_add(scan_len as u64);
             let header_end = match cursor.checked_add(RECORD_HEADER_SIZE as u64) {
                 Some(end) if end <= region.used => end,
-                _ => return false,
+                _ => return Ok(false),
             };
             if cursor < scan_start || header_end > scan_end {
                 let remaining = match usize::try_from(region.used - cursor) {
                     Ok(remaining) => remaining,
-                    Err(_) => return false,
+                    Err(_) => return Ok(false),
                 };
                 scan_len = remaining.min(scan.len());
                 let absolute = match region_base.checked_add(cursor) {
                     Some(absolute) => absolute,
-                    None => return false,
+                    None => return Ok(false),
                 };
                 if read_exact_at(self.inner.io.as_ref(), &mut scan[..scan_len], absolute).is_err() {
-                    return false;
+                    return Ok(false);
                 }
                 scan_start = cursor;
             }
             let relative = match usize::try_from(cursor - scan_start) {
                 Ok(relative) => relative,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             let Some(encoded) = scan.get(relative..relative + RECORD_HEADER_SIZE) else {
-                return false;
+                return Ok(false);
             };
             let Some(header) = RecordHeader::decode(encoded) else {
-                return false;
+                return Ok(false);
             };
             let end = match cursor
                 .checked_add(u64::from(header.record_len))
                 .filter(|end| *end <= region.used)
             {
                 Some(end) => end,
-                None => return false,
+                None => return Ok(false),
             };
             if header.region_incarnation != region.header.incarnation
                 || header.seqno < region.header.created_seqno
             {
-                return false;
+                return Ok(false);
             }
             let offset = match u32::try_from(cursor) {
                 Ok(offset) => offset,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             let location = match PackedLocation::new(
                 region.header.region_id,
@@ -3676,7 +3680,7 @@ impl DiskCache {
                 header.kind == RecordKind::Tombstone,
             ) {
                 Ok(location) => location,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             atomic_saturating_add(&self.inner.reclaim_records_scanned, 1);
             let expected = IndexEntry {
@@ -3694,14 +3698,11 @@ impl DiskCache {
                         header.seqno,
                     );
                 }
-                Err(_) => {
-                    self.poison_runtime();
-                    return false;
-                }
+                Err(error) => return Err(error),
             }
             cursor = end;
         }
-        cursor == region.used
+        Ok(cursor == region.used)
     }
 
     fn scrub_or_fallback_region_index(
@@ -3709,9 +3710,9 @@ impl DiskCache {
         superblock: &Superblock,
         region: RegionMeta,
         min_seqno: u64,
-    ) {
-        if self.scrub_region_index(superblock, region) {
-            return;
+    ) -> Result<()> {
+        if self.scrub_region_index(superblock, region)? {
+            return Ok(());
         }
         atomic_saturating_add(&self.inner.reclaim_index_fallbacks, 1);
         let mut accounting_ok = true;
@@ -3723,7 +3724,53 @@ impl DiskCache {
             });
         if !accounting_ok {
             self.poison_runtime();
+            return Err(CacheError::CorruptMetadata(
+                "Region reclaim exceeded namespace live usage",
+            ));
         }
+        Ok(())
+    }
+
+    fn publish_scrubbed_region_generation(&self, header: RegionHeader) -> Result<()> {
+        let counts = self
+            .inner
+            .index
+            .invalidate_region_generation(
+                header.region_id,
+                RegionGeneration::Allocated {
+                    created_seqno: header.created_seqno,
+                },
+            )
+            .ok_or(CacheError::CorruptMetadata(
+                "reused Region is out of index bounds",
+            ))?;
+        if counts.entries != 0 || counts.values != 0 {
+            return Err(CacheError::CorruptMetadata(
+                "Region reclaim left visible index entries",
+            ));
+        }
+        let victim_index = header.region_id as usize;
+        let valid_bytes =
+            self.inner
+                .region_valid_bytes
+                .get(victim_index)
+                .ok_or(CacheError::CorruptMetadata(
+                    "reused Region accounting is out of bounds",
+                ))?;
+        let reinserted_bytes = self.inner.region_reinserted_bytes.get(victim_index).ok_or(
+            CacheError::CorruptMetadata("reused Region reinsertion accounting is out of bounds"),
+        )?;
+        let reinsert_pending = self.inner.region_reinsert_pending.get(victim_index).ok_or(
+            CacheError::CorruptMetadata("reused Region pending accounting is out of bounds"),
+        )?;
+        if valid_bytes.swap(0, Ordering::AcqRel) != 0 {
+            return Err(CacheError::CorruptMetadata(
+                "Region reclaim left valid-byte accounting",
+            ));
+        }
+        reinserted_bytes.store(0, Ordering::Release);
+        reinsert_pending.store(0, Ordering::Release);
+        Ok(())
     }
 
     fn schedule_second_chance(&self, hash: u64, entry: IndexEntry, region: RegionMeta) {
@@ -4219,8 +4266,11 @@ impl DiskCache {
     }
 
     fn request_background_reclaim(&self, force: bool) {
-        if self.inner.config.reclaim_mode != ReclaimMode::SecondChance
-            || !self.inner.accepting.load(Ordering::Acquire)
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            return;
+        }
+        if self.inner.config.reclaim_mode == ReclaimMode::Fifo
+            && !self.inner.reclaim_eligible.load(Ordering::Acquire)
         {
             return;
         }
@@ -4234,9 +4284,7 @@ impl DiskCache {
     }
 
     fn run_background_reclaim(&self) {
-        if self.inner.config.reclaim_mode != ReclaimMode::SecondChance
-            || !self.inner.accepting.load(Ordering::Acquire)
-        {
+        if !self.inner.accepting.load(Ordering::Acquire) {
             return;
         }
         let forced = self.inner.reclaim_forced.swap(false, Ordering::AcqRel);
@@ -4255,6 +4303,10 @@ impl DiskCache {
                 || state.reclaiming_region.is_some()
                 || state.reclaim_ready_region.is_some()
                 || !state.free_regions.is_empty()
+                // FIFO must retain one synchronous victim so background
+                // precleaning cannot introduce a new ReclaimBacklog outcome.
+                || (self.inner.config.reclaim_mode == ReclaimMode::Fifo
+                    && state.sealed_regions.len() <= 1)
             {
                 return;
             }
@@ -4339,30 +4391,13 @@ impl DiskCache {
         // The new incarnation is already published to readers. Scrub only the
         // old Region's record identities, then advance its generation floor in
         // O(1). Corrupt record headers use the legacy full-index fallback.
-        self.scrub_or_fallback_region_index(&planned.0, planned.3, planned.2);
-        if self
-            .inner
-            .index
-            .invalidate_region_generation(
-                planned.1.region_id,
-                RegionGeneration::Allocated {
-                    created_seqno: planned.1.created_seqno,
-                },
-            )
-            .is_none()
+        if let Err(error) = self
+            .scrub_or_fallback_region_index(&planned.0, planned.3, planned.2)
+            .and_then(|()| self.publish_scrubbed_region_generation(planned.1))
         {
-            self.finish_background_reclaim(
-                planned.1,
-                Err(CacheError::CorruptMetadata(
-                    "background reclaim Region is out of index bounds",
-                )),
-            );
+            self.finish_background_reclaim(planned.1, Err(error));
             return;
         }
-        let victim_index = planned.1.region_id as usize;
-        self.inner.region_valid_bytes[victim_index].store(0, Ordering::Release);
-        self.inner.region_reinserted_bytes[victim_index].store(0, Ordering::Release);
-        self.inner.region_reinsert_pending[victim_index].store(0, Ordering::Release);
 
         let result = self
             .write_backend_tracked(
@@ -4378,6 +4413,9 @@ impl DiskCache {
                 },
             )
             .and_then(|()| {
+                if self.inner.owner_dirty.is_some() {
+                    return Ok(());
+                }
                 sync_backend_tracked(
                     self.inner.io.as_ref(),
                     self.inner.policy.host_writes(),
@@ -5472,10 +5510,14 @@ impl DiskCache {
             .ok_or(CacheError::CorruptMetadata(
                 "append lane id is out of bounds",
             ))?;
-        // Prefer unused capacity. FIFO reclaims synchronously as the reference
-        // policy; SecondChance only consumes a Region that the maintenance
-        // worker has already fenced and emptied.
+        // Prefer unused capacity, then a Region that maintenance has already
+        // fenced, scrubbed, and emptied. SecondChance requires that prepared
+        // victim; FIFO retains synchronous reclaim as a fallback when the
+        // maintenance worker has not completed in time.
         let free = state.free_regions.pop_front();
+        if free.is_some() && state.free_regions.is_empty() {
+            self.inner.reclaim_eligible.store(true, Ordering::Release);
+        }
         let victim = if let Some(free) = free {
             if state.regions[free as usize].header.state != RegionState::Free {
                 return Err(CacheError::CorruptMetadata(
@@ -5483,27 +5525,24 @@ impl DiskCache {
                 ));
             }
             free
-        } else if self.inner.config.reclaim_mode == ReclaimMode::SecondChance {
-            let ready = state.reclaim_ready_region.take();
-            match ready {
-                Some(ready)
-                    if state.regions[ready as usize].header.state == RegionState::Sealed
-                        && state.regions[ready as usize].used == REGION_HEADER_SIZE as u64 =>
-                {
-                    ready
-                }
-                Some(_) => {
-                    return Err(CacheError::CorruptMetadata(
-                        "background reclaim published an invalid Region",
-                    ));
-                }
-                None => {
-                    state.stats.reclaim_backlog_rejections =
-                        state.stats.reclaim_backlog_rejections.saturating_add(1);
-                    self.request_background_reclaim(true);
-                    return Err(CacheError::ReclaimBacklog);
-                }
+        } else if let Some(ready) = state.reclaim_ready_region.take() {
+            if state.regions[ready as usize].header.state != RegionState::Sealed
+                || state.regions[ready as usize].used != REGION_HEADER_SIZE as u64
+            {
+                return Err(CacheError::CorruptMetadata(
+                    "background reclaim published an invalid Region",
+                ));
             }
+            ready
+        } else if self.inner.config.reclaim_mode == ReclaimMode::SecondChance {
+            state.stats.reclaim_backlog_rejections =
+                state.stats.reclaim_backlog_rejections.saturating_add(1);
+            self.request_background_reclaim(true);
+            return Err(CacheError::ReclaimBacklog);
+        } else if state.reclaiming_region.is_some() && state.sealed_regions.is_empty() {
+            state.stats.reclaim_backlog_rejections =
+                state.stats.reclaim_backlog_rejections.saturating_add(1);
+            return Err(CacheError::ReclaimBacklog);
         } else {
             state
                 .sealed_regions
@@ -5563,27 +5602,8 @@ impl DiskCache {
             &state.superblock,
             old_victim,
             state.superblock.epoch_start_seqno,
-        );
-        state
-            .index
-            .invalidate_region_generation(
-                victim,
-                RegionGeneration::Allocated {
-                    created_seqno: header.created_seqno,
-                },
-            )
-            .ok_or(CacheError::CorruptMetadata(
-                "reused Region is out of index bounds",
-            ))?;
-        if let Some(counter) = self.inner.region_valid_bytes.get(victim_index) {
-            counter.store(0, Ordering::Release);
-        }
-        if let Some(counter) = self.inner.region_reinserted_bytes.get(victim_index) {
-            counter.store(0, Ordering::Release);
-        }
-        if let Some(counter) = self.inner.region_reinsert_pending.get(victim_index) {
-            counter.store(0, Ordering::Release);
-        }
+        )?;
+        self.publish_scrubbed_region_generation(header)?;
         state.regions[victim_index] = RegionMeta {
             header,
             used: REGION_HEADER_SIZE as u64,
@@ -10389,7 +10409,9 @@ mod m1_tests {
             let active = state.regions[state.active_regions[0] as usize];
             (state.superblock, active, state.superblock.epoch_start_seqno)
         };
-        cache.scrub_or_fallback_region_index(&superblock, active, min_seqno);
+        cache
+            .scrub_or_fallback_region_index(&superblock, active, min_seqno)
+            .unwrap();
 
         assert_eq!(
             retired
@@ -10400,6 +10422,39 @@ mod m1_tests {
         );
         assert_eq!(cache.scan_live_usage(|_| {}).unwrap(), 0);
         cache.close().unwrap();
+    }
+
+    #[test]
+    fn managed_region_scrub_failure_is_reported_and_poisons_the_cache() {
+        let file = TestFile::new("managed-retire-scrub-failure");
+        let shared = Arc::new(HostWriteTracker::try_new(None, None).unwrap());
+        let namespaces =
+            Arc::new(NamespaceController::try_new(&[NamespaceConfig::new(11)]).unwrap());
+        let cache = DiskCache::open_managed_with_retire_sink(
+            config(&file.0),
+            shared,
+            namespaces,
+            Arc::new(|_| false),
+        )
+        .unwrap();
+        assert_eq!(
+            cache
+                .put_in(11, b"key", b"value", PutOptions::default())
+                .unwrap(),
+            PutOutcome::Stored
+        );
+        let (superblock, active, min_seqno) = {
+            let state = cache.lock_state().unwrap();
+            let active = state.regions[state.active_regions[0] as usize];
+            (state.superblock, active, state.superblock.epoch_start_seqno)
+        };
+
+        assert!(matches!(
+            cache.scrub_or_fallback_region_index(&superblock, active, min_seqno),
+            Err(CacheError::CorruptMetadata(_))
+        ));
+        assert_eq!(cache.status(), CacheStatus::Poisoned);
+        assert!(matches!(cache.close(), Err(CacheError::Poisoned)));
     }
 
     #[test]
