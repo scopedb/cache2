@@ -51,9 +51,13 @@
 //! exact-key pending directory that masks any older lower value and makes a
 //! same-key mutation wait without holding the coarse ordering lock. Disposable
 //! lower-absent work uses at most 75% of the executor and may be dropped to a
-//! miss; lower-candidate updates use the complete bounded budget, and admission
-//! failure keeps the victim resident and rejects the incoming cache put instead
-//! of doing foreground device I/O. Both disk tiers provide bounded
+//! miss. A lower-candidate update persists while its projected occupancy stays
+//! at or below 75%; under pressure it instead schedules a smaller durable
+//! deletion, drops the dirty value to a miss, and keeps the pending fence until
+//! the old L2 value is gone. If that bounded deletion cannot be allocated,
+//! registered, or admitted, the victim remains resident and the incoming cache
+//! put is rejected. No path performs foreground device I/O. Both disk tiers
+//! provide bounded
 //! sync/`io_uring` runtimes and aligned optional `O_DIRECT` without changing
 //! their respective Format V1 encodings.
 

@@ -89,6 +89,16 @@ health, dirty L1 bytes/entries, and every bounded write-back queue/memory gauge.
 final drained snapshot. Export these from the owning service; `cachectl` does
 not open a live Hybrid cache merely to scrape metrics.
 
+For write-back pressure, compare current and peak queue slots and bytes against
+their capacities independently. `proactive_persisted` preserves a dirty value.
+`proactive_invalidated` together with `dropped_evictions` means the engine
+intentionally converted an update to a miss after durably deleting its stale L2
+candidate; this is cache loss, not stale data or corruption. Correlate it with
+`lower_candidate_evictions`, hit rate, and origin QPS. `demotion_failures`, put
+rejections, and lower-candidate `proactive_skipped` mean the compact fallback
+could not be established/admitted, or a lifecycle/setup boundary intervened.
+`proactive_skipped` alone can also be an expected lower-absent drop.
+
 Interpret write governance by both views: `daily_host_write_bytes` is actual
 submitted I/O, while `daily_budget_used_bytes` and
 `daily_budget_reserved_bytes` are admission accounting. Bucket RMW submits a
@@ -175,6 +185,7 @@ state and check:
 - hit rate and origin QPS/concurrency;
 - request p50/p95/p99 and timeout/error classes;
 - queue depth, rejection, and origin-fill rejection;
+- write-back persist/invalidate/drop rates and the resulting origin QPS;
 - recovery progress and checkpoint failures;
 - region valid ratio, reclaim backlog, victim scan records, and full-index fallback;
 - host writes, write amplification, and NVMe health.
@@ -192,6 +203,8 @@ attempt an in-place downgrade of a file already written by the new binary.
 | checkpoint fallback increases | Continue only if latency/origin budgets hold | Run offline `cachectl verify` after the owner closes |
 | reclaim index fallback increases | Keep reads available and watch p99 | Correlate with short read/corrupt header/device errors; verify offline after close |
 | `ReclaimBacklog` or queue rejects | Shed/defer writes; reads retain reserved capacity | Reduce write traffic or tune only within the validated memory/device plan |
+| sustained proactive invalidation without rejects | Keep serving if origin and latency budgets hold | Reduce churn or add write-back/device throughput; validate the expected miss-rate tradeoff |
+| write-back demotion failures or put rejects | Shed/defer cache writes | Inspect both slot and byte hard caps plus pending allocation/lifecycle failures |
 | NVMe critical | Stop new cache writes according to configured policy | Drain/replace the device; the authoritative store remains the source |
 | `ENOSPC` | Stop cache writes and traffic to the instance | Free space or provision a new path; never truncate a live cache |
 

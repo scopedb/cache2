@@ -311,11 +311,17 @@ exact namespace refund. Also hold the daily budget exhausted to prove logical
 expiry does not release physical quota early or corrupt the Bloom fast-miss.
 
 Retain tier hit counts, combined host-write bytes, Bucket/Region physical I/O,
-request rejections, queue-depth peaks, journal rollover count/max latency,
+request rejections, queue-depth peaks and capacities,
+`lower_candidate_evictions`, `proactive_persisted`, `proactive_invalidated`,
+`dropped_evictions`, `demotion_failures`, journal rollover count/max latency,
 capacity turnovers, final drain time, process/device/SMART profiles, and an
 offline `cachectl hybrid-verify` report. The gate fails on a stale per-key
 version, a missing Bucket or Region I/O submission, an insufficient QD peak,
-or (in write-back mode) no completed demotion. The configured rollover,
+or (in write-back mode) no completed demotion. Under sustained update pressure,
+`proactive_invalidated` records dirty values deliberately degraded to miss after
+their old L2 candidates were durably deleted; it is not a demotion failure.
+Hard-cap demotion failures or rejected puts still fail a no-rejection run. The
+configured rollover,
 rollover-latency, and close-latency thresholds are also enforced;
 `--steady-state-fill-turnovers` runs the same workload before measurement until
 host writes since the pre-measure baseline reach the requested combined disk

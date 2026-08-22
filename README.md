@@ -25,13 +25,15 @@ HybridCache
 ```
 
 The default is the performance-first **write-back** mode: a `put` publishes a
-dirty L1 value after allocating a process-local version, then writes it to the
-selected SSD engine on eviction or during `flush`/`close`. Steady-state
-mutations do not append a route-journal record or issue a durability sync.
-Queue slots, workers, and owned key/value bytes are hard-bounded; a value that
-cannot safely use the reserved path takes the explicit backpressure or
-write-through fallback rather than growing memory. `HybridWriteMode::WriteThrough`
-remains available when disk-first publication is required.
+dirty L1 value after allocating a process-local version. `flush`/`close` drain
+resident dirty values; eviction normally persists one in the selected SSD
+engine, but may deliberately lose it to a miss under bounded executor pressure
+after durably deleting any older L2 candidate. Steady-state mutations do not
+append a route-journal record or issue a durability sync. Queue slots, workers,
+and owned task bytes are hard-bounded. Oversize/nonresident L1 paths retain
+explicit backpressure or write-through fallback semantics independently of
+eviction pressure. `HybridWriteMode::WriteThrough` remains available when
+disk-first publication is required.
 
 L1 values use shared immutable `Arc` storage. `get_handle` returns a
 `HybridValueHandle`, so an L1 hit only increments a reference count while the
@@ -66,9 +68,14 @@ A dirty victim may leave L1 before its SSD write completes after it registers in
 the bounded exact-key pending directory. While pending, reads mask any older
 lower value and same-key mutations wait without holding the coarse ordering
 lock. Lower-absent writes use at most 75% of the executor and may be dropped to
-a miss under pressure. Lower-candidate writes have priority over the complete
-bounded budget; if admission fails, the dirty victim remains resident and the
-incoming cache put is rejected rather than performing foreground device I/O.
+a miss under pressure. Lower-candidate writes have priority: when admitting the
+full value keeps projected slot/byte occupancy at or below 75% they persist it;
+at higher pressure they schedule only a smaller durable deletion of the stale
+L2 value and drop the
+dirty value to a miss. The exact-key fence remains until deletion completes. If
+even that work cannot be allocated, registered, or admitted, the dirty victim
+remains resident and the incoming cache put is rejected rather than performing
+foreground device I/O.
 
 Compatible non-empty journal recovery is two-pass and hard-bounded. A first
 streaming pass uses at most 64 KiB scratch to validate structure, CRC, generation, versions,
@@ -614,6 +621,10 @@ there is no destructive Hybrid reset shortcut. At runtime,
 `HybridCache::openmetrics_snapshot()` reports Memory/Bucket/Region hits,
 request bounds, admission, combined host writes, I/O, component health, dirty
 L1 state, and bounded write-back queue/memory state with fixed label cardinality.
+`proactive_persisted` is value-preserving demotion;
+`proactive_invalidated` plus `dropped_evictions` is intentional cache loss after
+durable stale-L2 deletion; `demotion_failures` identifies demotion work that
+could not safely complete.
 
 ## NVMe staging acceptance
 
@@ -667,8 +678,9 @@ target/release/cache-bench hybrid \
 The qualification matrix covers both
 `--write-mode write-through` and `--write-mode write-back`; it reports tier
 hits, global write amplification, version-stale failures, bounded prefill,
-Bucket/Region submitted I/O and QD peaks, write-back demotion, capacity turnover,
-request rejects, latency, and final clean-checkpoint drain time. Steady-state
+Bucket/Region submitted I/O and QD peaks, write-back persist/invalidate/drop and
+hard-cap failures, capacity turnover, request rejects, latency, and final
+clean-checkpoint drain time. Steady-state
 mutations are expected to leave journal rollover counters unchanged. The run
 requires three empty paths plus `--yes`. JSON always records
 `hardware_qualification=false`, `target_nvme_matrix_passed=false`, and the
