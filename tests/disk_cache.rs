@@ -219,7 +219,7 @@ fn fifo_region_reuse_evicts_old_offsets_without_harming_new_values() {
     assert_eq!(cache.get(b"key-19").unwrap(), Some(value.clone()));
     let stats = cache.stats();
     assert_eq!(stats.regions_reused, 2);
-    assert!(stats.reclaim_records_scanned > 0);
+    assert_eq!(stats.reclaim_records_scanned, 0);
     assert_eq!(stats.reclaim_index_fallbacks, 0);
     cache.flush().unwrap();
     drop(cache);

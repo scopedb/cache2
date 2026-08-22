@@ -932,6 +932,75 @@ fn unconfigured_namespace_can_be_removed_and_stays_deleted_when_reconfigured() {
 }
 
 #[test]
+fn generation_reclaim_does_not_charge_a_historical_foreign_namespace() {
+    let file = TestFile::new("generation-reclaim-foreign-namespace");
+    let configured = config(&file.0).with_namespace(NamespaceConfig::new(7));
+    let foreign = configured.open().unwrap();
+    let value = vec![b'f'; 1536];
+    for id in 0..28 {
+        foreign
+            .put_in(
+                7,
+                format!("foreign-{id:02}").as_bytes(),
+                &value,
+                PutOptions::default(),
+            )
+            .unwrap();
+    }
+    foreign.close().unwrap();
+
+    let sole_config = config(&file.0);
+    let sole = sole_config.clone().open().unwrap();
+    assert_eq!(sole.inner.generation_reclaim_namespace, Some(0));
+    for id in 0..48 {
+        sole.put(format!("current-{id:02}"), &value, PutOptions::default())
+            .unwrap();
+    }
+    assert_eq!(sole.status(), CacheStatus::Healthy);
+    assert!(sole.stats().regions_reused > 0);
+    assert_eq!(sole.stats().reclaim_records_scanned, 0);
+
+    let mut scanned_current_bytes = 0_u64;
+    sole.scan_live_usage(|usage| {
+        if usage.namespace == 0 {
+            scanned_current_bytes = scanned_current_bytes.saturating_add(usage.live_bytes);
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        sole.inner
+            .policy
+            .namespaces()
+            .snapshot(0)
+            .unwrap()
+            .live_bytes,
+        scanned_current_bytes
+    );
+    sole.close().unwrap();
+
+    let reopened = sole_config.open().unwrap();
+    let mut reopened_current_bytes = 0_u64;
+    reopened
+        .scan_live_usage(|usage| {
+            if usage.namespace == 0 {
+                reopened_current_bytes = reopened_current_bytes.saturating_add(usage.live_bytes);
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        reopened
+            .inner
+            .policy
+            .namespaces()
+            .snapshot(0)
+            .unwrap()
+            .live_bytes,
+        reopened_current_bytes
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn coalesced_lane_rejects_only_the_namespace_over_capacity() {
     let file = TestFile::new("coalesced-namespace-capacity");
     let config = config(&file.0)

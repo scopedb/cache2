@@ -40,8 +40,7 @@ fn diagnostics_validates_the_resource_plan_without_touching_the_path() {
     assert!(diagnostics.checkpoint_slot_bytes >= CHECKPOINT_SLOT_HEADER_SIZE as u64);
     assert_eq!(
         diagnostics.checkpoint_accounting_bytes,
-        u64::from(diagnostics.region_count) * std::mem::size_of::<u64>() as u64
-            + std::mem::size_of::<NamespaceUsage>() as u64
+        std::mem::size_of::<NamespaceUsage>() as u64
     );
 
     let exact_budget = usize::try_from(diagnostics.planned_memory_bytes).unwrap();

@@ -316,9 +316,13 @@ The scalable fast path is steady-state record I/O: independent reads and
 hash-selected append lanes overlap. FIFO selects the exact oldest victim only
 after a concrete append batch no longer fits, preserving the original capacity
 and eviction contract. A short global rotation gate fixes selection order, but
-the reader drain, Region Header I/O, and exact victim scrub run without the
-global Region-manager state lock, so unrelated lanes can continue reserving
-and publishing writes. `SecondChance` instead prepares one oldest sealed Region
+the reader drain and Region Header I/O run without the global Region-manager
+state lock, so unrelated lanes can continue reserving and publishing writes.
+With one effective namespace, FIFO retires a victim in O(1) by flipping its
+index generation and returning the index's exact tracked bytes; entries left by
+a removed namespace are hidden without charging the current owner. Multiple
+namespaces retain the bounded victim-local streaming scrub for exact
+attribution. `SecondChance` instead prepares one oldest sealed Region
 on the maintenance worker and can return `ReclaimBacklog` when no prepared
 victim is ready. Standalone Region preserves the rotation durability barrier;
 owner-fenced Hybrid defers it to `flush`/`close`, because an unclean session
@@ -517,8 +521,10 @@ data was actually scanned, while `recovery_bytes_scanned` includes every Region
 Header read plus scanned record bytes. `completed/total` is monotonic progress
 over all Regions, including those that required no record scan. v1.1 adds
 `reclaim_records_scanned` and `reclaim_index_fallbacks`: normal reuse scans only
-the victim's record headers; the full-index path is reserved for malformed
-victim metadata and is explicitly observable.
+the victim's record headers when namespace attribution requires it. FIFO with
+one effective namespace uses generation retirement and scans zero victim
+records; the full-index path is reserved for malformed victim metadata and is
+explicitly observable.
 
 Nine focused M6 behavior tests cover the pre-traffic baseline, dirty put/remove
 replay, `clear` as an epoch barrier, slot alternation and newest-slot corruption,

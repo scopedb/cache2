@@ -7,7 +7,7 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const REGION_BITS: u32 = 21;
@@ -479,6 +479,7 @@ impl CompactIndex {
         self.apply_if_newer_with_visibility(hash, location, seqno, namespace_id, flags, |entry| {
             entry.seqno >= min_seqno
         })
+        .0
     }
 
     fn apply_if_newer_with_visibility(
@@ -489,7 +490,7 @@ impl CompactIndex {
         namespace_id: u32,
         flags: u32,
         mut is_visible: impl FnMut(IndexEntry) -> bool,
-    ) -> ApplyResult {
+    ) -> (ApplyResult, Option<IndexEntry>) {
         let supplied = IndexEntry {
             location,
             seqno,
@@ -497,7 +498,7 @@ impl CompactIndex {
             flags,
         };
         if seqno == 0 || !is_visible(supplied) {
-            return ApplyResult::ignored(None);
+            return (ApplyResult::ignored(None), None);
         }
 
         let start = self.start_slot(hash);
@@ -508,9 +509,9 @@ impl CompactIndex {
             let slot = self.slots[index];
 
             if slot.is_empty() {
-                let (target, previous) = reusable.unwrap_or((index, None));
+                let (target, replaced) = reusable.unwrap_or((index, None));
                 self.install(target, hash, location, seqno, namespace_id, flags);
-                return ApplyResult::applied(previous);
+                return (ApplyResult::applied(None), replaced);
             }
 
             if slot.is_deleted() {
@@ -529,26 +530,29 @@ impl CompactIndex {
             let current = slot.entry();
             if slot.hash == hash {
                 if is_visible(current) && seqno <= slot.seqno {
-                    return ApplyResult::ignored(Some(current));
+                    return (ApplyResult::ignored(Some(current)), None);
                 }
 
                 self.install(index, hash, location, seqno, namespace_id, flags);
-                return ApplyResult::applied(is_visible(current).then_some(current));
+                return (
+                    ApplyResult::applied(is_visible(current).then_some(current)),
+                    Some(current),
+                );
             }
 
             if !is_visible(current) && reusable.is_none() {
-                reusable = Some((index, None));
+                reusable = Some((index, Some(current)));
             }
         }
 
-        if let Some((target, previous)) = reusable {
+        if let Some((target, replaced)) = reusable {
             self.install(target, hash, location, seqno, namespace_id, flags);
-            return ApplyResult::applied(previous);
+            return (ApplyResult::applied(None), replaced);
         }
 
         let previous = self.slots[start].entry();
         self.install(start, hash, location, seqno, namespace_id, flags);
-        ApplyResult::applied(Some(previous))
+        (ApplyResult::applied(Some(previous)), Some(previous))
     }
 
     fn update_second_chance_if_visible(
@@ -795,12 +799,16 @@ pub(crate) enum RegionGeneration {
 pub(crate) struct RegionIndexCounts {
     pub(crate) entries: usize,
     pub(crate) values: usize,
+    pub(crate) record_bytes: u64,
+    pub(crate) tracked_value_bytes: u64,
 }
 
 struct RegionVisibility {
     generation: RegionGeneration,
     entries: AtomicUsize,
     values: AtomicUsize,
+    record_bytes: AtomicU64,
+    tracked_value_bytes: AtomicU64,
 }
 
 impl RegionVisibility {
@@ -809,6 +817,8 @@ impl RegionVisibility {
             generation,
             entries: AtomicUsize::new(0),
             values: AtomicUsize::new(0),
+            record_bytes: AtomicU64::new(0),
+            tracked_value_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -841,6 +851,7 @@ impl Visibility {
 pub(crate) struct ShardedIndex {
     shards: Vec<RwLock<CompactIndex>>,
     slot_count: usize,
+    tracked_namespace: Option<u32>,
     visibility: RwLock<Visibility>,
     entries: AtomicUsize,
     values: AtomicUsize,
@@ -875,6 +886,7 @@ impl ShardedIndex {
         Ok(Self {
             shards,
             slot_count,
+            tracked_namespace: None,
             visibility: RwLock::new(Visibility {
                 min_seqno: 0,
                 regions,
@@ -888,11 +900,21 @@ impl ShardedIndex {
 
     #[cfg(test)]
     pub(crate) fn new(slot_count: usize) -> Self {
-        let index =
+        let mut index =
             Self::try_new(slot_count, 64).expect("test sharded-index allocation must succeed");
+        index.set_tracked_namespace(Some(0));
         let generations = vec![RegionGeneration::Allocated { created_seqno: 0 }; 64];
         assert!(index.reset_visibility_for_restore(0, generations.into_iter()));
         index
+    }
+
+    /// Bind exact Region byte accounting to the sole effective namespace.
+    /// This is configured once on a freshly allocated index, before recovery
+    /// can restore entries from namespaces that are no longer configured.
+    pub(crate) fn set_tracked_namespace(&mut self, namespace: Option<u32>) {
+        debug_assert_eq!(self.entries.load(Ordering::Relaxed), 0);
+        debug_assert_eq!(self.values.load(Ordering::Relaxed), 0);
+        self.tracked_namespace = namespace;
     }
 
     /// Resets all Region generations before rebuilding an index from recovery.
@@ -914,6 +936,8 @@ impl ShardedIndex {
             region.generation = generation;
             region.entries.store(0, Ordering::Relaxed);
             region.values.store(0, Ordering::Relaxed);
+            region.record_bytes.store(0, Ordering::Relaxed);
+            region.tracked_value_bytes.store(0, Ordering::Relaxed);
         }
         self.entries.store(0, Ordering::Relaxed);
         self.values.store(0, Ordering::Relaxed);
@@ -928,6 +952,8 @@ impl ShardedIndex {
         for region in &visibility.regions {
             region.entries.store(0, Ordering::Relaxed);
             region.values.store(0, Ordering::Relaxed);
+            region.record_bytes.store(0, Ordering::Relaxed);
+            region.tracked_value_bytes.store(0, Ordering::Relaxed);
         }
         self.entries.store(0, Ordering::Relaxed);
         self.values.store(0, Ordering::Relaxed);
@@ -945,6 +971,8 @@ impl ShardedIndex {
         let counts = RegionIndexCounts {
             entries: region.entries.swap(0, Ordering::Relaxed),
             values: region.values.swap(0, Ordering::Relaxed),
+            record_bytes: region.record_bytes.swap(0, Ordering::Relaxed),
+            tracked_value_bytes: region.tracked_value_bytes.swap(0, Ordering::Relaxed),
         };
         subtract_exact(&self.entries, counts.entries);
         subtract_exact(&self.values, counts.values);
@@ -979,13 +1007,13 @@ impl ShardedIndex {
         flags: u32,
     ) -> ApplyResult {
         let visibility = read_unpoisoned(&self.visibility);
-        let result = write_unpoisoned(&self.shards[self.shard_for(hash)])
+        let (result, replaced) = write_unpoisoned(&self.shards[self.shard_for(hash)])
             .apply_if_newer_with_visibility(hash, location, seqno, namespace_id, flags, |entry| {
                 visibility.is_visible(entry, min_seqno)
             });
         if result.applied {
-            if let Some(previous) = result.previous {
-                self.subtract_entry(&visibility, previous);
+            if let Some(replaced) = replaced.filter(|entry| visibility.is_visible(*entry, 0)) {
+                self.subtract_entry(&visibility, replaced);
             }
             self.add_entry(
                 &visibility,
@@ -1085,6 +1113,8 @@ impl ShardedIndex {
         for region in &visibility.regions {
             region.entries.store(0, Ordering::Relaxed);
             region.values.store(0, Ordering::Relaxed);
+            region.record_bytes.store(0, Ordering::Relaxed);
+            region.tracked_value_bytes.store(0, Ordering::Relaxed);
         }
         self.entries.store(0, Ordering::Relaxed);
         self.values.store(0, Ordering::Relaxed);
@@ -1197,8 +1227,8 @@ impl ShardedIndex {
                 write_unpoisoned(shard).evict_region_with_visibility(
                     region_id,
                     |entry| visibility.is_visible(entry, min_seqno),
-                    &mut |entry, was_visible| {
-                        if was_visible {
+                    &mut |entry, _| {
+                        if visibility.is_visible(entry, 0) {
                             self.subtract_entry(&visibility, entry);
                             visit(entry);
                         }
@@ -1237,6 +1267,14 @@ impl ShardedIndex {
             .sum()
     }
 
+    pub(crate) fn region_record_bytes(&self, region_id: u32) -> Option<u64> {
+        let visibility = read_unpoisoned(&self.visibility);
+        visibility
+            .regions
+            .get(region_id as usize)
+            .map(|region| region.record_bytes.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
     }
@@ -1244,9 +1282,17 @@ impl ShardedIndex {
     fn add_entry(&self, visibility: &Visibility, entry: IndexEntry) {
         let region = &visibility.regions[entry.location.region_id() as usize];
         region.entries.fetch_add(1, Ordering::Relaxed);
+        region
+            .record_bytes
+            .fetch_add(u64::from(entry.location.record_len()), Ordering::Relaxed);
         self.entries.fetch_add(1, Ordering::Relaxed);
         if !entry.location.is_tombstone() {
             region.values.fetch_add(1, Ordering::Relaxed);
+            if self.tracked_namespace == Some(entry.namespace_id) {
+                region
+                    .tracked_value_bytes
+                    .fetch_add(u64::from(entry.location.record_len()), Ordering::Relaxed);
+            }
             self.values.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1254,9 +1300,16 @@ impl ShardedIndex {
     fn subtract_entry(&self, visibility: &Visibility, entry: IndexEntry) {
         let region = &visibility.regions[entry.location.region_id() as usize];
         subtract_exact(&region.entries, 1);
+        subtract_exact_u64(&region.record_bytes, u64::from(entry.location.record_len()));
         subtract_exact(&self.entries, 1);
         if !entry.location.is_tombstone() {
             subtract_exact(&region.values, 1);
+            if self.tracked_namespace == Some(entry.namespace_id) {
+                subtract_exact_u64(
+                    &region.tracked_value_bytes,
+                    u64::from(entry.location.record_len()),
+                );
+            }
             subtract_exact(&self.values, 1);
         }
     }
@@ -1291,6 +1344,16 @@ fn subtract_exact(counter: &AtomicUsize, amount: usize) {
     if amount != 0 {
         let previous = counter.fetch_sub(amount, Ordering::Relaxed);
         debug_assert!(previous >= amount, "index visibility counter underflow");
+    }
+}
+
+fn subtract_exact_u64(counter: &AtomicU64, amount: u64) {
+    if amount != 0 {
+        let previous = counter.fetch_sub(amount, Ordering::Relaxed);
+        debug_assert!(
+            previous >= amount,
+            "index visibility byte counter underflow"
+        );
     }
 }
 
@@ -1627,11 +1690,34 @@ mod tests {
             2
         );
         removed.sort_unstable_by_key(|entry| entry.namespace_id);
-        assert_eq!(removed.len(), 1);
+        assert_eq!(removed.len(), 2);
         assert_eq!(removed[0].location, first);
         assert_eq!(removed[0].namespace_id, 11);
         assert_eq!(removed[0].flags, 0x10);
+        assert_eq!(removed[1].location, stale);
+        assert_eq!(removed[1].namespace_id, 12);
+        assert_eq!(removed[1].flags, 0x20);
+        assert_eq!(index.entry_len(), 1);
+        assert_eq!(index.region_record_bytes(3), Some(0));
+        assert_eq!(index.region_record_bytes(4), Some(0));
+        assert_eq!(index.region_record_bytes(5), Some(32));
         assert_eq!(index.get(3, 5).unwrap().location, survivor);
+    }
+
+    #[test]
+    fn caller_floor_replacement_keeps_generation_counters_exact() {
+        let index = ShardedIndex::new(32);
+        let old = location(4, 0);
+        let new = location(5, 8);
+        assert!(index.apply_if_newer(1, old, 2, 1).applied);
+
+        let replacement = index.apply_if_newer(1, new, 5, 5);
+        assert!(replacement.applied);
+        assert_eq!(replacement.previous, None);
+        assert_eq!(index.entry_len(), 1);
+        assert_eq!(index.value_len(1), 1);
+        assert_eq!(index.region_record_bytes(4), Some(0));
+        assert_eq!(index.region_record_bytes(5), Some(32));
     }
 
     #[test]
@@ -1788,8 +1874,10 @@ mod tests {
 
     #[test]
     fn region_generation_invalidation_is_constant_time_and_exactly_counted() {
-        let index = ShardedIndex::try_new(64, 4).unwrap();
+        let mut index = ShardedIndex::try_new(64, 4).unwrap();
+        index.set_tracked_namespace(Some(0));
         let value = location(1, 0);
+        let foreign_value = location(1, 40);
         let tombstone = PackedLocation::new(1, 8, 32, true).unwrap();
 
         // New production indexes start with every Region explicitly Free.
@@ -1805,11 +1893,16 @@ mod tests {
         assert!(index.apply_if_newer(1, value, 10, 1).applied);
         assert!(
             index
-                .apply_if_newer_with_metadata(2, tombstone, 11, 1, 7, 0)
+                .apply_if_newer_with_metadata(3, foreign_value, 11, 1, 7, 0)
                 .applied
         );
-        assert_eq!(index.entry_len(), 2);
-        assert_eq!(index.value_len(1), 1);
+        assert!(
+            index
+                .apply_if_newer_with_metadata(2, tombstone, 12, 1, 7, 0)
+                .applied
+        );
+        assert_eq!(index.entry_len(), 3);
+        assert_eq!(index.value_len(1), 2);
 
         let removed = index
             .invalidate_region_generation(1, RegionGeneration::Allocated { created_seqno: 20 })
@@ -1817,8 +1910,12 @@ mod tests {
         assert_eq!(
             removed,
             RegionIndexCounts {
-                entries: 2,
-                values: 1
+                entries: 3,
+                values: 2,
+                record_bytes: u64::from(value.record_len())
+                    + u64::from(foreign_value.record_len())
+                    + u64::from(tombstone.record_len()),
+                tracked_value_bytes: u64::from(value.record_len()),
             }
         );
         assert_eq!(index.entry_len(), 0);
@@ -1827,7 +1924,7 @@ mod tests {
         assert!(index.get(2, 1).is_none());
 
         let scrubbed = index
-            .remove_physical_if_entry(2, tombstone, 11)
+            .remove_physical_if_entry(2, tombstone, 12)
             .expect("stale physical tombstone must remain scrub-able");
         assert_eq!(scrubbed.location, tombstone);
         assert_eq!(index.entry_len(), 0);

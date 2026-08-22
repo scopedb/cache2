@@ -280,6 +280,12 @@ impl NamespaceController {
         self.find(namespace).is_some()
     }
 
+    /// Return the sole configured namespace when aggregate retirement can be
+    /// attributed without inspecting individual cache records.
+    pub(crate) fn single_namespace(&self) -> Option<NamespaceId> {
+        (self.namespaces.len() == 1).then(|| self.namespaces[0].namespace)
+    }
+
     /// Reserve the complete encoded size of a prospective live value.
     ///
     /// Reserving the full new size, rather than relying on replacement credit,
@@ -1345,6 +1351,28 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn aggregate_retirement_requires_exactly_one_effective_namespace() {
+        assert_eq!(
+            NamespaceController::try_new(&[])
+                .unwrap()
+                .single_namespace(),
+            Some(0)
+        );
+        assert_eq!(
+            NamespaceController::try_new(&[NamespaceConfig::new(0)])
+                .unwrap()
+                .single_namespace(),
+            Some(0)
+        );
+        assert_eq!(
+            NamespaceController::try_new(&[NamespaceConfig::new(7)])
+                .unwrap()
+                .single_namespace(),
+            None
+        );
+    }
 
     #[test]
     fn second_hit_admission_protects_updates_and_large_objects() {

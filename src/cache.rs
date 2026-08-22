@@ -593,15 +593,12 @@ impl CacheConfig {
                 .ok_or_else(|| CacheError::InvalidConfig("maximum record is too large".into()))?;
         let checkpoint_slot_bytes = required_slot_size(layout.region_count, self.index_slots)
             .map_err(checkpoint_codec_error)?;
-        let checkpoint_accounting_bytes = u64::try_from(checkpoint_accounting_workspace_bytes(
-            self,
-            layout.region_count as usize,
-        )?)
-        .map_err(|_| {
-            CacheError::InvalidConfig(
-                "checkpoint accounting workspace does not fit diagnostics".into(),
-            )
-        })?;
+        let checkpoint_accounting_bytes =
+            u64::try_from(checkpoint_accounting_workspace_bytes(self)?).map_err(|_| {
+                CacheError::InvalidConfig(
+                    "checkpoint accounting workspace does not fit diagnostics".into(),
+                )
+            })?;
         Ok(ConfigDiagnostics {
             path: self.path.clone(),
             requested_capacity_bytes: self.capacity,
@@ -933,13 +930,13 @@ pub(crate) struct Inner {
     policy: Arc<PolicyController>,
     delegated_policy: bool,
     delegated_namespaces: Option<Arc<NamespaceController>>,
+    generation_reclaim_namespace: Option<NamespaceId>,
     opened_clean: bool,
     retire_sink: Option<Arc<NamespaceRetireSink>>,
     owner_dirty: Option<Arc<OwnerDirtyFence>>,
     origin_fill_limiter: Option<Arc<OriginFillLimiter>>,
     telemetry: RequestTelemetry,
     index: Arc<ShardedIndex>,
-    region_valid_bytes: Vec<AtomicU64>,
     region_reinserted_bytes: Vec<AtomicU64>,
     region_reinsert_pending: Vec<AtomicU64>,
     operation_barrier: RwLock<()>,
@@ -1028,7 +1025,6 @@ struct OpenRuntime {
     policy: Arc<PolicyController>,
     delegated_policy: bool,
     origin_fill_limiter: Option<Arc<OriginFillLimiter>>,
-    region_valid_bytes: Vec<AtomicU64>,
     region_reinserted_bytes: Vec<AtomicU64>,
     region_reinsert_pending: Vec<AtomicU64>,
 }
@@ -1471,7 +1467,7 @@ impl DiskCache {
             owner_dirty,
         } = managed_policy;
         let OpenRuntime {
-            index,
+            mut index,
             mut regions,
             mut recovery_order,
             mut checkpoint_regions,
@@ -1482,10 +1478,22 @@ impl DiskCache {
             policy,
             delegated_policy,
             origin_fill_limiter,
-            region_valid_bytes,
             region_reinserted_bytes,
             region_reinsert_pending,
         } = runtime;
+        let generation_reclaim_namespace = if delegated_policy {
+            match (delegated_namespaces.as_ref(), retire_sink.as_ref()) {
+                (Some(namespaces), Some(_)) => namespaces.single_namespace(),
+                _ => None,
+            }
+        } else {
+            policy.namespaces().single_namespace()
+        };
+        Arc::get_mut(&mut index)
+            .ok_or(CacheError::CorruptMetadata(
+                "index ownership was shared before open",
+            ))?
+            .set_tracked_namespace(generation_reclaim_namespace);
         try_lock_exclusive(io.as_ref())?;
         let file_had_content = match io.len() {
             Ok(length) => length != 0,
@@ -1568,7 +1576,6 @@ impl DiskCache {
                                 &mut checkpoint_regions,
                                 policy.as_ref(),
                                 !delegated_policy,
-                                &region_valid_bytes,
                             )?;
                             let recovered = match checkpoint {
                                 Some(checkpoint) => recover_clean_checkpoint_state(
@@ -1639,7 +1646,6 @@ impl DiskCache {
                                 &mut checkpoint_regions,
                                 policy.as_ref(),
                                 !delegated_policy,
-                                &region_valid_bytes,
                             )? {
                                 Some(checkpoint) => {
                                     if config.recovery_mode == RecoveryMode::MissOnly {
@@ -1735,7 +1741,6 @@ impl DiskCache {
             &state,
             policy.as_ref(),
             !delegated_policy,
-            &region_valid_bytes,
             &region_reinserted_bytes,
             &region_reinsert_pending,
         ) {
@@ -1775,13 +1780,13 @@ impl DiskCache {
             policy,
             delegated_policy,
             delegated_namespaces,
+            generation_reclaim_namespace,
             opened_clean,
             retire_sink,
             owner_dirty,
             origin_fill_limiter,
             telemetry: RequestTelemetry::new(initial_status),
             index: Arc::clone(&state.index),
-            region_valid_bytes,
             region_reinserted_bytes,
             region_reinsert_pending,
             operation_barrier: RwLock::new(()),
@@ -3046,6 +3051,7 @@ impl DiskCache {
     }
 
     pub fn stats(&self) -> CacheStats {
+        let recovery_in_progress = self.inner.recovery_active.load(Ordering::Acquire);
         let state = match self.inner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -3061,11 +3067,14 @@ impl DiskCache {
                 continue;
             }
             let used = region.used.saturating_sub(REGION_HEADER_SIZE as u64);
-            let valid = self
-                .inner
-                .region_valid_bytes
-                .get(region.header.region_id as usize)
-                .map_or(0, |counter| counter.load(Ordering::Acquire));
+            let valid = if recovery_in_progress {
+                0
+            } else {
+                self.inner
+                    .index
+                    .region_record_bytes(region.header.region_id)
+                    .unwrap_or(0)
+            };
             stats.region_used_bytes = stats.region_used_bytes.saturating_add(used);
             stats.region_valid_bytes = stats.region_valid_bytes.saturating_add(valid);
             let ratio = ratio_bps(valid, used);
@@ -3148,7 +3157,7 @@ impl DiskCache {
         if recovery_total != 0 {
             stats.recovery_regions_total = recovery_total;
         }
-        stats.recovery_in_progress = self.inner.recovery_active.load(Ordering::Acquire);
+        stats.recovery_in_progress = recovery_in_progress;
         let admission = self.inner.policy.admission().snapshot();
         stats.admission_observations = admission.observations;
         stats.admission_rejections = admission.rejected;
@@ -3301,6 +3310,7 @@ impl DiskCache {
     }
 
     pub fn region_stats(&self) -> Result<Vec<RegionStats>> {
+        let recovery_in_progress = self.inner.recovery_active.load(Ordering::Acquire);
         let state = self
             .inner
             .state
@@ -3312,11 +3322,14 @@ impl DiskCache {
             .map_err(|_| CacheError::Overloaded(OverloadReason::ReadBufferUnavailable))?;
         for region in &state.regions {
             let used = region.used.saturating_sub(REGION_HEADER_SIZE as u64);
-            let valid = self
-                .inner
-                .region_valid_bytes
-                .get(region.header.region_id as usize)
-                .map_or(0, |counter| counter.load(Ordering::Acquire));
+            let valid = if recovery_in_progress {
+                0
+            } else {
+                self.inner
+                    .index
+                    .region_record_bytes(region.header.region_id)
+                    .unwrap_or(0)
+            };
             let second_chance_bytes = self
                 .inner
                 .region_reinserted_bytes
@@ -3512,17 +3525,9 @@ impl DiskCache {
         namespace: NamespaceId,
         flags: u32,
     ) -> ApplyResult {
-        let result = self
-            .inner
+        self.inner
             .index
-            .apply_if_newer_with_metadata(hash, location, seqno, min_seqno, namespace, flags);
-        if result.applied {
-            if let Some(previous) = result.previous {
-                self.subtract_region_valid(previous.location);
-            }
-            self.add_region_valid(location);
-        }
-        result
+            .apply_if_newer_with_metadata(hash, location, seqno, min_seqno, namespace, flags)
     }
 
     fn remove_index_entry_accounted(&self, hash: u64, expected: IndexEntry) -> Result<bool> {
@@ -3531,7 +3536,6 @@ impl DiskCache {
             .index
             .remove_if_entry(hash, expected.location, expected.seqno);
         if let Some(removed) = removed {
-            self.subtract_region_valid(removed.location);
             if !self.record_namespace_retirement(namespace_usage(removed)) {
                 let error = CacheError::CorruptMetadata(
                     "managed Region retirement exceeded namespace live usage",
@@ -3590,26 +3594,6 @@ impl DiskCache {
             ));
         }
         Ok(())
-    }
-
-    fn add_region_valid(&self, location: PackedLocation) {
-        if let Some(counter) = self
-            .inner
-            .region_valid_bytes
-            .get(location.region_id() as usize)
-        {
-            atomic_saturating_add(counter, u64::from(location.record_len()));
-        }
-    }
-
-    fn subtract_region_valid(&self, location: PackedLocation) {
-        if let Some(counter) = self
-            .inner
-            .region_valid_bytes
-            .get(location.region_id() as usize)
-        {
-            atomic_saturating_sub(counter, u64::from(location.record_len()));
-        }
     }
 
     /// Remove the index identities physically owned by one old Region
@@ -3726,7 +3710,6 @@ impl DiskCache {
         self.inner
             .index
             .evict_region_with(region.header.region_id, min_seqno, |entry| {
-                self.subtract_region_valid(entry.location);
                 accounting_ok &= self.record_namespace_retirement(namespace_usage(entry));
             });
         if !accounting_ok {
@@ -3751,32 +3734,91 @@ impl DiskCache {
             .ok_or(CacheError::CorruptMetadata(
                 "reused Region is out of index bounds",
             ))?;
-        if counts.entries != 0 || counts.values != 0 {
+        if counts.entries != 0
+            || counts.values != 0
+            || counts.record_bytes != 0
+            || counts.tracked_value_bytes != 0
+        {
             return Err(CacheError::CorruptMetadata(
                 "Region reclaim left visible index entries",
             ));
         }
         let victim_index = header.region_id as usize;
-        let valid_bytes =
-            self.inner
-                .region_valid_bytes
-                .get(victim_index)
-                .ok_or(CacheError::CorruptMetadata(
-                    "reused Region accounting is out of bounds",
-                ))?;
         let reinserted_bytes = self.inner.region_reinserted_bytes.get(victim_index).ok_or(
             CacheError::CorruptMetadata("reused Region reinsertion accounting is out of bounds"),
         )?;
         let reinsert_pending = self.inner.region_reinsert_pending.get(victim_index).ok_or(
             CacheError::CorruptMetadata("reused Region pending accounting is out of bounds"),
         )?;
-        if valid_bytes.swap(0, Ordering::AcqRel) != 0 {
-            return Err(CacheError::CorruptMetadata(
-                "Region reclaim left valid-byte accounting",
-            ));
-        }
         reinserted_bytes.store(0, Ordering::Release);
         reinsert_pending.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Retire a FIFO victim without reading its record body when policy has one
+    /// effective namespace. The index tracks that namespace's exact bytes;
+    /// entries left by a removed namespace are invalidated but never charged
+    /// against the current owner. Multiple effective namespaces retain the
+    /// streaming scrub path for exact attribution.
+    fn publish_single_namespace_region_generation(
+        &self,
+        header: RegionHeader,
+        namespace: NamespaceId,
+    ) -> Result<()> {
+        let counts = self
+            .inner
+            .index
+            .invalidate_region_generation(
+                header.region_id,
+                RegionGeneration::Allocated {
+                    created_seqno: header.created_seqno,
+                },
+            )
+            .ok_or(CacheError::CorruptMetadata(
+                "reused Region is out of index bounds",
+            ))?;
+        if counts.values > counts.entries
+            || (counts.entries == 0) != (counts.record_bytes == 0)
+            || counts.tracked_value_bytes > counts.record_bytes
+        {
+            return Err(CacheError::CorruptMetadata(
+                "Region index value-byte accounting is inconsistent",
+            ));
+        }
+
+        let victim_index = header.region_id as usize;
+        if counts.tracked_value_bytes != 0
+            && !self.record_namespace_retirement(Some(NamespaceUsage {
+                namespace,
+                live_bytes: counts.tracked_value_bytes,
+            }))
+        {
+            return Err(CacheError::CorruptMetadata(
+                "Region reclaim exceeded namespace live usage",
+            ));
+        }
+
+        self.inner
+            .region_reinserted_bytes
+            .get(victim_index)
+            .ok_or(CacheError::CorruptMetadata(
+                "reused Region reinsertion accounting is out of bounds",
+            ))?
+            .store(0, Ordering::Release);
+        if self
+            .inner
+            .region_reinsert_pending
+            .get(victim_index)
+            .ok_or(CacheError::CorruptMetadata(
+                "reused Region pending accounting is out of bounds",
+            ))?
+            .swap(0, Ordering::AcqRel)
+            != 0
+        {
+            return Err(CacheError::CorruptMetadata(
+                "FIFO Region reclaim overlapped pending reinsertion",
+            ));
+        }
         Ok(())
     }
 
@@ -5235,9 +5277,6 @@ impl DiskCache {
         if !self.inner.delegated_policy {
             self.inner.policy.namespaces().reset_live_bytes();
         }
-        for counter in &self.inner.region_valid_bytes {
-            counter.store(0, Ordering::Release);
-        }
         for counter in &self.inner.region_reinserted_bytes {
             counter.store(0, Ordering::Release);
         }
@@ -5656,12 +5695,16 @@ impl DiskCache {
         if self.inner.owner_dirty.is_none() {
             self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
         }
-        self.scrub_or_fallback_region_index(
-            &plan.superblock,
-            plan.victim,
-            plan.superblock.epoch_start_seqno,
-        )?;
-        self.publish_scrubbed_region_generation(plan.next_header)?;
+        if let Some(namespace) = self.inner.generation_reclaim_namespace {
+            self.publish_single_namespace_region_generation(plan.next_header, namespace)?;
+        } else {
+            self.scrub_or_fallback_region_index(
+                &plan.superblock,
+                plan.victim,
+                plan.superblock.epoch_start_seqno,
+            )?;
+            self.publish_scrubbed_region_generation(plan.next_header)?;
+        }
 
         // Acquire both Region views before State, following the read-view ->
         // State publication order. The operation barrier excludes clear,
@@ -6721,9 +6764,6 @@ fn background_recovery_worker(inner: Weak<Inner>, pending: PendingRecovery) {
             if !inner.delegated_policy {
                 inner.policy.namespaces().reset_live_bytes();
             }
-            for counter in &inner.region_valid_bytes {
-                counter.store(0, Ordering::Release);
-            }
             inner.recovery_active.store(false, Ordering::Release);
             return;
         }
@@ -6737,9 +6777,6 @@ fn background_recovery_worker(inner: Weak<Inner>, pending: PendingRecovery) {
         if !inner.delegated_policy {
             inner.policy.namespaces().reset_live_bytes();
         }
-        for counter in &inner.region_valid_bytes {
-            counter.store(0, Ordering::Release);
-        }
         inner.recovery_active.store(false, Ordering::Release);
         return;
     }
@@ -6747,7 +6784,6 @@ fn background_recovery_worker(inner: Weak<Inner>, pending: PendingRecovery) {
         &recovered,
         inner.policy.as_ref(),
         !inner.delegated_policy,
-        &inner.region_valid_bytes,
         &inner.region_reinserted_bytes,
         &inner.region_reinsert_pending,
     ) {
@@ -6780,9 +6816,6 @@ fn finish_failed_background_recovery(cache: &DiskCache, error: CacheError) {
     state.index.clear();
     if !cache.inner.delegated_policy {
         cache.inner.policy.namespaces().reset_live_bytes();
-    }
-    for counter in &cache.inner.region_valid_bytes {
-        counter.store(0, Ordering::Release);
     }
     state.stats.checkpoint_errors = state.stats.checkpoint_errors.saturating_add(1);
     state.status = if matches!(error, CacheError::Io(_)) {
@@ -6872,32 +6905,15 @@ struct LoadedCheckpoint {
     header: CheckpointSlotHeader,
 }
 
-/// Accounting assembled in the same streaming pass that restores a
-/// checkpoint. A checkpoint may be loaded into a differently sized compact
-/// index, so collisions and same-hash versions must be applied exactly like
-/// the index: subtract the visible entry replaced by an install, then add the
-/// supplied entry only when the install was applied.
+/// Namespace accounting assembled in the same streaming pass that restores a
+/// checkpoint. Per-Region record bytes live in the index generation counters;
+/// collision replacement must still update namespace usage like the index.
 struct CheckpointLoadAccounting {
-    region_valid_bytes: Vec<u64>,
     namespace_live_bytes: Vec<NamespaceUsage>,
 }
 
 impl CheckpointLoadAccounting {
-    fn try_new(
-        region_count: usize,
-        policy: &PolicyController,
-        account_namespaces: bool,
-    ) -> Result<Self> {
-        let mut region_valid_bytes = Vec::new();
-        region_valid_bytes
-            .try_reserve_exact(region_count)
-            .map_err(|_| {
-                CacheError::InvalidConfig(
-                    "checkpoint Region accounting workspace cannot be allocated".into(),
-                )
-            })?;
-        region_valid_bytes.resize(region_count, 0);
-
+    fn try_new(policy: &PolicyController, account_namespaces: bool) -> Result<Self> {
         let namespace_live_bytes = if account_namespaces {
             policy.namespaces().try_zero_usage().map_err(|_| {
                 CacheError::InvalidConfig(
@@ -6908,7 +6924,6 @@ impl CheckpointLoadAccounting {
             Vec::new()
         };
         Ok(Self {
-            region_valid_bytes,
             namespace_live_bytes,
         })
     }
@@ -6925,17 +6940,6 @@ impl CheckpointLoadAccounting {
 
     fn add(&mut self, entry: IndexEntry) -> Result<()> {
         let bytes = u64::from(entry.location.record_len());
-        let region = self
-            .region_valid_bytes
-            .get_mut(entry.location.region_id() as usize)
-            .ok_or(CacheError::CorruptMetadata(
-                "checkpoint accounting Region is out of bounds",
-            ))?;
-        *region = region
-            .checked_add(bytes)
-            .ok_or(CacheError::CorruptMetadata(
-                "checkpoint Region valid-byte accounting overflow",
-            ))?;
         if !entry.location.is_tombstone() {
             if let Ok(index) = self
                 .namespace_live_bytes
@@ -6956,17 +6960,6 @@ impl CheckpointLoadAccounting {
 
     fn subtract(&mut self, entry: IndexEntry) -> Result<()> {
         let bytes = u64::from(entry.location.record_len());
-        let region = self
-            .region_valid_bytes
-            .get_mut(entry.location.region_id() as usize)
-            .ok_or(CacheError::CorruptMetadata(
-                "checkpoint accounting Region is out of bounds",
-            ))?;
-        *region = region
-            .checked_sub(bytes)
-            .ok_or(CacheError::CorruptMetadata(
-                "checkpoint Region valid-byte accounting underflow",
-            ))?;
         if !entry.location.is_tombstone() {
             if let Ok(index) = self
                 .namespace_live_bytes
@@ -6985,20 +6978,7 @@ impl CheckpointLoadAccounting {
         Ok(())
     }
 
-    fn publish(
-        self,
-        policy: &PolicyController,
-        account_namespaces: bool,
-        region_valid_bytes: &[AtomicU64],
-    ) -> Result<()> {
-        if self.region_valid_bytes.len() != region_valid_bytes.len() {
-            return Err(CacheError::CorruptMetadata(
-                "checkpoint Region accounting length mismatch",
-            ));
-        }
-        for (counter, bytes) in region_valid_bytes.iter().zip(self.region_valid_bytes) {
-            counter.store(bytes, Ordering::Release);
-        }
+    fn publish(self, policy: &PolicyController, account_namespaces: bool) -> Result<()> {
         if account_namespaces {
             policy.namespaces().reset_live_bytes();
             for usage in self.namespace_live_bytes {
@@ -7170,7 +7150,6 @@ fn try_load_checkpoint(
     checkpoint_regions: &mut Vec<CheckpointRegionSnapshot>,
     policy: &PolicyController,
     account_namespaces: bool,
-    region_valid_bytes: &[AtomicU64],
 ) -> Result<Option<LoadedCheckpoint>> {
     let data_len = data_file_len(superblock)?;
     let Some(directory) = read_checkpoint_directory(io, data_len)? else {
@@ -7215,11 +7194,7 @@ fn try_load_checkpoint(
         }
         index.clear();
         checkpoint_regions.clear();
-        let mut accounting = CheckpointLoadAccounting::try_new(
-            superblock.region_count as usize,
-            policy,
-            account_namespaces,
-        )?;
+        let mut accounting = CheckpointLoadAccounting::try_new(policy, account_namespaces)?;
         match load_checkpoint_payload(
             io,
             directory,
@@ -7229,7 +7204,7 @@ fn try_load_checkpoint(
             &mut accounting,
         ) {
             Ok(()) => {
-                accounting.publish(policy, account_namespaces, region_valid_bytes)?;
+                accounting.publish(policy, account_namespaces)?;
                 return Ok(Some(LoadedCheckpoint { header }));
             }
             Err(CacheError::CorruptMetadata(_)) => {
@@ -7641,10 +7616,6 @@ fn allocate_open_runtime(
         "background recovery workspace cannot be allocated",
     )?;
     let read_regions = try_region_workspace(region_count, "read region view cannot be allocated")?;
-    let region_valid_bytes = try_atomic_u64_workspace(
-        region_count,
-        "region valid-byte counters cannot be allocated",
-    )?;
     let region_reinserted_bytes = try_atomic_u64_workspace(
         region_count,
         "region reinsertion counters cannot be allocated",
@@ -7665,7 +7636,6 @@ fn allocate_open_runtime(
         policy,
         delegated_policy,
         origin_fill_limiter,
-        region_valid_bytes,
         region_reinserted_bytes,
         region_reinsert_pending,
     })
@@ -7752,10 +7722,7 @@ fn build_region_queues(regions: &[RegionMeta]) -> Result<(VecDeque<u32>, VecDequ
     Ok((free, sealed))
 }
 
-fn checkpoint_accounting_workspace_bytes(
-    config: &CacheConfig,
-    region_count: usize,
-) -> Result<usize> {
+fn checkpoint_accounting_workspace_bytes(config: &CacheConfig) -> Result<usize> {
     let namespace_count = config
         .namespace_configs
         .len()
@@ -7766,13 +7733,8 @@ fn checkpoint_accounting_workspace_bytes(
                 .any(|namespace| namespace.namespace() == 0),
         ))
         .ok_or_else(|| CacheError::InvalidConfig("checkpoint namespace count overflow".into()))?;
-    region_count
-        .checked_mul(std::mem::size_of::<u64>())
-        .and_then(|bytes| {
-            namespace_count
-                .checked_mul(std::mem::size_of::<NamespaceUsage>())
-                .and_then(|namespace_bytes| bytes.checked_add(namespace_bytes))
-        })
+    namespace_count
+        .checked_mul(std::mem::size_of::<NamespaceUsage>())
         .ok_or_else(|| {
             CacheError::InvalidConfig("checkpoint accounting workspace size overflow".into())
         })
@@ -7808,7 +7770,7 @@ fn allocate_resources(config: &CacheConfig, layout: &Layout) -> Result<Arc<Resou
         .ok_or_else(|| {
             CacheError::InvalidConfig("checkpoint region memory size overflow".into())
         })?;
-    let checkpoint_accounting_bytes = checkpoint_accounting_workspace_bytes(config, region_count)?;
+    let checkpoint_accounting_bytes = checkpoint_accounting_workspace_bytes(config)?;
     let append_queue_bytes = config
         .write_queue_depth
         .checked_add(2)
@@ -7845,7 +7807,7 @@ fn allocate_resources(config: &CacheConfig, layout: &Layout) -> Result<Arc<Resou
         )
         .and_then(|bytes| {
             region_count
-                .checked_mul(3 * std::mem::size_of::<AtomicU64>())
+                .checked_mul(2 * std::mem::size_of::<AtomicU64>())
                 .and_then(|region_bytes| bytes.checked_add(region_bytes))
         })
         .and_then(|bytes| {
@@ -9622,15 +9584,11 @@ fn rebuild_runtime_accounting(
     state: &State,
     policy: &PolicyController,
     account_namespaces: bool,
-    region_valid_bytes: &[AtomicU64],
     region_reinserted_bytes: &[AtomicU64],
     region_reinsert_pending: &[AtomicU64],
 ) -> Result<()> {
     if account_namespaces {
         policy.namespaces().reset_live_bytes();
-    }
-    for counter in region_valid_bytes {
-        counter.store(0, Ordering::Release);
     }
     for counter in region_reinserted_bytes {
         counter.store(0, Ordering::Release);
@@ -9638,21 +9596,15 @@ fn rebuild_runtime_accounting(
     for counter in region_reinsert_pending {
         counter.store(0, Ordering::Release);
     }
+    if !account_namespaces {
+        return Ok(());
+    }
     state.index.try_for_each_snapshot_entry(
         state.superblock.epoch_start_seqno,
         |_physical_slot, entry| -> Result<()> {
             let location = PackedLocation::try_from_raw(entry.location_raw)
                 .map_err(|_| CacheError::CorruptMetadata("invalid live index location"))?;
-            let counter = region_valid_bytes
-                .get(location.region_id() as usize)
-                .ok_or(CacheError::CorruptMetadata(
-                    "live index region is out of bounds",
-                ))?;
-            atomic_saturating_add(counter, u64::from(location.record_len()));
-            if account_namespaces
-                && !location.is_tombstone()
-                && policy.namespaces().contains(entry.namespace_id)
-            {
+            if !location.is_tombstone() && policy.namespaces().contains(entry.namespace_id) {
                 policy
                     .namespaces()
                     .restore_live_bytes(entry.namespace_id, u64::from(location.record_len()))
@@ -9931,8 +9883,7 @@ mod scale_config_tests {
             + std::mem::size_of::<RwLock<RegionMeta>>()
             + 3 * std::mem::size_of::<u32>()
             + std::mem::size_of::<CheckpointRegionSnapshot>()
-            + std::mem::size_of::<u64>()
-            + 3 * std::mem::size_of::<AtomicU64>();
+            + 2 * std::mem::size_of::<AtomicU64>();
         assert_eq!(
             seventeen_regions.planned_memory_bytes - sixteen_regions.planned_memory_bytes,
             per_region_delta as u64
@@ -10164,6 +10115,86 @@ mod m1_tests {
             0
         );
         cache.close().unwrap();
+    }
+
+    #[test]
+    fn managed_fifo_generation_reclaim_requires_one_effective_namespace() {
+        let single_file = TestFile::new("managed-generation-reclaim");
+        let single_events = Arc::new(Mutex::new(Vec::<NamespaceUsage>::new()));
+        let sink_events = Arc::clone(&single_events);
+        let single_sink: Arc<NamespaceRetireSink> = Arc::new(move |usage| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(usage);
+            true
+        });
+        let single_namespaces = Arc::new(NamespaceController::try_new(&[]).unwrap());
+        let single = DiskCache::open_managed_with_retire_sink(
+            config(&single_file.0),
+            Arc::new(HostWriteTracker::try_new(None, None).unwrap()),
+            single_namespaces,
+            single_sink,
+        )
+        .unwrap();
+        assert_eq!(single.inner.generation_reclaim_namespace, Some(0));
+        let value = vec![b'x'; 1536];
+        for id in 0..24 {
+            single
+                .put(format!("single-{id:02}"), &value, PutOptions::default())
+                .unwrap();
+        }
+        assert!(single.stats().regions_reused > 0);
+        assert_eq!(single.stats().reclaim_records_scanned, 0);
+        let single_events = single_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!single_events.is_empty());
+        assert!(single_events.iter().all(|usage| usage.namespace == 0));
+        drop(single_events);
+        single.close().unwrap();
+
+        let mixed_file = TestFile::new("managed-scrub-reclaim");
+        let mixed_events = Arc::new(Mutex::new(Vec::<NamespaceUsage>::new()));
+        let sink_events = Arc::clone(&mixed_events);
+        let mixed_sink: Arc<NamespaceRetireSink> = Arc::new(move |usage| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(usage);
+            true
+        });
+        let mixed_namespaces = Arc::new(
+            NamespaceController::try_new(&[NamespaceConfig::new(11), NamespaceConfig::new(12)])
+                .unwrap(),
+        );
+        let mixed = DiskCache::open_managed_with_retire_sink(
+            config(&mixed_file.0),
+            Arc::new(HostWriteTracker::try_new(None, None).unwrap()),
+            mixed_namespaces,
+            mixed_sink,
+        )
+        .unwrap();
+        assert_eq!(mixed.inner.generation_reclaim_namespace, None);
+        for id in 0..24 {
+            mixed
+                .put_in(
+                    if id % 2 == 0 { 11 } else { 12 },
+                    format!("mixed-{id:02}").as_bytes(),
+                    &value,
+                    PutOptions::default(),
+                )
+                .unwrap();
+        }
+        assert!(mixed.stats().regions_reused > 0);
+        assert!(mixed.stats().reclaim_records_scanned > 0);
+        let mixed_events = mixed_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(mixed_events.iter().any(|usage| usage.namespace == 11));
+        assert!(mixed_events.iter().any(|usage| usage.namespace == 12));
+        drop(mixed_events);
+        mixed.close().unwrap();
     }
 
     #[test]

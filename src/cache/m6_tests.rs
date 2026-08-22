@@ -535,12 +535,19 @@ fn miss_only_recovers_behind_a_single_atomic_publication() {
     let initial_get = reopened.get(b"baseline");
     let initial_put = reopened.put("blocked", "value", PutOptions::default());
     let initial_stats = reopened.stats();
+    let initial_region_stats = reopened.region_stats().unwrap();
     gate.release();
 
     assert_eq!(initial_status, CacheStatus::MissOnly);
     assert_eq!(initial_get.unwrap(), None);
     assert!(matches!(initial_put, Err(CacheError::Poisoned)));
     assert!(initial_stats.recovery_in_progress);
+    assert_eq!(initial_stats.region_valid_bytes, 0);
+    assert!(
+        initial_region_stats
+            .iter()
+            .all(|region| region.valid_bytes == 0 && region.valid_ratio_bps == 0)
+    );
     assert!(wait_until(Duration::from_secs(3), || {
         reopened.status() == CacheStatus::Healthy
     }));
