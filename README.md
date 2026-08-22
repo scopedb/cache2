@@ -340,14 +340,14 @@ in memory and do not write journal records or issue metadata syncs. A dirty
 Hybrid reopen may safely clear both lower tiers. Standalone `DiskCache` retains
 its checkpoint-plus-incremental-tail recovery behavior described below.
 
-Clean checkpoint loading derives per-Region valid bytes and standalone
+Clean checkpoint loading rebuilds per-Region index counters and standalone
 namespace live bytes during the same streamed entry-decode pass. It accounts
 only entries actually applied after compact-index collision/replacement rules;
 tombstones remain Region-valid physical data but are not namespace live data.
 Clean and initial `MissOnly` loads therefore do not perform a second full-index
-snapshot scan. The bounded Region and namespace accounting workspace is
-reported as `ConfigDiagnostics::checkpoint_accounting_bytes` (and
-`region_checkpoint_accounting_bytes` by Hybrid diagnostics).
+snapshot scan. Only the bounded namespace accounting workspace remains external
+to the index; it is reported as `ConfigDiagnostics::checkpoint_accounting_bytes`
+(and `region_checkpoint_accounting_bytes` by Hybrid diagnostics).
 
 The checkpoint extension starts immediately after the original Format V1 data
 extent: one 4 KiB directory and two independently checksummed slots. Each slot

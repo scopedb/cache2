@@ -1042,11 +1042,11 @@ struct State {
     stats: CacheStats,
     status: CacheStatus,
     lock_held: bool,
-    /// The checkpoint loader has already rebuilt Region and namespace live
-    /// byte accounting while restoring the final visible index entries.
-    /// Dirty/full-scan recovery must leave this false because it mutates the
-    /// index after the checkpoint payload has been consumed.
-    runtime_accounting_restored: bool,
+    /// The checkpoint loader has already rebuilt standalone namespace usage
+    /// while restoring the final visible index entries. Per-Region bytes are
+    /// owned by the index itself. Dirty/full-scan recovery must leave this
+    /// false because it mutates the index after consuming the checkpoint.
+    namespace_accounting_restored: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1735,7 +1735,7 @@ impl DiskCache {
                 return Err(error);
             }
         };
-        if state.runtime_accounting_restored {
+        if state.namespace_accounting_restored {
             reset_reinsertion_accounting(&region_reinserted_bytes, &region_reinsert_pending);
         } else if let Err(error) = rebuild_runtime_accounting(
             &state,
@@ -8105,7 +8105,7 @@ fn format_state(
         stats: CacheStats::default(),
         status: CacheStatus::Healthy,
         lock_held: true,
-        runtime_accounting_restored: false,
+        namespace_accounting_restored: false,
     })
 }
 
@@ -8189,7 +8189,7 @@ fn recover_clean_checkpoint_state(
         },
         status: CacheStatus::Healthy,
         lock_held: true,
-        runtime_accounting_restored: true,
+        namespace_accounting_restored: true,
     })
 }
 
@@ -8242,7 +8242,7 @@ fn prepare_miss_only_recovery_state(
         },
         status: CacheStatus::MissOnly,
         lock_held: true,
-        runtime_accounting_restored: true,
+        namespace_accounting_restored: true,
     })
 }
 
@@ -8642,7 +8642,7 @@ fn recover_dirty_checkpoint_state(
         },
         status: CacheStatus::Healthy,
         lock_held: true,
-        runtime_accounting_restored: false,
+        namespace_accounting_restored: false,
     })
 }
 
@@ -9347,7 +9347,7 @@ fn recover_state(
         },
         status: CacheStatus::Healthy,
         lock_held: true,
-        runtime_accounting_restored: false,
+        namespace_accounting_restored: false,
     })
 }
 
