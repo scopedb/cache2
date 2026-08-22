@@ -1882,7 +1882,8 @@ pub(crate) fn ready_future<T: Send + 'static>(value: T) -> CacheFuture<T> {
         Arc::new(|_| panic!("a ready future cannot fail dispatch")),
         Weak::new(),
     ));
-    debug_assert!(core.start(TaskKind::CancelableRead));
+    let started = core.start(TaskKind::CancelableRead);
+    debug_assert!(started);
     core.finish(value);
     CacheFuture { core }
 }
@@ -2155,6 +2156,13 @@ mod tests {
         assert_eq!(async_read_worker_count(16, 8), 8);
         assert_eq!(async_read_worker_count(64, 128), 64);
         assert_eq!(async_read_worker_count(256, 256), 128);
+    }
+
+    #[test]
+    fn ready_future_completes_without_an_executor() {
+        let request = ready_future(7);
+        assert_eq!(request.cancel(), CancelOutcome::Completed);
+        assert_eq!(request.wait(), 7);
     }
 
     #[test]
