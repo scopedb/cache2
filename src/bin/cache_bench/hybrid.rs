@@ -197,12 +197,13 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
             let now = Instant::now();
             if now >= deadline {
                 return Err(format!(
-                    "steady-state fill timed out after {:.3}s: physical turnover {:.3}x/{:.3}x, Region reuse={}/{}",
+                    "steady-state fill timed out after {:.3}s: physical turnover {:.3}x/{:.3}x, Region reuse={}/{} {}",
                     options.steady_state_fill_max.as_secs_f64(),
                     capacity_turnovers_for(&options, progress.host_write_bytes),
                     options.steady_state_fill_turnovers,
                     progress.region_reuses,
                     required_region_reuses,
+                    overload_diagnostics(&cache),
                 ));
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -255,11 +256,12 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     let premeasure_stats = StatsDelta::between(premeasure_before, before);
     if !steady_state_gate_ready(&options, &premeasure_stats, required_region_reuses) {
         return Err(format!(
-            "steady-state fill boundary did not satisfy its gate: physical turnover {:.3}x/{:.3}x, Region reuse={}/{}",
+            "steady-state fill boundary did not satisfy its gate: physical turnover {:.3}x/{:.3}x, Region reuse={}/{} {}",
             capacity_turnovers_for(&options, premeasure_stats.host_write_bytes),
             options.steady_state_fill_turnovers,
             premeasure_stats.region_reuses,
             required_region_reuses,
+            overload_diagnostics(&cache),
         ));
     }
     let premeasure_elapsed = premeasure_started.elapsed();
@@ -328,7 +330,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
 fn overload_diagnostics(cache: &BenchCache) -> String {
     let stats = cache.cache().stats();
     format!(
-        "request_rejections={} memory={}/{} write_back_failures={} lower_candidates={} skipped={} queue={}/{}/{} write_back_memory={}/{}/{} Bucket_buffer_rejections={} Region_rejected={}",
+        "request_rejections={} memory={}/{} write_back_failures={} lower_candidates={} skipped={} queue={}/{}/{} write_back_memory={}/{}/{} Bucket_buffer_rejections={} Region_rejected={} waits_ns(req/WB/Bbuf/Rbp)={}/{}/{}/{} io_submitted(B/R)={}/{} io_completion_ns(B/R)={}/{}",
         stats.request_rejections,
         stats.memory_charged_bytes,
         stats.memory_capacity_bytes,
@@ -343,6 +345,14 @@ fn overload_diagnostics(cache: &BenchCache) -> String {
         stats.write_back.memory_capacity_bytes,
         stats.bucket.page_buffer_rejections,
         stats.region.rejected,
+        stats.request_wait_ns,
+        stats.write_back.queue_wait_ns,
+        stats.bucket.page_buffer_wait_ns,
+        stats.region.backpressure_wait_ns,
+        stats.bucket.io_submitted,
+        stats.region.io_submitted,
+        stats.bucket.io_completion_ns,
+        stats.region.io_completion_ns,
     )
 }
 
@@ -2442,16 +2452,25 @@ struct StatsDelta {
     misses: u64,
     promotions: u64,
     request_rejections: u64,
+    request_wait_ns: u64,
     bucket_bytes_read: u64,
     bucket_bytes_written: u64,
     bucket_io_submitted: u64,
+    bucket_io_completed: u64,
     bucket_io_errors: u64,
+    bucket_io_submit_wait_ns: u64,
+    bucket_io_completion_ns: u64,
+    bucket_page_buffer_wait_ns: u64,
     region_bytes_read: u64,
     region_bytes_written: u64,
     region_write_batches: u64,
     region_records_coalesced: u64,
     region_io_submitted: u64,
+    region_io_completed: u64,
     region_io_errors: u64,
+    region_backpressure_wait_ns: u64,
+    region_io_submit_wait_ns: u64,
+    region_io_completion_ns: u64,
     region_reuses: u64,
     host_write_bytes: u64,
     admitted_value_bytes: u64,
@@ -2494,6 +2513,9 @@ struct StatsDelta {
     write_back_queue_rejections: u64,
     write_back_worker_panics: u64,
     write_back_queue_peak: u64,
+    write_back_queue_submitted: u64,
+    write_back_queue_completed: u64,
+    write_back_queue_wait_ns: u64,
 }
 
 impl StatsDelta {
@@ -2509,6 +2531,7 @@ impl StatsDelta {
             request_rejections: after
                 .request_rejections
                 .saturating_sub(before.request_rejections),
+            request_wait_ns: after.request_wait_ns.saturating_sub(before.request_wait_ns),
             bucket_bytes_read: after
                 .bucket
                 .bytes_read
@@ -2521,10 +2544,26 @@ impl StatsDelta {
                 .bucket
                 .io_submitted
                 .saturating_sub(before.bucket.io_submitted),
+            bucket_io_completed: after
+                .bucket
+                .io_completed
+                .saturating_sub(before.bucket.io_completed),
             bucket_io_errors: after
                 .bucket
                 .io_errors
                 .saturating_sub(before.bucket.io_errors),
+            bucket_io_submit_wait_ns: after
+                .bucket
+                .io_submit_wait_ns
+                .saturating_sub(before.bucket.io_submit_wait_ns),
+            bucket_io_completion_ns: after
+                .bucket
+                .io_completion_ns
+                .saturating_sub(before.bucket.io_completion_ns),
+            bucket_page_buffer_wait_ns: after
+                .bucket
+                .page_buffer_wait_ns
+                .saturating_sub(before.bucket.page_buffer_wait_ns),
             region_bytes_read: after
                 .region
                 .bytes_read
@@ -2545,10 +2584,26 @@ impl StatsDelta {
                 .region
                 .io_submitted
                 .saturating_sub(before.region.io_submitted),
+            region_io_completed: after
+                .region
+                .io_completed
+                .saturating_sub(before.region.io_completed),
             region_io_errors: after
                 .region
                 .io_errors
                 .saturating_sub(before.region.io_errors),
+            region_backpressure_wait_ns: after
+                .region
+                .backpressure_wait_ns
+                .saturating_sub(before.region.backpressure_wait_ns),
+            region_io_submit_wait_ns: after
+                .region
+                .io_submit_wait_ns
+                .saturating_sub(before.region.io_submit_wait_ns),
+            region_io_completion_ns: after
+                .region
+                .io_completion_ns
+                .saturating_sub(before.region.io_completion_ns),
             region_reuses: after
                 .region
                 .regions_reused
@@ -2689,6 +2744,18 @@ impl StatsDelta {
                 .worker_panics
                 .saturating_sub(before.write_back.worker_panics),
             write_back_queue_peak: after.write_back.queue_in_flight_peak,
+            write_back_queue_submitted: after
+                .write_back
+                .queue_submitted
+                .saturating_sub(before.write_back.queue_submitted),
+            write_back_queue_completed: after
+                .write_back
+                .queue_completed
+                .saturating_sub(before.write_back.queue_completed),
+            write_back_queue_wait_ns: after
+                .write_back
+                .queue_wait_ns
+                .saturating_sub(before.write_back.queue_wait_ns),
         }
     }
 }
@@ -3244,14 +3311,57 @@ impl Report<'_> {
         number_field!("hybrid_misses", self.stats.misses);
         number_field!("promotions", self.stats.promotions);
         number_field!("request_rejections", self.stats.request_rejections);
+        number_field!("request_wait_ns", self.stats.request_wait_ns);
         number_field!("bucket_bytes_read", self.stats.bucket_bytes_read);
         number_field!("bucket_bytes_written", self.stats.bucket_bytes_written);
+        number_field!("bucket_io_submitted", self.stats.bucket_io_submitted);
+        number_field!("bucket_io_completed", self.stats.bucket_io_completed);
+        number_field!(
+            "bucket_io_submit_wait_ns",
+            self.stats.bucket_io_submit_wait_ns
+        );
+        number_field!(
+            "bucket_io_completion_ns",
+            self.stats.bucket_io_completion_ns
+        );
+        number_field!(
+            "bucket_io_completion_avg_us",
+            average_us(
+                self.stats.bucket_io_completion_ns,
+                self.stats.bucket_io_completed
+            )
+        );
+        number_field!(
+            "bucket_page_buffer_wait_ns",
+            self.stats.bucket_page_buffer_wait_ns
+        );
         number_field!("region_bytes_read", self.stats.region_bytes_read);
         number_field!("region_bytes_written", self.stats.region_bytes_written);
         number_field!("region_write_batches", self.stats.region_write_batches);
         number_field!(
             "region_records_coalesced",
             self.stats.region_records_coalesced
+        );
+        number_field!("region_io_submitted", self.stats.region_io_submitted);
+        number_field!("region_io_completed", self.stats.region_io_completed);
+        number_field!(
+            "region_backpressure_wait_ns",
+            self.stats.region_backpressure_wait_ns
+        );
+        number_field!(
+            "region_io_submit_wait_ns",
+            self.stats.region_io_submit_wait_ns
+        );
+        number_field!(
+            "region_io_completion_ns",
+            self.stats.region_io_completion_ns
+        );
+        number_field!(
+            "region_io_completion_avg_us",
+            average_us(
+                self.stats.region_io_completion_ns,
+                self.stats.region_io_completed
+            )
         );
         number_field!("region_reuses", self.stats.region_reuses);
         number_field!("host_write_bytes", self.stats.host_write_bytes);
@@ -3365,15 +3475,86 @@ impl Report<'_> {
             self.stats.write_back_queue_peak
         );
         number_field!(
+            "write_back_queue_submitted",
+            self.stats.write_back_queue_submitted
+        );
+        number_field!(
+            "write_back_queue_completed",
+            self.stats.write_back_queue_completed
+        );
+        number_field!(
+            "write_back_queue_wait_ns",
+            self.stats.write_back_queue_wait_ns
+        );
+        number_field!(
             "total_bucket_io_submitted",
             self.total_stats.bucket_io_submitted
+        );
+        number_field!(
+            "total_bucket_io_completed",
+            self.total_stats.bucket_io_completed
         );
         number_field!(
             "total_region_io_submitted",
             self.total_stats.region_io_submitted
         );
+        number_field!(
+            "total_region_io_completed",
+            self.total_stats.region_io_completed
+        );
         number_field!("total_bucket_io_errors", self.total_stats.bucket_io_errors);
         number_field!("total_region_io_errors", self.total_stats.region_io_errors);
+        number_field!("total_request_wait_ns", self.total_stats.request_wait_ns);
+        number_field!(
+            "total_bucket_io_submit_wait_ns",
+            self.total_stats.bucket_io_submit_wait_ns
+        );
+        number_field!(
+            "total_bucket_io_completion_ns",
+            self.total_stats.bucket_io_completion_ns
+        );
+        number_field!(
+            "total_bucket_io_completion_avg_us",
+            average_us(
+                self.total_stats.bucket_io_completion_ns,
+                self.total_stats.bucket_io_completed
+            )
+        );
+        number_field!(
+            "total_bucket_page_buffer_wait_ns",
+            self.total_stats.bucket_page_buffer_wait_ns
+        );
+        number_field!(
+            "total_region_backpressure_wait_ns",
+            self.total_stats.region_backpressure_wait_ns
+        );
+        number_field!(
+            "total_region_io_submit_wait_ns",
+            self.total_stats.region_io_submit_wait_ns
+        );
+        number_field!(
+            "total_region_io_completion_ns",
+            self.total_stats.region_io_completion_ns
+        );
+        number_field!(
+            "total_region_io_completion_avg_us",
+            average_us(
+                self.total_stats.region_io_completion_ns,
+                self.total_stats.region_io_completed
+            )
+        );
+        number_field!(
+            "total_write_back_queue_submitted",
+            self.total_stats.write_back_queue_submitted
+        );
+        number_field!(
+            "total_write_back_queue_completed",
+            self.total_stats.write_back_queue_completed
+        );
+        number_field!(
+            "total_write_back_queue_wait_ns",
+            self.total_stats.write_back_queue_wait_ns
+        );
         number_field!("total_region_reuses", self.total_stats.region_reuses);
         number_field!("total_bucket_io_qd_peak", self.total_stats.bucket_io_peak);
         number_field!("total_region_io_qd_peak", self.total_stats.region_io_peak);
@@ -3703,11 +3884,39 @@ impl Report<'_> {
             self.stats.write_amplification_milli as f64 / 1000.0
         );
         println!(
-            "  total Bucket/Region I/O: {}/{} submitted; QD peak {}/{}",
+            "  total I/O sub/complete:  Bucket {}/{}; Region {}/{}; QD peak {}/{}",
             self.total_stats.bucket_io_submitted,
+            self.total_stats.bucket_io_completed,
             self.total_stats.region_io_submitted,
+            self.total_stats.region_io_completed,
             self.total_stats.bucket_io_peak,
             self.total_stats.region_io_peak
+        );
+        println!(
+            "  wait measure req/WB/Bbuf/Rbp: {:.3}/{:.3}/{:.3}/{:.3} ms",
+            self.stats.request_wait_ns as f64 / 1_000_000.0,
+            self.stats.write_back_queue_wait_ns as f64 / 1_000_000.0,
+            self.stats.bucket_page_buffer_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_backpressure_wait_ns as f64 / 1_000_000.0,
+        );
+        println!(
+            "  I/O measure submit/complete: Bucket {:.1}/{:.1} us; Region {:.1}/{:.1} us",
+            average_us(
+                self.stats.bucket_io_submit_wait_ns,
+                self.stats.bucket_io_submitted,
+            ),
+            average_us(
+                self.stats.bucket_io_completion_ns,
+                self.stats.bucket_io_completed,
+            ),
+            average_us(
+                self.stats.region_io_submit_wait_ns,
+                self.stats.region_io_submitted,
+            ),
+            average_us(
+                self.stats.region_io_completion_ns,
+                self.stats.region_io_completed,
+            ),
         );
         println!(
             "  write-back put/fallback/demotion/reject: {}/{}/{}/{}",
@@ -3965,6 +4174,14 @@ fn rate(value: u64, elapsed: Duration) -> f64 {
     }
 }
 
+fn average_us(total_ns: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_ns as f64 / count as f64 / 1000.0
+    }
+}
+
 fn percent_of(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -4185,6 +4402,50 @@ mod tests {
 
         assert_eq!(phase.stored, 2);
         assert_eq!(phase.write_bytes, (256 + 4 * 1024) as u64);
+    }
+
+    #[test]
+    fn stats_delta_preserves_every_wait_path_as_a_counter() {
+        let mut before = HybridCacheStats::default();
+        before.request_wait_ns = 10;
+        before.write_back.queue_submitted = 10;
+        before.write_back.queue_completed = 10;
+        before.write_back.queue_wait_ns = 10;
+        before.bucket.io_completed = 10;
+        before.bucket.io_submit_wait_ns = 10;
+        before.bucket.io_completion_ns = 10;
+        before.bucket.page_buffer_wait_ns = 10;
+        before.region.backpressure_wait_ns = 10;
+        before.region.io_completed = 10;
+        before.region.io_submit_wait_ns = 10;
+        before.region.io_completion_ns = 10;
+        let mut after = before;
+        after.request_wait_ns = 17;
+        after.write_back.queue_submitted = 17;
+        after.write_back.queue_completed = 17;
+        after.write_back.queue_wait_ns = 17;
+        after.bucket.io_completed = 17;
+        after.bucket.io_submit_wait_ns = 17;
+        after.bucket.io_completion_ns = 17;
+        after.bucket.page_buffer_wait_ns = 17;
+        after.region.backpressure_wait_ns = 17;
+        after.region.io_completed = 17;
+        after.region.io_submit_wait_ns = 17;
+        after.region.io_completion_ns = 17;
+
+        let delta = StatsDelta::between(before, after);
+        assert_eq!(delta.request_wait_ns, 7);
+        assert_eq!(delta.write_back_queue_submitted, 7);
+        assert_eq!(delta.write_back_queue_completed, 7);
+        assert_eq!(delta.write_back_queue_wait_ns, 7);
+        assert_eq!(delta.bucket_io_completed, 7);
+        assert_eq!(delta.bucket_io_submit_wait_ns, 7);
+        assert_eq!(delta.bucket_io_completion_ns, 7);
+        assert_eq!(delta.bucket_page_buffer_wait_ns, 7);
+        assert_eq!(delta.region_backpressure_wait_ns, 7);
+        assert_eq!(delta.region_io_completed, 7);
+        assert_eq!(delta.region_io_submit_wait_ns, 7);
+        assert_eq!(delta.region_io_completion_ns, 7);
     }
 
     #[test]
@@ -4447,6 +4708,10 @@ mod tests {
         assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
         assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
         assert!(json.contains("\"latency_samples\":0"));
+        assert!(json.contains("\"request_wait_ns\":0"));
+        assert!(json.contains("\"bucket_io_completion_avg_us\":0"));
+        assert!(json.contains("\"region_io_completion_avg_us\":0"));
+        assert!(json.contains("\"total_write_back_queue_wait_ns\":0"));
         assert!(json.contains("\"hardware_qualification\":false"));
         assert!(json.contains("\"target_nvme_matrix_passed\":false"));
         assert!(json.contains("\"journal_rollover_max_ms\":1"));
