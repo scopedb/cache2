@@ -2441,6 +2441,7 @@ struct StatsDelta {
     write_back_proactive_rejected: u64,
     write_back_proactive_fatal: u64,
     write_back_proactive_invalidated: u64,
+    write_back_volatile_loss_pending: bool,
     write_back_pending_entries: u64,
     write_back_pending_entries_peak: u64,
     write_back_pending_bytes: u64,
@@ -2620,6 +2621,7 @@ impl StatsDelta {
                 .write_back
                 .proactive_invalidated
                 .saturating_sub(before.write_back.proactive_invalidated),
+            write_back_volatile_loss_pending: after.write_back.volatile_loss_pending,
             write_back_pending_entries: after.write_back.pending_entries,
             write_back_pending_entries_peak: after.write_back.pending_entries_peak,
             write_back_pending_bytes: after.write_back.pending_bytes,
@@ -3256,6 +3258,10 @@ impl Report<'_> {
             "write_back_proactive_invalidated",
             self.stats.write_back_proactive_invalidated
         );
+        raw_field!(
+            "write_back_volatile_loss_pending",
+            self.stats.write_back_volatile_loss_pending
+        );
         number_field!(
             "write_back_pending_entries",
             self.stats.write_back_pending_entries
@@ -3649,12 +3655,17 @@ impl Report<'_> {
             self.stats.write_back_queue_rejections
         );
         println!(
-            "  proactive scheduled/skipped/persisted/rejected/fatal: {}/{}/{}/{}/{}",
+            "  proactive scheduled/skipped/persisted/rejected/fatal/invalidate: {}/{}/{}/{}/{}/{}",
             self.stats.write_back_proactive_scheduled,
             self.stats.write_back_proactive_skipped,
             self.stats.write_back_proactive_persisted,
             self.stats.write_back_proactive_rejected,
-            self.stats.write_back_proactive_fatal
+            self.stats.write_back_proactive_fatal,
+            self.stats.write_back_proactive_invalidated
+        );
+        println!(
+            "  volatile loss pending: {}",
+            self.stats.write_back_volatile_loss_pending
         );
         println!(
             "  eviction absent/candidate/sync/drop: {}/{}/{}/{}",
