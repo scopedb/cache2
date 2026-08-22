@@ -27,8 +27,8 @@ use crate::format::{
 };
 use crate::index::{
     ApplyResult, INDEX_FLAG_SECOND_CHANCE_PENDING, INDEX_FLAG_SECOND_CHANCE_USED,
-    INDEX_RUNTIME_ONLY_FLAGS, IndexEntry, IndexSnapshotEntry, MAX_INDEX_SLOTS, MAX_RECORD_LEN,
-    MAX_REGION_OFFSET, PackedLocation, RegionGeneration, ShardedIndex,
+    INDEX_FLAG_VOLATILE, INDEX_RUNTIME_ONLY_FLAGS, IndexEntry, IndexSnapshotEntry, MAX_INDEX_SLOTS,
+    MAX_RECORD_LEN, MAX_REGION_OFFSET, PackedLocation, RegionGeneration, ShardedIndex,
 };
 use crate::io_backend::{
     DIRECT_IO_ALIGNMENT, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
@@ -2511,7 +2511,7 @@ impl DiskCache {
                     .inner
                     .index
                     .get(hash, current_superblock.epoch_start_seqno)
-                    != Some(entry)
+                    .is_none_or(|current| !current.same_record_identity(entry))
             {
                 self.inner.read_stats.record_miss();
                 return Ok(None);
@@ -6432,6 +6432,11 @@ impl DiskCache {
                 .try_for_each_snapshot_entry(min_seqno, |physical_slot, entry| {
                     let location = PackedLocation::try_from_raw(entry.location_raw)
                         .map_err(|_| CacheError::CorruptMetadata("invalid live index location"))?;
+                    if entry.flags & INDEX_FLAG_VOLATILE != 0 {
+                        return Err(CacheError::CorruptMetadata(
+                            "clean checkpoint contains a volatile index entry",
+                        ));
+                    }
                     let owner = state.regions.get(location.region_id() as usize).ok_or(
                         CacheError::CorruptMetadata("checkpoint index region is out of bounds"),
                     )?;

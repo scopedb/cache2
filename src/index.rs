@@ -177,6 +177,17 @@ pub(crate) struct IndexEntry {
     pub(crate) flags: u32,
 }
 
+impl IndexEntry {
+    /// Runtime flags can change while one immutable record version remains at
+    /// the same physical identity. They must not make a completed read or I/O
+    /// completion look like a different version.
+    pub(crate) const fn same_record_identity(self, other: Self) -> bool {
+        self.location.raw() == other.location.raw()
+            && self.seqno == other.seqno
+            && self.namespace_id == other.namespace_id
+    }
+}
+
 /// Stable fields emitted to, and restored from, an index checkpoint.
 ///
 /// The raw packed location is kept here so checkpoint codecs need not depend
@@ -600,6 +611,36 @@ impl CompactIndex {
             }
         }
         false
+    }
+
+    fn clear_flags_if_entry_visible(
+        &mut self,
+        hash: u64,
+        expected: IndexEntry,
+        required: u32,
+        clear: u32,
+        mut is_visible: impl FnMut(IndexEntry) -> bool,
+    ) -> Option<IndexEntry> {
+        let start = self.start_slot(hash);
+        for step in 0..self.probe_limit() {
+            let index = self.probe_slot(start, step);
+            let slot = self.slots[index];
+            if slot.is_empty() {
+                return None;
+            }
+            if slot.is_live() && slot.hash == hash {
+                let current = slot.entry();
+                if !is_visible(current)
+                    || !current.same_record_identity(expected)
+                    || current.flags & required != required
+                {
+                    return None;
+                }
+                self.slots[index].flags &= !clear;
+                return Some(self.slots[index].entry());
+            }
+        }
+        None
     }
 
     /// Removes an entry only if all identity and version fields still match.
@@ -1051,7 +1092,38 @@ impl ShardedIndex {
         seqno: u64,
         namespace_id: u32,
     ) -> bool {
-        self.update_second_chance_if(hash, location, seqno, namespace_id, false)
+        self.clear_flags_if_entry(
+            hash,
+            IndexEntry {
+                location,
+                seqno,
+                namespace_id,
+                flags: 0,
+            },
+            INDEX_FLAG_SECOND_CHANCE_PENDING,
+            INDEX_FLAG_SECOND_CHANCE_PENDING,
+        )
+        .is_some()
+    }
+
+    /// Clear process-local state only when the complete immutable record
+    /// identity and all required flags still match. This does not change any
+    /// index, Region, or namespace accounting.
+    pub(crate) fn clear_flags_if_entry(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        required: u32,
+        clear: u32,
+    ) -> Option<IndexEntry> {
+        let visibility = read_unpoisoned(&self.visibility);
+        write_unpoisoned(&self.shards[self.shard_for(hash)]).clear_flags_if_entry_visible(
+            hash,
+            expected,
+            required,
+            clear,
+            |entry| visibility.is_visible(entry, 0),
+        )
     }
 
     fn update_second_chance_if(
@@ -1670,6 +1742,88 @@ mod tests {
             restored.remove_if_entry(7, replacement, 6),
             Some(default_metadata)
         );
+    }
+
+    #[test]
+    fn volatile_flag_clear_is_exact_and_accounting_neutral() {
+        let index = ShardedIndex::new(32);
+        let first = location(3, 0);
+        let replacement = location(4, 32);
+        let flags = INDEX_FLAG_SECOND_CHANCE_USED | INDEX_FLAG_VOLATILE;
+        assert!(
+            index
+                .apply_if_newer_with_metadata(7, first, 5, 1, 42, flags)
+                .applied
+        );
+        let expected = index.get(7, 1).unwrap();
+        assert_eq!(index.entry_len(), 1);
+        assert_eq!(index.value_len(1), 1);
+        assert_eq!(index.region_record_bytes(3), Some(32));
+
+        assert!(
+            index
+                .clear_flags_if_entry(8, expected, INDEX_FLAG_VOLATILE, INDEX_FLAG_VOLATILE)
+                .is_none()
+        );
+        assert!(
+            index
+                .clear_flags_if_entry(
+                    7,
+                    IndexEntry {
+                        location: replacement,
+                        ..expected
+                    },
+                    INDEX_FLAG_VOLATILE,
+                    INDEX_FLAG_VOLATILE,
+                )
+                .is_none()
+        );
+        assert!(
+            index
+                .clear_flags_if_entry(
+                    7,
+                    IndexEntry {
+                        seqno: 6,
+                        ..expected
+                    },
+                    INDEX_FLAG_VOLATILE,
+                    INDEX_FLAG_VOLATILE,
+                )
+                .is_none()
+        );
+        assert!(
+            index
+                .clear_flags_if_entry(
+                    7,
+                    IndexEntry {
+                        namespace_id: 41,
+                        ..expected
+                    },
+                    INDEX_FLAG_VOLATILE,
+                    INDEX_FLAG_VOLATILE,
+                )
+                .is_none()
+        );
+
+        let durable = index
+            .clear_flags_if_entry(7, expected, INDEX_FLAG_VOLATILE, INDEX_FLAG_VOLATILE)
+            .unwrap();
+        assert_eq!(durable.flags, INDEX_FLAG_SECOND_CHANCE_USED);
+        assert_eq!(index.entry_len(), 1);
+        assert_eq!(index.value_len(1), 1);
+        assert_eq!(index.region_record_bytes(3), Some(32));
+
+        assert!(
+            index
+                .apply_if_newer_with_metadata(7, replacement, 6, 1, 42, flags)
+                .applied
+        );
+        assert!(
+            index
+                .clear_flags_if_entry(7, expected, INDEX_FLAG_VOLATILE, INDEX_FLAG_VOLATILE)
+                .is_none()
+        );
+        assert_ne!(index.get(7, 1).unwrap().flags & INDEX_FLAG_VOLATILE, 0);
     }
 
     #[test]

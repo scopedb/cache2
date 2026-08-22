@@ -16,7 +16,9 @@ use crate::checksum::{Crc32c, crc32c};
 use crate::format::{
     FORMAT_VERSION, RECORD_ALIGNMENT, REGION_HEADER_SIZE, RegionState, SUPERBLOCK_AREA_SIZE,
 };
-use crate::index::{MAX_INDEX_SHARDS, MAX_INDEX_SLOTS, MAX_REGION_ID, PackedLocation};
+use crate::index::{
+    INDEX_FLAG_VOLATILE, MAX_INDEX_SHARDS, MAX_INDEX_SLOTS, MAX_REGION_ID, PackedLocation,
+};
 
 pub(crate) const CHECKPOINT_PAGE_SIZE: usize = 4 * 1024;
 pub(crate) const CHECKPOINT_SLOT_COUNT: usize = 2;
@@ -1087,7 +1089,7 @@ pub(crate) fn decode_checkpoint_index_entry(input: &[u8]) -> CodecResult<Checkpo
     }
     let location = PackedLocation::try_from_raw(get_u64(input, INDEX_LOCATION_OFFSET)?)
         .map_err(|_| CheckpointCodecError::InvalidField("entry_location"))?;
-    Ok(CheckpointIndexEntry {
+    let entry = CheckpointIndexEntry {
         key_hash: get_u64(input, INDEX_KEY_HASH_OFFSET)?,
         location,
         seqno: get_u64(input, INDEX_SEQNO_OFFSET)?,
@@ -1106,7 +1108,11 @@ pub(crate) fn decode_checkpoint_index_entry(input: &[u8]) -> CodecResult<Checkpo
         } else {
             None
         },
-    })
+    };
+    if entry.flags & INDEX_FLAG_VOLATILE != 0 {
+        return Err(CheckpointCodecError::InvalidField("entry_flags"));
+    }
+    Ok(entry)
 }
 
 fn validate_region(
@@ -1364,6 +1370,20 @@ mod tests {
                 physical_slot: Some(2),
             },
         ]
+    }
+
+    #[test]
+    fn persisted_index_entry_rejects_volatile_runtime_state() {
+        let directory = directory();
+        let regions = regions();
+        let mut encoded =
+            encode_checkpoint_index_entry(entries()[0], regions[0], directory, 10, 13).unwrap();
+        let flags = get_u32(&encoded, INDEX_FLAGS_OFFSET).unwrap() | INDEX_FLAG_VOLATILE;
+        put_u32(&mut encoded, INDEX_FLAGS_OFFSET, flags);
+        assert_eq!(
+            decode_checkpoint_index_entry(&encoded),
+            Err(CheckpointCodecError::InvalidField("entry_flags"))
+        );
     }
 
     fn encode_fixture() -> (
