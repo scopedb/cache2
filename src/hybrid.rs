@@ -3966,6 +3966,16 @@ impl DiskPair {
             degraded = true;
             None
         };
+        // A failed tier may have lost a newer volatile mutation. Returning a
+        // candidate from the surviving tier could therefore resurrect an old
+        // value. Cache contents are disposable, so fail the complete lower
+        // lookup closed until both tiers are healthy again.
+        if degraded
+            || self.region.status() != CacheStatus::Healthy
+            || self.bucket.status() != CacheStatus::Healthy
+        {
+            return Ok(DiskLookup::Miss(HybridMissKind::Recovering));
+        }
         let selected = match (region, bucket) {
             (Some(region), Some(bucket)) => match region.0.version.cmp(&bucket.0.version) {
                 CmpOrdering::Equal => {
@@ -3986,7 +3996,6 @@ impl DiskPair {
         };
         Ok(match selected {
             Some((entry, tier)) => DiskLookup::Hit { entry, tier },
-            None if degraded => DiskLookup::Miss(HybridMissKind::Recovering),
             None => DiskLookup::Miss(HybridMissKind::NotResident),
         })
     }
@@ -7714,7 +7723,7 @@ mod tests {
     }
 
     #[test]
-    fn one_degraded_disk_tier_preserves_memory_and_other_tier_reads() {
+    fn one_degraded_disk_tier_preserves_memory_but_fails_lower_reads_closed() {
         let files = TestFiles::new("tier-local-degradation");
         let cache = config(&files, 300).with_memory_shards(1).open().unwrap();
         let large = vec![8_u8; 2048];
@@ -7729,7 +7738,11 @@ mod tests {
         assert_eq!(health.bucket, CacheStatus::MissOnly);
         assert_eq!(health.region, CacheStatus::Healthy);
         assert!(!health.mutations_available);
-        assert_eq!(cache.get(b"large").unwrap(), Some(large));
+        assert_eq!(
+            cache.lookup(b"large").unwrap(),
+            HybridLookupOutcome::Miss(HybridMissKind::Recovering)
+        );
+        assert_eq!(cache.get(b"large").unwrap(), None);
         assert_eq!(cache.get(b"small").unwrap(), Some(b"memory".to_vec()));
         assert_eq!(
             cache.lookup(b"unknown").unwrap(),
