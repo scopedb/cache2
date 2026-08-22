@@ -607,6 +607,7 @@ fn lane_affine_remove_admission_does_not_block_an_idle_lane() {
     );
 
     let held_lane_zero = cache.inner.resources.begin_remove(0).unwrap();
+    let queued_lane_zero = cache.inner.resources.begin_remove(0).unwrap();
     assert!(matches!(
         cache.remove(&lane_zero_key),
         Err(CacheError::Overloaded(OverloadReason::WriteQueueFull))
@@ -616,7 +617,7 @@ fn lane_affine_remove_admission_does_not_block_an_idle_lane() {
         RemoveOutcome::Removed,
         "an occupied lane must not consume another lane's control permit"
     );
-    drop(held_lane_zero);
+    drop((held_lane_zero, queued_lane_zero));
     assert_eq!(
         cache.remove(&lane_zero_key).unwrap(),
         RemoveOutcome::Removed
