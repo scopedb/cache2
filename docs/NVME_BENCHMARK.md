@@ -272,11 +272,9 @@ target/release/cache-bench hybrid \
   --min-ops-per-sec <agreed-throughput> \
   --max-p99-us <agreed-p99> \
   --min-hit-percent <agreed-hit-percent> \
-  --min-journal-rollovers 1 \
   --min-capacity-turnovers 2 \
   --min-disk-qd-peak 8 \
   --min-write-back-qd-peak 8 \
-  --max-journal-rollover-ms <agreed-rollover-ms> \
   --max-close-ms <agreed-close-ms> \
   --yes --output json
 ```
@@ -313,16 +311,18 @@ expiry does not release physical quota early or corrupt the Bloom fast-miss.
 Retain tier hit counts, combined host-write bytes, Bucket/Region physical I/O,
 request rejections, queue-depth peaks and capacities,
 `lower_candidate_evictions`, `proactive_persisted`, `proactive_invalidated`,
-`dropped_evictions`, `demotion_failures`, journal rollover count/max latency,
-capacity turnovers, final drain time, process/device/SMART profiles, and an
+`dropped_evictions`, `demotion_failures`, `volatile_loss_pending`, journal
+rollover count/max latency, capacity turnovers, final boundary time,
+process/device/SMART profiles, and an
 offline `cachectl hybrid-verify` report. The gate fails on a stale per-key
 version, a missing Bucket or Region I/O submission, an insufficient QD peak,
 or (in write-back mode) no completed demotion. Under sustained update pressure,
 `proactive_invalidated` records dirty values deliberately degraded to miss after
-their old L2 candidates were durably deleted; it is not a demotion failure.
-Hard-cap demotion failures or rejected puts still fail a no-rejection run. The
-configured rollover,
-rollover-latency, and close-latency thresholds are also enforced;
+their Region/Bucket candidates were hidden in memory without a queue slot or
+device I/O; it is not a demotion failure. `volatile_loss_pending` predicts a
+safe-empty pre-measure flush or close boundary. Hard-cap demotion failures or
+rejected puts still fail a no-rejection run. The configured close-latency
+threshold is also enforced;
 `--steady-state-fill-turnovers` runs the same workload before measurement until
 host writes since the pre-measure baseline reach the requested combined disk
 capacity multiple and the Region reuse count reaches the configured Region
@@ -343,12 +343,13 @@ run evidence.
 
 For recovery qualification, run `SIGKILL/reopen` at several admitted-write
 distances since the last explicit `HybridCache::flush()`, including the maximum
-declared cadence. Record first-service/full-recovery latency and RSS peak with
-`journal_recovery_memory_bytes` and
-`region_checkpoint_accounting_bytes`. A journal rollover is not a full Region
-compact-index checkpoint; the benchmark's final `close` is. The matrix must
-therefore exercise both rollover-only dirty tails and explicit-flush clean
-starts instead of treating rollover count as recovery coverage.
+declared cadence. A normal dirty Hybrid session must reopen safe-empty; record
+cold-open latency, first-service latency, RSS peak, and the resulting origin
+miss storm. Separately verify warm reopen after explicit `flush` and `close`,
+using `journal_recovery_memory_bytes` and
+`region_checkpoint_accounting_bytes` as hard memory bounds. Legacy non-empty
+journal recovery belongs in a compatibility fixture/failpoint matrix, not the
+steady-state performance gate.
 Add crash points at the first managed-manifest dirty slot, the pre-lower open
 fence, each lower open/recovery boundary, and after an autonomous owner-dirty
 mutation. Dirty plus an empty journal must reopen as a safe-cleared two-tier

@@ -14,9 +14,9 @@ Record workload-specific limits before deployment:
 - memory budget, queue depths, and expected object-size distribution;
 - expected maximum live entries, index slots (target load at most 80%), and
   full-checkpoint pause/write budget;
-- Hybrid `flush()` cadence and maximum permitted dirty-tail recovery time;
-  managed Region periodic checkpoints are disabled and journal rollover is not
-  a full Region index checkpoint;
+- Hybrid `flush()` cadence, maximum clean-boundary age, and tolerated
+  cold-start/miss-storm exposure; managed Region periodic checkpoints are
+  disabled and journal rollover is not a full Region index checkpoint;
 - maximum daily host writes derived from the SSD DWPD allowance;
 - recovery-time objective for the configured capacity;
 - maximum reclaim backlog, I/O error, and checkpoint error counts.
@@ -52,14 +52,17 @@ Archive `journal_recovery_memory_bytes`,
 `region_checkpoint_accounting_bytes`, and `checkpoint_slot_bytes` from this
 report. They are enforced parts of the open-time memory/storage plan, not
 optional estimates. For Hybrid, schedule application-level `flush()` from the
-measured recovery RTO and the O(index-slots) pause/write budget. A flush drains
-dirty L1, fences both lower tiers, and publishes matching global namespace
-usage; the nested Region's checkpoint interval does not provide that boundary.
+measured recovery RTO and the O(index-slots) pause/write budget. Normally a
+flush drains dirty L1, fences both lower tiers, and publishes matching global
+namespace usage. If `write_back_volatile_loss_pending` is set, it instead clears
+L1 and both lower tiers, resets namespace usage, and publishes a clean-empty
+boundary. The nested Region's checkpoint interval does not provide either
+global boundary.
 The managed manifest starts dirty/unbound and every open fences it dirty before
 touching either lower tier. TTL/corruption cleanup and SecondChance reinsertion
 can also dirty the owner without a foreground write. If the process exits after
-such a fence but before the first durable intent/global clean boundary, the
-next open deliberately safe-clears both lower tiers. Treat that outcome as a
+such a fence but before a matching global clean boundary, the next open
+deliberately safe-clears both lower tiers. Treat that outcome as a
 cold-cache/miss-storm event, not as recovered source data, and keep the explicit
 Hybrid flush cadence even during read-heavy periods.
 
@@ -92,12 +95,15 @@ not open a live Hybrid cache merely to scrape metrics.
 For write-back pressure, compare current and peak queue slots and bytes against
 their capacities independently. `proactive_persisted` preserves a dirty value.
 `proactive_invalidated` together with `dropped_evictions` means the engine
-intentionally converted an update to a miss after durably deleting its stale L2
-candidate; this is cache loss, not stale data or corruption. Correlate it with
-`lower_candidate_evictions`, hit rate, and origin QPS. `demotion_failures`, put
-rejections, and lower-candidate `proactive_skipped` mean the compact fallback
-could not be established/admitted, or a lifecycle/setup boundary intervened.
-`proactive_skipped` alone can also be an expected lower-absent drop.
+intentionally converted an update to a miss after synchronously hiding its
+Region/Bucket candidates in memory; it consumes no queue slot or device I/O.
+This is cache loss, not stale data or corruption. While
+`volatile_loss_pending=1`, the next flush/close clears the complete cache before
+publishing a clean empty boundary. Correlate it with hit rate and origin QPS.
+Bucket namespace usage remains conservatively charged until that boundary, so
+tight quotas may reject early. `demotion_failures` or put rejections still mean
+the overload path could not safely complete. `proactive_skipped` alone can be an
+expected lower-absent drop.
 
 Interpret write governance by both views: `daily_host_write_bytes` is actual
 submitted I/O, while `daily_budget_used_bytes` and

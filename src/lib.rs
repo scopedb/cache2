@@ -40,10 +40,11 @@
 //! tier. Its default is bounded, memory-first [`HybridWriteMode::WriteBack`];
 //! [`HybridWriteMode::WriteThrough`] remains available explicitly. Open persists
 //! one dirty-session fence, after which steady-state mutations allocate versions
-//! in memory without a per-key journal write or durability sync. `flush` drains
-//! dirty L1 values, publishes clean lower/global checkpoints, and re-arms the
-//! session fence; `close` publishes the final clean boundary. An unclean session
-//! may cold-start the disposable lower tiers.
+//! in memory without a per-key journal write or durability sync. Normally,
+//! `flush` drains dirty L1 values and `close` publishes the final clean boundary.
+//! After volatile pressure loss, either operation instead clears the complete
+//! cache before publishing clean. An unclean session may also cold-start the
+//! disposable lower tiers.
 //!
 //! L1 values use shared immutable storage and [`HybridCache::get_handle`] avoids
 //! payload copies on L1 hits; compatibility `get`/`lookup` APIs copy only after
@@ -52,12 +53,11 @@
 //! same-key mutation wait without holding the coarse ordering lock. Disposable
 //! lower-absent work uses at most 75% of the executor and may be dropped to a
 //! miss. A lower-candidate update persists while its projected occupancy stays
-//! at or below 75%; under pressure it instead schedules a smaller durable
-//! deletion, drops the dirty value to a miss, and keeps the pending fence until
-//! the old L2 value is gone. If that bounded deletion cannot be allocated,
-//! registered, or admitted, the victim remains resident and the incoming cache
-//! put is rejected. No path performs foreground device I/O. Both disk tiers
-//! provide bounded
+//! at or below 75%; under pressure it instead synchronously hides the Region
+//! candidate and complete Bucket page in memory, then drops the dirty value to
+//! a miss without consuming a queue slot or issuing device I/O. The session
+//! dirty fence makes crashes safe-empty; the next flush/close publishes a clean
+//! empty boundary. Both disk tiers provide bounded
 //! sync/`io_uring` runtimes and aligned optional `O_DIRECT` without changing
 //! their respective Format V1 encodings.
 

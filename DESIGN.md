@@ -44,8 +44,10 @@ raw block device 和 SPDK 留到 v1.x。
 Hybrid 在此之上组合三个组件：固定容量、按 hash 分片的 `MemoryEngine`；无逐 entry
 DRAM index、整 bucket RMW 的小对象 `BucketCache`；以及统一生命周期、同 key ordering、
 TTL promotion 和按完整 key+value 大小路由的 `HybridCache`。默认采用 memory-first
-write-back：`put` 以进程内 version 发布 dirty L1；flush/close drain resident dirty value，
-eviction 低压时持久化新值、压力下可 durable delete 旧 lower 并把新值 drop 为 miss。显式
+write-back：`put` 以进程内 version 发布 dirty L1；eviction 低压时持久化新值，压力下在
+L1 victim 退出前同步隐藏 Region candidate 与整个 Bucket page，并把新值 drop 为 miss，不入队、
+不发设备 I/O。发生这种 volatile loss 后，flush/close 清空 L1/L2 并发布 clean empty；否则 drain
+resident dirty value。显式
 `WriteThrough` 保留 L2-first 行为。open 只持久化一次
 session dirty fence，稳态 mutation 不写 route journal、也不做 durability sync。`flush`
 写 clean lower/global checkpoint 后在恢复流量前重新挂 dirty fence，`close` 发布最终 clean
@@ -57,9 +59,9 @@ L1 value 使用 `Arc` 共享不可变 allocation；`get_handle` 的 L1 hit 只�
 directory 后即可 detached background eviction；pending 期间读取必须 mask 旧 lower value，
 同 key mutation 等待时不持有 coarse ordering lock。lower-absent 任务最多使用 executor 的 75%，
 压力下可 drop 为 miss；lower-candidate 任务在完整 value 加入后 projected slot/byte 占用不超过
-75% 时持久化，否则改为高优先级持久删除旧 L2 candidate，并把最新 dirty value drop 为 miss。
-delete 完成前 exact-key fence 持续 mask 旧值；小型 delete 无法分配、注册或 admission 时保留
-victim、拒绝 incoming put。
+75% 时持久化；否则 eviction callback 同步删除内存 Region index candidate、隐藏完整 Bucket
+page，再把最新 dirty value drop 为 miss。此路径没有 pending owner、write-back slot 或设备 I/O，
+并置位 `volatile_loss_pending`，直到 flush/close 发布 safe-empty boundary。
 任何 eviction 压力路径都不执行前台同步设备 I/O。
 
 ## 1. 结论
@@ -546,9 +548,10 @@ capacity 使用 durable receipt 返回的实际 packed record length（包含真
 standalone batch 的每日预算使用最终 `plan.write_len`。Hybrid 前台先保守预留 aligned
 record 和最多 4095 B direct tail，write-back dirty L1 保存这笔 exact pending charge，
 demotion 后在 pending 仍覆盖期间用 receipt 原子结算新旧物理 identity，最后才退款。
-压力 invalidation 只为 duplicated key 与固定 task owner 预留内存；durable delete 在 pending
-fence 覆盖期间先退休旧 lower usage、再退休 dirty pending physical charge，最后解除 fence，
-因此不会产生旧值可见或 namespace 配额低估窗口。
+压力 invalidation 在 L1 shard/Hybrid ordering 保护下同步完成：Region index retirement 精确，
+Bucket 以固定 bitmap 隐藏整个 page，不分配 per-key owner。Bucket page 内旧 entry 的 namespace
+usage 在 flush/close 全局 clear 前保持保守计费，可能造成紧 quota 提前拒绝，但不会低估或越界；
+dirty pending charge 正常退休。`volatile_loss_pending` 让 clean boundary 清空 L1/L2 并 reset usage。
 managed foreground 不在 Region 重复 reservation；SecondChance 自主 reinsertion 则必须在
 写前取得共享 namespace/daily budget，并计入 `Reinsertion` host-write class。
 `daily_host_write_bytes` 表示实际 submission；`daily_budget_used_bytes` 和
@@ -624,9 +627,10 @@ managed manifest 的首个有效 slot 是 dirty/unbound。open 在 lower open/re
 route journal，也不做逐 mutation metadata sync。任何打开/扫描/发布失败都以
 `close_without_checkpoint` 排空并解锁 lower。
 
-`HybridCache::flush()` 先 drain dirty L1，冻结 lower mutation，写完整 Region/Bucket
-boundary，最后发布匹配的全局 clean usage；在返回并继续服务前重新持久化 session dirty
-fence。`close()` 停止 admission、完成相同 drain/checkpoint，并把最终 global slot 保持 clean。
+`HybridCache::flush()` 通常先 drain dirty L1，冻结 lower mutation，写完整 Region/Bucket
+boundary，最后发布匹配的全局 clean usage；若 `volatile_loss_pending`，则清空 L1/L2、reset usage
+并发布 clean empty。返回继续服务前重新持久化 session dirty fence。`close()` 停止 admission、
+完成相同 drain-or-safe-empty/checkpoint，并把最终 global slot 保持 clean。
 `clear()` 清除 L1 与两个 lower，但不发布 global clean checkpoint。若崩溃落在 lower clean
 与 global clean 之间，或发生在任一 dirty session 中，恢复允许安全清空，绝不信任旧 usage。
 因此 Hybrid 只需按 warm clean restart 需求、O(index slots) pause 和 metadata 写量安排显式
@@ -725,20 +729,21 @@ logical budget，调用方必须约束长期持有的 handle 数量。
 Hybrid open/flush-resume 持久化一次 dirty-session fence；稳态 mutation 使用
 `Version { epoch, seqno }` 的进程内序列，不 append route journal、不做 durability sync。
 未 clean 的 session 重开时允许 safe-clear 两个 lower，因此只会得到 clean checkpoint 的值
-或 miss，不会因丢失 dirty L1 而暴露旧 route。`flush`/`close` 才 drain L1 并发布匹配的
-Region、Bucket 与 global clean checkpoint。
+或 miss，不会因丢失 dirty L1 而暴露旧 route。`flush`/`close` 通常 drain L1 并发布匹配的
+Region、Bucket 与 global clean checkpoint；存在 volatile loss 时则发布 clean empty。
 
 dirty victim 先在有界 exact-key pending directory 注册，再由 background task 持有共享
 payload 并脱离 L1。pending fence 贯穿 lower persistence；读取命中 fence 时直接 miss，
 foreground 同 key mutation 先等待 fence 完成，等待期间不持有 coarse ordering stripe。
 lower-absent 任务受 75% slot/byte 子预算限制，queue/memory pressure 下可丢弃为 miss；
 lower-candidate admission 检查加入完整 owned value 后的 projected slot/byte 占用：任一超过
-75% 时，退化成占用更少内存的 high-priority durable delete；否则完整 value 也进入 priority
-queue。旧 candidate 删除前 fence 不解除，成功后先退休 exact pending physical
-charge，并递增 `proactive_invalidated` 与 `dropped_evictions`，最新 dirty value 成为 miss。
-完整 persist 被 lower policy 拒绝时也走同一 delete。delete 无法分配、注册或进入 shared hard
-bounds 时才保留 dirty victim、拒绝 incoming put；fatal delete I/O 仍会 poison 并保留失败 fence。
-任何压力路径都不回退到前台同步 demotion。
+75% 时，直接在 eviction callback 内做 synchronous volatile invalidation；否则完整 value 进入
+priority queue。volatile 路径在 victim 离开 L1 前删除 Region index candidate、隐藏 Bucket page，
+所以不需要 pending fence、executor slot 或 device I/O，并递增 `proactive_invalidated` 与
+`dropped_evictions`。后台完整 persist 被 lower policy 拒绝时，已有 exact-key fence 保持到同一
+volatile invalidation 完成。crash 依靠 session dirty fence safe-clear；flush/close 看到
+`volatile_loss_pending` 后清空整个 cache、reset usage 并发布 clean empty。任何压力路径都不回退
+到前台同步 demotion。
 
 旧文件或测试注入可能仍包含 journal intent。只有结构有效且非空的 dirty journal 才执行
 touched-route reconciliation；当前正常 steady-state 的 dirty+empty journal，以及 Clear、

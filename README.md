@@ -25,10 +25,12 @@ HybridCache
 ```
 
 The default is the performance-first **write-back** mode: a `put` publishes a
-dirty L1 value after allocating a process-local version. `flush`/`close` drain
-resident dirty values; eviction normally persists one in the selected SSD
-engine, but may deliberately lose it to a miss under bounded executor pressure
-after durably deleting any older L2 candidate. Steady-state mutations do not
+dirty L1 value after allocating a process-local version. Eviction normally
+persists one in the selected SSD engine. Under bounded executor pressure it may
+instead hide the old lower candidates in memory and deliberately lose the dirty
+value to a miss, without queueing SSD work. The next `flush`/`close` then clears
+the complete cache and publishes a clean empty boundary; otherwise those calls
+drain resident dirty values. Steady-state mutations do not
 append a route-journal record or issue a durability sync. Queue slots, workers,
 and owned task bytes are hard-bounded. Oversize/nonresident L1 paths retain
 explicit backpressure or write-through fallback semantics independently of
@@ -56,8 +58,10 @@ or RegionLog, and absolute TTL is preserved during promotion/demotion.
 Small and large disk data use distinct dedicated files plus a third global
 manifest file. Open persists one session-level dirty fence before traffic; a
 successful `flush` publishes both lower checkpoints and the matching clean
-manifest, then re-arms that dirty fence before returning. `close` drains dirty
-L1 values and publishes the final clean lower/global checkpoint. Consequently,
+manifest, then re-arms that dirty fence before returning. Normally `close`
+drains dirty L1 values and publishes the final clean lower/global checkpoint;
+with volatile pressure loss, `flush`/`close` instead clear L1 and both lower
+tiers before publishing. Consequently,
 an unclean session may cold-start the disposable lower tiers instead of replaying
 each mutation, and an older disk value is never exposed as the result of a lost
 dirty L1 value. The bounded route-journal decoder remains for compatible recovery
@@ -70,12 +74,13 @@ lower value and same-key mutations wait without holding the coarse ordering
 lock. Lower-absent writes use at most 75% of the executor and may be dropped to
 a miss under pressure. Lower-candidate writes have priority: when admitting the
 full value keeps projected slot/byte occupancy at or below 75% they persist it;
-at higher pressure they schedule only a smaller durable deletion of the stale
-L2 value and drop the
-dirty value to a miss. The exact-key fence remains until deletion completes. If
-even that work cannot be allocated, registered, or admitted, the dirty victim
-remains resident and the incoming cache put is rejected rather than performing
-foreground device I/O.
+at higher pressure the eviction callback synchronously removes the Region index
+candidate and hides the complete fixed Bucket page in memory before releasing
+the L1 victim. It consumes no write-back slot, allocates no pending owner, and
+issues no device I/O. `volatile_loss_pending` remains true until flush/close
+publishes a safe-empty boundary. Bucket page usage stays conservatively charged
+until that boundary, so a tight namespace quota may reject early but is never
+undercounted.
 
 Compatible non-empty journal recovery is two-pass and hard-bounded. A first
 streaming pass uses at most 64 KiB scratch to validate structure, CRC, generation, versions,
@@ -294,11 +299,12 @@ fn main() -> cache_rs::Result<()> {
 The data format supports fewer than 2^21 Regions (just under 64 TiB with the
 default 32 MiB Region). For standalone `DiskCache`, the 256 MiB default
 periodic-checkpoint floor scales up automatically for a large index. A managed
-Region does not publish independently: `HybridCache::flush()` drains dirty L1,
-durably marks the global manifest dirty, freezes lower mutations, publishes
-both lower boundaries, and only then publishes matching namespace usage as
-globally clean; before normal service resumes, `flush()` re-arms the single
-dirty-session fence. `close()` provides the final clean boundary. Managed
+Region does not publish independently: `HybridCache::flush()` normally drains
+dirty L1, freezes lower mutations, publishes both lower boundaries, and only
+then publishes matching namespace usage as globally clean. With
+`volatile_loss_pending`, it first clears the complete cache and publishes empty
+usage. Before normal service resumes, `flush()` re-arms the single dirty-session
+fence. `close()` provides the final clean boundary. Managed
 Hybrid disables periodic Region checkpoints, so operators choose an explicit
 flush cadence only when warm clean restart is worth the full Region checkpoint
 cost. An unclean session is allowed to restart empty. Full Region checkpoints
@@ -623,8 +629,9 @@ request bounds, admission, combined host writes, I/O, component health, dirty
 L1 state, and bounded write-back queue/memory state with fixed label cardinality.
 `proactive_persisted` is value-preserving demotion;
 `proactive_invalidated` plus `dropped_evictions` is intentional cache loss after
-durable stale-L2 deletion; `demotion_failures` identifies demotion work that
-could not safely complete.
+volatile lower hiding. `volatile_loss_pending` means the next flush/close will
+publish an empty cache. `demotion_failures` identifies demotion work that could
+not safely complete.
 
 ## NVMe staging acceptance
 
@@ -680,7 +687,7 @@ The qualification matrix covers both
 hits, global write amplification, version-stale failures, bounded prefill,
 Bucket/Region submitted I/O and QD peaks, write-back persist/invalidate/drop and
 hard-cap failures, capacity turnover, request rejects, latency, and final
-clean-checkpoint drain time. Steady-state
+close/checkpoint boundary time. Steady-state
 mutations are expected to leave journal rollover counters unchanged. The run
 requires three empty paths plus `--yes`. JSON always records
 `hardware_qualification=false`, `target_nvme_matrix_passed=false`, and the
@@ -690,8 +697,9 @@ evidence for that run, not a substitute for the target-NVMe release matrix.
 `--steady-state-fill-turnovers 2` applies the same mixed temporal workload
 before latency/throughput accounting starts. It advances until pre-measure host
 writes reach two combined lower-tier capacities and the Region reuse count
-reaches the configured Region count (a complete reuse cycle), then drains
-the phase boundary and snapshots fresh measurement counters.
+reaches the configured Region count (a complete reuse cycle), then executes the
+pre-measure clean boundary (dirty drain or safe-empty clear) and snapshots fresh
+measurement counters.
 `--steady-state-fill-max-secs` bounds this preparation; failure to reach either
 condition exits non-zero instead of publishing a fresh-cache
 result. `--min-capacity-turnovers` remains a separate requirement on the

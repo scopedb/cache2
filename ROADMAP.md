@@ -441,8 +441,9 @@ production-ready。完成上述外部项并保留报告后，才对具体 deploy
   `journal_capacity + 4 × floor(capacity / 96)` 为诊断和 aggregate budget 中的硬上界。
 - [x] namespace capacity/write quota、admission、device write budget 上移 Hybrid Driver，不能由
   size route 绕过。
-- [x] managed Region 不能独立发布 clean checkpoint；显式 `flush` drain dirty L1、发布匹配
-  lower/global clean 后重新挂 dirty fence，`close` 发布最终 clean boundary，`clear` 保持 dirty。
+- [x] managed Region 不能独立发布 clean checkpoint；显式 `flush` 通常 drain dirty L1，存在
+  volatile loss 时改为 safe-clear 全 cache，再发布匹配 lower/global clean 并重新挂 dirty fence；
+  `close` 发布最终 clean boundary，`clear` 保持 dirty。
 - [x] 组合级 `SIGKILL/reopen` matrix 覆盖双向 Bucket↔Region 顺序、remove、TTL、write-back
   dirty eviction、open/session fence、lower/global clean 与 dirty+empty journal safe-clear；
   恢复只允许 clean boundary 的值或 miss。
@@ -452,16 +453,17 @@ production-ready。完成上述外部项并保留报告后，才对具体 deploy
 - [x] 默认 DRAM write-back、可选 write-through；dirty victim 通过有界 exact-key pending
   directory detached，pending 期间 mask 旧 lower value，同 key mutation 等待时不持有 coarse
   ordering lock。lower-absent 任务限用 75% executor、压力下可 drop 为 miss；lower-candidate
-  任务在完整 value 加入后 projected slot/byte 不超过 75% 时写 value，否则改为 high-priority
-  durable delete 并把最新值 drop 为 miss；delete 无法建立或 admission 时保留 victim、拒绝
-  incoming put。不做前台同步 I/O。
-- [x] dirty expiry fence、flush/close drain、clear discard、取消/超时和单一 `AsyncHybridCache` executor；
+  任务在完整 value 加入后 projected slot/byte 不超过 75% 时写 value，否则同步 volatile hide
+  Region candidate 与 Bucket page、把最新值 drop 为 miss，不占 queue/设备 I/O；下一 flush/close
+  发布 safe-empty boundary。
+- [x] dirty expiry fence、flush/close drain-or-safe-empty、clear discard、取消/超时和单一
+  `AsyncHybridCache` executor；
   read-side cleanup 以 CAS 动态提交，cancel 先赢无 mutation，commit 先赢返回 `TooLate` 并
   交付真实 completion。
 - [x] demotion entries/bytes、输入复制、queue 与 buffer 全部纳入 Hybrid hard memory budget。
-- [x] dirty L1 保存 exact pending physical charge；O_DIRECT fallback、demotion、pressure
-  invalidation、expiry、remove 和 write-through fallback 均在 pending fence 覆盖期间按 durable
-  receipt 结算，不能出现旧值可见或配额低估窗口。
+- [x] dirty L1 保存 exact pending physical charge；O_DIRECT fallback、demotion、expiry、remove
+  和 write-through fallback 在 pending fence 覆盖期间按 durable receipt 结算。pressure
+  invalidation 在 L1 退出前同步隐藏 lower；Bucket usage 保守保持到 safe-empty boundary，不会低估。
 - [x] Bucket expired entry 在成功整页 compact 前继续占 exact physical charge；仅 durable
   removal receipt 退款，预算拒绝/提交前取消/写失败保持原 quota 与 Bloom。
 - [x] `get_handle` 以共享 handle 返回 L1 value；兼容 L1 owned clone 与跨大小 Bucket/Region
