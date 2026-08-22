@@ -2469,6 +2469,13 @@ struct StatsDelta {
     region_io_completed: u64,
     region_io_errors: u64,
     region_backpressure_wait_ns: u64,
+    region_read_queue_wait_ns: u64,
+    region_write_queue_wait_ns: u64,
+    region_control_queue_wait_ns: u64,
+    region_read_buffer_wait_ns: u64,
+    region_write_buffer_wait_ns: u64,
+    region_control_buffer_wait_ns: u64,
+    region_metadata_buffer_wait_ns: u64,
     region_io_submit_wait_ns: u64,
     region_io_completion_ns: u64,
     region_reuses: u64,
@@ -2599,6 +2606,34 @@ impl StatsDelta {
                 .region
                 .backpressure_wait_ns
                 .saturating_sub(before.region.backpressure_wait_ns),
+            region_read_queue_wait_ns: after
+                .region
+                .read_queue_wait_ns
+                .saturating_sub(before.region.read_queue_wait_ns),
+            region_write_queue_wait_ns: after
+                .region
+                .write_queue_wait_ns
+                .saturating_sub(before.region.write_queue_wait_ns),
+            region_control_queue_wait_ns: after
+                .region
+                .control_queue_wait_ns
+                .saturating_sub(before.region.control_queue_wait_ns),
+            region_read_buffer_wait_ns: after
+                .region
+                .read_buffer_wait_ns
+                .saturating_sub(before.region.read_buffer_wait_ns),
+            region_write_buffer_wait_ns: after
+                .region
+                .write_buffer_wait_ns
+                .saturating_sub(before.region.write_buffer_wait_ns),
+            region_control_buffer_wait_ns: after
+                .region
+                .control_buffer_wait_ns
+                .saturating_sub(before.region.control_buffer_wait_ns),
+            region_metadata_buffer_wait_ns: after
+                .region
+                .metadata_buffer_wait_ns
+                .saturating_sub(before.region.metadata_buffer_wait_ns),
             region_io_submit_wait_ns: after
                 .region
                 .io_submit_wait_ns
@@ -3082,7 +3117,7 @@ impl Report<'_> {
             };
         }
 
-        number_field!("schema_version", 6);
+        number_field!("schema_version", 7);
         string_field!("cache", "hybrid");
         string_field!("latency_scope", "individual_cache_api_calls");
         string_field!("write_value_generation", "prebuilt_worker_template");
@@ -3364,6 +3399,34 @@ impl Report<'_> {
             self.stats.region_backpressure_wait_ns
         );
         number_field!(
+            "region_read_queue_wait_ns",
+            self.stats.region_read_queue_wait_ns
+        );
+        number_field!(
+            "region_write_queue_wait_ns",
+            self.stats.region_write_queue_wait_ns
+        );
+        number_field!(
+            "region_control_queue_wait_ns",
+            self.stats.region_control_queue_wait_ns
+        );
+        number_field!(
+            "region_read_buffer_wait_ns",
+            self.stats.region_read_buffer_wait_ns
+        );
+        number_field!(
+            "region_write_buffer_wait_ns",
+            self.stats.region_write_buffer_wait_ns
+        );
+        number_field!(
+            "region_control_buffer_wait_ns",
+            self.stats.region_control_buffer_wait_ns
+        );
+        number_field!(
+            "region_metadata_buffer_wait_ns",
+            self.stats.region_metadata_buffer_wait_ns
+        );
+        number_field!(
             "region_io_submit_wait_ns",
             self.stats.region_io_submit_wait_ns
         );
@@ -3554,6 +3617,34 @@ impl Report<'_> {
         number_field!(
             "total_region_backpressure_wait_ns",
             self.total_stats.region_backpressure_wait_ns
+        );
+        number_field!(
+            "total_region_read_queue_wait_ns",
+            self.total_stats.region_read_queue_wait_ns
+        );
+        number_field!(
+            "total_region_write_queue_wait_ns",
+            self.total_stats.region_write_queue_wait_ns
+        );
+        number_field!(
+            "total_region_control_queue_wait_ns",
+            self.total_stats.region_control_queue_wait_ns
+        );
+        number_field!(
+            "total_region_read_buffer_wait_ns",
+            self.total_stats.region_read_buffer_wait_ns
+        );
+        number_field!(
+            "total_region_write_buffer_wait_ns",
+            self.total_stats.region_write_buffer_wait_ns
+        );
+        number_field!(
+            "total_region_control_buffer_wait_ns",
+            self.total_stats.region_control_buffer_wait_ns
+        );
+        number_field!(
+            "total_region_metadata_buffer_wait_ns",
+            self.total_stats.region_metadata_buffer_wait_ns
         );
         number_field!(
             "total_region_io_submit_wait_ns",
@@ -3937,6 +4028,16 @@ impl Report<'_> {
             self.stats.write_back_queue_wait_ns as f64 / 1_000_000.0,
             self.stats.bucket_page_buffer_wait_ns as f64 / 1_000_000.0,
             self.stats.region_backpressure_wait_ns as f64 / 1_000_000.0,
+        );
+        println!(
+            "  Region wait queue R/W/C: {:.3}/{:.3}/{:.3} ms; buffer R/W/C/M: {:.3}/{:.3}/{:.3}/{:.3} ms",
+            self.stats.region_read_queue_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_write_queue_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_control_queue_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_read_buffer_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_write_buffer_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_control_buffer_wait_ns as f64 / 1_000_000.0,
+            self.stats.region_metadata_buffer_wait_ns as f64 / 1_000_000.0,
         );
         println!(
             "  I/O measure submit/complete: Bucket {:.1}/{:.1} us; Region {:.1}/{:.1} us",
@@ -4468,7 +4569,14 @@ mod tests {
                 ..cache_rs::BucketCacheStats::default()
             },
             region: cache_rs::CacheStats {
-                backpressure_wait_ns: 10,
+                read_queue_wait_ns: 10,
+                write_queue_wait_ns: 20,
+                control_queue_wait_ns: 30,
+                read_buffer_wait_ns: 40,
+                write_buffer_wait_ns: 50,
+                control_buffer_wait_ns: 60,
+                metadata_buffer_wait_ns: 70,
+                backpressure_wait_ns: 280,
                 io_completed: 10,
                 io_submit_wait_ns: 10,
                 io_completion_ns: 10,
@@ -4495,7 +4603,14 @@ mod tests {
                 ..before.bucket
             },
             region: cache_rs::CacheStats {
-                backpressure_wait_ns: 17,
+                read_queue_wait_ns: 11,
+                write_queue_wait_ns: 22,
+                control_queue_wait_ns: 33,
+                read_buffer_wait_ns: 44,
+                write_buffer_wait_ns: 55,
+                control_buffer_wait_ns: 66,
+                metadata_buffer_wait_ns: 77,
+                backpressure_wait_ns: 308,
                 io_completed: 17,
                 io_submit_wait_ns: 17,
                 io_completion_ns: 17,
@@ -4516,7 +4631,14 @@ mod tests {
         assert_eq!(delta.bucket_io_submit_wait_ns, 7);
         assert_eq!(delta.bucket_io_completion_ns, 7);
         assert_eq!(delta.bucket_page_buffer_wait_ns, 7);
-        assert_eq!(delta.region_backpressure_wait_ns, 7);
+        assert_eq!(delta.region_read_queue_wait_ns, 1);
+        assert_eq!(delta.region_write_queue_wait_ns, 2);
+        assert_eq!(delta.region_control_queue_wait_ns, 3);
+        assert_eq!(delta.region_read_buffer_wait_ns, 4);
+        assert_eq!(delta.region_write_buffer_wait_ns, 5);
+        assert_eq!(delta.region_control_buffer_wait_ns, 6);
+        assert_eq!(delta.region_metadata_buffer_wait_ns, 7);
+        assert_eq!(delta.region_backpressure_wait_ns, 28);
         assert_eq!(delta.region_io_completed, 7);
         assert_eq!(delta.region_io_submit_wait_ns, 7);
         assert_eq!(delta.region_io_completion_ns, 7);
@@ -4781,7 +4903,7 @@ mod tests {
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
         let json = report.to_json();
-        assert!(json.contains("\"schema_version\":6"));
+        assert!(json.contains("\"schema_version\":7"));
         assert!(json.contains("\"latency_scope\":\"individual_cache_api_calls\""));
         assert!(json.contains("\"write_value_generation\":\"prebuilt_worker_template\""));
         assert!(json.contains("\"latency_samples\":0"));
@@ -4789,6 +4911,27 @@ mod tests {
         assert!(json.contains("\"bucket_io_completion_avg_us\":0"));
         assert!(json.contains("\"region_io_completion_avg_us\":0"));
         assert!(json.contains("\"total_write_back_queue_wait_ns\":0"));
+        for field in [
+            "region_read_queue_wait_ns",
+            "region_write_queue_wait_ns",
+            "region_control_queue_wait_ns",
+            "region_read_buffer_wait_ns",
+            "region_write_buffer_wait_ns",
+            "region_control_buffer_wait_ns",
+            "region_metadata_buffer_wait_ns",
+            "total_region_read_queue_wait_ns",
+            "total_region_write_queue_wait_ns",
+            "total_region_control_queue_wait_ns",
+            "total_region_read_buffer_wait_ns",
+            "total_region_write_buffer_wait_ns",
+            "total_region_control_buffer_wait_ns",
+            "total_region_metadata_buffer_wait_ns",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\":0")),
+                "missing split Region wait field {field}"
+            );
+        }
         assert!(json.contains("\"hardware_qualification\":false"));
         assert!(json.contains("\"target_nvme_matrix_passed\":false"));
         assert!(json.contains("\"journal_rollover_max_ms\":1"));

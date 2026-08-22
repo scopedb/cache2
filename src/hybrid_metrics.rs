@@ -553,6 +553,21 @@ impl HybridCacheStats {
             self.region.direct_io_bytes,
         )?;
         counter(output, "region_io_errors", self.region.io_errors)?;
+        output.write_str("# TYPE cache_rs_hybrid_region_backpressure_wait_ns_total counter\n")?;
+        for (resource, wait_ns) in [
+            ("read_queue", self.region.read_queue_wait_ns),
+            ("write_queue", self.region.write_queue_wait_ns),
+            ("control_queue", self.region.control_queue_wait_ns),
+            ("read_buffer", self.region.read_buffer_wait_ns),
+            ("write_buffer", self.region.write_buffer_wait_ns),
+            ("control_buffer", self.region.control_buffer_wait_ns),
+            ("metadata_buffer", self.region.metadata_buffer_wait_ns),
+        ] {
+            writeln!(
+                output,
+                "cache_rs_hybrid_region_backpressure_wait_ns_total{{resource=\"{resource}\"}} {wait_ns}"
+            )?;
+        }
         metric(output, "region_io_in_flight", self.region.io_in_flight)?;
         metric(
             output,
@@ -750,12 +765,19 @@ mod tests {
             memory_hits: 3,
             small_disk_hits: 4,
             region_disk_hits: 5,
+            region: crate::CacheStats {
+                control_queue_wait_ns: 23,
+                ..crate::CacheStats::default()
+            },
             ..HybridCacheStats::default()
         };
         let output = stats.to_openmetrics();
         assert!(output.contains("cache_rs_hybrid_hits_total{tier=\"memory\"} 3"));
         assert!(output.contains("cache_rs_hybrid_hits_total{tier=\"bucket\"} 4"));
         assert!(output.contains("cache_rs_hybrid_hits_total{tier=\"region\"} 5"));
+        assert!(output.contains(
+            "cache_rs_hybrid_region_backpressure_wait_ns_total{resource=\"control_queue\"} 23"
+        ));
         assert!(output.ends_with("# EOF\n"));
     }
 }

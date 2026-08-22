@@ -166,7 +166,8 @@ request delivers its real completion after the dirty fence and cleanup finish.
 - explicit reject, caller-blocking, and timeout backpressure policies;
 - an optional token-bucket write budget that rejects a `put` before dirtying
   metadata, changing the index, or issuing I/O;
-- queue, buffer, rejection, wait-time, and memory current/peak statistics;
+- queue, buffer, rejection, true saturation wait-time, and memory current/peak
+  statistics, with Region waits split by queue and buffer resource;
 - 256 key-ordering stripes for mutations, optimistic lock-free-by-key reads,
   and location/seqno/incarnation revalidation;
 - per-Region read pins, so reuse waits only for readers of the victim Region

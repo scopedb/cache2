@@ -382,6 +382,21 @@ impl MetricsSnapshot {
             "cache_rs_buffer_rejections_total",
             self.stats.buffer_rejections,
         )?;
+        output.write_str("# TYPE cache_rs_backpressure_wait_ns_total counter\n")?;
+        for (resource, wait_ns) in [
+            ("read_queue", self.stats.read_queue_wait_ns),
+            ("write_queue", self.stats.write_queue_wait_ns),
+            ("control_queue", self.stats.control_queue_wait_ns),
+            ("read_buffer", self.stats.read_buffer_wait_ns),
+            ("write_buffer", self.stats.write_buffer_wait_ns),
+            ("control_buffer", self.stats.control_buffer_wait_ns),
+            ("metadata_buffer", self.stats.metadata_buffer_wait_ns),
+        ] {
+            writeln!(
+                output,
+                "cache_rs_backpressure_wait_ns_total{{resource=\"{resource}\"}} {wait_ns}"
+            )?;
+        }
         write_counter(
             output,
             "cache_rs_reclaim_backlog_rejections_total",
@@ -760,6 +775,7 @@ mod tests {
             CacheStats {
                 reclaim_records_scanned: 17,
                 reclaim_index_fallbacks: 2,
+                control_queue_wait_ns: 19,
                 ..CacheStats::default()
             },
             OriginFillStats::default(),
@@ -775,6 +791,9 @@ mod tests {
         assert!(encoded.contains("cache_rs_requests_total{operation=\"get\",result=\"hit\"} 1"));
         assert!(encoded.contains("cache_rs_reclaim_records_scanned_total 17"));
         assert!(encoded.contains("cache_rs_reclaim_index_fallbacks_total 2"));
+        assert!(
+            encoded.contains("cache_rs_backpressure_wait_ns_total{resource=\"control_queue\"} 19")
+        );
         assert!(encoded.ends_with("# EOF\n"));
     }
 

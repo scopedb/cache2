@@ -296,14 +296,17 @@ caches; this prevents benchmark automation from erasing a warm production
 Hybrid cache.
 
 JSON and human output split accumulated waiting across the Hybrid request
-budget, write-back gate, Bucket page-buffer pool, Region backpressure, and each
-disk tier's submit/completion path. I/O completion time runs from the submission
+budget, write-back gate, Bucket page-buffer pool, the Region read/write/control
+queues, the Region read/write/control/metadata buffer pools, and each disk
+tier's submit/completion path. Region resource wait counters measure only time
+after a caller observes that resource saturated; an uncontended acquisition or
+immediate rejection contributes zero wait. Their saturating sum remains exposed
+as aggregate Region backpressure for compatibility. Bucket page-buffer wait has
+the same saturation-only meaning. I/O completion time runs from the submission
 attempt to published completion and therefore includes admission, engine
 queueing, and device time. A request that crosses the measurement boundary
 completes in the separate drain or total counters rather than the measurement
-average;
-the other wait counters also include the small lock cost of uncontended fast
-paths, so a non-zero total alone does not prove saturation.
+average.
 
 At minimum run these distributions under both synchronous and asynchronous
 public APIs, write-through/write-back policies, buffered/direct modes, and

@@ -376,6 +376,13 @@ impl ResourceController {
         let control_buffers_in_use = self.control_pool.in_use.load(Ordering::Relaxed);
         let metadata_buffers_in_use = self.metadata_pool.in_use.load(Ordering::Relaxed);
         let memory_used_bytes = self.memory.current.load(Ordering::Relaxed);
+        let read_queue_wait_ns = self.read_gate.wait_ns.load(Ordering::Relaxed);
+        let write_queue_wait_ns = self.write_gate.wait_ns.load(Ordering::Relaxed);
+        let control_queue_wait_ns = self.control_gate.wait_ns.load(Ordering::Relaxed);
+        let read_buffer_wait_ns = self.read_pool.wait_ns.load(Ordering::Relaxed);
+        let write_buffer_wait_ns = self.write_pool.wait_ns.load(Ordering::Relaxed);
+        let control_buffer_wait_ns = self.control_pool.wait_ns.load(Ordering::Relaxed);
+        let metadata_buffer_wait_ns = self.metadata_pool.wait_ns.load(Ordering::Relaxed);
         ResourceSnapshot {
             read_queue_depth: usize_to_u64(read_queue_depth),
             write_queue_depth: usize_to_u64(write_queue_depth),
@@ -442,16 +449,20 @@ impl ResourceController {
             write_budget_rejections: self.write_budget.as_ref().map_or(0, |budget| {
                 lock_unpoisoned(budget).rejections.load(Ordering::Relaxed)
             }),
-            backpressure_wait_ns: self
-                .read_gate
-                .wait_ns
-                .load(Ordering::Relaxed)
-                .saturating_add(self.write_gate.wait_ns.load(Ordering::Relaxed))
-                .saturating_add(self.read_pool.wait_ns.load(Ordering::Relaxed))
-                .saturating_add(self.write_pool.wait_ns.load(Ordering::Relaxed))
-                .saturating_add(self.control_gate.wait_ns.load(Ordering::Relaxed))
-                .saturating_add(self.control_pool.wait_ns.load(Ordering::Relaxed))
-                .saturating_add(self.metadata_pool.wait_ns.load(Ordering::Relaxed)),
+            read_queue_wait_ns,
+            write_queue_wait_ns,
+            control_queue_wait_ns,
+            read_buffer_wait_ns,
+            write_buffer_wait_ns,
+            control_buffer_wait_ns,
+            metadata_buffer_wait_ns,
+            backpressure_wait_ns: read_queue_wait_ns
+                .saturating_add(write_queue_wait_ns)
+                .saturating_add(control_queue_wait_ns)
+                .saturating_add(read_buffer_wait_ns)
+                .saturating_add(write_buffer_wait_ns)
+                .saturating_add(control_buffer_wait_ns)
+                .saturating_add(metadata_buffer_wait_ns),
             memory_budget_bytes: usize_to_u64(self.memory.budget),
             memory_used_bytes: usize_to_u64(memory_used_bytes),
             memory_peak_bytes: usize_to_u64(
@@ -514,6 +525,13 @@ pub(crate) struct ResourceSnapshot {
     pub(crate) queue_rejections: u64,
     pub(crate) buffer_rejections: u64,
     pub(crate) write_budget_rejections: u64,
+    pub(crate) read_queue_wait_ns: u64,
+    pub(crate) write_queue_wait_ns: u64,
+    pub(crate) control_queue_wait_ns: u64,
+    pub(crate) read_buffer_wait_ns: u64,
+    pub(crate) write_buffer_wait_ns: u64,
+    pub(crate) control_buffer_wait_ns: u64,
+    pub(crate) metadata_buffer_wait_ns: u64,
     pub(crate) backpressure_wait_ns: u64,
     pub(crate) memory_budget_bytes: u64,
     pub(crate) memory_used_bytes: u64,
@@ -578,9 +596,12 @@ impl RequestGate {
     }
 
     fn enter(self: &Arc<Self>, wait: WaitMode) -> Result<QueuePermit, WaitFailure> {
-        let started = Instant::now();
+        let mut wait_started = None;
         let mut state = lock_unpoisoned(&self.state);
         while state.current == self.limit {
+            if wait_started.is_none() && !matches!(wait, WaitMode::Reject) {
+                wait_started = Some(Instant::now());
+            }
             state = match wait {
                 WaitMode::Reject => {
                     self.rejections.fetch_add(1, Ordering::Relaxed);
@@ -590,14 +611,14 @@ impl RequestGate {
                 WaitMode::Deadline(deadline) => {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_duration(&self.wait_ns, started.elapsed());
+                        add_wait_duration(&self.wait_ns, wait_started);
                         return Err(WaitFailure::TimedOut);
                     };
                     let (guard, timed_out) =
                         wait_timeout_unpoisoned(&self.available, state, remaining);
                     if timed_out && guard.current == self.limit {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_duration(&self.wait_ns, started.elapsed());
+                        add_wait_duration(&self.wait_ns, wait_started);
                         return Err(WaitFailure::TimedOut);
                     }
                     guard
@@ -608,7 +629,7 @@ impl RequestGate {
         let current = state.current;
         self.current.store(current, Ordering::Relaxed);
         update_peak(&self.peak, current);
-        add_duration(&self.wait_ns, started.elapsed());
+        add_wait_duration(&self.wait_ns, wait_started);
         Ok(QueuePermit {
             gate: Arc::clone(self),
         })
@@ -732,16 +753,17 @@ impl DedicatedBufferPool {
     }
 
     pub(crate) fn acquire(&self) -> Option<BufferLease> {
-        let started = Instant::now();
+        let mut wait_started = None;
         let mut state = lock_unpoisoned(&self.inner.state);
         while state.free.is_empty() && !self.closed.load(Ordering::Acquire) {
+            wait_started.get_or_insert_with(Instant::now);
             self.waiters.fetch_add(1, Ordering::Relaxed);
             state = wait_unpoisoned(&self.inner.available, state);
             self.waiters.fetch_sub(1, Ordering::Relaxed);
         }
         if self.closed.load(Ordering::Acquire) {
             self.inner.rejections.fetch_add(1, Ordering::Relaxed);
-            add_duration(&self.inner.wait_ns, started.elapsed());
+            add_wait_duration(&self.inner.wait_ns, wait_started);
             return None;
         }
         let buffer = state
@@ -750,7 +772,7 @@ impl DedicatedBufferPool {
             .expect("dedicated pool wake requires a free buffer or closure");
         let current = self.inner.in_use.fetch_add(1, Ordering::Relaxed) + 1;
         update_peak(&self.inner.peak, current);
-        add_duration(&self.inner.wait_ns, started.elapsed());
+        add_wait_duration(&self.inner.wait_ns, wait_started);
         drop(state);
         let mut lease = BufferLease {
             pool: Arc::clone(&self.inner),
@@ -767,25 +789,26 @@ impl DedicatedBufferPool {
         cancelled: &AtomicBool,
         deadline: Option<Instant>,
     ) -> Result<BufferLease, DedicatedBufferAcquireError> {
-        let started = Instant::now();
+        let mut wait_started = None;
         let mut state = lock_unpoisoned(&self.inner.state);
         let buffer = loop {
             if cancelled.load(Ordering::Acquire) {
-                add_duration(&self.inner.wait_ns, started.elapsed());
+                add_wait_duration(&self.inner.wait_ns, wait_started);
                 return Err(DedicatedBufferAcquireError::Cancelled);
             }
             if self.closed.load(Ordering::Acquire) {
                 self.inner.rejections.fetch_add(1, Ordering::Relaxed);
-                add_duration(&self.inner.wait_ns, started.elapsed());
+                add_wait_duration(&self.inner.wait_ns, wait_started);
                 return Err(DedicatedBufferAcquireError::Closed);
             }
             if let Some(buffer) = state.free.pop() {
                 break buffer;
             }
+            wait_started.get_or_insert_with(Instant::now);
             state = if let Some(deadline) = deadline {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     self.inner.rejections.fetch_add(1, Ordering::Relaxed);
-                    add_duration(&self.inner.wait_ns, started.elapsed());
+                    add_wait_duration(&self.inner.wait_ns, wait_started);
                     return Err(DedicatedBufferAcquireError::TimedOut);
                 };
                 self.waiters.fetch_add(1, Ordering::Relaxed);
@@ -794,7 +817,7 @@ impl DedicatedBufferPool {
                 self.waiters.fetch_sub(1, Ordering::Relaxed);
                 if timed_out && guard.free.is_empty() {
                     self.inner.rejections.fetch_add(1, Ordering::Relaxed);
-                    add_duration(&self.inner.wait_ns, started.elapsed());
+                    add_wait_duration(&self.inner.wait_ns, wait_started);
                     return Err(DedicatedBufferAcquireError::TimedOut);
                 }
                 guard
@@ -807,7 +830,7 @@ impl DedicatedBufferPool {
         };
         let current = self.inner.in_use.fetch_add(1, Ordering::Relaxed) + 1;
         update_peak(&self.inner.peak, current);
-        add_duration(&self.inner.wait_ns, started.elapsed());
+        add_wait_duration(&self.inner.wait_ns, wait_started);
         drop(state);
         let mut lease = BufferLease {
             pool: Arc::clone(&self.inner),
@@ -882,9 +905,12 @@ impl BufferPool {
     }
 
     fn acquire(self: &Arc<Self>, wait: WaitMode) -> Result<BufferLease, WaitFailure> {
-        let started = Instant::now();
+        let mut wait_started = None;
         let mut state = lock_unpoisoned(&self.state);
         while state.free.is_empty() {
+            if wait_started.is_none() && !matches!(wait, WaitMode::Reject) {
+                wait_started = Some(Instant::now());
+            }
             state = match wait {
                 WaitMode::Reject => {
                     self.rejections.fetch_add(1, Ordering::Relaxed);
@@ -894,14 +920,14 @@ impl BufferPool {
                 WaitMode::Deadline(deadline) => {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_duration(&self.wait_ns, started.elapsed());
+                        add_wait_duration(&self.wait_ns, wait_started);
                         return Err(WaitFailure::TimedOut);
                     };
                     let (guard, timed_out) =
                         wait_timeout_unpoisoned(&self.available, state, remaining);
                     if timed_out && guard.free.is_empty() {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_duration(&self.wait_ns, started.elapsed());
+                        add_wait_duration(&self.wait_ns, wait_started);
                         return Err(WaitFailure::TimedOut);
                     }
                     guard
@@ -911,7 +937,7 @@ impl BufferPool {
         let buffer = state.free.pop().expect("checked non-empty buffer pool");
         let current = self.in_use.fetch_add(1, Ordering::Relaxed) + 1;
         update_peak(&self.peak, current);
-        add_duration(&self.wait_ns, started.elapsed());
+        add_wait_duration(&self.wait_ns, wait_started);
         Ok(BufferLease {
             pool: Arc::clone(self),
             buffer: Some(buffer),
@@ -1322,6 +1348,12 @@ fn add_duration(counter: &AtomicU64, duration: Duration) {
     });
 }
 
+fn add_wait_duration(counter: &AtomicU64, started: Option<Instant>) {
+    if let Some(started) = started {
+        add_duration(counter, started.elapsed());
+    }
+}
+
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -1501,16 +1533,72 @@ mod tests {
 
     #[test]
     fn timeout_is_bounded_and_counted() {
-        let resources =
-            ResourceController::try_new(limits(BackpressurePolicy::Timeout(Duration::ZERO)))
-                .unwrap();
+        let resources = ResourceController::try_new(limits(BackpressurePolicy::Timeout(
+            Duration::from_millis(1),
+        )))
+        .unwrap();
         let _first = resources.begin_read().unwrap();
         let _second = resources.begin_read().unwrap();
+        assert_eq!(resources.snapshot().backpressure_wait_ns, 0);
         assert_eq!(
             resources.begin_read().err(),
             Some(OverloadReason::ReadTimeout)
         );
-        assert_eq!(resources.snapshot().queue_rejections, 1);
+        let snapshot = resources.snapshot();
+        assert_eq!(snapshot.queue_rejections, 1);
+        assert!(snapshot.read_queue_wait_ns > 0);
+        assert_eq!(snapshot.write_queue_wait_ns, 0);
+        assert_eq!(snapshot.control_queue_wait_ns, 0);
+        assert_eq!(snapshot.read_buffer_wait_ns, 0);
+        assert_eq!(snapshot.write_buffer_wait_ns, 0);
+        assert_eq!(snapshot.control_buffer_wait_ns, 0);
+        assert_eq!(snapshot.metadata_buffer_wait_ns, 0);
+        assert_eq!(snapshot.backpressure_wait_ns, snapshot.read_queue_wait_ns);
+    }
+
+    #[test]
+    fn buffer_timeout_is_attributed_without_counting_queue_fast_path() {
+        let mut configured = limits(BackpressurePolicy::Timeout(Duration::from_millis(1)));
+        configured.read_queue_depth = 3;
+        configured.read_buffer_slots = 2;
+        let resources = ResourceController::try_new(configured).unwrap();
+        let _first = resources.begin_read().unwrap();
+        let _second = resources.begin_read().unwrap();
+
+        assert_eq!(
+            resources.begin_read().err(),
+            Some(OverloadReason::ReadTimeout)
+        );
+        let snapshot = resources.snapshot();
+        assert_eq!(snapshot.read_queue_wait_ns, 0);
+        assert!(snapshot.read_buffer_wait_ns > 0);
+        assert_eq!(snapshot.backpressure_wait_ns, snapshot.read_buffer_wait_ns);
+    }
+
+    #[test]
+    fn resource_wait_snapshot_preserves_each_component_and_exact_sum() {
+        let resources = ResourceController::try_new(limits(BackpressurePolicy::Reject)).unwrap();
+        for (counter, value) in [
+            (&resources.read_gate.wait_ns, 1),
+            (&resources.write_gate.wait_ns, 2),
+            (&resources.control_gate.wait_ns, 3),
+            (&resources.read_pool.wait_ns, 4),
+            (&resources.write_pool.wait_ns, 5),
+            (&resources.control_pool.wait_ns, 6),
+            (&resources.metadata_pool.wait_ns, 7),
+        ] {
+            counter.store(value, Ordering::Relaxed);
+        }
+
+        let snapshot = resources.snapshot();
+        assert_eq!(snapshot.read_queue_wait_ns, 1);
+        assert_eq!(snapshot.write_queue_wait_ns, 2);
+        assert_eq!(snapshot.control_queue_wait_ns, 3);
+        assert_eq!(snapshot.read_buffer_wait_ns, 4);
+        assert_eq!(snapshot.write_buffer_wait_ns, 5);
+        assert_eq!(snapshot.control_buffer_wait_ns, 6);
+        assert_eq!(snapshot.metadata_buffer_wait_ns, 7);
+        assert_eq!(snapshot.backpressure_wait_ns, 28);
     }
 
     #[test]

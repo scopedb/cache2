@@ -829,6 +829,13 @@ pub struct CacheStats {
     pub queue_rejections: u64,
     pub buffer_rejections: u64,
     pub write_budget_rejections: u64,
+    pub read_queue_wait_ns: u64,
+    pub write_queue_wait_ns: u64,
+    pub control_queue_wait_ns: u64,
+    pub read_buffer_wait_ns: u64,
+    pub write_buffer_wait_ns: u64,
+    pub control_buffer_wait_ns: u64,
+    pub metadata_buffer_wait_ns: u64,
     pub backpressure_wait_ns: u64,
     pub memory_budget_bytes: u64,
     pub memory_used_bytes: u64,
@@ -3108,6 +3115,13 @@ impl DiskCache {
         stats.queue_rejections = resources.queue_rejections;
         stats.buffer_rejections = resources.buffer_rejections;
         stats.write_budget_rejections = resources.write_budget_rejections;
+        stats.read_queue_wait_ns = resources.read_queue_wait_ns;
+        stats.write_queue_wait_ns = resources.write_queue_wait_ns;
+        stats.control_queue_wait_ns = resources.control_queue_wait_ns;
+        stats.read_buffer_wait_ns = resources.read_buffer_wait_ns;
+        stats.write_buffer_wait_ns = resources.write_buffer_wait_ns;
+        stats.control_buffer_wait_ns = resources.control_buffer_wait_ns;
+        stats.metadata_buffer_wait_ns = resources.metadata_buffer_wait_ns;
         stats.backpressure_wait_ns = resources.backpressure_wait_ns;
         stats.memory_budget_bytes = resources.memory_budget_bytes;
         stats.memory_used_bytes = resources.memory_used_bytes;
