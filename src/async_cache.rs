@@ -228,30 +228,70 @@ impl StopToken {
 /// A runtime-neutral request that can be awaited or waited synchronously.
 #[must_use = "cache requests do nothing useful unless awaited, waited, or cancelled"]
 pub struct CacheFuture<T> {
-    core: Arc<RequestCore<T>>,
+    state: CacheFutureState<T>,
+}
+
+enum CacheFutureState<T> {
+    Ready(Mutex<Option<T>>),
+    Pending(Arc<RequestCore<T>>),
 }
 
 impl<T> CacheFuture<T> {
-    pub fn cancel(&self) -> CancelOutcome {
-        self.core.request_stop(AsyncFailure::Cancelled)
+    fn ready(value: T) -> Self {
+        Self {
+            state: CacheFutureState::Ready(Mutex::new(Some(value))),
+        }
     }
 
-    pub fn wait(self) -> T {
-        self.core.completion.wait()
+    fn pending(core: Arc<RequestCore<T>>) -> Self {
+        Self {
+            state: CacheFutureState::Pending(core),
+        }
+    }
+
+    pub fn cancel(&self) -> CancelOutcome {
+        match &self.state {
+            CacheFutureState::Ready(_) => CancelOutcome::Completed,
+            CacheFutureState::Pending(core) => core.request_stop(AsyncFailure::Cancelled),
+        }
+    }
+
+    pub fn wait(mut self) -> T {
+        match &mut self.state {
+            CacheFutureState::Ready(value) => value
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("a ready cache future is consumed once"),
+            CacheFutureState::Pending(core) => core.completion.wait(),
+        }
     }
 }
+
+impl<T> Unpin for CacheFuture<T> {}
 
 impl<T> Future for CacheFuture<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.core.completion.poll(context)
+        match &mut self.get_mut().state {
+            CacheFutureState::Ready(value) => Poll::Ready(
+                value
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("a ready cache future cannot be polled after completion"),
+            ),
+            CacheFutureState::Pending(core) => core.completion.poll(context),
+        }
     }
 }
 
 impl<T> Drop for CacheFuture<T> {
     fn drop(&mut self) {
-        let _ = self.core.request_stop(AsyncFailure::Cancelled);
+        if let CacheFutureState::Pending(core) = &self.state {
+            let _ = core.request_stop(AsyncFailure::Cancelled);
+        }
     }
 }
 
@@ -1201,7 +1241,7 @@ impl AsyncExecutor {
                 self.timer.register(&core, deadline);
             }
         }
-        CacheFuture { core }
+        CacheFuture::pending(core)
     }
 
     /// Stop admission and return a future for all already accepted work.
@@ -1878,14 +1918,7 @@ fn copy_input(input: &[u8], allocation_failure: OverloadReason) -> CacheResult<V
 }
 
 pub(crate) fn ready_future<T: Send + 'static>(value: T) -> CacheFuture<T> {
-    let core = Arc::new(RequestCore::new(
-        Arc::new(|_| panic!("a ready future cannot fail dispatch")),
-        Weak::new(),
-    ));
-    let started = core.start(TaskKind::CancelableRead);
-    debug_assert!(started);
-    core.finish(value);
-    CacheFuture { core }
+    CacheFuture::ready(value)
 }
 
 /// Completion handle used before invoking `DiskCache::close`.
@@ -2160,9 +2193,21 @@ mod tests {
 
     #[test]
     fn ready_future_completes_without_an_executor() {
+        fn assert_send_sync_unpin<T: Send + Sync + Unpin>() {}
+        fn assert_unpin<T: Unpin>() {}
+
+        assert_send_sync_unpin::<CacheFuture<std::cell::Cell<u8>>>();
+        assert_unpin::<CacheFuture<std::marker::PhantomPinned>>();
+
         let request = ready_future(7);
         assert_eq!(request.cancel(), CancelOutcome::Completed);
         assert_eq!(request.wait(), 7);
+
+        let mut request = ready_future(9);
+        let waker = Waker::from(Arc::new(PanicWake));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut request).poll(&mut context), Poll::Ready(9));
+        assert_eq!(request.cancel(), CancelOutcome::Completed);
     }
 
     #[test]

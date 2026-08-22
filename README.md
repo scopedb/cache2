@@ -107,7 +107,9 @@ manifest, Bucket, and Region degradation visible independently.
 A no-deadline async read that finds a live L1 value completes on the caller's
 L1 completion lane: it remains charged to the shared Hybrid request slot/byte
 budget but does not copy the key, allocate a runnable, consume the slow read
-queue, or wake a worker. L1 misses, expired entries, lock contention, and every
+queue, or wake a worker. Its completed result is stored directly in the returned
+future, without allocating the normal request/completion state. L1 misses,
+expired entries, lock contention, and every
 request with a deadline retain the bounded cancelable read-queue path. Thus
 read-queue saturation rejects lower-tier work without rejecting an otherwise
 admissible live L1 hit.
