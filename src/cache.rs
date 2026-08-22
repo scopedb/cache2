@@ -5984,32 +5984,34 @@ impl DiskCache {
                 .map_err(checkpoint_codec_error)?;
             writer.push(&encoded)?;
         }
-        state
-            .index
-            .try_for_each_snapshot_entry(min_seqno, |physical_slot, entry| {
-                let location = PackedLocation::try_from_raw(entry.location_raw)
-                    .map_err(|_| CacheError::CorruptMetadata("invalid live index location"))?;
-                let owner = state.regions.get(location.region_id() as usize).ok_or(
-                    CacheError::CorruptMetadata("checkpoint index region is out of bounds"),
-                )?;
-                let encoded = encoder
-                    .encode_index_entry(
-                        CheckpointIndexEntry {
-                            key_hash: entry.hash,
-                            location,
-                            seqno: entry.seqno,
-                            namespace_id: entry.namespace_id,
-                            // A queued copy is process-local and may not have
-                            // written a record yet. Only the durable USED bit
-                            // is meaningful after restart.
-                            flags: entry.flags & !INDEX_FLAG_SECOND_CHANCE_PENDING,
-                            physical_slot: Some(physical_slot),
-                        },
-                        checkpoint_region(owner, None),
-                    )
-                    .map_err(checkpoint_codec_error)?;
-                writer.push(&encoded)
-            })?;
+        if entry_count != 0 {
+            state
+                .index
+                .try_for_each_snapshot_entry(min_seqno, |physical_slot, entry| {
+                    let location = PackedLocation::try_from_raw(entry.location_raw)
+                        .map_err(|_| CacheError::CorruptMetadata("invalid live index location"))?;
+                    let owner = state.regions.get(location.region_id() as usize).ok_or(
+                        CacheError::CorruptMetadata("checkpoint index region is out of bounds"),
+                    )?;
+                    let encoded = encoder
+                        .encode_index_entry(
+                            CheckpointIndexEntry {
+                                key_hash: entry.hash,
+                                location,
+                                seqno: entry.seqno,
+                                namespace_id: entry.namespace_id,
+                                // A queued copy is process-local and may not have
+                                // written a record yet. Only the durable USED bit
+                                // is meaningful after restart.
+                                flags: entry.flags & !INDEX_FLAG_SECOND_CHANCE_PENDING,
+                                physical_slot: Some(physical_slot),
+                            },
+                            checkpoint_region(owner, None),
+                        )
+                        .map_err(checkpoint_codec_error)?;
+                    writer.push(&encoded)
+                })?;
+        }
         let summary = encoder.finish().map_err(checkpoint_codec_error)?;
         writer.finish(
             summary.payload_len,
