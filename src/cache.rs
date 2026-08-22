@@ -1341,6 +1341,9 @@ impl DiskCache {
         retire_sink: Arc<dyn Fn(NamespaceUsage) -> bool + Send + Sync>,
         owner_dirty: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     ) -> Result<Self> {
+        // The owner fence makes an unclean lower session disposable. Region
+        // rotation may therefore defer its local durability syncs to the
+        // owner's flush/close boundary.
         Self::open_with_requirement_and_host_writes(
             config,
             OpenRequirement::OpenOrCreate,
@@ -1414,6 +1417,32 @@ impl DiskCache {
                 retire_sink: None,
                 delegated_namespaces: None,
                 owner_dirty: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn open_with_backend_and_owner_hooks(
+        config: CacheConfig,
+        io: Box<dyn IoBackend>,
+        shared_host_writes: Arc<HostWriteTracker>,
+        delegated_namespaces: Arc<NamespaceController>,
+        retire_sink: Arc<NamespaceRetireSink>,
+        owner_dirty: Arc<OwnerDirtyFence>,
+    ) -> Result<Self> {
+        let layout = config.validate()?;
+        let runtime = allocate_open_runtime(&config, &layout, Some(shared_host_writes))?;
+        Self::open_on_backend(
+            config,
+            layout,
+            runtime,
+            Arc::from(io),
+            None,
+            OpenRequirement::OpenOrCreate,
+            ManagedPolicyHooks {
+                retire_sink: Some(retire_sink),
+                delegated_namespaces: Some(delegated_namespaces),
+                owner_dirty: Some(owner_dirty),
             },
         )
     }
@@ -5498,7 +5527,13 @@ impl DiskCache {
         // The old lane owner must be durably non-Active before a replacement
         // can become durable. Otherwise a crash between the two header writes
         // can reopen with append_lanes + 1 Active Regions.
-        self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        // A Hybrid owner has already published its own dirty-session fence and
+        // treats any unclean lower session as disposable. It can therefore
+        // defer both rotation barriers to flush/close; dirty lower recovery
+        // already formats inconsistent header combinations to an empty cache.
+        if self.inner.owner_dirty.is_none() {
+            self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        }
         state.regions[old_active_index].header = sealed;
         state.sealed_regions.push_back(old_active);
         *self.inner.read_view.regions[old_active_index]
@@ -5521,7 +5556,9 @@ impl DiskCache {
             used: REGION_HEADER_SIZE as u64,
         };
         self.write_region_header(&state.superblock, header)?;
-        self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        if self.inner.owner_dirty.is_none() {
+            self.engine_sync(SyncPoint::RegionRotation, SyncMode::Data)?;
+        }
         self.scrub_or_fallback_region_index(
             &state.superblock,
             old_victim,
@@ -10016,6 +10053,60 @@ mod m1_tests {
         assert!(bytes.is_some());
         assert!(invalidated);
         cache.close().unwrap();
+    }
+
+    #[test]
+    fn owner_fenced_rotation_defers_sync_until_the_clean_boundary() {
+        let file = TestFile::new("owner-fenced-rotation");
+        let cache_config = config(&file.0);
+        let (backend, faults) = FaultBackend::open(&file.0).unwrap();
+        let host_writes = Arc::new(HostWriteTracker::try_new(None, None).unwrap());
+        let namespaces =
+            Arc::new(NamespaceController::try_new(&[NamespaceConfig::new(0)]).unwrap());
+        let retire_sink: Arc<NamespaceRetireSink> = Arc::new(|_| true);
+        let owner_dirty: Arc<OwnerDirtyFence> = Arc::new(|| Ok(()));
+        let cache = DiskCache::open_with_backend_and_owner_hooks(
+            cache_config.clone(),
+            Box::new(backend),
+            host_writes,
+            namespaces,
+            retire_sink,
+            owner_dirty,
+        )
+        .unwrap();
+
+        // A RegionRotation sync would fail this test immediately. The owning
+        // session fence permits lossy rotations, while close still publishes a
+        // fully durable clean checkpoint.
+        faults.arm(
+            FaultEvent::Sync(SyncPoint::RegionRotation),
+            1,
+            FaultAction::Error(EIO),
+        );
+        let value = vec![b'x'; 1536];
+        for index in 0..24 {
+            let key = format!("key-{index:02}");
+            assert_eq!(
+                cache
+                    .put(key.as_bytes(), &value, PutOptions::default())
+                    .unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        assert!(cache.stats().regions_reused > 0);
+        assert!(
+            !faults
+                .events()
+                .contains(&FaultEvent::Sync(SyncPoint::RegionRotation))
+        );
+
+        cache.close().unwrap();
+        let reopened = cache_config.open().unwrap();
+        assert_eq!(
+            reopened.get(b"key-23").unwrap().as_deref(),
+            Some(value.as_slice())
+        );
+        reopened.close().unwrap();
     }
 
     #[test]
