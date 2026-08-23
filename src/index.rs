@@ -324,7 +324,7 @@ impl Slot {
     }
 }
 
-const MAX_PROBES: usize = 64;
+pub(crate) const MAX_INDEX_PROBES: usize = 64;
 pub(crate) const MAX_INDEX_SHARDS: usize = 4096;
 
 /// A bounded open-addressing table.
@@ -823,7 +823,7 @@ impl CompactIndex {
     }
 
     fn probe_limit(&self) -> usize {
-        self.slots.len().min(MAX_PROBES)
+        self.slots.len().min(MAX_INDEX_PROBES)
     }
 
     fn probe_slot(&self, start: usize, step: usize) -> usize {
@@ -1994,7 +1994,7 @@ mod tests {
 
         assert!(
             index
-                .restore_exact_if_visible(MAX_PROBES - 1, 0, entry, |_| true)
+                .restore_exact_if_visible(MAX_INDEX_PROBES - 1, 0, entry, |_| true)
                 .unwrap()
         );
         assert_eq!(index.get(0, 1), Some(entry));
@@ -2002,7 +2002,7 @@ mod tests {
 
         let mut invalid = CompactIndex::new(128);
         assert_eq!(
-            invalid.restore_exact_if_visible(MAX_PROBES, 0, entry, |_| true),
+            invalid.restore_exact_if_visible(MAX_INDEX_PROBES, 0, entry, |_| true),
             Err(IndexSnapshotError::PhysicalSlotOutsideProbeWindow)
         );
         assert_eq!(invalid.len(), 0);

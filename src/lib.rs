@@ -76,6 +76,8 @@ mod hybrid_journal;
 mod hybrid_manifest;
 mod hybrid_metrics;
 mod index;
+#[allow(dead_code)]
+mod index_v2;
 // The V2 foundation is compiled and behavior-tested before the Region data
 // path is switched over; the production graph intentionally does not call it yet.
 #[allow(dead_code)]

@@ -21,7 +21,7 @@ ChunkCache
 │   ├── L1 eviction admission
 │   └── lifecycle
 └── RegionCache                 唯一的 SSD L2
-    ├── CompactIndex            Empty / Value / Masked
+    ├── CompactIndex            Empty / Deleted / Value / Masked
     ├── RegionManager           Active / Sealed / Free
     ├── FIFO reclaimer          首版唯一 L2 replacement
     └── IoEngine / Device       positioned I/O 或 io_uring
@@ -187,7 +187,9 @@ hash64 | packed_location64 | seqno64 | namespace32 | flags32
 - 每个 4 KiB index page 只属于一个 shard，shard range 必须 page-aligned，避免 first-touch
   validation 与 COW mutation 跨锁竞争；
 - 固定容量、固定 shard、bounded probe，不 rehash；
-- flags/location 明确定义 Empty、Value 和 Masked(seqno) 三态；
+- slot 明确定义四态：全零为 Empty；`seqno=0/location=max` 为 probe Deleted；
+  `seqno!=0` 且 PackedLocation 合法为 Value；带专用 flag 的 `hash+seqno` 为 transient Masked。
+  指向 tombstone record 的 live slot 仍是 Value，不能误计为 probe Deleted；
 - 每 shard 的 physical live/deleted/masked count 和 slot range 存在小目录中，locks 不进 image；
 - image writer 清除 VOLATILE、PENDING、hit hint 等 process-local flags；
 - full key 仍保存在 Region record，读取时必须验证；
@@ -206,7 +208,14 @@ fresh/dirty start 使用零页懒分配的 anonymous mapping。clean start 将�
 index page 只属于一个 range，range 分别加锁并维护 physical stats，但共享 page validation 与
 sticky image-health。这样既不会在 16 KiB host page 上产生重叠 MAP_PRIVATE COW 分叉，也能在
 任一 shard 首次发现损坏时 O(1) 拒绝整张 image。production hash operations 和 RegionManager
-仍需在这组 range views 上完成接线。
+仍需在这组 range views 上完成接线。crate-private `RegionIndexV2` 已直接在 range guard 上完成
+64-step bounded lookup/upsert/mask/conditional replace/remove：每次 point operation 只获取一次
+shard lock，完整 probe 成功后最多提交一个 slot，并返回 exact physical transition；foreign
+Masked 永不被 collision 或 reclaimer 覆盖。下一步由 RegionManager 提供 visibility/accounting，
+并接入 corruption → MissOnly → no-CLEAN 生命周期。
+
+V2 仍是 crate-private、未发布的 profile；本次四态语义冻结前生成的开发 sidecar 不属于兼容面，
+必须 reset/cold start，不能当作已发布的 Format V1 镜像继续使用。
 
 不采用 Base + Delta，也不采用运行期 WAL。它们只有在要求“异常退出仍增量恢复”或
 “在线持续发布 checkpoint”时才有必要，而这两个都不是当前 cache 契约。

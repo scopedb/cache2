@@ -780,9 +780,12 @@ where
                 .index
                 .write_warm_image(&mut writer, index_image_binding(header))
                 .map_err(index_storage_io_error)?;
-            if written.bytes_written != index_len || writer.offset() != region_table_offset {
+            if written.bytes_written != index_len
+                || written.physical_stats != physical_stats
+                || writer.offset() != region_table_offset
+            {
                 return Err(io::Error::other(
-                    "V2 index writer produced the wrong length",
+                    "V2 index writer produced inconsistent length or physical statistics",
                 ));
             }
             write_all_at(
@@ -1374,6 +1377,7 @@ fn closed_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::PackedLocation;
     use crate::index_storage::IndexSlotV1;
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::recovery_v2::{DataGeometryV2, PersistentId};
@@ -1758,7 +1762,7 @@ mod tests {
         let data = test_data_superblock();
         let value = IndexSlotV1 {
             hash: 11,
-            location_raw: 22,
+            location_raw: PackedLocation::new(0, 0, 32, false).unwrap().raw(),
             seqno: 33,
             namespace_id: 44,
             flags: 0,
@@ -1857,7 +1861,7 @@ mod tests {
         let data = test_data_superblock_with_regions(2);
         let value = IndexSlotV1 {
             hash: 11,
-            location_raw: 22,
+            location_raw: PackedLocation::new(0, 0, 32, false).unwrap().raw(),
             seqno: 1,
             namespace_id: 0,
             flags: 0,
