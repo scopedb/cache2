@@ -273,19 +273,39 @@ impl FileRegionRuntimeV2 {
     /// The first production-facing operation intentionally exposes only typed
     /// point semantics. A lazy image failure latches the whole L2 miss-only;
     /// it is never surfaced as a cache hit or allowed to authorize CLEAN.
-    fn lookup(&self, hash: u64) -> io::Result<IndexLookupV2> {
+    fn lookup_snapshot(&self, hash: u64) -> io::Result<IndexLookupV2> {
         if !self.health.is_healthy() {
             return Ok(IndexLookupV2::Miss);
         }
-        match self
-            .index
-            .lookup(hash, |entry| self.manager.is_visible(entry))
-        {
+        match self.index.lookup_raw(hash) {
+            Ok(IndexLookupV2::Hit(entry)) if self.health.is_healthy() => {
+                Ok(if self.manager.is_visible(entry) {
+                    IndexLookupV2::Hit(entry)
+                } else {
+                    IndexLookupV2::Miss
+                })
+            }
             Ok(result) if self.health.is_healthy() => Ok(result),
             Ok(_) => Ok(IndexLookupV2::Miss),
             Err(_) => {
                 self.health.enter_miss_only();
                 Ok(IndexLookupV2::Miss)
+            }
+        }
+    }
+
+    /// Revalidate only the exact index identity. Region visibility is checked
+    /// separately by the read snapshot owner after the index shard is free.
+    fn revalidate_exact(&self, hash: u64, expected: crate::index::IndexEntry) -> io::Result<bool> {
+        if !self.health.is_healthy() {
+            return Ok(false);
+        }
+        match self.index.revalidate_exact(hash, expected) {
+            Ok(matches) if self.health.is_healthy() => Ok(matches),
+            Ok(_) => Ok(false),
+            Err(_) => {
+                self.health.enter_miss_only();
+                Ok(false)
             }
         }
     }
@@ -1342,10 +1362,8 @@ fn empty_region_metadata(
             durable_used_offset: RECOVERY_PAGE_SIZE as u64,
             max_seqno: 0,
             physical_record_count: 0,
-            logical_entry_count: 0,
-            logical_value_count: 0,
-            logical_record_bytes: 0,
-            logical_value_bytes: 0,
+            live_record_count: 0,
+            live_record_bytes: 0,
         });
     }
     let shards = empty_shard_metadata(&shard_ranges)?;
@@ -1371,12 +1389,8 @@ fn empty_region_metadata(
             physical_value_slots: 0,
             physical_deleted_slots: 0,
             physical_masked_slots: 0,
-            logical_entry_count: 0,
-            logical_value_count: 0,
-            logical_record_bytes: 0,
-            logical_value_bytes: 0,
-            admission_namespace_id: 0,
-            admission_live_bytes: 0,
+            live_record_count: 0,
+            live_record_bytes: 0,
             write_budget_window: 0,
             write_budget_used_bytes: 0,
             free_region_count: data.geometry.region_count - 1,
@@ -1501,6 +1515,7 @@ fn closed_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{IndexEntry, PackedLocation};
     use crate::index_storage::IndexSlotV1;
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::recovery_v2::{DataGeometryV2, PersistentId};
@@ -1909,7 +1924,7 @@ mod tests {
         .unwrap();
         assert_eq!(dirty.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            dirty.runtime.as_ref().unwrap().lookup(11).unwrap(),
+            dirty.runtime.as_ref().unwrap().lookup_snapshot(11).unwrap(),
             IndexLookupV2::Miss
         );
         dirty.close_fast().unwrap();
@@ -2038,7 +2053,12 @@ mod tests {
         .unwrap();
         assert_eq!(rejected.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            rejected.runtime.as_ref().unwrap().lookup(0).unwrap(),
+            rejected
+                .runtime
+                .as_ref()
+                .unwrap()
+                .lookup_snapshot(0)
+                .unwrap(),
             IndexLookupV2::Miss
         );
         rejected.close_fast().unwrap();
@@ -2078,10 +2098,24 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
         let runtime = recovered.runtime.as_ref().unwrap();
-        assert_eq!(runtime.lookup(0).unwrap(), IndexLookupV2::Miss);
-        assert_eq!(runtime.lookup(1).unwrap(), IndexLookupV2::Miss);
+        assert_eq!(runtime.lookup_snapshot(0).unwrap(), IndexLookupV2::Miss);
+        assert!(runtime.health.is_healthy());
+        assert!(
+            !runtime
+                .revalidate_exact(
+                    1,
+                    IndexEntry {
+                        location: PackedLocation::new(0, 4096, 32, false).unwrap(),
+                        seqno: 1,
+                        namespace_id: 0,
+                        flags: 0,
+                    },
+                )
+                .unwrap()
+        );
         assert!(!runtime.health.is_healthy());
-        assert_eq!(runtime.lookup(0).unwrap(), IndexLookupV2::Miss);
+        assert_eq!(runtime.lookup_snapshot(1).unwrap(), IndexLookupV2::Miss);
+        assert_eq!(runtime.lookup_snapshot(0).unwrap(), IndexLookupV2::Miss);
         assert!(recovered.close_warm().is_err());
 
         let mut cold = RegionStoreV2::open_v2(
@@ -2091,7 +2125,7 @@ mod tests {
         .unwrap();
         assert_eq!(cold.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            cold.runtime.as_ref().unwrap().lookup(1).unwrap(),
+            cold.runtime.as_ref().unwrap().lookup_snapshot(1).unwrap(),
             IndexLookupV2::Miss
         );
         cold.close_fast().unwrap();
@@ -2268,7 +2302,12 @@ mod tests {
             RegionV2Startup::CleanMapped | RegionV2Startup::DirtyEmpty
         ));
         assert_eq!(
-            reopened.runtime.as_ref().unwrap().lookup(0).unwrap(),
+            reopened
+                .runtime
+                .as_ref()
+                .unwrap()
+                .lookup_snapshot(0)
+                .unwrap(),
             IndexLookupV2::Miss
         );
         reopened.close_fast().unwrap();

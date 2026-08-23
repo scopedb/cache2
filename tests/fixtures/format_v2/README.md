@@ -1,0 +1,19 @@
+# Format V2 golden fixtures
+
+These files are committed byte truth for the V2 recovery control plane. They
+use the same sparse text representation as the Format V1 fixtures: the first
+line declares the complete byte length, every following line gives a
+hexadecimal offset and non-zero bytes, and unspecified bytes are zero.
+
+The fixtures bind one 128-Region, 32 MiB-per-Region cache with asymmetric
+identities and counters:
+
+- data generation `7`, cache UUID bytes `01`, data identity bytes `02`;
+- hash seed `0x123456789abcdef0` and config fingerprint
+  `0x8877665544332211`;
+- CLEAN state generation `19`, image identity bytes `03`, image generation
+  `11`;
+- 2,016 index slots, a 64 KiB index image, and one 4 KiB Region metadata page.
+
+An intentional change to these bytes requires an explicit Format V2 decision.
+Tests never regenerate the fixtures.

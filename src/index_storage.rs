@@ -29,6 +29,13 @@ pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 32;
 pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
     (INDEX_IMAGE_PAGE_SIZE - INDEX_IMAGE_PAGE_HEADER_SIZE) / INDEX_IMAGE_SLOT_SIZE;
 
+/// Upper bound for one underlying warm-image write.
+///
+/// Page encoding remains independently checksummed at 4 KiB, but warm close
+/// accumulates those pages into a sequential MiB-sized write so a large index
+/// does not issue one positioned syscall per page.
+const WARM_IMAGE_WRITE_BATCH_BYTES: usize = 1024 * 1024;
+
 const PAGE_MAGIC: [u8; 8] = *b"CRSIDX1\0";
 const PAGE_FORMAT_VERSION: u16 = 1;
 
@@ -63,6 +70,7 @@ const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
         == INDEX_IMAGE_PAGE_SIZE
 );
+const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES % INDEX_IMAGE_PAGE_SIZE == 0);
 
 /// One canonical, page-aligned shard of Index Image V1.
 ///
@@ -791,11 +799,29 @@ impl IndexStorage {
 
     /// Sequentially emits a new, fully checksummed Index Image V1.
     ///
-    /// Only a single 4 KiB stack buffer is used, regardless of index size.
-    /// Process-local flags are always cleared before persistence. The
-    /// destination should be an
+    /// Encoding uses one 4 KiB stack page and one lazily allocated, fixed
+    /// 1 MiB write batch regardless of index size. Process-local flags are
+    /// always cleared before persistence. The destination should be an
     /// unpublished temporary image because an error can leave a prefix written.
     pub(crate) fn write_warm_image<W>(
+        &self,
+        writer: &mut W,
+        binding: IndexImageBindingV1,
+    ) -> Result<WarmImageStats, IndexStorageError>
+    where
+        W: Write + ?Sized,
+    {
+        let mut batch_writer = WarmImageBatchWriter::new(writer);
+        let stats = self.write_warm_image_pages(&mut batch_writer, binding)?;
+        batch_writer.finish()?;
+        Ok(stats)
+    }
+
+    /// Emits checksummed pages into a caller-owned batching boundary.
+    ///
+    /// `ShardedIndexStorage` uses this directly so one MiB batch can span
+    /// canonical shard boundaries while all shard read guards stay frozen.
+    fn write_warm_image_pages<W>(
         &self,
         writer: &mut W,
         binding: IndexImageBindingV1,
@@ -1379,8 +1405,9 @@ impl ShardedIndexStorage {
             bytes_written: 0,
             physical_stats: IndexPhysicalStats::default(),
         };
+        let mut batch_writer = WarmImageBatchWriter::new(writer);
         for shard in &frozen_shards {
-            let written = shard.write_warm_image(writer, binding)?;
+            let written = shard.write_warm_image_pages(&mut batch_writer, binding)?;
             total.pages_written = total
                 .pages_written
                 .checked_add(written.pages_written)
@@ -1396,6 +1423,7 @@ impl ShardedIndexStorage {
             total.physical_stats =
                 checked_add_physical_stats(total.physical_stats, written.physical_stats)?;
         }
+        batch_writer.finish()?;
         if total.slots_written != self.slot_count || total.physical_stats != physical_stats {
             return Err(IndexStorageError::InvalidArgument(
                 "canonical index shard image emission is inconsistent",
@@ -1494,6 +1522,77 @@ fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Fixed-memory sequential write combiner used only while producing an
+/// unpublished warm image.
+///
+/// The buffer is allocated lazily, after the index writer has checked the
+/// image binding and transient-mask preconditions. Dropping this writer after
+/// an encoding error intentionally discards an unflushed tail; the destination
+/// image is temporary and must never be published after any error.
+struct WarmImageBatchWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    buffer: Vec<u8>,
+    used: usize,
+}
+
+impl<'a, W: Write + ?Sized> WarmImageBatchWriter<'a, W> {
+    const fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            used: 0,
+        }
+    }
+
+    fn ensure_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            self.buffer
+                .try_reserve_exact(WARM_IMAGE_WRITE_BATCH_BYTES)
+                .map_err(|_| io::Error::other("unable to allocate warm index write batch"))?;
+            self.buffer.resize(WARM_IMAGE_WRITE_BATCH_BYTES, 0);
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.used != 0 {
+            self.inner.write_all(&self.buffer[..self.used])?;
+            self.used = 0;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.flush_buffer()
+    }
+}
+
+impl<W: Write + ?Sized> Write for WarmImageBatchWriter<'_, W> {
+    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
+        let input_len = input.len();
+        if input_len == 0 {
+            return Ok(0);
+        }
+        self.ensure_buffer()?;
+        while !input.is_empty() {
+            let available = WARM_IMAGE_WRITE_BATCH_BYTES - self.used;
+            let copied = available.min(input.len());
+            self.buffer[self.used..self.used + copied].copy_from_slice(&input[..copied]);
+            self.used += copied;
+            input = &input[copied..];
+            if self.used == WARM_IMAGE_WRITE_BATCH_BYTES {
+                self.flush_buffer()?;
+            }
+        }
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffer()?;
+        self.inner.flush()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2025,6 +2124,61 @@ mod tests {
             &[IndexPhysicalStats::default(), expected_shard_stats[1]]
         );
         assert_eq!(source.shard_stats().unwrap(), expected_shard_stats);
+    }
+
+    #[test]
+    fn sharded_warm_image_aggregates_pages_into_bounded_mib_writes() {
+        const PAGES_PER_BATCH: usize = WARM_IMAGE_WRITE_BATCH_BYTES / INDEX_IMAGE_PAGE_SIZE;
+        const PAGE_COUNT: usize = PAGES_PER_BATCH * 3 + 7;
+        const SLOT_COUNT: usize = PAGE_COUNT * INDEX_IMAGE_SLOTS_PER_PAGE;
+
+        #[derive(Default)]
+        struct CountingSink {
+            calls: Vec<usize>,
+            bytes: usize,
+        }
+
+        impl Write for CountingSink {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.calls.push(buffer.len());
+                self.bytes += buffer.len();
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let source = ShardedIndexStorage::anonymous(SLOT_COUNT).unwrap();
+        assert!(
+            source.shard_count() > 1,
+            "test image must span canonical shards"
+        );
+        let mut sink = CountingSink::default();
+        let written = source.write_warm_image(&mut sink, binding(149)).unwrap();
+
+        assert_eq!(written.pages_written, PAGE_COUNT);
+        assert_eq!(written.slots_written, SLOT_COUNT);
+        assert_eq!(sink.bytes, PAGE_COUNT * INDEX_IMAGE_PAGE_SIZE);
+        assert_eq!(
+            sink.calls,
+            [
+                WARM_IMAGE_WRITE_BATCH_BYTES,
+                WARM_IMAGE_WRITE_BATCH_BYTES,
+                WARM_IMAGE_WRITE_BATCH_BYTES,
+                7 * INDEX_IMAGE_PAGE_SIZE,
+            ]
+        );
+        assert!(
+            sink.calls.len() * 100 < PAGE_COUNT,
+            "warm image writes must be aggregated far below one call per page"
+        );
+        assert!(
+            sink.calls
+                .iter()
+                .all(|bytes| *bytes <= WARM_IMAGE_WRITE_BATCH_BYTES)
+        );
     }
 
     #[test]

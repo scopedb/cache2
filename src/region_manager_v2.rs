@@ -6,7 +6,7 @@
 //! queue, and root accounting field from live manager state.
 
 use crate::index::IndexEntry;
-use crate::recovery_v2::PersistentId;
+use crate::recovery_v2::{CacheEpochV2, PersistentId};
 use crate::region_metadata_v1::{
     RegionMetadataRecordV1, RegionMetadataRootV1, RegionMetadataStateV1, RegionMetadataV1,
     RegionMetadataV1Error, ShardMetadataRecordV1,
@@ -27,39 +27,23 @@ pub(crate) struct RegionMetadataBindingV2 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RegionLogicalAccountingV2 {
-    pub(crate) entry_count: u64,
-    pub(crate) value_count: u64,
-    pub(crate) record_bytes: u64,
-    pub(crate) value_bytes: u64,
+    pub(crate) live_record_count: u64,
+    pub(crate) live_record_bytes: u64,
 }
 
 impl RegionLogicalAccountingV2 {
     fn checked_add_region(self, region: &RegionRuntimeV2) -> Result<Self, RegionMetadataV1Error> {
         Ok(Self {
-            entry_count: self
-                .entry_count
-                .checked_add(region.logical.entry_count)
+            live_record_count: self
+                .live_record_count
+                .checked_add(region.logical.live_record_count)
                 .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?,
-            value_count: self
-                .value_count
-                .checked_add(region.logical.value_count)
-                .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?,
-            record_bytes: self
-                .record_bytes
-                .checked_add(region.logical.record_bytes)
-                .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?,
-            value_bytes: self
-                .value_bytes
-                .checked_add(region.logical.value_bytes)
+            live_record_bytes: self
+                .live_record_bytes
+                .checked_add(region.logical.live_record_bytes)
                 .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionAdmissionAccountingV2 {
-    pub(crate) namespace_id: u32,
-    pub(crate) live_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -89,14 +73,13 @@ pub(crate) struct RegionRuntimeV2 {
 pub(crate) struct RegionManagerV2 {
     binding: RegionMetadataBindingV2,
     region_size: u64,
-    cache_epoch: u64,
+    cache_epoch: CacheEpochV2,
     clear_floor_seqno: u64,
     next_seqno: u64,
     regions: Vec<RegionRuntimeV2>,
     active_regions: Vec<u32>,
     free_regions: VecDeque<u32>,
     sealed_regions: VecDeque<u32>,
-    admission_namespace_id: u32,
     write_budget: RegionWriteBudgetV2,
 }
 
@@ -139,10 +122,8 @@ impl RegionManagerV2 {
                 max_seqno: encoded.max_seqno,
                 physical_record_count: encoded.physical_record_count,
                 logical: RegionLogicalAccountingV2 {
-                    entry_count: encoded.logical_entry_count,
-                    value_count: encoded.logical_value_count,
-                    record_bytes: encoded.logical_record_bytes,
-                    value_bytes: encoded.logical_value_bytes,
+                    live_record_count: encoded.live_record_count,
+                    live_record_bytes: encoded.live_record_bytes,
                 },
             };
             install_recovered_queue_entry(
@@ -186,7 +167,6 @@ impl RegionManagerV2 {
             active_regions,
             free_regions,
             sealed_regions,
-            admission_namespace_id: root.admission_namespace_id,
             write_budget: RegionWriteBudgetV2 {
                 window: root.write_budget_window,
                 used_bytes: root.write_budget_used_bytes,
@@ -202,7 +182,7 @@ impl RegionManagerV2 {
         self.region_size
     }
 
-    pub(crate) const fn cache_epoch(&self) -> u64 {
+    pub(crate) const fn cache_epoch(&self) -> CacheEpochV2 {
         self.cache_epoch
     }
 
@@ -259,15 +239,6 @@ impl RegionManagerV2 {
             })
     }
 
-    pub(crate) fn admission_accounting(
-        &self,
-    ) -> Result<RegionAdmissionAccountingV2, RegionMetadataV1Error> {
-        Ok(RegionAdmissionAccountingV2 {
-            namespace_id: self.admission_namespace_id,
-            live_bytes: self.logical_accounting()?.value_bytes,
-        })
-    }
-
     /// Freezes the complete Region metadata table against the current
     /// canonical index shard directory and physical counters supplied by the
     /// index owner.
@@ -296,10 +267,8 @@ impl RegionManagerV2 {
                 durable_used_offset: region.durable_used,
                 max_seqno: region.max_seqno,
                 physical_record_count: region.physical_record_count,
-                logical_entry_count: region.logical.entry_count,
-                logical_value_count: region.logical.value_count,
-                logical_record_bytes: region.logical.record_bytes,
-                logical_value_bytes: region.logical.value_bytes,
+                live_record_count: region.logical.live_record_count,
+                live_record_bytes: region.logical.live_record_bytes,
             });
         }
 
@@ -336,12 +305,8 @@ impl RegionManagerV2 {
                 physical_value_slots: shard_totals.physical_value_slots,
                 physical_deleted_slots: shard_totals.physical_deleted_slots,
                 physical_masked_slots: shard_totals.physical_masked_slots,
-                logical_entry_count: logical.entry_count,
-                logical_value_count: logical.value_count,
-                logical_record_bytes: logical.record_bytes,
-                logical_value_bytes: logical.value_bytes,
-                admission_namespace_id: self.admission_namespace_id,
-                admission_live_bytes: logical.value_bytes,
+                live_record_count: logical.live_record_count,
+                live_record_bytes: logical.live_record_bytes,
                 write_budget_window: self.write_budget.window,
                 write_budget_used_bytes: self.write_budget.used_bytes,
                 free_region_count,
@@ -554,12 +519,8 @@ mod tests {
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
                 physical_masked_slots: 0,
-                logical_entry_count: 1,
-                logical_value_count: 1,
-                logical_record_bytes: 64,
-                logical_value_bytes: 64,
-                admission_namespace_id: 9,
-                admission_live_bytes: 64,
+                live_record_count: 1,
+                live_record_bytes: 64,
                 write_budget_window: 123,
                 write_budget_used_bytes: 456,
                 free_region_count: 2,
@@ -588,7 +549,7 @@ mod tests {
         created_seqno: u64,
         used_bytes: u64,
         max_seqno: u64,
-        logical_entries: u64,
+        live_records: u64,
     ) -> RegionMetadataRecordV1 {
         RegionMetadataRecordV1 {
             region_id,
@@ -599,10 +560,8 @@ mod tests {
             durable_used_offset: crate::recovery_v2::RECOVERY_PAGE_SIZE as u64 + used_bytes,
             max_seqno,
             physical_record_count: used_bytes / 64,
-            logical_entry_count: logical_entries,
-            logical_value_count: logical_entries,
-            logical_record_bytes: logical_entries * 64,
-            logical_value_bytes: logical_entries * 64,
+            live_record_count: live_records,
+            live_record_bytes: live_records * 64,
         }
     }
 
@@ -637,17 +596,8 @@ mod tests {
         assert_eq!(
             manager.logical_accounting().unwrap(),
             RegionLogicalAccountingV2 {
-                entry_count: 1,
-                value_count: 1,
-                record_bytes: 64,
-                value_bytes: 64,
-            }
-        );
-        assert_eq!(
-            manager.admission_accounting().unwrap(),
-            RegionAdmissionAccountingV2 {
-                namespace_id: 9,
-                live_bytes: 64,
+                live_record_count: 1,
+                live_record_bytes: 64,
             }
         );
         assert_eq!(

@@ -14,7 +14,7 @@ use crate::index_storage::{
     canonical_index_shard_ranges,
 };
 use crate::recovery_v2::{
-    DataSuperblockV2, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1,
+    CacheEpochV2, DataSuperblockV2, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1,
 };
 use std::fmt;
 
@@ -68,13 +68,13 @@ const ROOT_MAX_SEQNO_OFFSET: usize = 128;
 const ROOT_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 136;
 const ROOT_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 144;
 const ROOT_PHYSICAL_MASKED_SLOTS_OFFSET: usize = 152;
-const ROOT_LOGICAL_ENTRY_COUNT_OFFSET: usize = 160;
-const ROOT_LOGICAL_VALUE_COUNT_OFFSET: usize = 168;
-const ROOT_LOGICAL_RECORD_BYTES_OFFSET: usize = 176;
-const ROOT_LOGICAL_VALUE_BYTES_OFFSET: usize = 184;
-const ROOT_ADMISSION_NAMESPACE_OFFSET: usize = 192;
+const ROOT_LIVE_RECORD_COUNT_OFFSET: usize = 160;
+const ROOT_DEPRECATED_VALUE_COUNT_OFFSET: usize = 168;
+const ROOT_LIVE_RECORD_BYTES_OFFSET: usize = 176;
+const ROOT_DEPRECATED_VALUE_BYTES_OFFSET: usize = 184;
+const ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET: usize = 192;
 const ROOT_FLAGS_OFFSET: usize = 196;
-const ROOT_ADMISSION_LIVE_BYTES_OFFSET: usize = 200;
+const ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET: usize = 200;
 const ROOT_WRITE_BUDGET_WINDOW_OFFSET: usize = 208;
 const ROOT_WRITE_BUDGET_USED_OFFSET: usize = 216;
 const ROOT_REGION_FIRST_PAGE_OFFSET: usize = 224;
@@ -96,10 +96,10 @@ const REGION_CREATED_SEQNO_OFFSET: usize = 16;
 const REGION_DURABLE_USED_OFFSET: usize = 24;
 const REGION_MAX_SEQNO_OFFSET: usize = 32;
 const REGION_RECORD_COUNT_OFFSET: usize = 40;
-const REGION_LOGICAL_ENTRY_COUNT_OFFSET: usize = 48;
-const REGION_LOGICAL_VALUE_COUNT_OFFSET: usize = 56;
-const REGION_LOGICAL_RECORD_BYTES_OFFSET: usize = 64;
-const REGION_LOGICAL_VALUE_BYTES_OFFSET: usize = 72;
+const REGION_LIVE_RECORD_COUNT_OFFSET: usize = 48;
+const REGION_DEPRECATED_VALUE_COUNT_OFFSET: usize = 56;
+const REGION_LIVE_RECORD_BYTES_OFFSET: usize = 64;
+const REGION_DEPRECATED_VALUE_BYTES_OFFSET: usize = 72;
 const REGION_RESERVED_OFFSET: usize = 80;
 
 const SHARD_ID_OFFSET: usize = 0;
@@ -170,18 +170,20 @@ pub(crate) struct RegionMetadataRootV1 {
     pub(crate) region_count: u32,
     pub(crate) shard_count: u32,
     pub(crate) append_lane_count: u32,
-    pub(crate) cache_epoch: u64,
+    /// Matches the fixed-width epoch in the V2 record header. The physical
+    /// root slot remains eight bytes so the metadata page layout stays fixed;
+    /// its high 32 bits are reserved and must be zero.
+    pub(crate) cache_epoch: CacheEpochV2,
     pub(crate) clear_floor_seqno: u64,
     pub(crate) max_seqno: u64,
     pub(crate) physical_value_slots: u64,
     pub(crate) physical_deleted_slots: u64,
     pub(crate) physical_masked_slots: u64,
-    pub(crate) logical_entry_count: u64,
-    pub(crate) logical_value_count: u64,
-    pub(crate) logical_record_bytes: u64,
-    pub(crate) logical_value_bytes: u64,
-    pub(crate) admission_namespace_id: u32,
-    pub(crate) admission_live_bytes: u64,
+    /// Number of logically reachable Value records.
+    pub(crate) live_record_count: u64,
+    /// Sum of their aligned on-disk record lengths. This is the sole live-byte
+    /// and admission charge used by V2.
+    pub(crate) live_record_bytes: u64,
     /// Zero means that no write-budget window is persisted.
     pub(crate) write_budget_window: u64,
     pub(crate) write_budget_used_bytes: u64,
@@ -203,10 +205,10 @@ pub(crate) struct RegionMetadataRecordV1 {
     pub(crate) durable_used_offset: u64,
     pub(crate) max_seqno: u64,
     pub(crate) physical_record_count: u64,
-    pub(crate) logical_entry_count: u64,
-    pub(crate) logical_value_count: u64,
-    pub(crate) logical_record_bytes: u64,
-    pub(crate) logical_value_bytes: u64,
+    pub(crate) live_record_count: u64,
+    /// Sum of aligned record lengths for reachable Value records in this
+    /// Region.
+    pub(crate) live_record_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -525,12 +527,9 @@ fn validate_root_directory(root: RegionMetadataRootV1, layout: MetadataLayout) -
         || root.clear_floor_seqno == 0
         || root.clear_floor_seqno > root.max_seqno
         || root.max_seqno == u64::MAX
-        || root.logical_value_count > root.logical_entry_count
-        || root.logical_value_bytes > root.logical_record_bytes
-        || (root.logical_entry_count == 0) != (root.logical_record_bytes == 0)
-        || (root.logical_value_count == 0) != (root.logical_value_bytes == 0)
-        || root.logical_entry_count > root.physical_value_slots
-        || root.admission_live_bytes != root.logical_value_bytes
+        || (root.live_record_count == 0) != (root.live_record_bytes == 0)
+        || root.live_record_count > root.physical_value_slots
+        || root.live_record_bytes % 32 != 0
         || root.active_region_count != root.append_lane_count
         || root
             .free_region_count
@@ -612,10 +611,8 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
                 || region.durable_used_offset != RECOVERY_PAGE_SIZE as u64
                 || region.max_seqno != 0
                 || region.physical_record_count != 0
-                || region.logical_entry_count != 0
-                || region.logical_value_count != 0
-                || region.logical_record_bytes != 0
-                || region.logical_value_bytes != 0
+                || region.live_record_count != 0
+                || region.live_record_bytes != 0
             {
                 return Err(RegionMetadataV1Error::InvalidField("free_region"));
             }
@@ -631,16 +628,12 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
             || (empty && region.max_seqno != 0)
             || (!empty
                 && (region.max_seqno < region.created_seqno || region.max_seqno > root.max_seqno))
-            || region.logical_entry_count > region.physical_record_count
-            || region.logical_value_count > region.logical_entry_count
-            || region.logical_value_bytes > region.logical_record_bytes
-            || (region.logical_entry_count == 0) != (region.logical_record_bytes == 0)
-            || (region.logical_value_count == 0) != (region.logical_value_bytes == 0)
-            || region.logical_record_bytes > used_bytes
-            || region.logical_value_bytes > used_bytes
+            || region.live_record_count > region.physical_record_count
+            || (region.live_record_count == 0) != (region.live_record_bytes == 0)
+            || region.live_record_bytes > used_bytes
+            || region.live_record_bytes % 32 != 0
             || !minimum_bytes_fit(region.physical_record_count, used_bytes)?
-            || !minimum_bytes_fit(region.logical_entry_count, region.logical_record_bytes)?
-            || !minimum_bytes_fit(region.logical_value_count, region.logical_value_bytes)?
+            || !minimum_bytes_fit(region.live_record_count, region.live_record_bytes)?
         {
             return Err(RegionMetadataV1Error::InvalidField("allocated_region"));
         }
@@ -659,10 +652,8 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
     if sealed_created.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(RegionMetadataV1Error::InvalidField("sealed_fifo_order"));
     }
-    if totals.logical_entry_count != root.logical_entry_count
-        || totals.logical_value_count != root.logical_value_count
-        || totals.logical_record_bytes != root.logical_record_bytes
-        || totals.logical_value_bytes != root.logical_value_bytes
+    if totals.live_record_count != root.live_record_count
+        || totals.live_record_bytes != root.live_record_bytes
     {
         return Err(RegionMetadataV1Error::InvalidField("region_accounting"));
     }
@@ -744,22 +735,14 @@ fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool> {
 
 #[derive(Default)]
 struct RegionTotals {
-    logical_entry_count: u64,
-    logical_value_count: u64,
-    logical_record_bytes: u64,
-    logical_value_bytes: u64,
+    live_record_count: u64,
+    live_record_bytes: u64,
 }
 
 impl RegionTotals {
     fn add(&mut self, region: RegionMetadataRecordV1) -> Result<()> {
-        self.logical_entry_count =
-            checked_add(self.logical_entry_count, region.logical_entry_count)?;
-        self.logical_value_count =
-            checked_add(self.logical_value_count, region.logical_value_count)?;
-        self.logical_record_bytes =
-            checked_add(self.logical_record_bytes, region.logical_record_bytes)?;
-        self.logical_value_bytes =
-            checked_add(self.logical_value_bytes, region.logical_value_bytes)?;
+        self.live_record_count = checked_add(self.live_record_count, region.live_record_count)?;
+        self.live_record_bytes = checked_add(self.live_record_bytes, region.live_record_bytes)?;
         Ok(())
     }
 }
@@ -1027,7 +1010,7 @@ fn encode_root(root: &RegionMetadataRootV1, layout: MetadataLayout, output: &mut
         root.append_lane_count,
     );
     put_u32(output, ROOT_NAMESPACE_COUNT_OFFSET, 1);
-    put_u64(output, ROOT_CACHE_EPOCH_OFFSET, root.cache_epoch);
+    put_u64(output, ROOT_CACHE_EPOCH_OFFSET, u64::from(root.cache_epoch));
     put_u64(
         output,
         ROOT_CLEAR_FLOOR_SEQNO_OFFSET,
@@ -1051,36 +1034,20 @@ fn encode_root(root: &RegionMetadataRootV1, layout: MetadataLayout, output: &mut
     );
     put_u64(
         output,
-        ROOT_LOGICAL_ENTRY_COUNT_OFFSET,
-        root.logical_entry_count,
+        ROOT_LIVE_RECORD_COUNT_OFFSET,
+        root.live_record_count,
     );
+    put_u64(output, ROOT_DEPRECATED_VALUE_COUNT_OFFSET, 0);
     put_u64(
         output,
-        ROOT_LOGICAL_VALUE_COUNT_OFFSET,
-        root.logical_value_count,
+        ROOT_LIVE_RECORD_BYTES_OFFSET,
+        root.live_record_bytes,
     );
-    put_u64(
-        output,
-        ROOT_LOGICAL_RECORD_BYTES_OFFSET,
-        root.logical_record_bytes,
-    );
-    put_u64(
-        output,
-        ROOT_LOGICAL_VALUE_BYTES_OFFSET,
-        root.logical_value_bytes,
-    );
-    put_u32(
-        output,
-        ROOT_ADMISSION_NAMESPACE_OFFSET,
-        root.admission_namespace_id,
-    );
+    put_u64(output, ROOT_DEPRECATED_VALUE_BYTES_OFFSET, 0);
+    put_u32(output, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET, 0);
     let flags = u32::from(root.write_budget_window != 0) * ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW;
     put_u32(output, ROOT_FLAGS_OFFSET, flags);
-    put_u64(
-        output,
-        ROOT_ADMISSION_LIVE_BYTES_OFFSET,
-        root.admission_live_bytes,
-    );
+    put_u64(output, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET, 0);
     put_u64(
         output,
         ROOT_WRITE_BUDGET_WINDOW_OFFSET,
@@ -1133,6 +1100,10 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRootV1> {
     if input.len() != REGION_METADATA_V1_ROOT_SIZE
         || get_u32(input, ROOT_NAMESPACE_COUNT_OFFSET)? != 1
         || get_u32(input, ROOT_FLAGS_OFFSET)? & !ROOT_FLAGS_SUPPORTED != 0
+        || get_u64(input, ROOT_DEPRECATED_VALUE_COUNT_OFFSET)? != 0
+        || get_u64(input, ROOT_DEPRECATED_VALUE_BYTES_OFFSET)? != 0
+        || get_u32(input, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET)? != 0
+        || get_u64(input, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET)? != 0
         || get_u32(input, ROOT_RESERVED_OFFSET)? != 0
     {
         return Err(RegionMetadataV1Error::InvalidField("root_encoding"));
@@ -1145,6 +1116,8 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRootV1> {
     {
         return Err(RegionMetadataV1Error::InvalidField("root_write_budget"));
     }
+    let cache_epoch = u32::try_from(get_u64(input, ROOT_CACHE_EPOCH_OFFSET)?)
+        .map_err(|_| RegionMetadataV1Error::InvalidField("cache_epoch"))?;
     Ok(RegionMetadataRootV1 {
         cache_uuid: get_id(input, ROOT_CACHE_UUID_OFFSET)?,
         data_identity: get_id(input, ROOT_DATA_IDENTITY_OFFSET)?,
@@ -1158,18 +1131,14 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRootV1> {
         region_count: get_u32(input, ROOT_REGION_COUNT_OFFSET)?,
         shard_count: get_u32(input, ROOT_SHARD_COUNT_OFFSET)?,
         append_lane_count: get_u32(input, ROOT_APPEND_LANE_COUNT_OFFSET)?,
-        cache_epoch: get_u64(input, ROOT_CACHE_EPOCH_OFFSET)?,
+        cache_epoch,
         clear_floor_seqno: get_u64(input, ROOT_CLEAR_FLOOR_SEQNO_OFFSET)?,
         max_seqno: get_u64(input, ROOT_MAX_SEQNO_OFFSET)?,
         physical_value_slots: get_u64(input, ROOT_PHYSICAL_VALUE_SLOTS_OFFSET)?,
         physical_deleted_slots: get_u64(input, ROOT_PHYSICAL_DELETED_SLOTS_OFFSET)?,
         physical_masked_slots: get_u64(input, ROOT_PHYSICAL_MASKED_SLOTS_OFFSET)?,
-        logical_entry_count: get_u64(input, ROOT_LOGICAL_ENTRY_COUNT_OFFSET)?,
-        logical_value_count: get_u64(input, ROOT_LOGICAL_VALUE_COUNT_OFFSET)?,
-        logical_record_bytes: get_u64(input, ROOT_LOGICAL_RECORD_BYTES_OFFSET)?,
-        logical_value_bytes: get_u64(input, ROOT_LOGICAL_VALUE_BYTES_OFFSET)?,
-        admission_namespace_id: get_u32(input, ROOT_ADMISSION_NAMESPACE_OFFSET)?,
-        admission_live_bytes: get_u64(input, ROOT_ADMISSION_LIVE_BYTES_OFFSET)?,
+        live_record_count: get_u64(input, ROOT_LIVE_RECORD_COUNT_OFFSET)?,
+        live_record_bytes: get_u64(input, ROOT_LIVE_RECORD_BYTES_OFFSET)?,
         write_budget_window,
         write_budget_used_bytes,
         free_region_count: get_u32(input, ROOT_FREE_REGION_COUNT_OFFSET)?,
@@ -1199,30 +1168,24 @@ fn encode_region(region: &RegionMetadataRecordV1, output: &mut [u8]) {
     );
     put_u64(
         output,
-        REGION_LOGICAL_ENTRY_COUNT_OFFSET,
-        region.logical_entry_count,
+        REGION_LIVE_RECORD_COUNT_OFFSET,
+        region.live_record_count,
     );
+    put_u64(output, REGION_DEPRECATED_VALUE_COUNT_OFFSET, 0);
     put_u64(
         output,
-        REGION_LOGICAL_VALUE_COUNT_OFFSET,
-        region.logical_value_count,
+        REGION_LIVE_RECORD_BYTES_OFFSET,
+        region.live_record_bytes,
     );
-    put_u64(
-        output,
-        REGION_LOGICAL_RECORD_BYTES_OFFSET,
-        region.logical_record_bytes,
-    );
-    put_u64(
-        output,
-        REGION_LOGICAL_VALUE_BYTES_OFFSET,
-        region.logical_value_bytes,
-    );
+    put_u64(output, REGION_DEPRECATED_VALUE_BYTES_OFFSET, 0);
 }
 
 fn decode_region(input: &[u8]) -> Result<RegionMetadataRecordV1> {
     if input.len() != REGION_METADATA_V1_REGION_SIZE
         || input[REGION_FLAGS_OFFSET] != 0
         || get_u16(input, REGION_RESERVED16_OFFSET)? != 0
+        || get_u64(input, REGION_DEPRECATED_VALUE_COUNT_OFFSET)? != 0
+        || get_u64(input, REGION_DEPRECATED_VALUE_BYTES_OFFSET)? != 0
         || input[REGION_RESERVED_OFFSET..]
             .iter()
             .any(|byte| *byte != 0)
@@ -1239,10 +1202,8 @@ fn decode_region(input: &[u8]) -> Result<RegionMetadataRecordV1> {
         durable_used_offset: get_u64(input, REGION_DURABLE_USED_OFFSET)?,
         max_seqno: get_u64(input, REGION_MAX_SEQNO_OFFSET)?,
         physical_record_count: get_u64(input, REGION_RECORD_COUNT_OFFSET)?,
-        logical_entry_count: get_u64(input, REGION_LOGICAL_ENTRY_COUNT_OFFSET)?,
-        logical_value_count: get_u64(input, REGION_LOGICAL_VALUE_COUNT_OFFSET)?,
-        logical_record_bytes: get_u64(input, REGION_LOGICAL_RECORD_BYTES_OFFSET)?,
-        logical_value_bytes: get_u64(input, REGION_LOGICAL_VALUE_BYTES_OFFSET)?,
+        live_record_count: get_u64(input, REGION_LIVE_RECORD_COUNT_OFFSET)?,
+        live_record_bytes: get_u64(input, REGION_LIVE_RECORD_BYTES_OFFSET)?,
     })
 }
 
@@ -1409,12 +1370,8 @@ mod tests {
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
                 physical_masked_slots: 0,
-                logical_entry_count: 1,
-                logical_value_count: 1,
-                logical_record_bytes: 128,
-                logical_value_bytes: 128,
-                admission_namespace_id: 0,
-                admission_live_bytes: 128,
+                live_record_count: 1,
+                live_record_bytes: 128,
                 write_budget_window: 20_000,
                 write_budget_used_bytes: 4096,
                 free_region_count: 1,
@@ -1431,10 +1388,8 @@ mod tests {
                     durable_used_offset: RECOVERY_PAGE_SIZE as u64,
                     max_seqno: 0,
                     physical_record_count: 0,
-                    logical_entry_count: 0,
-                    logical_value_count: 0,
-                    logical_record_bytes: 0,
-                    logical_value_bytes: 0,
+                    live_record_count: 0,
+                    live_record_bytes: 0,
                 },
                 RegionMetadataRecordV1 {
                     region_id: 1,
@@ -1445,10 +1400,8 @@ mod tests {
                     durable_used_offset: RECOVERY_PAGE_SIZE as u64 + 128,
                     max_seqno: 3,
                     physical_record_count: 2,
-                    logical_entry_count: 1,
-                    logical_value_count: 1,
-                    logical_record_bytes: 128,
-                    logical_value_bytes: 128,
+                    live_record_count: 1,
+                    live_record_bytes: 128,
                 },
                 RegionMetadataRecordV1 {
                     region_id: 2,
@@ -1459,10 +1412,8 @@ mod tests {
                     durable_used_offset: RECOVERY_PAGE_SIZE as u64 + 64,
                     max_seqno: 4,
                     physical_record_count: 1,
-                    logical_entry_count: 0,
-                    logical_value_count: 0,
-                    logical_record_bytes: 0,
-                    logical_value_bytes: 0,
+                    live_record_count: 0,
+                    live_record_bytes: 0,
                 },
                 RegionMetadataRecordV1 {
                     region_id: 3,
@@ -1473,10 +1424,8 @@ mod tests {
                     durable_used_offset: RECOVERY_PAGE_SIZE as u64,
                     max_seqno: 0,
                     physical_record_count: 0,
-                    logical_entry_count: 0,
-                    logical_value_count: 0,
-                    logical_record_bytes: 0,
-                    logical_value_bytes: 0,
+                    live_record_count: 0,
+                    live_record_bytes: 0,
                 },
             ]
             .into_boxed_slice(),
@@ -1542,6 +1491,78 @@ mod tests {
             &encoded[REGION_METADATA_V1_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET
                 ..REGION_METADATA_V1_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET + 8],
             &200_u64.to_le_bytes()
+        );
+        let root = &encoded[REGION_METADATA_V1_PAGE_HEADER_SIZE
+            ..REGION_METADATA_V1_PAGE_HEADER_SIZE + REGION_METADATA_V1_ROOT_SIZE];
+        assert_eq!(get_u64(root, ROOT_DEPRECATED_VALUE_COUNT_OFFSET), Ok(0));
+        assert_eq!(get_u64(root, ROOT_DEPRECATED_VALUE_BYTES_OFFSET), Ok(0));
+        assert_eq!(
+            get_u32(root, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET),
+            Ok(0)
+        );
+        assert_eq!(
+            get_u64(root, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn deprecated_accounting_slots_and_epoch_high_bits_are_rejected() {
+        let mut root_reserved = sample().encode().unwrap();
+        let root_page = page_mut(&mut root_reserved, 0).unwrap();
+        put_u64(
+            page_payload_mut(root_page, 0, REGION_METADATA_V1_ROOT_SIZE),
+            ROOT_DEPRECATED_VALUE_COUNT_OFFSET,
+            1,
+        );
+        finish_page(root_page);
+        assert_eq!(
+            RegionMetadataV1::decode(&root_reserved),
+            Err(RegionMetadataV1Error::InvalidField("root_encoding"))
+        );
+
+        let mut region_reserved = sample().encode().unwrap();
+        let region_page = page_mut(&mut region_reserved, 1).unwrap();
+        put_u64(
+            page_payload_mut(region_page, 1, REGION_METADATA_V1_REGION_SIZE),
+            REGION_DEPRECATED_VALUE_BYTES_OFFSET,
+            32,
+        );
+        finish_page(region_page);
+        assert_eq!(
+            RegionMetadataV1::decode(&region_reserved),
+            Err(RegionMetadataV1Error::InvalidField("region_encoding"))
+        );
+
+        let mut wide_epoch = sample().encode().unwrap();
+        let root_page = page_mut(&mut wide_epoch, 0).unwrap();
+        put_u64(
+            page_payload_mut(root_page, 0, REGION_METADATA_V1_ROOT_SIZE),
+            ROOT_CACHE_EPOCH_OFFSET,
+            u64::from(u32::MAX) + 1,
+        );
+        finish_page(root_page);
+        assert_eq!(
+            RegionMetadataV1::decode(&wide_epoch),
+            Err(RegionMetadataV1Error::InvalidField("cache_epoch"))
+        );
+    }
+
+    #[test]
+    fn live_record_charge_is_aligned_and_exactly_summed() {
+        let mut unaligned = sample();
+        unaligned.root.live_record_bytes = 127;
+        unaligned.regions[1].live_record_bytes = 127;
+        assert_eq!(
+            unaligned.validate(),
+            Err(RegionMetadataV1Error::InvalidField("root"))
+        );
+
+        let mut duplicate = sample();
+        duplicate.root.live_record_bytes += 64;
+        assert_eq!(
+            duplicate.validate(),
+            Err(RegionMetadataV1Error::InvalidField("region_accounting"))
         );
     }
 
@@ -1648,18 +1669,6 @@ mod tests {
         ] {
             sample_with_index_slots(index_slots).validate().unwrap();
         }
-    }
-
-    #[test]
-    fn duplicate_accounting_is_checked_without_walking_index_slots() {
-        let mut invalid = sample();
-        invalid.root.logical_record_bytes += 64;
-        invalid.root.logical_value_bytes += 64;
-        invalid.root.admission_live_bytes += 64;
-        assert_eq!(
-            invalid.encode(),
-            Err(RegionMetadataV1Error::InvalidField("region_accounting"))
-        );
     }
 
     #[test]

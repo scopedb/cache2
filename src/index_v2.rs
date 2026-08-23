@@ -1,12 +1,14 @@
 //! Mask-aware bounded point operations over the Region V2 mmap index.
 //!
 //! This layer owns the sharded storage but deliberately does not own Region
-//! visibility or logical accounting. Callers hold that authority and supply a
-//! visibility predicate while this type keeps one canonical shard locked for
-//! an entire probe. No slot is modified until the probe has selected its final
-//! target. Callers of `*_with_commit` must acquire their stable Region-manager
-//! authority before entering; the callback updates that already-held guard and
-//! must be infallible and non-reentrant.
+//! visibility or logical accounting. A lookup returns only the raw typed point
+//! state and releases its canonical shard before the caller consults Region
+//! authority. Mutations may still receive a visibility predicate after the
+//! caller has acquired stable Region-manager authority. No slot is modified
+//! until the probe has selected its final target. Callers of `*_with_commit`
+//! must acquire their stable Region-manager authority before entering; the
+//! callback updates that already-held guard and must be infallible and
+//! non-reentrant.
 
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
 use crate::index_storage::{IndexSlotStateV1, IndexStorageError, ShardedIndexStorage};
@@ -136,12 +138,12 @@ impl RegionIndexV2 {
         self.storage
     }
 
-    /// Looks up the unique same-hash identity in one bounded probe window.
-    pub(crate) fn lookup(
-        &self,
-        hash: u64,
-        mut is_visible: impl FnMut(IndexEntry) -> bool,
-    ) -> Result<IndexLookupV2, IndexStorageError> {
+    /// Looks up the raw typed state for one same-hash identity.
+    ///
+    /// Region generation and clear-floor visibility deliberately do not run
+    /// here: the shard guard is released when this method returns, before the
+    /// runtime consults its Region manager.
+    pub(crate) fn lookup_raw(&self, hash: u64) -> Result<IndexLookupV2, IndexStorageError> {
         let shard = self.storage.read_hash_shard(hash);
         let start = start_slot(hash, shard.slot_count());
         for step in 0..probe_limit(shard.slot_count()) {
@@ -161,16 +163,29 @@ impl RegionIndexV2 {
                     entry,
                 } => {
                     if current_hash == hash {
-                        return Ok(if is_visible(entry) {
-                            IndexLookupV2::Hit(entry)
-                        } else {
-                            IndexLookupV2::Miss
-                        });
+                        return Ok(IndexLookupV2::Hit(entry));
                     }
                 }
             }
         }
         Ok(IndexLookupV2::Miss)
+    }
+
+    /// Revalidates the exact immutable record identity observed by a prior
+    /// lookup without consulting Region visibility.
+    ///
+    /// Runtime-only flags are ignored because their transitions do not change
+    /// the physical record version. The caller separately revalidates its
+    /// Region generation/epoch snapshot after this shard guard is released.
+    pub(crate) fn revalidate_exact(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+    ) -> Result<bool, IndexStorageError> {
+        Ok(matches!(
+            self.lookup_raw(hash)?,
+            IndexLookupV2::Hit(current) if current.same_record_identity(expected)
+        ))
     }
 
     /// Installs a live value using the existing bounded replacement policy.
@@ -660,10 +675,7 @@ mod tests {
                 previous: Some(visible),
             } if old == first && new == second && visible == first
         ));
-        assert_eq!(
-            index.lookup(hash, |_| true).unwrap(),
-            IndexLookupV2::Hit(second)
-        );
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookupV2::Hit(second));
 
         assert_eq!(index.replace_if(hash, first, replacement).unwrap(), None);
         assert_eq!(
@@ -696,7 +708,44 @@ mod tests {
                 ..
             }) if old == replacement
         ));
-        assert_eq!(index.lookup(hash, |_| true).unwrap(), IndexLookupV2::Miss);
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookupV2::Miss);
+    }
+
+    #[test]
+    fn raw_lookup_and_exact_revalidate_need_no_visibility_callback() {
+        let index = anonymous(8);
+        let hash = 5;
+        let current = entry(2, 16, 9);
+        assert!(matches!(
+            index.upsert(hash, current, |_| true).unwrap(),
+            IndexUpsertV2::Applied { .. }
+        ));
+
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookupV2::Hit(current));
+        assert!(index.revalidate_exact(hash, current).unwrap());
+        assert!(
+            index
+                .revalidate_exact(
+                    hash,
+                    IndexEntry {
+                        flags: 7,
+                        ..current
+                    }
+                )
+                .unwrap()
+        );
+        assert!(!index.revalidate_exact(hash, entry(3, 24, 9)).unwrap());
+        assert!(!index.revalidate_exact(hash, entry(2, 16, 10)).unwrap());
+
+        assert!(matches!(
+            index.mask_if_newer(hash, 10, |_| true).unwrap(),
+            IndexMaskV2::Applied { .. }
+        ));
+        assert_eq!(
+            index.lookup_raw(hash).unwrap(),
+            IndexLookupV2::Masked { seqno: 10 }
+        );
+        assert!(!index.revalidate_exact(hash, current).unwrap());
     }
 
     #[test]
@@ -808,7 +857,7 @@ mod tests {
             } if entry == prior && visible == prior
         ));
         assert_eq!(
-            index.lookup(hash, |_| true).unwrap(),
+            index.lookup_raw(hash).unwrap(),
             IndexLookupV2::Masked { seqno: 12 }
         );
         assert_eq!(
@@ -955,7 +1004,7 @@ mod tests {
         );
 
         assert_eq!(
-            recovered.lookup(HASH_IN_SECOND_SHARD, |_| true).unwrap(),
+            recovered.lookup_raw(HASH_IN_SECOND_SHARD).unwrap(),
             IndexLookupV2::Hit(value)
         );
         assert_eq!(recovered.storage().shard_stats().unwrap(), shard_stats);

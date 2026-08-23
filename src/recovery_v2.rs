@@ -20,6 +20,11 @@ pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE_V1: u64 = INDEX_IMAGE_SLOTS_PER_P
 pub(crate) const REGION_HEADER_SIZE_V2: u32 = RECOVERY_PAGE_SIZE as u32;
 pub(crate) const RECORD_ALIGNMENT_V2: u32 = 32;
 pub(crate) const RECORD_FORMAT_VERSION_V2: u16 = 1;
+/// Cache-wide generation carried by both recovery metadata and every record.
+///
+/// Keeping one fixed width avoids an implicit truncation boundary when a
+/// runtime epoch is encoded into the reused V1 record header.
+pub(crate) type CacheEpochV2 = u32;
 
 const DATA_MAGIC: [u8; 8] = *b"CRDATA\0\0";
 const STATE_MAGIC: [u8; 8] = *b"CRSTATE\0";
@@ -964,6 +969,35 @@ mod tests {
         PersistentId::from_bytes([byte; 16]).unwrap()
     }
 
+    fn sparse_golden(input: &str) -> Vec<u8> {
+        let mut output: Option<Vec<u8>> = None;
+        for raw_line in input.lines() {
+            let line = raw_line.split('#').next().unwrap().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let first = fields.next().unwrap();
+            if first == "length" {
+                let length = fields.next().unwrap().parse::<usize>().unwrap();
+                assert!(output.replace(vec![0_u8; length]).is_none());
+                continue;
+            }
+            let offset = usize::from_str_radix(first, 16).unwrap();
+            let encoded = fields.next().unwrap();
+            assert_eq!(encoded.len() % 2, 0);
+            let bytes = encoded
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+            let output = output.as_mut().expect("golden length must come first");
+            output[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            assert!(fields.next().is_none());
+        }
+        output.expect("golden fixture must declare its length")
+    }
+
     fn data_superblock() -> DataSuperblockV2 {
         let region_size = 32 * 1024 * 1024;
         let region_count = 128;
@@ -1019,6 +1053,29 @@ mod tests {
                 (state == RecoveryState::Clean).then_some(image()),
             ),
         }
+    }
+
+    #[test]
+    fn format_v2_recovery_control_pages_match_committed_golden_bytes() {
+        let data = data_superblock();
+        let clean = record(19, RecoveryState::Clean);
+        let image = image_header();
+        let data_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v2/data_superblock.golden"
+        ));
+        let clean_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v2/clean_state.golden"
+        ));
+        let image_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v2/recovery_image_header.golden"
+        ));
+
+        assert_eq!(data.encode().unwrap().as_slice(), data_golden);
+        assert_eq!(clean.encode().unwrap().as_slice(), clean_golden);
+        assert_eq!(image.encode().unwrap().as_slice(), image_golden);
+        assert_eq!(DataSuperblockV2::decode(&data_golden), Some(data));
+        assert_eq!(StateRecordV2::decode(&clean_golden), Some(clean));
+        assert_eq!(RecoveryImageHeaderV1::decode(&image_golden), Some(image));
     }
 
     #[test]
