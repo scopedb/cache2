@@ -164,7 +164,7 @@ impl AsyncHybridCache {
     ) -> CacheFuture<Result<T>>
     where
         T: Send + 'static,
-        F: Fn(HybridLookupOutcome) -> T + Send + 'static,
+        F: FnOnce(HybridLookupOutcome) -> T + Send + 'static,
     {
         let cache = match self.cache_for_read() {
             Ok(cache) => cache,

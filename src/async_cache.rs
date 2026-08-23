@@ -359,14 +359,14 @@ struct RequestCore<T> {
     phase: Arc<AtomicU8>,
     stop: Arc<StopToken>,
     completion: Completion<T>,
-    failure: Arc<dyn Fn(AsyncFailure) -> T + Send + Sync>,
+    failure: Box<dyn Fn(AsyncFailure) -> T + Send + Sync>,
     timer: Weak<TimerInner>,
     timer_key: Mutex<Option<TimerKey>>,
     queued_in: Mutex<Option<Weak<PoolInner>>>,
 }
 
 impl<T> RequestCore<T> {
-    fn new(failure: Arc<dyn Fn(AsyncFailure) -> T + Send + Sync>, timer: Weak<TimerInner>) -> Self {
+    fn new(failure: Box<dyn Fn(AsyncFailure) -> T + Send + Sync>, timer: Weak<TimerInner>) -> Self {
         Self {
             phase: Arc::new(AtomicU8::new(PHASE_QUEUED)),
             stop: Arc::new(StopToken::new()),
@@ -430,7 +430,6 @@ impl<T> RequestCore<T> {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            self.stop.set(failure);
                             self.unregister_timer();
                             self.remove_from_queue();
                             self.completion.complete((self.failure)(failure));
@@ -648,7 +647,6 @@ impl PoolInner {
     fn release_reservation(&self, class: QueueClass) {
         let mut state = lock_unpoisoned(&self.state);
         release_reservation_locked(&mut state, class);
-        self.changed.notify_all();
     }
 
     fn begin_drain(&self) {
@@ -1222,7 +1220,7 @@ impl AsyncExecutor {
     {
         let pool = Arc::clone(&reservation.pool);
         let core = Arc::new(RequestCore::new(
-            Arc::new(map_failure),
+            Box::new(map_failure),
             Arc::downgrade(&self.timer.inner),
         ));
         let runnable: Box<dyn Runnable> = Box::new(RunnableTask {
@@ -1723,16 +1721,9 @@ impl AsyncDiskCache {
         if let Some(error) = write_status_error(cache.status()) {
             return ready_future(Err(error));
         }
-        let reservation = match self.inner.executor.reserve_control() {
-            Ok(reservation) => reservation,
-            Err(failure) => return ready_future(map_write_failure(failure)),
-        };
-        self.inner.executor.submit_mutation_reserved(
-            reservation,
-            request_options,
-            map_write_failure,
-            move |_| cache.flush(),
-        )
+        self.inner
+            .executor
+            .submit_control(request_options, map_write_failure, move |_| cache.flush())
     }
 
     pub fn clear(&self) -> CacheFuture<CacheResult<()>> {
@@ -1753,16 +1744,9 @@ impl AsyncDiskCache {
         if let Some(error) = write_status_error(cache.status()) {
             return ready_future(Err(error));
         }
-        let reservation = match self.inner.executor.reserve_control() {
-            Ok(reservation) => reservation,
-            Err(failure) => return ready_future(map_write_failure(failure)),
-        };
-        self.inner.executor.submit_mutation_reserved(
-            reservation,
-            request_options,
-            map_write_failure,
-            move |_| cache.clear(),
-        )
+        self.inner
+            .executor
+            .submit_control(request_options, map_write_failure, move |_| cache.clear())
     }
 
     /// Drain every accepted facade request, stop its workers, and then close
@@ -1786,36 +1770,12 @@ impl AsyncDiskCache {
         let inner = Arc::clone(&self.inner);
         let spawn = thread::Builder::new()
             .name("cache-rs-async-close".into())
-            .spawn(move || {
-                let worker_panicked = inner.drain_and_join();
-                let Some(cache) = inner.cache() else {
-                    inner.finish_close(false);
-                    return;
-                };
-                if catch_unwind(AssertUnwindSafe(|| {
-                    cache.close_after_async_drain(&inner, worker_panicked)
-                }))
-                .is_err()
-                {
-                    inner.finish_close(false);
-                }
-            });
+            .spawn(move || inner.drain_and_close());
         if spawn.is_err() {
             // Thread creation failure must not strand the file lock. The
             // caller pays the synchronous drain cost, but observes the same
             // shared close result as the normal coordinator path.
-            let worker_panicked = self.inner.drain_and_join();
-            let Some(cache) = self.inner.cache() else {
-                self.inner.finish_close(false);
-                return;
-            };
-            if catch_unwind(AssertUnwindSafe(|| {
-                cache.close_after_async_drain(&self.inner, worker_panicked)
-            }))
-            .is_err()
-            {
-                self.inner.finish_close(false);
-            }
+            self.inner.drain_and_close();
         }
     }
 }
@@ -1855,6 +1815,21 @@ impl AsyncInner {
     pub(crate) fn drain_and_join(&self) -> bool {
         self.executor.begin_drain().wait();
         self.executor.join()
+    }
+
+    fn drain_and_close(&self) {
+        let worker_panicked = self.drain_and_join();
+        let Some(cache) = self.cache() else {
+            self.finish_close(false);
+            return;
+        };
+        if catch_unwind(AssertUnwindSafe(|| {
+            cache.close_after_async_drain(self, worker_panicked)
+        }))
+        .is_err()
+        {
+            self.finish_close(false);
+        }
     }
 
     /// Publish the one shared async-close result.
