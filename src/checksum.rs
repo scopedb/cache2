@@ -1,34 +1,14 @@
-//! Dependency-free CRC32C (Castagnoli) used by the on-disk format.
+//! CRC32C (Castagnoli) used by the on-disk format.
+//!
+//! The dependency selects hardware acceleration when the host supports it and
+//! retains a portable software fallback. This wrapper keeps the cache's codec
+//! API and checksum values independent from that implementation detail.
 
-const CRC32C_POLYNOMIAL: u32 = 0x82f6_3b78;
-
-const CRC32C_TABLE: [u32; 256] = make_table();
-
-const fn make_table() -> [u32; 256] {
-    let mut table = [0_u32; 256];
-    let mut index = 0;
-    while index < table.len() {
-        let mut value = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            value = if value & 1 == 1 {
-                (value >> 1) ^ CRC32C_POLYNOMIAL
-            } else {
-                value >> 1
-            };
-            bit += 1;
-        }
-        table[index] = value;
-        index += 1;
-    }
-    table
-}
+use crc32c::{crc32c as accelerated_crc32c, crc32c_append};
 
 /// Computes the standard CRC32C checksum of `bytes`.
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
-    let mut checksum = Crc32c::new();
-    checksum.update(bytes);
-    checksum.finish()
+    accelerated_crc32c(bytes)
 }
 
 /// Incremental CRC32C state, useful for checksumming a key and value without
@@ -40,18 +20,15 @@ pub(crate) struct Crc32c {
 
 impl Crc32c {
     pub(crate) const fn new() -> Self {
-        Self { state: u32::MAX }
+        Self { state: 0 }
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            let index = ((self.state ^ u32::from(byte)) & 0xff) as usize;
-            self.state = (self.state >> 8) ^ CRC32C_TABLE[index];
-        }
+        self.state = crc32c_append(self.state, bytes);
     }
 
     pub(crate) const fn finish(self) -> u32 {
-        !self.state
+        self.state
     }
 }
 
@@ -78,5 +55,21 @@ mod tests {
         checksum.update(b"value");
 
         assert_eq!(checksum.finish(), crc32c(b"keyvalue"));
+    }
+
+    #[test]
+    fn arbitrary_chunking_matches_one_shot_checksum() {
+        let payload = (0..64 * 1024)
+            .map(|index| ((index * 31 + index / 7) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let expected = crc32c(&payload);
+
+        for chunk_bytes in [1, 7, 64, 4093, payload.len()] {
+            let mut checksum = Crc32c::new();
+            for chunk in payload.chunks(chunk_bytes) {
+                checksum.update(chunk);
+            }
+            assert_eq!(checksum.finish(), expected, "chunk size {chunk_bytes}");
+        }
     }
 }
