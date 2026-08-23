@@ -1395,12 +1395,7 @@ impl ShardedIndex {
     }
 
     fn shard_for(&self, hash: u64) -> usize {
-        debug_assert!(self.shards.len().is_power_of_two());
-        if self.shards.len() == 1 {
-            return 0;
-        }
-        let shard_bits = self.shards.len().trailing_zeros();
-        (mix_for_shard(hash) >> (u64::BITS - shard_bits)) as usize
+        index_shard_for(hash, self.shards.len())
     }
 
     fn physical_slot_parts(&self, physical_slot: usize) -> Option<(usize, usize)> {
@@ -1418,6 +1413,18 @@ impl ShardedIndex {
             Some((remainder + relative / base, relative % base))
         }
     }
+}
+
+/// Stable hash route shared by the legacy heap index and the V2 mmap-backed
+/// shard directory. `shard_count` is fixed at format time and must be a
+/// non-zero power of two.
+pub(crate) fn index_shard_for(hash: u64, shard_count: usize) -> usize {
+    debug_assert!(shard_count.is_power_of_two());
+    if shard_count == 1 {
+        return 0;
+    }
+    let shard_bits = shard_count.trailing_zeros();
+    (mix_for_shard(hash) >> (u64::BITS - shard_bits)) as usize
 }
 
 fn subtract_exact(counter: &AtomicUsize, amount: usize) {
@@ -1473,6 +1480,23 @@ mod tests {
 
     fn location(region_id: u32, offset: u32) -> PackedLocation {
         PackedLocation::new(region_id, offset, 32, false).unwrap()
+    }
+
+    #[test]
+    fn shard_route_is_stable_for_v2_images() {
+        let cases = [
+            (0_u64, [0, 0, 0, 0]),
+            (1, [1, 2, 5, 2_885]),
+            (0x0123_4567_89ab_cdef, [1, 2, 4, 2_172]),
+            (u64::MAX, [0, 1, 3, 1_611]),
+            (0x9e37_79b9_7f4a_7c15, [1, 2, 4, 2_506]),
+        ];
+        for (hash, expected) in cases {
+            assert_eq!(index_shard_for(hash, 2), expected[0]);
+            assert_eq!(index_shard_for(hash, 4), expected[1]);
+            assert_eq!(index_shard_for(hash, 8), expected[2]);
+            assert_eq!(index_shard_for(hash, 4_096), expected[3]);
+        }
     }
 
     #[test]

@@ -9,7 +9,10 @@ use crate::checksum::Crc32c;
 use crate::index::{
     MAX_INDEX_SHARDS, MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE,
 };
-use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
+use crate::index_storage::{
+    INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE, IndexStorageError,
+    canonical_index_shard_ranges,
+};
 use crate::recovery_v2::{
     DataSuperblockV2, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1,
 };
@@ -667,25 +670,44 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
 }
 
 fn validate_shards(root: RegionMetadataRootV1, shards: &[ShardMetadataRecordV1]) -> Result<()> {
-    let mut next_page = 0_u64;
-    let mut next_slot = 0_u64;
+    let index_slots =
+        usize::try_from(root.index_slots).map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+    let canonical = canonical_index_shard_ranges(index_slots).map_err(|error| match error {
+        IndexStorageError::SizeOverflow => RegionMetadataV1Error::ArithmeticOverflow,
+        // The canonical helper performs no I/O. Its only I/O-shaped failure
+        // is the fallible allocation of this O(shards) directory.
+        IndexStorageError::Io(_) => RegionMetadataV1Error::Allocation,
+        _ => RegionMetadataV1Error::InvalidField("canonical_shard_directory"),
+    })?;
+    if canonical.len() != shards.len() {
+        return Err(RegionMetadataV1Error::InvalidField(
+            "canonical_shard_directory",
+        ));
+    }
+
     let mut live = 0_u64;
     let mut deleted = 0_u64;
     let mut masked = 0_u64;
-    for (expected_id, shard) in shards.iter().copied().enumerate() {
-        let pages_for_shard =
-            pages_for_records(shard.slot_count, INDEX_IMAGE_SLOTS_PER_PAGE as u64)?;
-        if shard.shard_id as usize != expected_id
-            || shard.first_index_page != next_page
-            || shard.first_slot != next_slot
-            || shard.first_slot
-                != shard
-                    .first_index_page
-                    .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE as u64)
-                    .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?
-            || shard.slot_count < 8
-            || shard.index_page_count != u64::from(pages_for_shard)
-            || shard.physical_masked_slots != 0
+    for (shard, expected) in shards.iter().copied().zip(canonical.iter().copied()) {
+        let expected_first_page = u64::try_from(expected.first_page)
+            .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+        let expected_page_count = u64::try_from(expected.page_count)
+            .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+        let expected_first_slot = u64::try_from(expected.first_slot)
+            .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+        let expected_slot_count = u64::try_from(expected.slot_count)
+            .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+        if shard.shard_id as usize != expected.shard_id
+            || shard.first_index_page != expected_first_page
+            || shard.index_page_count != expected_page_count
+            || shard.first_slot != expected_first_slot
+            || shard.slot_count != expected_slot_count
+        {
+            return Err(RegionMetadataV1Error::InvalidField(
+                "canonical_shard_directory",
+            ));
+        }
+        if shard.physical_masked_slots != 0
             || checked_sum3(
                 shard.physical_value_slots,
                 shard.physical_deleted_slots,
@@ -694,12 +716,6 @@ fn validate_shards(root: RegionMetadataRootV1, shards: &[ShardMetadataRecordV1])
         {
             return Err(RegionMetadataV1Error::InvalidField("shard"));
         }
-        next_page = next_page
-            .checked_add(shard.index_page_count)
-            .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?;
-        next_slot = next_slot
-            .checked_add(shard.slot_count)
-            .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?;
         live = live
             .checked_add(shard.physical_value_slots)
             .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?;
@@ -710,9 +726,7 @@ fn validate_shards(root: RegionMetadataRootV1, shards: &[ShardMetadataRecordV1])
             .checked_add(shard.physical_masked_slots)
             .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?;
     }
-    if next_page != root.index_page_count
-        || next_slot != root.index_slots
-        || live != root.physical_value_slots
+    if live != root.physical_value_slots
         || deleted != root.physical_deleted_slots
         || masked != root.physical_masked_slots
     {
@@ -1492,6 +1506,31 @@ mod tests {
         }
     }
 
+    fn sample_with_index_slots(index_slots: usize) -> RegionMetadataV1 {
+        let mut metadata = sample();
+        let ranges = canonical_index_shard_ranges(index_slots).unwrap();
+        metadata.root.index_slots = index_slots as u64;
+        metadata.root.index_page_count = ranges.iter().map(|range| range.page_count as u64).sum();
+        metadata.root.shard_count = ranges.len() as u32;
+        metadata.shards = ranges
+            .iter()
+            .map(|range| ShardMetadataRecordV1 {
+                shard_id: range.shard_id as u32,
+                first_index_page: range.first_page as u64,
+                index_page_count: range.page_count as u64,
+                first_slot: range.first_slot as u64,
+                slot_count: range.slot_count as u64,
+                physical_value_slots: 0,
+                physical_deleted_slots: 0,
+                physical_masked_slots: 0,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        metadata.shards[0].physical_value_slots = metadata.root.physical_value_slots;
+        metadata.shards[0].physical_deleted_slots = metadata.root.physical_deleted_slots;
+        metadata
+    }
+
     #[test]
     fn round_trip_preserves_exact_frozen_authority() {
         let expected = sample();
@@ -1538,8 +1577,77 @@ mod tests {
         invalid.shards[1].first_slot = 125;
         assert_eq!(
             invalid.encode(),
-            Err(RegionMetadataV1Error::InvalidField("shard"))
+            Err(RegionMetadataV1Error::InvalidField(
+                "canonical_shard_directory"
+            ))
         );
+    }
+
+    #[test]
+    fn crc_valid_page_balanced_but_non_canonical_shard_directory_is_rejected() {
+        let metadata = sample_with_index_slots(12 * INDEX_IMAGE_SLOTS_PER_PAGE);
+        let ranges = canonical_index_shard_ranges(metadata.root.index_slots as usize).unwrap();
+        let right = ranges
+            .iter()
+            .position(|range| range.shard_id != 0 && range.page_count >= 2)
+            .unwrap();
+        let left = right - 1;
+        assert_eq!(right / REGION_METADATA_V1_SHARDS_PER_PAGE, 0);
+
+        let mut encoded = metadata.encode().unwrap();
+        let layout =
+            MetadataLayout::new(metadata.root.region_count, metadata.root.shard_count).unwrap();
+        let shard_page = page_mut(&mut encoded, layout.shard_first_page as usize).unwrap();
+        let left_record = page_payload_mut(shard_page, left, REGION_METADATA_V1_SHARD_SIZE);
+        let left_pages = get_u64(left_record, SHARD_INDEX_PAGE_COUNT_OFFSET).unwrap();
+        let left_slots = get_u64(left_record, SHARD_SLOT_COUNT_OFFSET).unwrap();
+        put_u64(left_record, SHARD_INDEX_PAGE_COUNT_OFFSET, left_pages + 1);
+        put_u64(
+            left_record,
+            SHARD_SLOT_COUNT_OFFSET,
+            left_slots + INDEX_IMAGE_SLOTS_PER_PAGE as u64,
+        );
+        let right_record = page_payload_mut(shard_page, right, REGION_METADATA_V1_SHARD_SIZE);
+        let right_first_page = get_u64(right_record, SHARD_FIRST_INDEX_PAGE_OFFSET).unwrap();
+        let right_pages = get_u64(right_record, SHARD_INDEX_PAGE_COUNT_OFFSET).unwrap();
+        let right_first_slot = get_u64(right_record, SHARD_FIRST_SLOT_OFFSET).unwrap();
+        let right_slots = get_u64(right_record, SHARD_SLOT_COUNT_OFFSET).unwrap();
+        put_u64(
+            right_record,
+            SHARD_FIRST_INDEX_PAGE_OFFSET,
+            right_first_page + 1,
+        );
+        put_u64(right_record, SHARD_INDEX_PAGE_COUNT_OFFSET, right_pages - 1);
+        put_u64(
+            right_record,
+            SHARD_FIRST_SLOT_OFFSET,
+            right_first_slot + INDEX_IMAGE_SLOTS_PER_PAGE as u64,
+        );
+        put_u64(
+            right_record,
+            SHARD_SLOT_COUNT_OFFSET,
+            right_slots - INDEX_IMAGE_SLOTS_PER_PAGE as u64,
+        );
+        finish_page(shard_page);
+
+        assert_eq!(
+            RegionMetadataV1::decode(&encoded),
+            Err(RegionMetadataV1Error::InvalidField(
+                "canonical_shard_directory"
+            ))
+        );
+    }
+
+    #[test]
+    fn metadata_accepts_canonical_partial_tail_and_maximum_layouts() {
+        for index_slots in [
+            INDEX_IMAGE_SLOTS_PER_PAGE + 1,
+            INDEX_IMAGE_SLOTS_PER_PAGE + 7,
+            INDEX_IMAGE_SLOTS_PER_PAGE + 8,
+            MAX_INDEX_SLOTS,
+        ] {
+            sample_with_index_slots(index_slots).validate().unwrap();
+        }
     }
 
     #[test]

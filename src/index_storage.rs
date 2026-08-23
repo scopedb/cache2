@@ -7,12 +7,14 @@
 //! runtime mutations become private copy-on-write pages.
 
 use crate::checksum::Crc32c;
-use crate::index::INDEX_RUNTIME_ONLY_FLAGS;
+use crate::index::{INDEX_RUNTIME_ONLY_FLAGS, MAX_INDEX_SHARDS};
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
@@ -56,6 +58,114 @@ const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
         == INDEX_IMAGE_PAGE_SIZE
 );
+
+/// One canonical, page-aligned shard of Index Image V1.
+///
+/// Ordinals are global to the complete image. Every physical 4 KiB page is
+/// owned by exactly one range, so a shard lock also owns every slot byte and
+/// lazy-validation state it can mutate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexShardRangeV1 {
+    pub(crate) shard_id: usize,
+    pub(crate) first_page: usize,
+    pub(crate) page_count: usize,
+    pub(crate) first_slot: usize,
+    pub(crate) slot_count: usize,
+}
+
+/// Builds the stable page-balanced shard directory for one slot capacity.
+///
+/// The shard count is the greatest usable power of two bounded by the physical
+/// page count and [`MAX_INDEX_SHARDS`]. Extra pages are assigned to the final
+/// shards so the partially filled final image page stays with a larger range.
+/// If that range would still contain fewer than eight slots, the shard count is
+/// halved until every range is a valid bounded-probe table.
+pub(crate) fn canonical_index_shard_ranges(
+    slot_count: usize,
+) -> Result<Box<[IndexShardRangeV1]>, IndexStorageError> {
+    if slot_count < 8 {
+        return Err(IndexStorageError::InvalidArgument(
+            "sharded index storage requires at least 8 slots",
+        ));
+    }
+    let layout = ImageLayout::new(slot_count)?;
+    let maximum = layout.page_count.min(MAX_INDEX_SHARDS);
+    let mut shard_count = greatest_power_of_two(maximum);
+    while shard_count > 1 && final_shard_slots(slot_count, layout.page_count, shard_count)? < 8 {
+        shard_count /= 2;
+    }
+
+    let base_pages = layout.page_count / shard_count;
+    let extra_pages = layout.page_count % shard_count;
+    let first_extra = shard_count - extra_pages;
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(shard_count).map_err(|_| {
+        IndexStorageError::Io(io::Error::other(
+            "unable to allocate canonical index shard directory",
+        ))
+    })?;
+    let mut first_page = 0_usize;
+    for shard_id in 0..shard_count {
+        let page_count = base_pages + usize::from(shard_id >= first_extra);
+        let first_slot = first_page
+            .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+        let range_capacity = page_count
+            .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+        let slots_remaining = slot_count
+            .checked_sub(first_slot)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+        let range_slot_count = slots_remaining.min(range_capacity);
+        if page_count == 0 || range_slot_count < 8 {
+            return Err(IndexStorageError::InvalidArgument(
+                "canonical index shard contains fewer than 8 slots",
+            ));
+        }
+        ranges.push(IndexShardRangeV1 {
+            shard_id,
+            first_page,
+            page_count,
+            first_slot,
+            slot_count: range_slot_count,
+        });
+        first_page = first_page
+            .checked_add(page_count)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+    }
+    debug_assert_eq!(first_page, layout.page_count);
+    debug_assert_eq!(
+        ranges
+            .last()
+            .and_then(|range| range.first_slot.checked_add(range.slot_count)),
+        Some(slot_count)
+    );
+    Ok(ranges.into_boxed_slice())
+}
+
+fn greatest_power_of_two(limit: usize) -> usize {
+    debug_assert!(limit != 0);
+    1_usize << (usize::BITS - 1 - limit.leading_zeros())
+}
+
+fn final_shard_slots(
+    slot_count: usize,
+    page_count: usize,
+    shard_count: usize,
+) -> Result<usize, IndexStorageError> {
+    let base_pages = page_count / shard_count;
+    let extra_pages = page_count % shard_count;
+    let final_pages = base_pages + usize::from(extra_pages != 0);
+    let first_page = page_count
+        .checked_sub(final_pages)
+        .ok_or(IndexStorageError::SizeOverflow)?;
+    let first_slot = first_page
+        .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
+        .ok_or(IndexStorageError::SizeOverflow)?;
+    slot_count
+        .checked_sub(first_slot)
+        .ok_or(IndexStorageError::SizeOverflow)
+}
 
 /// Logical fields in one Index Image V1 slot.
 ///
@@ -367,33 +477,33 @@ pub(crate) struct WarmImageStats {
 /// each source page only when a slot on that page is first read or mutated.
 /// Callers must freeze mutations while [`Self::write_warm_image`] runs.
 pub(crate) struct IndexStorage {
-    backing: Backing,
-    data_offset: usize,
-    image_len: usize,
-    slot_count: usize,
-    page_count: usize,
-    expected_binding: Option<IndexImageBindingV1>,
+    core: Arc<IndexStorageCore>,
+    range: IndexShardRangeV1,
     physical_stats: IndexPhysicalStats,
-    image_state: AtomicU8,
-    page_states: Box<[AtomicU8]>,
 }
 
 impl IndexStorage {
     /// Creates a lazily allocated, zero-filled runtime image.
     pub(crate) fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
         let layout = ImageLayout::new(slot_count)?;
-        let backing = Backing::anonymous(layout.image_len)?;
+        let mut backing = Backing::anonymous(layout.image_len)?;
+        let data_pointer = backing.as_mut_ptr();
         let page_states = allocate_page_states(layout.page_count, PAGE_STATE_VALID)?;
-        Ok(Self {
-            backing,
+        let core = Arc::new(IndexStorageCore {
+            _backing: UnsafeCell::new(backing),
+            data_pointer,
             data_offset: 0,
             image_len: layout.image_len,
             slot_count,
             page_count: layout.page_count,
             expected_binding: None,
-            physical_stats: IndexPhysicalStats::default(),
             image_state: AtomicU8::new(IMAGE_STATE_USABLE),
             page_states,
+        });
+        Ok(Self {
+            core,
+            range: whole_image_range(slot_count, layout.page_count),
+            physical_stats: IndexPhysicalStats::default(),
         })
     }
 
@@ -442,23 +552,29 @@ impl IndexStorage {
             .into());
         }
 
-        let backing = Backing::map_file_private(file, mapping_len)?;
+        let mut backing = Backing::map_file_private(file, mapping_len)?;
+        let data_pointer = backing.as_mut_ptr();
         let page_states = allocate_page_states(layout.page_count, PAGE_STATE_UNCHECKED)?;
-        Ok(Self {
-            backing,
+        let core = Arc::new(IndexStorageCore {
+            _backing: UnsafeCell::new(backing),
+            data_pointer,
             data_offset,
             image_len: layout.image_len,
             slot_count,
             page_count: layout.page_count,
             expected_binding: Some(expected_binding),
-            physical_stats,
             image_state: AtomicU8::new(IMAGE_STATE_USABLE),
             page_states,
+        });
+        Ok(Self {
+            core,
+            range: whole_image_range(slot_count, layout.page_count),
+            physical_stats,
         })
     }
 
     pub(crate) const fn slot_count(&self) -> usize {
-        self.slot_count
+        self.range.slot_count
     }
 
     pub(crate) const fn physical_stats(&self) -> IndexPhysicalStats {
@@ -474,61 +590,35 @@ impl IndexStorage {
         &self,
         page: usize,
     ) -> Result<PageValidationState, IndexStorageError> {
-        let state = self
-            .page_states
-            .get(page)
-            .ok_or(IndexStorageError::PageOutOfBounds {
-                page,
-                page_count: self.page_count,
-            })?;
-        if self.image_is_rejected() {
-            return Ok(PageValidationState::Rejected);
-        }
-        let state = state.load(Ordering::Acquire);
-        Ok(match state {
-            PAGE_STATE_UNCHECKED => PageValidationState::Unchecked,
-            PAGE_STATE_VALIDATING => PageValidationState::Validating,
-            PAGE_STATE_VALID => PageValidationState::Valid,
-            PAGE_STATE_DIRTY => PageValidationState::Dirty,
-            PAGE_STATE_REJECTED => PageValidationState::Rejected,
-            _ => PageValidationState::Rejected,
-        })
+        self.core.page_validation_state(self.global_page(page)?)
     }
 
     pub(crate) fn read_slot(&self, slot: usize) -> Result<IndexSlotV1, IndexStorageError> {
-        let (page, offset) = self.slot_address(slot)?;
-        self.ensure_page_valid(page)?;
-        Ok(self.decode_at(offset))
+        self.core.read_slot(self.global_slot(slot)?)
     }
 
-    /// Encodes one logical slot. Exclusive access makes the byte mutation
-    /// sound; the future sharded index must split storage on page boundaries or
-    /// put the owning range behind its shard lock.
+    /// Encodes one range-local slot.
+    ///
+    /// Exclusive access owns this complete page-aligned range. Canonical range
+    /// construction guarantees that another view of the same core cannot
+    /// address these slot bytes.
     pub(crate) fn write_slot(
         &mut self,
         slot: usize,
         value: IndexSlotV1,
     ) -> Result<(), IndexStorageError> {
-        let (page, offset) = self.slot_address(slot)?;
-        self.ensure_page_valid(page)?;
-        let old = self.decode_at(offset);
+        let global_slot = self.global_slot(slot)?;
+        let old = self.core.read_slot(global_slot)?;
         let next_stats = self
             .physical_stats
-            .transitioned(old.physical_kind(), value.physical_kind(), self.slot_count)
+            .transitioned(
+                old.physical_kind(),
+                value.physical_kind(),
+                self.range.slot_count,
+            )
             .ok_or(IndexStorageError::InvalidPhysicalStats)?;
-        let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
-        value.encode(&mut encoded);
-        // SAFETY: `offset` identifies one complete slot inside the owned
-        // mapping and `&mut self` excludes simultaneous safe readers/writers.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                encoded.as_ptr(),
-                self.data_mut_ptr().add(offset),
-                INDEX_IMAGE_SLOT_SIZE,
-            );
-        }
+        self.core.write_slot(global_slot, value)?;
         self.physical_stats = next_stats;
-        self.page_states[page].store(PAGE_STATE_DIRTY, Ordering::Release);
         Ok(())
     }
 
@@ -551,20 +641,25 @@ impl IndexStorage {
                 "warm index image binding must be non-zero",
             ));
         }
-        self.ensure_image_usable(0)?;
+        self.core.ensure_image_usable(self.range.first_page)?;
         if self.physical_stats.masked != 0 {
             return Err(IndexStorageError::MaskedSlotsPresent {
                 count: self.physical_stats.masked,
             });
         }
         let mut output = [0_u8; INDEX_IMAGE_PAGE_SIZE];
-        for page in 0..self.page_count {
-            self.ensure_page_valid(page)?;
+        for local_page in 0..self.range.page_count {
+            let page = self
+                .range
+                .first_page
+                .checked_add(local_page)
+                .ok_or(IndexStorageError::SizeOverflow)?;
+            self.core.ensure_page_valid(page)?;
             output.fill(0);
             let first_slot = page
                 .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
                 .ok_or(IndexStorageError::SizeOverflow)?;
-            let valid_slots = self.valid_slots_in_page(page);
+            let valid_slots = self.core.valid_slots_in_page(page);
             encode_page_header(&mut output, page, first_slot, valid_slots, binding)?;
 
             for slot_in_page in 0..valid_slots {
@@ -575,7 +670,7 @@ impl IndexStorage {
                         base.checked_add(slot_in_page.checked_mul(INDEX_IMAGE_SLOT_SIZE)?)
                     })
                     .ok_or(IndexStorageError::SizeOverflow)?;
-                let mut value = self.decode_at(source_offset);
+                let mut value = self.core.decode_at(source_offset);
                 if value.physical_kind().is_masked() {
                     return Err(IndexStorageError::MaskedSlotsPresent { count: 1 });
                 }
@@ -594,12 +689,106 @@ impl IndexStorage {
             writer.write_all(&output)?;
         }
 
+        let bytes_written = self
+            .range
+            .page_count
+            .checked_mul(INDEX_IMAGE_PAGE_SIZE)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(IndexStorageError::SizeOverflow)?;
         Ok(WarmImageStats {
-            pages_written: self.page_count,
-            slots_written: self.slot_count,
-            bytes_written: u64::try_from(self.image_len)
-                .map_err(|_| IndexStorageError::SizeOverflow)?,
+            pages_written: self.range.page_count,
+            slots_written: self.range.slot_count,
+            bytes_written,
         })
+    }
+
+    fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
+        if slot >= self.range.slot_count {
+            return Err(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.range.slot_count,
+            });
+        }
+        self.range
+            .first_slot
+            .checked_add(slot)
+            .ok_or(IndexStorageError::SizeOverflow)
+    }
+
+    fn global_page(&self, page: usize) -> Result<usize, IndexStorageError> {
+        if page >= self.range.page_count {
+            return Err(IndexStorageError::PageOutOfBounds {
+                page,
+                page_count: self.range.page_count,
+            });
+        }
+        self.range
+            .first_page
+            .checked_add(page)
+            .ok_or(IndexStorageError::SizeOverflow)
+    }
+}
+
+struct IndexStorageCore {
+    _backing: UnsafeCell<Backing>,
+    data_pointer: *mut u8,
+    data_offset: usize,
+    image_len: usize,
+    slot_count: usize,
+    page_count: usize,
+    expected_binding: Option<IndexImageBindingV1>,
+    image_state: AtomicU8,
+    page_states: Box<[AtomicU8]>,
+}
+
+impl IndexStorageCore {
+    fn page_validation_state(&self, page: usize) -> Result<PageValidationState, IndexStorageError> {
+        let state = self
+            .page_states
+            .get(page)
+            .ok_or(IndexStorageError::PageOutOfBounds {
+                page,
+                page_count: self.page_count,
+            })?;
+        if self.image_is_rejected() {
+            return Ok(PageValidationState::Rejected);
+        }
+        Ok(match state.load(Ordering::Acquire) {
+            PAGE_STATE_UNCHECKED => PageValidationState::Unchecked,
+            PAGE_STATE_VALIDATING => PageValidationState::Validating,
+            PAGE_STATE_VALID => PageValidationState::Valid,
+            PAGE_STATE_DIRTY => PageValidationState::Dirty,
+            PAGE_STATE_REJECTED => PageValidationState::Rejected,
+            _ => PageValidationState::Rejected,
+        })
+    }
+
+    fn read_slot(&self, slot: usize) -> Result<IndexSlotV1, IndexStorageError> {
+        let (page, offset) = self.slot_address(slot)?;
+        self.ensure_page_valid(page)?;
+        let value = self.decode_at(offset);
+        self.ensure_image_usable(page)?;
+        Ok(value)
+    }
+
+    fn write_slot(&self, slot: usize, value: IndexSlotV1) -> Result<(), IndexStorageError> {
+        let (page, offset) = self.slot_address(slot)?;
+        self.ensure_page_valid(page)?;
+        let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
+        value.encode(&mut encoded);
+        // SAFETY: callers can reach this method only through one non-Clone
+        // `IndexStorage` range while holding its exclusive shard lock or `&mut`
+        // owner. Canonical ranges never overlap, and `offset` addresses one
+        // complete slot inside that range.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                self.data_mut_ptr().add(offset),
+                INDEX_IMAGE_SLOT_SIZE,
+            );
+        }
+        self.page_states[page].store(PAGE_STATE_DIRTY, Ordering::Release);
+        self.ensure_image_usable(page)
     }
 
     fn slot_address(&self, slot: usize) -> Result<(usize, usize), IndexStorageError> {
@@ -747,23 +936,294 @@ impl IndexStorage {
     }
 
     fn data_ptr(&self) -> *const u8 {
-        // SAFETY: `data_offset + image_len` was checked against the backing
-        // length during construction.
-        unsafe { self.backing.as_ptr().add(self.data_offset) }
+        // SAFETY: `data_pointer` addresses the stable allocation owned by
+        // `_backing`, and `data_offset + image_len` was checked against that
+        // allocation during construction.
+        unsafe { self.data_pointer.cast_const().add(self.data_offset) }
     }
 
-    fn data_mut_ptr(&mut self) -> *mut u8 {
-        // SAFETY: `data_offset + image_len` was checked against the backing
-        // length during construction, and mutable access is exclusive.
-        unsafe { self.backing.as_mut_ptr().add(self.data_offset) }
+    fn data_mut_ptr(&self) -> *mut u8 {
+        // SAFETY: callers provide exclusive access to a non-overlapping shard
+        // range. Using the cached raw allocation pointer avoids manufacturing
+        // overlapping `&mut Backing` references for concurrent ranges.
+        unsafe { self.data_pointer.add(self.data_offset) }
     }
 }
 
-// Shared access only validates or reads bytes. All byte mutation requires
-// `&mut IndexStorage`, so these marker implementations preserve Rust's aliasing
-// and data-race requirements.
-unsafe impl Send for IndexStorage {}
-unsafe impl Sync for IndexStorage {}
+// `IndexStorageCore` owns one stable mapping shared by non-overlapping canonical
+// ranges. Shared operations only validate/read; byte writes require the owning
+// range's exclusive lock or `&mut IndexStorage`.
+unsafe impl Send for IndexStorageCore {}
+unsafe impl Sync for IndexStorageCore {}
+
+fn whole_image_range(slot_count: usize, page_count: usize) -> IndexShardRangeV1 {
+    IndexShardRangeV1 {
+        shard_id: 0,
+        first_page: 0,
+        page_count,
+        first_slot: 0,
+        slot_count,
+    }
+}
+
+/// Canonically sharded views over one anonymous or MAP_PRIVATE index image.
+///
+/// Every view owns its physical counters and is protected by one range lock;
+/// all views share a single backing mapping, page-validation table, and sticky
+/// image-health state. Mapping and warm-image work are therefore O(shards), not
+/// O(slots), until a slot page is actually touched.
+pub(crate) struct ShardedIndexStorage {
+    slot_count: usize,
+    ranges: Box<[IndexShardRangeV1]>,
+    shards: Box<[RwLock<IndexStorage>]>,
+}
+
+impl ShardedIndexStorage {
+    pub(crate) fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
+        let ranges = canonical_index_shard_ranges(slot_count)?;
+        let whole = IndexStorage::anonymous(slot_count)?;
+        let IndexStorage { core, .. } = whole;
+        Self::from_core(slot_count, ranges, core, None)
+    }
+
+    pub(crate) fn map_private(
+        file: &File,
+        file_offset: u64,
+        slot_count: usize,
+        expected_binding: IndexImageBindingV1,
+        shard_stats: &[IndexPhysicalStats],
+    ) -> Result<Self, IndexStorageError> {
+        let ranges = canonical_index_shard_ranges(slot_count)?;
+        if shard_stats.len() != ranges.len() {
+            return Err(IndexStorageError::InvalidPhysicalStats);
+        }
+        for (range, stats) in ranges.iter().zip(shard_stats) {
+            if !stats.is_valid_for(range.slot_count) {
+                return Err(IndexStorageError::InvalidPhysicalStats);
+            }
+        }
+        let physical_stats = checked_sum_physical_stats(shard_stats)?;
+        if !physical_stats.is_valid_for(slot_count) {
+            return Err(IndexStorageError::InvalidPhysicalStats);
+        }
+        let whole = IndexStorage::map_private(
+            file,
+            file_offset,
+            slot_count,
+            expected_binding,
+            physical_stats,
+        )?;
+        let IndexStorage { core, .. } = whole;
+        Self::from_core(slot_count, ranges, core, Some(shard_stats))
+    }
+
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub(crate) fn shard_ranges(&self) -> &[IndexShardRangeV1] {
+        &self.ranges
+    }
+
+    pub(crate) fn physical_stats(&self) -> Result<IndexPhysicalStats, IndexStorageError> {
+        let mut stats = IndexPhysicalStats::default();
+        for shard in &self.shards {
+            stats = checked_add_physical_stats(stats, read_unpoisoned(shard).physical_stats())?;
+        }
+        stats
+            .is_valid_for(self.slot_count)
+            .then_some(stats)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)
+    }
+
+    pub(crate) fn shard_stats(&self) -> Result<Box<[IndexPhysicalStats]>, IndexStorageError> {
+        let mut stats = Vec::new();
+        stats.try_reserve_exact(self.shards.len()).map_err(|_| {
+            IndexStorageError::Io(io::Error::other(
+                "unable to allocate index shard statistics",
+            ))
+        })?;
+        for shard in &self.shards {
+            stats.push(read_unpoisoned(shard).physical_stats());
+        }
+        Ok(stats.into_boxed_slice())
+    }
+
+    pub(crate) fn read_slot(&self, slot: usize) -> Result<IndexSlotV1, IndexStorageError> {
+        let (shard, local_slot) = self.shard_for_slot(slot)?;
+        read_unpoisoned(&self.shards[shard]).read_slot(local_slot)
+    }
+
+    pub(crate) fn write_slot(
+        &self,
+        slot: usize,
+        value: IndexSlotV1,
+    ) -> Result<(), IndexStorageError> {
+        let (shard, local_slot) = self.shard_for_slot(slot)?;
+        write_unpoisoned(&self.shards[shard]).write_slot(local_slot, value)
+    }
+
+    /// Sequentially writes all canonical ranges in global page order.
+    ///
+    /// Every range read lock remains held for the complete emission, making
+    /// the file one coherent index snapshot. The warm-close owner must still
+    /// keep runtime mutation frozen until the matching metadata is published.
+    pub(crate) fn write_warm_image<W>(
+        &self,
+        writer: &mut W,
+        binding: IndexImageBindingV1,
+    ) -> Result<WarmImageStats, IndexStorageError>
+    where
+        W: Write + ?Sized,
+    {
+        let mut frozen_shards = Vec::new();
+        frozen_shards
+            .try_reserve_exact(self.shards.len())
+            .map_err(|_| {
+                IndexStorageError::Io(io::Error::other(
+                    "unable to allocate frozen index shard guards",
+                ))
+            })?;
+        for shard in &self.shards {
+            frozen_shards.push(read_unpoisoned(shard));
+        }
+
+        let physical_stats = frozen_shards
+            .iter()
+            .try_fold(IndexPhysicalStats::default(), |stats, shard| {
+                checked_add_physical_stats(stats, shard.physical_stats())
+            })?;
+        if !physical_stats.is_valid_for(self.slot_count) {
+            return Err(IndexStorageError::InvalidPhysicalStats);
+        }
+        if physical_stats.masked != 0 {
+            return Err(IndexStorageError::MaskedSlotsPresent {
+                count: physical_stats.masked,
+            });
+        }
+        let mut total = WarmImageStats {
+            pages_written: 0,
+            slots_written: 0,
+            bytes_written: 0,
+        };
+        for shard in &frozen_shards {
+            let written = shard.write_warm_image(writer, binding)?;
+            total.pages_written = total
+                .pages_written
+                .checked_add(written.pages_written)
+                .ok_or(IndexStorageError::SizeOverflow)?;
+            total.slots_written = total
+                .slots_written
+                .checked_add(written.slots_written)
+                .ok_or(IndexStorageError::SizeOverflow)?;
+            total.bytes_written = total
+                .bytes_written
+                .checked_add(written.bytes_written)
+                .ok_or(IndexStorageError::SizeOverflow)?;
+        }
+        if total.slots_written != self.slot_count {
+            return Err(IndexStorageError::InvalidArgument(
+                "canonical index shard ranges do not cover every slot",
+            ));
+        }
+        Ok(total)
+    }
+
+    fn from_core(
+        slot_count: usize,
+        ranges: Box<[IndexShardRangeV1]>,
+        core: Arc<IndexStorageCore>,
+        shard_stats: Option<&[IndexPhysicalStats]>,
+    ) -> Result<Self, IndexStorageError> {
+        if core.slot_count != slot_count || ranges.is_empty() {
+            return Err(IndexStorageError::InvalidArgument(
+                "index shard directory does not match the shared image",
+            ));
+        }
+        let mut shards = Vec::new();
+        shards.try_reserve_exact(ranges.len()).map_err(|_| {
+            IndexStorageError::Io(io::Error::other("unable to allocate index shard locks"))
+        })?;
+        for (index, range) in ranges.iter().copied().enumerate() {
+            let physical_stats = shard_stats.map(|stats| stats[index]).unwrap_or_default();
+            shards.push(RwLock::new(IndexStorage {
+                core: Arc::clone(&core),
+                range,
+                physical_stats,
+            }));
+        }
+        Ok(Self {
+            slot_count,
+            ranges,
+            shards: shards.into_boxed_slice(),
+        })
+    }
+
+    fn shard_for_slot(&self, slot: usize) -> Result<(usize, usize), IndexStorageError> {
+        if slot >= self.slot_count {
+            return Err(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.slot_count,
+            });
+        }
+        let shard = self
+            .ranges
+            .partition_point(|range| range.first_slot + range.slot_count <= slot);
+        let range = self
+            .ranges
+            .get(shard)
+            .ok_or(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.slot_count,
+            })?;
+        let local_slot = slot
+            .checked_sub(range.first_slot)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+        Ok((shard, local_slot))
+    }
+}
+
+fn checked_sum_physical_stats(
+    stats: &[IndexPhysicalStats],
+) -> Result<IndexPhysicalStats, IndexStorageError> {
+    stats
+        .iter()
+        .copied()
+        .try_fold(IndexPhysicalStats::default(), checked_add_physical_stats)
+}
+
+fn checked_add_physical_stats(
+    left: IndexPhysicalStats,
+    right: IndexPhysicalStats,
+) -> Result<IndexPhysicalStats, IndexStorageError> {
+    Ok(IndexPhysicalStats {
+        value: left
+            .value
+            .checked_add(right.value)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
+        deleted: left
+            .deleted
+            .checked_add(right.deleted)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
+        masked: left
+            .masked
+            .checked_add(right.masked)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
+    })
+}
+
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Copy)]
 struct ImageLayout {
@@ -1041,15 +1501,6 @@ impl Backing {
         }
     }
 
-    fn as_ptr(&self) -> *const u8 {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Mapping(mapping) => mapping.pointer.cast_const(),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Heap(bytes) => bytes.as_ptr(),
-        }
-    }
-
     fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1169,6 +1620,191 @@ mod tests {
             namespace_id: 0x3132_3334 ^ seed as u32,
             flags: (0x4142_4344 ^ seed as u32) & !INDEX_RUNTIME_ONLY_FLAGS,
         }
+    }
+
+    #[test]
+    fn canonical_shard_ranges_balance_pages_and_keep_a_usable_tail() {
+        type RangeShape = (usize, usize, usize, usize);
+        let cases: &[(usize, &[RangeShape])] = &[
+            (8, &[(0, 1, 0, 8)]),
+            (126, &[(0, 1, 0, 126)]),
+            (127, &[(0, 2, 0, 127)]),
+            (133, &[(0, 2, 0, 133)]),
+            (134, &[(0, 1, 0, 126), (1, 1, 126, 8)]),
+            (252, &[(0, 1, 0, 126), (1, 1, 126, 126)]),
+            (253, &[(0, 1, 0, 126), (1, 2, 126, 127)]),
+        ];
+
+        for &(slot_count, expected) in cases {
+            let ranges = canonical_index_shard_ranges(slot_count).unwrap();
+            assert!(
+                ranges
+                    .iter()
+                    .enumerate()
+                    .all(|(shard_id, range)| range.shard_id == shard_id)
+            );
+            let actual: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    (
+                        range.first_page,
+                        range.page_count,
+                        range.first_slot,
+                        range.slot_count,
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "slot_count={slot_count}");
+            assert!(actual.iter().all(|range| range.3 >= 8));
+        }
+    }
+
+    #[test]
+    fn sharded_storage_mutates_adjacent_ranges_and_roundtrips_stats() {
+        const SLOT_COUNT: usize = 253;
+        const GENERATION: u64 = 113;
+        const FIRST_RANGE_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
+        const SECOND_RANGE_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
+
+        let source = ShardedIndexStorage::anonymous(SLOT_COUNT).unwrap();
+        assert_eq!(source.slot_count(), SLOT_COUNT);
+        assert_eq!(source.shard_count(), 2);
+        assert_eq!(
+            source.shard_ranges(),
+            canonical_index_shard_ranges(SLOT_COUNT).unwrap().as_ref()
+        );
+
+        let first_value = sample_slot(1);
+        let mut second_deleted = sample_slot(2);
+        second_deleted.location_raw |= INDEX_LOCATION_TOMBSTONE_BIT;
+        let tail_value = sample_slot(3);
+        source
+            .write_slot(FIRST_RANGE_LAST_SLOT, first_value)
+            .unwrap();
+        source
+            .write_slot(SECOND_RANGE_FIRST_SLOT, second_deleted)
+            .unwrap();
+        source.write_slot(SLOT_COUNT - 1, tail_value).unwrap();
+        assert_eq!(
+            source.read_slot(FIRST_RANGE_LAST_SLOT).unwrap(),
+            first_value
+        );
+        assert_eq!(
+            source.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
+            second_deleted
+        );
+
+        let expected_shard_stats: Box<[IndexPhysicalStats]> = Box::new([
+            IndexPhysicalStats {
+                value: 1,
+                deleted: 0,
+                masked: 0,
+            },
+            IndexPhysicalStats {
+                value: 1,
+                deleted: 1,
+                masked: 0,
+            },
+        ]);
+        assert_eq!(source.shard_stats().unwrap(), expected_shard_stats);
+        assert_eq!(
+            source.physical_stats().unwrap(),
+            IndexPhysicalStats {
+                value: 2,
+                deleted: 1,
+                masked: 0,
+            }
+        );
+
+        let mut test_file = TestFile::create();
+        let written = source
+            .write_warm_image(&mut test_file.file, binding(GENERATION))
+            .unwrap();
+        assert_eq!(written.pages_written, 3);
+        assert_eq!(written.slots_written, SLOT_COUNT);
+        assert_eq!(written.bytes_written, (3 * INDEX_IMAGE_PAGE_SIZE) as u64);
+        test_file.file.sync_all().unwrap();
+
+        let recovered = ShardedIndexStorage::map_private(
+            &test_file.file,
+            0,
+            SLOT_COUNT,
+            binding(GENERATION),
+            &expected_shard_stats,
+        )
+        .unwrap();
+        assert_eq!(recovered.shard_stats().unwrap(), expected_shard_stats);
+        assert_eq!(
+            recovered.read_slot(FIRST_RANGE_LAST_SLOT).unwrap(),
+            first_value
+        );
+        assert_eq!(
+            recovered.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
+            second_deleted
+        );
+        assert_eq!(recovered.read_slot(SLOT_COUNT - 1).unwrap(), tail_value);
+
+        recovered
+            .write_slot(FIRST_RANGE_LAST_SLOT, IndexSlotV1::EMPTY)
+            .unwrap();
+        assert_eq!(
+            recovered.shard_stats().unwrap().as_ref(),
+            &[IndexPhysicalStats::default(), expected_shard_stats[1]]
+        );
+        assert_eq!(source.shard_stats().unwrap(), expected_shard_stats);
+    }
+
+    #[test]
+    fn corrupt_page_in_one_shard_rejects_every_shard() {
+        const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE * 2;
+        const GENERATION: u64 = 127;
+
+        let source = ShardedIndexStorage::anonymous(SLOT_COUNT).unwrap();
+        source.write_slot(0, sample_slot(1)).unwrap();
+        source
+            .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE, sample_slot(2))
+            .unwrap();
+        let shard_stats = source.shard_stats().unwrap();
+        let mut image = Vec::new();
+        source
+            .write_warm_image(&mut image, binding(GENERATION))
+            .unwrap();
+        image[INDEX_IMAGE_PAGE_SIZE + INDEX_IMAGE_PAGE_HEADER_SIZE + 7] ^= 0x80;
+
+        let mut test_file = TestFile::create();
+        test_file.file.write_all(&image).unwrap();
+        test_file.file.sync_all().unwrap();
+        let recovered = ShardedIndexStorage::map_private(
+            &test_file.file,
+            0,
+            SLOT_COUNT,
+            binding(GENERATION),
+            &shard_stats,
+        )
+        .unwrap();
+
+        assert_eq!(recovered.read_slot(0).unwrap(), sample_slot(1));
+        assert!(matches!(
+            recovered.read_slot(INDEX_IMAGE_SLOTS_PER_PAGE),
+            Err(IndexStorageError::CorruptPage {
+                page_index: 1,
+                reason: CorruptPageReason::ChecksumMismatch { .. }
+            })
+        ));
+        assert!(matches!(
+            recovered.read_slot(0),
+            Err(IndexStorageError::CorruptPage {
+                page_index: 0,
+                reason: CorruptPageReason::PreviouslyRejected
+            })
+        ));
+        assert!(matches!(
+            recovered.write_slot(0, sample_slot(3)),
+            Err(IndexStorageError::CorruptPage {
+                page_index: 0,
+                reason: CorruptPageReason::PreviouslyRejected
+            })
+        ));
     }
 
     #[test]

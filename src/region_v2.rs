@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{MAX_INDEX_SHARDS, MAX_INDEX_SLOTS};
 use crate::index_storage::{
-    IndexImageBindingV1, IndexPhysicalStats, IndexStorage, IndexStorageError,
+    IndexImageBindingV1, IndexPhysicalStats, IndexShardRangeV1, IndexStorageError,
+    ShardedIndexStorage, canonical_index_shard_ranges,
 };
 use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, SyncMode, SyncPoint, WritePoint,
@@ -140,10 +141,11 @@ pub(crate) trait RegionV2Backend {
     /// sources must be quiescent on both success and error returns.
     fn stop_fast(&mut self, runtime: Self::Runtime) -> io::Result<()>;
 
-    /// Consume the runtime after all producers/completions are quiescent and
-    /// produce one immutable owner of index + Region/FIFO/accounting state.
-    /// On error, the backend must synchronously tear down every worker and
-    /// completion source because ownership of `runtime` has been consumed.
+    /// Consume the runtime after every admitted operation is quiescent,
+    /// including readers, producers, and completions, then produce one
+    /// immutable owner of index + Region/FIFO/accounting state. On error, the
+    /// backend must synchronously tear down every worker and completion source
+    /// because ownership of `runtime` has been consumed.
     fn freeze_warm(&mut self, runtime: Self::Runtime) -> io::Result<Self::FrozenView>;
 
     /// Make data and one complete image durable. Success returns the only
@@ -184,7 +186,7 @@ impl RegionV2Files {
 }
 
 pub(crate) struct FileRegionRuntimeV2 {
-    index: IndexStorage,
+    index: ShardedIndexStorage,
     metadata: RegionMetadataV1,
 }
 
@@ -326,7 +328,7 @@ impl<F> RegionV2Backend for FileRegionV2Backend<F>
 where
     F: RegionV2FileSystem,
 {
-    type Index = IndexStorage;
+    type Index = ShardedIndexStorage;
     type Runtime = FileRegionRuntimeV2;
     type CleanImage = CleanFileRegionImageV1;
     type FrozenView = FrozenFileRegionViewV2;
@@ -581,7 +583,8 @@ where
         }
         let metadata = empty_region_metadata(data, config.index_slots)?;
         Ok(FileRegionRuntimeV2 {
-            index: IndexStorage::anonymous(config.index_slots).map_err(index_storage_io_error)?,
+            index: ShardedIndexStorage::anonymous(config.index_slots)
+                .map_err(index_storage_io_error)?,
             metadata,
         })
     }
@@ -617,18 +620,14 @@ where
             self.cold_reset_needed = true;
             return Ok(None);
         }
-        let stats = IndexPhysicalStats {
-            value: clean.metadata.root.physical_value_slots,
-            deleted: clean.metadata.root.physical_deleted_slots,
-            masked: clean.metadata.root.physical_masked_slots,
-        };
+        let shard_stats = metadata_shard_stats(&clean.metadata)?;
         let binding = index_image_binding(clean.header);
-        let index = IndexStorage::map_private(
+        let index = ShardedIndexStorage::map_private(
             &clean.file,
             clean.header.index_offset,
             config.index_slots,
             binding,
-            stats,
+            &shard_stats,
         )
         .map_err(index_storage_io_error)?;
         Ok(Some(FileRegionRuntimeV2 {
@@ -676,11 +675,25 @@ where
         source_metadata
             .validate()
             .map_err(region_metadata_io_error)?;
-        let physical_stats = view.runtime.index.physical_stats();
+        let physical_stats = view
+            .runtime
+            .index
+            .physical_stats()
+            .map_err(index_storage_io_error)?;
+        let shard_stats = view
+            .runtime
+            .index
+            .shard_stats()
+            .map_err(index_storage_io_error)?;
         if physical_stats.masked != 0
+            || source_metadata.root.index_slots
+                != u64::try_from(view.runtime.index.slot_count()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "V2 index capacity is too large")
+                })?
             || source_metadata.root.physical_value_slots != physical_stats.value
             || source_metadata.root.physical_deleted_slots != physical_stats.deleted
             || source_metadata.root.physical_masked_slots != physical_stats.masked
+            || !metadata_shard_stats_match(source_metadata, &shard_stats)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1104,10 +1117,85 @@ fn maximum_region_metadata_len(region_count: u32) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("V2 Region metadata length overflow"))
 }
 
+fn empty_shard_metadata(ranges: &[IndexShardRangeV1]) -> io::Result<Box<[ShardMetadataRecordV1]>> {
+    let mut shards = Vec::new();
+    shards.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate V2 index shard directory",
+        )
+    })?;
+    for range in ranges {
+        shards.push(ShardMetadataRecordV1 {
+            shard_id: u32::try_from(range.shard_id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "V2 shard id is too large")
+            })?,
+            first_index_page: u64::try_from(range.first_page).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 shard page offset is too large",
+                )
+            })?,
+            index_page_count: u64::try_from(range.page_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 shard page count is too large",
+                )
+            })?,
+            first_slot: u64::try_from(range.first_slot).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 shard slot offset is too large",
+                )
+            })?,
+            slot_count: u64::try_from(range.slot_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 shard slot count is too large",
+                )
+            })?,
+            physical_value_slots: 0,
+            physical_deleted_slots: 0,
+            physical_masked_slots: 0,
+        });
+    }
+    Ok(shards.into_boxed_slice())
+}
+
+fn metadata_shard_stats(metadata: &RegionMetadataV1) -> io::Result<Box<[IndexPhysicalStats]>> {
+    let mut stats = Vec::new();
+    stats
+        .try_reserve_exact(metadata.shards.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate V2 index shard statistics",
+            )
+        })?;
+    for shard in &metadata.shards {
+        stats.push(IndexPhysicalStats {
+            value: shard.physical_value_slots,
+            deleted: shard.physical_deleted_slots,
+            masked: shard.physical_masked_slots,
+        });
+    }
+    Ok(stats.into_boxed_slice())
+}
+
+fn metadata_shard_stats_match(metadata: &RegionMetadataV1, stats: &[IndexPhysicalStats]) -> bool {
+    metadata.shards.len() == stats.len()
+        && metadata.shards.iter().zip(stats).all(|(metadata, actual)| {
+            metadata.physical_value_slots == actual.value
+                && metadata.physical_deleted_slots == actual.deleted
+                && metadata.physical_masked_slots == actual.masked
+        })
+}
+
 fn empty_region_metadata(
     data: DataSuperblockV2,
     index_slots: usize,
 ) -> io::Result<RegionMetadataV1> {
+    let shard_ranges = canonical_index_shard_ranges(index_slots).map_err(index_storage_io_error)?;
     let index_slots = u64::try_from(index_slots)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "V2 index is too large"))?;
     let index_len = recovery_image_index_len_v1(index_slots)
@@ -1143,6 +1231,7 @@ fn empty_region_metadata(
             logical_value_bytes: 0,
         });
     }
+    let shards = empty_shard_metadata(&shard_ranges)?;
     let metadata = RegionMetadataV1 {
         root: RegionMetadataRootV1 {
             cache_uuid: data.cache_uuid,
@@ -1155,7 +1244,9 @@ fn empty_region_metadata(
             index_page_count,
             region_size: data.geometry.region_size,
             region_count: data.geometry.region_count,
-            shard_count: 1,
+            shard_count: u32::try_from(shard_ranges.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many V2 index shards")
+            })?,
             append_lane_count: 1,
             cache_epoch: 1,
             clear_floor_seqno: 1,
@@ -1176,17 +1267,7 @@ fn empty_region_metadata(
             sealed_region_count: 0,
         },
         regions: regions.into_boxed_slice(),
-        shards: vec![ShardMetadataRecordV1 {
-            shard_id: 0,
-            first_index_page: 0,
-            index_page_count,
-            first_slot: 0,
-            slot_count: index_slots,
-            physical_value_slots: 0,
-            physical_deleted_slots: 0,
-            physical_masked_slots: 0,
-        }]
-        .into_boxed_slice(),
+        shards,
     };
     metadata.validate().map_err(region_metadata_io_error)?;
     Ok(metadata)
@@ -1772,7 +1853,7 @@ mod tests {
     #[test]
     fn complete_warm_image_maps_without_rebuilding_index_slots() {
         let directory = TestDirectory::new();
-        let config = RegionV2Config { index_slots: 130 };
+        let config = RegionV2Config { index_slots: 134 };
         let data = test_data_superblock_with_regions(2);
         let value = IndexSlotV1 {
             hash: 11,
@@ -1788,10 +1869,11 @@ mod tests {
         )
         .unwrap();
         let runtime = first.runtime.as_mut().unwrap();
-        runtime.index.write_slot(129, value).unwrap();
+        assert_eq!(runtime.index.shard_count(), 2);
+        runtime.index.write_slot(133, value).unwrap();
         let metadata = &mut runtime.metadata;
         metadata.root.physical_value_slots = 1;
-        metadata.shards[0].physical_value_slots = 1;
+        metadata.shards[1].physical_value_slots = 1;
         first.close_warm().unwrap();
         assert!(directory.files.image.exists());
 
@@ -1801,7 +1883,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
-        assert_eq!(recovered.index().unwrap().read_slot(129).unwrap(), value);
+        assert_eq!(recovered.index().unwrap().shard_count(), 2);
+        assert_eq!(recovered.index().unwrap().read_slot(133).unwrap(), value);
         recovered.close_fast().unwrap();
     }
 
@@ -1850,7 +1933,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         let directory = TestDirectory::new();
-        let config = RegionV2Config { index_slots: 130 };
+        let config = RegionV2Config { index_slots: 134 };
         let data = test_data_superblock_with_regions(2);
         let mut first = RegionStoreV2::open_v2(
             config,
@@ -1865,7 +1948,10 @@ mod tests {
             .open(&directory.files.image)
             .unwrap();
         image
-            .write_all_at(&[0x5a], RECOVERY_IMAGE_INDEX_OFFSET_V1 + 100)
+            .write_all_at(
+                &[0x5a],
+                RECOVERY_IMAGE_INDEX_OFFSET_V1 + RECOVERY_PAGE_SIZE as u64 + 100,
+            )
             .unwrap();
         image.sync_data().unwrap();
 
@@ -1875,8 +1961,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
+        assert_eq!(
+            recovered.index().unwrap().read_slot(0).unwrap(),
+            IndexSlotV1::EMPTY
+        );
+        assert!(recovered.index().unwrap().read_slot(133).is_err());
         assert!(recovered.index().unwrap().read_slot(0).is_err());
-        assert!(recovered.index().unwrap().read_slot(129).is_err());
         recovered.close_fast().unwrap();
     }
 

@@ -202,6 +202,12 @@ fresh/dirty start 使用零页懒分配的 anonymous mapping。clean start 将�
 - 内核不会把运行时随机 index mutation 回写到恢复镜像；
 - 第一次访问的 page 可以按需 fault，后台 prefetch 只是优化，不阻塞开放流量。
 
+当前 foundation 已使用单一 mapping owner 和 canonical page-balanced shard ranges：每个 4 KiB
+index page 只属于一个 range，range 分别加锁并维护 physical stats，但共享 page validation 与
+sticky image-health。这样既不会在 16 KiB host page 上产生重叠 MAP_PRIVATE COW 分叉，也能在
+任一 shard 首次发现损坏时 O(1) 拒绝整张 image。production hash operations 和 RegionManager
+仍需在这组 range views 上完成接线。
+
 不采用 Base + Delta，也不采用运行期 WAL。它们只有在要求“异常退出仍增量恢复”或
 “在线持续发布 checkpoint”时才有必要，而这两个都不是当前 cache 契约。
 
