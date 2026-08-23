@@ -14,11 +14,16 @@
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::format::{REGION_HEADER_SIZE, RegionHeader, RegionState};
+use crate::checksum::crc32c;
+use crate::format::{
+    RECORD_HEADER_SIZE, REGION_HEADER_SIZE, RecordCodec, RecordHeader, RecordKind, RegionHeader,
+    RegionState,
+};
 use crate::index::{IndexEntry, MAX_INDEX_SHARDS, MAX_INDEX_SLOTS};
 use crate::index_storage::{
     IndexImageBindingV1, IndexPhysicalStats, IndexShardRangeV1, IndexStorageError,
@@ -32,6 +37,10 @@ use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, SyncMode, SyncPoint, WritePoint,
     read_exact_at, write_all_at,
 };
+use crate::io_engine::IoEngine;
+use crate::record_codec_v2::{
+    RecordEncodeErrorV2, encode_value_into, hash_namespaced_key_v2, planned_record_bytes,
+};
 use crate::recovery_v2::{
     DATA_REGION_AREA_OFFSET_V2, DataSuperblockV2, DataSuperblockV2Probe, PersistentId,
     RECOVERY_IMAGE_INDEX_OFFSET_V1, RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1,
@@ -40,12 +49,22 @@ use crate::recovery_v2::{
     latest_state_v2, prepare_next_state_v2, prepare_running_barrier_v2,
     recovery_image_index_len_v1,
 };
-use crate::region_manager_v2::{RegionManagerV2, RegionMutationErrorV2};
+use crate::region_appender_v2::submit_span;
+use crate::region_manager_v2::{RegionManagerV2, RegionMutationErrorV2, RegionRuntimeV2};
 use crate::region_metadata_v1::{
     REGION_METADATA_V1_PAGE_SIZE, REGION_METADATA_V1_REGIONS_PER_PAGE,
     REGION_METADATA_V1_SHARDS_PER_PAGE, RegionMetadataRecordV1, RegionMetadataRootV1,
     RegionMetadataStateV1, RegionMetadataV1, RegionMetadataV1Error, ShardMetadataRecordV1,
 };
+use crate::region_read_v2::{
+    RegionReadDirectoryV2, RegionReadErrorV2, RegionReadGuardV2, RegionReadSnapshotV2,
+};
+use crate::region_reader_v2::submit_record_read;
+use crate::region_staging_v2::{
+    RegionStagingV2, StageAppendV2, StagedRecordV2, StagedWriteV2, StagingV2EncodeError,
+    StagingV2Error,
+};
+use crate::resources::BufferLease;
 
 /// Static inputs needed before recovery state is inspected.
 ///
@@ -341,7 +360,76 @@ impl IndexMutationAuthorityV2 for RegionIndexMutationAuthorityV2<'_> {
 pub(crate) struct FileRegionRuntimeV2 {
     index: RegionIndexV2,
     manager: RegionManagerAuthorityV2,
+    append_lanes: Box<[RegionAppendLaneV2]>,
+    read_directory: RegionReadDirectoryV2,
+    read_epoch: AtomicU32,
+    read_clear_floor: AtomicU64,
     health: RegionV2HealthLatch,
+}
+
+/// Short lane-local transaction gates. `mutation` makes manager receipts and
+/// staging transitions one operation; `completion` enforces one ordered span
+/// completion worker per lane while still allowing the second buffer to fill
+/// during device I/O.
+#[derive(Default)]
+struct RegionAppendLaneV2 {
+    mutation: Mutex<()>,
+    completion: Mutex<()>,
+}
+
+/// Exact point identity pinned to one Region generation across record I/O.
+pub(crate) struct RegionPointReadV2<'a> {
+    pub(crate) hash: u64,
+    pub(crate) entry: IndexEntry,
+    region: RegionReadGuardV2<'a>,
+    cache_epoch: u32,
+    clear_floor_seqno: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionSpanPublishV2 {
+    pub(crate) span: crate::region_manager_v2::RegionWriteSpanV2,
+    pub(crate) published_records: u64,
+    pub(crate) obsolete_records: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionStagedValueV2 {
+    pub(crate) hash: u64,
+    pub(crate) seqno: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegionStageValueV2 {
+    Staged(RegionStagedValueV2),
+    NeedsFlush,
+    NeedsRotation,
+    Busy,
+}
+
+impl RegionPointReadV2<'_> {
+    pub(crate) fn region_snapshot(&self) -> RegionReadSnapshotV2 {
+        self.region.snapshot()
+    }
+
+    pub(crate) fn record_generation_matches(&self, epoch: u32, incarnation: u32) -> bool {
+        self.region.validate_snapshot(epoch, incarnation)
+    }
+}
+
+pub(crate) struct RegionValueReadV2 {
+    buffer: BufferLease,
+    io_len: usize,
+    value_range: Range<usize>,
+}
+
+impl RegionValueReadV2 {
+    pub(crate) fn value(&self) -> &[u8] {
+        &self
+            .buffer
+            .prepared(self.io_len)
+            .expect("validated V2 read retains its prepared buffer")[self.value_range.clone()]
+    }
 }
 
 pub(crate) struct FrozenFileRegionViewV2 {
@@ -379,11 +467,69 @@ impl FileRegionRuntimeV2 {
             ));
         }
         let manager = RegionManagerV2::from_metadata(metadata).map_err(region_metadata_io_error)?;
+        let read_directory = RegionReadDirectoryV2::try_new(
+            u32::try_from(manager.regions().len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "V2 Region count is too large")
+            })?,
+            manager.region_size(),
+        )
+        .map_err(region_read_io_error)?;
+        for region in manager.regions().iter().copied() {
+            if region.state != RegionMetadataStateV1::Free {
+                read_directory
+                    .install(region_read_snapshot(&manager, region))
+                    .map_err(region_read_io_error)?;
+            }
+        }
+        let mut append_lanes = Vec::new();
+        append_lanes
+            .try_reserve_exact(manager.active_regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate V2 append lane gates",
+                )
+            })?;
+        append_lanes.resize_with(manager.active_regions().len(), RegionAppendLaneV2::default);
         let health = RegionV2HealthLatch::healthy();
         Ok(Self {
             index: RegionIndexV2::from_storage(index),
+            read_epoch: AtomicU32::new(manager.cache_epoch()),
+            read_clear_floor: AtomicU64::new(manager.clear_floor_seqno()),
             manager: RegionManagerAuthorityV2::new(manager, health.clone()),
+            append_lanes: append_lanes.into_boxed_slice(),
+            read_directory,
             health,
+        })
+    }
+
+    fn lock_lane_mutation(&self, lane_id: usize) -> io::Result<MutexGuard<'_, ()>> {
+        let lane = self.append_lane(lane_id)?;
+        self.lock_lane_gate(&lane.mutation)
+    }
+
+    fn lock_lane_completion(&self, lane_id: usize) -> io::Result<MutexGuard<'_, ()>> {
+        let lane = self.append_lane(lane_id)?;
+        self.lock_lane_gate(&lane.completion)
+    }
+
+    fn append_lane(&self, lane_id: usize) -> io::Result<&RegionAppendLaneV2> {
+        self.append_lanes.get(lane_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V2 append lane is out of bounds",
+            )
+        })
+    }
+
+    fn lock_lane_gate<'a>(&self, gate: &'a Mutex<()>) -> io::Result<MutexGuard<'a, ()>> {
+        self.health.require_healthy()?;
+        gate.lock().map_err(|_| {
+            self.health.enter_miss_only();
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 append lane gate is poisoned",
+            )
         })
     }
 
@@ -396,7 +542,7 @@ impl FileRegionRuntimeV2 {
         }
         match self.index.lookup_raw(hash) {
             Ok(IndexLookupV2::Hit(entry)) if self.health.is_healthy() => {
-                Ok(if self.manager.is_visible(entry) {
+                Ok(if self.acquire_region_read(entry)?.is_some() {
                     IndexLookupV2::Hit(entry)
                 } else {
                     IndexLookupV2::Miss
@@ -409,6 +555,507 @@ impl FileRegionRuntimeV2 {
                 Ok(IndexLookupV2::Miss)
             }
         }
+    }
+
+    /// Begins a physical read without touching the global Region-manager
+    /// mutex. The returned per-Region guard must live through I/O, record
+    /// validation, and exact index revalidation.
+    fn begin_point_read(&self, hash: u64) -> io::Result<Option<RegionPointReadV2<'_>>> {
+        if !self.health.is_healthy() {
+            return Ok(None);
+        }
+        let entry = match self.index.lookup_raw(hash) {
+            Ok(IndexLookupV2::Hit(entry)) => entry,
+            Ok(_) => return Ok(None),
+            Err(_) => {
+                self.health.enter_miss_only();
+                return Ok(None);
+            }
+        };
+        let Some((region, cache_epoch, clear_floor_seqno)) = self.acquire_region_read(entry)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RegionPointReadV2 {
+            hash,
+            entry,
+            region,
+            cache_epoch,
+            clear_floor_seqno,
+        }))
+    }
+
+    /// Finishes a physical read while its Region generation is still pinned.
+    /// A same-key overwrite/remove, clear fence, or health transition turns
+    /// the result into a miss.
+    fn revalidate_point_read(&self, read: &RegionPointReadV2<'_>) -> io::Result<bool> {
+        if read.region_snapshot().cache_epoch != read.cache_epoch
+            || self.read_epoch.load(Ordering::Acquire) != read.cache_epoch
+            || self.read_clear_floor.load(Ordering::Acquire) != read.clear_floor_seqno
+            || read.entry.seqno < read.clear_floor_seqno
+            || !self.revalidate_exact(read.hash, read.entry)?
+        {
+            return Ok(false);
+        }
+        Ok(self.health.is_healthy())
+    }
+
+    /// Performs one durable value read under a per-Region generation pin.
+    /// The aligned envelope buffer is returned as the value owner, avoiding a
+    /// second payload copy on the disk-hit path.
+    #[allow(clippy::too_many_arguments)]
+    fn read_value(
+        &self,
+        engine: &dyn IoEngine,
+        geometry: crate::recovery_v2::DataGeometryV2,
+        buffer: BufferLease,
+        hash_seed: u64,
+        namespace_id: u32,
+        key: &[u8],
+        now_unix_ms: u64,
+    ) -> io::Result<Option<RegionValueReadV2>> {
+        let hash = hash_namespaced_key_v2(hash_seed, namespace_id, key);
+        let Some(point) = self.begin_point_read(hash)? else {
+            return Ok(None);
+        };
+        if point.entry.namespace_id != namespace_id {
+            return Ok(None);
+        }
+        let flight = match submit_record_read(engine, geometry, point.entry, buffer) {
+            Ok(flight) => flight,
+            Err(error) => {
+                if error.error.kind() != io::ErrorKind::OutOfMemory {
+                    self.health.enter_miss_only();
+                }
+                return Err(error.error);
+            }
+        };
+        let completion = flight.wait();
+        if let Err(error) = completion.result {
+            self.health.enter_miss_only();
+            return Err(error);
+        }
+        let record = completion.record_bytes().ok_or_else(|| {
+            self.health.enter_miss_only();
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 record completion lost its exact record slice",
+            )
+        })?;
+        let header = RecordHeader::decode(
+            record
+                .get(..RECORD_HEADER_SIZE)
+                .ok_or_else(|| corrupt_v2_record(&self.health))?,
+        )
+        .ok_or_else(|| corrupt_v2_record(&self.health))?;
+        if header.kind != RecordKind::Value
+            || header.record_len != point.entry.location.record_len()
+            || header.seqno != point.entry.seqno
+            || header.key_hash != hash
+            || !point.record_generation_matches(header.epoch, header.region_incarnation)
+        {
+            self.health.enter_miss_only();
+            return Err(corrupt_v2_record(&self.health));
+        }
+        if header.expires_at != 0 && header.expires_at <= now_unix_ms {
+            return Ok(None);
+        }
+        let key_len = header.key_len as usize;
+        let value_len = header.stored_len as usize;
+        let payload_end = RECORD_HEADER_SIZE
+            .checked_add(key_len)
+            .and_then(|end| end.checked_add(value_len))
+            .filter(|end| *end <= record.len())
+            .ok_or_else(|| corrupt_v2_record(&self.health))?;
+        let encoded_key = &record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + key_len];
+        if !record_key_matches_v2(header.codec, encoded_key, namespace_id, key) {
+            return Ok(None);
+        }
+        if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
+            self.health.enter_miss_only();
+            return Err(corrupt_v2_record(&self.health));
+        }
+        if !self.revalidate_point_read(&point)? {
+            return Ok(None);
+        }
+        let value_start = completion.plan.record_range.start + RECORD_HEADER_SIZE + key_len;
+        let value_end = value_start
+            .checked_add(value_len)
+            .ok_or_else(|| corrupt_v2_record(&self.health))?;
+        let Some(buffer) = completion.buffer else {
+            self.health.enter_miss_only();
+            return Err(corrupt_v2_record(&self.health));
+        };
+        Ok(Some(RegionValueReadV2 {
+            buffer,
+            io_len: completion.plan.io_len,
+            value_range: value_start..value_end,
+        }))
+    }
+
+    fn acquire_region_read(
+        &self,
+        entry: IndexEntry,
+    ) -> io::Result<Option<(RegionReadGuardV2<'_>, u32, u64)>> {
+        let cache_epoch = self.read_epoch.load(Ordering::Acquire);
+        let clear_floor_seqno = self.read_clear_floor.load(Ordering::Acquire);
+        let guard = self
+            .read_directory
+            .acquire_visible(entry, cache_epoch, clear_floor_seqno)
+            .map_err(|error| {
+                self.health.enter_miss_only();
+                region_read_io_error(error)
+            })?;
+        if !self.health.is_healthy()
+            || self.read_epoch.load(Ordering::Acquire) != cache_epoch
+            || self.read_clear_floor.load(Ordering::Acquire) != clear_floor_seqno
+        {
+            return Ok(None);
+        }
+        Ok(guard.map(|guard| (guard, cache_epoch, clear_floor_seqno)))
+    }
+
+    /// Reserves and encodes one value directly into a lane's aligned fill
+    /// buffer. This method performs no device I/O and never publishes an index
+    /// entry. `NeedsFlush` cancels the unused tail receipt exactly, so a lane
+    /// worker may submit the prior 4 MiB span before the caller retries.
+    #[allow(clippy::too_many_arguments)]
+    fn try_stage_value(
+        &self,
+        staging: &RegionStagingV2,
+        lane_id: usize,
+        hash_seed: u64,
+        namespace_id: u32,
+        key: &[u8],
+        value: &[u8],
+        expires_at: u64,
+    ) -> io::Result<RegionStageValueV2> {
+        self.health.require_healthy()?;
+        let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len())
+            .map_err(record_encode_io_error)?;
+        if record_bytes as usize > staging.chunk_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V2 value exceeds one fixed staging chunk",
+            ));
+        }
+        let _lane_mutation = self.lock_lane_mutation(lane_id)?;
+        let receipt = {
+            let mut manager = self.manager.lock()?;
+            match manager.reserve_append(lane_id, record_bytes) {
+                Ok(receipt) => receipt,
+                Err(RegionMutationErrorV2::WouldBlock) => return Ok(RegionStageValueV2::Busy),
+                Err(RegionMutationErrorV2::FlushBeforeRotation) => {
+                    return Ok(RegionStageValueV2::NeedsFlush);
+                }
+                Err(RegionMutationErrorV2::RegionFull) => {
+                    return Ok(RegionStageValueV2::NeedsRotation);
+                }
+                Err(error) => {
+                    self.health.enter_miss_only();
+                    return Err(region_mutation_io_error(error));
+                }
+            }
+        };
+
+        let mut encoded_value = None;
+        let staged = staging.encode_reserved(receipt, |destination| {
+            let encoded = encode_value_into(
+                destination,
+                receipt,
+                hash_seed,
+                namespace_id,
+                key,
+                value,
+                expires_at,
+            )?;
+            encoded_value = Some(encoded);
+            Ok::<StagedRecordV2, RecordEncodeErrorV2>(StagedRecordV2 {
+                hash: encoded.hash,
+                entry: encoded.entry,
+            })
+        });
+        match staged {
+            Ok(StageAppendV2::Appended) => {
+                if let Err(error) = self.manager.lock()?.stage_reservation(receipt) {
+                    self.health.enter_miss_only();
+                    staging.close();
+                    return Err(region_mutation_io_error(error));
+                }
+                let Some(encoded) = encoded_value else {
+                    self.health.enter_miss_only();
+                    staging.close();
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "V2 encoder completed without record metadata",
+                    ));
+                };
+                Ok(RegionStageValueV2::Staged(RegionStagedValueV2 {
+                    hash: encoded.hash,
+                    seqno: receipt.seqno,
+                }))
+            }
+            Ok(StageAppendV2::NeedsSeal) => {
+                self.cancel_unused_reservation(receipt)?;
+                Ok(RegionStageValueV2::NeedsFlush)
+            }
+            Err(StagingV2EncodeError::Encode(error)) => {
+                self.cancel_unused_reservation(receipt)?;
+                Err(record_encode_io_error(error))
+            }
+            Err(StagingV2EncodeError::Staging(StagingV2Error::WouldBlock)) => {
+                self.cancel_unused_reservation(receipt)?;
+                Ok(RegionStageValueV2::Busy)
+            }
+            Err(StagingV2EncodeError::Staging(error)) => {
+                let cancel = self.cancel_unused_reservation(receipt);
+                self.health.enter_miss_only();
+                staging.close();
+                cancel?;
+                Err(staging_v2_io_error(error))
+            }
+        }
+    }
+
+    fn cancel_unused_reservation(
+        &self,
+        receipt: crate::region_manager_v2::RegionAppendReservationV2,
+    ) -> io::Result<()> {
+        self.manager
+            .lock()?
+            .cancel_reservation(receipt)
+            .map_err(|error| {
+                self.health.enter_miss_only();
+                region_mutation_io_error(error)
+            })
+    }
+
+    /// Lane-worker kernel for one complete staging span. It performs no sync:
+    /// RUNNING recovery is safe-empty, and the only durability barrier is the
+    /// later CLEAN data sync. Index entries become visible only after the
+    /// exact owned-buffer write completion succeeds.
+    fn flush_staging_lane(
+        &self,
+        staging: &RegionStagingV2,
+        engine: &dyn IoEngine,
+        lane_id: usize,
+    ) -> io::Result<Option<RegionSpanPublishV2>> {
+        let _completion_worker = self.lock_lane_completion(lane_id)?;
+        let lane_mutation = self.lock_lane_mutation(lane_id)?;
+        let geometry_for = |manager: &RegionManagerV2| {
+            let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
+                self.health.enter_miss_only();
+                io::Error::new(io::ErrorKind::InvalidData, "V2 Region count is too large")
+            })?;
+            let data_file_len = crate::recovery_v2::DataGeometryV2::expected_file_len(
+                manager.region_size(),
+                region_count,
+            )
+            .ok_or_else(|| {
+                self.health.enter_miss_only();
+                io::Error::new(io::ErrorKind::InvalidData, "V2 data geometry overflow")
+            })?;
+            Ok::<_, io::Error>(crate::recovery_v2::DataGeometryV2 {
+                data_file_len,
+                region_size: manager.region_size(),
+                region_count,
+            })
+        };
+
+        // An already aligned span is sealed under this first manager guard. A
+        // non-zero tail receipt remains a lane fence while staging rewrites its
+        // last record outside the manager lock.
+        let (padding, sealed) = {
+            let mut manager = self.manager.lock()?;
+            let padding = match manager.reserve_write_padding(lane_id) {
+                Ok(padding) => padding,
+                Err(RegionMutationErrorV2::WouldBlock) => return Ok(None),
+                Err(error) => {
+                    self.health.enter_miss_only();
+                    return Err(region_mutation_io_error(error));
+                }
+            };
+            let sealed = if padding.is_none() {
+                let span = manager.seal_write_span(lane_id).map_err(|error| {
+                    self.health.enter_miss_only();
+                    region_mutation_io_error(error)
+                })?;
+                Some((span, geometry_for(&manager)?))
+            } else {
+                None
+            };
+            (padding, sealed)
+        };
+        let (span, geometry) = if let Some(sealed) = sealed {
+            sealed
+        } else {
+            let padding = padding.ok_or_else(|| {
+                self.health.enter_miss_only();
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V2 padding receipt disappeared before sealing",
+                )
+            })?;
+            if let Err(error) = staging.apply_write_padding(padding) {
+                self.health.enter_miss_only();
+                staging.close();
+                return Err(staging_v2_io_error(error));
+            }
+            let mut manager = self.manager.lock()?;
+            let span = match manager.seal_write_span_with_padding(padding) {
+                Ok(span) => span,
+                Err(error) => {
+                    drop(manager);
+                    self.health.enter_miss_only();
+                    staging.close();
+                    return Err(region_mutation_io_error(error));
+                }
+            };
+            let geometry = geometry_for(&manager)?;
+            (span, geometry)
+        };
+
+        let job = match staging.take_sealed(span) {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                self.health.enter_miss_only();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V2 manager sealed a span with no staging bytes",
+                ));
+            }
+            Err(error) => {
+                self.health.enter_miss_only();
+                return Err(staging_v2_io_error(error));
+            }
+        };
+        drop(lane_mutation);
+        let StagedWriteV2 {
+            span,
+            buffer,
+            absolute,
+            records,
+        } = job;
+        let flight = match submit_span(engine, geometry, span, buffer, absolute) {
+            Ok(flight) => flight,
+            Err(error) => {
+                let original = error.error;
+                self.fail_staged_span(staging, span, error.buffer, records);
+                return Err(original);
+            }
+        };
+        let completion = flight.wait();
+        let crate::region_appender_v2::RegionSpanCompletionV2 {
+            span,
+            result,
+            buffer,
+        } = completion;
+        if let Err(error) = result {
+            self.fail_staged_span(staging, span, buffer, records);
+            return Err(error);
+        }
+        let Some(buffer) = buffer else {
+            self.fail_staged_span(staging, span, None, records);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 span completion lost its owned buffer",
+            ));
+        };
+
+        let snapshot = {
+            let mut manager = match self.manager.lock() {
+                Ok(manager) => manager,
+                Err(error) => {
+                    self.fail_staged_span(staging, span, Some(buffer), records);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = manager.complete_write_span(span) {
+                self.health.enter_miss_only();
+                drop(manager);
+                self.fail_staged_span(staging, span, Some(buffer), records);
+                return Err(region_mutation_io_error(error));
+            }
+            let Some(region) = manager.regions().get(span.region_id as usize).copied() else {
+                self.health.enter_miss_only();
+                drop(manager);
+                self.fail_staged_span(staging, span, Some(buffer), records);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "completed V2 span has no Region authority",
+                ));
+            };
+            region_read_snapshot(&manager, region)
+        };
+        if let Err(error) = self.read_directory.update_active(snapshot) {
+            self.health.enter_miss_only();
+            self.fail_staged_span(staging, span, Some(buffer), records);
+            return Err(region_read_io_error(error));
+        }
+
+        let (published_records, obsolete_records) =
+            match self.publish_completed_records(records.as_slice()) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    self.fail_staged_span(staging, span, Some(buffer), records);
+                    return Err(error);
+                }
+            };
+        if let Err(error) = staging.finish_success(span, buffer, records) {
+            self.health.enter_miss_only();
+            return Err(staging_v2_io_error(error));
+        }
+        Ok(Some(RegionSpanPublishV2 {
+            span,
+            published_records,
+            obsolete_records,
+        }))
+    }
+
+    /// Publishes one completed batch under a single manager acquisition. This
+    /// keeps per-entry lock overhead out of the 4 MiB completion path while
+    /// preserving exact index/accounting commits.
+    fn publish_completed_records(&self, records: &[StagedRecordV2]) -> io::Result<(u64, u64)> {
+        let mut authority = self.manager.begin_index_mutation()?;
+        let mut published = 0_u64;
+        let mut obsolete = 0_u64;
+        let mut index_error = None;
+        for record in records.iter().copied() {
+            match self
+                .index
+                .upsert_with_authority(record.hash, record.entry, &mut authority)
+            {
+                Ok(IndexUpsertV2::Applied { .. }) => published = published.saturating_add(1),
+                Ok(IndexUpsertV2::Ignored { .. })
+                | Ok(IndexUpsertV2::Masked { .. })
+                | Ok(IndexUpsertV2::Saturated) => obsolete = obsolete.saturating_add(1),
+                Err(error) => {
+                    index_error = Some(error);
+                    break;
+                }
+            }
+            if authority.accounting_error.is_some() {
+                break;
+            }
+        }
+        let accounting = authority.finish();
+        if let Some(error) = index_error {
+            self.health.enter_miss_only();
+            return Err(index_storage_io_error(error));
+        }
+        accounting?;
+        Ok((published, obsolete))
+    }
+
+    fn fail_staged_span(
+        &self,
+        staging: &RegionStagingV2,
+        span: crate::region_manager_v2::RegionWriteSpanV2,
+        buffer: Option<crate::io_engine::IoBuffer>,
+        records: Vec<StagedRecordV2>,
+    ) {
+        self.health.enter_miss_only();
+        let _ = staging.finish_failure(span, buffer, records);
     }
 
     /// Revalidate only the exact index identity. Region visibility is checked
@@ -958,9 +1605,51 @@ where
         let FileRegionRuntimeV2 {
             index,
             manager,
+            append_lanes,
+            read_directory,
+            read_epoch,
+            read_clear_floor,
             health,
         } = runtime;
+        if append_lanes
+            .iter()
+            .any(|lane| lane.mutation.is_poisoned() || lane.completion.is_poisoned())
+        {
+            health.enter_miss_only();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 append lane gate is poisoned",
+            ));
+        }
         let manager = manager.into_inner()?;
+        if read_epoch.into_inner() != manager.cache_epoch()
+            || read_clear_floor.into_inner() != manager.clear_floor_seqno()
+        {
+            health.enter_miss_only();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 read fence and Region authority disagree",
+            ));
+        }
+        for region in manager.regions().iter().copied() {
+            let valid = if region.state == RegionMetadataStateV1::Free {
+                read_directory
+                    .snapshot(region.region_id)
+                    .map_err(region_read_io_error)?
+                    .is_none()
+            } else {
+                read_directory
+                    .validate_snapshot(region_read_snapshot(&manager, region))
+                    .map_err(region_read_io_error)?
+            };
+            if !valid {
+                health.enter_miss_only();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V2 read projection and Region authority disagree",
+                ));
+            }
+        }
         let shards = index_shard_metadata(index.storage(), &health)?;
         let metadata = manager
             .freeze_metadata(shards)
@@ -1583,7 +2272,7 @@ fn snapshot_empty_active_region_headers(
         })?;
         if region.region_id != region_id
             || region.state != RegionMetadataStateV1::Active
-            || region.durable_used != REGION_HEADER_SIZE as u64
+            || region.completed_used != REGION_HEADER_SIZE as u64
             || region.reserved_used != REGION_HEADER_SIZE as u64
             || region.max_seqno != 0
             || region.physical_record_count != 0
@@ -1615,7 +2304,7 @@ fn snapshot_empty_active_region_headers(
             incarnation: region.incarnation,
             state: RegionState::Active,
             created_seqno: region.created_seqno,
-            used: region.durable_used,
+            used: region.completed_used,
         };
         headers.push((region_offset, header));
     }
@@ -1792,6 +2481,70 @@ fn region_mutation_io_error(error: RegionMutationErrorV2) -> io::Error {
     )
 }
 
+fn region_read_snapshot(
+    manager: &RegionManagerV2,
+    region: RegionRuntimeV2,
+) -> RegionReadSnapshotV2 {
+    RegionReadSnapshotV2 {
+        region_id: region.region_id,
+        cache_epoch: manager.cache_epoch(),
+        incarnation: region.incarnation,
+        created_seqno: region.created_seqno,
+        completed_used: region.completed_used,
+        max_seqno: region.max_seqno,
+    }
+}
+
+fn region_read_io_error(error: RegionReadErrorV2) -> io::Error {
+    let kind = match error {
+        RegionReadErrorV2::Allocation => io::ErrorKind::OutOfMemory,
+        RegionReadErrorV2::InvalidGeometry => io::ErrorKind::InvalidInput,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error.to_string())
+}
+
+fn record_encode_io_error(error: RecordEncodeErrorV2) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn record_key_matches_v2(
+    codec: RecordCodec,
+    encoded_key: &[u8],
+    namespace_id: u32,
+    expected_key: &[u8],
+) -> bool {
+    match codec {
+        RecordCodec::PlainKey | RecordCodec::SecondChancePlainKey => {
+            namespace_id == 0 && encoded_key == expected_key
+        }
+        RecordCodec::NamespacedKey | RecordCodec::SecondChanceNamespacedKey => {
+            namespace_id != 0
+                && encoded_key.get(..size_of::<u32>())
+                    == Some(namespace_id.to_le_bytes().as_slice())
+                && encoded_key.get(size_of::<u32>()..) == Some(expected_key)
+        }
+    }
+}
+
+fn corrupt_v2_record(health: &RegionV2HealthLatch) -> io::Error {
+    health.enter_miss_only();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "V2 Region record failed identity or checksum validation",
+    )
+}
+
+fn staging_v2_io_error(error: StagingV2Error) -> io::Error {
+    let kind = match error {
+        StagingV2Error::Closed => io::ErrorKind::BrokenPipe,
+        StagingV2Error::WouldBlock => io::ErrorKind::WouldBlock,
+        StagingV2Error::InvalidLane => io::ErrorKind::InvalidInput,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error.to_string())
+}
+
 fn index_storage_io_error(error: IndexStorageError) -> io::Error {
     match error {
         IndexStorageError::Io(error) => error,
@@ -1819,7 +2572,11 @@ mod tests {
     use crate::index::{IndexEntry, PackedLocation};
     use crate::index_storage::IndexSlotV1;
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
+    use crate::io_engine::BackendIoEngine;
     use crate::recovery_v2::{DataGeometryV2, PersistentId};
+    use crate::resources::{
+        BackpressurePolicy, DedicatedBufferPool, ResourceController, ResourceLimits,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2189,9 +2946,213 @@ mod tests {
         test_data_superblock_with_regions(2)
     }
 
+    fn data_path_superblock() -> DataSuperblockV2 {
+        let region_size = 8 * 1024 * 1024;
+        DataSuperblockV2 {
+            geometry: DataGeometryV2 {
+                data_file_len: DataGeometryV2::expected_file_len(region_size, 2).unwrap(),
+                region_size,
+                region_count: 2,
+            },
+            ..test_data_superblock()
+        }
+    }
+
+    fn data_path_resources() -> ResourceController {
+        ResourceController::try_new(ResourceLimits {
+            memory_budget_bytes: 32 * 1024 * 1024,
+            base_memory_bytes: 0,
+            max_buffer_bytes: RECOVERY_PAGE_SIZE,
+            read_queue_depth: 2,
+            write_queue_depth: 2,
+            read_buffer_slots: 1,
+            write_buffer_slots: 1,
+            control_concurrency: 1,
+            backpressure: BackpressurePolicy::Reject,
+            write_budget_bytes_per_second: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntimeV2::install(
+            ShardedIndexStorage::anonymous(512).unwrap(),
+            empty_region_metadata(data, 512).unwrap(),
+        )
+        .unwrap();
+        let resources = data_path_resources();
+        let staging = RegionStagingV2::try_new(
+            1,
+            crate::region_appender_v2::V2_WRITE_BATCH_BYTES,
+            data.geometry.region_size,
+            &resources,
+        )
+        .unwrap();
+        let directory = TestDirectory::new();
+        let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+        backend.set_len(data.geometry.data_file_len).unwrap();
+        let engine = BackendIoEngine::new(Arc::new(backend), 2).unwrap();
+        let value = vec![0x5a; 16 * 1024];
+        let mut first = None;
+        let mut last = None;
+        let mut staged_records = 0_u64;
+        loop {
+            let key = format!("file/chunk/{staged_records:04}");
+            match runtime
+                .try_stage_value(&staging, 0, data.hash_seed, 7, key.as_bytes(), &value, 0)
+                .unwrap()
+            {
+                RegionStageValueV2::Staged(identity) => {
+                    if first.is_none() {
+                        first = Some((key.clone(), identity));
+                    }
+                    last = Some((key, identity));
+                    staged_records += 1;
+                }
+                RegionStageValueV2::NeedsFlush => break,
+                outcome => panic!("unexpected staging outcome: {outcome:?}"),
+            }
+        }
+        let (first_key, identity) = first.expect("4 MiB span must contain target-size records");
+        let (last_key, last_identity) = last.expect("4 MiB span must retain its final record");
+        assert!(staged_records > 240);
+        assert_eq!(
+            runtime.lookup_snapshot(identity.hash).unwrap(),
+            IndexLookupV2::Miss
+        );
+
+        let published = runtime
+            .flush_staging_lane(&staging, &engine, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.published_records, staged_records);
+        assert_eq!(published.obsolete_records, 0);
+        assert_eq!(
+            (published.span.end_offset - published.span.start_offset) % RECOVERY_PAGE_SIZE as u64,
+            0
+        );
+        let IndexLookupV2::Hit(entry) = runtime.lookup_snapshot(identity.hash).unwrap() else {
+            panic!("completed first record must be published");
+        };
+        assert_eq!(entry.seqno, identity.seqno);
+        assert_eq!(
+            entry.location.record_len(),
+            planned_record_bytes(7, first_key.len(), value.len()).unwrap()
+        );
+        assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
+        let IndexLookupV2::Hit(last_entry) = runtime.lookup_snapshot(last_identity.hash).unwrap()
+        else {
+            panic!("completed final record must be published");
+        };
+        assert_eq!(last_entry.seqno, last_identity.seqno);
+        assert!(
+            last_entry.location.record_len()
+                > planned_record_bytes(7, last_key.len(), value.len()).unwrap()
+        );
+        assert_eq!(
+            u64::from(last_entry.location.offset()) + u64::from(last_entry.location.record_len()),
+            published.span.end_offset
+        );
+        let read = runtime
+            .begin_point_read(identity.hash)
+            .unwrap()
+            .expect("completed entry must acquire its Region read pin");
+        assert!(read.record_generation_matches(
+            read.region_snapshot().cache_epoch,
+            read.region_snapshot().incarnation
+        ));
+        assert!(runtime.revalidate_point_read(&read).unwrap());
+        drop(read);
+
+        let read_buffer_bytes = (last_entry.location.record_len() as usize)
+            .div_ceil(RECOVERY_PAGE_SIZE)
+            * RECOVERY_PAGE_SIZE;
+        let read_pool = DedicatedBufferPool::try_new(1, read_buffer_bytes).unwrap();
+        let hit = runtime
+            .read_value(
+                &engine,
+                data.geometry,
+                read_pool.acquire().unwrap(),
+                data.hash_seed,
+                7,
+                last_key.as_bytes(),
+                1,
+            )
+            .unwrap()
+            .expect("completed record must validate as a disk hit");
+        assert_eq!(hit.value(), value);
+        drop(hit);
+        assert_eq!(read_pool.snapshot().in_use, 0);
+
+        assert_eq!(
+            faults.events(),
+            vec![FaultEvent::Write(WritePoint::Record), FaultEvent::Read]
+        );
+        assert_eq!(engine.stats().submitted, 2);
+        assert_eq!(engine.stats().completed, 2);
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_span_write_never_publishes_and_latches_miss_only() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntimeV2::install(
+            ShardedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64).unwrap(),
+        )
+        .unwrap();
+        let resources = data_path_resources();
+        let staging = RegionStagingV2::try_new(
+            1,
+            crate::region_appender_v2::V2_WRITE_BATCH_BYTES,
+            data.geometry.region_size,
+            &resources,
+        )
+        .unwrap();
+        let directory = TestDirectory::new();
+        let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+        backend.set_len(data.geometry.data_file_len).unwrap();
+        let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
+        let RegionStageValueV2::Staged(identity) = runtime
+            .try_stage_value(&staging, 0, data.hash_seed, 0, b"key", &[7; 16 * 1024], 0)
+            .unwrap()
+        else {
+            panic!("value must stage before the injected write failure");
+        };
+        faults.arm(
+            FaultEvent::Write(WritePoint::Record),
+            1,
+            FaultAction::ErrorAlways(5),
+        );
+
+        assert_eq!(
+            runtime
+                .flush_staging_lane(&staging, &engine, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(!runtime.health.is_healthy());
+        assert_eq!(
+            runtime.lookup_snapshot(identity.hash).unwrap(),
+            IndexLookupV2::Miss
+        );
+        assert_eq!(
+            runtime.index.lookup_raw(identity.hash).unwrap(),
+            IndexLookupV2::Miss
+        );
+        assert_eq!(
+            runtime.manager.inner.lock().unwrap().regions()[0].completed_used,
+            RECOVERY_PAGE_SIZE as u64
+        );
+        engine.shutdown().unwrap();
+    }
+
     #[test]
     fn index_mutation_and_region_accounting_share_one_failure_fence() {
-        let data = test_data_superblock();
+        let data = data_path_superblock();
         let runtime = FileRegionRuntimeV2::install(
             ShardedIndexStorage::anonymous(8).unwrap(),
             empty_region_metadata(data, 8).unwrap(),
@@ -2202,7 +3163,8 @@ mod tests {
             let mut manager = runtime.manager.lock().unwrap();
             let reservation = manager.reserve_append(0, 64).unwrap();
             manager.stage_reservation(reservation).unwrap();
-            let span = manager.seal_write_span(0).unwrap();
+            let padding = manager.reserve_write_padding(0).unwrap().unwrap();
+            let span = manager.seal_write_span_with_padding(padding).unwrap();
             manager.complete_write_span(span).unwrap();
             reservation
         };

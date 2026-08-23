@@ -91,12 +91,22 @@ mod miss_guard;
 mod pending_write;
 mod policy;
 #[allow(dead_code)]
+mod record_codec_v2;
+#[allow(dead_code)]
 mod recovery_v2;
+#[allow(dead_code)]
+mod region_appender_v2;
 #[allow(dead_code)]
 mod region_manager_v2;
 #[allow(dead_code)]
 mod region_metadata_v1;
+#[allow(dead_code)]
+mod region_read_v2;
+#[allow(dead_code)]
+mod region_reader_v2;
 mod region_staging;
+#[allow(dead_code)]
+mod region_staging_v2;
 #[allow(dead_code)]
 mod region_v2;
 mod resources;

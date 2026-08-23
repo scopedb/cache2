@@ -443,8 +443,13 @@ impl SubmitError {
     }
 
     pub(crate) fn into_lease(self) -> (io::Error, Option<BufferLease>) {
+        let (error, buffer) = self.into_buffer();
+        (error, buffer.map(IoBuffer::into_lease))
+    }
+
+    pub(crate) fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
         let (error, operation) = self.into_parts();
-        (error, operation.into_buffer().map(IoBuffer::into_lease))
+        (error, operation.into_buffer())
     }
 }
 
