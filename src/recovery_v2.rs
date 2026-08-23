@@ -311,8 +311,8 @@ impl ImageBindingV2 {
 
 /// Header of the immutable clean-recovery image.
 ///
-/// The index mapping starts at exactly 4 KiB. An optional page-aligned region
-/// table follows it; the table format can evolve independently of this header.
+/// The index mapping starts at exactly 4 KiB. A mandatory page-aligned Region
+/// metadata section follows it; that format can evolve independently of this header.
 /// The state file must bind the exact `image_binding()` before this image is
 /// eligible for a clean open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

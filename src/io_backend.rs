@@ -255,6 +255,14 @@ pub(crate) enum WritePoint {
     Record,
     RegionHeader,
     Superblock,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2State,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2RecoveryImageHeader,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2RecoveryImageIndex,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2RecoveryImageMetadata,
     HybridManifest,
     HybridJournal,
     CheckpointDirectory,
@@ -268,6 +276,16 @@ pub(crate) enum SyncPoint {
     FormatTruncate,
     FormatRegions,
     FormatClean,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2StateReset,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2RunningState,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2WarmData,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2RecoveryImage,
+    #[cfg_attr(not(test), allow(dead_code))]
+    V2CleanState,
     DirtyMarker,
     RegionRotation,
     ClearBarrier,
@@ -303,6 +321,34 @@ pub(crate) trait IoBackend: Send + Sync {
     }
 }
 
+/// Buffered descriptor access needed by recovery-control code.
+///
+/// Recovery uses the [`IoBackend`] methods for injectable positioned I/O and
+/// durability barriers, then clones this exact validated descriptor for an
+/// immutable private mapping. File identity is intentionally descriptor-based
+/// so callers never need to reopen a path between validation and `mmap`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait ControlIoBackend: IoBackend {
+    fn try_clone_control_file(&self) -> io::Result<File>;
+
+    fn control_file_identity(&self) -> io::Result<ControlFileIdentity>;
+
+    fn is_same_file(&self, other: &dyn ControlIoBackend) -> io::Result<bool> {
+        Ok(self.control_file_identity()? == other.control_file_identity()?)
+    }
+}
+
+/// Stable identity of one open regular file within the running system.
+///
+/// The fields remain opaque: recovery code only needs equality to reject
+/// aliased data, state, and image descriptors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ControlFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
 pub(crate) struct FileBackend {
     /// Buffered control descriptor and flock owner.
     file: File,
@@ -323,6 +369,29 @@ impl FileBackend {
 
     pub(crate) fn open_existing_with_io_mode(path: &Path, mode: DirectIoMode) -> io::Result<Self> {
         Self::open_with_io_mode_and_create(path, mode, false)
+    }
+
+    /// Atomically creates a new buffered control file without following a
+    /// symbolic link or opening an existing recovery-image target.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn create_new_buffered(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(SAFE_CACHE_OPEN_FLAGS)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache path must be a regular file",
+            ));
+        }
+        Ok(Self {
+            file,
+            direct: None,
+            direct_mode: DirectIoMode::Buffered,
+        })
     }
 
     fn open_with_io_mode_and_create(
@@ -394,16 +463,20 @@ impl FileBackend {
     pub(crate) const fn direct_active(&self) -> bool {
         self.direct.is_some()
     }
+}
 
-    pub(crate) fn try_clone_control_file(&self) -> io::Result<File> {
+#[cfg(unix)]
+impl ControlIoBackend for FileBackend {
+    fn try_clone_control_file(&self) -> io::Result<File> {
         self.file.try_clone()
     }
 
-    #[cfg(unix)]
-    pub(crate) fn is_same_file(&self, other: &Self) -> io::Result<bool> {
-        let left = self.file.metadata()?;
-        let right = other.file.metadata()?;
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    fn control_file_identity(&self) -> io::Result<ControlFileIdentity> {
+        let metadata = self.file.metadata()?;
+        Ok(ControlFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 }
 
@@ -986,6 +1059,89 @@ mod tests {
     }
 
     #[test]
+    fn recovery_control_backend_clones_exact_file_and_detects_aliases() {
+        let primary = TestFile::new("control-primary");
+        let alias = TestFile::new("control-alias");
+        let other = TestFile::new("control-other");
+        drop(primary.open());
+        std::fs::hard_link(&primary.0, &alias.0).unwrap();
+
+        let primary = FileBackend::open(&primary.0).unwrap();
+        let alias = FileBackend::open(&alias.0).unwrap();
+        let other = FileBackend::open(&other.0).unwrap();
+        let cloned = ControlIoBackend::try_clone_control_file(&primary).unwrap();
+
+        primary
+            .write_at(WritePoint::V2RecoveryImageHeader, b"image-v2", 0)
+            .unwrap();
+        let mut observed = [0_u8; 8];
+        cloned.read_at(&mut observed, 0).unwrap();
+        assert_eq!(&observed, b"image-v2");
+        assert!(ControlIoBackend::is_same_file(&primary, &alias).unwrap());
+        assert!(!ControlIoBackend::is_same_file(&primary, &other).unwrap());
+    }
+
+    #[test]
+    fn recovery_temp_creation_never_reopens_an_existing_target() {
+        let image = TestFile::new("recovery-create-new");
+        let backend = FileBackend::create_new_buffered(&image.0).unwrap();
+        backend
+            .write_at(WritePoint::V2RecoveryImageMetadata, b"metadata", 0)
+            .unwrap();
+
+        let error = FileBackend::create_new_buffered(&image.0)
+            .err()
+            .expect("create_new must reject an existing recovery target");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn one_fault_handle_controls_multiple_recovery_files() {
+        use super::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
+
+        let state = TestFile::new("shared-fault-state");
+        let image = TestFile::new("shared-fault-image");
+        let temp = TestFile::new("shared-fault-temp");
+        let faults = FaultHandle::default();
+        let state = FaultBackend::open_with_handle(&state.0, faults.clone()).unwrap();
+        let image = FaultBackend::open_with_handle(&image.0, faults.clone()).unwrap();
+        let temp = FaultBackend::create_new_buffered_with_handle(&temp.0, faults.clone()).unwrap();
+
+        faults.arm(
+            FaultEvent::Write(WritePoint::V2State),
+            2,
+            FaultAction::Error(5),
+        );
+        assert_eq!(
+            state.write_at(WritePoint::V2State, b"running", 0).unwrap(),
+            7
+        );
+        assert_eq!(
+            image
+                .write_at(WritePoint::V2State, b"clean", 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(5)
+        );
+
+        for (point, offset) in [
+            (WritePoint::V2RecoveryImageIndex, 0),
+            (WritePoint::V2RecoveryImageMetadata, 8),
+        ] {
+            temp.write_at(point, b"12345678", offset).unwrap();
+        }
+        for point in [
+            SyncPoint::V2StateReset,
+            SyncPoint::V2RunningState,
+            SyncPoint::V2WarmData,
+            SyncPoint::V2RecoveryImage,
+            SyncPoint::V2CleanState,
+        ] {
+            temp.sync(point, SyncMode::Data).unwrap();
+        }
+    }
+
+    #[test]
     fn cache_open_rejects_symbolic_links() {
         let target = TestFile::new("symlink-target");
         let link = TestFile::new("symlink-link");
@@ -1084,13 +1240,39 @@ pub(crate) mod testing {
     impl FaultBackend {
         pub(crate) fn open(path: &Path) -> io::Result<(Self, FaultHandle)> {
             let handle = FaultHandle::default();
-            Ok((
-                Self {
-                    inner: FileBackend::open(path)?,
-                    handle: handle.clone(),
-                },
+            let backend = Self::open_with_handle(path, handle.clone())?;
+            Ok((backend, handle))
+        }
+
+        /// Opens another control file governed by the same fault schedule.
+        pub(crate) fn open_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
+            Ok(Self {
+                inner: FileBackend::open(path)?,
                 handle,
-            ))
+            })
+        }
+
+        /// Opens an existing control file without creating a missing path.
+        pub(crate) fn open_existing_with_handle(
+            path: &Path,
+            handle: FaultHandle,
+        ) -> io::Result<Self> {
+            Ok(Self {
+                inner: FileBackend::open_existing_with_io_mode(path, DirectIoMode::Buffered)?,
+                handle,
+            })
+        }
+
+        /// Atomically creates a new control file governed by an existing fault
+        /// schedule. This is used for unpublished recovery-image temporaries.
+        pub(crate) fn create_new_buffered_with_handle(
+            path: &Path,
+            handle: FaultHandle,
+        ) -> io::Result<Self> {
+            Ok(Self {
+                inner: FileBackend::create_new_buffered(path)?,
+                handle,
+            })
         }
     }
 
@@ -1204,6 +1386,17 @@ pub(crate) mod testing {
                 )),
                 None => self.inner.unlock(),
             }
+        }
+    }
+
+    #[cfg(unix)]
+    impl ControlIoBackend for FaultBackend {
+        fn try_clone_control_file(&self) -> io::Result<File> {
+            ControlIoBackend::try_clone_control_file(&self.inner)
+        }
+
+        fn control_file_identity(&self) -> io::Result<ControlFileIdentity> {
+            self.inner.control_file_identity()
         }
     }
 

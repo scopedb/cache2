@@ -35,7 +35,7 @@ const PAGE_FIRST_SLOT_OFFSET: usize = 24;
 const PAGE_VALID_SLOTS_OFFSET: usize = 32;
 const PAGE_FLAGS_OFFSET: usize = 36;
 const PAGE_GENERATION_OFFSET: usize = 40;
-const PAGE_RESERVED_OFFSET: usize = 48;
+const PAGE_IMAGE_TAG_OFFSET: usize = 48;
 const PAGE_CHECKSUM_OFFSET: usize = 56;
 const PAGE_TRAILING_RESERVED_OFFSET: usize = 60;
 
@@ -45,6 +45,11 @@ const PAGE_STATE_VALIDATING: u8 = 1;
 const PAGE_STATE_VALID: u8 = 2;
 const PAGE_STATE_DIRTY: u8 = 3;
 const PAGE_STATE_REJECTED: u8 = 4;
+const IMAGE_STATE_USABLE: u8 = 0;
+const IMAGE_STATE_REJECTED: u8 = 1;
+
+pub(crate) const INDEX_SLOT_FLAG_MASKED: u32 = 1 << 31;
+const INDEX_LOCATION_TOMBSTONE_BIT: u64 = 1 << 63;
 
 const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 126);
 const _: () = assert!(
@@ -92,6 +97,109 @@ impl IndexSlotV1 {
             flags: read_u32(input, 28),
         }
     }
+
+    fn physical_kind(self) -> SlotPhysicalKind {
+        if self == Self::EMPTY {
+            SlotPhysicalKind::Empty
+        } else if self.flags & INDEX_SLOT_FLAG_MASKED != 0 {
+            SlotPhysicalKind::Masked
+        } else if self.location_raw & INDEX_LOCATION_TOMBSTONE_BIT != 0 {
+            SlotPhysicalKind::Deleted
+        } else {
+            SlotPhysicalKind::Value
+        }
+    }
+}
+
+/// Identity carried by every self-checking index page in one recovery image.
+///
+/// `image_tag` is the stable non-zero 64-bit tag derived by the recovery-image
+/// owner. Together with a non-reused generation it prevents a page from an
+/// older image being accepted merely because its physical position matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexImageBindingV1 {
+    pub(crate) generation: u64,
+    pub(crate) image_tag: u64,
+}
+
+impl IndexImageBindingV1 {
+    const fn is_valid(self) -> bool {
+        self.generation != 0 && self.image_tag != 0
+    }
+}
+
+/// Counts of the three non-empty physical slot states.
+///
+/// Clean recovery metadata validates these counts before passing them to
+/// [`IndexStorage::map_private`], avoiding an O(slot-count) startup scan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndexPhysicalStats {
+    pub(crate) value: u64,
+    pub(crate) deleted: u64,
+    pub(crate) masked: u64,
+}
+
+impl IndexPhysicalStats {
+    fn total(self) -> Option<u64> {
+        self.value
+            .checked_add(self.deleted)?
+            .checked_add(self.masked)
+    }
+
+    fn is_valid_for(self, slot_count: usize) -> bool {
+        let Ok(slot_count) = u64::try_from(slot_count) else {
+            return false;
+        };
+        self.total().is_some_and(|total| total <= slot_count)
+    }
+
+    fn transitioned(
+        self,
+        old: SlotPhysicalKind,
+        new: SlotPhysicalKind,
+        slot_count: usize,
+    ) -> Option<Self> {
+        let mut next = self;
+        next.decrement(old)?;
+        next.increment(new)?;
+        next.is_valid_for(slot_count).then_some(next)
+    }
+
+    fn decrement(&mut self, kind: SlotPhysicalKind) -> Option<()> {
+        let counter = match kind {
+            SlotPhysicalKind::Empty => return Some(()),
+            SlotPhysicalKind::Value => &mut self.value,
+            SlotPhysicalKind::Deleted => &mut self.deleted,
+            SlotPhysicalKind::Masked => &mut self.masked,
+        };
+        *counter = counter.checked_sub(1)?;
+        Some(())
+    }
+
+    fn increment(&mut self, kind: SlotPhysicalKind) -> Option<()> {
+        let counter = match kind {
+            SlotPhysicalKind::Empty => return Some(()),
+            SlotPhysicalKind::Value => &mut self.value,
+            SlotPhysicalKind::Deleted => &mut self.deleted,
+            SlotPhysicalKind::Masked => &mut self.masked,
+        };
+        *counter = counter.checked_add(1)?;
+        Some(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SlotPhysicalKind {
+    Empty,
+    Value,
+    Deleted,
+    Masked,
+}
+
+impl SlotPhysicalKind {
+    const fn is_masked(self) -> bool {
+        matches!(self, Self::Masked)
+    }
 }
 
 /// The lazy validation state of one physical image page.
@@ -117,6 +225,7 @@ pub(crate) enum CorruptPageReason {
     WrongValidSlotCount { expected: u32, actual: u32 },
     UnsupportedFlags { actual: u32 },
     WrongGeneration { expected: u64, actual: u64 },
+    WrongImageTag { expected: u64, actual: u64 },
     ReservedBytesNonZero,
     ChecksumMismatch { stored: u32, computed: u32 },
     PreviouslyRejected,
@@ -157,6 +266,10 @@ impl fmt::Display for CorruptPageReason {
                 formatter,
                 "page generation mismatch: expected {expected}, found {actual}"
             ),
+            Self::WrongImageTag { expected, actual } => write!(
+                formatter,
+                "page image tag mismatch: expected {expected:#018x}, found {actual:#018x}"
+            ),
             Self::ReservedBytesNonZero => formatter.write_str("reserved page bytes are non-zero"),
             Self::ChecksumMismatch { stored, computed } => write!(
                 formatter,
@@ -186,6 +299,10 @@ pub(crate) enum IndexStorageError {
         page_index: usize,
         reason: CorruptPageReason,
     },
+    InvalidPhysicalStats,
+    MaskedSlotsPresent {
+        count: u64,
+    },
 }
 
 impl fmt::Display for IndexStorageError {
@@ -205,6 +322,12 @@ impl fmt::Display for IndexStorageError {
             Self::CorruptPage { page_index, reason } => {
                 write!(formatter, "index page {page_index} is corrupt: {reason}")
             }
+            Self::InvalidPhysicalStats => {
+                formatter.write_str("index physical slot counts are inconsistent")
+            }
+            Self::MaskedSlotsPresent { count } => {
+                write!(formatter, "warm index image contains {count} masked slots")
+            }
         }
     }
 }
@@ -217,7 +340,9 @@ impl std::error::Error for IndexStorageError {
             | Self::SizeOverflow
             | Self::SlotOutOfBounds { .. }
             | Self::PageOutOfBounds { .. }
-            | Self::CorruptPage { .. } => None,
+            | Self::CorruptPage { .. }
+            | Self::InvalidPhysicalStats
+            | Self::MaskedSlotsPresent { .. } => None,
         }
     }
 }
@@ -247,7 +372,9 @@ pub(crate) struct IndexStorage {
     image_len: usize,
     slot_count: usize,
     page_count: usize,
-    expected_generation: Option<u64>,
+    expected_binding: Option<IndexImageBindingV1>,
+    physical_stats: IndexPhysicalStats,
+    image_state: AtomicU8,
     page_states: Box<[AtomicU8]>,
 }
 
@@ -263,7 +390,9 @@ impl IndexStorage {
             image_len: layout.image_len,
             slot_count,
             page_count: layout.page_count,
-            expected_generation: None,
+            expected_binding: None,
+            physical_stats: IndexPhysicalStats::default(),
+            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
             page_states,
         })
     }
@@ -278,12 +407,16 @@ impl IndexStorage {
         file: &File,
         file_offset: u64,
         slot_count: usize,
-        expected_generation: u64,
+        expected_binding: IndexImageBindingV1,
+        physical_stats: IndexPhysicalStats,
     ) -> Result<Self, IndexStorageError> {
-        if expected_generation == 0 {
+        if !expected_binding.is_valid() {
             return Err(IndexStorageError::InvalidArgument(
-                "mapped index image generation must be non-zero",
+                "mapped index image binding must be non-zero",
             ));
+        }
+        if !physical_stats.is_valid_for(slot_count) {
+            return Err(IndexStorageError::InvalidPhysicalStats);
         }
         if file_offset % INDEX_IMAGE_PAGE_SIZE as u64 != 0 {
             return Err(IndexStorageError::InvalidArgument(
@@ -317,13 +450,19 @@ impl IndexStorage {
             image_len: layout.image_len,
             slot_count,
             page_count: layout.page_count,
-            expected_generation: Some(expected_generation),
+            expected_binding: Some(expected_binding),
+            physical_stats,
+            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
             page_states,
         })
     }
 
     pub(crate) const fn slot_count(&self) -> usize {
         self.slot_count
+    }
+
+    pub(crate) const fn physical_stats(&self) -> IndexPhysicalStats {
+        self.physical_stats
     }
 
     pub(crate) fn image_len_for_slots(slot_count: usize) -> Result<u64, IndexStorageError> {
@@ -341,8 +480,11 @@ impl IndexStorage {
             .ok_or(IndexStorageError::PageOutOfBounds {
                 page,
                 page_count: self.page_count,
-            })?
-            .load(Ordering::Acquire);
+            })?;
+        if self.image_is_rejected() {
+            return Ok(PageValidationState::Rejected);
+        }
+        let state = state.load(Ordering::Acquire);
         Ok(match state {
             PAGE_STATE_UNCHECKED => PageValidationState::Unchecked,
             PAGE_STATE_VALIDATING => PageValidationState::Validating,
@@ -369,6 +511,11 @@ impl IndexStorage {
     ) -> Result<(), IndexStorageError> {
         let (page, offset) = self.slot_address(slot)?;
         self.ensure_page_valid(page)?;
+        let old = self.decode_at(offset);
+        let next_stats = self
+            .physical_stats
+            .transitioned(old.physical_kind(), value.physical_kind(), self.slot_count)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
         let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
         value.encode(&mut encoded);
         // SAFETY: `offset` identifies one complete slot inside the owned
@@ -380,6 +527,7 @@ impl IndexStorage {
                 INDEX_IMAGE_SLOT_SIZE,
             );
         }
+        self.physical_stats = next_stats;
         self.page_states[page].store(PAGE_STATE_DIRTY, Ordering::Release);
         Ok(())
     }
@@ -393,15 +541,21 @@ impl IndexStorage {
     pub(crate) fn write_warm_image<W>(
         &self,
         writer: &mut W,
-        image_generation: u64,
+        binding: IndexImageBindingV1,
     ) -> Result<WarmImageStats, IndexStorageError>
     where
         W: Write + ?Sized,
     {
-        if image_generation == 0 {
+        if !binding.is_valid() {
             return Err(IndexStorageError::InvalidArgument(
-                "warm index image generation must be non-zero",
+                "warm index image binding must be non-zero",
             ));
+        }
+        self.ensure_image_usable(0)?;
+        if self.physical_stats.masked != 0 {
+            return Err(IndexStorageError::MaskedSlotsPresent {
+                count: self.physical_stats.masked,
+            });
         }
         let mut output = [0_u8; INDEX_IMAGE_PAGE_SIZE];
         for page in 0..self.page_count {
@@ -411,7 +565,7 @@ impl IndexStorage {
                 .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
                 .ok_or(IndexStorageError::SizeOverflow)?;
             let valid_slots = self.valid_slots_in_page(page);
-            encode_page_header(&mut output, page, first_slot, valid_slots, image_generation)?;
+            encode_page_header(&mut output, page, first_slot, valid_slots, binding)?;
 
             for slot_in_page in 0..valid_slots {
                 let source_offset = page
@@ -422,6 +576,9 @@ impl IndexStorage {
                     })
                     .ok_or(IndexStorageError::SizeOverflow)?;
                 let mut value = self.decode_at(source_offset);
+                if value.physical_kind().is_masked() {
+                    return Err(IndexStorageError::MaskedSlotsPresent { count: 1 });
+                }
                 value.flags &= !INDEX_RUNTIME_ONLY_FLAGS;
                 let target_offset =
                     INDEX_IMAGE_PAGE_HEADER_SIZE + slot_in_page * INDEX_IMAGE_SLOT_SIZE;
@@ -470,6 +627,7 @@ impl IndexStorage {
             });
         };
         loop {
+            self.ensure_image_usable(page)?;
             match state.load(Ordering::Acquire) {
                 PAGE_STATE_VALID | PAGE_STATE_DIRTY => return Ok(()),
                 PAGE_STATE_REJECTED => {
@@ -491,18 +649,22 @@ impl IndexStorage {
                         continue;
                     }
                     let result = self.validate_mapped_page(page);
-                    state.store(
-                        if result.is_ok() {
-                            PAGE_STATE_VALID
-                        } else {
-                            PAGE_STATE_REJECTED
-                        },
-                        Ordering::Release,
-                    );
-                    return result;
+                    match result {
+                        Ok(()) => {
+                            state.store(PAGE_STATE_VALID, Ordering::Release);
+                            self.ensure_image_usable(page)?;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            self.reject_image();
+                            state.store(PAGE_STATE_REJECTED, Ordering::Release);
+                            return Err(error);
+                        }
+                    }
                 }
                 PAGE_STATE_VALIDATING => std::hint::spin_loop(),
                 _ => {
+                    self.reject_image();
                     state.store(PAGE_STATE_REJECTED, Ordering::Release);
                     return Err(IndexStorageError::CorruptPage {
                         page_index: page,
@@ -514,11 +676,11 @@ impl IndexStorage {
     }
 
     fn validate_mapped_page(&self, page_index: usize) -> Result<(), IndexStorageError> {
-        let expected_generation =
-            self.expected_generation
-                .ok_or(IndexStorageError::InvalidArgument(
-                    "anonymous index page unexpectedly requires validation",
-                ))?;
+        let expected_binding = self
+            .expected_binding
+            .ok_or(IndexStorageError::InvalidArgument(
+                "anonymous index page unexpectedly requires validation",
+            ))?;
         let offset = page_index
             .checked_mul(INDEX_IMAGE_PAGE_SIZE)
             .ok_or(IndexStorageError::SizeOverflow)?;
@@ -539,9 +701,28 @@ impl IndexStorage {
             page_index,
             expected_first_slot,
             expected_valid_slots,
-            expected_generation,
+            expected_binding,
         )
         .map_err(|reason| IndexStorageError::CorruptPage { page_index, reason })
+    }
+
+    fn image_is_rejected(&self) -> bool {
+        self.image_state.load(Ordering::Acquire) == IMAGE_STATE_REJECTED
+    }
+
+    fn ensure_image_usable(&self, page_index: usize) -> Result<(), IndexStorageError> {
+        if self.image_is_rejected() {
+            return Err(IndexStorageError::CorruptPage {
+                page_index,
+                reason: CorruptPageReason::PreviouslyRejected,
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_image(&self) {
+        self.image_state
+            .store(IMAGE_STATE_REJECTED, Ordering::Release);
     }
 
     fn valid_slots_in_page(&self, page: usize) -> usize {
@@ -635,7 +816,7 @@ fn encode_page_header(
     page_index: usize,
     first_slot: usize,
     valid_slots: usize,
-    generation: u64,
+    binding: IndexImageBindingV1,
 ) -> Result<(), IndexStorageError> {
     page[..8].copy_from_slice(&PAGE_MAGIC);
     put_u16(page, PAGE_VERSION_OFFSET, PAGE_FORMAT_VERSION);
@@ -666,7 +847,8 @@ fn encode_page_header(
         u32::try_from(valid_slots).map_err(|_| IndexStorageError::SizeOverflow)?,
     );
     put_u32(page, PAGE_FLAGS_OFFSET, PAGE_FLAG_NONE);
-    put_u64(page, PAGE_GENERATION_OFFSET, generation);
+    put_u64(page, PAGE_GENERATION_OFFSET, binding.generation);
+    put_u64(page, PAGE_IMAGE_TAG_OFFSET, binding.image_tag);
     // The caller starts from a zero-filled page; write the checksum last.
     put_u32(page, PAGE_CHECKSUM_OFFSET, 0);
     Ok(())
@@ -677,7 +859,7 @@ fn validate_page_header(
     expected_page_index: usize,
     expected_first_slot: usize,
     expected_valid_slots: usize,
-    expected_generation: u64,
+    expected_binding: IndexImageBindingV1,
 ) -> Result<(), CorruptPageReason> {
     if page[..8] != PAGE_MAGIC {
         return Err(CorruptPageReason::InvalidMagic);
@@ -748,15 +930,21 @@ fn validate_page_header(
         return Err(CorruptPageReason::UnsupportedFlags { actual: flags });
     }
     let actual_generation = read_u64(page, PAGE_GENERATION_OFFSET);
-    if actual_generation != expected_generation {
+    if actual_generation != expected_binding.generation {
         return Err(CorruptPageReason::WrongGeneration {
-            expected: expected_generation,
+            expected: expected_binding.generation,
             actual: actual_generation,
         });
     }
-    if page[PAGE_RESERVED_OFFSET..PAGE_CHECKSUM_OFFSET]
+    let actual_image_tag = read_u64(page, PAGE_IMAGE_TAG_OFFSET);
+    if actual_image_tag != expected_binding.image_tag {
+        return Err(CorruptPageReason::WrongImageTag {
+            expected: expected_binding.image_tag,
+            actual: actual_image_tag,
+        });
+    }
+    if page[PAGE_TRAILING_RESERVED_OFFSET..INDEX_IMAGE_PAGE_HEADER_SIZE]
         .iter()
-        .chain(page[PAGE_TRAILING_RESERVED_OFFSET..INDEX_IMAGE_PAGE_HEADER_SIZE].iter())
         .any(|byte| *byte != 0)
     {
         return Err(CorruptPageReason::ReservedBytesNonZero);
@@ -938,6 +1126,13 @@ mod tests {
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
+    const fn binding(generation: u64) -> IndexImageBindingV1 {
+        IndexImageBindingV1 {
+            generation,
+            image_tag: 0x0102_0304_0506_0708,
+        }
+    }
+
     struct TestFile {
         path: PathBuf,
         file: File,
@@ -991,6 +1186,72 @@ mod tests {
     }
 
     #[test]
+    fn physical_stats_follow_constant_time_slot_transitions() {
+        let mut storage = IndexStorage::anonymous(3).unwrap();
+        assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
+
+        storage.write_slot(0, sample_slot(1)).unwrap();
+        assert_eq!(
+            storage.physical_stats(),
+            IndexPhysicalStats {
+                value: 1,
+                deleted: 0,
+                masked: 0,
+            }
+        );
+
+        let mut deleted = sample_slot(2);
+        deleted.location_raw |= INDEX_LOCATION_TOMBSTONE_BIT;
+        storage.write_slot(0, deleted).unwrap();
+        assert_eq!(
+            storage.physical_stats(),
+            IndexPhysicalStats {
+                value: 0,
+                deleted: 1,
+                masked: 0,
+            }
+        );
+
+        let mut masked = sample_slot(3);
+        masked.flags |= INDEX_SLOT_FLAG_MASKED;
+        storage.write_slot(0, masked).unwrap();
+        assert_eq!(
+            storage.physical_stats(),
+            IndexPhysicalStats {
+                value: 0,
+                deleted: 0,
+                masked: 1,
+            }
+        );
+        assert!(matches!(
+            storage.write_warm_image(&mut Vec::new(), binding(1)),
+            Err(IndexStorageError::MaskedSlotsPresent { count: 1 })
+        ));
+
+        storage.write_slot(0, IndexSlotV1::EMPTY).unwrap();
+        assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
+    }
+
+    #[test]
+    fn mapped_physical_stats_must_fit_the_slot_capacity() {
+        let test_file = TestFile::create();
+        assert!(matches!(
+            IndexStorage::map_private(
+                &test_file.file,
+                0,
+                1,
+                binding(1),
+                IndexPhysicalStats {
+                    value: 1,
+                    deleted: 1,
+                    masked: 0,
+                }
+            ),
+            Err(IndexStorageError::InvalidPhysicalStats)
+        ));
+    }
+
+    #[test]
     fn anonymous_warm_image_maps_private_without_rebuilding_slots() {
         const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE + 3;
         const GENERATION: u64 = 47;
@@ -1009,7 +1270,7 @@ mod tests {
         test_file.file.set_len(PREFIX as u64).unwrap();
         test_file.file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
         let stats = source
-            .write_warm_image(&mut test_file.file, GENERATION)
+            .write_warm_image(&mut test_file.file, binding(GENERATION))
             .unwrap();
         assert_eq!(stats.pages_written, 2);
         assert_eq!(stats.slots_written, SLOT_COUNT);
@@ -1017,21 +1278,42 @@ mod tests {
         test_file.file.sync_all().unwrap();
 
         assert!(matches!(
-            IndexStorage::map_private(&test_file.file, (PREFIX + 1) as u64, SLOT_COUNT, GENERATION),
+            IndexStorage::map_private(
+                &test_file.file,
+                (PREFIX + 1) as u64,
+                SLOT_COUNT,
+                binding(GENERATION),
+                source.physical_stats()
+            ),
             Err(IndexStorageError::InvalidArgument(
                 "index image file offset must be 4 KiB aligned"
             ))
         ));
         assert!(matches!(
-            IndexStorage::map_private(&test_file.file, PREFIX as u64, SLOT_COUNT, 0),
+            IndexStorage::map_private(
+                &test_file.file,
+                PREFIX as u64,
+                SLOT_COUNT,
+                IndexImageBindingV1 {
+                    generation: 0,
+                    image_tag: 1
+                },
+                source.physical_stats()
+            ),
             Err(IndexStorageError::InvalidArgument(
-                "mapped index image generation must be non-zero"
+                "mapped index image binding must be non-zero"
             ))
         ));
 
-        let mut recovered =
-            IndexStorage::map_private(&test_file.file, PREFIX as u64, SLOT_COUNT, GENERATION)
-                .unwrap();
+        let mut recovered = IndexStorage::map_private(
+            &test_file.file,
+            PREFIX as u64,
+            SLOT_COUNT,
+            binding(GENERATION),
+            source.physical_stats(),
+        )
+        .unwrap();
+        assert_eq!(recovered.physical_stats(), source.physical_stats());
         assert_eq!(
             recovered.page_validation_state(0).unwrap(),
             PageValidationState::Unchecked
@@ -1060,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_page_is_rejected_only_when_that_page_is_touched() {
+    fn corrupt_page_rejects_the_whole_image_when_touched() {
         const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE * 2;
         const GENERATION: u64 = 91;
 
@@ -1070,14 +1352,22 @@ mod tests {
             .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE, sample_slot(2))
             .unwrap();
         let mut image = Vec::new();
-        source.write_warm_image(&mut image, GENERATION).unwrap();
+        source
+            .write_warm_image(&mut image, binding(GENERATION))
+            .unwrap();
         image[INDEX_IMAGE_PAGE_SIZE + INDEX_IMAGE_PAGE_HEADER_SIZE + 7] ^= 0x80;
 
         let mut test_file = TestFile::create();
         test_file.file.write_all(&image).unwrap();
         test_file.file.sync_all().unwrap();
-        let recovered =
-            IndexStorage::map_private(&test_file.file, 0, SLOT_COUNT, GENERATION).unwrap();
+        let recovered = IndexStorage::map_private(
+            &test_file.file,
+            0,
+            SLOT_COUNT,
+            binding(GENERATION),
+            source.physical_stats(),
+        )
+        .unwrap();
 
         assert_eq!(recovered.read_slot(0).unwrap(), sample_slot(1));
         let error = recovered.read_slot(INDEX_IMAGE_SLOTS_PER_PAGE).unwrap_err();
@@ -1092,31 +1382,48 @@ mod tests {
             recovered.page_validation_state(1).unwrap(),
             PageValidationState::Rejected
         );
+        assert_eq!(
+            recovered.page_validation_state(0).unwrap(),
+            PageValidationState::Rejected
+        );
         assert!(matches!(
-            recovered.read_slot(INDEX_IMAGE_SLOTS_PER_PAGE),
+            recovered.read_slot(0),
             Err(IndexStorageError::CorruptPage {
-                page_index: 1,
+                page_index: 0,
                 reason: CorruptPageReason::PreviouslyRejected
             })
         ));
     }
 
     #[test]
-    fn generation_binding_is_checked_on_first_page_touch() {
+    fn image_binding_is_checked_on_first_page_touch() {
         let source = IndexStorage::anonymous(1).unwrap();
         assert!(matches!(
-            source.write_warm_image(&mut Vec::new(), 0),
+            source.write_warm_image(
+                &mut Vec::new(),
+                IndexImageBindingV1 {
+                    generation: 0,
+                    image_tag: 1
+                }
+            ),
             Err(IndexStorageError::InvalidArgument(
-                "warm index image generation must be non-zero"
+                "warm index image binding must be non-zero"
             ))
         ));
         let mut image = Vec::new();
-        source.write_warm_image(&mut image, 7).unwrap();
+        source.write_warm_image(&mut image, binding(7)).unwrap();
         let mut test_file = TestFile::create();
         test_file.file.write_all(&image).unwrap();
         test_file.file.sync_all().unwrap();
 
-        let recovered = IndexStorage::map_private(&test_file.file, 0, 1, 8).unwrap();
+        let recovered = IndexStorage::map_private(
+            &test_file.file,
+            0,
+            1,
+            binding(8),
+            IndexPhysicalStats::default(),
+        )
+        .unwrap();
         assert_eq!(
             recovered.page_validation_state(0).unwrap(),
             PageValidationState::Unchecked
@@ -1129,6 +1436,25 @@ mod tests {
                     expected: 8,
                     actual: 7
                 }
+            })
+        ));
+
+        let recovered = IndexStorage::map_private(
+            &test_file.file,
+            0,
+            1,
+            IndexImageBindingV1 {
+                generation: 7,
+                image_tag: binding(7).image_tag ^ 1,
+            },
+            IndexPhysicalStats::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.read_slot(0),
+            Err(IndexStorageError::CorruptPage {
+                page_index: 0,
+                reason: CorruptPageReason::WrongImageTag { .. }
             })
         ));
     }

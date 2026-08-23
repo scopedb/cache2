@@ -222,7 +222,8 @@ mandatory Region metadata pages
 
 V1 物理顺序固定为 header → index pages → Region metadata pages，不能留 gap 或 trailing
 bytes。Region metadata 是 CLEAN image 的必需部分；只有 index 的临时镜像不得编码、发布或
-恢复。当前基础层在完整 frozen Region view 接入前明确拒绝 warm close。
+恢复。当前 crate-private recovery vertical slice 已能冻结、发布并 mmap 恢复完整 image；
+production Region appender/manager 尚未接入该 seam，因此还不是对外数据路径。
 
 Region table 只与 Region 数量有关。以 100 GiB、32 MiB Region 计算约 3,200 项。
 slot array 保留物理位置，恢复时不重新 hash。per-region accounting 至少保存 state、
@@ -266,7 +267,7 @@ open 顺序：
 获取独占锁
   → 读取最新有效 state
   → CLEAN 且 cache UUID、data/image identity、config 完全匹配：MAP_PRIVATE 映射 index
-  → 否则：anonymous empty index，旧 data bytes 保持不可达
+  → 否则：先使 state 失效，再 truncate/reinitialize data extent，使用 anonymous empty index
   → 将两个 state 槽都改写为递增 generation 的 RUNNING，再一次 fdatasync
   → RUNNING barrier 失败则 abort open，绝不开放或 mutate recovered mapping
   → 开放流量
@@ -298,7 +299,9 @@ warm close 顺序：
   → 释放锁
 ~~~
 
-任一步骤失败都保留 RUNNING。下次启动直接 empty，不尝试修复半成品。
+在 CLEAN marker 写入前任一步骤失败都保留 RUNNING；下次启动直接 empty，不尝试修复半成品。
+最终 CLEAN 全页写已完成但 state fdatasync 报错时，close 返回错误，下一次允许得到 fully-safe
+CLEAN 或 empty（sync 错误无法证明此前的完整页一定未落盘），但绝不能选择未完成的 image。
 
 ### 5.4 唯一格式 authority
 
@@ -315,6 +318,8 @@ Region table 是 clean open 的唯一 Region runtime state。format/reset 必须
 升级或旧 recovery fallback。
 
 Data、state、image 使用不含版本号的稳定 family magic；版本只编码在固定 envelope 字段中。
+三个文件必须位于同一目录，使 image rename 后的一次 parent-directory fsync 同时固定首次创建的
+data/state 目录项；recovery temporary path 也必须与三者互异。
 magic 匹配且整页 CRC 有效的未知版本必须拒绝打开，不能静默 downgrade；CRC 无效的未知
 version byte 按 torn/corrupt cache 冷启动。只要 IndexSlotV1 继续使用 PackedLocation，
 geometry 就必须限制在其 region-id 和 region-offset 位宽内。

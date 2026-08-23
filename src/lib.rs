@@ -90,6 +90,8 @@ mod pending_write;
 mod policy;
 #[allow(dead_code)]
 mod recovery_v2;
+#[allow(dead_code)]
+mod region_metadata_v1;
 mod region_staging;
 #[allow(dead_code)]
 mod region_v2;
