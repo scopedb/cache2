@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::hybrid_manifest::HybridVersion;
 use crate::policy::NamespaceId;
 
 pub(crate) const PENDING_WRITE_OWNED_OVERHEAD_BYTES: usize = 256;
@@ -43,35 +42,26 @@ pub(crate) enum PendingWaitOutcome {
     Failed,
 }
 
-struct PendingState {
-    terminal: PendingTerminal,
-}
-
 pub(crate) struct PendingWriteSlot {
     namespace: NamespaceId,
     key: Vec<u8>,
     hash: u64,
-    version: HybridVersion,
     charged_bytes: usize,
-    state: Mutex<PendingState>,
+    state: Mutex<PendingTerminal>,
     finished: Condvar,
 }
 
 impl PendingWriteSlot {
-    pub(crate) fn version(&self) -> HybridVersion {
-        self.version
-    }
-
     pub(crate) fn wait_finished(&self) -> (PendingWaitOutcome, Duration) {
         let started = Instant::now();
         let mut state = lock_mutex(&self.state);
-        while state.terminal == PendingTerminal::Active {
+        while *state == PendingTerminal::Active {
             state = self
                 .finished
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let outcome = match state.terminal {
+        let outcome = match *state {
             PendingTerminal::Finished => PendingWaitOutcome::Finished,
             PendingTerminal::Failed => PendingWaitOutcome::Failed,
             PendingTerminal::Active => unreachable!("pending wait exits only at a terminal state"),
@@ -80,7 +70,7 @@ impl PendingWriteSlot {
     }
 
     pub(crate) fn failed(&self) -> bool {
-        lock_mutex(&self.state).terminal == PendingTerminal::Failed
+        *lock_mutex(&self.state) == PendingTerminal::Failed
     }
 
     fn matches(&self, namespace: NamespaceId, key: &[u8]) -> bool {
@@ -137,7 +127,6 @@ impl PendingWriteDirectory {
         namespace: NamespaceId,
         key: &[u8],
         hash: u64,
-        version: HybridVersion,
         charged_bytes: usize,
     ) -> Result<Arc<PendingWriteSlot>, PendingRegisterError> {
         let mut shard = lock_mutex(&self.shards[hash as usize & self.shard_mask]);
@@ -153,9 +142,11 @@ impl PendingWriteDirectory {
             .try_reserve_exact(key.len())
             .map_err(|_| PendingRegisterError::AllocationFailed)?;
         owned_key.extend_from_slice(key);
-        shard
-            .try_reserve(1)
-            .map_err(|_| PendingRegisterError::AllocationFailed)?;
+        if !shard.contains_key(&hash) {
+            shard
+                .try_reserve(1)
+                .map_err(|_| PendingRegisterError::AllocationFailed)?;
+        }
         let slots = shard.entry(hash).or_default();
         slots
             .try_reserve(1)
@@ -164,11 +155,8 @@ impl PendingWriteDirectory {
             namespace,
             key: owned_key,
             hash,
-            version,
             charged_bytes,
-            state: Mutex::new(PendingState {
-                terminal: PendingTerminal::Active,
-            }),
+            state: Mutex::new(PendingTerminal::Active),
             finished: Condvar::new(),
         });
         slots.push(Arc::clone(&slot));
@@ -189,10 +177,10 @@ impl PendingWriteDirectory {
     pub(crate) fn finish(&self, slot: &Arc<PendingWriteSlot>) {
         {
             let mut state = lock_mutex(&slot.state);
-            if state.terminal != PendingTerminal::Active {
+            if *state != PendingTerminal::Active {
                 return;
             }
-            state.terminal = PendingTerminal::Finished;
+            *state = PendingTerminal::Finished;
         }
         let mut shard = lock_mutex(&self.shards[slot.hash as usize & self.shard_mask]);
         let mut removed = false;
@@ -221,8 +209,8 @@ impl PendingWriteDirectory {
     /// still observe this terminal and refuse the stale lower value.
     pub(crate) fn fail(&self, slot: &Arc<PendingWriteSlot>) {
         let mut state = lock_mutex(&slot.state);
-        if state.terminal == PendingTerminal::Active {
-            state.terminal = PendingTerminal::Failed;
+        if *state == PendingTerminal::Active {
+            *state = PendingTerminal::Failed;
             slot.finished.notify_all();
         }
     }
@@ -239,7 +227,7 @@ impl PendingWriteDirectory {
     }
 }
 
-pub(crate) fn allocation_bytes(shards: usize, _maximum_entries: usize) -> Option<usize> {
+pub(crate) fn allocation_bytes(shards: usize) -> Option<usize> {
     shards.checked_mul(PENDING_WRITE_SHARD_OVERHEAD_BYTES)
 }
 
@@ -262,12 +250,8 @@ mod tests {
     #[test]
     fn exact_keys_sharing_a_hash_have_independent_fences() {
         let directory = PendingWriteDirectory::try_new(4).unwrap();
-        let first = directory
-            .try_register(7, b"first", 11, HybridVersion::ZERO, 100)
-            .unwrap();
-        let second = directory
-            .try_register(7, b"second", 11, HybridVersion::ZERO, 200)
-            .unwrap();
+        let first = directory.try_register(7, b"first", 11, 100).unwrap();
+        let second = directory.try_register(7, b"second", 11, 200).unwrap();
 
         assert!(directory.find(7, b"first", 11).is_some());
         assert!(directory.find(7, b"second", 11).is_some());
@@ -285,18 +269,12 @@ mod tests {
     #[test]
     fn duplicate_exact_key_is_rejected_until_owner_finishes() {
         let directory = PendingWriteDirectory::try_new(2).unwrap();
-        let slot = directory
-            .try_register(3, b"key", 5, HybridVersion::ZERO, 64)
-            .unwrap();
+        let slot = directory.try_register(3, b"key", 5, 64).unwrap();
         assert!(matches!(
-            directory.try_register(3, b"key", 5, HybridVersion::ZERO, 64),
+            directory.try_register(3, b"key", 5, 64),
             Err(PendingRegisterError::AlreadyPending)
         ));
         directory.finish(&slot);
-        assert!(
-            directory
-                .try_register(3, b"key", 5, HybridVersion::ZERO, 64)
-                .is_ok()
-        );
+        assert!(directory.try_register(3, b"key", 5, 64).is_ok());
     }
 }

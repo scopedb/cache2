@@ -776,13 +776,10 @@ impl HybridCacheConfig {
             .memory_shards
             .checked_mul(size_of::<Mutex<()>>())
             .ok_or_else(|| CacheError::InvalidConfig("hybrid ordering memory overflow".into()))?;
-        let pending_write_overhead_bytes =
-            pending_write_allocation_bytes(self.memory_shards, self.write_back_queue_depth)
-                .ok_or_else(|| {
-                    CacheError::InvalidConfig(
-                        "hybrid pending-write directory memory overflow".into(),
-                    )
-                })?;
+        let pending_write_overhead_bytes = pending_write_allocation_bytes(self.memory_shards)
+            .ok_or_else(|| {
+                CacheError::InvalidConfig("hybrid pending-write directory memory overflow".into())
+            })?;
         let async_queue_bytes = self
             .async_read_queue_depth
             .checked_add(self.async_write_queue_depth)
@@ -3311,7 +3308,6 @@ impl HybridCache {
             entry.namespace,
             &entry.key,
             hash,
-            entry.version,
             reservation_bytes,
         ) {
             Ok(pending) => pending,
@@ -3363,7 +3359,6 @@ impl HybridCache {
                 .operation
                 .read()
                 .map_err(|_| DirtyPersistFailure::Fatal(CacheError::Poisoned))?;
-            debug_assert_eq!(pending.version(), entry.version);
             match self.persist_dirty_entry(&entry) {
                 Ok(_) => {
                     self.inner
@@ -6976,13 +6971,7 @@ mod tests {
         let pending = cache
             .inner
             .pending_writes
-            .try_register(
-                first.namespace,
-                &first.key,
-                first_hash,
-                first.version,
-                background_bytes,
-            )
+            .try_register(first.namespace, &first.key, first_hash, background_bytes)
             .unwrap();
         let background_cache = cache.clone();
         let background_pending = Arc::clone(&pending);
