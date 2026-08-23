@@ -84,12 +84,12 @@ fn run() -> Result<(), String> {
         .with_memory_budget(options.memory_budget)
         .with_submission_queue_depths(options.queue_depth, options.queue_depth)
         .with_append_lanes(options.append_lanes)
-        .with_io_engine(options.engine.into_cache_engine())
+        .with_io_engine(options.engine.cache())
         .with_io_queue_depth(options.queue_depth)
         .with_backpressure(BackpressurePolicy::Block)
         .with_admission_mode(options.admission.into_cache_mode())
         .with_reclaim_mode(options.reclaim.into_cache_mode())
-        .with_io_mode(cache_io_mode(options.io_mode));
+        .with_io_mode(options.io_mode.cache());
 
     let keys = Arc::new(build_keys(options.keys)?);
     let value = Arc::new(build_value(options.object_size)?);
@@ -582,7 +582,7 @@ impl FromStr for ApiArg {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EngineArg {
     Sync,
     Auto,
@@ -598,7 +598,7 @@ impl EngineArg {
         }
     }
 
-    const fn into_cache_engine(self) -> IoEngineKind {
+    const fn cache(self) -> IoEngineKind {
         match self {
             Self::Sync => IoEngineKind::Sync,
             Self::Auto => IoEngineKind::Auto,
@@ -635,6 +635,14 @@ impl IoModeArg {
             Self::Buffered => "buffered",
             Self::Direct => "direct",
             Self::Auto => "auto",
+        }
+    }
+
+    const fn cache(self) -> IoMode {
+        match self {
+            Self::Buffered => IoMode::Buffered,
+            Self::Direct => IoMode::Direct,
+            Self::Auto => IoMode::Auto,
         }
     }
 }
@@ -743,14 +751,6 @@ impl FromStr for OutputKind {
                 "invalid --output {value:?}; expected json or human"
             )),
         }
-    }
-}
-
-fn cache_io_mode(mode: IoModeArg) -> IoMode {
-    match mode {
-        IoModeArg::Buffered => IoMode::Buffered,
-        IoModeArg::Auto => IoMode::Auto,
-        IoModeArg::Direct => IoMode::Direct,
     }
 }
 
@@ -1082,7 +1082,7 @@ fn worker_loop(context: WorkerContext, start: Instant) -> PhaseResult {
     let mut random = XorShift64::new(context.seed);
     let mut result = PhaseResult::new();
     while !context.abort.load(Ordering::Acquire) && Instant::now() < deadline {
-        let is_read = random.next_u64() % 100 < u64::from(context.access.read_percent);
+        let is_read = random.next() % 100 < u64::from(context.access.read_percent);
         let key_index = select_key_index(&mut random, context.keys.len(), context.access);
         let operation_start = Instant::now();
         if is_read {
@@ -1149,13 +1149,13 @@ fn worker_loop(context: WorkerContext, start: Instant) -> PhaseResult {
 fn select_key_index(random: &mut XorShift64, key_count: usize, access: AccessPattern) -> usize {
     let hotset_keys = access.hotset_keys.min(key_count).max(1);
     if hotset_keys == key_count {
-        return (random.next_u64() as usize) % key_count;
+        return (random.next() as usize) % key_count;
     }
-    let use_hot = random.next_u64() % 100 < u64::from(access.hot_access_percent);
+    let use_hot = random.next() % 100 < u64::from(access.hot_access_percent);
     if use_hot {
-        (random.next_u64() as usize) % hotset_keys
+        (random.next() as usize) % hotset_keys
     } else {
-        hotset_keys + (random.next_u64() as usize) % (key_count - hotset_keys)
+        hotset_keys + (random.next() as usize) % (key_count - hotset_keys)
     }
 }
 
@@ -1183,7 +1183,7 @@ impl XorShift64 {
         Self(if seed == 0 { DEFAULT_SEED } else { seed })
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn next(&mut self) -> u64 {
         let mut value = self.0;
         value ^= value << 13;
         value ^= value >> 7;
@@ -3013,7 +3013,7 @@ mod tests {
 
     #[test]
     fn direct_mode_maps_to_required_direct_io() {
-        assert_eq!(cache_io_mode(IoModeArg::Direct), IoMode::Direct);
+        assert_eq!(IoModeArg::Direct.cache(), IoMode::Direct);
     }
 
     #[test]

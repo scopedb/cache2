@@ -1,5 +1,10 @@
 //! Mixed-size benchmark path for the complete Hybrid cache.
 
+use super::{
+    ApiArg as Api, EngineArg as Engine, IoModeArg as Mode, XorShift64, json_escape, parse_number,
+    parse_seed, percentage_count, rate, validate_range,
+};
+
 use std::fmt::Write as _;
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -12,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cache_rs::{
     AsyncHybridCache, BackpressurePolicy, BucketCacheConfig, CacheConfig, CacheError, CacheTier,
     HybridCache, HybridCacheConfig, HybridCacheStats, HybridLookupOutcome, HybridWriteMode,
-    IoEngineKind, IoMode, PutOptions, PutOutcome, RegionStagingStats, RejectReason, RemoveOutcome,
+    PutOptions, PutOutcome, RegionStagingStats, RejectReason, RemoveOutcome,
 };
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
@@ -353,12 +358,6 @@ fn overload_diagnostics(cache: &BenchCache) -> String {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Api {
-    Sync,
-    Async,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum AccessPattern {
     #[default]
@@ -422,34 +421,6 @@ impl FromStr for AccessPattern {
     }
 }
 
-impl Api {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sync => "sync",
-            Self::Async => "async",
-        }
-    }
-
-    const fn client_completion_model(self) -> &'static str {
-        match self {
-            Self::Sync => "direct_call",
-            Self::Async => "blocking_wait_one_outstanding",
-        }
-    }
-}
-
-impl FromStr for Api {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "sync" => Ok(Self::Sync),
-            "async" => Ok(Self::Async),
-            _ => Err("--api must be sync or async".into()),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Output {
     Human,
@@ -466,82 +437,6 @@ impl FromStr for Output {
             "json" => Ok(Self::Json),
             "openmetrics" => Ok(Self::OpenMetrics),
             _ => Err("--output must be human, json, or openmetrics".into()),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Engine {
-    Sync,
-    Auto,
-    IoUring,
-}
-
-impl Engine {
-    const fn cache(self) -> IoEngineKind {
-        match self {
-            Self::Sync => IoEngineKind::Sync,
-            Self::Auto => IoEngineKind::Auto,
-            Self::IoUring => IoEngineKind::IoUring,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sync => "sync",
-            Self::Auto => "auto",
-            Self::IoUring => "io_uring",
-        }
-    }
-}
-
-impl FromStr for Engine {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "sync" => Ok(Self::Sync),
-            "auto" => Ok(Self::Auto),
-            "uring" | "io_uring" | "io-uring" => Ok(Self::IoUring),
-            _ => Err("--engine must be sync, auto, or uring".into()),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode {
-    Buffered,
-    Auto,
-    Direct,
-}
-
-impl Mode {
-    const fn cache(self) -> IoMode {
-        match self {
-            Self::Buffered => IoMode::Buffered,
-            Self::Auto => IoMode::Auto,
-            Self::Direct => IoMode::Direct,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Buffered => "buffered",
-            Self::Auto => "auto",
-            Self::Direct => "direct",
-        }
-    }
-}
-
-impl FromStr for Mode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "buffered" => Ok(Self::Buffered),
-            "auto" => Ok(Self::Auto),
-            "direct" => Ok(Self::Direct),
-            _ => Err("--mode must be buffered, auto, or direct".into()),
         }
     }
 }
@@ -4310,17 +4205,6 @@ fn required<T>(value: Option<T>, name: &str) -> Result<T, String> {
     value.ok_or_else(|| format!("{name} is required"))
 }
 
-fn validate_range<T>(name: &str, value: T, minimum: T, maximum: T) -> Result<(), String>
-where
-    T: Copy + PartialOrd + std::fmt::Display,
-{
-    if value < minimum || value > maximum {
-        Err(format!("{name} must be in {minimum}..={maximum}"))
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_memory(name: &str, value: usize) -> Result<(), String> {
     let value = u64::try_from(value).map_err(|_| format!("{name} does not fit u64"))?;
     validate_range(name, value, 1, MAX_TOOL_MEMORY_BYTES)
@@ -4356,13 +4240,6 @@ fn parse_usize_bytes(value: &str, name: &str) -> Result<usize, String> {
         .map_err(|_| format!("byte value for {name} does not fit this platform"))
 }
 
-fn parse_number<T: FromStr>(value: &str, name: &str) -> Result<T, String> {
-    value
-        .replace('_', "")
-        .parse()
-        .map_err(|_| format!("invalid value {value:?} for {name}"))
-}
-
 fn parse_duration(value: &str, name: &str, allow_zero: bool) -> Result<Duration, String> {
     let seconds = value
         .parse::<f64>()
@@ -4381,20 +4258,6 @@ fn parse_duration(value: &str, name: &str, allow_zero: bool) -> Result<Duration,
         return Err(format!("{name} must not exceed 24 hours"));
     }
     Ok(Duration::from_secs_f64(seconds))
-}
-
-fn parse_seed(value: &str) -> Result<u64, String> {
-    let compact = value.replace('_', "");
-    if let Some(hex) = compact
-        .strip_prefix("0x")
-        .or_else(|| compact.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).map_err(|_| format!("invalid --seed {value:?}"))
-    } else {
-        compact
-            .parse()
-            .map_err(|_| format!("invalid --seed {value:?}"))
-    }
 }
 
 fn parse_positive(value: &str, name: &str) -> Result<f64, String> {
@@ -4455,18 +4318,6 @@ fn default_index_slots(keys: usize) -> Result<usize, String> {
         .clamp(1024, 256 * 1024 * 1024))
 }
 
-fn percentage_count(total: usize, percent: u8) -> usize {
-    ((total as u128 * u128::from(percent)) / 100) as usize
-}
-
-fn rate(value: u64, elapsed: Duration) -> f64 {
-    if elapsed.is_zero() {
-        0.0
-    } else {
-        value as f64 / elapsed.as_secs_f64()
-    }
-}
-
 fn average_us(total_ns: u64, count: u64) -> f64 {
     if count == 0 {
         0.0
@@ -4506,48 +4357,12 @@ fn optional_f64(value: Option<f64>) -> String {
     value.map_or_else(|| "null".into(), |value| format!("{value:.3}"))
 }
 
-fn json_escape(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            character if character.is_control() => {
-                write!(output, "\\u{:04x}", character as u32)
-                    .expect("writing JSON into a String cannot fail");
-            }
-            character => output.push(character),
-        }
-    }
-    output
-}
-
 fn mix64(mut value: u64) -> u64 {
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
-}
-
-struct XorShift64(u64);
-
-impl XorShift64 {
-    fn new(seed: u64) -> Self {
-        Self(if seed == 0 { DEFAULT_SEED } else { seed })
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut value = self.0;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.0 = value;
-        value
-    }
 }
 
 fn print_help() {
