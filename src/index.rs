@@ -29,6 +29,8 @@ const RECORD_LEN_ALIGNMENT: u32 = 32;
 pub(crate) const MAX_REGION_ID: u32 = REGION_MASK as u32;
 pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMENT;
 pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32) * RECORD_LEN_ALIGNMENT;
+pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
+pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
 /// Format V1 checkpoints encode the entry count as `u32`. Keep a conservative
 /// 256M-slot runtime ceiling (8 GiB at 32 bytes/slot), which supports well over
 /// 100M live entries at the recommended <= 80% load factor.

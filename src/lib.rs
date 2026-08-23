@@ -76,6 +76,10 @@ mod hybrid_journal;
 mod hybrid_manifest;
 mod hybrid_metrics;
 mod index;
+// The V2 foundation is compiled and behavior-tested before the Region data
+// path is switched over; the production graph intentionally does not call it yet.
+#[allow(dead_code)]
+mod index_storage;
 mod io_backend;
 mod io_engine;
 mod management;
@@ -84,7 +88,11 @@ mod metrics;
 mod miss_guard;
 mod pending_write;
 mod policy;
+#[allow(dead_code)]
+mod recovery_v2;
 mod region_staging;
+#[allow(dead_code)]
+mod region_v2;
 mod resources;
 mod write_back;
 mod write_batch;

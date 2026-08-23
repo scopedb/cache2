@@ -210,15 +210,19 @@ fresh/dirty start 使用零页懒分配的 anonymous mapping。clean start 将�
 单个 sidecar image 即可，内容为：
 
 ~~~text
-4 KiB header
-cache/data identity + config fingerprint
-cache epoch / clear floor / max seqno
-per-shard physical counts / slot ranges
-Region table + FIFO order + per-region accounting
-global admission accounting
+4 KiB header：cache/data identity + config fingerprint + exact section directory
 4 KiB self-checking index pages
   └── 64 B page header/CRC + 126 × 32 B IndexSlotV1
+mandatory Region metadata pages
+  ├── cache epoch / clear floor / max seqno
+  ├── per-shard physical counts / slot ranges
+  ├── Region table + FIFO order + per-region accounting
+  └── global admission accounting
 ~~~
+
+V1 物理顺序固定为 header → index pages → Region metadata pages，不能留 gap 或 trailing
+bytes。Region metadata 是 CLEAN image 的必需部分；只有 index 的临时镜像不得编码、发布或
+恢复。当前基础层在完整 frozen Region view 接入前明确拒绝 warm close。
 
 Region table 只与 Region 数量有关。以 100 GiB、32 MiB Region 计算约 3,200 项。
 slot array 保留物理位置，恢复时不重新 hash。per-region accounting 至少保存 state、
@@ -263,12 +267,16 @@ open 顺序：
   → 读取最新有效 state
   → CLEAN 且 cache UUID、data/image identity、config 完全匹配：MAP_PRIVATE 映射 index
   → 否则：anonymous empty index，旧 data bytes 保持不可达
-  → 写入并 fdatasync 新一代 RUNNING
+  → 将两个 state 槽都改写为递增 generation 的 RUNNING，再一次 fdatasync
   → RUNNING barrier 失败则 abort open，绝不开放或 mutate recovered mapping
   → 开放流量
 ~~~
 
-双槽总是选择 CRC 有效且 generation 最大的 state。CLEAN 还必须绑定 Data Superblock
+双槽总是选择 CRC 有效且 generation 最大的 state。open 不能只在另一槽写 RUNNING 后保留
+旧 CLEAN：否则新 RUNNING 页后续损坏时，latest-valid 会回退到已被当前 session 复用过
+data Region 的旧 CLEAN。因此两个 RUNNING 页必须在同一个开放流量的 durable barrier 前写完；
+warm close 只在其中一槽发布新 CLEAN，另一槽保留 RUNNING，使 CLEAN 损坏时必然 cold start。
+CLEAN 还必须绑定 Data Superblock
 generation、hash seed 和 data file length；仅配置相同不足以恢复。
 
 warm close 顺序：
@@ -305,6 +313,11 @@ state。RUNNING/CLEAN state file 是 startup 的唯一 recovery authority，reco
 Region table 是 clean open 的唯一 Region runtime state。format/reset 必须先使旧 CLEAN
 不可用，再生成新 identity。旧 V1 文件首次由 V2 打开时直接 cold reset，不做在线 metadata
 升级或旧 recovery fallback。
+
+Data、state、image 使用不含版本号的稳定 family magic；版本只编码在固定 envelope 字段中。
+magic 匹配且整页 CRC 有效的未知版本必须拒绝打开，不能静默 downgrade；CRC 无效的未知
+version byte 按 torn/corrupt cache 冷启动。只要 IndexSlotV1 继续使用 PackedLocation，
+geometry 就必须限制在其 region-id 和 region-offset 位宽内。
 
 ## 6. L1/L2 协调语义
 
@@ -491,8 +504,8 @@ submission，不得绕过 4 MiB staging 回到 128 KiB/64-record 小 batch。
     page 借给 L1，OS page cache 只可视为 reclaimable overhead。
 14. recovered slot page 必须先验证再 lookup/mutate；校验失败 safe-clear 整个 L2，不能带着
     不一致的 Region/accounting 状态继续部分服务。
-15. RUNNING state write/fdatasync 失败必须 abort open；旧 CLEAN image 绝不能被已开始 mutation
-    的新进程重复使用。
+15. 两个 state 槽的 RUNNING write/fdatasync 失败必须 abort open；开放流量前不得留下可回退的
+    旧 CLEAN，旧 image 绝不能被已开始 mutation 的新进程重复使用。
 16. CLEAN image 必须来自同一个 frozen view，覆盖 index、Region/FIFO、epoch/floor、seqno
     和 admission accounting。
 17. state、image 和 Data Superblock 必须绑定同一不可复用 cache UUID 与 data identity。

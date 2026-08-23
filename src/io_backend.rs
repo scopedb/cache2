@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -393,6 +393,17 @@ impl FileBackend {
 
     pub(crate) const fn direct_active(&self) -> bool {
         self.direct.is_some()
+    }
+
+    pub(crate) fn try_clone_control_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_same_file(&self, other: &Self) -> io::Result<bool> {
+        let left = self.file.metadata()?;
+        let right = other.file.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
     }
 }
 
