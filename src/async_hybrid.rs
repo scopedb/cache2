@@ -22,9 +22,7 @@ use crate::async_cache::{
 use crate::cache::{
     CacheError, CacheStatus, PutOptions, PutOutcome, RejectReason, RemoveOutcome, Result,
 };
-use crate::hybrid::{
-    HybridAsyncConfig, HybridCache, HybridInner, HybridLookupOutcome, HybridMissKind,
-};
+use crate::hybrid::{HybridAsyncConfig, HybridCache, HybridInner, HybridLookupOutcome};
 use crate::policy::NamespaceId;
 use crate::resources::OverloadReason;
 
@@ -138,9 +136,38 @@ impl AsyncHybridCache {
         key: impl AsRef<[u8]>,
         options: AsyncRequestOptions,
     ) -> CacheFuture<Result<Option<Vec<u8>>>> {
+        self.read_in_with_options(namespace, key, options, |outcome| match outcome {
+            HybridLookupOutcome::Hit { value, .. } => Some(value),
+            HybridLookupOutcome::Miss(_) => None,
+        })
+    }
+
+    pub fn lookup(&self, key: impl AsRef<[u8]>) -> CacheFuture<Result<HybridLookupOutcome>> {
+        self.lookup_in_with_options(0, key, AsyncRequestOptions::default())
+    }
+
+    pub fn lookup_in_with_options(
+        &self,
+        namespace: NamespaceId,
+        key: impl AsRef<[u8]>,
+        options: AsyncRequestOptions,
+    ) -> CacheFuture<Result<HybridLookupOutcome>> {
+        self.read_in_with_options(namespace, key, options, |outcome| outcome)
+    }
+
+    fn read_in_with_options<T, F>(
+        &self,
+        namespace: NamespaceId,
+        key: impl AsRef<[u8]>,
+        options: AsyncRequestOptions,
+        map: F,
+    ) -> CacheFuture<Result<T>>
+    where
+        T: Send + 'static,
+        F: Fn(HybridLookupOutcome) -> T + Send + 'static,
+    {
         let cache = match self.cache_for_read() {
-            Ok(Some(cache)) => cache,
-            Ok(None) => return ready_future(Ok(None)),
+            Ok(cache) => cache,
             Err(error) => return ready_future(Err(error)),
         };
         let key = key.as_ref();
@@ -151,10 +178,7 @@ impl AsyncHybridCache {
         let mut permit = permit;
         if options.deadline().is_none() {
             match cache.lookup_memory_in_admitted(namespace, key, &mut permit) {
-                Ok(Some(HybridLookupOutcome::Hit { value, .. })) => {
-                    return ready_future(Ok(Some(value)));
-                }
-                Ok(Some(HybridLookupOutcome::Miss(_))) => return ready_future(Ok(None)),
+                Ok(Some(outcome)) => return ready_future(Ok(map(outcome))),
                 Ok(None) => {}
                 Err(error) => return ready_future(Err(error)),
             }
@@ -174,58 +198,7 @@ impl AsyncHybridCache {
             move |context| {
                 cache
                     .lookup_in_admitted_with_task_context(namespace, &key, &mut permit, &context)
-                    .map(|outcome| match outcome {
-                        HybridLookupOutcome::Hit { value, .. } => Some(value),
-                        HybridLookupOutcome::Miss(_) => None,
-                    })
-            },
-        )
-    }
-
-    pub fn lookup(&self, key: impl AsRef<[u8]>) -> CacheFuture<Result<HybridLookupOutcome>> {
-        self.lookup_in_with_options(0, key, AsyncRequestOptions::default())
-    }
-
-    pub fn lookup_in_with_options(
-        &self,
-        namespace: NamespaceId,
-        key: impl AsRef<[u8]>,
-        options: AsyncRequestOptions,
-    ) -> CacheFuture<Result<HybridLookupOutcome>> {
-        let cache = match self.cache_for_read() {
-            Ok(Some(cache)) => cache,
-            Ok(None) => {
-                return ready_future(Ok(HybridLookupOutcome::Miss(HybridMissKind::Recovering)));
-            }
-            Err(error) => return ready_future(Err(error)),
-        };
-        let key = key.as_ref();
-        let permit = match cache.try_reserve_async_read(key.len()) {
-            Ok(permit) => permit,
-            Err(error) => return ready_future(Err(error)),
-        };
-        let mut permit = permit;
-        if options.deadline().is_none() {
-            match cache.lookup_memory_in_admitted(namespace, key, &mut permit) {
-                Ok(Some(outcome)) => return ready_future(Ok(outcome)),
-                Ok(None) => {}
-                Err(error) => return ready_future(Err(error)),
-            }
-        }
-        let reservation = match self.inner.executor.reserve_read() {
-            Ok(reservation) => reservation,
-            Err(failure) => return ready_future(map_read_failure(failure)),
-        };
-        let key = match copy_input(key, OverloadReason::ReadBufferUnavailable) {
-            Ok(key) => key,
-            Err(error) => return ready_future(Err(error)),
-        };
-        self.inner.executor.submit_read_reserved(
-            reservation,
-            options,
-            map_read_failure,
-            move |context| {
-                cache.lookup_in_admitted_with_task_context(namespace, &key, &mut permit, &context)
+                    .map(map)
             },
         )
     }
@@ -412,13 +385,13 @@ impl AsyncHybridCache {
         future
     }
 
-    fn cache_for_read(&self) -> Result<Option<HybridCache>> {
+    fn cache_for_read(&self) -> Result<HybridCache> {
         if self.inner.close_state.load(Ordering::Acquire) != CLOSE_OPEN {
             return Err(CacheError::Closed);
         }
         let cache = HybridCache::from_inner(Arc::clone(&self.inner.cache));
         match cache.status() {
-            CacheStatus::Healthy | CacheStatus::MissOnly => Ok(Some(cache)),
+            CacheStatus::Healthy | CacheStatus::MissOnly => Ok(cache),
             CacheStatus::Poisoned => Err(CacheError::Poisoned),
             CacheStatus::Closed => Err(CacheError::Closed),
         }
