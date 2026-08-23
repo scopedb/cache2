@@ -1,5 +1,9 @@
 # cache-rs Roadmap
 
+> 本文记录 v1.1 legacy implementation 的历史交付。下一版 production 收敛计划以
+> [ARCHITECTURE.md](ARCHITECTURE.md) 为准：Memory + 单一 RegionCache、统一 mutation
+> lanes、clean-only mmap recovery。旧 H0–H5 Hybrid 路径不再继续扩展。
+
 > 当前状态：**v1.1 — large-scale source-complete production candidate**。M0--M8 与
 > 单盘大容量/大 entry 数量数据路径代码已完成；M5 目标 NVMe 吞吐/p99/profile、M6 TB 级恢复 SLA、M7 workload hit-rate/DWPD，
 > 以及 M8 24--72 小时 soak、canary 和真实掉电仍待部署环境 sign-off。大小对象 + DRAM

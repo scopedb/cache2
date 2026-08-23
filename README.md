@@ -1,5 +1,9 @@
 # cache-rs
 
+> 当前代码是 v1.1 legacy implementation。面向 16–256 KiB file chunk 的下一版
+> production 架构已收敛为 Memory + 单一 RegionCache，并采用 clean-only mmap recovery。
+> 设计决策与迁移边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
 `cache-rs` provides a bounded RegionLog disk cache and a production-candidate
 Hybrid cache for mixed small/large objects. The Hybrid path combines a sharded
 DRAM LRU, a fixed-bucket small-object SSD engine, and the RegionLog large-object

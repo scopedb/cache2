@@ -1,5 +1,10 @@
 # cache-rs：面向 NVMe SSD 的 Hybrid Cache Engine 设计
 
+> 本文记录当前 v1.1 legacy implementation。下一版 production 数据路径已经收敛为
+> Memory + 单一 RegionCache、clean-only mmap recovery；权威目标设计见
+> [ARCHITECTURE.md](ARCHITECTURE.md)。Bucket/DiskPair、route journal 和 dirty-tail
+> checkpoint 不再继续演进。
+
 状态：v1.1 单设备 large-scale Hybrid source-complete production candidate；全局
 session manifest、统一 policy、有界 write-back/Async、Bucket/Region NVMe 数据路径和运维面均已
 实现。目标 NVMe 性能、TB 级恢复、命中率/DWPD、24--72 小时 soak、canary 与真实掉电仍需部署
