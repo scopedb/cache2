@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(all(
     feature = "io-uring",
@@ -39,6 +39,13 @@ use crate::resources::BufferLease;
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const DEFAULT_IO_QUEUE_DEPTH: usize = 128;
 pub(crate) const MAX_IO_QUEUE_DEPTH: usize = 4096;
+/// A stalled cache-device operation must not hold a frontend or shutdown
+/// barrier forever. This is intentionally a fixed production guardrail rather
+/// than a durability knob: V2 cache contents are disposable.
+pub(crate) const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cancellation is only a request. Give the target operation a short window to
+/// publish its own completion, which is the actual buffer-lifetime fence.
+pub(crate) const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
 
 /// A logical range of an engine-budgeted aligned buffer lease.
 pub(crate) struct IoBuffer {
@@ -208,17 +215,6 @@ pub(crate) enum OperationKind {
 }
 
 impl OperationKind {
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
     const fn is_mutation(self) -> bool {
         matches!(self, Self::Write | Self::Flush)
     }
@@ -510,6 +506,24 @@ impl CompletionState {
         }
     }
 
+    fn wait_until(&self, deadline: Instant) -> Option<IoCompletion> {
+        let mut cell = lock_unpoisoned(&self.cell);
+        loop {
+            if let Some(completion) = cell.completion.take() {
+                return Some(completion);
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(cell, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cell = next;
+            if timeout.timed_out() && cell.completion.is_none() {
+                return None;
+            }
+        }
+    }
+
     fn poll(&self, context: &mut Context<'_>) -> Poll<IoCompletion> {
         let mut cell = lock_unpoisoned(&self.cell);
         if let Some(completion) = cell.completion.take() {
@@ -565,6 +579,19 @@ impl IoRequest {
         self.finished = true;
         completion
     }
+
+    /// Wait through an absolute deadline without detaching the consumer. On
+    /// timeout ownership of the request is returned so the caller can request
+    /// cancellation and continue waiting for the target lifetime fence.
+    pub(crate) fn wait_until(mut self, deadline: Instant) -> Result<IoCompletion, Self> {
+        match self.completion.wait_until(deadline) {
+            Some(completion) => {
+                self.finished = true;
+                Ok(completion)
+            }
+            None => Err(self),
+        }
+    }
 }
 
 impl Future for IoRequest {
@@ -589,6 +616,100 @@ impl Drop for IoRequest {
     }
 }
 
+/// One admitted cache I/O carrying the same absolute deadline through queue
+/// admission and target completion.
+pub(crate) struct BoundedIoRequest {
+    request: IoRequest,
+    deadline: Instant,
+    cancel_grace: Duration,
+}
+
+impl BoundedIoRequest {
+    pub(crate) const fn id(&self) -> RequestId {
+        self.request.id()
+    }
+
+    pub(crate) fn wait(self, engine: &dyn IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
+        let request = match self.request.wait_until(self.deadline) {
+            Ok(completion) => return Ok(completion),
+            Err(request) => request,
+        };
+        let cancel_error = engine.cancel(request.id()).err();
+        let grace_deadline = Instant::now()
+            .checked_add(self.cancel_grace)
+            .unwrap_or_else(Instant::now);
+        match request.wait_until(grace_deadline) {
+            Ok(completion) => Err(IoDeadlineExceeded::new(cancel_error, Some(completion))),
+            Err(request) => {
+                // Dropping the consumer detaches it but deliberately leaves the
+                // operation and owned buffer in the driver. Stop all further
+                // admission; close will inspect the exact in-flight mutation
+                // count before deciding whether to retain flock.
+                engine.stop_admission();
+                drop(request);
+                Err(IoDeadlineExceeded::new(cancel_error, None))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IoDeadlineExceeded {
+    error: io::Error,
+    completion: Option<IoCompletion>,
+}
+
+impl IoDeadlineExceeded {
+    fn new(cancel_error: Option<io::Error>, completion: Option<IoCompletion>) -> Self {
+        let message = cancel_error.map_or_else(
+            || "cache I/O completion deadline expired".to_owned(),
+            |error| format!("cache I/O completion deadline expired; cancellation failed: {error}"),
+        );
+        Self {
+            error: io::Error::new(io::ErrorKind::TimedOut, message),
+            completion,
+        }
+    }
+
+    pub(crate) fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
+        let buffer = self
+            .completion
+            .and_then(|completion| completion.into_io_result().1);
+        (self.error, buffer)
+    }
+
+    pub(crate) fn into_lease(self) -> (io::Error, Option<BufferLease>) {
+        let (error, buffer) = self.into_buffer();
+        (error, buffer.map(IoBuffer::into_lease))
+    }
+}
+
+/// Submit one V2 cache-device request with a hard end-to-end deadline.
+pub(crate) fn submit_cache_io(
+    engine: &dyn IoEngine,
+    operation: IoOperation,
+) -> Result<BoundedIoRequest, SubmitError> {
+    let deadline = Instant::now()
+        .checked_add(CACHE_IO_COMPLETION_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
+}
+
+fn submit_cache_io_until(
+    engine: &dyn IoEngine,
+    operation: IoOperation,
+    deadline: Instant,
+    cancel_grace: Duration,
+) -> Result<BoundedIoRequest, SubmitError> {
+    let cancelled = AtomicBool::new(false);
+    let request = engine.submit_wait_controlled(operation, &cancelled, Some(deadline))?;
+    Ok(BoundedIoRequest {
+        request,
+        deadline,
+        cancel_grace,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EngineKind {
     Sync,
@@ -610,6 +731,10 @@ pub(crate) trait IoEngine: Send + Sync {
     fn queue_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
     fn direct_active(&self) -> bool;
+    /// Permanently stop admission after a target operation missed both its
+    /// deadline and cancellation grace period.
+    fn stop_admission(&self);
+    fn in_flight_mutations(&self) -> usize;
     /// True means a failed driver could not fence an issued write or flush.
     /// The cache must retain its exclusive file lock for process lifetime.
     fn has_unfenced_mutations(&self) -> bool;
@@ -669,11 +794,17 @@ impl RequestControl {
 
 struct AdmissionPermit {
     shared: Arc<RuntimeShared>,
+    mutation: bool,
 }
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         let _admission = lock_unpoisoned(&self.shared.admission_lock);
+        if self.mutation {
+            self.shared
+                .in_flight_mutations
+                .fetch_sub(1, Ordering::AcqRel);
+        }
         self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.shared.admission_available.notify_one();
     }
@@ -683,6 +814,7 @@ struct RuntimeShared {
     queue_depth: usize,
     accepting: AtomicBool,
     in_flight: AtomicUsize,
+    in_flight_mutations: AtomicUsize,
     in_flight_peak: AtomicUsize,
     submitted: AtomicU64,
     completed: AtomicU64,
@@ -709,6 +841,7 @@ impl RuntimeShared {
             queue_depth,
             accepting: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
+            in_flight_mutations: AtomicUsize::new(0),
             in_flight_peak: AtomicUsize::new(0),
             submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
@@ -724,7 +857,7 @@ impl RuntimeShared {
         }
     }
 
-    fn try_admit(self: &Arc<Self>) -> Option<AdmissionPermit> {
+    fn try_admit(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
         let mut current = self.in_flight.load(Ordering::Acquire);
         loop {
             if current >= self.queue_depth {
@@ -737,9 +870,13 @@ impl RuntimeShared {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    if mutation {
+                        self.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
+                    }
                     update_peak(&self.in_flight_peak, current + 1);
                     return Some(AdmissionPermit {
                         shared: Arc::clone(self),
+                        mutation,
                     });
                 }
                 Err(observed) => current = observed,
@@ -747,13 +884,13 @@ impl RuntimeShared {
         }
     }
 
-    fn admit_wait(self: &Arc<Self>) -> Option<AdmissionPermit> {
+    fn admit_wait(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
         let mut admission = lock_unpoisoned(&self.admission_lock);
         loop {
             if !self.accepting.load(Ordering::Acquire) {
                 return None;
             }
-            if let Some(permit) = self.try_admit() {
+            if let Some(permit) = self.try_admit(mutation) {
                 return Some(permit);
             }
             admission = self
@@ -765,6 +902,7 @@ impl RuntimeShared {
 
     fn admit_wait_controlled(
         self: &Arc<Self>,
+        mutation: bool,
         cancelled: &AtomicBool,
         deadline: Option<Instant>,
     ) -> Result<AdmissionPermit, AdmissionWaitError> {
@@ -783,7 +921,7 @@ impl RuntimeShared {
                 self.admission_available.notify_all();
                 return Err(AdmissionWaitError::TimedOut);
             }
-            if let Some(permit) = self.try_admit() {
+            if let Some(permit) = self.try_admit(mutation) {
                 return Ok(permit);
             }
             admission = match remaining {
@@ -1089,12 +1227,16 @@ impl RuntimeInner {
         if let Err(error) = operation.validate() {
             return Err(SubmitError { error, operation });
         }
+        let mutation = operation.kind().is_mutation();
         let permit = match admission_mode {
+            AdmissionMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
+            ),
             AdmissionMode::Try => self
                 .shared
-                .try_admit()
+                .try_admit(mutation)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "I/O queue is full")),
-            AdmissionMode::Wait => self.shared.admit_wait().ok_or_else(|| {
+            AdmissionMode::Wait => self.shared.admit_wait(mutation).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
             }),
             AdmissionMode::Controlled {
@@ -1102,7 +1244,7 @@ impl RuntimeInner {
                 deadline,
             } => self
                 .shared
-                .admit_wait_controlled(cancelled, deadline)
+                .admit_wait_controlled(mutation, cancelled, deadline)
                 .map_err(|error| match error {
                     AdmissionWaitError::Shutdown => {
                         io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
@@ -1211,6 +1353,20 @@ impl RuntimeInner {
             wake.wake();
         }
         Ok(true)
+    }
+
+    fn stop_admission(&self) {
+        let mut submit_state = lock_unpoisoned(&self.submit_state);
+        submit_state.accepting = false;
+        {
+            let _admission = lock_unpoisoned(&self.shared.admission_lock);
+            self.shared.accepting.store(false, Ordering::Release);
+            self.shared.admission_available.notify_all();
+        }
+        drop(submit_state);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -1391,6 +1547,17 @@ impl IoEngine for BackendIoEngine {
 
     fn direct_active(&self) -> bool {
         self.backend.direct_io_stats().direct_active
+    }
+
+    fn stop_admission(&self) {
+        self.inner.stop_admission();
+    }
+
+    fn in_flight_mutations(&self) -> usize {
+        self.inner
+            .shared
+            .in_flight_mutations
+            .load(Ordering::Acquire)
     }
 
     fn has_unfenced_mutations(&self) -> bool {
@@ -1702,6 +1869,17 @@ mod uring {
 
         fn direct_active(&self) -> bool {
             self.io_stats.snapshot().direct_active
+        }
+
+        fn stop_admission(&self) {
+            self.inner.stop_admission();
+        }
+
+        fn in_flight_mutations(&self) -> usize {
+            self.inner
+                .shared
+                .in_flight_mutations
+                .load(Ordering::Acquire)
         }
 
         fn has_unfenced_mutations(&self) -> bool {
@@ -2568,18 +2746,8 @@ mod tests {
         fn maximum_active(&self) -> usize {
             lock_unpoisoned(&self.state).maximum_active
         }
-    }
 
-    impl IoBackend for BlockingBackend {
-        fn len(&self) -> io::Result<u64> {
-            Ok(1024 * 1024)
-        }
-
-        fn set_len(&self, _len: u64) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn read_at(&self, buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+        fn enter_and_wait(&self) {
             let mut state = lock_unpoisoned(&self.state);
             state.entered += 1;
             state.active += 1;
@@ -2592,12 +2760,26 @@ mod tests {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             state.active -= 1;
-            drop(state);
+        }
+    }
+
+    impl IoBackend for BlockingBackend {
+        fn len(&self) -> io::Result<u64> {
+            Ok(1024 * 1024)
+        }
+
+        fn set_len(&self, _len: u64) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn read_at(&self, buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+            self.enter_and_wait();
             buffer.fill(0);
             Ok(buffer.len())
         }
 
         fn write_at(&self, _point: WritePoint, buffer: &[u8], _offset: u64) -> io::Result<usize> {
+            self.enter_and_wait();
             Ok(buffer.len())
         }
 
@@ -2879,6 +3061,73 @@ mod tests {
     }
 
     #[test]
+    fn completion_deadline_stops_admission_without_releasing_an_unfenced_target() {
+        let backend = Arc::new(BlockingBackend::default());
+        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let resources = resources(4096);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let request = submit_cache_io_until(
+            &engine,
+            IoOperation::read(read_buffer(&resources, 4096), 0),
+            deadline,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(backend.wait_for_entered(1));
+
+        let timeout = request.wait(&engine).unwrap_err();
+        let pending = engine.in_flight();
+        let pending_mutations = engine.in_flight_mutations();
+        backend.release();
+        let (error, buffer) = timeout.into_buffer();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(buffer.is_none());
+        assert_eq!(pending, 1);
+        assert_eq!(pending_mutations, 0);
+
+        let rejected = engine
+            .submit(IoOperation::read(read_buffer(&resources, 1), 0))
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::BrokenPipe);
+
+        engine.shutdown().unwrap();
+        assert_eq!(engine.in_flight(), 0);
+    }
+
+    #[test]
+    fn completion_deadline_keeps_an_issued_mutation_counted_until_target_completion() {
+        let backend = Arc::new(BlockingBackend::default());
+        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let resources = resources(4096);
+        let request = submit_cache_io_until(
+            &engine,
+            IoOperation::write(
+                WritePoint::RegionHeader,
+                write_buffer(&resources, &[0x5a; 4096]),
+                0,
+            ),
+            Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(backend.wait_for_entered(1));
+
+        let timeout = request.wait(&engine).unwrap_err();
+        let pending = engine.in_flight();
+        let pending_mutations = engine.in_flight_mutations();
+        backend.release();
+        let (error, buffer) = timeout.into_buffer();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(buffer.is_none());
+        assert_eq!(pending, 1);
+        assert_eq!(pending_mutations, 1);
+
+        engine.shutdown().unwrap();
+        assert_eq!(engine.in_flight(), 0);
+        assert_eq!(engine.in_flight_mutations(), 0);
+    }
+
+    #[test]
     fn queue_depth_is_hard_bounded() {
         let file = TestFile::new();
         assert!(matches!(
@@ -3067,7 +3316,7 @@ mod tests {
     #[test]
     fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
         let shared = Arc::new(RuntimeShared::new(1));
-        let permit = shared.try_admit().unwrap();
+        let permit = shared.try_admit(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
         let control = Arc::new(RequestControl::new());

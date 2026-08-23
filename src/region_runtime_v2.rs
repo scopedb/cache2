@@ -302,7 +302,14 @@ impl RegionDataPlaneV2 {
             now_unix_ms,
         );
         drop(queue);
-        result
+        match result {
+            // MissOnly is a cache availability state, not an application data
+            // error. The operation that trips the one-way health latch and all
+            // later reads therefore fail open as cache misses. Resource
+            // overload remains explicit while the core is still healthy.
+            Err(_) if !self.core.is_healthy() => Ok(None),
+            result => result,
+        }
     }
 
     /// Completes and publishes every record admitted before this call. This is
@@ -639,22 +646,54 @@ fn stop_running(mut owner: RunningOwnerV2) -> io::Result<bool> {
         }
     }
     owner.shared.staging.close();
+    let in_flight = owner.shared.engine.in_flight();
+    let in_flight_mutations = owner.shared.engine.in_flight_mutations();
     let unfenced_before = owner.shared.engine.has_unfenced_mutations();
-    let shutdown = owner.shared.engine.shutdown();
+    // A request that missed its cancellation grace may still own a kernel
+    // target and buffer. Joining that engine can wait forever. Retain only the
+    // engine Arc; the runtime/core can still be released normally.
+    let skip_shutdown = in_flight != 0 || unfenced_before;
+    let shutdown = if skip_shutdown {
+        Ok(())
+    } else {
+        owner.shared.engine.shutdown()
+    };
     let unfenced = unfenced_before || owner.shared.engine.has_unfenced_mutations();
     let result = drain
         .and_then(|()| join_error.map_or(Ok(()), Err))
         .and(shutdown);
-    if unfenced {
-        // Keep the duplicated flock-owning descriptor alive. The backend will
-        // skip its explicit unlock when this flag is returned.
-        std::mem::forget(owner);
-        return result.map(|()| true).or_else(|error| {
+    if skip_shutdown || unfenced {
+        // A merely pending target gets a detached reaper: close returns now,
+        // while eventual target completion still shuts the engine down and
+        // reclaims its fd/thread/buffer set. A sticky fatal unfenced mutation
+        // has no trustworthy future fence and remains process-lifetime state.
+        if unfenced {
+            std::mem::forget(Arc::clone(&owner.shared.engine));
+        } else {
+            reap_engine_after_target_fence(&owner.shared.engine);
+        }
+        let retain_lock = in_flight_mutations != 0 || unfenced;
+        return result.map(|()| retain_lock).or_else(|error| {
             let _ = error;
-            Ok(true)
+            Ok(retain_lock)
         });
     }
     result.map(|()| false)
+}
+
+fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
+    let reaper_engine = Arc::clone(engine);
+    let spawn = std::thread::Builder::new()
+        .name("cache-rs-v2-io-reaper".to_owned())
+        .spawn(move || {
+            let _ = reaper_engine.shutdown();
+        });
+    if spawn.is_err() {
+        // The original owner is still alive while this fallback clone is
+        // created, so a failed thread spawn cannot synchronously run the
+        // engine's blocking Drop path.
+        std::mem::forget(Arc::clone(engine));
+    }
 }
 
 fn resource_build_io_error(error: ResourceBuildError) -> io::Error {

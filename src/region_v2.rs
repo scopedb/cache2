@@ -37,7 +37,7 @@ use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
     WritePoint, read_exact_at, write_all_at,
 };
-use crate::io_engine::{IoBuffer, IoEngine, IoOperation, OperationKind};
+use crate::io_engine::{IoBuffer, IoEngine, IoOperation, OperationKind, submit_cache_io};
 use crate::record_codec_v2::{
     RecordEncodeErrorV2, encode_value_into, hash_namespaced_key_v2, planned_record_bytes,
 };
@@ -619,6 +619,10 @@ impl FileRegionCoreV2 {
         self.health.enter_miss_only();
     }
 
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.health.is_healthy()
+    }
+
     fn lock_lane_mutation(&self, lane_id: usize) -> io::Result<MutexGuard<'_, ()>> {
         let lane = self.append_lane(lane_id)?;
         self.lock_lane_gate(&lane.mutation)
@@ -776,7 +780,7 @@ impl FileRegionCoreV2 {
                 return Err(error.error);
             }
         };
-        let completion = flight.wait();
+        let completion = flight.wait(engine);
         if let Err(error) = completion.result {
             self.health.enter_miss_only();
             return Err(error);
@@ -1090,7 +1094,7 @@ impl FileRegionCoreV2 {
                 return Err(original);
             }
         };
-        let completion = flight.wait();
+        let completion = flight.wait(engine);
         let crate::region_appender_v2::RegionSpanCompletionV2 {
             span,
             result,
@@ -1397,11 +1401,15 @@ fn write_region_header_v2(
         .checked_mul(geometry.region_size)
         .and_then(|offset| DATA_REGION_AREA_OFFSET_V2.checked_add(offset))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "V2 header offset overflow"))?;
-    let request = engine
-        .submit_wait(IoOperation::write(WritePoint::RegionHeader, buffer, offset))
-        .map_err(|error| error.error)?;
+    let request = submit_cache_io(
+        engine,
+        IoOperation::write(WritePoint::RegionHeader, buffer, offset),
+    )
+    .map_err(|error| error.error)?;
     let request_id = request.id();
-    let completion = request.wait();
+    let completion = request
+        .wait(engine)
+        .map_err(|timeout| timeout.into_buffer().0)?;
     let identity_valid = completion.request_id == request_id
         && completion.kind == OperationKind::Write
         && completion.bytes_transferred == bytes.len();

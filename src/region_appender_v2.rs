@@ -8,7 +8,9 @@ use std::fmt;
 use std::io;
 
 use crate::io_backend::{DIRECT_IO_ALIGNMENT, WritePoint};
-use crate::io_engine::{IoBuffer, IoEngine, IoOperation, IoRequest, OperationKind, RequestId};
+use crate::io_engine::{
+    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId, submit_cache_io,
+};
 use crate::recovery_v2::{DATA_REGION_AREA_OFFSET_V2, DataGeometryV2, REGION_HEADER_SIZE_V2};
 use crate::region_manager_v2::RegionWriteSpanV2;
 
@@ -47,7 +49,7 @@ pub(crate) struct RegionSpanFlightV2 {
     span: RegionWriteSpanV2,
     expected_len: usize,
     request_id: RequestId,
-    request: IoRequest,
+    request: BoundedIoRequest,
 }
 
 pub(crate) struct RegionSpanCompletionV2 {
@@ -57,8 +59,18 @@ pub(crate) struct RegionSpanCompletionV2 {
 }
 
 impl RegionSpanFlightV2 {
-    pub(crate) fn wait(self) -> RegionSpanCompletionV2 {
-        let completion = self.request.wait();
+    pub(crate) fn wait(self, engine: &dyn IoEngine) -> RegionSpanCompletionV2 {
+        let completion = match self.request.wait(engine) {
+            Ok(completion) => completion,
+            Err(timeout) => {
+                let (error, buffer) = timeout.into_buffer();
+                return RegionSpanCompletionV2 {
+                    span: self.span,
+                    result: Err(error),
+                    buffer,
+                };
+            }
+        };
         let identity_valid =
             completion.request_id == self.request_id && completion.kind == OperationKind::Write;
         let bytes_transferred = completion.bytes_transferred;
@@ -139,8 +151,10 @@ pub(crate) fn submit_span(
             buffer: Some(buffer),
         });
     }
-    let request = match engine.submit_wait(IoOperation::write(WritePoint::Record, buffer, absolute))
-    {
+    let request = match submit_cache_io(
+        engine,
+        IoOperation::write(WritePoint::Record, buffer, absolute),
+    ) {
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_buffer();
@@ -292,7 +306,7 @@ mod tests {
         let absolute = DATA_REGION_AREA_OFFSET_V2 + geometry().region_size + 4096;
         let completion = submit_span(&engine, geometry(), span(), buffer, absolute)
             .unwrap()
-            .wait();
+            .wait(&engine);
         assert!(completion.result.is_ok());
         assert_eq!(completion.span, span());
         assert!(completion.buffer.is_some());

@@ -10,7 +10,9 @@ use std::io;
 use std::ops::Range;
 
 use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
-use crate::io_engine::{IoBuffer, IoEngine, IoOperation, IoRequest, OperationKind, RequestId};
+use crate::io_engine::{
+    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId, submit_cache_io,
+};
 use crate::recovery_v2::{
     DATA_REGION_AREA_OFFSET_V2, DataGeometryV2, RECORD_ALIGNMENT_V2, REGION_HEADER_SIZE_V2,
 };
@@ -59,7 +61,7 @@ impl std::error::Error for RegionRecordReadSubmitErrorV2 {
 pub(crate) struct RegionRecordReadFlightV2 {
     plan: RegionRecordReadPlanV2,
     request_id: RequestId,
-    request: IoRequest,
+    request: BoundedIoRequest,
 }
 
 pub(crate) struct RegionRecordReadCompletionV2 {
@@ -84,8 +86,18 @@ impl RegionRecordReadCompletionV2 {
 }
 
 impl RegionRecordReadFlightV2 {
-    pub(crate) fn wait(self) -> RegionRecordReadCompletionV2 {
-        let completion = self.request.wait();
+    pub(crate) fn wait(self, engine: &dyn IoEngine) -> RegionRecordReadCompletionV2 {
+        let completion = match self.request.wait(engine) {
+            Ok(completion) => completion,
+            Err(timeout) => {
+                let (error, buffer) = timeout.into_lease();
+                return RegionRecordReadCompletionV2 {
+                    plan: self.plan,
+                    result: Err(error),
+                    buffer,
+                };
+            }
+        };
         let identity_valid =
             completion.request_id == self.request_id && completion.kind == OperationKind::Read;
         let bytes_transferred = completion.bytes_transferred;
@@ -177,7 +189,7 @@ pub(crate) fn submit_record_read(
             });
         }
     };
-    let request = match engine.submit_wait(IoOperation::read(buffer, plan.absolute)) {
+    let request = match submit_cache_io(engine, IoOperation::read(buffer, plan.absolute)) {
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_lease();
@@ -384,7 +396,7 @@ mod tests {
 
         let completion = submit_record_read(&engine, geometry(), entry, pool.acquire().unwrap())
             .unwrap()
-            .wait();
+            .wait(&engine);
         assert!(completion.result.is_ok());
         assert_eq!(completion.plan.record_range, 32..96);
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
