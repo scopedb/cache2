@@ -687,13 +687,17 @@ without adding a runtime scheduler; JSON records this as
 `client_completion_model=blocking_wait_one_outstanding` so harness revisions
 cannot be mistaken for engine-only performance changes.
 
-`cache-bench hybrid` adds deterministic weighted object sizes such as
-`--sizes 256:50,4KiB:30,64KiB:20` and exercises both SSD routes behind the
-bounded memory engine. Keys are generated on demand (no `Vec<Vec<u8>>`), while
-an 8-byte-per-key bounded state table tracks the current value version so a
-superseded small/large update is a hard correctness failure. A production-scale
-gate starts from the following target-host command (replace every agreed
-threshold with the deployment value):
+`cache-bench hybrid` accepts either one fixed size with
+`--cross-tier-percent 0` or deterministic weighted sizes such as
+`--sizes 256:50,4KiB:30,64KiB:20`. Fixed-size rows isolate the Bucket and Region
+data paths before the mixed composition is measured; turnover and I/O gates
+apply only to the active route. Keys are generated on demand (no
+`Vec<Vec<u8>>`), while an 8-byte-per-key bounded state table tracks the current
+value version so a superseded small/large update is a hard correctness failure.
+After the measured close, the harness reopens with the same configuration and
+samples that state table before closing cleanly again. A production-scale gate
+starts from the following target-host command (replace every agreed threshold
+with the deployment value):
 
 ```text
 target/release/cache-bench hybrid \

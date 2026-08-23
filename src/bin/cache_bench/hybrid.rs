@@ -1,4 +1,4 @@
-//! Mixed-size benchmark path for the complete Hybrid cache.
+//! Fixed- and mixed-size benchmark path for the complete Hybrid cache.
 
 use super::{
     ApiArg as Api, EngineArg as Engine, IoModeArg as Mode, XorShift64, json_escape, parse_number,
@@ -77,7 +77,11 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         diagnostics.bucket.file_len_bytes,
         diagnostics.region.data_file_len_bytes
     );
-    let required_region_reuses = u64::from(diagnostics.region.region_count);
+    let required_region_reuses = if options.mix.uses_region(options.small_object_max) {
+        u64::from(diagnostics.region.region_count)
+    } else {
+        0
+    };
     let keys = Arc::new(KeySpace::new(options.keys, options.seed));
     let states = Arc::new(KeyStateTable::try_new(
         options.keys,
@@ -88,6 +92,7 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     let generator_planned_memory = states.planned_memory_bytes();
     let cache = Arc::new(
         config
+            .clone()
             .open()
             .map_err(|error| format!("cannot format/open Hybrid cache: {error}"))?,
     );
@@ -121,10 +126,10 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         options.verify_samples,
         &options.mix,
     )?;
-    exercise_mixed_semantics(&cache, &keys, &states, &options)?;
+    exercise_semantics(&cache, &keys, &states, &options)?;
     cache
         .flush()
-        .map_err(|error| format!("mixed semantic gate flush failed: {error}"))?;
+        .map_err(|error| format!("semantic gate flush failed: {error}"))?;
     let temporal = (options.access_pattern == AccessPattern::Temporal).then(|| {
         TemporalAccess::new(
             options.keys,
@@ -276,8 +281,8 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     let phase = run_phase(
         &cache,
         PhaseWorkload {
-            keys,
-            states,
+            keys: Arc::clone(&keys),
+            states: Arc::clone(&states),
             mix: options.mix.clone(),
             read_percent: options.read_percent,
             remove_percent: options.remove_percent,
@@ -301,6 +306,32 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         .map_err(|error| format!("Hybrid drain/close failed: {error}"))?;
     let drain = drain_start.elapsed();
     let after = cache.stats();
+    eprintln!(
+        "cache-bench hybrid: reopening clean cache and verifying {} samples",
+        options.verify_samples.min(options.keys)
+    );
+    let reopen_started = Instant::now();
+    let reopened = Arc::new(
+        config
+            .open()
+            .map_err(|error| format!("clean Hybrid reopen failed: {error}"))?,
+    );
+    let reopened = BenchCache::new(reopened, options.api)?;
+    let reopen = reopen_started.elapsed();
+    let reopen_verify_started = Instant::now();
+    let reopen_verification = verify_reopen(
+        &reopened,
+        &keys,
+        &states,
+        options.verify_samples,
+        &options.mix,
+    )?;
+    let reopen_verify = reopen_verify_started.elapsed();
+    let reopen_close_started = Instant::now();
+    reopened
+        .close()
+        .map_err(|error| format!("reopened Hybrid close failed: {error}"))?;
+    let reopen_close = reopen_close_started.elapsed();
     let report = Report {
         options: &options,
         phase,
@@ -315,6 +346,10 @@ pub(super) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
         steady_state_fill_phase,
         required_region_reuses,
         drain,
+        reopen,
+        reopen_verify,
+        reopen_close,
+        reopen_verification,
     };
     match options.output {
         Output::Human => report.print_human(),
@@ -519,6 +554,18 @@ impl SizeMix {
             .iter()
             .position(|class| KEY_BYTES.saturating_add(class.bytes) > small_object_max)?;
         Some((small, large))
+    }
+
+    fn uses_bucket(&self, small_object_max: usize) -> bool {
+        self.classes
+            .iter()
+            .any(|class| KEY_BYTES.saturating_add(class.bytes) <= small_object_max)
+    }
+
+    fn uses_region(&self, small_object_max: usize) -> bool {
+        self.classes
+            .iter()
+            .any(|class| KEY_BYTES.saturating_add(class.bytes) > small_object_max)
     }
 
     fn maximum_bytes(&self) -> usize {
@@ -887,9 +934,9 @@ impl Options {
                 "--small-object-max must be in 1..={MAX_OBJECT_SIZE}"
             ));
         }
-        if mix.routing_classes(small_object_max).is_none() {
+        if cross_tier_percent != 0 && mix.routing_classes(small_object_max).is_none() {
             return Err(
-                "--sizes must include at least one Bucket-routed and one Region-routed value class after accounting for the generated key"
+                "--cross-tier-percent requires --sizes to include at least one Bucket-routed and one Region-routed value class after accounting for the generated key; use --cross-tier-percent=0 for fixed-tier workloads"
                     .into(),
             );
         }
@@ -968,7 +1015,11 @@ fn build_config(options: &Options) -> Result<HybridCacheConfig, String> {
         .maximum_bytes()
         .checked_add(256)
         .ok_or_else(|| "maximum Hybrid value size overflow".to_owned())?;
-    let index_slots = default_index_slots(options.keys)?;
+    let index_slots = if options.mix.uses_region(options.small_object_max) {
+        default_index_slots(options.keys)?
+    } else {
+        default_index_slots(1)?
+    };
     let bucket = BucketCacheConfig::new(&options.bucket_path, options.bucket_capacity)
         .with_bucket_size(options.bucket_size)
         .with_memory_budget(options.bucket_memory_budget)
@@ -1506,7 +1557,63 @@ fn verify_prefill(
     Ok(())
 }
 
-fn exercise_mixed_semantics(
+#[derive(Clone, Copy, Debug, Default)]
+struct ReopenVerification {
+    samples: usize,
+    expected_live: usize,
+    live_hits: usize,
+    live_misses: usize,
+    absent_verified: usize,
+}
+
+fn verify_reopen(
+    cache: &BenchCache,
+    keys: &KeySpace,
+    states: &KeyStateTable,
+    requested_samples: usize,
+    mix: &SizeMix,
+) -> Result<ReopenVerification, String> {
+    let samples = requested_samples.min(keys.count);
+    let mut verification = ReopenVerification {
+        samples,
+        ..ReopenVerification::default()
+    };
+    for sample in 0..samples {
+        let index = ((sample as u128 * keys.count as u128) / samples as u128) as usize;
+        let _ordering = states.lock(index);
+        let state = states.normalize_expiry(index, states.load(index));
+        let key = keys.key(index);
+        let found = cache
+            .get(&key)
+            .map_err(|error| format!("reopen sample read failed for key {index}: {error}"))?;
+        match (state.present, found) {
+            (true, Some(value)) => {
+                verification.expected_live = verification.expected_live.saturating_add(1);
+                if !validate_value(&value, mix, state.class, index, state.version) {
+                    return Err(format!(
+                        "stale/corrupt value after clean reopen for key {index}"
+                    ));
+                }
+                verification.live_hits = verification.live_hits.saturating_add(1);
+            }
+            (true, None) => {
+                verification.expected_live = verification.expected_live.saturating_add(1);
+                verification.live_misses = verification.live_misses.saturating_add(1);
+            }
+            (false, Some(_)) => {
+                return Err(format!(
+                    "removed/expired value resurrected after clean reopen for key {index}"
+                ));
+            }
+            (false, None) => {
+                verification.absent_verified = verification.absent_verified.saturating_add(1);
+            }
+        }
+    }
+    Ok(verification)
+}
+
+fn exercise_semantics(
     cache: &BenchCache,
     keys: &KeySpace,
     states: &KeyStateTable,
@@ -1515,13 +1622,12 @@ fn exercise_mixed_semantics(
     let index = keys.count - 1;
     let _ordering = states.lock(index);
     let key = keys.key(index);
-    let (small, large) = options
-        .mix
-        .routing_classes(options.small_object_max)
-        .expect("options validated mixed routing classes");
+    let routes = options.mix.routing_classes(options.small_object_max);
+    let classes = routes.map_or_else(|| vec![0, 0], |(small, large)| vec![small, large, small]);
+    let ttl_class = routes.map_or(0, |(small, _)| small);
     let mut state = states.normalize_expiry(index, states.load(index));
     let mut value = Vec::new();
-    for class in [small, large, small] {
+    for class in classes {
         let version = state.next_version()?;
         let length = fill_value(&mut value, &options.mix, class, index, version)?;
         match cache.put(&key, &value[..length]) {
@@ -1535,13 +1641,13 @@ fn exercise_mixed_semantics(
                 states.store(index, state);
             }
             Ok(PutOutcome::Rejected(reason)) => {
-                return Err(format!("cross-tier semantic put rejected: {reason:?}"));
+                return Err(format!("semantic put rejected: {reason:?}"));
             }
-            Err(error) => return Err(format!("cross-tier semantic put failed: {error}")),
+            Err(error) => return Err(format!("semantic put failed: {error}")),
         }
         cache
             .flush()
-            .map_err(|error| format!("cross-tier semantic flush failed: {error}"))?;
+            .map_err(|error| format!("semantic flush failed: {error}"))?;
         require_current_hit(cache, &key, &options.mix, index, state)?;
     }
     cache
@@ -1553,7 +1659,7 @@ fn exercise_mixed_semantics(
 
     let version = state.next_version()?;
     let expires_at = now_unix_ms().saturating_add(options.ttl_ms);
-    let length = fill_value(&mut value, &options.mix, small, index, version)?;
+    let length = fill_value(&mut value, &options.mix, ttl_class, index, version)?;
     match cache.put_with_options(
         &key,
         &value[..length],
@@ -1570,7 +1676,7 @@ fn exercise_mixed_semantics(
     state = ExpectedState {
         present: true,
         version,
-        class: small,
+        class: ttl_class,
         expiry_delta_ms: states.expiry_delta(expires_at)?,
     };
     states.store(index, state);
@@ -2721,14 +2827,26 @@ impl StatsDelta {
 }
 
 fn capacity_turnovers_for(options: &Options, host_write_bytes: u64) -> f64 {
-    let capacity = options
-        .bucket_capacity
-        .saturating_add(options.region_capacity);
+    let capacity = active_disk_capacity(options);
     if capacity == 0 {
         0.0
     } else {
         host_write_bytes as f64 / capacity as f64
     }
+}
+
+fn active_disk_capacity(options: &Options) -> u64 {
+    let bucket = if options.mix.uses_bucket(options.small_object_max) {
+        options.bucket_capacity
+    } else {
+        0
+    };
+    let region = if options.mix.uses_region(options.small_object_max) {
+        options.region_capacity
+    } else {
+        0
+    };
+    bucket.saturating_add(region)
 }
 
 fn steady_state_gate_ready(
@@ -2756,6 +2874,10 @@ struct Report<'a> {
     steady_state_fill_phase: Phase,
     required_region_reuses: u64,
     drain: Duration,
+    reopen: Duration,
+    reopen_verify: Duration,
+    reopen_close: Duration,
+    reopen_verification: ReopenVerification,
 }
 
 impl Report<'_> {
@@ -2798,10 +2920,7 @@ impl Report<'_> {
     }
 
     fn bytes_per_capacity(&self, bytes: u64) -> f64 {
-        let capacity = self
-            .options
-            .bucket_capacity
-            .saturating_add(self.options.region_capacity);
+        let capacity = active_disk_capacity(self.options);
         if capacity == 0 {
             0.0
         } else {
@@ -2901,21 +3020,37 @@ impl Report<'_> {
                 self.total_stats.bucket_io_errors, self.total_stats.region_io_errors
             ));
         }
-        if self.total_stats.bucket_io_submitted == 0 || self.total_stats.region_io_submitted == 0 {
+        let uses_bucket = self.options.mix.uses_bucket(self.options.small_object_max);
+        let uses_region = self.options.mix.uses_region(self.options.small_object_max);
+        if uses_bucket && self.stats.bucket_io_submitted == 0 {
             failures.push(format!(
-                "both disk tiers must submit I/O; Bucket/Region = {}/{}",
-                self.total_stats.bucket_io_submitted, self.total_stats.region_io_submitted
+                "measurement must submit active Bucket I/O; submitted={}",
+                self.stats.bucket_io_submitted
             ));
         }
-        if self.total_stats.bucket_io_peak < self.options.min_disk_qd_peak
-            || self.total_stats.region_io_peak < self.options.min_disk_qd_peak
-        {
+        if uses_region && self.stats.region_io_submitted == 0 {
             failures.push(format!(
-                "Bucket/Region I/O QD peaks {}/{} below required {}",
-                self.total_stats.bucket_io_peak,
-                self.total_stats.region_io_peak,
-                self.options.min_disk_qd_peak
+                "measurement must submit active Region I/O; submitted={}",
+                self.stats.region_io_submitted
             ));
+        }
+        if uses_bucket && self.total_stats.bucket_io_peak < self.options.min_disk_qd_peak {
+            failures.push(format!(
+                "active Bucket I/O QD peak {} below required {}",
+                self.total_stats.bucket_io_peak, self.options.min_disk_qd_peak
+            ));
+        }
+        if uses_region && self.total_stats.region_io_peak < self.options.min_disk_qd_peak {
+            failures.push(format!(
+                "active Region I/O QD peak {} below required {}",
+                self.total_stats.region_io_peak, self.options.min_disk_qd_peak
+            ));
+        }
+        if uses_bucket
+            && self.options.steady_state_fill_turnovers > 0.0
+            && self.final_stats.bucket.evictions == 0
+        {
+            failures.push("steady-state Bucket workload observed no entry eviction".into());
         }
         if self.options.write_mode == HybridWriteMode::WriteBack {
             if self.total_stats.write_back_demoted_entries == 0 {
@@ -3052,6 +3187,10 @@ impl Report<'_> {
         );
         number_field!("bucket_capacity_bytes", self.options.bucket_capacity);
         number_field!("region_capacity_bytes", self.options.region_capacity);
+        number_field!(
+            "active_disk_capacity_bytes",
+            active_disk_capacity(self.options)
+        );
         number_field!("memory_capacity_bytes", self.options.memory_capacity);
         string_field!("size_mix", &self.options.mix.as_spec());
         number_field!("small_object_max_bytes", self.options.small_object_max);
@@ -3773,6 +3912,29 @@ impl Report<'_> {
             self.drain_stats.write_back_synchronous_demotions
         );
         number_field!("drain_close_ms", self.drain.as_secs_f64() * 1000.0);
+        number_field!("clean_reopen_ms", self.reopen.as_secs_f64() * 1000.0);
+        number_field!(
+            "clean_reopen_verify_ms",
+            self.reopen_verify.as_secs_f64() * 1000.0
+        );
+        number_field!(
+            "clean_reopen_close_ms",
+            self.reopen_close.as_secs_f64() * 1000.0
+        );
+        number_field!("clean_reopen_samples", self.reopen_verification.samples);
+        number_field!(
+            "clean_reopen_expected_live",
+            self.reopen_verification.expected_live
+        );
+        number_field!("clean_reopen_live_hits", self.reopen_verification.live_hits);
+        number_field!(
+            "clean_reopen_live_misses",
+            self.reopen_verification.live_misses
+        );
+        number_field!(
+            "clean_reopen_absent_verified",
+            self.reopen_verification.absent_verified
+        );
         raw_field!(
             "min_ops_per_sec",
             optional_f64(self.options.min_ops_per_sec)
@@ -3901,6 +4063,24 @@ impl Report<'_> {
             self.drain.as_secs_f64() * 1000.0
         )
         .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_clean_reopen_milliseconds gauge\ncache_rs_hybrid_bench_clean_reopen_milliseconds {:.6}",
+            self.reopen.as_secs_f64() * 1000.0
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_clean_reopen_samples gauge\ncache_rs_hybrid_bench_clean_reopen_samples {}",
+            self.reopen_verification.samples
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
+        writeln!(
+            output,
+            "# TYPE cache_rs_hybrid_bench_clean_reopen_live_hits gauge\ncache_rs_hybrid_bench_clean_reopen_live_hits {}",
+            self.reopen_verification.live_hits
+        )
+        .expect("writing OpenMetrics into a String cannot fail");
         output.push_str(
             "# TYPE cache_rs_hybrid_bench_hardware_qualification gauge\ncache_rs_hybrid_bench_hardware_qualification 0\n# EOF\n",
         );
@@ -3908,7 +4088,7 @@ impl Report<'_> {
     }
 
     fn print_human(&self) {
-        println!("cache-rs Hybrid mixed-object benchmark");
+        println!("cache-rs Hybrid fixed/mixed-object benchmark");
         println!("  hardware qualification: no (single run; target sign-off external)");
         println!("  size mix:               {}", self.options.mix.as_spec());
         println!(
@@ -4191,6 +4371,16 @@ impl Report<'_> {
             self.drain_stats.write_back_synchronous_demotions,
         );
         println!(
+            "  reopen/verify/close:     {:.3}/{:.3}/{:.3} ms; samples={} live hit/miss={}/{} absent={}",
+            self.reopen.as_secs_f64() * 1000.0,
+            self.reopen_verify.as_secs_f64() * 1000.0,
+            self.reopen_close.as_secs_f64() * 1000.0,
+            self.reopen_verification.samples,
+            self.reopen_verification.live_hits,
+            self.reopen_verification.live_misses,
+            self.reopen_verification.absent_verified,
+        );
+        println!(
             "  acceptance:              {}",
             if self.acceptance_failures().is_empty() {
                 "pass"
@@ -4367,7 +4557,7 @@ fn mix64(mut value: u64) -> u64 {
 
 fn print_help() {
     println!(
-        r#"cache-bench hybrid — mixed-size Memory + Bucket + Region benchmark
+        r#"cache-bench hybrid — fixed/mixed-size Memory + Bucket + Region benchmark
 
 Usage:
   cache-bench hybrid --bucket-path PATH --bucket-capacity BYTES \
@@ -4378,7 +4568,8 @@ Safety: all three paths must be distinct, missing or empty regular files.
 The benchmark never resets an existing cache. --yes is mandatory.
 
 Workload:
-  --sizes SIZE:WEIGHT,...     Up to 16 classes (default 256:50,4KiB:30,64KiB:20)
+  --sizes SIZE:WEIGHT,...     One fixed class or up to 16 mixed classes
+                             (default 256:50,4KiB:30,64KiB:20)
   --small-object-max BYTES    Bucket routing threshold (default 1KiB)
   --keys 1..100000000        Streamed key population (default 100000)
   --generator-memory-budget B Hard bound for version state, scratch, worker stacks (default 2GiB)
@@ -4391,7 +4582,8 @@ Workload:
   --verify-samples 1..1000000 Sampled prefill version checks (default 10000)
   --remove-percent 0..100    Share of mutations (default 10)
   --ttl-percent 0..100       Share of mutations (default 5)
-  --cross-tier-percent 0..100 Same-key small/large update share (default 20)
+  --cross-tier-percent 0..100 Same-key small/large update share (default 20;
+                             must be 0 for a single-tier size set)
   --ttl-ms 1..60000          TTL mutation lifetime (default 100)
   --concurrency 1..4096      Caller concurrency (default 16)
   --queue-depth 1..4096      Both lower I/O queue bounds (default 128)
@@ -4428,7 +4620,7 @@ Output/gates:
   --min-journal-rollovers N  Require journal rollover activity
   --min-capacity-turnovers N Require measured host writes / disk capacity
   --min-logical-keyspace-turnovers N Require temporal write-head advances / key count
-  --min-disk-qd-peak N       Required on both Bucket and Region (default 1)
+  --min-disk-qd-peak N       Required on each active disk tier (default 1)
   --min-write-back-qd-peak N Required for write-back runs (default 1)
   --max-journal-rollover-ms N
   --max-close-ms N
@@ -4456,6 +4648,11 @@ mod tests {
         assert_eq!(mix.maximum_bytes(), 64 * 1024);
         assert_eq!(mix.class_for_key(42), mix.class_for_key(42));
         assert_eq!(mix.routing_classes(1024), Some((0, 1)));
+        assert!(mix.uses_bucket(1024));
+        assert!(mix.uses_region(1024));
+        let fixed = SizeMix::parse("256:1").unwrap();
+        assert!(fixed.uses_bucket(1024));
+        assert!(!fixed.uses_region(1024));
         assert!(SizeMix::parse("0:1").is_err());
         assert!(SizeMix::parse("1:0").is_err());
     }
@@ -4720,6 +4917,111 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_fixed_tier_workloads_with_route_aware_capacity() {
+        let base = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=2GiB",
+            "--region-path=region",
+            "--region-capacity=3GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--sizes=256:1",
+            "--cross-tier-percent=0",
+            "--write-mode=write-through",
+            "--yes",
+        ];
+        let ParseOutcome::Run(small) =
+            Options::parse(base.iter().map(|value| (*value).to_owned())).unwrap()
+        else {
+            panic!("expected runnable options");
+        };
+        assert_eq!(active_disk_capacity(&small), 2 * 1024 * 1024 * 1024);
+        assert!(small.mix.uses_bucket(small.small_object_max));
+        assert!(!small.mix.uses_region(small.small_object_max));
+        assert_eq!(
+            build_config(&small)
+                .unwrap()
+                .diagnostics()
+                .unwrap()
+                .region
+                .index_slots,
+            1024
+        );
+
+        let large_arguments = base
+            .iter()
+            .map(|value| {
+                if value.starts_with("--sizes=") {
+                    "--sizes=64KiB:1".to_owned()
+                } else {
+                    (*value).to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        let ParseOutcome::Run(large) = Options::parse(large_arguments).unwrap() else {
+            panic!("expected runnable options");
+        };
+        assert_eq!(active_disk_capacity(&large), 3 * 1024 * 1024 * 1024);
+        assert!(!large.mix.uses_bucket(large.small_object_max));
+        assert!(large.mix.uses_region(large.small_object_max));
+
+        let missing_cross_tier_disable = base
+            .iter()
+            .filter(|value| !value.starts_with("--cross-tier-percent="))
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        assert!(Options::parse(missing_cross_tier_disable).is_err());
+    }
+
+    #[test]
+    fn fixed_tier_acceptance_ignores_inactive_disk_tier() {
+        let arguments = [
+            "--bucket-path=bucket",
+            "--bucket-capacity=2GiB",
+            "--region-path=region",
+            "--region-capacity=3GiB",
+            "--manifest-path=manifest",
+            "--memory-capacity=1MiB",
+            "--sizes=256:1",
+            "--cross-tier-percent=0",
+            "--write-mode=write-through",
+            "--yes",
+        ];
+        let ParseOutcome::Run(options) =
+            Options::parse(arguments.iter().map(|value| (*value).to_owned())).unwrap()
+        else {
+            panic!("expected runnable options");
+        };
+        let report = Report {
+            options: &options,
+            phase: Phase::default(),
+            stats: StatsDelta {
+                bucket_io_submitted: 1,
+                ..StatsDelta::default()
+            },
+            drain_stats: StatsDelta::default(),
+            total_stats: StatsDelta {
+                bucket_io_submitted: 1,
+                bucket_io_peak: 1,
+                ..StatsDelta::default()
+            },
+            premeasure_stats: StatsDelta::default(),
+            final_stats: HybridCacheStats::default(),
+            generator_planned_memory: 1,
+            prefill_elapsed: Duration::ZERO,
+            premeasure_elapsed: Duration::ZERO,
+            steady_state_fill_phase: Phase::default(),
+            required_region_reuses: 0,
+            drain: Duration::ZERO,
+            reopen: Duration::ZERO,
+            reopen_verify: Duration::ZERO,
+            reopen_close: Duration::ZERO,
+            reopen_verification: ReopenVerification::default(),
+        };
+        assert!(report.acceptance_failures().is_empty());
+    }
+
+    #[test]
     fn steady_state_gate_requires_physical_turnover_and_region_reuse() {
         let arguments = [
             "--bucket-path=bucket",
@@ -4858,6 +5160,8 @@ mod tests {
         );
         let measured = StatsDelta {
             host_write_bytes: capacity.saturating_mul(2),
+            bucket_io_submitted: 1,
+            region_io_submitted: 1,
             ..StatsDelta::default()
         };
         let qualifying_premeasure = StatsDelta {
@@ -4890,13 +5194,23 @@ mod tests {
             drain_stats: StatsDelta::default(),
             total_stats: qualifying_total,
             premeasure_stats: qualifying_premeasure,
-            final_stats: HybridCacheStats::default(),
+            final_stats: HybridCacheStats {
+                bucket: cache_rs::BucketCacheStats {
+                    evictions: 1,
+                    ..cache_rs::BucketCacheStats::default()
+                },
+                ..HybridCacheStats::default()
+            },
             generator_planned_memory: 1,
             prefill_elapsed: Duration::ZERO,
             premeasure_elapsed: Duration::ZERO,
             steady_state_fill_phase: Phase::default(),
             required_region_reuses: required_reuses,
             drain: Duration::from_millis(1),
+            reopen: Duration::ZERO,
+            reopen_verify: Duration::ZERO,
+            reopen_close: Duration::ZERO,
+            reopen_verification: ReopenVerification::default(),
         };
         assert!(report.acceptance_failures().is_empty());
         assert_eq!(report.capacity_turnovers(), 2.0);
@@ -4968,7 +5282,10 @@ mod tests {
                 stale_values: 1,
                 ..Phase::default()
             },
-            stats: measured,
+            stats: StatsDelta {
+                bucket_io_submitted: 0,
+                ..measured
+            },
             drain_stats: StatsDelta::default(),
             total_stats: StatsDelta {
                 bucket_io_submitted: 0,
@@ -4982,10 +5299,14 @@ mod tests {
             steady_state_fill_phase: Phase::default(),
             required_region_reuses: required_reuses,
             drain: Duration::from_millis(20),
+            reopen: Duration::ZERO,
+            reopen_verify: Duration::ZERO,
+            reopen_close: Duration::ZERO,
+            reopen_verification: ReopenVerification::default(),
         };
         let failures = failed.acceptance_failures().join("; ");
         assert!(failures.contains("stale or corrupt"));
-        assert!(failures.contains("both disk tiers"));
+        assert!(failures.contains("measurement must submit active Bucket"));
         assert!(failures.contains("drain/close"));
         assert!(failures.contains("steady-state pre-measure gate"));
     }

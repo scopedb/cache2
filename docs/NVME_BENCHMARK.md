@@ -242,6 +242,41 @@ specific: hit rate must not regress against `always/fifo`, and daily submitted
 host bytes must remain inside the budget derived from the actual SSD capacity,
 warranty period, and DWPD rating.
 
+## Hybrid fixed-object baselines
+
+Before a mixed-size run, isolate each lower data path with one exact value
+size. A single `--sizes SIZE:WEIGHT` class is accepted when
+`--cross-tier-percent 0` is explicit. The generated 32-byte key participates
+in routing, so with `--small-object-max 1KiB`, a 992-byte value is the largest
+exact Bucket boundary and a 993-byte value is the first Region boundary.
+
+Run the same capacity progression for one Bucket-routed size and one
+Region-routed size. Turnover uses only the capacity of the active data tier;
+the inactive Region also receives only a 1024-slot placeholder index. The
+acceptance gate requires measurement-window I/O and queue activity only from
+the active tier. When a pre-measure turnover target is set, a Bucket-only run
+must also observe a real Bucket eviction, while a Region run must complete the
+configured Region reuse cycle.
+
+Every Hybrid run now closes, reopens with the identical configuration, samples
+the bounded expected-state table, and closes again before reporting. A sampled
+hit must contain the current key/version payload, and a sampled removed or
+expired key must remain absent; a live sampled value may be a miss because this
+is a disposable cache. Retain the reported clean-reopen and verification
+latencies, then run `cachectl hybrid-verify` over all three files.
+
+Representative fixed classes are:
+
+| Size | Route | Primary signal |
+| --- | --- | --- |
+| `992:1` | Bucket boundary | entry throughput, page RMW, collision eviction |
+| `4KiB:1` | Region | high-entry compact-index and reclaim cost |
+| `1MiB:1` | Region | batching bandwidth, copy cost, and tail latency |
+
+After the fixed paths pass at the target capacity, run a `992:1,993:1`
+threshold migration row with non-zero cross-tier updates, then proceed to the
+production mix below.
+
 ## Hybrid mixed-object acceptance
 
 The Region-only matrix above isolates the append/index/reclaim path. It does
