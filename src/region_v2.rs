@@ -15,27 +15,32 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::index::{MAX_INDEX_SHARDS, MAX_INDEX_SLOTS};
+use crate::format::{REGION_HEADER_SIZE, RegionHeader, RegionState};
+use crate::index::{IndexEntry, MAX_INDEX_SHARDS, MAX_INDEX_SLOTS};
 use crate::index_storage::{
     IndexImageBindingV1, IndexPhysicalStats, IndexShardRangeV1, IndexStorageError,
     ShardedIndexStorage, canonical_index_shard_ranges,
 };
-use crate::index_v2::{IndexLookupV2, RegionIndexV2};
+use crate::index_v2::{
+    IndexLookupV2, IndexMaskV2, IndexMutationAuthorityV2, IndexTransitionV2, IndexUpsertV2,
+    RegionIndexV2,
+};
 use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, SyncMode, SyncPoint, WritePoint,
     read_exact_at, write_all_at,
 };
 use crate::recovery_v2::{
-    DataSuperblockV2, DataSuperblockV2Probe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET_V1,
-    RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1, RecoveryImageHeaderV1Probe, RecoveryState,
-    STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedStateV2, StateBindingV2, StatePageWriteV2,
-    StateRecordV2, StateSelectionError, clean_image_matches_v2, latest_state_v2,
-    prepare_next_state_v2, prepare_running_barrier_v2, recovery_image_index_len_v1,
+    DATA_REGION_AREA_OFFSET_V2, DataSuperblockV2, DataSuperblockV2Probe, PersistentId,
+    RECOVERY_IMAGE_INDEX_OFFSET_V1, RECOVERY_PAGE_SIZE, RecoveryImageHeaderV1,
+    RecoveryImageHeaderV1Probe, RecoveryState, STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedStateV2,
+    StateBindingV2, StatePageWriteV2, StateRecordV2, StateSelectionError, clean_image_matches_v2,
+    latest_state_v2, prepare_next_state_v2, prepare_running_barrier_v2,
+    recovery_image_index_len_v1,
 };
-use crate::region_manager_v2::RegionManagerV2;
+use crate::region_manager_v2::{RegionManagerV2, RegionMutationErrorV2};
 use crate::region_metadata_v1::{
     REGION_METADATA_V1_PAGE_SIZE, REGION_METADATA_V1_REGIONS_PER_PAGE,
     REGION_METADATA_V1_SHARDS_PER_PAGE, RegionMetadataRecordV1, RegionMetadataRootV1,
@@ -188,6 +193,7 @@ impl RegionV2Files {
 
 const REGION_V2_HEALTHY: u8 = 0;
 const REGION_V2_MISS_ONLY: u8 = 1;
+const _: () = assert!(REGION_HEADER_SIZE == RECOVERY_PAGE_SIZE);
 
 /// One-way health fence shared by the live, frozen, and prepared-clean owners.
 /// Once a lazy index fault rejects the recovery image, no later phase may
@@ -222,9 +228,119 @@ impl RegionV2HealthLatch {
     }
 }
 
+/// The only steady-state owner of Region visibility, FIFO state, and logical
+/// accounting. Its mutex is intentionally narrower than the index: an index
+/// mutation holds it across one bounded shard probe and the matching
+/// accounting commit, but never across record encoding, staging, queueing, or
+/// device I/O.
+struct RegionManagerAuthorityV2 {
+    inner: Mutex<RegionManagerV2>,
+    health: RegionV2HealthLatch,
+}
+
+impl RegionManagerAuthorityV2 {
+    fn new(manager: RegionManagerV2, health: RegionV2HealthLatch) -> Self {
+        Self {
+            inner: Mutex::new(manager),
+            health,
+        }
+    }
+
+    fn lock(&self) -> io::Result<MutexGuard<'_, RegionManagerV2>> {
+        self.health.require_healthy()?;
+        match self.inner.lock() {
+            Ok(guard) if self.health.is_healthy() => Ok(guard),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionStore V2 became miss-only while acquiring Region authority",
+            )),
+            Err(_) => {
+                self.health.enter_miss_only();
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RegionStore V2 Region authority is poisoned",
+                ))
+            }
+        }
+    }
+
+    fn is_visible(&self, entry: IndexEntry) -> bool {
+        let Ok(manager) = self.lock() else {
+            return false;
+        };
+        let visible = manager.is_visible(entry);
+        visible && self.health.is_healthy()
+    }
+
+    fn begin_index_mutation(&self) -> io::Result<RegionIndexMutationAuthorityV2<'_>> {
+        Ok(RegionIndexMutationAuthorityV2 {
+            manager: self.lock()?,
+            health: self.health.clone(),
+            accounting_error: None,
+        })
+    }
+
+    fn empty_active_headers(&self, data: DataSuperblockV2) -> io::Result<Vec<(u64, RegionHeader)>> {
+        let manager = self.lock()?;
+        snapshot_empty_active_region_headers(data, &manager)
+    }
+
+    fn into_inner(self) -> io::Result<RegionManagerV2> {
+        match self.inner.into_inner() {
+            Ok(manager) if self.health.is_healthy() => Ok(manager),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionStore V2 became miss-only while freezing Region authority",
+            )),
+            Err(_) => {
+                self.health.enter_miss_only();
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RegionStore V2 Region authority is poisoned",
+                ))
+            }
+        }
+    }
+}
+
+/// One manager guard paired with one index mutation. `commit` cannot return
+/// through the index API after the physical slot is installed, so accounting
+/// failures are recorded here, latch miss-only immediately, and are surfaced
+/// when the short critical section ends.
+struct RegionIndexMutationAuthorityV2<'a> {
+    manager: MutexGuard<'a, RegionManagerV2>,
+    health: RegionV2HealthLatch,
+    accounting_error: Option<RegionMutationErrorV2>,
+}
+
+impl RegionIndexMutationAuthorityV2<'_> {
+    fn finish(self) -> io::Result<()> {
+        drop(self.manager);
+        match self.accounting_error {
+            Some(error) => Err(region_mutation_io_error(error)),
+            None => self.health.require_healthy(),
+        }
+    }
+}
+
+impl IndexMutationAuthorityV2 for RegionIndexMutationAuthorityV2<'_> {
+    fn is_visible(&self, entry: IndexEntry) -> bool {
+        self.manager.is_visible(entry)
+    }
+
+    fn commit(&mut self, transition: IndexTransitionV2) {
+        if self.accounting_error.is_none() {
+            if let Err(error) = self.manager.apply_index_transition(transition) {
+                self.health.enter_miss_only();
+                self.accounting_error = Some(error);
+            }
+        }
+    }
+}
+
 pub(crate) struct FileRegionRuntimeV2 {
     index: RegionIndexV2,
-    manager: RegionManagerV2,
+    manager: RegionManagerAuthorityV2,
     health: RegionV2HealthLatch,
 }
 
@@ -263,10 +379,11 @@ impl FileRegionRuntimeV2 {
             ));
         }
         let manager = RegionManagerV2::from_metadata(metadata).map_err(region_metadata_io_error)?;
+        let health = RegionV2HealthLatch::healthy();
         Ok(Self {
             index: RegionIndexV2::from_storage(index),
-            manager,
-            health: RegionV2HealthLatch::healthy(),
+            manager: RegionManagerAuthorityV2::new(manager, health.clone()),
+            health,
         })
     }
 
@@ -306,6 +423,65 @@ impl FileRegionRuntimeV2 {
             Err(_) => {
                 self.health.enter_miss_only();
                 Ok(false)
+            }
+        }
+    }
+
+    fn upsert_entry(&self, hash: u64, entry: IndexEntry) -> io::Result<IndexUpsertV2> {
+        self.mutate_index(|index, authority| index.upsert_with_authority(hash, entry, authority))
+    }
+
+    fn mask_hash(&self, hash: u64, seqno: u64) -> io::Result<IndexMaskV2> {
+        self.mutate_index(|index, authority| {
+            index.mask_if_newer_with_authority(hash, seqno, authority)
+        })
+    }
+
+    fn remove_entry(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+    ) -> io::Result<Option<IndexTransitionV2>> {
+        self.mutate_index(|index, authority| {
+            index.remove_if_with_authority(hash, expected, authority)
+        })
+    }
+
+    fn replace_entry(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        replacement: IndexEntry,
+    ) -> io::Result<Option<IndexTransitionV2>> {
+        self.mutate_index(|index, authority| {
+            index.replace_if_with_authority(hash, expected, replacement, authority)
+        })
+    }
+
+    fn normalize_mask(&self, hash: u64, seqno: u64) -> io::Result<Option<IndexTransitionV2>> {
+        self.mutate_index(|index, authority| {
+            index.normalize_mask_if_with_authority(hash, seqno, authority)
+        })
+    }
+
+    fn mutate_index<T>(
+        &self,
+        mutation: impl FnOnce(
+            &RegionIndexV2,
+            &mut RegionIndexMutationAuthorityV2<'_>,
+        ) -> Result<T, IndexStorageError>,
+    ) -> io::Result<T> {
+        let mut authority = self.manager.begin_index_mutation()?;
+        let result = mutation(&self.index, &mut authority);
+        let accounting = authority.finish();
+        match result {
+            Ok(value) => {
+                accounting?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.health.enter_miss_only();
+                Err(index_storage_io_error(error))
             }
         }
     }
@@ -383,6 +559,7 @@ where
     current_state: Option<SelectedStateV2>,
     prepared_clean: Option<(u8, StateRecordV2)>,
     cold_reset_needed: bool,
+    materialize_active_headers: bool,
     locked: bool,
 }
 
@@ -411,6 +588,7 @@ where
             current_state: None,
             prepared_clean: None,
             cold_reset_needed: false,
+            materialize_active_headers: false,
             locked: false,
         }
     }
@@ -690,7 +868,9 @@ where
         let metadata = empty_region_metadata(data, config.index_slots)?;
         let index =
             ShardedIndexStorage::anonymous(config.index_slots).map_err(index_storage_io_error)?;
-        FileRegionRuntimeV2::install(index, metadata)
+        let runtime = FileRegionRuntimeV2::install(index, metadata)?;
+        self.materialize_active_headers = true;
+        Ok(runtime)
     }
 
     fn map_clean_runtime(
@@ -734,7 +914,9 @@ where
             &shard_stats,
         )
         .map_err(index_storage_io_error)?;
-        FileRegionRuntimeV2::install(index, clean.metadata).map(Some)
+        let runtime = FileRegionRuntimeV2::install(index, clean.metadata)?;
+        self.materialize_active_headers = false;
+        Ok(Some(runtime))
     }
 
     fn publish_running(&mut self) -> io::Result<()> {
@@ -756,6 +938,14 @@ where
     }
 
     fn start_runtime(&mut self, runtime: Self::Runtime) -> io::Result<Self::Runtime> {
+        if self.materialize_active_headers {
+            let data = self.data_superblock()?;
+            let data_file = self.data_file.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "V2 data file is not open")
+            })?;
+            materialize_empty_active_region_headers(data_file, data, &runtime.manager)?;
+            self.materialize_active_headers = false;
+        }
         Ok(runtime)
     }
 
@@ -770,6 +960,7 @@ where
             manager,
             health,
         } = runtime;
+        let manager = manager.into_inner()?;
         let shards = index_shard_metadata(index.storage(), &health)?;
         let metadata = manager
             .freeze_metadata(shards)
@@ -967,6 +1158,7 @@ where
             .unwrap_or(Ok(()));
         self.locked = false;
         self.prepared_clean = None;
+        self.materialize_active_headers = false;
         self.state_file.take();
         self.data_file.take();
         state_result.and(data_result)
@@ -1328,6 +1520,108 @@ fn metadata_shard_stats_match(metadata: &RegionMetadataV1, stats: &[IndexPhysica
         })
 }
 
+/// Materializes the first page of every empty append lane after RUNNING is
+/// durable and before the runtime can admit requests.
+///
+/// This is deliberately only a positioned write boundary. The normal data
+/// durability policy will cover these pages later; startup must not add one
+/// sync per lane. Clean-recovered lanes already have authoritative headers and
+/// never call this helper.
+fn materialize_empty_active_region_headers<B>(
+    data_file: &B,
+    data: DataSuperblockV2,
+    manager: &RegionManagerAuthorityV2,
+) -> io::Result<()>
+where
+    B: IoBackend,
+{
+    // Snapshot under the manager lock, then release it before the first write.
+    // This keeps startup on the same lock contract as steady-state rotation.
+    for (region_offset, header) in manager.empty_active_headers(data)? {
+        write_all_at(
+            data_file,
+            WritePoint::RegionHeader,
+            &header.encode(),
+            region_offset,
+        )?;
+    }
+    Ok(())
+}
+
+fn snapshot_empty_active_region_headers(
+    data: DataSuperblockV2,
+    manager: &RegionManagerV2,
+) -> io::Result<Vec<(u64, RegionHeader)>> {
+    if manager.region_size() != data.geometry.region_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V2 runtime Region size does not match the data geometry",
+        ));
+    }
+
+    let mut headers = Vec::new();
+    headers
+        .try_reserve_exact(manager.active_regions().len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate V2 Active Region header snapshot",
+            )
+        })?;
+    for &region_id in manager.active_regions() {
+        let region_index = usize::try_from(region_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 Active Region id is too large",
+            )
+        })?;
+        let region = manager.regions().get(region_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 Active Region is outside the data geometry",
+            )
+        })?;
+        if region.region_id != region_id
+            || region.state != RegionMetadataStateV1::Active
+            || region.durable_used != REGION_HEADER_SIZE as u64
+            || region.reserved_used != REGION_HEADER_SIZE as u64
+            || region.max_seqno != 0
+            || region.physical_record_count != 0
+            || region.logical.live_record_count != 0
+            || region.logical.live_record_bytes != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 anonymous Active Region is not empty",
+            ));
+        }
+
+        let region_offset = u64::from(region_id)
+            .checked_mul(data.geometry.region_size)
+            .and_then(|offset| DATA_REGION_AREA_OFFSET_V2.checked_add(offset))
+            .ok_or_else(|| io::Error::other("V2 Active Region offset overflow"))?;
+        let region_end = region_offset
+            .checked_add(REGION_HEADER_SIZE as u64)
+            .ok_or_else(|| io::Error::other("V2 Active Region header end overflow"))?;
+        if region_end > data.geometry.data_file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 Active Region header exceeds the data file",
+            ));
+        }
+
+        let header = RegionHeader {
+            region_id,
+            incarnation: region.incarnation,
+            state: RegionState::Active,
+            created_seqno: region.created_seqno,
+            used: region.durable_used,
+        };
+        headers.push((region_offset, header));
+    }
+    Ok(headers)
+}
+
 fn empty_region_metadata(
     data: DataSuperblockV2,
     index_slots: usize,
@@ -1489,6 +1783,13 @@ fn region_metadata_io_error(error: RegionMetadataV1Error) -> io::Error {
         RegionMetadataV1Error::Allocation => io::Error::new(io::ErrorKind::OutOfMemory, error),
         error => io::Error::new(io::ErrorKind::InvalidData, error),
     }
+}
+
+fn region_mutation_io_error(error: RegionMutationErrorV2) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("RegionStore V2 authority mutation failed: {error:?}"),
+    )
 }
 
 fn index_storage_io_error(error: IndexStorageError) -> io::Error {
@@ -1886,6 +2187,261 @@ mod tests {
 
     fn test_data_superblock() -> DataSuperblockV2 {
         test_data_superblock_with_regions(2)
+    }
+
+    #[test]
+    fn index_mutation_and_region_accounting_share_one_failure_fence() {
+        let data = test_data_superblock();
+        let runtime = FileRegionRuntimeV2::install(
+            ShardedIndexStorage::anonymous(8).unwrap(),
+            empty_region_metadata(data, 8).unwrap(),
+        )
+        .unwrap();
+
+        let append = |runtime: &FileRegionRuntimeV2| {
+            let mut manager = runtime.manager.lock().unwrap();
+            let reservation = manager.reserve_append(0, 64).unwrap();
+            manager.stage_reservation(reservation).unwrap();
+            let span = manager.seal_write_span(0).unwrap();
+            manager.complete_write_span(span).unwrap();
+            reservation
+        };
+        let entry_for =
+            |reservation: crate::region_manager_v2::RegionAppendReservationV2| IndexEntry {
+                location: PackedLocation::new(
+                    reservation.region_id,
+                    reservation.offset,
+                    reservation.record_bytes,
+                    false,
+                )
+                .unwrap(),
+                seqno: reservation.seqno,
+                namespace_id: 0,
+                flags: 0,
+            };
+
+        let first = entry_for(append(&runtime));
+        assert!(matches!(
+            runtime.upsert_entry(7, first).unwrap(),
+            IndexUpsertV2::Applied { .. }
+        ));
+        assert_eq!(
+            runtime
+                .manager
+                .lock()
+                .unwrap()
+                .logical_accounting()
+                .unwrap()
+                .live_record_bytes,
+            64
+        );
+
+        let remove_seqno = runtime.manager.lock().unwrap().allocate_seqno().unwrap();
+        assert!(matches!(
+            runtime.mask_hash(7, remove_seqno).unwrap(),
+            IndexMaskV2::Applied { .. }
+        ));
+        runtime.normalize_mask(7, remove_seqno).unwrap();
+        assert_eq!(
+            runtime
+                .manager
+                .lock()
+                .unwrap()
+                .logical_accounting()
+                .unwrap()
+                .live_record_count,
+            0
+        );
+
+        let second = entry_for(append(&runtime));
+        runtime.upsert_entry(7, second).unwrap();
+        runtime
+            .manager
+            .lock()
+            .unwrap()
+            .apply_index_transition(IndexTransitionV2 {
+                global_slot: 0,
+                previous: crate::index_storage::IndexSlotStateV1::Value {
+                    hash: 7,
+                    entry: second,
+                },
+                installed: crate::index_storage::IndexSlotStateV1::Deleted,
+            })
+            .unwrap();
+
+        let error = runtime.remove_entry(7, second).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!runtime.health.is_healthy());
+        assert_eq!(runtime.lookup_snapshot(7).unwrap(), IndexLookupV2::Miss);
+    }
+
+    fn assert_active_header_startup_boundary(events: &[FaultEvent]) {
+        let running_sync = events
+            .iter()
+            .rposition(|event| *event == FaultEvent::Sync(SyncPoint::V2RunningState))
+            .expect("startup must make RUNNING durable");
+        let header_writes = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (*event == FaultEvent::Write(WritePoint::RegionHeader)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(header_writes.len(), 1, "one Active lane needs one header");
+        let header_write = header_writes[0];
+        assert!(
+            running_sync < header_write,
+            "Active header must follow the durable RUNNING barrier"
+        );
+        assert!(
+            events[header_write + 1..]
+                .iter()
+                .all(|event| !matches!(event, FaultEvent::Sync(_))),
+            "Active header materialization must not add a startup sync"
+        );
+    }
+
+    #[test]
+    fn fresh_and_dirty_empty_materialize_active_header_after_running_without_sync() {
+        use std::os::unix::fs::FileExt;
+
+        let directory = TestDirectory::new();
+        let config = RegionV2Config { index_slots: 8 };
+        let data = test_data_superblock();
+
+        let (fresh_file_system, fresh_io, _) = FaultRegionV2FileSystem::new();
+        let mut fresh = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new_with_file_system(
+                directory.files.clone(),
+                data,
+                fresh_file_system,
+            ),
+        )
+        .unwrap();
+        assert_eq!(fresh.startup(), RegionV2Startup::FreshEmpty);
+        assert_active_header_startup_boundary(&fresh_io.events());
+
+        let mut encoded = [0_u8; REGION_HEADER_SIZE];
+        File::open(&directory.files.data)
+            .unwrap()
+            .read_exact_at(&mut encoded, DATA_REGION_AREA_OFFSET_V2)
+            .unwrap();
+        assert_eq!(
+            RegionHeader::decode(&encoded),
+            Some(RegionHeader {
+                region_id: 0,
+                incarnation: 1,
+                state: RegionState::Active,
+                created_seqno: 1,
+                used: REGION_HEADER_SIZE as u64,
+            })
+        );
+        fresh.close_fast().unwrap();
+
+        let (dirty_file_system, dirty_io, _) = FaultRegionV2FileSystem::new();
+        let mut dirty = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new_with_file_system(
+                directory.files.clone(),
+                data,
+                dirty_file_system,
+            ),
+        )
+        .unwrap();
+        assert_eq!(dirty.startup(), RegionV2Startup::DirtyEmpty);
+        assert_active_header_startup_boundary(&dirty_io.events());
+        dirty.close_fast().unwrap();
+    }
+
+    #[test]
+    fn active_header_failure_aborts_open_unlocks_and_leaves_running() {
+        let directory = TestDirectory::new();
+        let config = RegionV2Config { index_slots: 8 };
+        let data = test_data_superblock();
+        let (file_system, faults, _) = FaultRegionV2FileSystem::new();
+        faults.arm(
+            FaultEvent::Write(WritePoint::RegionHeader),
+            1,
+            FaultAction::Torn {
+                bytes: 128,
+                raw_os_error: 5,
+            },
+        );
+
+        let error = match RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new_with_file_system(directory.files.clone(), data, file_system),
+        ) {
+            Ok(_) => panic!("torn Active header must abort open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(5));
+
+        let events = faults.events();
+        let running_sync = events
+            .iter()
+            .position(|event| *event == FaultEvent::Sync(SyncPoint::V2RunningState))
+            .unwrap();
+        let header_write = events
+            .iter()
+            .position(|event| *event == FaultEvent::Write(WritePoint::RegionHeader))
+            .unwrap();
+        let first_unlock = events
+            .iter()
+            .position(|event| *event == FaultEvent::Unlock)
+            .unwrap();
+        assert!(running_sync < header_write && header_write < first_unlock);
+
+        let state = std::fs::read(&directory.files.state).unwrap();
+        let selected = latest_state_v2([
+            &state[..RECOVERY_PAGE_SIZE],
+            &state[RECOVERY_PAGE_SIZE..STATE_FILE_SIZE],
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.record.state, RecoveryState::Running);
+
+        let mut reopened = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .expect("failed open must release both V2 file locks");
+        assert_eq!(reopened.startup(), RegionV2Startup::DirtyEmpty);
+        reopened.close_fast().unwrap();
+    }
+
+    #[test]
+    fn clean_recovery_does_not_rewrite_active_header() {
+        let directory = TestDirectory::new();
+        let config = RegionV2Config { index_slots: 8 };
+        let data = test_data_superblock();
+        let mut first = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .unwrap();
+        first.close_warm().unwrap();
+
+        let (file_system, faults, _) = FaultRegionV2FileSystem::new();
+        faults.arm(
+            FaultEvent::Write(WritePoint::RegionHeader),
+            1,
+            FaultAction::ErrorAlways(5),
+        );
+        let mut recovered = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new_with_file_system(directory.files.clone(), data, file_system),
+        )
+        .expect("clean recovery must preserve the existing Active header");
+        assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
+        assert!(
+            faults
+                .events()
+                .iter()
+                .all(|event| *event != FaultEvent::Write(WritePoint::RegionHeader))
+        );
+        recovered.close_fast().unwrap();
     }
 
     #[test]

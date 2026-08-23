@@ -3,12 +3,12 @@
 //! This layer owns the sharded storage but deliberately does not own Region
 //! visibility or logical accounting. A lookup returns only the raw typed point
 //! state and releases its canonical shard before the caller consults Region
-//! authority. Mutations may still receive a visibility predicate after the
-//! caller has acquired stable Region-manager authority. No slot is modified
-//! until the probe has selected its final target. Callers of `*_with_commit`
-//! must acquire their stable Region-manager authority before entering; the
-//! callback updates that already-held guard and must be infallible and
-//! non-reentrant.
+//! authority. Mutations receive one authority object after the caller has
+//! acquired stable Region-manager authority. No slot is modified until the
+//! probe has selected its final target. The same object supplies visibility
+//! during the probe and consumes the exact committed transition before the
+//! shard guard is released; neither method may perform I/O or re-enter the
+//! index.
 
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
 use crate::index_storage::{IndexSlotStateV1, IndexStorageError, ShardedIndexStorage};
@@ -19,6 +19,47 @@ pub(crate) struct IndexTransitionV2 {
     pub(crate) global_slot: usize,
     pub(crate) previous: IndexSlotStateV1,
     pub(crate) installed: IndexSlotStateV1,
+}
+
+/// Stable Region authority shared by one complete index mutation.
+///
+/// Callers acquire the Region-manager authority before entering the index.
+/// `commit` runs synchronously after the slot and shard physical statistics
+/// have changed, but before the shard write guard is released. It must be
+/// infallible and must not acquire another manager or index lock.
+pub(crate) trait IndexMutationAuthorityV2 {
+    fn is_visible(&self, entry: IndexEntry) -> bool;
+
+    fn commit(&mut self, transition: IndexTransitionV2);
+}
+
+#[cfg(test)]
+struct PredicateAuthorityV2<F> {
+    is_visible: F,
+}
+
+#[cfg(test)]
+impl<F> IndexMutationAuthorityV2 for PredicateAuthorityV2<F>
+where
+    F: Fn(IndexEntry) -> bool,
+{
+    fn is_visible(&self, entry: IndexEntry) -> bool {
+        (self.is_visible)(entry)
+    }
+
+    fn commit(&mut self, _transition: IndexTransitionV2) {}
+}
+
+#[cfg(test)]
+struct NoopAuthorityV2;
+
+#[cfg(test)]
+impl IndexMutationAuthorityV2 for NoopAuthorityV2 {
+    fn is_visible(&self, _entry: IndexEntry) -> bool {
+        true
+    }
+
+    fn commit(&mut self, _transition: IndexTransitionV2) {}
 }
 
 /// Typed result of a point lookup.
@@ -194,25 +235,25 @@ impl RegionIndexV2 {
     /// foreign mask is never reusable or evictable. If the window has no
     /// reusable slot, the first visible value becomes the bounded eviction
     /// victim; an all-mask window is saturated instead of violating a mask.
-    pub(crate) fn upsert(
+    #[cfg(test)]
+    fn upsert(
         &self,
         hash: u64,
         supplied: IndexEntry,
-        is_visible: impl FnMut(IndexEntry) -> bool,
+        is_visible: impl Fn(IndexEntry) -> bool,
     ) -> Result<IndexUpsertV2, IndexStorageError> {
-        self.upsert_with_commit(hash, supplied, is_visible, |_| {})
+        let mut authority = PredicateAuthorityV2 { is_visible };
+        self.upsert_with_authority(hash, supplied, &mut authority)
     }
 
-    /// Installs a live value and reports the committed physical transition
-    /// before releasing its shard write lock.
-    pub(crate) fn upsert_with_commit(
+    /// Installs a live value under one stable Region authority.
+    pub(crate) fn upsert_with_authority(
         &self,
         hash: u64,
         supplied: IndexEntry,
-        mut is_visible: impl FnMut(IndexEntry) -> bool,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<IndexUpsertV2, IndexStorageError> {
-        if supplied.seqno == 0 || !is_visible(supplied) {
+        if supplied.seqno == 0 || !authority.is_visible(supplied) {
             return Ok(IndexUpsertV2::Ignored { current: None });
         }
 
@@ -220,7 +261,7 @@ impl RegionIndexV2 {
             hash,
             entry: supplied,
         };
-        self.install_if_newer(hash, supplied.seqno, installed, is_visible, on_commit)
+        self.install_if_newer(hash, supplied.seqno, installed, authority)
             .map(IndexUpsertV2::from)
     }
 
@@ -228,23 +269,23 @@ impl RegionIndexV2 {
     ///
     /// Equal or newer same-hash values and masks win. Foreign masks are never
     /// overwritten, including when they fill the complete bounded window.
-    pub(crate) fn mask_if_newer(
+    #[cfg(test)]
+    fn mask_if_newer(
         &self,
         hash: u64,
         seqno: u64,
-        is_visible: impl FnMut(IndexEntry) -> bool,
+        is_visible: impl Fn(IndexEntry) -> bool,
     ) -> Result<IndexMaskV2, IndexStorageError> {
-        self.mask_if_newer_with_commit(hash, seqno, is_visible, |_| {})
+        let mut authority = PredicateAuthorityV2 { is_visible };
+        self.mask_if_newer_with_authority(hash, seqno, &mut authority)
     }
 
-    /// Reserves a hash/version and reports the committed physical transition
-    /// before releasing its shard write lock.
-    pub(crate) fn mask_if_newer_with_commit(
+    /// Reserves a hash/version under one stable Region authority.
+    pub(crate) fn mask_if_newer_with_authority(
         &self,
         hash: u64,
         seqno: u64,
-        is_visible: impl FnMut(IndexEntry) -> bool,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<IndexMaskV2, IndexStorageError> {
         if seqno == 0 {
             return Ok(IndexMaskV2::Ignored { current: None });
@@ -253,8 +294,7 @@ impl RegionIndexV2 {
             hash,
             seqno,
             IndexSlotStateV1::Masked { hash, seqno },
-            is_visible,
-            on_commit,
+            authority,
         )
         .map(IndexMaskV2::from)
     }
@@ -264,8 +304,7 @@ impl RegionIndexV2 {
         hash: u64,
         supplied_seqno: u64,
         installed: IndexSlotStateV1,
-        mut is_visible: impl FnMut(IndexEntry) -> bool,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<IndexInstallV2, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -301,7 +340,7 @@ impl RegionIndexV2 {
                     hash: current_hash,
                     entry: current,
                 } => {
-                    let current_visible = is_visible(current);
+                    let current_visible = authority.is_visible(current);
                     if current_hash == hash {
                         if current_visible && supplied_seqno <= current.seqno {
                             return Ok(IndexInstallV2::Ignored {
@@ -325,7 +364,7 @@ impl RegionIndexV2 {
         };
         let old = shard.replace(local_slot, installed)?;
         let transition = transition(first_slot, local_slot, old, installed);
-        on_commit(transition);
+        authority.commit(transition);
         drop(shard);
         Ok(IndexInstallV2::Applied {
             transition,
@@ -335,73 +374,79 @@ impl RegionIndexV2 {
 
     /// Replaces one exact immutable record identity with the canonical
     /// probe-deleted marker.
-    pub(crate) fn remove_if(
+    #[cfg(test)]
+    fn remove_if(
         &self,
         hash: u64,
         expected: IndexEntry,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
-        self.remove_if_with_commit(hash, expected, |_| {})
+        let mut authority = NoopAuthorityV2;
+        self.remove_if_with_authority(hash, expected, &mut authority)
     }
 
-    /// Removes one exact record and reports its committed physical transition
-    /// before releasing the shard write lock.
-    pub(crate) fn remove_if_with_commit(
+    /// Removes one exact record under one stable Region authority.
+    pub(crate) fn remove_if_with_authority(
         &self,
         hash: u64,
         expected: IndexEntry,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
-        self.replace_exact_value(hash, expected, None, on_commit)
+        self.replace_exact_value(hash, expected, None, authority)
     }
 
     /// Physically relocates one exact immutable record identity. The new
     /// location may differ, but seqno and namespace must remain unchanged;
-    /// logical updates use [`Self::upsert`]. Runtime flag changes do not make
-    /// the same record a different completion target. Masked, deleted, stale,
-    /// and foreign states are never modified.
-    pub(crate) fn replace_if(
+    /// logical updates use [`Self::upsert_with_authority`]. Runtime flag
+    /// changes do not make the same record a different completion target.
+    /// Masked, deleted, stale, and foreign states are never modified.
+    #[cfg(test)]
+    fn replace_if(
         &self,
         hash: u64,
         expected: IndexEntry,
         replacement: IndexEntry,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
-        self.replace_if_with_commit(hash, expected, replacement, |_| {})
+        let mut authority = NoopAuthorityV2;
+        self.replace_if_with_authority(hash, expected, replacement, &mut authority)
     }
 
-    /// Relocates one exact record and reports its committed physical
-    /// transition before releasing the shard write lock.
-    pub(crate) fn replace_if_with_commit(
+    /// Relocates one exact record under one stable Region authority.
+    pub(crate) fn replace_if_with_authority(
         &self,
         hash: u64,
         expected: IndexEntry,
         replacement: IndexEntry,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         if replacement.seqno == 0
             || replacement.seqno != expected.seqno
             || replacement.namespace_id != expected.namespace_id
+            || replacement.location.record_len() != expected.location.record_len()
+            || replacement.location.is_tombstone() != expected.location.is_tombstone()
+            || !authority.is_visible(replacement)
         {
             return Ok(None);
         }
-        self.replace_exact_value(hash, expected, Some(replacement), on_commit)
+        self.replace_exact_value(hash, expected, Some(replacement), authority)
     }
 
     /// Normalizes only the exact same-hash producer mask to a deleted marker.
-    pub(crate) fn normalize_mask_if(
+    #[cfg(test)]
+    fn normalize_mask_if(
         &self,
         hash: u64,
         seqno: u64,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
-        self.normalize_mask_if_with_commit(hash, seqno, |_| {})
+        let mut authority = NoopAuthorityV2;
+        self.normalize_mask_if_with_authority(hash, seqno, &mut authority)
     }
 
-    /// Normalizes one exact producer mask and reports its committed physical
-    /// transition before releasing the shard write lock.
-    pub(crate) fn normalize_mask_if_with_commit(
+    /// Normalizes one exact producer mask under one stable Region authority.
+    pub(crate) fn normalize_mask_if_with_authority(
         &self,
         hash: u64,
         seqno: u64,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -439,7 +484,7 @@ impl RegionIndexV2 {
         let installed = IndexSlotStateV1::Deleted;
         let old = shard.replace(local_slot, installed)?;
         let transition = transition(first_slot, local_slot, old, installed);
-        on_commit(transition);
+        authority.commit(transition);
         drop(shard);
         Ok(Some(transition))
     }
@@ -449,7 +494,7 @@ impl RegionIndexV2 {
         hash: u64,
         expected: IndexEntry,
         replacement: Option<IndexEntry>,
-        on_commit: impl FnOnce(IndexTransitionV2),
+        authority: &mut impl IndexMutationAuthorityV2,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -473,7 +518,9 @@ impl RegionIndexV2 {
                     entry,
                 } => {
                     if current_hash == hash {
-                        if entry.same_record_identity(expected) {
+                        if entry.same_record_identity(expected)
+                            && (replacement.is_none() || authority.is_visible(entry))
+                        {
                             target = Some(local_slot);
                         }
                         break;
@@ -489,7 +536,7 @@ impl RegionIndexV2 {
         });
         let old = shard.replace(local_slot, installed)?;
         let transition = transition(first_slot, local_slot, old, installed);
-        on_commit(transition);
+        authority.commit(transition);
         drop(shard);
         Ok(Some(transition))
     }
@@ -534,7 +581,6 @@ mod tests {
         CorruptPageReason, INDEX_IMAGE_PAGE_HEADER_SIZE, INDEX_IMAGE_PAGE_SIZE,
         IndexImageBindingV1, IndexPhysicalStats,
     };
-    use std::cell::Cell;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -586,39 +632,55 @@ mod tests {
         RegionIndexV2::from_storage(ShardedIndexStorage::anonymous(slot_count).unwrap())
     }
 
+    #[derive(Default)]
+    struct RecordingAuthority {
+        min_visible_seqno: u64,
+        invisible_region: Option<u32>,
+        live_records: i64,
+        transitions: Vec<IndexTransitionV2>,
+    }
+
+    impl RecordingAuthority {
+        fn charge(&self, state: IndexSlotStateV1) -> i64 {
+            match state {
+                IndexSlotStateV1::Value { entry, .. } if self.is_visible(entry) => 1,
+                _ => 0,
+            }
+        }
+    }
+
+    impl IndexMutationAuthorityV2 for RecordingAuthority {
+        fn is_visible(&self, entry: IndexEntry) -> bool {
+            entry.seqno >= self.min_visible_seqno
+                && self.invisible_region != Some(entry.location.region_id())
+        }
+
+        fn commit(&mut self, transition: IndexTransitionV2) {
+            self.live_records +=
+                self.charge(transition.installed) - self.charge(transition.previous);
+            self.transitions.push(transition);
+        }
+    }
+
     #[test]
-    fn commit_callback_reports_only_an_applied_transition() {
+    fn authority_commits_only_applied_transitions_using_stable_visibility() {
         let index = anonymous(8);
         let hash = 3;
         let first = entry(1, 8, 10);
-        let calls = Cell::new(0);
-        let reported = Cell::new(None);
+        let mut authority = RecordingAuthority::default();
 
         let outcome = index
-            .upsert_with_commit(
-                hash,
-                first,
-                |_| true,
-                |transition| {
-                    calls.set(calls.get() + 1);
-                    reported.set(Some(transition));
-                },
-            )
+            .upsert_with_authority(hash, first, &mut authority)
             .unwrap();
         let IndexUpsertV2::Applied { transition, .. } = outcome else {
             panic!("upsert must commit");
         };
-        assert_eq!(calls.get(), 1);
-        assert_eq!(reported.get(), Some(transition));
+        assert_eq!(authority.transitions, [transition]);
+        assert_eq!(authority.live_records, 1);
 
         assert_eq!(
             index
-                .upsert_with_commit(
-                    hash,
-                    entry(2, 16, 9),
-                    |_| true,
-                    |_| { panic!("ignored upsert must not report a commit") }
-                )
+                .upsert_with_authority(hash, entry(2, 16, 9), &mut authority)
                 .unwrap(),
             IndexUpsertV2::Ignored {
                 current: Some(first)
@@ -626,13 +688,69 @@ mod tests {
         );
         assert_eq!(
             index
-                .remove_if_with_commit(hash, entry(2, 16, 9), |_| {
-                    panic!("mismatched removal must not report a commit")
-                })
+                .remove_if_with_authority(hash, entry(2, 16, 9), &mut authority)
                 .unwrap(),
             None
         );
-        assert_eq!(calls.get(), 1);
+        assert_eq!(authority.transitions.len(), 1);
+        assert_eq!(authority.live_records, 1);
+
+        // Advancing the authority floor invalidates the old physical value in
+        // O(1). Replacing it must add the new visible record without charging
+        // a subtraction for the now-invisible predecessor.
+        authority.min_visible_seqno = 11;
+        authority.live_records = 0;
+        let second = entry(2, 16, 11);
+        assert!(matches!(
+            index
+                .upsert_with_authority(hash, second, &mut authority)
+                .unwrap(),
+            IndexUpsertV2::Applied { previous: None, .. }
+        ));
+        assert_eq!(authority.transitions.len(), 2);
+        assert_eq!(authority.live_records, 1);
+
+        assert!(matches!(
+            index
+                .mask_if_newer_with_authority(hash, 12, &mut authority)
+                .unwrap(),
+            IndexMaskV2::Applied { previous: Some(entry), .. } if entry == second
+        ));
+        assert_eq!(authority.transitions.len(), 3);
+        assert_eq!(authority.live_records, 0);
+    }
+
+    #[test]
+    fn relocation_requires_both_record_locations_to_remain_visible() {
+        let index = anonymous(8);
+        let hash = 3;
+        let source = entry(1, 4096, 10);
+        let target = entry(2, 8192, 10);
+        let mut authority = RecordingAuthority::default();
+        index
+            .upsert_with_authority(hash, source, &mut authority)
+            .unwrap();
+        authority.transitions.clear();
+
+        authority.invisible_region = Some(source.location.region_id());
+        assert_eq!(
+            index
+                .replace_if_with_authority(hash, source, target, &mut authority)
+                .unwrap(),
+            None
+        );
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookupV2::Hit(source));
+        assert!(authority.transitions.is_empty());
+
+        authority.invisible_region = Some(target.location.region_id());
+        assert_eq!(
+            index
+                .replace_if_with_authority(hash, source, target, &mut authority)
+                .unwrap(),
+            None
+        );
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookupV2::Hit(source));
+        assert!(authority.transitions.is_empty());
     }
 
     #[test]
@@ -797,29 +915,21 @@ mod tests {
         }
         let index = RegionIndexV2::from_storage(storage);
         let before = index.storage().shard_stats().unwrap();
+        let mut authority = RecordingAuthority::default();
 
         assert_eq!(
             index
-                .upsert_with_commit(
-                    1,
-                    entry(1, 8, 20),
-                    |_| true,
-                    |_| { panic!("saturated upsert must not report a commit") }
-                )
+                .upsert_with_authority(1, entry(1, 8, 20), &mut authority)
                 .unwrap(),
             IndexUpsertV2::Saturated
         );
         assert_eq!(
             index
-                .mask_if_newer_with_commit(
-                    1,
-                    20,
-                    |_| true,
-                    |_| { panic!("saturated mask must not report a commit") }
-                )
+                .mask_if_newer_with_authority(1, 20, &mut authority)
                 .unwrap(),
             IndexMaskV2::Saturated
         );
+        assert!(authority.transitions.is_empty());
         assert_eq!(index.storage().shard_stats().unwrap(), before);
         let shard = index.storage().read_hash_shard(0);
         for slot in 0..shard.slot_count() {
@@ -952,19 +1062,16 @@ mod tests {
                 .unwrap();
         let index = RegionIndexV2::from_storage(recovered);
         let before = index.storage().shard_stats().unwrap();
+        let mut authority = RecordingAuthority::default();
 
         assert!(matches!(
-            index.upsert_with_commit(
-                HASH,
-                entry(3, 24, 20),
-                |_| true,
-                |_| { panic!("failed replace must not report a commit") }
-            ),
+            index.upsert_with_authority(HASH, entry(3, 24, 20), &mut authority),
             Err(IndexStorageError::CorruptPage {
                 page_index: 1,
                 reason: CorruptPageReason::ChecksumMismatch { .. },
             })
         ));
+        assert!(authority.transitions.is_empty());
         assert_eq!(index.storage().shard_stats().unwrap(), before);
     }
 

@@ -5,8 +5,11 @@
 //! canonical shard records from the index owner and derives every Region,
 //! queue, and root accounting field from live manager state.
 
-use crate::index::IndexEntry;
-use crate::recovery_v2::{CacheEpochV2, PersistentId};
+use crate::format::{RegionHeader, RegionState};
+use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
+use crate::index_storage::IndexSlotStateV1;
+use crate::index_v2::IndexTransitionV2;
+use crate::recovery_v2::{CacheEpochV2, PersistentId, RECORD_ALIGNMENT_V2, REGION_HEADER_SIZE_V2};
 use crate::region_metadata_v1::{
     RegionMetadataRecordV1, RegionMetadataRootV1, RegionMetadataStateV1, RegionMetadataV1,
     RegionMetadataV1Error, ShardMetadataRecordV1,
@@ -46,11 +49,122 @@ impl RegionLogicalAccountingV2 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionLogicalChargeV2 {
+    region_index: usize,
+    record_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RegionWriteBudgetV2 {
     /// Zero means that no persisted write-budget window is active.
     pub(crate) window: u64,
     pub(crate) used_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegionMutationErrorV2 {
+    InvalidLane,
+    InvalidRecordLength,
+    WouldBlock,
+    RegionFull,
+    StaleReceipt,
+    SequenceExhausted,
+    IncarnationExhausted,
+    ArithmeticOverflow,
+    Invariant(&'static str),
+}
+
+/// Exclusive tail reservation owned by one append lane until its encoded
+/// bytes have either entered staging or been cancelled. Device completion is
+/// deliberately represented by [`RegionWriteSpanV2`], not by this per-record
+/// receipt, so one lane can accumulate many records into a MiB-scale write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionAppendReservationV2 {
+    pub(crate) lane_id: usize,
+    pub(crate) cache_epoch: CacheEpochV2,
+    pub(crate) region_id: u32,
+    pub(crate) region_incarnation: u32,
+    pub(crate) offset: u32,
+    pub(crate) record_bytes: u32,
+    pub(crate) seqno: u64,
+}
+
+impl RegionAppendReservationV2 {
+    fn end_offset(self) -> Option<u64> {
+        u64::from(self.offset).checked_add(u64::from(self.record_bytes))
+    }
+}
+
+/// One ordered staging span. A lane has at most one submitted span while it
+/// continues filling the next resident staging chunk. Completion advances the
+/// durable cursor only when this exact generation and start offset still own
+/// the lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionWriteSpanV2 {
+    pub(crate) lane_id: usize,
+    pub(crate) span_id: u64,
+    pub(crate) cache_epoch: CacheEpochV2,
+    pub(crate) region_id: u32,
+    pub(crate) region_incarnation: u32,
+    pub(crate) start_offset: u64,
+    pub(crate) end_offset: u64,
+    pub(crate) record_count: u64,
+    pub(crate) max_seqno: u64,
+}
+
+/// Headers which must be written outside the manager's short critical
+/// section. Until [`RegionManagerV2::finish_rotation`] accepts this exact
+/// receipt, the lane rejects new reservations and the sealed Region is kept
+/// out of the reclaim FIFO.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionRotationReceiptV2 {
+    pub(crate) lane_id: usize,
+    pub(crate) cache_epoch: CacheEpochV2,
+    pub(crate) sealed: RegionHeader,
+    pub(crate) activated: RegionHeader,
+    pub(crate) reused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenWriteSpanV2 {
+    cache_epoch: CacheEpochV2,
+    region_id: u32,
+    region_incarnation: u32,
+    start_offset: u64,
+    end_offset: u64,
+    record_count: u64,
+    max_seqno: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LaneMutationV2 {
+    tail: Option<RegionAppendReservationV2>,
+    open_span: Option<OpenWriteSpanV2>,
+    submitted_span: Option<RegionWriteSpanV2>,
+    rotation: Option<RegionRotationReceiptV2>,
+    next_span_id: u64,
+}
+
+impl Default for LaneMutationV2 {
+    fn default() -> Self {
+        Self {
+            tail: None,
+            open_span: None,
+            submitted_span: None,
+            rotation: None,
+            next_span_id: 1,
+        }
+    }
+}
+
+impl LaneMutationV2 {
+    const fn is_quiescent(self) -> bool {
+        self.tail.is_none()
+            && self.open_span.is_none()
+            && self.submitted_span.is_none()
+            && self.rotation.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +192,7 @@ pub(crate) struct RegionManagerV2 {
     next_seqno: u64,
     regions: Vec<RegionRuntimeV2>,
     active_regions: Vec<u32>,
+    lane_mutations: Vec<LaneMutationV2>,
     free_regions: VecDeque<u32>,
     sealed_regions: VecDeque<u32>,
     write_budget: RegionWriteBudgetV2,
@@ -105,11 +220,16 @@ impl RegionManagerV2 {
             .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
         let sealed_count = usize::try_from(root.sealed_region_count)
             .map_err(|_| RegionMetadataV1Error::ArithmeticOverflow)?;
+        let sealed_capacity = region_count
+            .checked_sub(active_count)
+            .ok_or(RegionMetadataV1Error::ArithmeticOverflow)?;
 
         let mut regions = try_vec(region_count)?;
         let mut active_regions = try_unassigned_vec(active_count)?;
-        let mut free_regions = try_unassigned_queue(free_count)?;
-        let mut sealed_regions = try_unassigned_queue(sealed_count)?;
+        let mut lane_mutations = try_vec(active_count)?;
+        lane_mutations.resize(active_count, LaneMutationV2::default());
+        let mut free_regions = try_unassigned_queue(free_count, free_count)?;
+        let mut sealed_regions = try_unassigned_queue(sealed_count, sealed_capacity)?;
 
         for encoded in encoded_regions.iter().copied() {
             let runtime = RegionRuntimeV2 {
@@ -165,6 +285,7 @@ impl RegionManagerV2 {
             next_seqno,
             regions,
             active_regions,
+            lane_mutations,
             free_regions,
             sealed_regions,
             write_budget: RegionWriteBudgetV2 {
@@ -214,18 +335,544 @@ impl RegionManagerV2 {
         self.write_budget
     }
 
+    /// Allocates one process-local ordering version. Sequence exhaustion is a
+    /// terminal condition for the current cache identity; `u64::MAX` is never
+    /// issued because clean metadata reserves it as invalid.
+    pub(crate) fn allocate_seqno(&mut self) -> Result<u64, RegionMutationErrorV2> {
+        if self.next_seqno == u64::MAX {
+            return Err(RegionMutationErrorV2::SequenceExhausted);
+        }
+        let allocated = self.next_seqno;
+        self.next_seqno += 1;
+        Ok(allocated)
+    }
+
+    /// Reserves the aligned tail of one lane's Active Region. Only the bytes
+    /// needed to encode this record are exclusive; once staged, the lane may
+    /// reserve the next record without waiting for device completion.
+    pub(crate) fn reserve_append(
+        &mut self,
+        lane_id: usize,
+        record_bytes: u32,
+    ) -> Result<RegionAppendReservationV2, RegionMutationErrorV2> {
+        if record_bytes == 0 || record_bytes % RECORD_ALIGNMENT_V2 != 0 {
+            return Err(RegionMutationErrorV2::InvalidRecordLength);
+        }
+        let lane = self
+            .lane_mutations
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail.is_some() || lane.rotation.is_some() {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+        let region_id = *self
+            .active_regions
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        let region_index =
+            usize::try_from(region_id).map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let region =
+            self.regions
+                .get(region_index)
+                .copied()
+                .ok_or(RegionMutationErrorV2::Invariant(
+                    "active Region id is out of bounds",
+                ))?;
+        if region.state != RegionMetadataStateV1::Active || region.region_id != region_id {
+            return Err(RegionMutationErrorV2::Invariant(
+                "append lane does not own an Active Region",
+            ));
+        }
+        let end = region
+            .reserved_used
+            .checked_add(u64::from(record_bytes))
+            .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?;
+        if end > self.region_size {
+            return Err(RegionMutationErrorV2::RegionFull);
+        }
+        let offset = u32::try_from(region.reserved_used)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let seqno = self.allocate_seqno()?;
+        let receipt = RegionAppendReservationV2 {
+            lane_id,
+            cache_epoch: self.cache_epoch,
+            region_id,
+            region_incarnation: region.incarnation,
+            offset,
+            record_bytes,
+            seqno,
+        };
+        self.regions[region_index].reserved_used = end;
+        self.lane_mutations[lane_id].tail = Some(receipt);
+        Ok(receipt)
+    }
+
+    /// Publishes one fully encoded tail reservation into the resident staging
+    /// span. This is not a durability completion and therefore does not move
+    /// `durable_used` or physical record accounting.
+    pub(crate) fn stage_reservation(
+        &mut self,
+        receipt: RegionAppendReservationV2,
+    ) -> Result<(), RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(receipt.lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        let end = receipt
+            .end_offset()
+            .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?;
+        let next_span = match lane.open_span {
+            Some(span)
+                if span.cache_epoch == receipt.cache_epoch
+                    && span.region_id == receipt.region_id
+                    && span.region_incarnation == receipt.region_incarnation
+                    && span.end_offset == u64::from(receipt.offset) =>
+            {
+                OpenWriteSpanV2 {
+                    end_offset: end,
+                    record_count: span
+                        .record_count
+                        .checked_add(1)
+                        .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?,
+                    max_seqno: span.max_seqno.max(receipt.seqno),
+                    ..span
+                }
+            }
+            None => OpenWriteSpanV2 {
+                cache_epoch: receipt.cache_epoch,
+                region_id: receipt.region_id,
+                region_incarnation: receipt.region_incarnation,
+                start_offset: u64::from(receipt.offset),
+                end_offset: end,
+                record_count: 1,
+                max_seqno: receipt.seqno,
+            },
+            Some(_) => {
+                return Err(RegionMutationErrorV2::Invariant(
+                    "staged reservations are not contiguous",
+                ));
+            }
+        };
+        self.lane_mutations[receipt.lane_id].open_span = Some(next_span);
+        self.lane_mutations[receipt.lane_id].tail = None;
+        Ok(())
+    }
+
+    /// Cancels only the current, not-yet-staged tail. Sequence numbers remain
+    /// consumed, but the reservation cursor is rolled back exactly because no
+    /// later reservation can exist on the same lane.
+    pub(crate) fn cancel_reservation(
+        &mut self,
+        receipt: RegionAppendReservationV2,
+    ) -> Result<(), RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(receipt.lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        let region_index = usize::try_from(receipt.region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let region = self
+            .regions
+            .get(region_index)
+            .ok_or(RegionMutationErrorV2::StaleReceipt)?;
+        if self.active_regions.get(receipt.lane_id) != Some(&receipt.region_id)
+            || region.state != RegionMetadataStateV1::Active
+            || region.incarnation != receipt.region_incarnation
+            || region.reserved_used
+                != receipt
+                    .end_offset()
+                    .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?
+        {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        self.regions[region_index].reserved_used = u64::from(receipt.offset);
+        self.lane_mutations[receipt.lane_id].tail = None;
+        Ok(())
+    }
+
+    /// Seals the lane's accumulated resident records into one ordered device
+    /// span. A second span may be built concurrently in resident staging, but
+    /// only one submitted span per lane is admitted in this first kernel.
+    pub(crate) fn seal_write_span(
+        &mut self,
+        lane_id: usize,
+    ) -> Result<RegionWriteSpanV2, RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail.is_some() || lane.rotation.is_some() || lane.submitted_span.is_some() {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+        let open = lane.open_span.ok_or(RegionMutationErrorV2::Invariant(
+            "append lane has no staged records",
+        ))?;
+        if lane.next_span_id == u64::MAX {
+            return Err(RegionMutationErrorV2::SequenceExhausted);
+        }
+        let receipt = RegionWriteSpanV2 {
+            lane_id,
+            span_id: lane.next_span_id,
+            cache_epoch: open.cache_epoch,
+            region_id: open.region_id,
+            region_incarnation: open.region_incarnation,
+            start_offset: open.start_offset,
+            end_offset: open.end_offset,
+            record_count: open.record_count,
+            max_seqno: open.max_seqno,
+        };
+        let lane = &mut self.lane_mutations[lane_id];
+        lane.next_span_id += 1;
+        lane.open_span = None;
+        lane.submitted_span = Some(receipt);
+        Ok(receipt)
+    }
+
+    /// Advances the durable prefix for one exact, ordered device completion.
+    /// Duplicate, cancelled, wrong-generation, and late completions are
+    /// rejected without touching the current Region incarnation.
+    pub(crate) fn complete_write_span(
+        &mut self,
+        receipt: RegionWriteSpanV2,
+    ) -> Result<(), RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(receipt.lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.submitted_span != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        let region_index = usize::try_from(receipt.region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let region = self
+            .regions
+            .get(region_index)
+            .copied()
+            .ok_or(RegionMutationErrorV2::StaleReceipt)?;
+        if self.active_regions.get(receipt.lane_id) != Some(&receipt.region_id)
+            || region.state != RegionMetadataStateV1::Active
+            || region.incarnation != receipt.region_incarnation
+            || region.durable_used != receipt.start_offset
+            || receipt.end_offset > region.reserved_used
+            || receipt.start_offset >= receipt.end_offset
+            || receipt.record_count == 0
+        {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        let physical_record_count = region
+            .physical_record_count
+            .checked_add(receipt.record_count)
+            .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?;
+        let region = &mut self.regions[region_index];
+        region.durable_used = receipt.end_offset;
+        region.max_seqno = region.max_seqno.max(receipt.max_seqno);
+        region.physical_record_count = physical_record_count;
+        self.lane_mutations[receipt.lane_id].submitted_span = None;
+        Ok(())
+    }
+
+    /// Starts one FIFO rotation without performing I/O. Free Regions are used
+    /// first; once exhausted, the oldest sealed Region generation is reused.
+    /// The outgoing Active Region is withheld from the FIFO until its two
+    /// header writes complete and [`Self::finish_rotation`] is called.
+    pub(crate) fn begin_rotation(
+        &mut self,
+        lane_id: usize,
+    ) -> Result<RegionRotationReceiptV2, RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail.is_some()
+            || lane.open_span.is_some()
+            || lane.submitted_span.is_some()
+            || lane.rotation.is_some()
+        {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+        let old_region_id = *self
+            .active_regions
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        let old_index = usize::try_from(old_region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let old = self
+            .regions
+            .get(old_index)
+            .copied()
+            .ok_or(RegionMutationErrorV2::Invariant(
+                "active Region id is out of bounds",
+            ))?;
+        if old.state != RegionMetadataStateV1::Active || old.reserved_used != old.durable_used {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+
+        let free = self.free_regions.front().copied();
+        let (victim_region_id, reused) = match free {
+            Some(region_id) => (region_id, false),
+            None => (
+                self.sealed_regions
+                    .front()
+                    .copied()
+                    .ok_or(RegionMutationErrorV2::WouldBlock)?,
+                true,
+            ),
+        };
+        let victim_index = usize::try_from(victim_region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let victim =
+            self.regions
+                .get(victim_index)
+                .copied()
+                .ok_or(RegionMutationErrorV2::Invariant(
+                    "rotation victim id is out of bounds",
+                ))?;
+        let expected_victim_state = if reused {
+            RegionMetadataStateV1::Sealed
+        } else {
+            RegionMetadataStateV1::Free
+        };
+        if victim.state != expected_victim_state || victim.region_id == old.region_id {
+            return Err(RegionMutationErrorV2::Invariant(
+                "rotation victim queue is inconsistent",
+            ));
+        }
+        let incarnation = victim
+            .incarnation
+            .checked_add(1)
+            .filter(|incarnation| *incarnation != u32::MAX)
+            .ok_or(RegionMutationErrorV2::IncarnationExhausted)?;
+        let created_seqno = self.allocate_seqno()?;
+        let removed = if reused {
+            self.sealed_regions.pop_front()
+        } else {
+            self.free_regions.pop_front()
+        };
+        if removed != Some(victim_region_id) {
+            return Err(RegionMutationErrorV2::Invariant(
+                "rotation victim changed during selection",
+            ));
+        }
+
+        self.regions[old_index].state = RegionMetadataStateV1::Sealed;
+        self.regions[victim_index] = RegionRuntimeV2 {
+            region_id: victim_region_id,
+            incarnation,
+            state: RegionMetadataStateV1::Active,
+            created_seqno,
+            durable_used: u64::from(REGION_HEADER_SIZE_V2),
+            reserved_used: u64::from(REGION_HEADER_SIZE_V2),
+            max_seqno: 0,
+            physical_record_count: 0,
+            logical: RegionLogicalAccountingV2::default(),
+        };
+        self.active_regions[lane_id] = victim_region_id;
+        let receipt = RegionRotationReceiptV2 {
+            lane_id,
+            cache_epoch: self.cache_epoch,
+            sealed: RegionHeader {
+                region_id: old.region_id,
+                incarnation: old.incarnation,
+                state: RegionState::Sealed,
+                created_seqno: old.created_seqno,
+                used: old.durable_used,
+            },
+            activated: RegionHeader {
+                region_id: victim_region_id,
+                incarnation,
+                state: RegionState::Active,
+                created_seqno,
+                used: u64::from(REGION_HEADER_SIZE_V2),
+            },
+            reused,
+        };
+        self.lane_mutations[lane_id].rotation = Some(receipt);
+        Ok(receipt)
+    }
+
+    /// Publishes the outgoing Region at the tail of the sealed FIFO
+    /// after the caller has completed both header writes. A repeated or late
+    /// receipt cannot make a Region reachable by the current generation.
+    pub(crate) fn finish_rotation(
+        &mut self,
+        receipt: RegionRotationReceiptV2,
+    ) -> Result<(), RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(receipt.lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.rotation != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        let sealed_index = usize::try_from(receipt.sealed.region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let activated_index = usize::try_from(receipt.activated.region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let sealed = self
+            .regions
+            .get(sealed_index)
+            .ok_or(RegionMutationErrorV2::StaleReceipt)?;
+        let activated = self
+            .regions
+            .get(activated_index)
+            .ok_or(RegionMutationErrorV2::StaleReceipt)?;
+        if self.active_regions.get(receipt.lane_id) != Some(&receipt.activated.region_id)
+            || sealed.state != RegionMetadataStateV1::Sealed
+            || sealed.incarnation != receipt.sealed.incarnation
+            || sealed.created_seqno != receipt.sealed.created_seqno
+            || sealed.durable_used != receipt.sealed.used
+            || activated.state != RegionMetadataStateV1::Active
+            || activated.incarnation != receipt.activated.incarnation
+            || activated.created_seqno != receipt.activated.created_seqno
+        {
+            return Err(RegionMutationErrorV2::StaleReceipt);
+        }
+        if self.sealed_regions.len() == self.sealed_regions.capacity() {
+            return Err(RegionMutationErrorV2::Invariant(
+                "sealed Region queue exceeded its reserved capacity",
+            ));
+        }
+        self.sealed_regions.push_back(receipt.sealed.region_id);
+        self.lane_mutations[receipt.lane_id].rotation = None;
+        Ok(())
+    }
+
     /// Tests the Region generation and global clear fence which make one
-    /// physical index entry logically reachable. Invalid Region ids fail
-    /// closed.
+    /// completed physical index entry logically reachable. Resident-only
+    /// values need a typed staging lookup and are deliberately rejected until
+    /// that read path exists; a plain point lookup may address only the
+    /// Region's durable prefix. Invalid fields fail closed.
     pub(crate) fn is_visible(&self, entry: IndexEntry) -> bool {
-        if entry.seqno < self.clear_floor_seqno {
+        if entry.seqno < self.clear_floor_seqno || entry.flags & INDEX_FLAG_VOLATILE != 0 {
             return false;
         }
         let Ok(region_id) = usize::try_from(entry.location.region_id()) else {
             return false;
         };
+        let offset = u64::from(entry.location.offset());
+        let Some(end) = offset.checked_add(u64::from(entry.location.record_len())) else {
+            return false;
+        };
         self.regions.get(region_id).is_some_and(|region| {
-            region.state != RegionMetadataStateV1::Free && entry.seqno >= region.created_seqno
+            region.state != RegionMetadataStateV1::Free
+                && entry.seqno >= region.created_seqno
+                && entry.seqno <= region.max_seqno
+                && offset >= u64::from(REGION_HEADER_SIZE_V2)
+                && offset % u64::from(RECORD_ALIGNMENT_V2) == 0
+                && end <= region.durable_used
+        })
+    }
+
+    /// Applies one exact index mutation to per-Region logical accounting.
+    ///
+    /// The caller must keep this manager authority stable for the complete
+    /// index probe and invoke this method from the index commit callback. Both
+    /// affected Regions are checked before either is changed, so an invariant
+    /// or arithmetic failure cannot leave a partial cross-Region transfer.
+    pub(crate) fn apply_index_transition(
+        &mut self,
+        transition: IndexTransitionV2,
+    ) -> Result<(), RegionMutationErrorV2> {
+        let previous = self.logical_charge(transition.previous);
+        let installed = self.logical_charge(transition.installed);
+
+        let mut updates = [None, None];
+        match (previous, installed) {
+            (None, None) => return Ok(()),
+            (Some(previous), Some(installed))
+                if previous.region_index == installed.region_index =>
+            {
+                updates[0] = Some((
+                    previous.region_index,
+                    self.checked_logical_update(
+                        previous.region_index,
+                        Some(previous),
+                        Some(installed),
+                    )?,
+                ));
+            }
+            (Some(previous), Some(installed)) => {
+                let previous_update =
+                    self.checked_logical_update(previous.region_index, Some(previous), None)?;
+                let installed_update =
+                    self.checked_logical_update(installed.region_index, None, Some(installed))?;
+                updates[0] = Some((previous.region_index, previous_update));
+                updates[1] = Some((installed.region_index, installed_update));
+            }
+            (Some(previous), None) => {
+                updates[0] = Some((
+                    previous.region_index,
+                    self.checked_logical_update(previous.region_index, Some(previous), None)?,
+                ));
+            }
+            (None, Some(installed)) => {
+                updates[0] = Some((
+                    installed.region_index,
+                    self.checked_logical_update(installed.region_index, None, Some(installed))?,
+                ));
+            }
+        }
+
+        for (region_index, logical) in updates.into_iter().flatten() {
+            self.regions[region_index].logical = logical;
+        }
+        Ok(())
+    }
+
+    fn logical_charge(&self, state: IndexSlotStateV1) -> Option<RegionLogicalChargeV2> {
+        let IndexSlotStateV1::Value { entry, .. } = state else {
+            return None;
+        };
+        if entry.location.is_tombstone() || !self.is_visible(entry) {
+            return None;
+        }
+        Some(RegionLogicalChargeV2 {
+            region_index: entry.location.region_id() as usize,
+            record_bytes: u64::from(entry.location.record_len()),
+        })
+    }
+
+    fn checked_logical_update(
+        &self,
+        region_index: usize,
+        previous: Option<RegionLogicalChargeV2>,
+        installed: Option<RegionLogicalChargeV2>,
+    ) -> Result<RegionLogicalAccountingV2, RegionMutationErrorV2> {
+        let current = self
+            .regions
+            .get(region_index)
+            .ok_or(RegionMutationErrorV2::Invariant(
+                "visible index entry has an invalid Region id",
+            ))?
+            .logical;
+        let removed_count = u64::from(previous.is_some());
+        let removed_bytes = previous.map_or(0, |charge| charge.record_bytes);
+        let added_count = u64::from(installed.is_some());
+        let added_bytes = installed.map_or(0, |charge| charge.record_bytes);
+
+        Ok(RegionLogicalAccountingV2 {
+            live_record_count: current
+                .live_record_count
+                .checked_sub(removed_count)
+                .ok_or(RegionMutationErrorV2::Invariant(
+                    "logical record count underflow",
+                ))?
+                .checked_add(added_count)
+                .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?,
+            live_record_bytes: current
+                .live_record_bytes
+                .checked_sub(removed_bytes)
+                .ok_or(RegionMutationErrorV2::Invariant(
+                    "logical record bytes underflow",
+                ))?
+                .checked_add(added_bytes)
+                .ok_or(RegionMutationErrorV2::ArithmeticOverflow)?,
         })
     }
 
@@ -246,6 +893,9 @@ impl RegionManagerV2 {
         &self,
         shards: Box<[ShardMetadataRecordV1]>,
     ) -> Result<RegionMetadataV1, RegionMetadataV1Error> {
+        if self.lane_mutations.iter().any(|lane| !lane.is_quiescent()) {
+            return Err(RegionMetadataV1Error::InvalidField("live_region_authority"));
+        }
         let shard_totals = ShardTotalsV2::from_records(&shards)?;
         let queue_ordinals = self.freeze_queue_ordinals()?;
         let mut records = try_vec(self.regions.len())?;
@@ -461,10 +1111,13 @@ fn try_unassigned_vec(count: usize) -> Result<Vec<u32>, RegionMetadataV1Error> {
     Ok(values)
 }
 
-fn try_unassigned_queue(count: usize) -> Result<VecDeque<u32>, RegionMetadataV1Error> {
+fn try_unassigned_queue(
+    count: usize,
+    capacity: usize,
+) -> Result<VecDeque<u32>, RegionMetadataV1Error> {
     let mut values = VecDeque::new();
     values
-        .try_reserve_exact(count)
+        .try_reserve_exact(capacity)
         .map_err(|_| RegionMetadataV1Error::Allocation)?;
     values.resize(count, UNASSIGNED_REGION);
     Ok(values)
@@ -565,6 +1218,68 @@ mod tests {
         }
     }
 
+    fn sample_without_free_regions() -> RegionMetadataV1 {
+        let mut metadata = sample();
+        metadata.root.free_region_count = 0;
+        metadata.root.sealed_region_count = 4;
+
+        metadata.regions[4].created_seqno = 3;
+        metadata.regions[4].queue_ordinal = 0;
+
+        metadata.regions[1].state = RegionMetadataStateV1::Sealed;
+        metadata.regions[1].created_seqno = 4;
+        metadata.regions[1].queue_ordinal = 1;
+
+        metadata.regions[5].state = RegionMetadataStateV1::Sealed;
+        metadata.regions[5].created_seqno = 6;
+        metadata.regions[5].queue_ordinal = 2;
+
+        metadata.regions[2].queue_ordinal = 3;
+        metadata.validate().unwrap();
+        metadata
+    }
+
+    fn value_slot(
+        hash: u64,
+        region_id: u32,
+        seqno: u64,
+        record_bytes: u32,
+        tombstone: bool,
+    ) -> IndexSlotStateV1 {
+        IndexSlotStateV1::Value {
+            hash,
+            entry: IndexEntry {
+                location: PackedLocation::new(region_id, 4096, record_bytes, tombstone).unwrap(),
+                seqno,
+                namespace_id: 0,
+                flags: 0,
+            },
+        }
+    }
+
+    fn index_transition(
+        previous: IndexSlotStateV1,
+        installed: IndexSlotStateV1,
+    ) -> IndexTransitionV2 {
+        IndexTransitionV2 {
+            global_slot: 17,
+            previous,
+            installed,
+        }
+    }
+
+    fn append_completed(
+        manager: &mut RegionManagerV2,
+        lane_id: usize,
+        record_bytes: u32,
+    ) -> RegionAppendReservationV2 {
+        let reservation = manager.reserve_append(lane_id, record_bytes).unwrap();
+        manager.stage_reservation(reservation).unwrap();
+        let span = manager.seal_write_span(lane_id).unwrap();
+        manager.complete_write_span(span).unwrap();
+        reservation
+    }
+
     #[test]
     fn restores_non_id_queue_and_lane_order() {
         let manager = RegionManagerV2::from_metadata(sample()).unwrap();
@@ -613,17 +1328,135 @@ mod tests {
     #[test]
     fn visibility_applies_clear_floor_region_generation_and_bounds() {
         let manager = RegionManagerV2::from_metadata(sample()).unwrap();
-        let entry = |region_id, seqno| IndexEntry {
-            location: PackedLocation::new(region_id, 4096, 32, false).unwrap(),
+        let entry = |region_id, offset, seqno, flags| IndexEntry {
+            location: PackedLocation::new(region_id, offset, 32, false).unwrap(),
             seqno,
             namespace_id: 0,
-            flags: 0,
+            flags,
         };
-        assert!(manager.is_visible(entry(4, 4)));
-        assert!(!manager.is_visible(entry(4, 3)));
-        assert!(!manager.is_visible(entry(1, 7)));
-        assert!(!manager.is_visible(entry(3, 1)));
-        assert!(!manager.is_visible(entry(99, 7)));
+        assert!(manager.is_visible(entry(4, 4096, 4, 0)));
+        assert!(!manager.is_visible(entry(4, 4096, 3, 0)));
+        assert!(!manager.is_visible(entry(4, 4096, 6, 0)));
+        assert!(!manager.is_visible(entry(4, 4088, 4, 0)));
+        assert!(!manager.is_visible(entry(4, 4104, 4, 0)));
+        assert!(!manager.is_visible(entry(4, 4224, 4, 0)));
+        assert!(!manager.is_visible(entry(4, 4096, 4, INDEX_FLAG_VOLATILE)));
+        assert!(!manager.is_visible(entry(1, 4096, 7, 0)));
+        assert!(!manager.is_visible(entry(3, 4096, 1, 0)));
+        assert!(!manager.is_visible(entry(99, 4096, 7, 0)));
+    }
+
+    #[test]
+    fn index_transitions_move_and_remove_exact_live_record_charges() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let appended = append_completed(&mut manager, 0, 96);
+        assert_eq!((appended.region_id, appended.seqno), (3, 8));
+        let old = value_slot(7, 4, 4, 64, false);
+        let new = value_slot(7, 3, 8, 96, false);
+
+        manager
+            .apply_index_transition(index_transition(old, new))
+            .unwrap();
+        assert_eq!(
+            manager.regions[4].logical,
+            RegionLogicalAccountingV2::default()
+        );
+        assert_eq!(
+            manager.regions[3].logical,
+            RegionLogicalAccountingV2 {
+                live_record_count: 1,
+                live_record_bytes: 96,
+            }
+        );
+
+        manager
+            .apply_index_transition(index_transition(
+                new,
+                IndexSlotStateV1::Masked { hash: 7, seqno: 9 },
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.regions[3].logical,
+            RegionLogicalAccountingV2::default()
+        );
+
+        manager
+            .apply_index_transition(index_transition(IndexSlotStateV1::Deleted, new))
+            .unwrap();
+        manager
+            .apply_index_transition(index_transition(new, IndexSlotStateV1::Deleted))
+            .unwrap();
+        assert_eq!(
+            manager.regions[3].logical,
+            RegionLogicalAccountingV2::default()
+        );
+    }
+
+    #[test]
+    fn invisible_and_tombstone_values_do_not_change_logical_accounting() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let appended = append_completed(&mut manager, 0, 32);
+        assert_eq!((appended.region_id, appended.seqno), (3, 8));
+        let before = manager.regions[4].logical;
+        let stale = value_slot(7, 4, 3, 64, false);
+        let installed = value_slot(7, 3, 8, 32, false);
+
+        manager
+            .apply_index_transition(index_transition(stale, installed))
+            .unwrap();
+        assert_eq!(manager.regions[4].logical, before);
+        assert_eq!(
+            manager.regions[3].logical,
+            RegionLogicalAccountingV2 {
+                live_record_count: 1,
+                live_record_bytes: 32,
+            }
+        );
+
+        let tombstone = value_slot(11, 2, 7, 64, true);
+        let all_before = manager.regions.clone();
+        manager
+            .apply_index_transition(index_transition(IndexSlotStateV1::Deleted, tombstone))
+            .unwrap();
+        manager
+            .apply_index_transition(index_transition(tombstone, IndexSlotStateV1::Deleted))
+            .unwrap();
+        assert_eq!(manager.regions, all_before);
+    }
+
+    #[test]
+    fn failed_logical_transition_never_partially_updates_either_region() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let appended = append_completed(&mut manager, 0, 32);
+        assert_eq!((appended.region_id, appended.seqno), (3, 8));
+        let old = value_slot(7, 3, 8, 32, false);
+        let installed = value_slot(7, 4, 4, 32, false);
+
+        assert_eq!(
+            manager.apply_index_transition(index_transition(old, IndexSlotStateV1::Deleted,)),
+            Err(RegionMutationErrorV2::Invariant(
+                "logical record count underflow"
+            ))
+        );
+        assert_eq!(
+            manager.regions[3].logical,
+            RegionLogicalAccountingV2::default()
+        );
+
+        manager.regions[3].logical = RegionLogicalAccountingV2 {
+            live_record_count: 1,
+            live_record_bytes: 32,
+        };
+        manager.regions[4].logical = RegionLogicalAccountingV2 {
+            live_record_count: u64::MAX,
+            live_record_bytes: u64::MAX,
+        };
+        let before = manager.regions.clone();
+        assert_eq!(
+            manager.apply_index_transition(index_transition(old, installed)),
+            Err(RegionMutationErrorV2::ArithmeticOverflow)
+        );
+        assert_eq!(manager.regions, before);
     }
 
     #[test]
@@ -646,6 +1479,221 @@ mod tests {
         assert_eq!(
             manager.freeze_metadata(shards).unwrap_err(),
             RegionMetadataV1Error::ArithmeticOverflow
+        );
+    }
+
+    #[test]
+    fn tail_reservation_is_exclusive_until_staged_or_cancelled() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        assert_eq!(
+            manager.reserve_append(0, 0),
+            Err(RegionMutationErrorV2::InvalidRecordLength)
+        );
+        assert_eq!(
+            manager.reserve_append(0, RECORD_ALIGNMENT_V2 + 1),
+            Err(RegionMutationErrorV2::InvalidRecordLength)
+        );
+        assert_eq!(
+            manager.reserve_append(99, 64),
+            Err(RegionMutationErrorV2::InvalidLane)
+        );
+
+        let reservation = manager.reserve_append(0, 64).unwrap();
+        assert_eq!(
+            reservation,
+            RegionAppendReservationV2 {
+                lane_id: 0,
+                cache_epoch: 3,
+                region_id: 3,
+                region_incarnation: 1,
+                offset: REGION_HEADER_SIZE_V2,
+                record_bytes: 64,
+                seqno: 8,
+            }
+        );
+        assert_eq!(
+            manager.reserve_append(0, 64),
+            Err(RegionMutationErrorV2::WouldBlock)
+        );
+        assert_eq!(manager.regions[3].durable_used, 4096);
+        assert_eq!(manager.regions[3].reserved_used, 4160);
+
+        let mut stale = reservation;
+        stale.seqno += 1;
+        assert_eq!(
+            manager.cancel_reservation(stale),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+        manager.cancel_reservation(reservation).unwrap();
+        assert_eq!(manager.regions[3].reserved_used, 4096);
+        assert_eq!(
+            manager.cancel_reservation(reservation),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+        assert_eq!(manager.next_seqno(), 9);
+    }
+
+    #[test]
+    fn many_records_share_ordered_spans_without_waiting_per_record() {
+        let metadata = sample();
+        let shards = metadata.shards.clone();
+        let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
+
+        let first = manager.reserve_append(0, 64).unwrap();
+        manager.stage_reservation(first).unwrap();
+        let second = manager.reserve_append(0, 128).unwrap();
+        manager.stage_reservation(second).unwrap();
+        let submitted = manager.seal_write_span(0).unwrap();
+        assert_eq!(submitted.start_offset, 4096);
+        assert_eq!(submitted.end_offset, 4288);
+        assert_eq!(submitted.record_count, 2);
+        assert_eq!(submitted.max_seqno, second.seqno);
+        assert_eq!(manager.regions[3].durable_used, 4096);
+
+        // The next staging chunk is filled while the first span is in flight.
+        let third = manager.reserve_append(0, 64).unwrap();
+        assert_eq!(third.offset, 4288);
+        manager.stage_reservation(third).unwrap();
+        assert_eq!(
+            manager.seal_write_span(0),
+            Err(RegionMutationErrorV2::WouldBlock)
+        );
+        assert_eq!(
+            manager.freeze_metadata(shards.clone()),
+            Err(RegionMetadataV1Error::InvalidField("live_region_authority"))
+        );
+
+        manager.complete_write_span(submitted).unwrap();
+        assert_eq!(manager.regions[3].durable_used, 4288);
+        assert_eq!(manager.regions[3].physical_record_count, 2);
+        assert_eq!(manager.regions[3].max_seqno, second.seqno);
+        assert_eq!(
+            manager.complete_write_span(submitted),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+
+        let next = manager.seal_write_span(0).unwrap();
+        assert_eq!(next.start_offset, 4288);
+        assert_eq!(next.end_offset, 4352);
+        assert_eq!(next.record_count, 1);
+        manager.complete_write_span(next).unwrap();
+        assert_eq!(manager.regions[3].durable_used, 4352);
+        assert_eq!(manager.regions[3].reserved_used, 4352);
+        assert_eq!(manager.regions[3].physical_record_count, 3);
+        manager.freeze_metadata(shards).unwrap();
+    }
+
+    #[test]
+    fn rotation_prefers_free_and_withholds_old_active_until_headers_finish() {
+        let metadata = sample();
+        let shards = metadata.shards.clone();
+        let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
+
+        let rotation = manager.begin_rotation(0).unwrap();
+        assert!(!rotation.reused);
+        assert_eq!(rotation.sealed.region_id, 3);
+        assert_eq!(rotation.activated.region_id, 5);
+        assert_eq!(rotation.activated.incarnation, 8);
+        assert_eq!(rotation.activated.created_seqno, 8);
+        assert_eq!(manager.active_regions(), &[5, 0]);
+        assert_eq!(
+            manager.free_regions().iter().copied().collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
+            [4, 2]
+        );
+        assert_eq!(
+            manager.reserve_append(0, 64),
+            Err(RegionMutationErrorV2::WouldBlock)
+        );
+        assert_eq!(
+            manager.freeze_metadata(shards.clone()),
+            Err(RegionMetadataV1Error::InvalidField("live_region_authority"))
+        );
+
+        manager.finish_rotation(rotation).unwrap();
+        assert_eq!(
+            manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
+            [4, 2, 3]
+        );
+        assert_eq!(
+            manager.finish_rotation(rotation),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+        manager.freeze_metadata(shards).unwrap();
+    }
+
+    #[test]
+    fn fifo_reuse_bumps_generation_and_clears_live_accounting_in_constant_time() {
+        let metadata = sample_without_free_regions();
+        let shards = metadata.shards.clone();
+        let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
+        assert_eq!(manager.logical_accounting().unwrap().live_record_count, 1);
+
+        let rotation = manager.begin_rotation(0).unwrap();
+        assert!(rotation.reused);
+        assert_eq!(rotation.activated.region_id, 4);
+        assert_eq!(rotation.activated.incarnation, 9);
+        assert_eq!(rotation.activated.created_seqno, 8);
+        assert_eq!(manager.regions[4].physical_record_count, 0);
+        assert_eq!(
+            manager.regions[4].logical,
+            RegionLogicalAccountingV2::default()
+        );
+        assert_eq!(manager.logical_accounting().unwrap().live_record_count, 0);
+
+        manager.finish_rotation(rotation).unwrap();
+        assert_eq!(
+            manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
+            [1, 5, 2, 3]
+        );
+        let frozen = manager.freeze_metadata(shards).unwrap();
+        assert_eq!(frozen.root.live_record_count, 0);
+        assert_eq!(frozen.root.live_record_bytes, 0);
+    }
+
+    #[test]
+    fn incomplete_or_late_span_cannot_cross_a_region_generation() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let reservation = manager.reserve_append(0, 64).unwrap();
+        manager.stage_reservation(reservation).unwrap();
+        let span = manager.seal_write_span(0).unwrap();
+        assert_eq!(
+            manager.begin_rotation(0),
+            Err(RegionMutationErrorV2::WouldBlock)
+        );
+        manager.complete_write_span(span).unwrap();
+
+        let rotation = manager.begin_rotation(0).unwrap();
+        manager.finish_rotation(rotation).unwrap();
+        let activated = manager.regions[rotation.activated.region_id as usize];
+        assert_eq!(
+            manager.complete_write_span(span),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+        assert_eq!(
+            manager.regions[rotation.activated.region_id as usize],
+            activated
+        );
+    }
+
+    #[test]
+    fn incarnation_exhaustion_does_not_consume_fifo_or_seqno() {
+        let mut metadata = sample();
+        metadata.regions[5].incarnation = u32::MAX - 1;
+        let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
+        let next_seqno = manager.next_seqno();
+        assert_eq!(
+            manager.begin_rotation(0),
+            Err(RegionMutationErrorV2::IncarnationExhausted)
+        );
+        assert_eq!(manager.next_seqno(), next_seqno);
+        assert_eq!(manager.active_regions(), &[3, 0]);
+        assert_eq!(
+            manager.free_regions().iter().copied().collect::<Vec<_>>(),
+            [5, 1]
         );
     }
 }

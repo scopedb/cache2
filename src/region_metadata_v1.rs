@@ -580,7 +580,6 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
     let mut free_seen = zeroed_bytes(root.free_region_count as usize)?;
     let mut active_seen = zeroed_bytes(root.active_region_count as usize)?;
     let mut sealed_seen = zeroed_bytes(root.sealed_region_count as usize)?;
-    let mut sealed_created = zeroed_u64(root.sealed_region_count as usize)?;
     let mut totals = RegionTotals::default();
 
     for (expected_id, region) in regions.iter().copied().enumerate() {
@@ -602,10 +601,6 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
         {
             return Err(RegionMetadataV1Error::InvalidField("region_queue_ordinal"));
         }
-        if region.state == RegionMetadataStateV1::Sealed {
-            sealed_created[region.queue_ordinal as usize] = region.created_seqno;
-        }
-
         if region.state == RegionMetadataStateV1::Free {
             if region.created_seqno != 0
                 || region.durable_used_offset != RECOVERY_PAGE_SIZE as u64
@@ -648,9 +643,6 @@ fn validate_regions(root: RegionMetadataRootV1, regions: &[RegionMetadataRecordV
         return Err(RegionMetadataV1Error::InvalidField(
             "region_queue_permutation",
         ));
-    }
-    if sealed_created.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(RegionMetadataV1Error::InvalidField("sealed_fifo_order"));
     }
     if totals.live_record_count != root.live_record_count
         || totals.live_record_bytes != root.live_record_bytes
@@ -757,15 +749,6 @@ fn checked_sum3(first: u64, second: u64, third: u64) -> Result<u64> {
 }
 
 fn zeroed_bytes(len: usize) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(len)
-        .map_err(|_| RegionMetadataV1Error::Allocation)?;
-    output.resize(len, 0);
-    Ok(output)
-}
-
-fn zeroed_u64(len: usize) -> Result<Vec<u64>> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(len)
@@ -1590,6 +1573,18 @@ mod tests {
             RegionMetadataV1::decode_owned(encoded),
             Err(RegionMetadataV1Error::InvalidField("region_queue_ordinal"))
         );
+    }
+
+    #[test]
+    fn sealed_fifo_order_is_defined_only_by_queue_ordinal() {
+        let mut metadata = sample();
+        metadata.regions[1].created_seqno = 3;
+        metadata.regions[2].created_seqno = 2;
+        metadata.validate().unwrap();
+        let decoded = RegionMetadataV1::decode(&metadata.encode().unwrap()).unwrap();
+        assert_eq!(decoded.regions[1].queue_ordinal, 0);
+        assert_eq!(decoded.regions[2].queue_ordinal, 1);
+        assert!(decoded.regions[1].created_seqno > decoded.regions[2].created_seqno);
     }
 
     #[test]
