@@ -2407,6 +2407,53 @@ mod uring {
 ))]
 pub(crate) use uring::UringIoEngine;
 
+/// Builds the fastest available native file engine while preserving the
+/// positioned-I/O backend as a behaviorally identical fallback.
+#[cfg(unix)]
+pub(crate) fn build_auto_file_engine(
+    files: RuntimeFileSet,
+    queue_depth: usize,
+) -> io::Result<Arc<dyn IoEngine>> {
+    #[cfg(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        )
+    ))]
+    {
+        let fallback = files.try_clone()?;
+        match UringIoEngine::new_with_files(files, queue_depth) {
+            Ok(engine) => return Ok(Arc::new(engine)),
+            Err(error) if UringIoEngine::is_unavailable_error(&error) => {
+                return BackendIoEngine::new_with_files(fallback, queue_depth)
+                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        )
+    )))]
+    {
+        BackendIoEngine::new_with_files(files, queue_depth)
+            .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+    }
+}
+
 fn update_peak(peak: &AtomicUsize, value: usize) {
     let mut observed = peak.load(Ordering::Relaxed);
     while value > observed {

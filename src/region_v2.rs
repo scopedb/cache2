@@ -14,7 +14,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -34,10 +34,10 @@ use crate::index_v2::{
     RegionIndexV2,
 };
 use crate::io_backend::{
-    ControlIoBackend, DirectIoMode, FileBackend, IoBackend, SyncMode, SyncPoint, WritePoint,
-    read_exact_at, write_all_at,
+    ControlIoBackend, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
+    WritePoint, read_exact_at, write_all_at,
 };
-use crate::io_engine::IoEngine;
+use crate::io_engine::{IoBuffer, IoEngine, IoOperation, OperationKind};
 use crate::record_codec_v2::{
     RecordEncodeErrorV2, encode_value_into, hash_namespaced_key_v2, planned_record_bytes,
 };
@@ -60,6 +60,7 @@ use crate::region_read_v2::{
     RegionReadDirectoryV2, RegionReadErrorV2, RegionReadGuardV2, RegionReadSnapshotV2,
 };
 use crate::region_reader_v2::submit_record_read;
+use crate::region_runtime_v2::{RegionDataPlaneV2, RegionPutV2};
 use crate::region_staging_v2::{
     RegionStagingV2, StageAppendV2, StagedRecordV2, StagedWriteV2, StagingV2EncodeError,
     StagingV2Error,
@@ -76,6 +77,13 @@ use crate::resources::BufferLease;
 pub(crate) struct RegionV2Config {
     pub(crate) index_slots: usize,
 }
+
+/// Fixed production topology for the first V2 runtime.
+///
+/// Lane count is already encoded in the clean Region metadata. Keeping it
+/// fixed here avoids exposing a tuning surface before lane workers and their
+/// resource budget are owned by one production runtime.
+pub(crate) const REGION_V2_APPEND_LANES: u32 = 4;
 
 impl RegionV2Config {
     fn validate(self) -> io::Result<Self> {
@@ -229,15 +237,15 @@ impl RegionV2HealthLatch {
         }
     }
 
-    fn is_healthy(&self) -> bool {
+    pub(crate) fn is_healthy(&self) -> bool {
         self.state.load(Ordering::Acquire) == REGION_V2_HEALTHY
     }
 
-    fn enter_miss_only(&self) {
+    pub(crate) fn enter_miss_only(&self) {
         self.state.store(REGION_V2_MISS_ONLY, Ordering::Release);
     }
 
-    fn require_healthy(&self) -> io::Result<()> {
+    pub(crate) fn require_healthy(&self) -> io::Result<()> {
         self.is_healthy().then_some(()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -357,14 +365,30 @@ impl IndexMutationAuthorityV2 for RegionIndexMutationAuthorityV2<'_> {
     }
 }
 
-pub(crate) struct FileRegionRuntimeV2 {
+pub(crate) struct FileRegionCoreV2 {
     index: RegionIndexV2,
     manager: RegionManagerAuthorityV2,
     append_lanes: Box<[RegionAppendLaneV2]>,
+    rotation: Mutex<()>,
     read_directory: RegionReadDirectoryV2,
     read_epoch: AtomicU32,
     read_clear_floor: AtomicU64,
     health: RegionV2HealthLatch,
+}
+
+/// Unique steady-state owner. Workers share only `core`; runtime resources and
+/// their join handles are attached here after RUNNING is durable.
+pub(crate) struct FileRegionRuntimeV2 {
+    core: Arc<FileRegionCoreV2>,
+    data_plane: Option<RegionDataPlaneV2>,
+}
+
+impl Deref for FileRegionRuntimeV2 {
+    type Target = FileRegionCoreV2;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 /// Short lane-local transaction gates. `mutation` makes manager receipts and
@@ -493,14 +517,106 @@ impl FileRegionRuntimeV2 {
         append_lanes.resize_with(manager.active_regions().len(), RegionAppendLaneV2::default);
         let health = RegionV2HealthLatch::healthy();
         Ok(Self {
-            index: RegionIndexV2::from_storage(index),
-            read_epoch: AtomicU32::new(manager.cache_epoch()),
-            read_clear_floor: AtomicU64::new(manager.clear_floor_seqno()),
-            manager: RegionManagerAuthorityV2::new(manager, health.clone()),
-            append_lanes: append_lanes.into_boxed_slice(),
-            read_directory,
-            health,
+            core: Arc::new(FileRegionCoreV2 {
+                index: RegionIndexV2::from_storage(index),
+                read_epoch: AtomicU32::new(manager.cache_epoch()),
+                read_clear_floor: AtomicU64::new(manager.clear_floor_seqno()),
+                manager: RegionManagerAuthorityV2::new(manager, health.clone()),
+                append_lanes: append_lanes.into_boxed_slice(),
+                rotation: Mutex::new(()),
+                read_directory,
+                health,
+            }),
+            data_plane: None,
         })
+    }
+
+    fn attach_data_plane(
+        &mut self,
+        data: DataSuperblockV2,
+        files: RuntimeFileSet,
+    ) -> io::Result<()> {
+        if self.data_plane.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "V2 data plane is already attached",
+            ));
+        }
+        self.data_plane = Some(RegionDataPlaneV2::new(Arc::clone(&self.core), data, files));
+        Ok(())
+    }
+
+    fn shutdown_data_plane(&mut self) -> io::Result<bool> {
+        self.data_plane
+            .take()
+            .map(|plane| plane.shutdown())
+            .unwrap_or(Ok(false))
+    }
+
+    fn data_plane(&self) -> io::Result<&RegionDataPlaneV2> {
+        self.data_plane.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "V2 backend does not provide a native runtime data path",
+            )
+        })
+    }
+
+    fn into_core(self) -> io::Result<FileRegionCoreV2> {
+        let Self { core, data_plane } = self;
+        if data_plane.is_some() {
+            return Err(io::Error::other(
+                "V2 data plane must stop before freezing its core",
+            ));
+        }
+        Arc::try_unwrap(core).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "V2 runtime still has live data-plane references",
+            )
+        })
+    }
+}
+
+impl FileRegionCoreV2 {
+    pub(crate) const fn append_lane_count(&self) -> usize {
+        self.append_lanes.len()
+    }
+
+    pub(crate) fn runtime_base_memory_bytes(&self) -> io::Result<usize> {
+        let slots = u64::try_from(self.index.storage().slot_count()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V2 index capacity is too large",
+            )
+        })?;
+        let index_bytes = recovery_image_index_len_v1(slots)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 index memory does not fit the platform",
+                )
+            })?;
+        // Manager, read-directory, lane gates, and FIFO nodes are all fixed by
+        // Region count. Charge a conservative constant per Region instead of
+        // exposing allocator-specific layout as a tuning surface.
+        let region_bytes = self
+            .manager
+            .lock()?
+            .regions()
+            .len()
+            .checked_mul(256)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "V2 memory size overflow")
+            })?;
+        index_bytes
+            .checked_add(region_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "V2 memory size overflow"))
+    }
+
+    pub(crate) fn enter_miss_only(&self) {
+        self.health.enter_miss_only();
     }
 
     fn lock_lane_mutation(&self, lane_id: usize) -> io::Result<MutexGuard<'_, ()>> {
@@ -603,8 +719,19 @@ impl FileRegionRuntimeV2 {
     /// Performs one durable value read under a per-Region generation pin.
     /// The aligned envelope buffer is returned as the value owner, avoiding a
     /// second payload copy on the disk-hit path.
+    pub(crate) fn begin_value_read(
+        &self,
+        hash_seed: u64,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<Option<RegionPointReadV2<'_>>> {
+        let hash = hash_namespaced_key_v2(hash_seed, namespace_id, key);
+        let point = self.begin_point_read(hash)?;
+        Ok(point.filter(|point| point.entry.namespace_id == namespace_id))
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn read_value(
+    pub(crate) fn read_value(
         &self,
         engine: &dyn IoEngine,
         geometry: crate::recovery_v2::DataGeometryV2,
@@ -614,13 +741,32 @@ impl FileRegionRuntimeV2 {
         key: &[u8],
         now_unix_ms: u64,
     ) -> io::Result<Option<RegionValueReadV2>> {
-        let hash = hash_namespaced_key_v2(hash_seed, namespace_id, key);
-        let Some(point) = self.begin_point_read(hash)? else {
+        let Some(point) = self.begin_value_read(hash_seed, namespace_id, key)? else {
             return Ok(None);
         };
-        if point.entry.namespace_id != namespace_id {
-            return Ok(None);
-        }
+        self.read_value_from_point(
+            engine,
+            geometry,
+            buffer,
+            point,
+            namespace_id,
+            key,
+            now_unix_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_value_from_point(
+        &self,
+        engine: &dyn IoEngine,
+        geometry: crate::recovery_v2::DataGeometryV2,
+        buffer: BufferLease,
+        point: RegionPointReadV2<'_>,
+        namespace_id: u32,
+        key: &[u8],
+        now_unix_ms: u64,
+    ) -> io::Result<Option<RegionValueReadV2>> {
+        let hash = point.hash;
         let flight = match submit_record_read(engine, geometry, point.entry, buffer) {
             Ok(flight) => flight,
             Err(error) => {
@@ -720,7 +866,7 @@ impl FileRegionRuntimeV2 {
     /// entry. `NeedsFlush` cancels the unused tail receipt exactly, so a lane
     /// worker may submit the prior 4 MiB span before the caller retries.
     #[allow(clippy::too_many_arguments)]
-    fn try_stage_value(
+    pub(crate) fn try_stage_value(
         &self,
         staging: &RegionStagingV2,
         lane_id: usize,
@@ -834,7 +980,7 @@ impl FileRegionRuntimeV2 {
     /// RUNNING recovery is safe-empty, and the only durability barrier is the
     /// later CLEAN data sync. Index entries become visible only after the
     /// exact owned-buffer write completion succeeds.
-    fn flush_staging_lane(
+    pub(crate) fn flush_staging_lane(
         &self,
         staging: &RegionStagingV2,
         engine: &dyn IoEngine,
@@ -1012,6 +1158,96 @@ impl FileRegionRuntimeV2 {
         }))
     }
 
+    /// Rotates one empty append lane through the exact read-drain and header
+    /// completion boundary. The global gate protects the FIFO plan while no
+    /// manager mutex is held waiting for readers of a reused victim.
+    pub(crate) fn rotate_append_lane(
+        &self,
+        engine: &dyn IoEngine,
+        geometry: crate::recovery_v2::DataGeometryV2,
+        lane_id: usize,
+        buffer: BufferLease,
+    ) -> io::Result<()> {
+        self.health.require_healthy()?;
+        if !geometry.is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V2 rotation data geometry is invalid",
+            ));
+        }
+        let _completion_worker = self.lock_lane_completion(lane_id)?;
+        let _lane_mutation = self.lock_lane_mutation(lane_id)?;
+        let _rotation = self.rotation.lock().map_err(|_| {
+            self.health.enter_miss_only();
+            io::Error::new(io::ErrorKind::InvalidData, "V2 rotation gate is poisoned")
+        })?;
+        let plan = self
+            .manager
+            .lock()?
+            .plan_rotation(lane_id)
+            .map_err(region_mutation_io_error)?;
+
+        let mut victim = if plan.reused {
+            Some(
+                self.read_directory
+                    .acquire_rotation_write(
+                        plan.victim_region_id,
+                        plan.cache_epoch,
+                        plan.victim_incarnation,
+                    )
+                    .map_err(region_read_io_error)?,
+            )
+        } else {
+            None
+        };
+
+        let receipt = self
+            .manager
+            .lock()?
+            .begin_rotation(plan)
+            .map_err(region_mutation_io_error)?;
+        if let Some(victim) = victim.as_mut() {
+            victim.mark_unreadable();
+        }
+
+        let buffer =
+            write_region_header_v2(engine, geometry, receipt.sealed, buffer).inspect_err(|_| {
+                self.health.enter_miss_only();
+            })?;
+        let _buffer = write_region_header_v2(engine, geometry, receipt.activated, buffer)
+            .inspect_err(|_| {
+                self.health.enter_miss_only();
+            })?;
+
+        let activated = {
+            let mut manager = self.manager.lock()?;
+            manager.finish_rotation(receipt).map_err(|error| {
+                self.health.enter_miss_only();
+                region_mutation_io_error(error)
+            })?;
+            let region = manager
+                .regions()
+                .get(receipt.activated.region_id as usize)
+                .copied()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "activated V2 Region is outside manager authority",
+                    )
+                })?;
+            region_read_snapshot(&manager, region)
+        };
+        let projection = match victim.as_mut() {
+            Some(victim) => victim.install(activated),
+            None => self.read_directory.install(activated),
+        };
+        if let Err(error) = projection {
+            self.health.enter_miss_only();
+            return Err(region_read_io_error(error));
+        }
+        Ok(())
+    }
+
     /// Publishes one completed batch under a single manager acquisition. This
     /// keeps per-entry lock overhead out of the 4 MiB completion path while
     /// preserving exact index/accounting commits.
@@ -1134,10 +1370,76 @@ impl FileRegionRuntimeV2 {
     }
 }
 
+fn write_region_header_v2(
+    engine: &dyn IoEngine,
+    geometry: crate::recovery_v2::DataGeometryV2,
+    header: RegionHeader,
+    mut buffer: BufferLease,
+) -> io::Result<BufferLease> {
+    if header.region_id >= geometry.region_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "V2 Region header target is outside the data geometry",
+        ));
+    }
+    let bytes = header.encode();
+    buffer
+        .prepare(bytes.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "V2 metadata buffer cannot hold one Region header",
+            )
+        })?
+        .copy_from_slice(&bytes);
+    let buffer = IoBuffer::from_lease(buffer, bytes.len()).map_err(|error| error.error)?;
+    let offset = u64::from(header.region_id)
+        .checked_mul(geometry.region_size)
+        .and_then(|offset| DATA_REGION_AREA_OFFSET_V2.checked_add(offset))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "V2 header offset overflow"))?;
+    let request = engine
+        .submit_wait(IoOperation::write(WritePoint::RegionHeader, buffer, offset))
+        .map_err(|error| error.error)?;
+    let request_id = request.id();
+    let completion = request.wait();
+    let identity_valid = completion.request_id == request_id
+        && completion.kind == OperationKind::Write
+        && completion.bytes_transferred == bytes.len();
+    let (result, buffer) = completion.into_io_result();
+    let completed = result?;
+    if !identity_valid || completed != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "V2 Region header write completed with the wrong identity or length",
+        ));
+    }
+    let buffer = buffer.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V2 Region header completion lost its owned buffer",
+        )
+    })?;
+    if buffer.len() != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V2 Region header completion returned the wrong buffer length",
+        ));
+    }
+    Ok(buffer.into_lease())
+}
+
 pub(crate) trait RegionV2FileSystem {
     type File: ControlIoBackend;
 
     fn open(&self, path: &Path, create: bool) -> io::Result<Self::File>;
+
+    fn open_data(&self, path: &Path, create: bool) -> io::Result<Self::File> {
+        self.open(path, create)
+    }
+
+    fn try_clone_runtime_files(&self, _file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
+        Ok(None)
+    }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File>;
 
@@ -1160,6 +1462,18 @@ impl RegionV2FileSystem for SystemRegionV2FileSystem {
         } else {
             FileBackend::open_existing_with_io_mode(path, DirectIoMode::Buffered)
         }
+    }
+
+    fn open_data(&self, path: &Path, create: bool) -> io::Result<Self::File> {
+        if create {
+            FileBackend::open_with_io_mode(path, DirectIoMode::Auto)
+        } else {
+            FileBackend::open_existing_with_io_mode(path, DirectIoMode::Auto)
+        }
+    }
+
+    fn try_clone_runtime_files(&self, file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
+        file.try_clone_runtime_files().map(Some)
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File> {
@@ -1185,11 +1499,10 @@ impl RegionV2FileSystem for SystemRegionV2FileSystem {
 
 /// Concrete V2 state/index lifecycle backed by one data file and two sidecars.
 ///
-/// This intentionally remains a crate-private recovery vertical slice. It can
-/// persist and recover one complete frozen index + Region/FIFO/accounting view,
-/// but it is not connected to the production Region append/read workers yet.
-/// No index-only CLEAN authority is published, and no legacy checkpoint or
-/// record scan is reachable from this backend.
+/// This remains a crate-private vertical slice while the public Hybrid graph is
+/// migrated. It owns the native four-lane append/read runtime, persists one
+/// complete index + Region/FIFO/accounting view, and never reaches a legacy
+/// checkpoint or record scan.
 pub(crate) struct FileRegionV2Backend<F = SystemRegionV2FileSystem>
 where
     F: RegionV2FileSystem,
@@ -1208,6 +1521,7 @@ where
     cold_reset_needed: bool,
     materialize_active_headers: bool,
     locked: bool,
+    retain_lock: bool,
 }
 
 impl FileRegionV2Backend<SystemRegionV2FileSystem> {
@@ -1237,6 +1551,7 @@ where
             cold_reset_needed: false,
             materialize_active_headers: false,
             locked: false,
+            retain_lock: false,
         }
     }
 
@@ -1272,10 +1587,10 @@ where
                 "RegionStore V2 backend is already locked",
             ));
         }
-        if self.format_data.geometry.region_count < 2 {
+        if self.format_data.geometry.region_count <= REGION_V2_APPEND_LANES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore V2 requires at least two Regions",
+                "RegionStore V2 requires at least five Regions for four append lanes",
             ));
         }
         if self.files.data == self.files.state
@@ -1305,7 +1620,7 @@ where
                 "RegionStore V2 recovery temporary path collides with a cache file",
             ));
         }
-        let data = self.file_system.open(&self.files.data, true)?;
+        let data = self.file_system.open_data(&self.files.data, true)?;
         data.try_lock_exclusive()?;
         let state = match self.file_system.open(&self.files.state, true) {
             Ok(state) => state,
@@ -1487,7 +1802,9 @@ where
             }
             Err(_) => return Ok(RecoveryPlan::Running),
         };
-        if !metadata.matches_image(data, header) {
+        if !metadata.matches_image(data, header)
+            || metadata.root.append_lane_count != REGION_V2_APPEND_LANES
+        {
             return Ok(RecoveryPlan::Running);
         }
         let file = image.try_clone_control_file()?;
@@ -1546,6 +1863,7 @@ where
                 expected_index_len,
             )
         }) && clean.metadata.matches_image(data, clean.header)
+            && clean.metadata.root.append_lane_count == REGION_V2_APPEND_LANES
             && clean.metadata.validate().is_ok();
         if !eligible {
             self.cold_reset_needed = true;
@@ -1584,7 +1902,7 @@ where
         Ok(())
     }
 
-    fn start_runtime(&mut self, runtime: Self::Runtime) -> io::Result<Self::Runtime> {
+    fn start_runtime(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::Runtime> {
         if self.materialize_active_headers {
             let data = self.data_superblock()?;
             let data_file = self.data_file.as_ref().ok_or_else(|| {
@@ -1593,27 +1911,62 @@ where
             materialize_empty_active_region_headers(data_file, data, &runtime.manager)?;
             self.materialize_active_headers = false;
         }
+        let data = self.data_superblock()?;
+        let data_file = self.data_file.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "V2 data file is not open")
+        })?;
+        if let Some(files) = self.file_system.try_clone_runtime_files(data_file)? {
+            runtime.attach_data_plane(data, files)?;
+        }
         Ok(runtime)
     }
 
-    fn stop_fast(&mut self, _runtime: Self::Runtime) -> io::Result<()> {
-        Ok(())
+    fn stop_fast(&mut self, mut runtime: Self::Runtime) -> io::Result<()> {
+        match runtime.shutdown_data_plane() {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                self.retain_lock = true;
+                Err(io::Error::other(
+                    "V2 I/O engine could not fence an issued mutation; lock retained",
+                ))
+            }
+            Err(error) => {
+                runtime.health.enter_miss_only();
+                Err(error)
+            }
+        }
     }
 
-    fn freeze_warm(&mut self, runtime: Self::Runtime) -> io::Result<Self::FrozenView> {
+    fn freeze_warm(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::FrozenView> {
+        match runtime.shutdown_data_plane() {
+            Ok(false) => {}
+            Ok(true) => {
+                self.retain_lock = true;
+                runtime.health.enter_miss_only();
+                return Err(io::Error::other(
+                    "V2 I/O engine could not fence an issued mutation; CLEAN rejected",
+                ));
+            }
+            Err(error) => {
+                runtime.health.enter_miss_only();
+                return Err(error);
+            }
+        }
         runtime.health.require_healthy()?;
-        let FileRegionRuntimeV2 {
+        let FileRegionCoreV2 {
             index,
             manager,
             append_lanes,
+            rotation,
             read_directory,
             read_epoch,
             read_clear_floor,
             health,
-        } = runtime;
+        } = runtime.into_core()?;
         if append_lanes
             .iter()
             .any(|lane| lane.mutation.is_poisoned() || lane.completion.is_poisoned())
+            || rotation.is_poisoned()
         {
             health.enter_miss_only();
             return Err(io::Error::new(
@@ -1840,11 +2193,14 @@ where
             .as_ref()
             .map(IoBackend::unlock)
             .unwrap_or(Ok(()));
-        let data_result = self
-            .data_file
-            .as_ref()
-            .map(IoBackend::unlock)
-            .unwrap_or(Ok(()));
+        let data_result = if self.retain_lock {
+            Ok(())
+        } else {
+            self.data_file
+                .as_ref()
+                .map(IoBackend::unlock)
+                .unwrap_or(Ok(()))
+        };
         self.locked = false;
         self.prepared_clean = None;
         self.materialize_active_headers = false;
@@ -1854,10 +2210,9 @@ where
     }
 }
 
-/// Minimal RegionStore V2 ownership and recovery coordinator.
+/// RegionStore V2 ownership and recovery coordinator.
 ///
-/// The steady-state Region append/read implementation will be attached below
-/// this seam.  The seam already freezes the two important contracts:
+/// The seam freezes the two important contracts:
 ///
 /// - open never calls the legacy `DiskCache::open` or its scan recovery;
 /// - fast close leaves RUNNING, while the generic warm sequence publishes
@@ -1959,6 +2314,42 @@ impl<B: RegionV2Backend> RegionStoreV2<B> {
     }
 }
 
+impl RegionStoreV2<FileRegionV2Backend<SystemRegionV2FileSystem>> {
+    pub(crate) fn put_value_v2(
+        &self,
+        namespace_id: u32,
+        key: &[u8],
+        value: &[u8],
+        expires_at: u64,
+    ) -> io::Result<RegionPutV2> {
+        self.live_file_runtime()?
+            .data_plane()?
+            .put(namespace_id, key, value, expires_at)
+    }
+
+    pub(crate) fn get_value_v2(
+        &self,
+        namespace_id: u32,
+        key: &[u8],
+        now_unix_ms: u64,
+    ) -> io::Result<Option<RegionValueReadV2>> {
+        self.live_file_runtime()?
+            .data_plane()?
+            .get(namespace_id, key, now_unix_ms)
+    }
+
+    pub(crate) fn drain_v2(&self) -> io::Result<()> {
+        self.live_file_runtime()?.data_plane()?.drain()
+    }
+
+    fn live_file_runtime(&self) -> io::Result<&FileRegionRuntimeV2> {
+        if self.closed {
+            return Err(closed_error());
+        }
+        self.runtime.as_ref().ok_or_else(closed_error)
+    }
+}
+
 impl<B: RegionV2Backend> Drop for RegionStoreV2<B> {
     fn drop(&mut self) {
         if !self.closed {
@@ -2029,7 +2420,10 @@ where
     state.sync(SyncPoint::V2StateReset, SyncMode::Data)?;
     file.set_len(0)?;
     file.sync(SyncPoint::FormatTruncate, SyncMode::All)?;
-    file.set_len(format_data.geometry.data_file_len)?;
+    // Establish the complete extent once. Runtime lane writes then remain
+    // positioned and sequential within Regions instead of allocating blocks
+    // on the latency-sensitive path or discovering ENOSPC after admission.
+    file.preallocate(format_data.geometry.data_file_len)?;
     write_all_at(file, WritePoint::Superblock, &encoded, 0)?;
     file.sync(SyncPoint::FormatClean, SyncMode::All)?;
     Ok(())
@@ -2315,6 +2709,12 @@ fn empty_region_metadata(
     data: DataSuperblockV2,
     index_slots: usize,
 ) -> io::Result<RegionMetadataV1> {
+    if data.geometry.region_count <= REGION_V2_APPEND_LANES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RegionStore V2 requires at least five Regions for four append lanes",
+        ));
+    }
     let shard_ranges = canonical_index_shard_ranges(index_slots).map_err(index_storage_io_error)?;
     let index_slots = u64::try_from(index_slots)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "V2 index is too large"))?;
@@ -2331,7 +2731,7 @@ fn empty_region_metadata(
         )
     })?;
     for region_id in 0..data.geometry.region_count {
-        let active = region_id == 0;
+        let active = region_id < REGION_V2_APPEND_LANES;
         regions.push(RegionMetadataRecordV1 {
             region_id,
             incarnation: u32::from(active),
@@ -2340,8 +2740,12 @@ fn empty_region_metadata(
             } else {
                 RegionMetadataStateV1::Free
             },
-            queue_ordinal: if active { 0 } else { region_id - 1 },
-            created_seqno: u64::from(active),
+            queue_ordinal: if active {
+                region_id
+            } else {
+                region_id - REGION_V2_APPEND_LANES
+            },
+            created_seqno: if active { u64::from(region_id) + 1 } else { 0 },
             durable_used_offset: RECOVERY_PAGE_SIZE as u64,
             max_seqno: 0,
             physical_record_count: 0,
@@ -2365,10 +2769,10 @@ fn empty_region_metadata(
             shard_count: u32::try_from(shard_ranges.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "too many V2 index shards")
             })?,
-            append_lane_count: 1,
+            append_lane_count: REGION_V2_APPEND_LANES,
             cache_epoch: 1,
             clear_floor_seqno: 1,
-            max_seqno: 1,
+            max_seqno: u64::from(REGION_V2_APPEND_LANES),
             physical_value_slots: 0,
             physical_deleted_slots: 0,
             physical_masked_slots: 0,
@@ -2376,8 +2780,8 @@ fn empty_region_metadata(
             live_record_bytes: 0,
             write_budget_window: 0,
             write_budget_used_bytes: 0,
-            free_region_count: data.geometry.region_count - 1,
-            active_region_count: 1,
+            free_region_count: data.geometry.region_count - REGION_V2_APPEND_LANES,
+            active_region_count: REGION_V2_APPEND_LANES,
             sealed_region_count: 0,
         },
         regions: regions.into_boxed_slice(),
@@ -2943,16 +3347,20 @@ mod tests {
     }
 
     fn test_data_superblock() -> DataSuperblockV2 {
-        test_data_superblock_with_regions(2)
+        test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1)
     }
 
     fn data_path_superblock() -> DataSuperblockV2 {
         let region_size = 8 * 1024 * 1024;
         DataSuperblockV2 {
             geometry: DataGeometryV2 {
-                data_file_len: DataGeometryV2::expected_file_len(region_size, 2).unwrap(),
+                data_file_len: DataGeometryV2::expected_file_len(
+                    region_size,
+                    REGION_V2_APPEND_LANES + 1,
+                )
+                .unwrap(),
                 region_size,
-                region_count: 2,
+                region_count: REGION_V2_APPEND_LANES + 1,
             },
             ..test_data_superblock()
         }
@@ -2972,6 +3380,166 @@ mod tests {
             write_budget_bytes_per_second: None,
         })
         .unwrap()
+    }
+
+    fn production_data_superblock(region_size: u64) -> DataSuperblockV2 {
+        let region_count = REGION_V2_APPEND_LANES + 1;
+        DataSuperblockV2 {
+            generation: 1,
+            cache_uuid: persistent_id(21),
+            data_identity: persistent_id(22),
+            geometry: DataGeometryV2 {
+                data_file_len: DataGeometryV2::expected_file_len(region_size, region_count)
+                    .unwrap(),
+                region_size,
+                region_count,
+            },
+            hash_seed: 23,
+            config_fingerprint: 24,
+        }
+    }
+
+    fn key_for_lane(data: DataSuperblockV2, namespace_id: u32, lane: u64, ordinal: u64) -> Vec<u8> {
+        for attempt in 0_u64..10_000 {
+            let key = format!("lane-{lane}-object-{ordinal}-{attempt}").into_bytes();
+            if hash_namespaced_key_v2(data.hash_seed, namespace_id, &key)
+                % u64::from(REGION_V2_APPEND_LANES)
+                == lane
+            {
+                return key;
+            }
+        }
+        panic!("could not find a deterministic key for V2 lane {lane}");
+    }
+
+    #[test]
+    fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
+        let directory = TestDirectory::new();
+        let data = production_data_superblock(512 * 1024);
+        let namespace_id = 7;
+        let mut store = RegionStoreV2::open_v2(
+            RegionV2Config { index_slots: 4096 },
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .unwrap();
+
+        let mixed = [16 * 1024, 64 * 1024, 128 * 1024, 256 * 1024];
+        let mut expected = Vec::new();
+        for (ordinal, size) in mixed.into_iter().enumerate() {
+            let key = key_for_lane(data, namespace_id, ordinal as u64, ordinal as u64);
+            let value = vec![(ordinal as u8) + 1; size];
+            assert!(matches!(
+                store.put_value_v2(namespace_id, &key, &value, 0).unwrap(),
+                RegionPutV2::Buffered(_)
+            ));
+            expected.push((key, value));
+        }
+        store.drain_v2().unwrap();
+        for (key, value) in &expected {
+            assert_eq!(
+                store
+                    .get_value_v2(namespace_id, key, u64::MAX)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                value
+            );
+        }
+
+        // A 256 KiB record leaves insufficient room for another same-lane
+        // record in this test geometry. Repeated writes therefore consume the
+        // free Region and then exercise sealed FIFO reuse.
+        let rotation_value = vec![0xa5; 256 * 1024];
+        let mut recent = Vec::new();
+        for ordinal in 0..4 {
+            let key = key_for_lane(data, namespace_id, 0, 100 + ordinal);
+            store
+                .put_value_v2(namespace_id, &key, &rotation_value, 0)
+                .unwrap();
+            store.drain_v2().unwrap();
+            recent.push(key);
+        }
+        for key in recent.iter().rev().take(2) {
+            assert_eq!(
+                store
+                    .get_value_v2(namespace_id, key, u64::MAX)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                rotation_value
+            );
+        }
+
+        let retained_hits: Vec<_> = (0..crate::region_runtime_v2::V2_READ_BUFFER_SLOTS)
+            .map(|_| {
+                store
+                    .get_value_v2(namespace_id, recent.last().unwrap(), u64::MAX)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let overloaded = match store.get_value_v2(namespace_id, recent.last().unwrap(), u64::MAX) {
+            Err(error) => error,
+            Ok(_) => panic!("V2 retained-hit pool exceeded its fixed slot bound"),
+        };
+        assert_eq!(overloaded.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            store
+                .get_value_v2(namespace_id, b"definite-index-miss", u64::MAX)
+                .unwrap()
+                .is_none(),
+            "an index miss must not acquire a retained-hit buffer"
+        );
+
+        // Retained zero-copy hits own their read buffers, but cannot pin the
+        // runtime operation barrier or prevent a warm shutdown.
+        store.close_warm().unwrap();
+        assert_eq!(retained_hits[0].value(), rotation_value);
+        drop(retained_hits);
+        let mut recovered = RegionStoreV2::open_v2(
+            RegionV2Config { index_slots: 4096 },
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .unwrap();
+        assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
+        assert_eq!(
+            recovered
+                .get_value_v2(namespace_id, recent.last().unwrap(), u64::MAX)
+                .unwrap()
+                .unwrap()
+                .value(),
+            rotation_value
+        );
+        recovered.close_fast().unwrap();
+    }
+
+    #[test]
+    fn fresh_metadata_assigns_four_active_lanes_and_a_free_victim() {
+        let data = test_data_superblock();
+        let metadata = empty_region_metadata(data, 64).unwrap();
+        let append_lanes = usize::try_from(REGION_V2_APPEND_LANES).unwrap();
+
+        assert_eq!(metadata.root.append_lane_count, REGION_V2_APPEND_LANES);
+        assert_eq!(metadata.root.active_region_count, REGION_V2_APPEND_LANES);
+        assert_eq!(metadata.root.free_region_count, 1);
+        assert_eq!(metadata.root.max_seqno, u64::from(REGION_V2_APPEND_LANES));
+        for lane_id in 0..REGION_V2_APPEND_LANES {
+            let region = metadata.regions[usize::try_from(lane_id).unwrap()];
+            assert_eq!(region.state, RegionMetadataStateV1::Active);
+            assert_eq!(region.queue_ordinal, lane_id);
+            assert_eq!(region.created_seqno, u64::from(lane_id) + 1);
+        }
+        let free = metadata.regions[append_lanes];
+        assert_eq!(free.state, RegionMetadataStateV1::Free);
+        assert_eq!(free.queue_ordinal, 0);
+
+        let manager = RegionManagerV2::from_metadata(metadata).unwrap();
+        assert_eq!(manager.active_regions(), &[0, 1, 2, 3]);
+        assert_eq!(
+            manager.free_regions().iter().copied().collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(manager.next_seqno(), 5);
     }
 
     #[test]
@@ -3151,6 +3719,39 @@ mod tests {
     }
 
     #[test]
+    fn either_rotation_header_failure_latches_miss_only_before_victim_release() {
+        for failing_write in 1..=2 {
+            let data = data_path_superblock();
+            let runtime = FileRegionRuntimeV2::install(
+                ShardedIndexStorage::anonymous(64).unwrap(),
+                empty_region_metadata(data, 64).unwrap(),
+            )
+            .unwrap();
+            let directory = TestDirectory::new();
+            let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+            backend.set_len(data.geometry.data_file_len).unwrap();
+            let engine = BackendIoEngine::new(Arc::new(backend), 2).unwrap();
+            let buffers = DedicatedBufferPool::try_new(1, RECOVERY_PAGE_SIZE).unwrap();
+            faults.arm(
+                FaultEvent::Write(WritePoint::RegionHeader),
+                failing_write,
+                FaultAction::ErrorAlways(5),
+            );
+
+            assert_eq!(
+                runtime
+                    .rotate_append_lane(&engine, data.geometry, 0, buffers.acquire().unwrap(),)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(5)
+            );
+            assert!(!runtime.health.is_healthy());
+            assert_eq!(runtime.lookup_snapshot(1).unwrap(), IndexLookupV2::Miss);
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn index_mutation_and_region_accounting_share_one_failure_fence() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntimeV2::install(
@@ -3249,17 +3850,22 @@ mod tests {
                 (*event == FaultEvent::Write(WritePoint::RegionHeader)).then_some(index)
             })
             .collect::<Vec<_>>();
-        assert_eq!(header_writes.len(), 1, "one Active lane needs one header");
-        let header_write = header_writes[0];
-        assert!(
-            running_sync < header_write,
-            "Active header must follow the durable RUNNING barrier"
+        assert_eq!(
+            header_writes.len(),
+            usize::try_from(REGION_V2_APPEND_LANES).unwrap(),
+            "each Active lane needs one header"
         );
         assert!(
-            events[header_write + 1..]
+            header_writes
+                .iter()
+                .all(|header_write| running_sync < *header_write),
+            "Active headers must follow the durable RUNNING barrier"
+        );
+        assert!(
+            events[running_sync + 1..]
                 .iter()
                 .all(|event| !matches!(event, FaultEvent::Sync(_))),
-            "Active header materialization must not add a startup sync"
+            "Active header materialization must not add startup syncs"
         );
     }
 
@@ -3284,21 +3890,23 @@ mod tests {
         assert_eq!(fresh.startup(), RegionV2Startup::FreshEmpty);
         assert_active_header_startup_boundary(&fresh_io.events());
 
-        let mut encoded = [0_u8; REGION_HEADER_SIZE];
-        File::open(&directory.files.data)
-            .unwrap()
-            .read_exact_at(&mut encoded, DATA_REGION_AREA_OFFSET_V2)
-            .unwrap();
-        assert_eq!(
-            RegionHeader::decode(&encoded),
-            Some(RegionHeader {
-                region_id: 0,
-                incarnation: 1,
-                state: RegionState::Active,
-                created_seqno: 1,
-                used: REGION_HEADER_SIZE as u64,
-            })
-        );
+        let file = File::open(&directory.files.data).unwrap();
+        for lane_id in 0..REGION_V2_APPEND_LANES {
+            let mut encoded = [0_u8; REGION_HEADER_SIZE];
+            let offset =
+                DATA_REGION_AREA_OFFSET_V2 + u64::from(lane_id) * data.geometry.region_size;
+            file.read_exact_at(&mut encoded, offset).unwrap();
+            assert_eq!(
+                RegionHeader::decode(&encoded),
+                Some(RegionHeader {
+                    region_id: lane_id,
+                    incarnation: 1,
+                    state: RegionState::Active,
+                    created_seqno: u64::from(lane_id) + 1,
+                    used: REGION_HEADER_SIZE as u64,
+                })
+            );
+        }
         fresh.close_fast().unwrap();
 
         let (dirty_file_system, dirty_io, _) = FaultRegionV2FileSystem::new();
@@ -3407,6 +4015,60 @@ mod tests {
     }
 
     #[test]
+    fn clean_image_with_a_different_lane_topology_cold_starts_safely() {
+        let directory = TestDirectory::new();
+        let config = RegionV2Config { index_slots: 8 };
+        let data = test_data_superblock();
+
+        // Build one otherwise valid CLEAN image with the previous one-lane
+        // topology. This exercises the real state/image selection path rather
+        // than treating a lane mismatch as malformed Format V1 metadata.
+        let mut metadata = empty_region_metadata(data, config.index_slots).unwrap();
+        metadata.root.append_lane_count = 1;
+        metadata.root.active_region_count = 1;
+        metadata.root.free_region_count = data.geometry.region_count - 1;
+        metadata.root.max_seqno = 1;
+        for (ordinal, region) in metadata.regions.iter_mut().skip(1).enumerate() {
+            region.incarnation = 0;
+            region.state = RegionMetadataStateV1::Free;
+            region.queue_ordinal = u32::try_from(ordinal).unwrap();
+            region.created_seqno = 0;
+        }
+        metadata.validate().unwrap();
+
+        let mut old = FileRegionV2Backend::new(directory.files.clone(), data);
+        old.acquire_exclusive().unwrap();
+        assert!(matches!(
+            old.inspect_recovery(config).unwrap(),
+            RecoveryPlan::Fresh
+        ));
+        let runtime = FileRegionRuntimeV2::install(
+            ShardedIndexStorage::anonymous(config.index_slots).unwrap(),
+            metadata,
+        )
+        .unwrap();
+        old.publish_running().unwrap();
+        old.materialize_active_headers = true;
+        let runtime = old.start_runtime(runtime).unwrap();
+        let frozen = old.freeze_warm(runtime).unwrap();
+        let prepared = old.persist_frozen(&frozen).unwrap();
+        old.publish_clean(prepared).unwrap();
+        old.release_exclusive().unwrap();
+
+        let mut reopened = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .unwrap();
+        assert_eq!(reopened.startup(), RegionV2Startup::DirtyEmpty);
+        let manager = reopened.runtime.as_ref().unwrap().manager.lock().unwrap();
+        assert_eq!(manager.active_regions(), &[0, 1, 2, 3]);
+        assert_eq!(manager.free_regions().len(), 1);
+        drop(manager);
+        reopened.close_fast().unwrap();
+    }
+
+    #[test]
     fn transient_index_mask_cannot_publish_a_warm_image() {
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 130 };
@@ -3487,13 +4149,13 @@ mod tests {
     }
 
     #[test]
-    fn concrete_recovery_profile_rejects_a_single_region_before_file_creation() {
+    fn concrete_recovery_profile_rejects_fewer_than_five_regions_before_file_creation() {
         let directory = TestDirectory::new();
         let opened = RegionStoreV2::open_v2(
             RegionV2Config { index_slots: 8 },
             FileRegionV2Backend::new(
                 directory.files.clone(),
-                test_data_superblock_with_regions(1),
+                test_data_superblock_with_regions(REGION_V2_APPEND_LANES),
             ),
         );
         assert!(matches!(
@@ -3508,7 +4170,7 @@ mod tests {
     fn complete_warm_image_maps_without_rebuilding_index_slots() {
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 134 };
-        let data = test_data_superblock_with_regions(2);
+        let data = test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1);
         let value = IndexSlotV1::DELETED;
 
         let mut first = RegionStoreV2::open_v2(
@@ -3543,7 +4205,7 @@ mod tests {
 
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 130 };
-        let data = test_data_superblock_with_regions(2);
+        let data = test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1);
         let mut first = RegionStoreV2::open_v2(
             config,
             FileRegionV2Backend::new(directory.files.clone(), data),
@@ -3588,7 +4250,7 @@ mod tests {
 
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 134 };
-        let data = test_data_superblock_with_regions(2);
+        let data = test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1);
         let mut first = RegionStoreV2::open_v2(
             config,
             FileRegionV2Backend::new(directory.files.clone(), data),
@@ -3710,7 +4372,7 @@ mod tests {
         for (case, (io_fault, file_system_fault)) in cases.into_iter().enumerate() {
             let directory = TestDirectory::new();
             let config = RegionV2Config { index_slots: 8 };
-            let data = test_data_superblock_with_regions(2);
+            let data = test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1);
             let (file_system, io_faults, file_system_faults) = FaultRegionV2FileSystem::new();
             let backend = FileRegionV2Backend::new_with_file_system(
                 directory.files.clone(),
@@ -3862,7 +4524,10 @@ mod tests {
 
         let opened = RegionStoreV2::open_v2(
             RegionV2Config { index_slots: 8 },
-            FileRegionV2Backend::new(files, test_data_superblock_with_regions(2)),
+            FileRegionV2Backend::new(
+                files,
+                test_data_superblock_with_regions(REGION_V2_APPEND_LANES + 1),
+            ),
         );
         assert!(matches!(
             opened,

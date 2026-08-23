@@ -277,19 +277,22 @@ impl ResourceController {
         self.acquire_write(WaitMode::new(self.backpressure))
     }
 
+    /// Admit a write whose payload already lives in engine-owned storage.
+    ///
+    /// RegionStore V2 encodes directly into its fixed per-lane staging
+    /// buffers, so leasing another general-purpose write buffer here would
+    /// double-account memory and reduce useful concurrency.
+    pub(crate) fn begin_write_permit(&self) -> Result<QueuePermit, OverloadReason> {
+        self.acquire_write_permit(WaitMode::new(self.backpressure))
+    }
+
     /// Non-blocking acquisition used by low-priority policy work.
     pub(crate) fn try_begin_write(&self) -> Result<DataResources, OverloadReason> {
         self.acquire_write(WaitMode::Reject)
     }
 
     fn acquire_write(&self, wait: WaitMode) -> Result<DataResources, OverloadReason> {
-        let queue = self
-            .write_gate
-            .enter(wait)
-            .map_err(|failure| match failure {
-                WaitFailure::Full => OverloadReason::WriteQueueFull,
-                WaitFailure::TimedOut => OverloadReason::WriteTimeout,
-            })?;
+        let queue = self.acquire_write_permit(wait)?;
         let buffer = self
             .write_pool
             .acquire(wait)
@@ -301,6 +304,15 @@ impl ResourceController {
             _queue: queue,
             buffer,
         })
+    }
+
+    fn acquire_write_permit(&self, wait: WaitMode) -> Result<QueuePermit, OverloadReason> {
+        self.write_gate
+            .enter(wait)
+            .map_err(|failure| match failure {
+                WaitFailure::Full => OverloadReason::WriteQueueFull,
+                WaitFailure::TimedOut => OverloadReason::WriteTimeout,
+            })
     }
 
     pub(crate) fn begin_write_control(&self) -> Result<QueuePermit, OverloadReason> {
@@ -348,11 +360,12 @@ impl ResourceController {
             .map_err(|_| OverloadReason::ReadBufferUnavailable)
     }
 
-    /// Lease the append lane's dedicated metadata buffer.
+    /// Lease the Region manager's dedicated metadata buffer.
     ///
     /// This pool is independent of foreground admission so an accepted write
-    /// can always finish its region-header or superblock publication. M4 has a
-    /// single append lane, therefore one blocking slot is sufficient.
+    /// can always finish its region-header or superblock publication. Region
+    /// rotation is globally ordered, so one blocking slot is sufficient even
+    /// when several append lanes are active.
     pub(crate) fn metadata_buffer(&self) -> Result<BufferLease, OverloadReason> {
         self.metadata_pool
             .acquire(WaitMode::Block)

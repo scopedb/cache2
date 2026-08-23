@@ -152,6 +152,31 @@ pub(crate) struct RegionRotationReceiptV2 {
     pub(crate) reused: bool,
 }
 
+/// Read-only selection of the next FIFO rotation victim.
+///
+/// A caller may retain this value while it drops manager authority and drains
+/// readers of a reused Region generation. It must hold the process-wide
+/// rotation gate until [`RegionManagerV2::begin_rotation`] consumes the plan.
+/// `victim_incarnation` identifies the generation being replaced; the newly
+/// activated generation advances it by exactly one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionRotationPlanV2 {
+    pub(crate) lane_id: usize,
+    pub(crate) cache_epoch: CacheEpochV2,
+    pub(crate) victim_region_id: u32,
+    pub(crate) victim_incarnation: u32,
+    pub(crate) reused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionRotationSelectionV2 {
+    plan: RegionRotationPlanV2,
+    old_index: usize,
+    old: RegionRuntimeV2,
+    victim_index: usize,
+    activated_incarnation: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OpenWriteSpanV2 {
     cache_epoch: CacheEpochV2,
@@ -780,78 +805,44 @@ impl RegionManagerV2 {
         Ok(())
     }
 
-    /// Starts one FIFO rotation without performing I/O. Free Regions are used
-    /// first; once exhausted, the oldest sealed Region generation is reused.
-    /// The outgoing Active Region is withheld from the FIFO until its two
-    /// header writes complete and [`Self::finish_rotation`] is called.
+    /// Selects the next FIFO victim without changing manager authority.
+    ///
+    /// The returned generation is suitable for draining the read projection
+    /// without holding the manager mutex. [`Self::begin_rotation`] validates
+    /// the same FIFO selection again before it mutates any state.
+    pub(crate) fn plan_rotation(
+        &self,
+        lane_id: usize,
+    ) -> Result<RegionRotationPlanV2, RegionMutationErrorV2> {
+        Ok(self.select_rotation(lane_id)?.plan)
+    }
+
+    /// Starts one previously planned FIFO rotation without performing I/O.
+    /// Free Regions are used first; once exhausted, the oldest sealed Region
+    /// generation is reused. The outgoing Active Region is withheld from the
+    /// FIFO until its two header writes complete and [`Self::finish_rotation`]
+    /// is called.
+    ///
+    /// This remains the only rotation mutation authority. A stale plan is
+    /// rejected before a sequence number or queue entry is consumed.
     pub(crate) fn begin_rotation(
         &mut self,
-        lane_id: usize,
+        plan: RegionRotationPlanV2,
     ) -> Result<RegionRotationReceiptV2, RegionMutationErrorV2> {
-        let lane = self
-            .lane_mutations
-            .get(lane_id)
-            .ok_or(RegionMutationErrorV2::InvalidLane)?;
-        if lane.tail.is_some()
-            || lane.open_span.is_some()
-            || lane.pending_padding.is_some()
-            || lane.submitted_span.is_some()
-            || lane.rotation.is_some()
-        {
-            return Err(RegionMutationErrorV2::WouldBlock);
+        let selection = self.select_rotation(plan.lane_id)?;
+        if selection.plan != plan {
+            return Err(RegionMutationErrorV2::StaleReceipt);
         }
-        let old_region_id = *self
-            .active_regions
-            .get(lane_id)
-            .ok_or(RegionMutationErrorV2::InvalidLane)?;
-        let old_index = usize::try_from(old_region_id)
-            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
-        let old = self
-            .regions
-            .get(old_index)
-            .copied()
-            .ok_or(RegionMutationErrorV2::Invariant(
-                "active Region id is out of bounds",
-            ))?;
-        if old.state != RegionMetadataStateV1::Active || old.reserved_used != old.completed_used {
-            return Err(RegionMutationErrorV2::WouldBlock);
-        }
-
-        let free = self.free_regions.front().copied();
-        let (victim_region_id, reused) = match free {
-            Some(region_id) => (region_id, false),
-            None => (
-                self.sealed_regions
-                    .front()
-                    .copied()
-                    .ok_or(RegionMutationErrorV2::WouldBlock)?,
-                true,
-            ),
-        };
-        let victim_index = usize::try_from(victim_region_id)
-            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
-        let victim =
-            self.regions
-                .get(victim_index)
-                .copied()
-                .ok_or(RegionMutationErrorV2::Invariant(
-                    "rotation victim id is out of bounds",
-                ))?;
-        let expected_victim_state = if reused {
-            RegionMetadataStateV1::Sealed
-        } else {
-            RegionMetadataStateV1::Free
-        };
-        if victim.state != expected_victim_state || victim.region_id == old.region_id {
-            return Err(RegionMutationErrorV2::Invariant(
-                "rotation victim queue is inconsistent",
-            ));
-        }
-        let incarnation = victim
-            .incarnation
-            .checked_add(1)
-            .filter(|incarnation| *incarnation != u32::MAX)
-            .ok_or(RegionMutationErrorV2::IncarnationExhausted)?;
+        let RegionRotationSelectionV2 {
+            old_index,
+            old,
+            victim_index,
+            activated_incarnation: incarnation,
+            ..
+        } = selection;
+        let lane_id = plan.lane_id;
+        let victim_region_id = plan.victim_region_id;
+        let reused = plan.reused;
         let created_seqno = self.allocate_seqno()?;
         let removed = if reused {
             self.sealed_regions.pop_front()
@@ -898,6 +889,95 @@ impl RegionManagerV2 {
         };
         self.lane_mutations[lane_id].rotation = Some(receipt);
         Ok(receipt)
+    }
+
+    fn select_rotation(
+        &self,
+        lane_id: usize,
+    ) -> Result<RegionRotationSelectionV2, RegionMutationErrorV2> {
+        let lane = self
+            .lane_mutations
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        if lane.tail.is_some()
+            || lane.open_span.is_some()
+            || lane.pending_padding.is_some()
+            || lane.submitted_span.is_some()
+            || lane.rotation.is_some()
+        {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+        let old_region_id = *self
+            .active_regions
+            .get(lane_id)
+            .ok_or(RegionMutationErrorV2::InvalidLane)?;
+        let old_index = usize::try_from(old_region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let old = self
+            .regions
+            .get(old_index)
+            .copied()
+            .ok_or(RegionMutationErrorV2::Invariant(
+                "active Region id is out of bounds",
+            ))?;
+        if old.region_id != old_region_id
+            || old.state != RegionMetadataStateV1::Active
+            || old.reserved_used != old.completed_used
+        {
+            return Err(RegionMutationErrorV2::WouldBlock);
+        }
+
+        let free = self.free_regions.front().copied();
+        let (victim_region_id, reused) = match free {
+            Some(region_id) => (region_id, false),
+            None => (
+                self.sealed_regions
+                    .front()
+                    .copied()
+                    .ok_or(RegionMutationErrorV2::WouldBlock)?,
+                true,
+            ),
+        };
+        let victim_index = usize::try_from(victim_region_id)
+            .map_err(|_| RegionMutationErrorV2::ArithmeticOverflow)?;
+        let victim =
+            self.regions
+                .get(victim_index)
+                .copied()
+                .ok_or(RegionMutationErrorV2::Invariant(
+                    "rotation victim id is out of bounds",
+                ))?;
+        let expected_victim_state = if reused {
+            RegionMetadataStateV1::Sealed
+        } else {
+            RegionMetadataStateV1::Free
+        };
+        if victim.region_id != victim_region_id
+            || victim.state != expected_victim_state
+            || victim.region_id == old.region_id
+        {
+            return Err(RegionMutationErrorV2::Invariant(
+                "rotation victim queue is inconsistent",
+            ));
+        }
+        let activated_incarnation = victim
+            .incarnation
+            .checked_add(1)
+            .filter(|incarnation| *incarnation != u32::MAX)
+            .ok_or(RegionMutationErrorV2::IncarnationExhausted)?;
+        Ok(RegionRotationSelectionV2 {
+            plan: RegionRotationPlanV2 {
+                lane_id,
+                cache_epoch: self.cache_epoch,
+                victim_region_id,
+                victim_incarnation: victim.incarnation,
+                reused,
+            },
+            old_index,
+            old,
+            victim_index,
+            activated_incarnation,
+        })
     }
 
     /// Publishes the outgoing Region at the tail of the sealed FIFO
@@ -1849,7 +1929,18 @@ mod tests {
         let shards = metadata.shards.clone();
         let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
 
-        let rotation = manager.begin_rotation(0).unwrap();
+        let plan = manager.plan_rotation(0).unwrap();
+        assert_eq!(
+            plan,
+            RegionRotationPlanV2 {
+                lane_id: 0,
+                cache_epoch: 3,
+                victim_region_id: 5,
+                victim_incarnation: 7,
+                reused: false,
+            }
+        );
+        let rotation = manager.begin_rotation(plan).unwrap();
         assert!(!rotation.reused);
         assert_eq!(rotation.sealed.region_id, 3);
         assert_eq!(rotation.activated.region_id, 5);
@@ -1892,7 +1983,18 @@ mod tests {
         let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
         assert_eq!(manager.logical_accounting().unwrap().live_record_count, 1);
 
-        let rotation = manager.begin_rotation(0).unwrap();
+        let plan = manager.plan_rotation(0).unwrap();
+        assert_eq!(
+            plan,
+            RegionRotationPlanV2 {
+                lane_id: 0,
+                cache_epoch: 3,
+                victim_region_id: 4,
+                victim_incarnation: 8,
+                reused: true,
+            }
+        );
+        let rotation = manager.begin_rotation(plan).unwrap();
         assert!(rotation.reused);
         assert_eq!(rotation.activated.region_id, 4);
         assert_eq!(rotation.activated.incarnation, 9);
@@ -1915,6 +2017,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_rotation_plan_does_not_consume_the_next_victim_or_seqno() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let stale = manager.plan_rotation(0).unwrap();
+
+        let other_plan = manager.plan_rotation(1).unwrap();
+        let other_rotation = manager.begin_rotation(other_plan).unwrap();
+        manager.finish_rotation(other_rotation).unwrap();
+        let next_seqno = manager.next_seqno();
+        let active = manager.active_regions().to_vec();
+        let free = manager.free_regions().clone();
+        let sealed = manager.sealed_regions().clone();
+
+        assert_eq!(
+            manager.begin_rotation(stale),
+            Err(RegionMutationErrorV2::StaleReceipt)
+        );
+        assert_eq!(manager.next_seqno(), next_seqno);
+        assert_eq!(manager.active_regions(), active);
+        assert_eq!(manager.free_regions(), &free);
+        assert_eq!(manager.sealed_regions(), &sealed);
+        assert_eq!(manager.plan_rotation(0).unwrap().victim_region_id, 1);
+    }
+
+    #[test]
+    fn rotation_plan_rejects_a_victim_queue_state_mismatch() {
+        let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
+        let next_seqno = manager.next_seqno();
+        let active = manager.active_regions().to_vec();
+        let sealed = manager.sealed_regions().clone();
+
+        // Region 4 is Sealed, so it cannot be selected from the Free FIFO.
+        manager.free_regions[0] = 4;
+        assert_eq!(
+            manager.plan_rotation(0),
+            Err(RegionMutationErrorV2::Invariant(
+                "rotation victim queue is inconsistent"
+            ))
+        );
+        assert_eq!(manager.next_seqno(), next_seqno);
+        assert_eq!(manager.active_regions(), active);
+        assert_eq!(manager.sealed_regions(), &sealed);
+    }
+
+    #[test]
     fn incomplete_or_late_span_cannot_cross_a_region_generation() {
         let mut manager = RegionManagerV2::from_metadata(sample()).unwrap();
         let reservation = manager.reserve_append(0, 64).unwrap();
@@ -1922,12 +2068,13 @@ mod tests {
         let padding = manager.reserve_write_padding(0).unwrap().unwrap();
         let span = manager.seal_write_span_with_padding(padding).unwrap();
         assert_eq!(
-            manager.begin_rotation(0),
+            manager.plan_rotation(0),
             Err(RegionMutationErrorV2::WouldBlock)
         );
         manager.complete_write_span(span).unwrap();
 
-        let rotation = manager.begin_rotation(0).unwrap();
+        let plan = manager.plan_rotation(0).unwrap();
+        let rotation = manager.begin_rotation(plan).unwrap();
         manager.finish_rotation(rotation).unwrap();
         let activated = manager.regions[rotation.activated.region_id as usize];
         assert_eq!(
@@ -1944,10 +2091,10 @@ mod tests {
     fn incarnation_exhaustion_does_not_consume_fifo_or_seqno() {
         let mut metadata = sample();
         metadata.regions[5].incarnation = u32::MAX - 1;
-        let mut manager = RegionManagerV2::from_metadata(metadata).unwrap();
+        let manager = RegionManagerV2::from_metadata(metadata).unwrap();
         let next_seqno = manager.next_seqno();
         assert_eq!(
-            manager.begin_rotation(0),
+            manager.plan_rotation(0),
             Err(RegionMutationErrorV2::IncarnationExhausted)
         );
         assert_eq!(manager.next_seqno(), next_seqno);

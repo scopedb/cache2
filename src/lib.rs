@@ -78,8 +78,9 @@ mod hybrid_metrics;
 mod index;
 #[allow(dead_code)]
 mod index_v2;
-// The V2 foundation is compiled and behavior-tested before the Region data
-// path is switched over; the production graph intentionally does not call it yet.
+// The self-owned V2 data path is compiled and behavior-tested behind a
+// crate-private migration seam; the public Hybrid graph is switched only
+// after its lower-tier integration contract is complete.
 #[allow(dead_code)]
 mod index_storage;
 mod io_backend;
@@ -104,6 +105,8 @@ mod region_metadata_v1;
 mod region_read_v2;
 #[allow(dead_code)]
 mod region_reader_v2;
+#[allow(dead_code)]
+mod region_runtime_v2;
 mod region_staging;
 #[allow(dead_code)]
 mod region_staging_v2;

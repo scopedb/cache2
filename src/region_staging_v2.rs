@@ -28,6 +28,12 @@ pub(crate) enum StageAppendV2 {
     NeedsSeal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LaneFillSnapshotV2 {
+    pub(crate) bytes: usize,
+    pub(crate) records: usize,
+}
+
 /// One V2 record whose exact index identity is published only after its
 /// containing device span completes. The descriptor stays owned by the
 /// completion path; staging never calls into the index while holding a lane
@@ -54,6 +60,8 @@ pub(crate) enum StagingV2Error {
     Failed,
     Closed,
     InvalidLane,
+    Encoding,
+    Submitted,
     WouldBlock,
     StaleReceipt,
     Invariant(&'static str),
@@ -65,6 +73,8 @@ impl fmt::Display for StagingV2Error {
             Self::Failed => formatter.write_str("V2 Region staging is failed"),
             Self::Closed => formatter.write_str("V2 Region staging is closed"),
             Self::InvalidLane => formatter.write_str("V2 Region staging lane is out of bounds"),
+            Self::Encoding => formatter.write_str("V2 Region staging lane is encoding"),
+            Self::Submitted => formatter.write_str("V2 Region staging lane has a submitted span"),
             Self::WouldBlock => formatter.write_str("V2 Region staging lane is busy"),
             Self::StaleReceipt => formatter.write_str("V2 Region staging receipt is stale"),
             Self::Invariant(message) => formatter.write_str(message),
@@ -260,6 +270,39 @@ impl RegionStagingV2 {
 
     pub(crate) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
+    }
+
+    /// Returns the currently sealable fill prefix without waiting for an
+    /// encoder or an earlier submitted span. `Ok(None)` is the only empty-lane
+    /// result, so a lane worker never has to probe the manager by attempting
+    /// to seal an absent span.
+    pub(crate) fn lane_fill_snapshot(
+        &self,
+        lane_id: usize,
+    ) -> Result<Option<LaneFillSnapshotV2>, StagingV2Error> {
+        let lane = self.lanes.get(lane_id).ok_or(StagingV2Error::InvalidLane)?;
+        let state = lock_unpoisoned(&lane.state);
+        ensure_open_v2(&state)?;
+        if state.encoding.is_some() {
+            return Err(StagingV2Error::Encoding);
+        }
+        if state.submitted.is_some() {
+            return Err(StagingV2Error::Submitted);
+        }
+        if state.fill.is_empty() {
+            return Ok(None);
+        }
+        let bytes = state
+            .fill
+            .used()
+            .filter(|bytes| *bytes != 0 && *bytes <= self.chunk_bytes)
+            .ok_or(StagingV2Error::Invariant(
+                "V2 staging fill snapshot has an invalid length",
+            ))?;
+        Ok(Some(LaneFillSnapshotV2 {
+            bytes,
+            records: state.fill.records.len(),
+        }))
     }
 
     /// Encodes one exact manager reservation directly into the fill lease.
@@ -768,6 +811,9 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod v2_tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
     use super::*;
     use crate::format::RecordCodec;
     use crate::index::PackedLocation;
@@ -928,6 +974,91 @@ mod v2_tests {
         staging
             .finish_success(second_span, buffer, records)
             .unwrap();
+    }
+
+    #[test]
+    fn v2_fill_snapshot_distinguishes_empty_ready_submitted_and_terminal_lanes() {
+        let resources = resources(8 * 1024 * 1024);
+        let staging = RegionStagingV2::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        assert_eq!(staging.lane_fill_snapshot(0).unwrap(), None);
+        assert_eq!(
+            staging.lane_fill_snapshot(1),
+            Err(StagingV2Error::InvalidLane)
+        );
+
+        let (receipt, record) = reservation(4096, 64, 11);
+        staging
+            .encode_reserved(receipt, |target| {
+                target.fill(0x31);
+                Ok::<StagedRecordV2, ()>(record)
+            })
+            .unwrap();
+        assert_eq!(
+            staging.lane_fill_snapshot(0).unwrap(),
+            Some(LaneFillSnapshotV2 {
+                bytes: 64,
+                records: 1,
+            })
+        );
+
+        let submitted = span(4096, 4160, 1, 11, 1);
+        let job = staging.take_sealed(submitted).unwrap().unwrap();
+        assert_eq!(
+            staging.lane_fill_snapshot(0),
+            Err(StagingV2Error::Submitted)
+        );
+        let StagedWriteV2 {
+            buffer, records, ..
+        } = job;
+        staging.finish_success(submitted, buffer, records).unwrap();
+        assert_eq!(staging.lane_fill_snapshot(0).unwrap(), None);
+        staging.close();
+        assert_eq!(staging.lane_fill_snapshot(0), Err(StagingV2Error::Closed));
+
+        let failed = RegionStagingV2::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        failed
+            .encode_reserved(receipt, |target| {
+                target.fill(0x32);
+                Ok::<StagedRecordV2, ()>(record)
+            })
+            .unwrap();
+        let job = failed.take_sealed(submitted).unwrap().unwrap();
+        let StagedWriteV2 {
+            buffer, records, ..
+        } = job;
+        drop(buffer);
+        failed.finish_failure(submitted, None, records).unwrap();
+        assert_eq!(failed.lane_fill_snapshot(0), Err(StagingV2Error::Failed));
+    }
+
+    #[test]
+    fn v2_fill_snapshot_never_observes_a_partially_encoded_record() {
+        let resources = resources(4 * 1024 * 1024);
+        let staging = Arc::new(RegionStagingV2::try_new(1, 4096, 64 * 1024, &resources).unwrap());
+        let (receipt, record) = reservation(4096, 64, 11);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let encoder_staging = Arc::clone(&staging);
+        let encoder = std::thread::spawn(move || {
+            encoder_staging.encode_reserved(receipt, |target| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                target.fill(0x41);
+                Ok::<StagedRecordV2, ()>(record)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(staging.lane_fill_snapshot(0), Err(StagingV2Error::Encoding));
+        release_tx.send(()).unwrap();
+        assert_eq!(encoder.join().unwrap().unwrap(), StageAppendV2::Appended);
+        assert_eq!(
+            staging.lane_fill_snapshot(0).unwrap(),
+            Some(LaneFillSnapshotV2 {
+                bytes: 64,
+                records: 1,
+            })
+        );
     }
 
     #[test]
