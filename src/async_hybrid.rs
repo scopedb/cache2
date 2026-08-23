@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::async_cache::{
-    AsyncExecutor, AsyncFailure, AsyncQueueStats, AsyncRequestOptions, CacheFuture, CancelOutcome,
-    ready_future,
+    AsyncExecutor, AsyncQueueStats, AsyncRequestOptions, CacheFuture, CancelOutcome, copy_input,
+    map_put_failure, map_read_failure, map_write_failure, ready_future,
 };
 use crate::cache::{
     CacheError, CacheStatus, PutOptions, PutOutcome, RejectReason, RemoveOutcome, Result,
@@ -727,40 +727,6 @@ impl HybridCloseWaiters {
                 return id;
             }
         }
-    }
-}
-
-fn copy_input(input: &[u8], reason: OverloadReason) -> Result<Vec<u8>> {
-    let mut owned = Vec::new();
-    owned
-        .try_reserve_exact(input.len())
-        .map_err(|_| CacheError::Overloaded(reason))?;
-    owned.extend_from_slice(input);
-    Ok(owned)
-}
-
-fn map_read_failure<T>(failure: AsyncFailure) -> Result<T> {
-    Err(map_failure(failure, OverloadReason::ReadQueueFull))
-}
-
-fn map_put_failure(failure: AsyncFailure) -> Result<PutOutcome> {
-    match failure {
-        AsyncFailure::QueueFull => Ok(PutOutcome::Rejected(RejectReason::SubmissionFull)),
-        failure => Err(map_failure(failure, OverloadReason::WriteQueueFull)),
-    }
-}
-
-fn map_write_failure<T>(failure: AsyncFailure) -> Result<T> {
-    Err(map_failure(failure, OverloadReason::WriteQueueFull))
-}
-
-fn map_failure(failure: AsyncFailure, queue_full: OverloadReason) -> CacheError {
-    match failure {
-        AsyncFailure::Closed => CacheError::Closed,
-        AsyncFailure::QueueFull => CacheError::Overloaded(queue_full),
-        AsyncFailure::Cancelled => CacheError::Cancelled,
-        AsyncFailure::TimedOut => CacheError::TimedOut,
-        AsyncFailure::WorkerPanicked => CacheError::Poisoned,
     }
 }
 

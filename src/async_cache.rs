@@ -249,6 +249,14 @@ impl<T> CacheFuture<T> {
         }
     }
 
+    fn take_ready(value: &mut Mutex<Option<T>>) -> T {
+        value
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("a ready cache future is consumed once")
+    }
+
     pub fn cancel(&self) -> CancelOutcome {
         match &self.state {
             CacheFutureState::Ready(_) => CancelOutcome::Completed,
@@ -258,11 +266,7 @@ impl<T> CacheFuture<T> {
 
     pub fn wait(mut self) -> T {
         match &mut self.state {
-            CacheFutureState::Ready(value) => value
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-                .expect("a ready cache future is consumed once"),
+            CacheFutureState::Ready(value) => Self::take_ready(value),
             CacheFutureState::Pending(core) => core.completion.wait(),
         }
     }
@@ -275,13 +279,7 @@ impl<T> Future for CacheFuture<T> {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.get_mut().state {
-            CacheFutureState::Ready(value) => Poll::Ready(
-                value
-                    .get_mut()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                    .expect("a ready cache future cannot be polled after completion"),
-            ),
+            CacheFutureState::Ready(value) => Poll::Ready(Self::take_ready(value)),
             CacheFutureState::Pending(core) => core.completion.poll(context),
         }
     }
@@ -1875,7 +1873,7 @@ impl AsyncInner {
     }
 }
 
-fn map_read_failure<T>(failure: AsyncFailure) -> CacheResult<T> {
+pub(crate) fn map_read_failure<T>(failure: AsyncFailure) -> CacheResult<T> {
     Err(map_failure(failure, OverloadReason::ReadQueueFull))
 }
 
@@ -1887,14 +1885,14 @@ fn write_status_error(status: CacheStatus) -> Option<CacheError> {
     }
 }
 
-fn map_put_failure(failure: AsyncFailure) -> CacheResult<PutOutcome> {
+pub(crate) fn map_put_failure(failure: AsyncFailure) -> CacheResult<PutOutcome> {
     match failure {
         AsyncFailure::QueueFull => Ok(PutOutcome::Rejected(RejectReason::SubmissionFull)),
         failure => Err(map_failure(failure, OverloadReason::WriteQueueFull)),
     }
 }
 
-fn map_write_failure<T>(failure: AsyncFailure) -> CacheResult<T> {
+pub(crate) fn map_write_failure<T>(failure: AsyncFailure) -> CacheResult<T> {
     Err(map_failure(failure, OverloadReason::WriteQueueFull))
 }
 
@@ -1908,7 +1906,7 @@ fn map_failure(failure: AsyncFailure, queue_full: OverloadReason) -> CacheError 
     }
 }
 
-fn copy_input(input: &[u8], allocation_failure: OverloadReason) -> CacheResult<Vec<u8>> {
+pub(crate) fn copy_input(input: &[u8], allocation_failure: OverloadReason) -> CacheResult<Vec<u8>> {
     let mut owned = Vec::new();
     owned
         .try_reserve_exact(input.len())
