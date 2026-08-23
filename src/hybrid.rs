@@ -23,6 +23,7 @@ use crate::bucket_engine::{
 use crate::cache::{
     CacheConfig, CacheError, CacheStats, CacheStatus, DiskCache, ManagedPutCommit, PutOptions,
     PutOutcome, RecoveryMode, RegionStagingStats, RejectReason, RemoveOutcome, Result,
+    put_reject_reason,
 };
 use crate::diagnostics::ConfigDiagnostics;
 #[cfg(test)]
@@ -1734,14 +1735,14 @@ impl HybridCache {
     /// Try to complete only an unexpired L1 hit. Lock contention or a miss has
     /// no Hybrid-visible side effects, so an async caller can hand the same
     /// admitted request to the cancelable lower-tier worker path.
-    pub(crate) fn lookup_memory_in_admitted(
+    pub(crate) fn try_get_live_memory_in_admitted(
         &self,
         namespace: NamespaceId,
         key: &[u8],
         request: &mut HybridRequestPermit,
-    ) -> Result<Option<HybridLookupOutcome>> {
+    ) -> Result<Option<Vec<u8>>> {
         let started = Instant::now();
-        let result = (|| -> Result<Option<HybridLookupOutcome>> {
+        let result = (|| -> Result<Option<Vec<u8>>> {
             let Some(_operation) = self.try_read_operation_admitted()? else {
                 return Ok(None);
             };
@@ -1771,10 +1772,7 @@ impl HybridCache {
                         hit.value.as_slice(),
                         OverloadReason::ReadBufferUnavailable,
                     )?;
-                    Ok(Some(HybridLookupOutcome::Hit {
-                        value,
-                        tier: CacheTier::Memory,
-                    }))
+                    Ok(Some(value))
                 }
                 Ok(None) => Ok(None),
                 Err(error) => {
@@ -1787,10 +1785,7 @@ impl HybridCache {
             self.record_operation(
                 CacheOperation::Get,
                 &result,
-                |outcome| match outcome {
-                    Some(HybridLookupOutcome::Hit { .. }) => RequestResultClass::Hit,
-                    Some(HybridLookupOutcome::Miss(_)) | None => RequestResultClass::Miss,
-                },
+                |_| RequestResultClass::Hit,
                 started.elapsed(),
             );
         }
@@ -2072,7 +2067,7 @@ impl HybridCache {
                 if !self.inner.accepting.load(Ordering::Acquire) {
                     return Err(CacheError::Closed);
                 }
-                return Ok(PutOutcome::Rejected(hybrid_put_reject_reason(reason)));
+                return Ok(PutOutcome::Rejected(put_reject_reason(reason)));
             }
         };
         self.put_in_routed(namespace, key, value, options, route)
@@ -4500,7 +4495,7 @@ fn try_clone_memory_entry(entry: &MemoryEntry) -> Result<MemoryEntry> {
 fn write_back_run_failure(error: WriteBackRunError) -> DirtyPersistFailure {
     match error {
         WriteBackRunError::Overloaded(reason) => {
-            DirtyPersistFailure::Rejected(hybrid_put_reject_reason(reason))
+            DirtyPersistFailure::Rejected(put_reject_reason(reason))
         }
         WriteBackRunError::Closed => DirtyPersistFailure::Fatal(CacheError::Closed),
         WriteBackRunError::WorkerPanicked => DirtyPersistFailure::Fatal(CacheError::Poisoned),
@@ -4510,7 +4505,7 @@ fn write_back_run_failure(error: WriteBackRunError) -> DirtyPersistFailure {
 fn dirty_persist_failure(error: DiskPairError) -> DirtyPersistFailure {
     match (error.phase, error.error) {
         (DiskMutationPhase::Uncommitted, CacheError::Overloaded(reason)) => {
-            DirtyPersistFailure::Rejected(hybrid_put_reject_reason(reason))
+            DirtyPersistFailure::Rejected(put_reject_reason(reason))
         }
         (DiskMutationPhase::Uncommitted, CacheError::ReclaimBacklog) => {
             DirtyPersistFailure::Rejected(RejectReason::ReclaimBacklog)
@@ -4527,21 +4522,6 @@ fn demotion_reject_error(reason: RejectReason) -> CacheError {
             CacheError::Overloaded(OverloadReason::WriteBufferUnavailable)
         }
         _ => CacheError::ReclaimBacklog,
-    }
-}
-
-fn hybrid_put_reject_reason(reason: OverloadReason) -> RejectReason {
-    match reason {
-        OverloadReason::ReadQueueFull
-        | OverloadReason::WriteQueueFull
-        | OverloadReason::JournalCapacityFull
-        | OverloadReason::CloseWaitersFull => RejectReason::SubmissionFull,
-        OverloadReason::ReadBufferUnavailable | OverloadReason::WriteBufferUnavailable => {
-            RejectReason::BufferUnavailable
-        }
-        OverloadReason::ReadTimeout | OverloadReason::WriteTimeout => {
-            RejectReason::SubmissionTimeout
-        }
     }
 }
 

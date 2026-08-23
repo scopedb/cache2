@@ -10080,7 +10080,7 @@ fn decode_cache_status(value: u8) -> CacheStatus {
     }
 }
 
-fn put_reject_reason(reason: OverloadReason) -> RejectReason {
+pub(crate) fn put_reject_reason(reason: OverloadReason) -> RejectReason {
     match reason {
         OverloadReason::ReadQueueFull
         | OverloadReason::WriteQueueFull

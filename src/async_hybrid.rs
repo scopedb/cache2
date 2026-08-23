@@ -21,8 +21,9 @@ use crate::async_cache::{
 };
 use crate::cache::{
     CacheError, CacheStatus, PutOptions, PutOutcome, RejectReason, RemoveOutcome, Result,
+    put_reject_reason,
 };
-use crate::hybrid::{HybridAsyncConfig, HybridCache, HybridInner, HybridLookupOutcome};
+use crate::hybrid::{CacheTier, HybridAsyncConfig, HybridCache, HybridInner, HybridLookupOutcome};
 use crate::policy::NamespaceId;
 use crate::resources::OverloadReason;
 
@@ -177,8 +178,13 @@ impl AsyncHybridCache {
         };
         let mut permit = permit;
         if options.deadline().is_none() {
-            match cache.lookup_memory_in_admitted(namespace, key, &mut permit) {
-                Ok(Some(outcome)) => return ready_future(Ok(map(outcome))),
+            match cache.try_get_live_memory_in_admitted(namespace, key, &mut permit) {
+                Ok(Some(value)) => {
+                    return ready_future(Ok(map(HybridLookupOutcome::Hit {
+                        value,
+                        tier: CacheTier::Memory,
+                    })));
+                }
                 Ok(None) => {}
                 Err(error) => return ready_future(Err(error)),
             }
@@ -699,21 +705,6 @@ impl HybridCloseWaiters {
             if self.registered.iter().all(|waiter| waiter.id != id) {
                 return id;
             }
-        }
-    }
-}
-
-fn put_reject_reason(reason: OverloadReason) -> RejectReason {
-    match reason {
-        OverloadReason::ReadQueueFull
-        | OverloadReason::WriteQueueFull
-        | OverloadReason::JournalCapacityFull
-        | OverloadReason::CloseWaitersFull => RejectReason::SubmissionFull,
-        OverloadReason::ReadBufferUnavailable | OverloadReason::WriteBufferUnavailable => {
-            RejectReason::BufferUnavailable
-        }
-        OverloadReason::ReadTimeout | OverloadReason::WriteTimeout => {
-            RejectReason::SubmissionTimeout
         }
     }
 }
