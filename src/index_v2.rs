@@ -4,7 +4,9 @@
 //! visibility or logical accounting. Callers hold that authority and supply a
 //! visibility predicate while this type keeps one canonical shard locked for
 //! an entire probe. No slot is modified until the probe has selected its final
-//! target.
+//! target. Callers of `*_with_commit` must acquire their stable Region-manager
+//! authority before entering; the callback updates that already-held guard and
+//! must be infallible and non-reentrant.
 
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
 use crate::index_storage::{IndexSlotStateV1, IndexStorageError, ShardedIndexStorage};
@@ -181,7 +183,19 @@ impl RegionIndexV2 {
         &self,
         hash: u64,
         supplied: IndexEntry,
+        is_visible: impl FnMut(IndexEntry) -> bool,
+    ) -> Result<IndexUpsertV2, IndexStorageError> {
+        self.upsert_with_commit(hash, supplied, is_visible, |_| {})
+    }
+
+    /// Installs a live value and reports the committed physical transition
+    /// before releasing its shard write lock.
+    pub(crate) fn upsert_with_commit(
+        &self,
+        hash: u64,
+        supplied: IndexEntry,
         mut is_visible: impl FnMut(IndexEntry) -> bool,
+        on_commit: impl FnOnce(IndexTransitionV2),
     ) -> Result<IndexUpsertV2, IndexStorageError> {
         if supplied.seqno == 0 || !is_visible(supplied) {
             return Ok(IndexUpsertV2::Ignored { current: None });
@@ -191,7 +205,7 @@ impl RegionIndexV2 {
             hash,
             entry: supplied,
         };
-        self.install_if_newer(hash, supplied.seqno, installed, is_visible)
+        self.install_if_newer(hash, supplied.seqno, installed, is_visible, on_commit)
             .map(IndexUpsertV2::from)
     }
 
@@ -205,6 +219,18 @@ impl RegionIndexV2 {
         seqno: u64,
         is_visible: impl FnMut(IndexEntry) -> bool,
     ) -> Result<IndexMaskV2, IndexStorageError> {
+        self.mask_if_newer_with_commit(hash, seqno, is_visible, |_| {})
+    }
+
+    /// Reserves a hash/version and reports the committed physical transition
+    /// before releasing its shard write lock.
+    pub(crate) fn mask_if_newer_with_commit(
+        &self,
+        hash: u64,
+        seqno: u64,
+        is_visible: impl FnMut(IndexEntry) -> bool,
+        on_commit: impl FnOnce(IndexTransitionV2),
+    ) -> Result<IndexMaskV2, IndexStorageError> {
         if seqno == 0 {
             return Ok(IndexMaskV2::Ignored { current: None });
         }
@@ -213,6 +239,7 @@ impl RegionIndexV2 {
             seqno,
             IndexSlotStateV1::Masked { hash, seqno },
             is_visible,
+            on_commit,
         )
         .map(IndexMaskV2::from)
     }
@@ -223,6 +250,7 @@ impl RegionIndexV2 {
         supplied_seqno: u64,
         installed: IndexSlotStateV1,
         mut is_visible: impl FnMut(IndexEntry) -> bool,
+        on_commit: impl FnOnce(IndexTransitionV2),
     ) -> Result<IndexInstallV2, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -281,8 +309,11 @@ impl RegionIndexV2 {
             return Ok(IndexInstallV2::Saturated);
         };
         let old = shard.replace(local_slot, installed)?;
+        let transition = transition(first_slot, local_slot, old, installed);
+        on_commit(transition);
+        drop(shard);
         Ok(IndexInstallV2::Applied {
-            transition: transition(first_slot, local_slot, old, installed),
+            transition,
             previous,
         })
     }
@@ -294,7 +325,18 @@ impl RegionIndexV2 {
         hash: u64,
         expected: IndexEntry,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
-        self.replace_exact_value(hash, expected, None)
+        self.remove_if_with_commit(hash, expected, |_| {})
+    }
+
+    /// Removes one exact record and reports its committed physical transition
+    /// before releasing the shard write lock.
+    pub(crate) fn remove_if_with_commit(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        on_commit: impl FnOnce(IndexTransitionV2),
+    ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
+        self.replace_exact_value(hash, expected, None, on_commit)
     }
 
     /// Physically relocates one exact immutable record identity. The new
@@ -308,13 +350,25 @@ impl RegionIndexV2 {
         expected: IndexEntry,
         replacement: IndexEntry,
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
+        self.replace_if_with_commit(hash, expected, replacement, |_| {})
+    }
+
+    /// Relocates one exact record and reports its committed physical
+    /// transition before releasing the shard write lock.
+    pub(crate) fn replace_if_with_commit(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        replacement: IndexEntry,
+        on_commit: impl FnOnce(IndexTransitionV2),
+    ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         if replacement.seqno == 0
             || replacement.seqno != expected.seqno
             || replacement.namespace_id != expected.namespace_id
         {
             return Ok(None);
         }
-        self.replace_exact_value(hash, expected, Some(replacement))
+        self.replace_exact_value(hash, expected, Some(replacement), on_commit)
     }
 
     /// Normalizes only the exact same-hash producer mask to a deleted marker.
@@ -322,6 +376,17 @@ impl RegionIndexV2 {
         &self,
         hash: u64,
         seqno: u64,
+    ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
+        self.normalize_mask_if_with_commit(hash, seqno, |_| {})
+    }
+
+    /// Normalizes one exact producer mask and reports its committed physical
+    /// transition before releasing the shard write lock.
+    pub(crate) fn normalize_mask_if_with_commit(
+        &self,
+        hash: u64,
+        seqno: u64,
+        on_commit: impl FnOnce(IndexTransitionV2),
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -358,7 +423,10 @@ impl RegionIndexV2 {
         };
         let installed = IndexSlotStateV1::Deleted;
         let old = shard.replace(local_slot, installed)?;
-        Ok(Some(transition(first_slot, local_slot, old, installed)))
+        let transition = transition(first_slot, local_slot, old, installed);
+        on_commit(transition);
+        drop(shard);
+        Ok(Some(transition))
     }
 
     fn replace_exact_value(
@@ -366,6 +434,7 @@ impl RegionIndexV2 {
         hash: u64,
         expected: IndexEntry,
         replacement: Option<IndexEntry>,
+        on_commit: impl FnOnce(IndexTransitionV2),
     ) -> Result<Option<IndexTransitionV2>, IndexStorageError> {
         let mut shard = self.storage.write_hash_shard(hash);
         let slot_count = shard.slot_count();
@@ -404,7 +473,10 @@ impl RegionIndexV2 {
             IndexSlotStateV1::Value { hash, entry }
         });
         let old = shard.replace(local_slot, installed)?;
-        Ok(Some(transition(first_slot, local_slot, old, installed)))
+        let transition = transition(first_slot, local_slot, old, installed);
+        on_commit(transition);
+        drop(shard);
+        Ok(Some(transition))
     }
 }
 
@@ -447,6 +519,7 @@ mod tests {
         CorruptPageReason, INDEX_IMAGE_PAGE_HEADER_SIZE, INDEX_IMAGE_PAGE_SIZE,
         IndexImageBindingV1, IndexPhysicalStats,
     };
+    use std::cell::Cell;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -496,6 +569,55 @@ mod tests {
 
     fn anonymous(slot_count: usize) -> RegionIndexV2 {
         RegionIndexV2::from_storage(ShardedIndexStorage::anonymous(slot_count).unwrap())
+    }
+
+    #[test]
+    fn commit_callback_reports_only_an_applied_transition() {
+        let index = anonymous(8);
+        let hash = 3;
+        let first = entry(1, 8, 10);
+        let calls = Cell::new(0);
+        let reported = Cell::new(None);
+
+        let outcome = index
+            .upsert_with_commit(
+                hash,
+                first,
+                |_| true,
+                |transition| {
+                    calls.set(calls.get() + 1);
+                    reported.set(Some(transition));
+                },
+            )
+            .unwrap();
+        let IndexUpsertV2::Applied { transition, .. } = outcome else {
+            panic!("upsert must commit");
+        };
+        assert_eq!(calls.get(), 1);
+        assert_eq!(reported.get(), Some(transition));
+
+        assert_eq!(
+            index
+                .upsert_with_commit(
+                    hash,
+                    entry(2, 16, 9),
+                    |_| true,
+                    |_| { panic!("ignored upsert must not report a commit") }
+                )
+                .unwrap(),
+            IndexUpsertV2::Ignored {
+                current: Some(first)
+            }
+        );
+        assert_eq!(
+            index
+                .remove_if_with_commit(hash, entry(2, 16, 9), |_| {
+                    panic!("mismatched removal must not report a commit")
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
@@ -628,11 +750,25 @@ mod tests {
         let before = index.storage().shard_stats().unwrap();
 
         assert_eq!(
-            index.upsert(1, entry(1, 8, 20), |_| true).unwrap(),
+            index
+                .upsert_with_commit(
+                    1,
+                    entry(1, 8, 20),
+                    |_| true,
+                    |_| { panic!("saturated upsert must not report a commit") }
+                )
+                .unwrap(),
             IndexUpsertV2::Saturated
         );
         assert_eq!(
-            index.mask_if_newer(1, 20, |_| true).unwrap(),
+            index
+                .mask_if_newer_with_commit(
+                    1,
+                    20,
+                    |_| true,
+                    |_| { panic!("saturated mask must not report a commit") }
+                )
+                .unwrap(),
             IndexMaskV2::Saturated
         );
         assert_eq!(index.storage().shard_stats().unwrap(), before);
@@ -769,7 +905,12 @@ mod tests {
         let before = index.storage().shard_stats().unwrap();
 
         assert!(matches!(
-            index.upsert(HASH, entry(3, 24, 20), |_| true),
+            index.upsert_with_commit(
+                HASH,
+                entry(3, 24, 20),
+                |_| true,
+                |_| { panic!("failed replace must not report a commit") }
+            ),
             Err(IndexStorageError::CorruptPage {
                 page_index: 1,
                 reason: CorruptPageReason::ChecksumMismatch { .. },

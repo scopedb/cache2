@@ -15,12 +15,15 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::index::{MAX_INDEX_SHARDS, MAX_INDEX_SLOTS};
 use crate::index_storage::{
     IndexImageBindingV1, IndexPhysicalStats, IndexShardRangeV1, IndexStorageError,
     ShardedIndexStorage, canonical_index_shard_ranges,
 };
+use crate::index_v2::{IndexLookupV2, RegionIndexV2};
 use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, SyncMode, SyncPoint, WritePoint,
     read_exact_at, write_all_at,
@@ -32,6 +35,7 @@ use crate::recovery_v2::{
     StateRecordV2, StateSelectionError, clean_image_matches_v2, latest_state_v2,
     prepare_next_state_v2, prepare_running_barrier_v2, recovery_image_index_len_v1,
 };
+use crate::region_manager_v2::RegionManagerV2;
 use crate::region_metadata_v1::{
     REGION_METADATA_V1_PAGE_SIZE, REGION_METADATA_V1_REGIONS_PER_PAGE,
     REGION_METADATA_V1_SHARDS_PER_PAGE, RegionMetadataRecordV1, RegionMetadataRootV1,
@@ -93,7 +97,6 @@ pub(crate) enum RegionV2Startup {
 /// descriptor exhaustion or address-space exhaustion must be returned as
 /// `Err`, not converted to `None`.
 pub(crate) trait RegionV2Backend {
-    type Index;
     type Runtime;
     type CleanImage;
     type FrozenView;
@@ -121,8 +124,6 @@ pub(crate) trait RegionV2Backend {
         clean: Self::CleanImage,
         config: RegionV2Config,
     ) -> io::Result<Option<Self::Runtime>>;
-
-    fn runtime_index(runtime: &Self::Runtime) -> &Self::Index;
 
     /// Publish RUNNING to both state slots, then issue one fdatasync.
     ///
@@ -185,13 +186,52 @@ impl RegionV2Files {
     }
 }
 
+const REGION_V2_HEALTHY: u8 = 0;
+const REGION_V2_MISS_ONLY: u8 = 1;
+
+/// One-way health fence shared by the live, frozen, and prepared-clean owners.
+/// Once a lazy index fault rejects the recovery image, no later phase may
+/// publish CLEAN from the partially trusted authority.
+#[derive(Clone)]
+pub(crate) struct RegionV2HealthLatch {
+    state: Arc<AtomicU8>,
+}
+
+impl RegionV2HealthLatch {
+    fn healthy() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(REGION_V2_HEALTHY)),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REGION_V2_HEALTHY
+    }
+
+    fn enter_miss_only(&self) {
+        self.state.store(REGION_V2_MISS_ONLY, Ordering::Release);
+    }
+
+    fn require_healthy(&self) -> io::Result<()> {
+        self.is_healthy().then_some(()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionStore V2 is miss-only and cannot publish CLEAN",
+            )
+        })
+    }
+}
+
 pub(crate) struct FileRegionRuntimeV2 {
-    index: ShardedIndexStorage,
-    metadata: RegionMetadataV1,
+    index: RegionIndexV2,
+    manager: RegionManagerV2,
+    health: RegionV2HealthLatch,
 }
 
 pub(crate) struct FrozenFileRegionViewV2 {
-    runtime: FileRegionRuntimeV2,
+    index: RegionIndexV2,
+    metadata: RegionMetadataV1,
+    health: RegionV2HealthLatch,
 }
 
 pub(crate) struct CleanFileRegionImageV1 {
@@ -202,6 +242,53 @@ pub(crate) struct CleanFileRegionImageV1 {
 
 pub(crate) struct PreparedFileRegionCleanV2 {
     state: StatePageWriteV2,
+    health: RegionV2HealthLatch,
+}
+
+impl FileRegionRuntimeV2 {
+    /// Installs one complete authority. Recovery metadata is consumed here so
+    /// the live runtime cannot retain a stale second copy beside the manager.
+    fn install(index: ShardedIndexStorage, metadata: RegionMetadataV1) -> io::Result<Self> {
+        let physical_stats = index.shard_stats().map_err(index_storage_io_error)?;
+        let slot_count = u64::try_from(index.slot_count()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "V2 index capacity is too large")
+        })?;
+        if metadata.root.index_slots != slot_count
+            || metadata.root.shard_count as usize != index.shard_count()
+            || !metadata_shard_stats_match(&metadata, &physical_stats)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V2 index and Region metadata do not describe one authority",
+            ));
+        }
+        let manager = RegionManagerV2::from_metadata(metadata).map_err(region_metadata_io_error)?;
+        Ok(Self {
+            index: RegionIndexV2::from_storage(index),
+            manager,
+            health: RegionV2HealthLatch::healthy(),
+        })
+    }
+
+    /// The first production-facing operation intentionally exposes only typed
+    /// point semantics. A lazy image failure latches the whole L2 miss-only;
+    /// it is never surfaced as a cache hit or allowed to authorize CLEAN.
+    fn lookup(&self, hash: u64) -> io::Result<IndexLookupV2> {
+        if !self.health.is_healthy() {
+            return Ok(IndexLookupV2::Miss);
+        }
+        match self
+            .index
+            .lookup(hash, |entry| self.manager.is_visible(entry))
+        {
+            Ok(result) if self.health.is_healthy() => Ok(result),
+            Ok(_) => Ok(IndexLookupV2::Miss),
+            Err(_) => {
+                self.health.enter_miss_only();
+                Ok(IndexLookupV2::Miss)
+            }
+        }
+    }
 }
 
 pub(crate) trait RegionV2FileSystem {
@@ -328,7 +415,6 @@ impl<F> RegionV2Backend for FileRegionV2Backend<F>
 where
     F: RegionV2FileSystem,
 {
-    type Index = ShardedIndexStorage;
     type Runtime = FileRegionRuntimeV2;
     type CleanImage = CleanFileRegionImageV1;
     type FrozenView = FrozenFileRegionViewV2;
@@ -582,11 +668,9 @@ where
             self.cold_reset_needed = false;
         }
         let metadata = empty_region_metadata(data, config.index_slots)?;
-        Ok(FileRegionRuntimeV2 {
-            index: ShardedIndexStorage::anonymous(config.index_slots)
-                .map_err(index_storage_io_error)?,
-            metadata,
-        })
+        let index =
+            ShardedIndexStorage::anonymous(config.index_slots).map_err(index_storage_io_error)?;
+        FileRegionRuntimeV2::install(index, metadata)
     }
 
     fn map_clean_runtime(
@@ -630,14 +714,7 @@ where
             &shard_stats,
         )
         .map_err(index_storage_io_error)?;
-        Ok(Some(FileRegionRuntimeV2 {
-            index,
-            metadata: clean.metadata,
-        }))
-    }
-
-    fn runtime_index(runtime: &Self::Runtime) -> &Self::Index {
-        &runtime.index
+        FileRegionRuntimeV2::install(index, clean.metadata).map(Some)
     }
 
     fn publish_running(&mut self) -> io::Result<()> {
@@ -667,27 +744,36 @@ where
     }
 
     fn freeze_warm(&mut self, runtime: Self::Runtime) -> io::Result<Self::FrozenView> {
-        Ok(FrozenFileRegionViewV2 { runtime })
+        runtime.health.require_healthy()?;
+        let FileRegionRuntimeV2 {
+            index,
+            manager,
+            health,
+        } = runtime;
+        let shards = index_shard_metadata(index.storage(), &health)?;
+        let metadata = manager
+            .freeze_metadata(shards)
+            .map_err(region_metadata_io_error)?;
+        health.require_healthy()?;
+        Ok(FrozenFileRegionViewV2 {
+            index,
+            metadata,
+            health,
+        })
     }
 
     fn persist_frozen(&mut self, view: &Self::FrozenView) -> io::Result<Self::PreparedClean> {
-        let source_metadata = &view.runtime.metadata;
+        view.health.require_healthy()?;
+        let source_metadata = &view.metadata;
         source_metadata
             .validate()
             .map_err(region_metadata_io_error)?;
-        let physical_stats = view
-            .runtime
-            .index
-            .physical_stats()
-            .map_err(index_storage_io_error)?;
-        let shard_stats = view
-            .runtime
-            .index
-            .shard_stats()
-            .map_err(index_storage_io_error)?;
+        let storage = view.index.storage();
+        let physical_stats = guarded_index_result(&view.health, storage.physical_stats())?;
+        let shard_stats = guarded_index_result(&view.health, storage.shard_stats())?;
         if physical_stats.masked != 0
             || source_metadata.root.index_slots
-                != u64::try_from(view.runtime.index.slot_count()).map_err(|_| {
+                != u64::try_from(storage.slot_count()).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "V2 index capacity is too large")
                 })?
             || source_metadata.root.physical_value_slots != physical_stats.value
@@ -714,7 +800,7 @@ where
                 "V2 Region metadata is too large",
             )
         })?;
-        let index_slots = u64::try_from(view.runtime.index.slot_count()).map_err(|_| {
+        let index_slots = u64::try_from(storage.slot_count()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "V2 index capacity is too large")
         })?;
         let index_len = recovery_image_index_len_v1(index_slots).ok_or_else(|| {
@@ -775,11 +861,10 @@ where
                 WritePoint::V2RecoveryImageIndex,
                 RECOVERY_IMAGE_INDEX_OFFSET_V1,
             );
-            let written = view
-                .runtime
-                .index
-                .write_warm_image(&mut writer, index_image_binding(header))
-                .map_err(index_storage_io_error)?;
+            let written = guarded_index_result(
+                &view.health,
+                storage.write_warm_image(&mut writer, index_image_binding(header)),
+            )?;
             if written.bytes_written != index_len
                 || written.physical_stats != physical_stats
                 || writer.offset() != region_table_offset
@@ -795,18 +880,24 @@ where
                 region_table_offset,
             )?;
             image.sync(SyncPoint::V2RecoveryImage, SyncMode::Data)?;
+            view.health.require_healthy()?;
             self.file_system.rename(&temporary, &self.files.image)?;
-            self.file_system.sync_parent(&self.files.image)
+            self.file_system.sync_parent(&self.files.image)?;
+            view.health.require_healthy()
         })();
         if persisted.is_err() {
             let _ = self.file_system.remove_file(&temporary);
         }
         persisted?;
         self.prepared_clean = Some((clean_state.slot, clean_state.record));
-        Ok(PreparedFileRegionCleanV2 { state: clean_state })
+        Ok(PreparedFileRegionCleanV2 {
+            state: clean_state,
+            health: view.health.clone(),
+        })
     }
 
     fn publish_clean(&mut self, prepared: Self::PreparedClean) -> io::Result<()> {
+        prepared.health.require_healthy()?;
         if self.prepared_clean.take() != Some((prepared.state.slot, prepared.state.record)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -830,6 +921,7 @@ where
             ));
         }
         let state = self.state_file()?;
+        prepared.health.require_healthy()?;
         write_state_page(state, &prepared.state.page, prepared.state.offset())?;
         state.sync(SyncPoint::V2CleanState, SyncMode::Data)?;
         self.current_state = Some(SelectedStateV2 {
@@ -928,13 +1020,6 @@ impl<B: RegionV2Backend> RegionStoreV2<B> {
 
     pub(crate) const fn startup(&self) -> RegionV2Startup {
         self.startup
-    }
-
-    pub(crate) fn index(&self) -> io::Result<&B::Index> {
-        self.runtime
-            .as_ref()
-            .map(B::runtime_index)
-            .ok_or_else(closed_error)
     }
 
     /// Stop the process without producing a recovery image.
@@ -1121,6 +1206,35 @@ fn maximum_region_metadata_len(region_count: u32) -> io::Result<u64> {
 }
 
 fn empty_shard_metadata(ranges: &[IndexShardRangeV1]) -> io::Result<Box<[ShardMetadataRecordV1]>> {
+    let mut stats = Vec::new();
+    stats.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate V2 index shard statistics",
+        )
+    })?;
+    stats.resize(ranges.len(), IndexPhysicalStats::default());
+    shard_metadata_from_stats(ranges, &stats)
+}
+
+fn index_shard_metadata(
+    index: &ShardedIndexStorage,
+    health: &RegionV2HealthLatch,
+) -> io::Result<Box<[ShardMetadataRecordV1]>> {
+    let stats = guarded_index_result(health, index.shard_stats())?;
+    shard_metadata_from_stats(index.shard_ranges(), &stats)
+}
+
+fn shard_metadata_from_stats(
+    ranges: &[IndexShardRangeV1],
+    stats: &[IndexPhysicalStats],
+) -> io::Result<Box<[ShardMetadataRecordV1]>> {
+    if ranges.len() != stats.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V2 index shard ranges and statistics disagree",
+        ));
+    }
     let mut shards = Vec::new();
     shards.try_reserve_exact(ranges.len()).map_err(|_| {
         io::Error::new(
@@ -1128,7 +1242,7 @@ fn empty_shard_metadata(ranges: &[IndexShardRangeV1]) -> io::Result<Box<[ShardMe
             "cannot allocate V2 index shard directory",
         )
     })?;
-    for range in ranges {
+    for (range, stats) in ranges.iter().zip(stats) {
         shards.push(ShardMetadataRecordV1 {
             shard_id: u32::try_from(range.shard_id).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "V2 shard id is too large")
@@ -1157,9 +1271,9 @@ fn empty_shard_metadata(ranges: &[IndexShardRangeV1]) -> io::Result<Box<[ShardMe
                     "V2 shard slot count is too large",
                 )
             })?,
-            physical_value_slots: 0,
-            physical_deleted_slots: 0,
-            physical_masked_slots: 0,
+            physical_value_slots: stats.value,
+            physical_deleted_slots: stats.deleted,
+            physical_masked_slots: stats.masked,
         });
     }
     Ok(shards.into_boxed_slice())
@@ -1370,6 +1484,16 @@ fn index_storage_io_error(error: IndexStorageError) -> io::Error {
     }
 }
 
+fn guarded_index_result<T>(
+    health: &RegionV2HealthLatch,
+    result: Result<T, IndexStorageError>,
+) -> io::Result<T> {
+    result.map_err(|error| {
+        health.enter_miss_only();
+        index_storage_io_error(error)
+    })
+}
+
 fn closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "RegionStore V2 is closed")
 }
@@ -1377,7 +1501,6 @@ fn closed_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::PackedLocation;
     use crate::index_storage::IndexSlotV1;
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::recovery_v2::{DataGeometryV2, PersistentId};
@@ -1412,7 +1535,6 @@ mod tests {
     }
 
     impl RegionV2Backend for Backend {
-        type Index = usize;
         type Runtime = usize;
         type CleanImage = bool;
         type FrozenView = usize;
@@ -1447,10 +1569,6 @@ mod tests {
         ) -> io::Result<Option<Self::Runtime>> {
             self.record("map")?;
             Ok(clean.then_some(config.index_slots))
-        }
-
-        fn runtime_index(runtime: &Self::Runtime) -> &Self::Index {
-            runtime
         }
 
         fn publish_running(&mut self) -> io::Result<()> {
@@ -1756,18 +1874,10 @@ mod tests {
     }
 
     #[test]
-    fn incoherent_index_metadata_cannot_publish_a_warm_image() {
+    fn transient_index_mask_cannot_publish_a_warm_image() {
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 130 };
         let data = test_data_superblock();
-        let value = IndexSlotV1 {
-            hash: 11,
-            location_raw: PackedLocation::new(0, 0, 32, false).unwrap().raw(),
-            seqno: 33,
-            namespace_id: 44,
-            flags: 0,
-        };
-
         let mut fresh = RegionStoreV2::open_v2(
             config,
             FileRegionV2Backend::new(directory.files.clone(), data),
@@ -1779,7 +1889,14 @@ mod tests {
             .as_mut()
             .unwrap()
             .index
-            .write_slot(0, value)
+            .storage()
+            .write_slot(
+                0,
+                IndexSlotV1::from_state(crate::index_storage::IndexSlotStateV1::Masked {
+                    hash: 11,
+                    seqno: 33,
+                }),
+            )
             .unwrap();
         let error = fresh.close_warm().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1792,8 +1909,8 @@ mod tests {
         .unwrap();
         assert_eq!(dirty.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            dirty.index().unwrap().read_slot(0).unwrap(),
-            IndexSlotV1::EMPTY
+            dirty.runtime.as_ref().unwrap().lookup(11).unwrap(),
+            IndexLookupV2::Miss
         );
         dirty.close_fast().unwrap();
     }
@@ -1859,13 +1976,7 @@ mod tests {
         let directory = TestDirectory::new();
         let config = RegionV2Config { index_slots: 134 };
         let data = test_data_superblock_with_regions(2);
-        let value = IndexSlotV1 {
-            hash: 11,
-            location_raw: PackedLocation::new(0, 0, 32, false).unwrap().raw(),
-            seqno: 1,
-            namespace_id: 0,
-            flags: 0,
-        };
+        let value = IndexSlotV1::DELETED;
 
         let mut first = RegionStoreV2::open_v2(
             config,
@@ -1873,11 +1984,8 @@ mod tests {
         )
         .unwrap();
         let runtime = first.runtime.as_mut().unwrap();
-        assert_eq!(runtime.index.shard_count(), 2);
-        runtime.index.write_slot(133, value).unwrap();
-        let metadata = &mut runtime.metadata;
-        metadata.root.physical_value_slots = 1;
-        metadata.shards[1].physical_value_slots = 1;
+        assert_eq!(runtime.index.storage().shard_count(), 2);
+        runtime.index.storage().write_slot(133, value).unwrap();
         first.close_warm().unwrap();
         assert!(directory.files.image.exists());
 
@@ -1887,8 +1995,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
-        assert_eq!(recovered.index().unwrap().shard_count(), 2);
-        assert_eq!(recovered.index().unwrap().read_slot(133).unwrap(), value);
+        let recovered_runtime = recovered.runtime.as_ref().unwrap();
+        assert_eq!(recovered_runtime.index.storage().shard_count(), 2);
+        assert_eq!(
+            recovered_runtime.index.storage().read_slot(133).unwrap(),
+            value
+        );
         recovered.close_fast().unwrap();
     }
 
@@ -1926,8 +2038,8 @@ mod tests {
         .unwrap();
         assert_eq!(rejected.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            rejected.index().unwrap().read_slot(0).unwrap(),
-            IndexSlotV1::EMPTY
+            rejected.runtime.as_ref().unwrap().lookup(0).unwrap(),
+            IndexLookupV2::Miss
         );
         rejected.close_fast().unwrap();
     }
@@ -1965,13 +2077,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.startup(), RegionV2Startup::CleanMapped);
+        let runtime = recovered.runtime.as_ref().unwrap();
+        assert_eq!(runtime.lookup(0).unwrap(), IndexLookupV2::Miss);
+        assert_eq!(runtime.lookup(1).unwrap(), IndexLookupV2::Miss);
+        assert!(!runtime.health.is_healthy());
+        assert_eq!(runtime.lookup(0).unwrap(), IndexLookupV2::Miss);
+        assert!(recovered.close_warm().is_err());
+
+        let mut cold = RegionStoreV2::open_v2(
+            config,
+            FileRegionV2Backend::new(directory.files.clone(), data),
+        )
+        .unwrap();
+        assert_eq!(cold.startup(), RegionV2Startup::DirtyEmpty);
         assert_eq!(
-            recovered.index().unwrap().read_slot(0).unwrap(),
-            IndexSlotV1::EMPTY
+            cold.runtime.as_ref().unwrap().lookup(1).unwrap(),
+            IndexLookupV2::Miss
         );
-        assert!(recovered.index().unwrap().read_slot(133).is_err());
-        assert!(recovered.index().unwrap().read_slot(0).is_err());
-        recovered.close_fast().unwrap();
+        cold.close_fast().unwrap();
     }
 
     #[test]
@@ -2145,8 +2268,8 @@ mod tests {
             RegionV2Startup::CleanMapped | RegionV2Startup::DirtyEmpty
         ));
         assert_eq!(
-            reopened.index().unwrap().read_slot(0).unwrap(),
-            IndexSlotV1::EMPTY
+            reopened.runtime.as_ref().unwrap().lookup(0).unwrap(),
+            IndexLookupV2::Miss
         );
         reopened.close_fast().unwrap();
     }

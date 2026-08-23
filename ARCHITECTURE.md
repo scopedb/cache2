@@ -207,15 +207,19 @@ fresh/dirty start 使用零页懒分配的 anonymous mapping。clean start 将�
 当前 foundation 已使用单一 mapping owner 和 canonical page-balanced shard ranges：每个 4 KiB
 index page 只属于一个 range，range 分别加锁并维护 physical stats，但共享 page validation 与
 sticky image-health。这样既不会在 16 KiB host page 上产生重叠 MAP_PRIVATE COW 分叉，也能在
-任一 shard 首次发现损坏时 O(1) 拒绝整张 image。production hash operations 和 RegionManager
-仍需在这组 range views 上完成接线。crate-private `RegionIndexV2` 已直接在 range guard 上完成
-64-step bounded lookup/upsert/mask/conditional replace/remove：每次 point operation 只获取一次
-shard lock，完整 probe 成功后最多提交一个 slot，并返回 exact physical transition；foreign
-Masked 永不被 collision 或 reclaimer 覆盖。下一步由 RegionManager 提供 visibility/accounting，
-并接入 corruption → MissOnly → no-CLEAN 生命周期。
+任一 shard 首次发现损坏时 O(1) 拒绝整张 image。crate-private `RegionIndexV2` 已直接在 range
+guard 上完成 64-step bounded lookup/upsert/mask/conditional replace/remove：每次 point
+operation 只获取一次 shard lock，完整 probe 成功后最多提交一个 slot；mutation callback 在
+slot/physical stats 提交后、shard guard 释放前收到 exact transition，foreign Masked 永不被
+collision 或 reclaimer 覆盖。
 
-V2 仍是 crate-private、未发布的 profile；本次四态语义冻结前生成的开发 sidecar 不属于兼容面，
-必须 reset/cold start，不能当作已发布的 Format V1 镜像继续使用。
+`RegionManagerV2` 现在消费恢复 metadata，成为 Region/FIFO/visibility/logical accounting 的
+唯一 live authority；旧 metadata 不留在 runtime。warm freeze 从 manager 和 index 的同一
+quiescent owner 重建 metadata。raw index accessor 已从 RegionStore lifecycle 删除，lazy index
+损坏会单向进入 MissOnly，frozen/prepared CLEAN 都复用同一 health latch 并在发布前复验。
+
+V2 仍是 crate-private、未发布的 greenfield profile。在首个可对外格式冻结前，
+盘上 schema 和运行时结构直接 inplace 收敛，不为开发期 sidecar 保留 adapter、迁移或兼容分支。
 
 不采用 Base + Delta，也不采用运行期 WAL。它们只有在要求“异常退出仍增量恢复”或
 “在线持续发布 checkpoint”时才有必要，而这两个都不是当前 cache 契约。
@@ -237,8 +241,9 @@ mandatory Region metadata pages
 
 V1 物理顺序固定为 header → index pages → Region metadata pages，不能留 gap 或 trailing
 bytes。Region metadata 是 CLEAN image 的必需部分；只有 index 的临时镜像不得编码、发布或
-恢复。当前 crate-private recovery vertical slice 已能冻结、发布并 mmap 恢复完整 image；
-production Region appender/manager 尚未接入该 seam，因此还不是对外数据路径。
+恢复。当前 crate-private recovery vertical slice 已接入 Region manager，能冻结、发布并 mmap
+恢复完整 image；production Region appender 和并发 mutation facade 尚未接入，因此还不是对外
+数据路径。
 
 Region table 只与 Region 数量有关。以 100 GiB、32 MiB Region 计算约 3,200 项。
 slot array 保留物理位置，恢复时不重新 hash。per-region accounting 至少保存 state、
