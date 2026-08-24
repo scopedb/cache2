@@ -11,7 +11,8 @@ use std::ops::Range;
 
 use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
 use crate::io_engine::{
-    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId, submit_cache_io,
+    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId,
+    submit_cache_io_nowait,
 };
 use crate::recovery::{
     DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT, REGION_HEADER_SIZE,
@@ -189,7 +190,7 @@ pub(crate) fn submit_record_read(
             });
         }
     };
-    let request = match submit_cache_io(engine, IoOperation::read(buffer, plan.absolute)) {
+    let request = match submit_cache_io_nowait(engine, IoOperation::read(buffer, plan.absolute)) {
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_lease();

@@ -568,9 +568,13 @@ impl RegionManager {
         Ok(receipt)
     }
 
-    /// Publishes one fully encoded tail reservation into the resident staging
-    /// span. This is not a write completion and therefore does not move
-    /// `completed_used` or physical record accounting.
+    /// Commits one tail reservation to the manager's resident staging span.
+    ///
+    /// The production caller holds the shard mutation gate, commits here, and
+    /// then encodes the matching bytes before releasing that gate. Any encode
+    /// failure is terminal for the runtime, so no worker can seal manager
+    /// accounting without its exact staged bytes. This is not a write
+    /// completion and does not move `completed_used` or physical accounting.
     pub(crate) fn stage_reservation(
         &mut self,
         receipt: RegionAppendReservation,
@@ -712,6 +716,7 @@ impl RegionManager {
     /// Cancels only the current, not-yet-staged tail. Sequence numbers remain
     /// consumed, but the reservation cursor is rolled back exactly because no
     /// later reservation can exist on the same shard.
+    #[cfg(test)]
     pub(crate) fn cancel_reservation(
         &mut self,
         receipt: RegionAppendReservation,

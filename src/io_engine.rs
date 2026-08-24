@@ -4,14 +4,13 @@
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -568,6 +567,7 @@ impl CompletionState {
 pub(crate) struct IoRequest {
     request_id: RequestId,
     completion: Arc<CompletionState>,
+    control: Arc<RequestControl>,
     finished: bool,
 }
 
@@ -647,7 +647,7 @@ impl BoundedIoRequest {
             Ok(completion) => return Ok(completion),
             Err(request) => request,
         };
-        let cancel_error = engine.cancel(request.id()).err();
+        let cancel_error = engine.cancel(request.id(), request.control.as_ref()).err();
         let grace_deadline = Instant::now()
             .checked_add(self.cancel_grace)
             .unwrap_or_else(Instant::now);
@@ -708,6 +708,26 @@ pub(crate) fn submit_cache_io(
     submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
 }
 
+/// Submit one cache-device request without waiting for engine capacity.
+///
+/// Foreground L2 reads use this after acquiring their fixed read buffer. A
+/// saturated engine is therefore an immediate L2 miss decision, never a
+/// second request-admission wait hidden behind the buffer admission boundary.
+pub(crate) fn submit_cache_io_nowait(
+    engine: &dyn IoEngine,
+    operation: IoOperation,
+) -> Result<BoundedIoRequest, SubmitError> {
+    let deadline = Instant::now()
+        .checked_add(CACHE_IO_COMPLETION_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let request = engine.submit_nowait(operation)?;
+    Ok(BoundedIoRequest {
+        request,
+        deadline,
+        cancel_grace: CACHE_IO_CANCEL_GRACE,
+    })
+}
+
 fn submit_cache_io_until(
     engine: &dyn IoEngine,
     operation: IoOperation,
@@ -732,8 +752,11 @@ pub(crate) enum FileIoEngineKind {
 }
 
 pub(crate) trait IoEngine: Send + Sync {
+    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.submit_nowait(operation)
+    }
     #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     fn submit_wait_controlled(
@@ -743,7 +766,7 @@ pub(crate) trait IoEngine: Send + Sync {
         deadline: Option<Instant>,
     ) -> Result<IoRequest, SubmitError>;
     fn wake_admission_waiters(&self);
-    fn cancel(&self, request_id: RequestId) -> io::Result<bool>;
+    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool>;
     fn shutdown(&self) -> io::Result<()>;
     fn in_flight(&self) -> usize;
     #[cfg(test)]
@@ -797,7 +820,7 @@ pub(crate) struct IoEngineStats {
     pub(crate) buffered_bytes: u64,
 }
 
-struct RequestControl {
+pub(crate) struct RequestControl {
     cancel_requested: AtomicBool,
     cancel_notified: AtomicBool,
 }
@@ -845,7 +868,6 @@ struct RuntimeShared {
     unfenced_mutations: AtomicBool,
     admission_lock: Mutex<()>,
     admission_available: Condvar,
-    registry: Mutex<HashMap<RequestId, Arc<RequestControl>>>,
 }
 
 enum AdmissionWaitError {
@@ -872,13 +894,13 @@ impl RuntimeShared {
             unfenced_mutations: AtomicBool::new(false),
             admission_lock: Mutex::new(()),
             admission_available: Condvar::new(),
-            registry: Mutex::new(HashMap::with_capacity(queue_depth)),
         }
     }
 
     fn try_admit(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
+        const MAX_ADMISSION_CAS_ATTEMPTS: usize = 8;
         let mut current = self.in_flight.load(Ordering::Acquire);
-        loop {
+        for _ in 0..MAX_ADMISSION_CAS_ATTEMPTS {
             if current >= self.queue_depth {
                 return None;
             }
@@ -901,6 +923,7 @@ impl RuntimeShared {
                 Err(observed) => current = observed,
             }
         }
+        None
     }
 
     #[cfg(test)]
@@ -1068,7 +1091,6 @@ impl RuntimeShared {
         permit: AdmissionPermit,
         submitted_at: Instant,
     ) {
-        lock_unpoisoned(&self.registry).remove(&request_id);
         self.completed.fetch_add(1, Ordering::Relaxed);
         match &status {
             CompletionStatus::Completed => {}
@@ -1173,15 +1195,15 @@ struct ShutdownState {
 struct RuntimeInner {
     shared: Arc<RuntimeShared>,
     commands: SyncSender<DriverCommand>,
-    submit_state: Arc<Mutex<SubmitState>>,
+    submit_state: Arc<RwLock<SubmitState>>,
     next_request_id: AtomicU64,
     wake: Option<Arc<dyn DriverWake>>,
     workers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
     shutdown: ShutdownState,
 }
 
+#[derive(Clone, Copy)]
 enum AdmissionMode<'a> {
-    #[cfg(test)]
     Try,
     #[cfg(test)]
     Wait,
@@ -1207,17 +1229,17 @@ impl RuntimeInner {
         // those bits for internal/cancel CQEs. Wrapping is practically
         // unreachable, but skipping zero preserves the invariant.
         const MAX_REQUEST_ID: u64 = (1_u64 << 62) - 1;
-        loop {
-            let observed = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let id = observed & MAX_REQUEST_ID;
-            if id != 0 {
-                return RequestId(id);
-            }
+        let observed = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let id = observed & MAX_REQUEST_ID;
+        if id != 0 {
+            return RequestId(id);
         }
+        let next = self.next_request_id.fetch_add(1, Ordering::Relaxed) & MAX_REQUEST_ID;
+        debug_assert_ne!(next, 0);
+        RequestId(next)
     }
 
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, AdmissionMode::Try)
     }
 
@@ -1252,11 +1274,9 @@ impl RuntimeInner {
         }
         let mutation = operation.kind().is_mutation();
         let permit = match admission_mode {
-            #[cfg(test)]
             AdmissionMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
             ),
-            #[cfg(test)]
             AdmissionMode::Try => self
                 .shared
                 .try_admit(mutation)
@@ -1290,7 +1310,31 @@ impl RuntimeInner {
                 return Err(SubmitError { error, operation });
             }
         };
-        let submit_state = lock_unpoisoned(&self.submit_state);
+        let submit_state = match admission_mode {
+            AdmissionMode::Try => match self.submit_state.try_read() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => {
+                    drop(permit);
+                    return Err(SubmitError {
+                        error: io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "I/O submission fence is busy",
+                        ),
+                        operation,
+                    });
+                }
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            },
+            #[cfg(test)]
+            AdmissionMode::Wait => self
+                .submit_state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            AdmissionMode::Controlled { .. } => self
+                .submit_state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
         if !submit_state.accepting {
             drop(permit);
             return Err(SubmitError {
@@ -1301,7 +1345,7 @@ impl RuntimeInner {
         let request_id = self.next_request_id();
         let completion = Arc::new(CompletionState::new());
         let control = Arc::new(RequestControl::new());
-        lock_unpoisoned(&self.shared.registry).insert(request_id, Arc::clone(&control));
+        let request_control = Arc::clone(&control);
         let task = Task {
             request_id,
             operation,
@@ -1321,12 +1365,12 @@ impl RuntimeInner {
                 Ok(IoRequest {
                     request_id,
                     completion,
+                    control: request_control,
                     finished: false,
                 })
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
                 self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
-                lock_unpoisoned(&self.shared.registry).remove(&request_id);
                 let Task {
                     operation, permit, ..
                 } = task;
@@ -1338,7 +1382,6 @@ impl RuntimeInner {
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
                 self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
-                lock_unpoisoned(&self.shared.registry).remove(&request_id);
                 let Task {
                     operation, permit, ..
                 } = task;
@@ -1354,13 +1397,7 @@ impl RuntimeInner {
         }
     }
 
-    fn cancel(&self, request_id: RequestId) -> io::Result<bool> {
-        let control = lock_unpoisoned(&self.shared.registry)
-            .get(&request_id)
-            .cloned();
-        let Some(control) = control else {
-            return Ok(false);
-        };
+    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
         if !control.cancel_requested.swap(true, Ordering::AcqRel) {
             self.shared.cancel_requested.fetch_add(1, Ordering::Relaxed);
         }
@@ -1382,7 +1419,10 @@ impl RuntimeInner {
     }
 
     fn stop_admission(&self) {
-        let mut submit_state = lock_unpoisoned(&self.submit_state);
+        let mut submit_state = self
+            .submit_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
         {
             let _admission = lock_unpoisoned(&self.shared.admission_lock);
@@ -1421,7 +1461,10 @@ impl RuntimeInner {
 
         let worker_count = lock_unpoisoned(&self.workers).len();
         let send_error = {
-            let mut submit_state = lock_unpoisoned(&self.submit_state);
+            let mut submit_state = self
+                .submit_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
             {
                 let _admission = lock_unpoisoned(&self.shared.admission_lock);
@@ -1543,7 +1586,7 @@ impl BackendIoEngine {
             inner: Arc::new(RuntimeInner {
                 shared,
                 commands,
-                submit_state: Arc::new(Mutex::new(SubmitState { accepting: true })),
+                submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
                 next_request_id: AtomicU64::new(1),
                 wake: None,
                 workers: Mutex::new(workers),
@@ -1558,9 +1601,8 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit(operation)
+    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner.submit_nowait(operation)
     }
 
     #[cfg(test)]
@@ -1582,8 +1624,8 @@ impl IoEngine for BackendIoEngine {
         self.inner.shared.wake_admission_waiters();
     }
 
-    fn cancel(&self, request_id: RequestId) -> io::Result<bool> {
-        self.inner.cancel(request_id)
+    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
+        self.inner.cancel(request_id, control)
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -1737,26 +1779,27 @@ mod uring {
     const LINUX_ECANCELED: i32 = 125;
     const LINUX_POLLIN: u32 = 0x0001;
     const FATAL_DRAIN_ROUNDS: usize = 64;
+    const MAX_WAKE_ATTEMPTS: usize = 4;
 
     struct SocketWake {
-        sender: Mutex<UnixStream>,
+        sender: UnixStream,
     }
 
     impl DriverWake for SocketWake {
         fn wake(&self) {
-            let mut sender = lock_unpoisoned(&self.sender);
-            loop {
+            let mut sender = &self.sender;
+            for _ in 0..MAX_WAKE_ATTEMPTS {
                 match sender.write(&[1]) {
-                    Ok(1) => break,
+                    Ok(1) => return,
                     Ok(0) => continue,
                     Ok(_) => unreachable!("one-byte wake write cannot write more than one byte"),
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                     Err(_) => {
                         // Closing or failing the socket also completes the
                         // driver's outstanding read, so it will observe the
                         // command channel instead of treating this as success.
-                        break;
+                        return;
                     }
                 }
             }
@@ -1821,7 +1864,7 @@ mod uring {
             let (wake_sender, wake_receiver) = UnixStream::pair()?;
             wake_sender.set_nonblocking(true)?;
             let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
-                sender: Mutex::new(wake_sender),
+                sender: wake_sender,
             });
             let shared = Arc::new(RuntimeShared::new(queue_depth));
             let command_capacity = queue_depth
@@ -1831,7 +1874,7 @@ mod uring {
                     io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow")
                 })?;
             let (commands, receiver) = mpsc::sync_channel(command_capacity);
-            let submit_state = Arc::new(Mutex::new(SubmitState { accepting: true }));
+            let submit_state = Arc::new(RwLock::new(SubmitState { accepting: true }));
             let worker_shared = Arc::clone(&shared);
             let worker_submit_state = Arc::clone(&submit_state);
             let worker = std::thread::Builder::new()
@@ -1875,9 +1918,8 @@ mod uring {
     }
 
     impl IoEngine for UringIoEngine {
-        #[cfg(test)]
-        fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-            self.inner.submit(operation)
+        fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+            self.inner.submit_nowait(operation)
         }
 
         #[cfg(test)]
@@ -1899,8 +1941,8 @@ mod uring {
             self.inner.shared.wake_admission_waiters();
         }
 
-        fn cancel(&self, request_id: RequestId) -> io::Result<bool> {
-            self.inner.cancel(request_id)
+        fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
+            self.inner.cancel(request_id, control)
         }
 
         fn shutdown(&self) -> io::Result<()> {
@@ -1972,7 +2014,7 @@ mod uring {
         wake_cancel_submitted: bool,
         wake_cancel_completed: bool,
         shared: Arc<RuntimeShared>,
-        submit_state: Arc<Mutex<SubmitState>>,
+        submit_state: Arc<RwLock<SubmitState>>,
         receiver: Receiver<DriverCommand>,
         flights: HashMap<RequestId, Flight>,
         pending_targets: VecDeque<RequestId>,
@@ -1985,7 +2027,7 @@ mod uring {
         ring: IoUring,
         wake_receiver: UnixStream,
         shared: Arc<RuntimeShared>,
-        submit_state: Arc<Mutex<SubmitState>>,
+        submit_state: Arc<RwLock<SubmitState>>,
         receiver: Receiver<DriverCommand>,
     ) -> io::Result<()> {
         let queue_depth = shared.queue_depth;
@@ -2381,9 +2423,13 @@ mod uring {
         }
 
         fn stop_accepting_and_fail_all(&mut self, error: &io::Error) {
-            // Submission holds this same mutex through the bounded channel
-            // send. Once acquired here, no task can appear after the drain.
-            let mut submit_state = lock_unpoisoned(&self.submit_state);
+            // Submission holds a shared fence through the bounded channel send.
+            // Once this exclusive guard is acquired, no task can appear after
+            // the drain.
+            let mut submit_state = self
+                .submit_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
             {
                 let _admission = lock_unpoisoned(&self.shared.admission_lock);
@@ -2724,20 +2770,20 @@ pub(crate) fn build_file_engine(
 }
 
 fn update_peak(peak: &AtomicUsize, value: usize) {
-    let mut observed = peak.load(Ordering::Relaxed);
-    while value > observed {
-        match peak.compare_exchange_weak(observed, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(actual) => observed = actual,
-        }
-    }
+    peak.fetch_max(value, Ordering::Relaxed);
 }
 
 fn add_duration_ns(counter: &AtomicU64, duration: std::time::Duration) {
+    const MAX_DURATION_CAS_ATTEMPTS: usize = 8;
     let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(nanos))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    for _ in 0..MAX_DURATION_CAS_ATTEMPTS {
+        let next = current.saturating_add(nanos);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -3227,6 +3273,27 @@ mod tests {
     }
 
     #[test]
+    fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
+        let file = TestFile::new();
+        let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
+        let resources = resources(1);
+        let fence = engine
+            .inner
+            .submit_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let rejected = engine
+            .submit(IoOperation::read(read_buffer(&resources, 1), 0))
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(engine.in_flight(), 0);
+
+        drop(fence);
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
     fn backend_workers_execute_independent_reads_concurrently() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
@@ -3410,7 +3477,6 @@ mod tests {
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
         let control = Arc::new(RequestControl::new());
-        lock_unpoisoned(&shared.registry).insert(request_id, Arc::clone(&control));
         shared.submitted.fetch_add(1, Ordering::Relaxed);
 
         let resources = resources(1);

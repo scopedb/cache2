@@ -270,6 +270,49 @@ impl RegionStaging {
         self.chunk_bytes
     }
 
+    /// Checks the fixed fill capacity before the manager allocates a receipt.
+    ///
+    /// The caller holds the shard mutation gate through this check, manager
+    /// reservation, and [`Self::encode_reserved`], so a successful preflight
+    /// cannot turn into ordinary staging saturation before encoding begins.
+    pub(crate) fn preflight_append(
+        &self,
+        shard_id: usize,
+        record_bytes: u32,
+    ) -> Result<StageAppend, StagingError> {
+        let record_bytes = usize::try_from(record_bytes)
+            .map_err(|_| StagingError::Invariant("staging record length does not fit usize"))?;
+        if record_bytes == 0
+            || record_bytes > self.chunk_bytes
+            || record_bytes % RECORD_ALIGNMENT as usize != 0
+        {
+            return Err(StagingError::Invariant(
+                "staging preflight record length is invalid",
+            ));
+        }
+        let shard = self
+            .shards
+            .get(shard_id)
+            .ok_or(StagingError::InvalidShard)?;
+        let state = lock_unpoisoned(&shard.state);
+        ensure_open(&state)?;
+        if state.encoding.is_some() {
+            return Err(StagingError::WouldBlock);
+        }
+        let used = state
+            .fill
+            .used()
+            .ok_or(StagingError::Invariant("staging fill length overflow"))?;
+        if state.fill.records.len() == MAX_STAGING_RECORDS
+            || used
+                .checked_add(record_bytes)
+                .is_none_or(|end| end > self.chunk_bytes)
+        {
+            return Ok(StageAppend::NeedsSeal);
+        }
+        Ok(StageAppend::Appended)
+    }
+
     /// Returns the currently sealable fill prefix without waiting for an
     /// encoder or an earlier submitted span. `Ok(None)` is the only empty-shard
     /// result, so a shard worker never has to probe the manager by attempting
@@ -905,7 +948,7 @@ mod tests {
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
             resources.snapshot().memory_used_bytes,
-            (2 * 4096 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()) as u64
+            (4 * 4096 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()) as u64
         );
 
         let (first, first_record) = reservation(REGION_HEADER_SIZE, 64, 11);

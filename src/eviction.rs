@@ -6,6 +6,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
+/// Maximum policy metadata inspected by one foreground victim selection.
+/// Exhausting this budget means L1 bypass; it never expands with cache size.
+const MAX_POLICY_SCAN_STEPS: usize = 64;
+const FREQUENCY_AGE_BATCH: usize = 64;
+
 /// Runtime-selectable RAM-tier eviction policy.
 ///
 /// This setting never participates in the persistent cache fingerprint and may
@@ -131,7 +136,7 @@ impl SlotList {
 
     fn oldest_evictable(&self, slots: &[PolicySlot]) -> Option<usize> {
         let mut candidate = self.tail;
-        for _ in 0..self.len {
+        for _ in 0..self.len.min(MAX_POLICY_SCAN_STEPS) {
             let index = candidate?;
             let slot = &slots[index];
             if slot.resident && slot.evictable {
@@ -380,7 +385,11 @@ impl EvictionState {
 }
 
 fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelection {
-    let maximum_steps = slots.len().saturating_mul(2).saturating_add(1);
+    let maximum_steps = slots
+        .len()
+        .saturating_mul(2)
+        .saturating_add(1)
+        .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
         if slots.is_empty() {
             break;
@@ -413,7 +422,12 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
         return VictimSelection::None;
     }
     let mut candidate = state.hand.or(state.entries.tail);
-    let maximum_steps = state.entries.len.saturating_mul(2).saturating_add(1);
+    let maximum_steps = state
+        .entries
+        .len
+        .saturating_mul(2)
+        .saturating_add(1)
+        .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
         let Some(index) = candidate else {
             break;
@@ -434,7 +448,11 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
 }
 
 fn select_s3fifo(state: &mut S3FifoState, slots: &mut [PolicySlot]) -> VictimSelection {
-    let maximum_steps = slots.len().saturating_mul(5).saturating_add(1);
+    let maximum_steps = slots
+        .len()
+        .saturating_mul(5)
+        .saturating_add(1)
+        .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
         let prefer_main = state.main.weight > state.main_target_bytes || state.small.len == 0;
         if !prefer_main {
@@ -481,6 +499,8 @@ struct FrequencySketch {
     width: usize,
     events: usize,
     sample_size: usize,
+    age_cursor: usize,
+    aging: bool,
 }
 
 impl FrequencySketch {
@@ -491,6 +511,8 @@ impl FrequencySketch {
                 width: 0,
                 events: 0,
                 sample_size: 0,
+                age_cursor: 0,
+                aging: false,
             });
         }
         let width = maximum_entries
@@ -513,6 +535,8 @@ impl FrequencySketch {
             width,
             events: 0,
             sample_size: maximum_entries.saturating_mul(10).max(1),
+            age_cursor: 0,
+            aging: false,
         })
     }
 
@@ -536,10 +560,22 @@ impl FrequencySketch {
         }
         self.events += 1;
         if self.events >= self.sample_size {
-            for counter in &mut self.counters {
+            self.aging = true;
+        }
+        if self.aging {
+            let end = self
+                .age_cursor
+                .saturating_add(FREQUENCY_AGE_BATCH)
+                .min(self.counters.len());
+            for counter in &mut self.counters[self.age_cursor..end] {
                 *counter >>= 1;
             }
-            self.events /= 2;
+            self.age_cursor = end;
+            if self.age_cursor == self.counters.len() {
+                self.age_cursor = 0;
+                self.aging = false;
+                self.events /= 2;
+            }
         }
     }
 

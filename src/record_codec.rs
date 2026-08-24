@@ -117,6 +117,7 @@ pub(crate) fn planned_record_bytes(
 /// path. Staging may later extend the final record of a sealed batch, rewriting
 /// its header and completion descriptor together.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn encode_value_into(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
@@ -127,6 +128,31 @@ pub(crate) fn encode_value_into(
     expires_at: u64,
 ) -> Result<EncodedValue, RecordEncodeError> {
     let required = required_record_bytes(namespace_id, key.len(), value.len())?;
+    let hash = hash_namespaced_key(hash_seed, namespace_id, key);
+    encode_value_into_hashed(
+        destination,
+        reservation,
+        hash,
+        required,
+        namespace_id,
+        key,
+        value,
+        expires_at,
+    )
+}
+
+/// Encodes using point metadata computed once by the public operation entry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_value_into_hashed(
+    destination: &mut [u8],
+    reservation: RegionAppendReservation,
+    hash: u64,
+    required: u32,
+    namespace_id: u32,
+    key: &[u8],
+    value: &[u8],
+    expires_at: u64,
+) -> Result<EncodedValue, RecordEncodeError> {
     let destination_len = destination.len();
     let reserved_len =
         usize::try_from(reservation.record_bytes).map_err(|_| RecordEncodeError::LengthOverflow)?;
@@ -174,7 +200,6 @@ pub(crate) fn encode_value_into(
     }
 
     let namespace_bytes = namespace_id.to_le_bytes();
-    let hash = hash_namespaced_key(hash_seed, namespace_id, key);
     let mut payload_crc = Crc32c::new();
     if namespace_id != 0 {
         payload_crc.update(&namespace_bytes);

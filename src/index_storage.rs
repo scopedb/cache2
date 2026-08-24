@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
@@ -547,6 +547,12 @@ pub(crate) enum IndexStorageError {
         page: usize,
         page_count: usize,
     },
+    PageBusy {
+        page_index: usize,
+    },
+    PartitionBusy {
+        partition_id: usize,
+    },
     CorruptPage {
         page_index: usize,
         reason: CorruptPageReason,
@@ -576,6 +582,12 @@ impl fmt::Display for IndexStorageError {
             Self::PageOutOfBounds { page, page_count } => {
                 write!(formatter, "index page {page} is outside {page_count} pages")
             }
+            Self::PageBusy { page_index } => {
+                write!(formatter, "index page {page_index} is being validated")
+            }
+            Self::PartitionBusy { partition_id } => {
+                write!(formatter, "index partition {partition_id} is being mutated")
+            }
             Self::CorruptPage { page_index, reason } => {
                 write!(formatter, "index page {page_index} is corrupt: {reason}")
             }
@@ -601,6 +613,8 @@ impl std::error::Error for IndexStorageError {
             | Self::SizeOverflow
             | Self::SlotOutOfBounds { .. }
             | Self::PageOutOfBounds { .. }
+            | Self::PageBusy { .. }
+            | Self::PartitionBusy { .. }
             | Self::CorruptPage { .. }
             | Self::CorruptSlot { .. }
             | Self::InvalidPhysicalStats
@@ -1050,7 +1064,9 @@ impl IndexStorageCore {
                         }
                     }
                 }
-                PAGE_STATE_VALIDATING => std::hint::spin_loop(),
+                PAGE_STATE_VALIDATING => {
+                    return Err(IndexStorageError::PageBusy { page_index: page });
+                }
                 _ => {
                     self.reject_image();
                     state.store(PAGE_STATE_REJECTED, Ordering::Release);
@@ -1293,12 +1309,24 @@ impl PartitionedIndexStorage {
         &self.ranges
     }
 
-    pub(crate) fn read_hash_partition(&self, hash: u64) -> IndexPartitionReadGuard<'_> {
+    pub(crate) fn try_read_hash_partition(
+        &self,
+        hash: u64,
+    ) -> Result<IndexPartitionReadGuard<'_>, IndexStorageError> {
         let partition = index_partition_for(hash, self.partitions.len());
-        IndexPartitionReadGuard {
+        let guard = match self.partitions[partition].try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(IndexStorageError::PartitionBusy {
+                    partition_id: partition,
+                });
+            }
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        Ok(IndexPartitionReadGuard {
             range: self.ranges[partition],
-            guard: read_unpoisoned(&self.partitions[partition]),
-        }
+            guard,
+        })
     }
 
     pub(crate) fn write_hash_partition(&self, hash: u64) -> IndexPartitionWriteGuard<'_> {

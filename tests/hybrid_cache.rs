@@ -2,11 +2,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cache_rs::{
-    CacheHealth, CacheTier, EvictionPolicy, HybridCacheConfig, IoEngine, RegionSetConfig,
-    RuntimeConfig, StartupMode, StaticConfig,
+    CacheHealth, CacheTier, EvictionPolicy, HybridCacheConfig, IoEngine, ReadBufferPolicy,
+    RegionSetConfig, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -99,6 +99,23 @@ fn rewrite_page_version(path: &std::path::Path, offset: u64, version: u16) {
     file.sync_all().unwrap();
 }
 
+fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match put() {
+            Ok(value) => return value,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "write staging did not make progress"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("cache write failed: {error}"),
+        }
+    }
+}
+
 #[test]
 fn fast_close_always_reopens_empty() {
     let files = TestCache::new("fast-close");
@@ -123,11 +140,80 @@ fn latest_put_is_immediately_visible_before_drain() {
     let files = TestCache::new("latest-memory-visible");
     let cache = files.config(2).open().unwrap();
     for version in 0_u8..64 {
-        cache.put("key", [version; 1024]).unwrap();
+        eventually_admitted(|| cache.put("key", [version; 1024]));
         let value = cache.get("key").unwrap().unwrap();
         assert_eq!(value.tier(), CacheTier::Memory);
         assert_eq!(value.as_ref(), &[version; 1024]);
     }
+    cache.close_fast().unwrap();
+}
+
+#[test]
+fn reject_returns_when_fixed_staging_needs_a_flush() {
+    let files = TestCache::new("reject-staging-flush");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(1)
+        .with_io_queue_depth(4)
+        .with_submission_queue_depths(4, 4)
+        .with_read_buffer_slots(2)
+        .with_memory_capacity(1024 * 1024)
+        .with_memory_budget(32 * 1024 * 1024)
+        .with_memory_shards(1)
+        .with_staging(256 * 1024, 256 * 1024)
+        .with_partial_flush_age(Duration::from_secs(60))
+        .with_stats(true);
+    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let first = vec![1_u8; 200 * 1024];
+    let second = vec![2_u8; 200 * 1024];
+
+    cache.put("key", &first).unwrap();
+    let error = match cache.put("key", &second) {
+        Err(error) => error,
+        Ok(_) => panic!("fixed staging accepted a second oversized resident batch"),
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(cache.get("key").unwrap().unwrap().as_ref(), first);
+    assert_eq!(cache.snapshot().unwrap().buffer_saturation, 1);
+    let queues = cache.detailed_snapshot().unwrap().queues;
+    assert_eq!(queues.write_staging_rejections, 1);
+    assert_eq!(queues.write_staging_wait_ns, 0);
+
+    cache.drain().unwrap();
+    eventually_admitted(|| cache.put("key", &second));
+    assert_eq!(cache.get("key").unwrap().unwrap().as_ref(), second);
+    cache.close_fast().unwrap();
+}
+
+#[test]
+fn l1_bypass_masks_the_old_region_value_without_waiting() {
+    let files = TestCache::new("l1-bypass-publication");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(2)
+        .with_io_queue_depth(8)
+        .with_submission_queue_depths(16, 16)
+        .with_read_buffer_slots(8)
+        .with_memory_capacity(512)
+        .with_memory_budget(32 * 1024 * 1024)
+        .with_memory_shards(1)
+        .with_staging(256 * 1024, 128 * 1024)
+        .with_partial_flush_age(Duration::from_secs(60))
+        .with_stats(true);
+    let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
+
+    cache.put("key", "old").unwrap();
+    cache.drain().unwrap();
+    let replacement = vec![9_u8; 1024];
+    cache.put("key", &replacement).unwrap();
+    assert_eq!(cache.snapshot().unwrap().l1_bypasses, 1);
+    assert!(cache.get("key").unwrap().is_none());
+
+    cache.drain().unwrap();
+    let value = cache.get("key").unwrap().unwrap();
+    assert_eq!(value.tier(), CacheTier::Region);
+    assert_eq!(value.as_ref(), replacement);
+    drop(value);
     cache.close_fast().unwrap();
 }
 
@@ -142,7 +228,7 @@ fn concurrent_first_operations_share_one_runtime() {
             scope.spawn(move || {
                 let key = ordinal.to_le_bytes();
                 let value = [ordinal as u8; 1024];
-                cache.put(key, value).unwrap();
+                eventually_admitted(|| cache.put(key, value));
                 assert_eq!(cache.get(key).unwrap().unwrap().as_ref(), &value);
             });
         }
@@ -158,7 +244,7 @@ fn latest_put_survives_warm_recovery() {
     let files = TestCache::new("latest-warm-recovery");
     let cache = files.config(3).open().unwrap();
     for version in 0_u8..64 {
-        cache.put("key", [version; 1024]).unwrap();
+        eventually_admitted(|| cache.put("key", [version; 1024]));
     }
     cache.close_warm().unwrap();
 
@@ -257,13 +343,13 @@ fn namespace_region_sets_rotate_and_recover_independently() {
 
     // Rotate BULK once so its first Region becomes a reclaimable sealed
     // candidate. Repeated HOT rotation must never select that Region.
-    cache.put_in(BULK, "bulk-survivor", &value).unwrap();
-    cache.put_in(BULK, "bulk-fill-1", &value).unwrap();
-    cache.put_in(BULK, "bulk-fill-2", &value).unwrap();
+    eventually_admitted(|| cache.put_in(BULK, "bulk-survivor", &value));
+    eventually_admitted(|| cache.put_in(BULK, "bulk-fill-1", &value));
+    eventually_admitted(|| cache.put_in(BULK, "bulk-fill-2", &value));
     cache.drain().unwrap();
 
     for ordinal in 0..12 {
-        cache.put_in(HOT, format!("hot-{ordinal}"), &value).unwrap();
+        eventually_admitted(|| cache.put_in(HOT, format!("hot-{ordinal}"), &value));
         cache.drain().unwrap();
     }
 
@@ -304,7 +390,7 @@ fn namespace_region_sets_rotate_and_recover_independently() {
 
 #[test]
 fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 5] = [
+    let cases: [RuntimeConfigCase; 7] = [
         ("workers-exceed-queue", |config| {
             config
                 .with_io_engine(IoEngine::Sync)
@@ -332,6 +418,12 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
                 .with_submission_queue_depths(65_537, 1)
         }),
         ("zero-memory-shards", |config| config.with_memory_shards(0)),
+        ("partial-flush-age-out-of-range", |config| {
+            config.with_partial_flush_age(Duration::from_secs(24 * 60 * 60 + 1))
+        }),
+        ("zero-read-buffer-wait", |config| {
+            config.with_read_buffer_policy(ReadBufferPolicy::Wait(Duration::ZERO))
+        }),
     ];
 
     for (case, configure) in cases {
@@ -401,9 +493,7 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
     let cache = files.config(4).open().unwrap();
 
     for ordinal in 0_u64..128 {
-        cache
-            .put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024])
-            .unwrap();
+        eventually_admitted(|| cache.put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024]));
     }
     cache.drain().unwrap();
 
@@ -423,7 +513,10 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
     assert_eq!(detailed.summary, resources);
     assert_eq!(detailed.queues.read_requests_in_flight, 0);
     assert_eq!(detailed.queues.write_requests_in_flight, 0);
-    assert!(detailed.queues.write_requests_peak > 0);
+    assert_eq!(
+        detailed.queues.write_requests_peak, 0,
+        "reject-mode puts use shard staging directly"
+    );
     assert_eq!(detailed.io.in_flight, 0);
     assert_eq!(detailed.io.completed, detailed.io.submitted);
     assert!(
@@ -515,13 +608,60 @@ fn read_io_failure_is_counted_and_latches_miss_only() {
         .set_len(4096)
         .unwrap();
     assert!(cache.get("key").unwrap().is_none());
-
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.health, CacheHealth::MissOnly);
     assert_eq!(snapshot.l1_misses, 1);
     assert_eq!(snapshot.l2_misses, 1);
     assert_eq!(snapshot.io_failures, 1);
     cache.close_fast().unwrap();
+}
+
+#[test]
+fn promoted_l2_values_release_the_read_buffer_before_return() {
+    let files = TestCache::new("promoted-l2-buffer-release");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(1)
+        .with_io_queue_depth(4)
+        .with_submission_queue_depths(1, 4)
+        .with_read_buffer_slots(1)
+        .with_memory_capacity(64 * 1024)
+        .with_memory_budget(32 * 1024 * 1024)
+        .with_memory_shards(1)
+        .with_staging(256 * 1024, 128 * 1024)
+        .with_stats(true);
+    let cache = files
+        .config(1)
+        .with_runtime_config(runtime.clone())
+        .open()
+        .unwrap();
+    cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
+    cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
+    cache.drain().unwrap();
+    cache.close_warm().unwrap();
+
+    let reopened = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let first = reopened.get("key-1").unwrap().unwrap();
+    assert_eq!(first.tier(), CacheTier::Region);
+    assert_eq!(first.as_ref(), vec![3_u8; 16 * 1024]);
+    assert_eq!(
+        reopened
+            .detailed_snapshot()
+            .unwrap()
+            .queues
+            .read_buffers_in_use,
+        0
+    );
+
+    let second = reopened.get("key-2").unwrap().unwrap();
+    assert_eq!(second.tier(), CacheTier::Region);
+    assert_eq!(second.as_ref(), vec![4_u8; 16 * 1024]);
+    let snapshot = reopened.detailed_snapshot().unwrap();
+    assert_eq!(snapshot.queues.read_buffers_in_use, 0);
+    assert_eq!(snapshot.queues.read_buffer_rejections, 0);
+    assert_eq!(snapshot.summary.promotions, 2);
+    drop((first, second));
+    reopened.close_fast().unwrap();
 }
 
 #[test]
@@ -538,22 +678,112 @@ fn retained_l2_value_reports_buffer_saturation() {
         .with_staging(256 * 1024, 128 * 1024)
         .with_stats(true);
     let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
-    cache.put("key", vec![3_u8; 16 * 1024]).unwrap();
+    cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
+    cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
     cache.drain().unwrap();
 
-    let retained = cache.get("key").unwrap().unwrap();
-    let error = match cache.get("key") {
+    let retained = cache.get("key-1").unwrap().unwrap();
+    assert!(cache.get("missing").unwrap().is_none());
+    let error = match cache.get("key-2") {
         Err(error) => error,
-        Ok(_) => panic!("second L2 read exceeded its one-slot buffer pool"),
+        Ok(_) => panic!("second L2 candidate exceeded its one-slot buffer pool"),
     };
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.l2_hits, 1);
+    assert_eq!(snapshot.l2_misses, 1);
     assert_eq!(snapshot.buffer_saturation, 1);
     assert_eq!(snapshot.queue_saturation, 0);
     let detailed = cache.detailed_snapshot().unwrap();
     assert_eq!(detailed.queues.read_buffers_in_use, 1);
     assert_eq!(detailed.queues.read_buffer_rejections, 1);
+    drop(retained);
+    cache.close_fast().unwrap();
+}
+
+#[test]
+fn bounded_read_buffer_wait_reprobes_l2_before_reading() {
+    let files = TestCache::new("read-buffer-wait-reprobe");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(1)
+        .with_io_queue_depth(4)
+        .with_submission_queue_depths(1, 4)
+        .with_read_buffer_slots(1)
+        .with_read_buffer_policy(ReadBufferPolicy::Wait(Duration::from_secs(1)))
+        .with_memory_capacity(0)
+        .with_memory_budget(32 * 1024 * 1024)
+        .with_staging(256 * 1024, 128 * 1024)
+        .with_stats(true);
+    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    cache.put("blocker", vec![1_u8; 16 * 1024]).unwrap();
+    cache.put("key", b"old").unwrap();
+    cache.drain().unwrap();
+
+    let retained = cache.get("blocker").unwrap().unwrap();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| cache.get("key"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cache
+            .detailed_snapshot()
+            .unwrap()
+            .queues
+            .read_buffer_waiters
+            == 0
+        {
+            assert!(Instant::now() < deadline, "get did not enter buffer wait");
+            std::thread::yield_now();
+        }
+
+        eventually_admitted(|| cache.put("key", b"new"));
+        drop(retained);
+        assert!(waiting.join().unwrap().unwrap().is_none());
+    });
+
+    cache.drain().unwrap();
+    assert_eq!(cache.get("key").unwrap().unwrap().as_ref(), b"new");
+    let snapshot = cache.detailed_snapshot().unwrap();
+    assert_eq!(snapshot.queues.read_buffer_rejections, 0);
+    assert_eq!(snapshot.queues.read_buffer_timeouts, 0);
+    assert_eq!(snapshot.queues.read_buffer_waiters, 0);
+    assert_eq!(snapshot.queues.read_buffer_waiters_peak, 1);
+    assert!(snapshot.queues.read_buffer_wait_ns > 0);
+    cache.close_fast().unwrap();
+}
+
+#[test]
+fn bounded_read_buffer_wait_reports_timeout_separately_from_reject() {
+    let files = TestCache::new("read-buffer-wait-timeout");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(1)
+        .with_io_queue_depth(4)
+        .with_submission_queue_depths(1, 4)
+        .with_read_buffer_slots(1)
+        .with_read_buffer_policy(ReadBufferPolicy::Wait(Duration::from_millis(5)))
+        .with_memory_capacity(0)
+        .with_memory_budget(32 * 1024 * 1024)
+        .with_staging(256 * 1024, 128 * 1024)
+        .with_stats(true);
+    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    cache.put("key-1", b"one").unwrap();
+    cache.put("key-2", b"two").unwrap();
+    cache.drain().unwrap();
+
+    let retained = cache.get("key-1").unwrap().unwrap();
+    let error = match cache.get("key-2") {
+        Err(error) => error,
+        Ok(_) => panic!("bounded read-buffer wait unexpectedly acquired capacity"),
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let snapshot = cache.detailed_snapshot().unwrap();
+    assert_eq!(snapshot.summary.buffer_saturation, 1);
+    assert_eq!(snapshot.summary.queue_saturation, 0);
+    assert_eq!(snapshot.queues.read_buffer_rejections, 0);
+    assert_eq!(snapshot.queues.read_buffer_timeouts, 1);
+    assert_eq!(snapshot.queues.read_buffer_waiters, 0);
+    assert_eq!(snapshot.queues.read_buffer_waiters_peak, 1);
+    assert!(snapshot.queues.read_buffer_wait_ns > 0);
     drop(retained);
     cache.close_fast().unwrap();
 }

@@ -33,7 +33,7 @@ use crate::region_runtime::{
     RuntimeSnapshot,
 };
 use crate::region_store::{RegionConfig, RegionStartup, RegionStore};
-use crate::resources::BackpressurePolicy;
+use crate::resources::{BackpressurePolicy, ReadBufferPolicy};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
@@ -310,6 +310,7 @@ pub struct RuntimeConfig {
     read_queue_depth: usize,
     write_queue_depth: usize,
     read_buffer_slots: usize,
+    read_buffer_policy: ReadBufferPolicy,
     memory_capacity_bytes: usize,
     memory_budget_bytes: usize,
     memory_shards: usize,
@@ -331,6 +332,7 @@ impl Default for RuntimeConfig {
             read_queue_depth: 128,
             write_queue_depth: 128,
             read_buffer_slots: 128,
+            read_buffer_policy: ReadBufferPolicy::Reject,
             memory_capacity_bytes: DEFAULT_MEMORY_CAPACITY_BYTES,
             memory_budget_bytes: 1024 * 1024 * 1024,
             memory_shards: DEFAULT_MEMORY_SHARDS,
@@ -365,14 +367,37 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets legacy read admission depth and waiting-policy write admission depth.
+    ///
+    /// `get` has no read admission queue; `read` is retained and validated for
+    /// configuration compatibility. Read concurrency is bounded solely by
+    /// [`Self::with_read_buffer_slots`]. The write depth is unused by the
+    /// default reject policy because shard staging is its admission boundary.
     pub fn with_submission_queue_depths(mut self, read: usize, write: usize) -> Self {
         self.read_queue_depth = read;
         self.write_queue_depth = write;
         self
     }
 
+    /// Sets the hard foreground L2 read-buffer budget.
+    ///
+    /// L2 acquires a fully prepared slot only after its index finds a
+    /// candidate. Exhaustion returns `WouldBlock` immediately. A successful
+    /// L1 promotion releases the transient slot before `get` returns; when L1
+    /// promotion bypasses, the returned zero-copy Region value retains its
+    /// slot until the caller drops it.
     pub fn with_read_buffer_slots(mut self, slots: usize) -> Self {
         self.read_buffer_slots = slots;
+        self
+    }
+
+    /// Selects behavior when every foreground L2 read buffer is leased.
+    ///
+    /// The default is [`ReadBufferPolicy::Reject`]. Waiting is bounded and
+    /// applies only after L2 finds a candidate; it never waits for an I/O
+    /// submission slot.
+    pub fn with_read_buffer_policy(mut self, policy: ReadBufferPolicy) -> Self {
+        self.read_buffer_policy = policy;
         self
     }
 
@@ -411,6 +436,8 @@ impl RuntimeConfig {
         self
     }
 
+    /// Selects write-side overload behavior. L2 reads reject only when their
+    /// fixed read-buffer pool is exhausted.
     pub fn with_backpressure(mut self, policy: BackpressurePolicy) -> Self {
         self.backpressure = policy;
         self
@@ -423,6 +450,16 @@ impl RuntimeConfig {
 
     pub const fn io_workers(&self) -> usize {
         self.io_workers
+    }
+
+    /// Returns the configured foreground L2 read-buffer budget.
+    pub const fn read_buffer_slots(&self) -> usize {
+        self.read_buffer_slots
+    }
+
+    /// Returns the configured foreground L2 read-buffer saturation policy.
+    pub const fn read_buffer_policy(&self) -> ReadBufferPolicy {
+        self.read_buffer_policy
     }
 
     pub const fn memory_capacity_bytes(&self) -> usize {
@@ -462,6 +499,7 @@ impl RuntimeConfig {
             read_queue_depth: self.read_queue_depth,
             write_queue_depth: self.write_queue_depth,
             read_buffer_slots: self.read_buffer_slots,
+            read_buffer_policy: self.read_buffer_policy,
             memory_capacity_bytes: self.memory_capacity_bytes,
             memory_budget_bytes: self.memory_budget_bytes,
             memory_shards: self.memory_shards,
@@ -621,9 +659,14 @@ pub struct CacheQueueSnapshot {
     pub write_requests_peak: u64,
     pub write_rejections: u64,
     pub write_wait_ns: u64,
+    pub write_staging_rejections: u64,
+    pub write_staging_wait_ns: u64,
     pub read_buffers_in_use: u64,
     pub read_buffers_peak: u64,
     pub read_buffer_rejections: u64,
+    pub read_buffer_timeouts: u64,
+    pub read_buffer_waiters: u64,
+    pub read_buffer_waiters_peak: u64,
     pub read_buffer_wait_ns: u64,
     pub metadata_buffers_in_use: u64,
     pub metadata_buffers_peak: u64,
@@ -700,6 +743,10 @@ impl AsRef<[u8]> for Value {
 }
 
 impl Value {
+    /// Returns the tier that served this lookup.
+    ///
+    /// A Region hit may already be backed by its promoted L1 value so the
+    /// transient L2 read buffer can be released before this handle is returned.
     pub const fn tier(&self) -> CacheTier {
         if self.inner.is_memory() {
             CacheTier::Memory
@@ -767,6 +814,13 @@ impl HybridCache {
         }
     }
 
+    /// Looks up a value in L1 and then L2.
+    ///
+    /// An L2 index miss returns directly. An L2 candidate performs one bounded
+    /// record read and exact revalidation. If no read buffer is available, the
+    /// lookup follows [`RuntimeConfig::with_read_buffer_policy`]: reject
+    /// immediately or wait for one bounded duration without retaining its
+    /// Region pin.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
         self.get_in(0, key)
     }
@@ -774,7 +828,8 @@ impl HybridCache {
     /// Looks up a value in a logical namespace.
     ///
     /// The system clock is read lazily only when a matching value carries an
-    /// expiration timestamp.
+    /// expiration timestamp. This method has the same L2 semantics as
+    /// [`Self::get`].
     pub fn get_in(&self, namespace: u32, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
         self.get_with_clock(namespace, key.as_ref(), ExpiryClock::System)
     }
@@ -852,9 +907,14 @@ impl HybridCache {
                 write_requests_peak: resources.write_requests_peak,
                 write_rejections: resources.write_rejections,
                 write_wait_ns: resources.write_wait_ns,
+                write_staging_rejections: runtime.staging_rejections,
+                write_staging_wait_ns: runtime.staging_wait_ns,
                 read_buffers_in_use: resources.read_buffers_in_use,
                 read_buffers_peak: resources.read_buffers_peak,
                 read_buffer_rejections: resources.read_buffer_rejections,
+                read_buffer_timeouts: resources.read_buffer_timeouts,
+                read_buffer_waiters: resources.read_buffer_waiters,
+                read_buffer_waiters_peak: resources.read_buffer_waiters_peak,
                 read_buffer_wait_ns: resources.read_buffer_wait_ns,
                 metadata_buffers_in_use: resources.metadata_buffers_in_use,
                 metadata_buffers_peak: resources.metadata_buffers_peak,

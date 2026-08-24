@@ -3,6 +3,10 @@
 This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
 
+The current harness gives its fixed index extra headroom for the complete L2
+working set and retries only rejected writes. Rerun the baseline before treating
+historical thresholds as release gates.
+
 ## M1 local baseline — 2026-08-24
 
 Environment:

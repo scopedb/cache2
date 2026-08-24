@@ -7,12 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{
-    CacheTier, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig,
-    StartupMode, StaticConfig,
+    CacheTier, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine, IoMode, PutReceipt,
+    RuntimeConfig, StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 256 * 1024;
+const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BenchConfig {
     entries: usize,
@@ -89,7 +90,7 @@ impl BenchConfig {
             .checked_mul(MIB)
             .ok_or_else(|| invalid("benchmark memory capacity is too large"))?;
         let estimated_index_bytes = entries
-            .checked_mul(80)
+            .checked_mul(160)
             .ok_or_else(|| invalid("benchmark index estimate is too large"))?;
         let default_memory_budget_mib = memory_bytes
             .checked_add(estimated_index_bytes)
@@ -149,7 +150,9 @@ impl BenchConfig {
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size(32 * MIB as u64)
-            .with_expected_entries(self.entries.saturating_mul(2))
+            // Keep the benchmark's complete L2 working set comfortably below
+            // every page-aligned index partition's bounded-probe capacity.
+            .with_expected_entries(self.entries.saturating_mul(4))
             .with_shards(self.shards)
     }
 
@@ -244,7 +247,7 @@ fn main() -> io::Result<()> {
     for ordinal in 0..config.entries {
         let key = benchmark_key(ordinal);
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-        let receipt = cache.put(black_box(key), black_box(&value))?;
+        let receipt = put_eventually(&cache, black_box(&key), black_box(&value))?;
         write_checksum =
             write_checksum.wrapping_add(receipt.sequence.rotate_left((ordinal % 64) as u32));
     }
@@ -404,6 +407,25 @@ fn concurrent_reads(
             checksum,
         })
     })
+}
+
+fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<PutReceipt> {
+    let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
+    loop {
+        match cache.put(key, value) {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "benchmark write did not enter bounded staging",
+                    ));
+                }
+                thread::sleep(Duration::from_micros(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn benchmark_key(ordinal: usize) -> [u8; 16] {

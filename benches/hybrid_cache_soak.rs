@@ -162,6 +162,7 @@ fn main() -> io::Result<()> {
     let deadline = started + config.duration;
     let mut next_sample = started + config.sample_period;
     let mut writes = 0_u64;
+    let mut write_rejections = 0_u64;
     let mut hits = 0_u64;
     let mut misses = 0_u64;
     let mut max_put = Duration::ZERO;
@@ -187,7 +188,16 @@ fn main() -> io::Result<()> {
         let key_index = writes as usize % keys.len();
         value[..8].copy_from_slice(&writes.to_le_bytes());
         let put_started = Instant::now();
-        cache.put(&keys[key_index], &value)?;
+        match cache.put(&keys[key_index], &value) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                max_put = max_put.max(put_started.elapsed());
+                write_rejections = write_rejections.saturating_add(1);
+                std::thread::sleep(Duration::from_micros(50));
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
         max_put = max_put.max(put_started.elapsed());
         expected[key_index] = Some(writes);
         writes = writes.saturating_add(1);
@@ -236,17 +246,15 @@ fn main() -> io::Result<()> {
             {
                 return Err(io::Error::other("soak exceeded the managed memory bound"));
             }
-            if resources.io_failures != 0
-                || resources.queue_saturation != 0
-                || resources.buffer_saturation != 0
-            {
+            if resources.io_failures != 0 {
                 return Err(io::Error::other("soak observed a cache runtime failure"));
             }
             max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
             println!(
-                "elapsed={:.1}s writes={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} rotations={} managed={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+                "elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} queue_saturation={} buffer_saturation={} rotations={} managed={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
                 started.elapsed().as_secs_f64(),
                 writes,
+                write_rejections,
                 hits,
                 misses,
                 0,
@@ -257,6 +265,8 @@ fn main() -> io::Result<()> {
                 resources.l1_evictions,
                 resources.l1_bypasses,
                 resources.l1_admission_rejections,
+                resources.queue_saturation,
+                resources.buffer_saturation,
                 resources.region_rotations,
                 resources.managed_memory_bytes,
                 max_managed_memory,
@@ -281,18 +291,16 @@ fn main() -> io::Result<()> {
     {
         return Err(io::Error::other("soak exceeded the managed memory bound"));
     }
-    if resources.io_failures != 0
-        || resources.queue_saturation != 0
-        || resources.buffer_saturation != 0
-    {
+    if resources.io_failures != 0 {
         return Err(io::Error::other("soak observed a cache runtime failure"));
     }
     max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
     cache.close_fast()?;
     println!(
-        "complete elapsed={:.1}s writes={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} rotations={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+        "complete elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} queue_saturation={} buffer_saturation={} rotations={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
         started.elapsed().as_secs_f64(),
         writes,
+        write_rejections,
         hits,
         misses,
         0,
@@ -303,6 +311,8 @@ fn main() -> io::Result<()> {
         resources.l1_evictions,
         resources.l1_bypasses,
         resources.l1_admission_rejections,
+        resources.queue_saturation,
+        resources.buffer_saturation,
         resources.region_rotations,
         max_managed_memory,
         resources.managed_memory_budget_bytes,

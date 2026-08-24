@@ -39,4 +39,4 @@ pub use cache::{
 };
 pub use eviction::EvictionPolicy;
 pub use region_layout::{RegionSetAllocation, RegionSetConfig, RegionSetId};
-pub use resources::BackpressurePolicy;
+pub use resources::{BackpressurePolicy, ReadBufferPolicy};

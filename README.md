@@ -114,7 +114,33 @@ the bounded Region staging path before returning. An admitted value is
 immediately readable from L1 even though its device write may still be pending.
 Values that do not fit their RAM shard bypass L1 and continue through L2.
 Successful completion publishes the L2 index entry and marks the matching RAM
-version clean.
+version clean. The default write backpressure policy rejects immediately when
+the fixed shard staging path is saturated; it has no global write-admission
+gate. Only an explicitly selected `Block` or `Timeout` policy may wait for
+write-side capacity.
+
+After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
+miss returns immediately without consuming a read buffer. An L2 candidate
+acquires one read buffer, performs one aligned record read, and revalidates the
+exact index record, Region generation, cache epoch, and clear floor before
+returning. Read-buffer exhaustion is the only `get` throttle boundary; there is
+no separate read queue or background-ready state. `ReadBufferPolicy::Reject` is
+the default and returns `WouldBlock` immediately. `ReadBufferPolicy::Wait`
+permits one bounded wait, releases the Region pin before sleeping, and probes L2
+once more after buffer admission so a concurrent replacement, removal, clear,
+or rotation decides the latest result. Timeout returns `TimedOut`. Read buffers
+are fully allocated during open. A successful L1 promotion returns a bounded
+L1-backed value and releases the transient read buffer before `get` returns
+while preserving `CacheTier::Region` as the source of that hit. If promotion
+bypasses, the zero-copy Region value retains its buffer lease until the caller
+drops it. If the I/O engine cannot accept an admitted candidate immediately, L2
+returns a miss instead of waiting or exposing a second overload boundary.
+Read-buffer bookkeeping contention is also a miss, not apparent exhaustion;
+only an observed empty pool may reject or enter the configured bounded wait.
+Region-generation and I/O submission-fence contention follow the same
+fail-open rule. Point hashes and record sizes are computed once per operation,
+and L1 admits at most eight distinct full keys for one 64-bit hash so collision
+work remains constant-bounded.
 
 Use `drain` when the caller needs all accepted Region writes completed, and
 `flush` when completed data should also be issued through the device data-sync
@@ -136,13 +162,18 @@ may change on every open without invalidating a clean image:
 - sync/automatic/io_uring engine selection;
 - buffered/automatic/direct I/O mode;
 - any positive I/O worker count within the configured total queue depth;
-- total I/O queue depth, read/write admission depth, and read buffers;
+- total I/O queue depth, write admission depth, and the hard foreground L2
+  read-buffer budget and its reject/bounded-wait policy (the legacy
+  read-admission depth setting is retained for configuration compatibility but
+  is not a `get` throttle boundary);
 - RAM L1 capacity, memory shard count, eviction policy, aggregate memory
   budget, staging size, batch target, flush age, backpressure, and opt-in
   operational counters.
 
 The RAM tier supports `Clock` (default), `Lru`, `TinyLfu`, `Sieve`, `Fifo`, and
-`S3Fifo`. TinyLFU uses a compact aged frequency sketch to admit candidates
+`S3Fifo`. Victim search, multi-entry eviction, and frequency aging use fixed
+per-operation work budgets; budget exhaustion bypasses L1. TinyLFU uses a
+compact incrementally aged frequency sketch to admit candidates
 against an LRU victim. S3-FIFO uses byte-targeted small/main queues and a
 bounded hash-only ghost queue; a ghost collision can affect admission but never
 key/value correctness because resident hits still verify namespace and the
@@ -184,13 +215,24 @@ Regions, use it for periodic diagnostics rather than on the request hot path.
 
 ## Overload and health
 
-Read admission, write admission, and read buffers are independently bounded.
-`BackpressurePolicy::Reject` returns `WouldBlock` immediately;
-`BackpressurePolicy::Block` waits for a slot; `Timeout` waits only for the
-configured duration. `CacheSnapshot::queue_saturation` and
-`buffer_saturation` count rejected or timed-out admission. A device or
-structural failure increments `io_failures` and moves health to `MissOnly` or
-`Failed`; reads then fail open as misses, while writes remain explicit errors.
+Fixed shard staging and read buffers are independently bounded. A true L2 miss
+does not acquire a buffer. A candidate encountering a full pool either returns
+`WouldBlock` under the default `ReadBufferPolicy::Reject` or waits for the
+configured bounded duration and returns `TimedOut`. The wait retains no Region
+pin or cache lock and never extends to I/O-engine admission. Promoted hits
+release the temporary lease before return; unpromoted zero-copy Region values
+retain it. For writes,
+`BackpressurePolicy::Reject` returns `WouldBlock` immediately from shard
+staging; `Block` waits for capacity and `Timeout` waits only for the configured
+duration. `CacheSnapshot::queue_saturation` and `buffer_saturation` count
+rejected or timed-out admission. A device or structural failure increments
+`io_failures` and moves health to `MissOnly` or `Failed`; reads then fail open
+as misses, while writes remain explicit errors.
+
+`HybridCache::detailed_snapshot()` separates immediate
+`read_buffer_rejections` from `read_buffer_timeouts` and reports current/peak
+read-buffer waiters plus cumulative `read_buffer_wait_ns`. Successful waits
+increment only the wait duration; they are not counted as rejections.
 
 Use `close_fast` (or ordinary drop) when restart warmth is not worth an
 O(index) image write. The next open is empty. Use `close_warm` only after the
@@ -208,8 +250,9 @@ device to data-sync, but neither makes the cache recoverable.
    uses approximately 1.25 slots per entry and 32 bytes per slot.
 3. Choose L1 capacity from the useful resident payload. The aggregate managed
    budget must additionally hold the index/Region metadata, two staging buffers
-   per shard, configured read buffers, queue metadata, recovery scratch, and
-   explicit cache-thread stacks. Invalid plans fail before creating files.
+   per shard, every configured read buffer at its maximum record-envelope size,
+   queue metadata, recovery scratch, and explicit cache-thread stacks. Invalid
+   plans fail before creating files.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
@@ -228,9 +271,10 @@ Run the release benchmark with:
 cargo bench --bench hybrid_cache
 ```
 
-It measures `put + drain`, resident L1 reads, warm close, L2 reads with L1
-promotion, and reads from the promoted L1 set. The default data set is 8,192 ×
-16 KiB. `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`,
+It measures non-blocking `put` retries plus `drain`, resident L1 reads, warm
+close, direct L2 reads with L1 promotion where admitted, and reads from the
+promoted L1 set. The default data set is 8,192 × 16 KiB.
+`CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`,
 `CACHE_BENCH_RESIDENT_ENTRIES`, `CACHE_BENCH_READ_OPS`,
 `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`,
 `CACHE_BENCH_MEMORY_BUDGET_MIB`, `CACHE_BENCH_SHARDS`,

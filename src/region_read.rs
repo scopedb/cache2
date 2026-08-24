@@ -1,17 +1,20 @@
 //! Per-Region read projection for the RegionStore data path.
 //!
 //! The Region manager remains the mutation authority. This directory is only
-//! its fixed-size read projection: a durable lookup holds one Region read
-//! guard across positioned I/O, while rotation takes that Region's write guard
-//! to drain readers before reusing its bytes. No operation in this module
-//! acquires or calls the Region manager.
+//! its fixed-size read projection: a durable lookup holds one atomic Region pin
+//! across positioned I/O, while the background rotation worker drains those
+//! pins before reusing the bytes. No generation lock crosses device I/O, and no
+//! operation in this module acquires or calls the Region manager.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::Duration;
 
 use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
 use crate::recovery::{CacheEpoch, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE, REGION_HEADER_SIZE};
+
+const READER_DRAIN_POLL: Duration = Duration::from_micros(50);
 
 /// Fields needed to authorize reads from one Region generation.
 ///
@@ -126,8 +129,9 @@ struct RegionReadCell {
     generation: RwLock<RegionReadGeneration>,
     completed_used: AtomicU64,
     max_seqno: AtomicU64,
-    /// Set before rotation waits for the generation write lock. This prevents
-    /// a hot read stream from continuously barging ahead of the writer.
+    readers: AtomicUsize,
+    /// Set before rotation waits for existing atomic reader pins. This prevents
+    /// a hot read stream from continuously barging ahead of the victim worker.
     draining: AtomicBool,
 }
 
@@ -137,6 +141,7 @@ impl RegionReadCell {
             generation: RwLock::new(RegionReadGeneration::empty(region_id)),
             completed_used: AtomicU64::new(REGION_HEADER_SIZE as u64),
             max_seqno: AtomicU64::new(0),
+            readers: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
         }
     }
@@ -162,14 +167,19 @@ impl RegionReadCell {
         self.completed_used
             .store(snapshot.completed_used, Ordering::Release);
     }
+
+    fn release_reader(&self) {
+        let previous = self.readers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
+    }
 }
 
 /// Fixed-size Region read projection.
 ///
-/// Reads of one Region share only that Region's generation lock. Active-prefix
-/// completion advances through atomics without draining those readers. A
-/// rotation write guard blocks new readers and waits for existing readers of
-/// the victim, without affecting any other Region.
+/// Reads briefly snapshot one Region's generation and then retain only an
+/// atomic pin across device I/O. Active-prefix completion advances through
+/// atomics. Rotation rejects new pins and waits in its background worker for
+/// existing pins to drain, without holding a lock across device I/O.
 pub(crate) struct RegionReadDirectory {
     region_size: u64,
     regions: Box<[RegionReadCell]>,
@@ -259,22 +269,39 @@ impl RegionReadDirectory {
         if cell.draining.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let generation = read_generation(cell)?;
+        cell.readers.fetch_add(1, Ordering::AcqRel);
+        if cell.draining.load(Ordering::Acquire) {
+            cell.release_reader();
+            return Ok(None);
+        }
+        let generation = match cell.generation.try_read() {
+            Ok(generation) => *generation,
+            Err(TryLockError::WouldBlock) => {
+                cell.release_reader();
+                return Ok(None);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                cell.release_reader();
+                return Err(RegionReadError::Poisoned);
+            }
+        };
         if cell.draining.load(Ordering::Acquire) || !generation.readable {
+            cell.release_reader();
             return Ok(None);
         }
         let snapshot = cell.snapshot(&generation);
         if !snapshot.makes_visible(entry, expected_epoch, clear_floor_seqno)
             || cell.draining.load(Ordering::Acquire)
         {
+            cell.release_reader();
             return Ok(None);
         }
         Ok(Some(RegionReadGuard { cell, generation }))
     }
 
-    /// Drains readers of one exact victim generation and prevents new ones
-    /// until the returned guard is dropped. The caller may wait here, so it
-    /// must not hold manager authority.
+    /// Drains atomic readers of one exact victim generation and prevents new
+    /// ones until the returned guard is dropped. Only the background rotation
+    /// worker may wait here, and no generation lock is retained across I/O.
     pub(crate) fn acquire_rotation_write(
         &self,
         region_id: u32,
@@ -289,8 +316,14 @@ impl RegionReadDirectory {
         {
             return Err(RegionReadError::StaleGeneration);
         }
-        let generation = match write_generation(cell) {
-            Ok(generation) => generation,
+        // This is a background-only rotation path. Polling keeps read-pin
+        // release completely lock-free, so a completed cache read never waits
+        // behind victim selection or generation reuse.
+        while cell.readers.load(Ordering::Acquire) != 0 {
+            std::thread::sleep(READER_DRAIN_POLL);
+        }
+        let generation = match read_generation(cell) {
+            Ok(generation) => *generation,
             Err(error) => {
                 cell.draining.store(false, Ordering::Release);
                 return Err(error);
@@ -410,7 +443,7 @@ fn write_generation(
 /// Read pin retained across record I/O and exact index revalidation.
 pub(crate) struct RegionReadGuard<'a> {
     cell: &'a RegionReadCell,
-    generation: RwLockReadGuard<'a, RegionReadGeneration>,
+    generation: RegionReadGeneration,
 }
 
 impl RegionReadGuard<'_> {
@@ -431,11 +464,17 @@ impl RegionReadGuard<'_> {
     }
 }
 
+impl Drop for RegionReadGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.release_reader();
+    }
+}
+
 /// Exclusive victim pin retained while rotation overwrites Region bytes.
 pub(crate) struct RegionRotationWriteGuard<'a> {
     region_size: u64,
     cell: &'a RegionReadCell,
-    generation: RwLockWriteGuard<'a, RegionReadGeneration>,
+    generation: RegionReadGeneration,
 }
 
 impl RegionRotationWriteGuard<'_> {
@@ -444,16 +483,27 @@ impl RegionRotationWriteGuard<'_> {
         self.cell.snapshot(&self.generation)
     }
 
-    pub(crate) fn mark_unreadable(&mut self) -> RegionReadSnapshot {
-        let snapshot = self.cell.snapshot(&self.generation);
-        self.generation.readable = false;
-        snapshot
+    pub(crate) fn mark_unreadable(&mut self) -> Result<RegionReadSnapshot, RegionReadError> {
+        let mut generation = write_generation(self.cell)?;
+        if !generation.readable
+            || generation.cache_epoch != self.generation.cache_epoch
+            || generation.incarnation != self.generation.incarnation
+            || generation.created_seqno != self.generation.created_seqno
+        {
+            return Err(RegionReadError::StaleGeneration);
+        }
+        let snapshot = self.cell.snapshot(&generation);
+        generation.readable = false;
+        self.generation = *generation;
+        Ok(snapshot)
     }
 
-    /// Publishes the activated generation while retaining the write guard.
-    /// Callers normally finish manager rotation before dropping this guard.
+    /// Publishes the activated generation under a short generation write lock.
     pub(crate) fn install(&mut self, snapshot: RegionReadSnapshot) -> Result<(), RegionReadError> {
-        install_snapshot(self.cell, &mut self.generation, snapshot, self.region_size)
+        let mut generation = write_generation(self.cell)?;
+        install_snapshot(self.cell, &mut generation, snapshot, self.region_size)?;
+        self.generation = *generation;
+        Ok(())
     }
 }
 
@@ -532,6 +582,33 @@ mod tests {
         release_tx.send(()).unwrap();
         drop(first);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn generation_lock_contention_is_an_immediate_miss() {
+        let directory = directory(1);
+        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        let cell = &directory.regions[0];
+        let generation = cell
+            .generation
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(
+            directory
+                .acquire_visible(entry(0, 7), 3, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cell.readers.load(Ordering::Acquire), 0);
+
+        drop(generation);
+        assert!(
+            directory
+                .acquire_visible(entry(0, 7), 3, 1)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -633,7 +710,7 @@ mod tests {
         directory.install(old).unwrap();
 
         let mut rotation = directory.acquire_rotation_write(0, 3, 1).unwrap();
-        assert_eq!(rotation.mark_unreadable(), old);
+        assert_eq!(rotation.mark_unreadable().unwrap(), old);
         let activated = snapshot(0, 2, 8, 4160, 9);
         rotation.install(activated).unwrap();
         drop(rotation);

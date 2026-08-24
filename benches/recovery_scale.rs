@@ -1,11 +1,13 @@
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
 
 const MIB: usize = 1024 * 1024;
+const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct ScaleConfig {
     expected_entries: usize,
@@ -179,7 +181,7 @@ fn main() -> io::Result<()> {
     let populated = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-        cache.put(key, &value)?;
+        put_eventually(&cache, key, &value)?;
     }
     cache.drain()?;
     emit("populate_and_drain", populated.elapsed());
@@ -225,6 +227,25 @@ fn verify_sentinels(cache: &cache_rs::HybridCache, keys: &[[u8; 16]]) -> io::Res
     }
     emit("verify_sentinels", started.elapsed());
     Ok(())
+}
+
+fn put_eventually(cache: &cache_rs::HybridCache, key: &[u8], value: &[u8]) -> io::Result<()> {
+    let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
+    loop {
+        match cache.put(key, value) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "recovery benchmark write did not enter bounded staging",
+                    ));
+                }
+                thread::sleep(Duration::from_micros(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn require_startup(observed: StartupMode, expected: StartupMode) -> io::Result<()> {

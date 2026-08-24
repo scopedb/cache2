@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
 use crate::expiry::ExpiryClock;
@@ -29,9 +29,9 @@ use crate::io_backend::{
 };
 use crate::io_engine::{IoBuffer, IoEngine, IoOperation, OperationKind, submit_cache_io};
 use crate::memory::MemoryStore;
-use crate::record_codec::{
-    RecordEncodeError, encode_value_into, hash_namespaced_key, planned_record_bytes,
-};
+use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
+#[cfg(test)]
+use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
 use crate::recovery::{
     DATA_REGION_AREA_OFFSET, DataSuperblock, DataSuperblockProbe, PersistentId,
     RECOVERY_IMAGE_INDEX_OFFSET, RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe,
@@ -69,6 +69,8 @@ use crate::region_staging::{
 use crate::region_store::RegionStartup;
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionConfig, RegionStore};
 use crate::resources::BufferLease;
+
+const INDEX_PUBLICATION_CHUNK_RECORDS: usize = 32;
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -160,6 +162,25 @@ impl RegionManagerAuthority {
                 "RegionStore became miss-only while acquiring Region authority",
             )),
             Err(_) => {
+                self.health.enter_miss_only();
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RegionStore Region authority is poisoned",
+                ))
+            }
+        }
+    }
+
+    fn try_lock(&self) -> io::Result<Option<MutexGuard<'_, RegionManager>>> {
+        self.health.require_healthy()?;
+        match self.inner.try_lock() {
+            Ok(guard) if self.health.is_healthy() => Ok(Some(guard)),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionStore became miss-only while acquiring Region authority",
+            )),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
                 self.health.enter_miss_only();
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -553,6 +574,26 @@ impl FileRegionCore {
         self.lock_shard_gate(&shard.mutation)
     }
 
+    fn try_lock_shard_mutation(&self, shard_id: usize) -> io::Result<Option<MutexGuard<'_, ()>>> {
+        self.health.require_healthy()?;
+        let shard = self.shard(shard_id)?;
+        match shard.mutation.try_lock() {
+            Ok(guard) if self.health.is_healthy() => Ok(Some(guard)),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionStore became miss-only while acquiring a shard gate",
+            )),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                self.health.enter_miss_only();
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data shard gate is poisoned",
+                ))
+            }
+        }
+    }
+
     fn lock_shard_completion(&self, shard_id: usize) -> io::Result<MutexGuard<'_, ()>> {
         let shard = self.shard(shard_id)?;
         self.lock_shard_gate(&shard.completion)
@@ -607,6 +648,9 @@ impl FileRegionCore {
         let entry = match self.index.lookup_raw(hash) {
             Ok(IndexLookup::Hit(entry)) => entry,
             Ok(_) => return Ok(None),
+            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
+                return Ok(None);
+            }
             Err(_) => {
                 self.health.enter_miss_only();
                 return Ok(None);
@@ -645,11 +689,9 @@ impl FileRegionCore {
     /// second payload copy on the disk-hit path.
     pub(crate) fn begin_value_read(
         &self,
-        hash_seed: u64,
+        hash: u64,
         namespace_id: u32,
-        key: &[u8],
     ) -> io::Result<Option<RegionPointRead<'_>>> {
-        let hash = hash_namespaced_key(hash_seed, namespace_id, key);
         let point = self.begin_point_read(hash)?;
         Ok(point.filter(|point| {
             point.entry.namespace_id == namespace_id
@@ -671,7 +713,8 @@ impl FileRegionCore {
         key: &[u8],
         clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
-        let Some(point) = self.begin_value_read(hash_seed, namespace_id, key)? else {
+        let hash = hash_namespaced_key(hash_seed, namespace_id, key);
+        let Some(point) = self.begin_value_read(hash, namespace_id)? else {
             return Ok(None);
         };
         self.read_value_from_point(engine, geometry, buffer, point, namespace_id, key, clock)
@@ -691,8 +734,15 @@ impl FileRegionCore {
         let hash = point.hash;
         let flight = match submit_record_read(engine, geometry, point.entry, buffer) {
             Ok(flight) => flight,
+            Err(error) if error.error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => {
-                if error.error.kind() != io::ErrorKind::OutOfMemory {
+                if !matches!(
+                    error.error.kind(),
+                    io::ErrorKind::OutOfMemory
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) {
                     self.health.enter_miss_only();
                 }
                 return Err(error.error);
@@ -785,34 +835,50 @@ impl FileRegionCore {
         Ok(guard.map(|guard| (guard, cache_epoch, clear_floor_seqno)))
     }
 
-    /// Reserves and encodes one value directly into a shard's aligned fill
-    /// buffer. This method performs no device I/O and never publishes an index
-    /// entry. `NeedsFlush` cancels the unused tail receipt exactly, so a shard
-    /// worker may submit the prior 4 MiB span before the caller retries.
+    /// Preflights, reserves, and encodes one value directly into a shard's
+    /// aligned fill buffer. Region reservation and open-span accounting share
+    /// one manager try-lock; the shard mutation gate then protects encoding
+    /// without retaining global authority. This method performs no device I/O
+    /// and never publishes an index entry.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_stage_value(
         &self,
         staging: &RegionStaging,
         shard_id: usize,
-        hash_seed: u64,
+        hash: u64,
+        record_bytes: u32,
         namespace_id: u32,
         key: &[u8],
         value: &[u8],
         expires_at: u64,
     ) -> io::Result<RegionStageValue> {
         self.health.require_healthy()?;
-        let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len())
-            .map_err(record_encode_io_error)?;
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "value exceeds one fixed staging chunk",
             ));
         }
-        let _shard_mutation = self.lock_shard_mutation(shard_id)?;
+        let Some(_shard_mutation) = self.try_lock_shard_mutation(shard_id)? else {
+            return Ok(RegionStageValue::Busy);
+        };
+        match staging.preflight_append(shard_id, record_bytes) {
+            Ok(StageAppend::Appended) => {}
+            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsFlush),
+            Err(StagingError::WouldBlock | StagingError::Encoding | StagingError::Submitted) => {
+                return Ok(RegionStageValue::Busy);
+            }
+            Err(error) => {
+                self.health.enter_miss_only();
+                staging.close();
+                return Err(staging_io_error(error));
+            }
+        }
         let receipt = {
-            let mut manager = self.manager.lock()?;
-            match manager.reserve_append(shard_id, record_bytes) {
+            let Some(mut manager) = self.manager.try_lock()? else {
+                return Ok(RegionStageValue::Busy);
+            };
+            let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
                 Err(RegionMutationError::WouldBlock) => return Ok(RegionStageValue::Busy),
                 Err(RegionMutationError::FlushBeforeRotation) => {
@@ -825,15 +891,22 @@ impl FileRegionCore {
                     self.health.enter_miss_only();
                     return Err(region_mutation_io_error(error));
                 }
+            };
+            if let Err(error) = manager.stage_reservation(receipt) {
+                self.health.enter_miss_only();
+                staging.close();
+                return Err(region_mutation_io_error(error));
             }
+            receipt
         };
 
         let mut encoded_value = None;
         let staged = staging.encode_reserved(receipt, |destination| {
-            let encoded = encode_value_into(
+            let encoded = encode_value_into_hashed(
                 destination,
                 receipt,
-                hash_seed,
+                hash,
+                record_bytes,
                 namespace_id,
                 key,
                 value,
@@ -847,11 +920,6 @@ impl FileRegionCore {
         });
         match staged {
             Ok(StageAppend::Appended) => {
-                if let Err(error) = self.manager.lock()?.stage_reservation(receipt) {
-                    self.health.enter_miss_only();
-                    staging.close();
-                    return Err(region_mutation_io_error(error));
-                }
                 let Some(encoded) = encoded_value else {
                     self.health.enter_miss_only();
                     staging.close();
@@ -865,39 +933,34 @@ impl FileRegionCore {
                     seqno: receipt.seqno,
                 }))
             }
-            Ok(StageAppend::NeedsSeal) => {
-                self.cancel_unused_reservation(receipt)?;
-                Ok(RegionStageValue::NeedsFlush)
-            }
+            Ok(StageAppend::NeedsSeal) => self.fail_preflighted_stage(
+                staging,
+                "staging capacity changed after successful preflight",
+            ),
             Err(StagingEncodeError::Encode(error)) => {
-                self.cancel_unused_reservation(receipt)?;
+                self.health.enter_miss_only();
+                staging.close();
                 Err(record_encode_io_error(error))
             }
             Err(StagingEncodeError::Staging(StagingError::WouldBlock)) => {
-                self.cancel_unused_reservation(receipt)?;
-                Ok(RegionStageValue::Busy)
+                self.fail_preflighted_stage(staging, "staging became busy after preflight")
             }
             Err(StagingEncodeError::Staging(error)) => {
-                let cancel = self.cancel_unused_reservation(receipt);
                 self.health.enter_miss_only();
                 staging.close();
-                cancel?;
                 Err(staging_io_error(error))
             }
         }
     }
 
-    fn cancel_unused_reservation(
+    fn fail_preflighted_stage(
         &self,
-        receipt: crate::region_manager::RegionAppendReservation,
-    ) -> io::Result<()> {
-        self.manager
-            .lock()?
-            .cancel_reservation(receipt)
-            .map_err(|error| {
-                self.health.enter_miss_only();
-                region_mutation_io_error(error)
-            })
+        staging: &RegionStaging,
+        message: &'static str,
+    ) -> io::Result<RegionStageValue> {
+        self.health.enter_miss_only();
+        staging.close();
+        Err(io::Error::new(io::ErrorKind::InvalidData, message))
     }
 
     /// Shard-worker kernel for one complete staging span. It performs no sync:
@@ -1065,7 +1128,7 @@ impl FileRegionCore {
         }
 
         let (published_records, obsolete_records) =
-            match self.publish_completed_records(records.as_slice(), memory) {
+            match self.publish_completed_records(shard_id, records.as_slice(), memory) {
                 Ok(counts) => counts,
                 Err(error) => {
                     self.fail_staged_span(staging, span, Some(buffer), records);
@@ -1092,7 +1155,7 @@ impl FileRegionCore {
         geometry: crate::recovery::DataGeometry,
         shard_id: usize,
         buffer: BufferLease,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         self.health.require_healthy()?;
         if !geometry.is_valid() {
             return Err(io::Error::new(
@@ -1100,17 +1163,17 @@ impl FileRegionCore {
                 "rotation data geometry is invalid",
             ));
         }
-        let _completion_worker = self.lock_shard_completion(shard_id)?;
-        let _shard_mutation = self.lock_shard_mutation(shard_id)?;
-        let _rotation = self.rotation.lock().map_err(|_| {
+        let completion_worker = self.lock_shard_completion(shard_id)?;
+        let shard_mutation = self.lock_shard_mutation(shard_id)?;
+        let rotation = self.rotation.lock().map_err(|_| {
             self.health.enter_miss_only();
             io::Error::new(io::ErrorKind::InvalidData, "rotation gate is poisoned")
         })?;
-        let plan = self
-            .manager
-            .lock()?
-            .plan_rotation(shard_id)
-            .map_err(region_mutation_io_error)?;
+        let plan = match self.manager.lock()?.plan_rotation(shard_id) {
+            Ok(plan) => plan,
+            Err(RegionMutationError::WouldBlock) => return Ok(false),
+            Err(error) => return Err(region_mutation_context("rotation planning", error)),
+        };
 
         let mut victim = if plan.reused {
             Some(
@@ -1130,10 +1193,16 @@ impl FileRegionCore {
             .manager
             .lock()?
             .begin_rotation(plan)
-            .map_err(region_mutation_io_error)?;
+            .map_err(|error| region_mutation_context("rotation begin", error))?;
         if let Some(victim) = victim.as_mut() {
-            victim.mark_unreadable();
+            victim.mark_unreadable().map_err(region_read_io_error)?;
         }
+        // Manager authority now carries the exact in-progress rotation receipt,
+        // so foreground staging fails fast on this shard. Release every mutex
+        // before issuing either header write.
+        drop(rotation);
+        drop(shard_mutation);
+        drop(completion_worker);
 
         let buffer =
             write_region_header(engine, geometry, receipt.sealed, buffer).inspect_err(|_| {
@@ -1148,7 +1217,7 @@ impl FileRegionCore {
             let mut manager = self.manager.lock()?;
             manager.finish_rotation(receipt).map_err(|error| {
                 self.health.enter_miss_only();
-                region_mutation_io_error(error)
+                region_mutation_context("rotation completion", error)
             })?;
             let region = manager
                 .regions()
@@ -1170,50 +1239,55 @@ impl FileRegionCore {
             self.health.enter_miss_only();
             return Err(region_read_io_error(error));
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Publishes one completed batch under a single manager acquisition. This
-    /// keeps per-entry lock overhead out of the 4 MiB completion path while
-    /// preserving exact index/accounting commits.
+    /// Publishes a completed batch in small fixed chunks. The worker keeps
+    /// batching index work, but never monopolizes global Region authority for
+    /// all records in a maximum-size staging span.
     fn publish_completed_records(
         &self,
+        shard_id: usize,
         records: &[StagedRecord],
         memory: Option<&MemoryStore>,
     ) -> io::Result<(u64, u64)> {
-        let mut authority = self.manager.begin_index_mutation()?;
         let mut published = 0_u64;
         let mut obsolete = 0_u64;
-        let mut index_error = None;
-        for record in records.iter().copied() {
-            match self
-                .index
-                .upsert_with_authority(record.hash, record.entry, &mut authority)
-            {
-                Ok(IndexUpsert::Applied { .. }) => {
-                    published = published.saturating_add(1);
-                    if let Some(memory) = memory {
-                        memory.complete(record.hash, record.entry.seqno);
+        for chunk in records.chunks(INDEX_PUBLICATION_CHUNK_RECORDS) {
+            let mut authority = self.manager.begin_index_mutation()?;
+            let mut index_error = None;
+            for record in chunk.iter().copied() {
+                let upsert =
+                    self.index
+                        .upsert_with_authority(record.hash, record.entry, &mut authority);
+                match upsert {
+                    Ok(IndexUpsert::Applied { .. }) => {
+                        published = published.saturating_add(1);
+                    }
+                    Ok(IndexUpsert::Ignored { .. })
+                    | Ok(IndexUpsert::Masked { .. })
+                    | Ok(IndexUpsert::Saturated) => obsolete = obsolete.saturating_add(1),
+                    Err(error) => {
+                        index_error = Some(error);
+                        break;
                     }
                 }
-                Ok(IndexUpsert::Ignored { .. })
-                | Ok(IndexUpsert::Masked { .. })
-                | Ok(IndexUpsert::Saturated) => obsolete = obsolete.saturating_add(1),
-                Err(error) => {
-                    index_error = Some(error);
+                if authority.accounting_error.is_some() {
                     break;
                 }
             }
-            if authority.accounting_error.is_some() {
-                break;
+            let accounting = authority.finish();
+            if let Some(error) = index_error {
+                self.health.enter_miss_only();
+                return Err(index_storage_io_error(error));
+            }
+            accounting?;
+            if let Some(memory) = memory {
+                for record in chunk.iter().copied() {
+                    memory.complete(shard_id, record.hash, record.entry.seqno);
+                }
             }
         }
-        let accounting = authority.finish();
-        if let Some(error) = index_error {
-            self.health.enter_miss_only();
-            return Err(index_storage_io_error(error));
-        }
-        accounting?;
         Ok((published, obsolete))
     }
 
@@ -1237,11 +1311,19 @@ impl FileRegionCore {
         match self.index.revalidate_exact(hash, expected) {
             Ok(matches) if self.health.is_healthy() => Ok(matches),
             Ok(_) => Ok(false),
+            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
+                Ok(false)
+            }
             Err(_) => {
                 self.health.enter_miss_only();
                 Ok(false)
             }
         }
+    }
+
+    pub(crate) fn mask_pending_value(&self, hash: u64, seqno: u64) -> io::Result<()> {
+        self.mutate_index(|index, authority| index.reserve_with_authority(hash, seqno, authority))
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -1270,7 +1352,6 @@ impl FileRegionCore {
         })
     }
 
-    #[cfg(test)]
     fn mutate_index<T>(
         &self,
         mutation: impl FnOnce(
@@ -2795,6 +2876,13 @@ fn region_mutation_io_error(error: RegionMutationError) -> io::Error {
     )
 }
 
+fn region_mutation_context(context: &'static str, error: RegionMutationError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("RegionStore {context} failed: {error:?}"),
+    )
+}
+
 fn region_read_snapshot(manager: &RegionManager, region: RegionRuntime) -> RegionReadSnapshot {
     RegionReadSnapshot {
         region_id: region.region_id,
@@ -2888,8 +2976,26 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match put() {
+                Ok(value) => return value,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "write staging did not make progress"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("cache write failed: {error}"),
+            }
+        }
+    }
 
     struct TestDirectory {
         root: PathBuf,
@@ -3235,7 +3341,7 @@ mod tests {
             let key = key_for_shard(data, namespace_id, ordinal as u64, ordinal as u64);
             let value = vec![(ordinal as u8) + 1; size];
             assert!(matches!(
-                store.put_value(namespace_id, &key, &value, 0).unwrap(),
+                eventually_admitted(|| store.put_value(namespace_id, &key, &value, 0)),
                 RegionPut::Buffered(_)
             ));
             expected.push((key, value));
@@ -3259,9 +3365,7 @@ mod tests {
         let mut recent = Vec::new();
         for ordinal in 0..32 {
             let key = key_for_shard(data, namespace_id, 0, 100 + ordinal);
-            store
-                .put_value(namespace_id, &key, &rotation_value, 0)
-                .unwrap();
+            eventually_admitted(|| store.put_value(namespace_id, &key, &rotation_value, 0));
             store.drain().unwrap();
             recent.push(key);
         }
@@ -3365,6 +3469,36 @@ mod tests {
     }
 
     #[test]
+    fn foreground_stage_rejects_busy_manager_without_consuming_a_sequence() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let resources = data_path_resources();
+        let staging = RegionStaging::try_new(
+            1,
+            crate::region_appender::_WRITE_BATCH_BYTES,
+            data.geometry.region_size,
+            &resources,
+        )
+        .unwrap();
+        let manager = runtime.manager.inner.lock().unwrap();
+        let next_seqno = manager.next_seqno();
+        let hash = hash_namespaced_key(data.hash_seed, 7, b"key");
+        let record_bytes = planned_record_bytes(7, b"key".len(), b"value".len()).unwrap();
+
+        assert_eq!(
+            runtime
+                .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value", 0)
+                .unwrap(),
+            RegionStageValue::Busy
+        );
+        assert_eq!(manager.next_seqno(), next_seqno);
+    }
+
+    #[test]
     fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntime::install(
@@ -3390,8 +3524,19 @@ mod tests {
         let mut staged_records = 0_u64;
         loop {
             let key = format!("file/chunk/{staged_records:04}");
+            let hash = hash_namespaced_key(data.hash_seed, 7, key.as_bytes());
+            let record_bytes = planned_record_bytes(7, key.len(), value.len()).unwrap();
             match runtime
-                .try_stage_value(&staging, 0, data.hash_seed, 7, key.as_bytes(), &value, 0)
+                .try_stage_value(
+                    &staging,
+                    0,
+                    hash,
+                    record_bytes,
+                    7,
+                    key.as_bytes(),
+                    &value,
+                    0,
+                )
                 .unwrap()
             {
                 RegionStageValue::Staged(identity) => {
@@ -3509,11 +3654,15 @@ mod tests {
         let owner_key = b"collision-owner";
         let foreign_key = b"collision-foreign";
         let value = b"owner-value-must-not-leak";
+        let owner_hash = hash_namespaced_key(data.hash_seed, namespace_id, owner_key);
+        let owner_record_bytes =
+            planned_record_bytes(namespace_id, owner_key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(identity) = runtime
             .try_stage_value(
                 &staging,
                 0,
-                data.hash_seed,
+                owner_hash,
+                owner_record_bytes,
                 namespace_id,
                 owner_key,
                 value,
@@ -3596,8 +3745,19 @@ mod tests {
         let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
         backend.set_len(data.geometry.data_file_len).unwrap();
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
+        let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
+        let record_bytes = planned_record_bytes(0, b"key".len(), 16 * 1024).unwrap();
         let RegionStageValue::Staged(identity) = runtime
-            .try_stage_value(&staging, 0, data.hash_seed, 0, b"key", &[7; 16 * 1024], 0)
+            .try_stage_value(
+                &staging,
+                0,
+                hash,
+                record_bytes,
+                0,
+                b"key",
+                &[7; 16 * 1024],
+                0,
+            )
             .unwrap()
         else {
             panic!("value must stage before the injected write failure");

@@ -87,7 +87,7 @@ pub(crate) enum IndexUpsert {
     Ignored {
         current: Option<IndexEntry>,
     },
-    /// A same-hash mask is at least as new as the supplied value.
+    /// A same-hash mask is newer than the supplied value.
     Masked {
         seqno: u64,
     },
@@ -183,7 +183,7 @@ impl RegionIndex {
     /// here: the partition guard is released when this method returns, before the
     /// runtime consults its Region manager.
     pub(crate) fn lookup_raw(&self, hash: u64) -> Result<IndexLookup, IndexStorageError> {
-        let partition = self.storage.read_hash_partition(hash);
+        let partition = self.storage.try_read_hash_partition(hash)?;
         let start = start_slot(hash, partition.slot_count());
         for step in 0..probe_limit(partition.slot_count()) {
             match partition.read(probe_slot(start, step, partition.slot_count()))? {
@@ -263,6 +263,26 @@ impl RegionIndex {
             .map(IndexUpsert::from)
     }
 
+    /// Reserves one hash/version for an in-flight producer. The matching
+    /// value publication may replace this mask at the same sequence number.
+    pub(crate) fn reserve_with_authority(
+        &self,
+        hash: u64,
+        seqno: u64,
+        authority: &mut impl IndexMutationAuthority,
+    ) -> Result<IndexUpsert, IndexStorageError> {
+        if seqno == 0 {
+            return Ok(IndexUpsert::Ignored { current: None });
+        }
+        self.install_if_newer(
+            hash,
+            seqno,
+            IndexSlotState::Masked { hash, seqno },
+            authority,
+        )
+        .map(IndexUpsert::from)
+    }
+
     /// Reserves a hash/version for an in-flight producer.
     ///
     /// Equal or newer same-hash values and masks win. Foreign masks are never
@@ -305,6 +325,7 @@ impl RegionIndex {
         installed: IndexSlotState,
         authority: &mut impl IndexMutationAuthority,
     ) -> Result<IndexInstall, IndexStorageError> {
+        let publishing_value = matches!(installed, IndexSlotState::Value { .. });
         let mut partition = self.storage.write_hash_partition(hash);
         let slot_count = partition.slot_count();
         let first_slot = partition.first_slot();
@@ -328,7 +349,8 @@ impl RegionIndex {
                     seqno,
                 } => {
                     if current_hash == hash {
-                        if supplied_seqno <= seqno {
+                        if supplied_seqno < seqno || (supplied_seqno == seqno && !publishing_value)
+                        {
                             return Ok(IndexInstall::Masked { seqno });
                         }
                         apply = Some((local_slot, None));
@@ -635,6 +657,18 @@ mod tests {
         RegionIndex::from_storage(PartitionedIndexStorage::anonymous(slot_count).unwrap())
     }
 
+    #[test]
+    fn lookup_returns_busy_instead_of_waiting_for_partition_mutation() {
+        let index = anonymous(8);
+        let hash = 7;
+        let _mutation = index.storage().write_hash_partition(hash);
+
+        assert!(matches!(
+            index.lookup_raw(hash),
+            Err(IndexStorageError::PartitionBusy { .. })
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingAuthority {
         min_visible_seqno: u64,
@@ -934,7 +968,7 @@ mod tests {
         );
         assert!(authority.transitions.is_empty());
         assert_eq!(index.storage().partition_stats().unwrap(), before);
-        let partition = index.storage().read_hash_partition(0);
+        let partition = index.storage().try_read_hash_partition(0).unwrap();
         for slot in 0..partition.slot_count() {
             assert_eq!(
                 partition.read(slot).unwrap(),
@@ -981,16 +1015,29 @@ mod tests {
             index.upsert(hash, entry(1, 8, 11), |_| true).unwrap(),
             IndexUpsert::Masked { seqno: 12 }
         );
+        let published = entry(1, 8, 12);
+        assert!(matches!(
+            index.upsert(hash, published, |_| true).unwrap(),
+            IndexUpsert::Applied {
+                transition: IndexTransition {
+                    previous: IndexSlotState::Masked { hash: 7, seqno: 12 },
+                    installed: IndexSlotState::Value { hash: 7, entry },
+                    ..
+                },
+                previous: None,
+            } if entry == published
+        ));
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookup::Hit(published));
         assert!(matches!(
             index.mask_if_newer(hash, 13, |_| true).unwrap(),
             IndexMask::Applied {
                 transition: IndexTransition {
-                    previous: IndexSlotState::Masked { hash: 7, seqno: 12 },
+                    previous: IndexSlotState::Value { hash: 7, entry },
                     installed: IndexSlotState::Masked { hash: 7, seqno: 13 },
                     ..
                 },
-                previous: None,
-            }
+                previous: Some(visible),
+            } if entry == published && visible == published
         ));
         assert_eq!(index.normalize_mask_if(hash, 12).unwrap(), None);
         assert!(matches!(
