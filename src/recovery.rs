@@ -1,0 +1,1487 @@
+//! Stable codecs for the recovery control plane.
+//!
+//! Session state deliberately lives outside the data superblock. The data
+//! superblock describes an immutable cache/data identity and geometry. A small
+//! two-page state file is the sole authority for `EMPTY`, `RUNNING`, and
+//! `CLEAN`. This module performs no I/O; callers must write the returned page
+//! to the selected slot and provide the required `fdatasync` barrier.
+
+use crate::checksum::{Crc32c, crc32c};
+use crate::index::{MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
+use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
+
+pub(crate) const RECOVERY_FORMAT_VERSION: u16 = 1;
+pub(crate) const RECOVERY_PAGE_SIZE: usize = 4 * 1024;
+pub(crate) const STATE_SLOT_COUNT: usize = 2;
+pub(crate) const STATE_FILE_SIZE: usize = STATE_SLOT_COUNT * RECOVERY_PAGE_SIZE;
+pub(crate) const DATA_REGION_AREA_OFFSET: u64 = RECOVERY_PAGE_SIZE as u64;
+pub(crate) const RECOVERY_IMAGE_INDEX_OFFSET: u64 = INDEX_IMAGE_PAGE_SIZE as u64;
+pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE as u64;
+pub(crate) const REGION_HEADER_SIZE: u32 = RECOVERY_PAGE_SIZE as u32;
+pub(crate) const RECORD_ALIGNMENT: u32 = 32;
+pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
+pub(crate) const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
+/// HybridCache-wide generation carried by both recovery metadata and every record.
+///
+/// Keeping one fixed width avoids an implicit truncation boundary when a
+/// runtime epoch is encoded into the record header.
+pub(crate) type CacheEpoch = u32;
+
+const DATA_MAGIC: [u8; 8] = *b"CRDATA\0\0";
+const STATE_MAGIC: [u8; 8] = *b"CRSTATE\0";
+const IMAGE_MAGIC: [u8; 8] = *b"CRIMAGE\0";
+const PAGE_CRC_OFFSET: usize = RECOVERY_PAGE_SIZE - size_of::<u32>();
+
+const _: () = assert!(RECOVERY_PAGE_SIZE == INDEX_IMAGE_PAGE_SIZE);
+
+const DATA_HEADER_SIZE: u16 = 112;
+const DATA_VERSION_OFFSET: usize = 8;
+const DATA_HEADER_SIZE_OFFSET: usize = 10;
+const DATA_HASH_ALGORITHM_OFFSET: usize = 12;
+const DATA_GENERATION_OFFSET: usize = 16;
+const DATA_CACHE_UUID_OFFSET: usize = 24;
+const DATA_IDENTITY_OFFSET: usize = 40;
+const DATA_FILE_LEN_OFFSET: usize = 56;
+const DATA_REGION_SIZE_OFFSET: usize = 64;
+const DATA_REGION_AREA_FIELD_OFFSET: usize = 72;
+const DATA_REGION_COUNT_OFFSET: usize = 80;
+const DATA_REGION_HEADER_SIZE_OFFSET: usize = 84;
+const DATA_RECORD_ALIGNMENT_OFFSET: usize = 88;
+const DATA_RECORD_FORMAT_OFFSET: usize = 92;
+const DATA_HASH_SEED_OFFSET: usize = 96;
+const DATA_CONFIG_FINGERPRINT_OFFSET: usize = 104;
+
+const STATE_HEADER_SIZE: u16 = 120;
+const STATE_VERSION_OFFSET: usize = 8;
+const STATE_HEADER_SIZE_OFFSET: usize = 10;
+const STATE_KIND_OFFSET: usize = 12;
+const STATE_FLAGS_OFFSET: usize = 13;
+const STATE_GENERATION_OFFSET: usize = 16;
+const STATE_CACHE_UUID_OFFSET: usize = 24;
+const STATE_DATA_IDENTITY_OFFSET: usize = 40;
+const STATE_DATA_GENERATION_OFFSET: usize = 56;
+const STATE_DATA_FILE_LEN_OFFSET: usize = 64;
+const STATE_HASH_SEED_OFFSET: usize = 72;
+const STATE_CONFIG_FINGERPRINT_OFFSET: usize = 80;
+const STATE_IMAGE_IDENTITY_OFFSET: usize = 88;
+const STATE_IMAGE_GENERATION_OFFSET: usize = 104;
+const STATE_IMAGE_FILE_LEN_OFFSET: usize = 112;
+
+const STATE_FLAG_HAS_IMAGE: u8 = 1;
+
+const IMAGE_FORMAT_VERSION: u16 = 1;
+const IMAGE_HEADER_SIZE: u16 = 144;
+const IMAGE_VERSION_OFFSET: usize = 8;
+const IMAGE_HEADER_SIZE_OFFSET: usize = 10;
+const IMAGE_FLAGS_OFFSET: usize = 12;
+const IMAGE_CACHE_UUID_OFFSET: usize = 16;
+const IMAGE_DATA_IDENTITY_OFFSET: usize = 32;
+const IMAGE_DATA_GENERATION_OFFSET: usize = 48;
+const IMAGE_HASH_SEED_OFFSET: usize = 56;
+const IMAGE_CONFIG_FINGERPRINT_OFFSET: usize = 64;
+const IMAGE_IDENTITY_OFFSET: usize = 72;
+const IMAGE_GENERATION_OFFSET: usize = 88;
+const IMAGE_FILE_LEN_OFFSET: usize = 96;
+const IMAGE_INDEX_SLOTS_OFFSET: usize = 104;
+const IMAGE_INDEX_OFFSET_OFFSET: usize = 112;
+const IMAGE_INDEX_LEN_OFFSET: usize = 120;
+const IMAGE_REGION_TABLE_OFFSET_OFFSET: usize = 128;
+const IMAGE_REGION_TABLE_LEN_OFFSET: usize = 136;
+
+/// A format-time generated, non-zero 128-bit identity.
+///
+/// This type does not generate randomness. The format owner must supply bytes
+/// from its UUID/random source and must never reuse the resulting cache UUID.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PersistentId([u8; 16]);
+
+impl PersistentId {
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+        (bytes != [0; 16]).then_some(Self(bytes))
+    }
+
+    pub(crate) const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Geometry whose exact values are part of the data identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataGeometry {
+    pub(crate) data_file_len: u64,
+    pub(crate) region_size: u64,
+    pub(crate) region_count: u32,
+}
+
+impl DataGeometry {
+    pub(crate) fn expected_file_len(region_size: u64, region_count: u32) -> Option<u64> {
+        region_size
+            .checked_mul(u64::from(region_count))?
+            .checked_add(DATA_REGION_AREA_OFFSET)
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        let minimum_region_size = u64::from(REGION_HEADER_SIZE) + 64;
+        self.region_count != 0
+            && self.region_count <= MAX_PACKED_REGION_COUNT
+            && self.region_size >= minimum_region_size
+            && self.region_size <= MAX_PACKED_REGION_SIZE
+            && self.region_size % RECOVERY_PAGE_SIZE as u64 == 0
+            && Self::expected_file_len(self.region_size, self.region_count)
+                == Some(self.data_file_len)
+    }
+}
+
+/// Immutable metadata at offset zero of a data file.
+///
+/// There is intentionally no clean/dirty/session bit here. Rewriting this page
+/// is a format/reset operation, not a normal cache mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataSuperblock {
+    pub(crate) generation: u64,
+    pub(crate) cache_uuid: PersistentId,
+    pub(crate) data_identity: PersistentId,
+    pub(crate) geometry: DataGeometry,
+    pub(crate) hash_seed: u64,
+    pub(crate) config_fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataSuperblockProbe {
+    Empty,
+    Valid(DataSuperblock),
+    Corrupt,
+    Unsupported(u16),
+    Unrecognized,
+    Truncated,
+}
+
+impl DataSuperblock {
+    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+        if !self.is_valid() {
+            return Err(CodecError::DataSuperblock);
+        }
+
+        let mut page = [0_u8; RECOVERY_PAGE_SIZE];
+        page[..DATA_MAGIC.len()].copy_from_slice(&DATA_MAGIC);
+        put_u16(&mut page, DATA_VERSION_OFFSET, RECOVERY_FORMAT_VERSION);
+        put_u16(&mut page, DATA_HEADER_SIZE_OFFSET, DATA_HEADER_SIZE);
+        put_u32(
+            &mut page,
+            DATA_HASH_ALGORITHM_OFFSET,
+            KEY_HASH_ALGORITHM_XXH3_64,
+        );
+        put_u64(&mut page, DATA_GENERATION_OFFSET, self.generation);
+        put_id(&mut page, DATA_CACHE_UUID_OFFSET, self.cache_uuid);
+        put_id(&mut page, DATA_IDENTITY_OFFSET, self.data_identity);
+        put_u64(&mut page, DATA_FILE_LEN_OFFSET, self.geometry.data_file_len);
+        put_u64(
+            &mut page,
+            DATA_REGION_SIZE_OFFSET,
+            self.geometry.region_size,
+        );
+        put_u64(
+            &mut page,
+            DATA_REGION_AREA_FIELD_OFFSET,
+            DATA_REGION_AREA_OFFSET,
+        );
+        put_u32(
+            &mut page,
+            DATA_REGION_COUNT_OFFSET,
+            self.geometry.region_count,
+        );
+        put_u32(
+            &mut page,
+            DATA_REGION_HEADER_SIZE_OFFSET,
+            REGION_HEADER_SIZE,
+        );
+        put_u32(&mut page, DATA_RECORD_ALIGNMENT_OFFSET, RECORD_ALIGNMENT);
+        put_u16(&mut page, DATA_RECORD_FORMAT_OFFSET, RECORD_FORMAT_VERSION);
+        put_u64(&mut page, DATA_HASH_SEED_OFFSET, self.hash_seed);
+        put_u64(
+            &mut page,
+            DATA_CONFIG_FINGERPRINT_OFFSET,
+            self.config_fingerprint,
+        );
+        write_page_crc(&mut page);
+        Ok(page)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
+        match Self::probe(page) {
+            DataSuperblockProbe::Valid(superblock) => Some(superblock),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn probe(page: &[u8]) -> DataSuperblockProbe {
+        if page.len() != RECOVERY_PAGE_SIZE {
+            return DataSuperblockProbe::Truncated;
+        }
+        if page.iter().all(|byte| *byte == 0) {
+            return DataSuperblockProbe::Empty;
+        }
+        if page[..DATA_MAGIC.len()] != DATA_MAGIC {
+            return DataSuperblockProbe::Unrecognized;
+        }
+        if !page_crc_matches(page) {
+            return DataSuperblockProbe::Corrupt;
+        }
+        let Some(version) = get_u16(page, DATA_VERSION_OFFSET) else {
+            return DataSuperblockProbe::Corrupt;
+        };
+        if version != RECOVERY_FORMAT_VERSION {
+            return DataSuperblockProbe::Unsupported(version);
+        }
+        if get_u16(page, DATA_HEADER_SIZE_OFFSET) != Some(DATA_HEADER_SIZE)
+            || get_u32(page, DATA_HASH_ALGORITHM_OFFSET) != Some(KEY_HASH_ALGORITHM_XXH3_64)
+            || get_u64(page, DATA_REGION_AREA_FIELD_OFFSET) != Some(DATA_REGION_AREA_OFFSET)
+            || get_u32(page, DATA_REGION_HEADER_SIZE_OFFSET) != Some(REGION_HEADER_SIZE)
+            || get_u32(page, DATA_RECORD_ALIGNMENT_OFFSET) != Some(RECORD_ALIGNMENT)
+            || get_u16(page, DATA_RECORD_FORMAT_OFFSET) != Some(RECORD_FORMAT_VERSION)
+            || page[DATA_RECORD_FORMAT_OFFSET + size_of::<u16>()..DATA_HASH_SEED_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+            || page[usize::from(DATA_HEADER_SIZE)..PAGE_CRC_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return DataSuperblockProbe::Corrupt;
+        }
+
+        let Some(cache_uuid) = get_id(page, DATA_CACHE_UUID_OFFSET) else {
+            return DataSuperblockProbe::Corrupt;
+        };
+        let Some(data_identity) = get_id(page, DATA_IDENTITY_OFFSET) else {
+            return DataSuperblockProbe::Corrupt;
+        };
+        let Some(superblock) = (|| {
+            Some(Self {
+                generation: get_u64(page, DATA_GENERATION_OFFSET)?,
+                cache_uuid,
+                data_identity,
+                geometry: DataGeometry {
+                    data_file_len: get_u64(page, DATA_FILE_LEN_OFFSET)?,
+                    region_size: get_u64(page, DATA_REGION_SIZE_OFFSET)?,
+                    region_count: get_u32(page, DATA_REGION_COUNT_OFFSET)?,
+                },
+                hash_seed: get_u64(page, DATA_HASH_SEED_OFFSET)?,
+                config_fingerprint: get_u64(page, DATA_CONFIG_FINGERPRINT_OFFSET)?,
+            })
+        })() else {
+            return DataSuperblockProbe::Corrupt;
+        };
+
+        if !superblock.is_valid() {
+            return DataSuperblockProbe::Corrupt;
+        }
+        DataSuperblockProbe::Valid(superblock)
+    }
+
+    fn is_valid(self) -> bool {
+        self.generation != 0 && self.geometry.is_valid()
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryState {
+    Empty = 0,
+    Running = 1,
+    Clean = 2,
+}
+
+impl RecoveryState {
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Empty),
+            1 => Some(Self::Running),
+            2 => Some(Self::Clean),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ImageBinding {
+    pub(crate) identity: PersistentId,
+    pub(crate) generation: u64,
+    pub(crate) file_len: u64,
+}
+
+impl ImageBinding {
+    fn is_valid(self) -> bool {
+        self.generation != 0 && self.file_len >= RECOVERY_PAGE_SIZE as u64
+    }
+}
+
+/// Header of the immutable clean-recovery image.
+///
+/// The index mapping starts at exactly 4 KiB. A mandatory page-aligned Region
+/// metadata section follows it; that format can evolve independently of this header.
+/// The state file must bind the exact `image_binding()` before this image is
+/// eligible for a clean open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryImageHeader {
+    pub(crate) cache_uuid: PersistentId,
+    pub(crate) data_identity: PersistentId,
+    pub(crate) data_superblock_generation: u64,
+    pub(crate) hash_seed: u64,
+    pub(crate) config_fingerprint: u64,
+    pub(crate) image_identity: PersistentId,
+    pub(crate) image_generation: u64,
+    pub(crate) image_file_len: u64,
+    pub(crate) index_slots: u64,
+    pub(crate) index_offset: u64,
+    pub(crate) index_len: u64,
+    pub(crate) region_table_offset: u64,
+    pub(crate) region_table_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryImageHeaderProbe {
+    Empty,
+    Valid(RecoveryImageHeader),
+    Corrupt,
+    Unsupported(u16),
+    Unrecognized,
+    Truncated,
+}
+
+impl RecoveryImageHeader {
+    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+        if !self.is_valid() {
+            return Err(CodecError::RecoveryImageHeader);
+        }
+
+        let mut page = [0_u8; RECOVERY_PAGE_SIZE];
+        page[..IMAGE_MAGIC.len()].copy_from_slice(&IMAGE_MAGIC);
+        put_u16(&mut page, IMAGE_VERSION_OFFSET, IMAGE_FORMAT_VERSION);
+        put_u16(&mut page, IMAGE_HEADER_SIZE_OFFSET, IMAGE_HEADER_SIZE);
+        put_u32(&mut page, IMAGE_FLAGS_OFFSET, 0);
+        put_id(&mut page, IMAGE_CACHE_UUID_OFFSET, self.cache_uuid);
+        put_id(&mut page, IMAGE_DATA_IDENTITY_OFFSET, self.data_identity);
+        put_u64(
+            &mut page,
+            IMAGE_DATA_GENERATION_OFFSET,
+            self.data_superblock_generation,
+        );
+        put_u64(&mut page, IMAGE_HASH_SEED_OFFSET, self.hash_seed);
+        put_u64(
+            &mut page,
+            IMAGE_CONFIG_FINGERPRINT_OFFSET,
+            self.config_fingerprint,
+        );
+        put_id(&mut page, IMAGE_IDENTITY_OFFSET, self.image_identity);
+        put_u64(&mut page, IMAGE_GENERATION_OFFSET, self.image_generation);
+        put_u64(&mut page, IMAGE_FILE_LEN_OFFSET, self.image_file_len);
+        put_u64(&mut page, IMAGE_INDEX_SLOTS_OFFSET, self.index_slots);
+        put_u64(&mut page, IMAGE_INDEX_OFFSET_OFFSET, self.index_offset);
+        put_u64(&mut page, IMAGE_INDEX_LEN_OFFSET, self.index_len);
+        put_u64(
+            &mut page,
+            IMAGE_REGION_TABLE_OFFSET_OFFSET,
+            self.region_table_offset,
+        );
+        put_u64(
+            &mut page,
+            IMAGE_REGION_TABLE_LEN_OFFSET,
+            self.region_table_len,
+        );
+        write_page_crc(&mut page);
+        Ok(page)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
+        match Self::probe(page) {
+            RecoveryImageHeaderProbe::Valid(header) => Some(header),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn probe(page: &[u8]) -> RecoveryImageHeaderProbe {
+        if page.len() != RECOVERY_PAGE_SIZE {
+            return RecoveryImageHeaderProbe::Truncated;
+        }
+        if page.iter().all(|byte| *byte == 0) {
+            return RecoveryImageHeaderProbe::Empty;
+        }
+        if page[..IMAGE_MAGIC.len()] != IMAGE_MAGIC {
+            return RecoveryImageHeaderProbe::Unrecognized;
+        }
+        if !page_crc_matches(page) {
+            return RecoveryImageHeaderProbe::Corrupt;
+        }
+        let Some(version) = get_u16(page, IMAGE_VERSION_OFFSET) else {
+            return RecoveryImageHeaderProbe::Corrupt;
+        };
+        if version != IMAGE_FORMAT_VERSION {
+            return RecoveryImageHeaderProbe::Unsupported(version);
+        }
+        if get_u16(page, IMAGE_HEADER_SIZE_OFFSET) != Some(IMAGE_HEADER_SIZE)
+            || get_u32(page, IMAGE_FLAGS_OFFSET) != Some(0)
+            || page[usize::from(IMAGE_HEADER_SIZE)..PAGE_CRC_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return RecoveryImageHeaderProbe::Corrupt;
+        }
+
+        let Some(cache_uuid) = get_id(page, IMAGE_CACHE_UUID_OFFSET) else {
+            return RecoveryImageHeaderProbe::Corrupt;
+        };
+        let Some(data_identity) = get_id(page, IMAGE_DATA_IDENTITY_OFFSET) else {
+            return RecoveryImageHeaderProbe::Corrupt;
+        };
+        let Some(image_identity) = get_id(page, IMAGE_IDENTITY_OFFSET) else {
+            return RecoveryImageHeaderProbe::Corrupt;
+        };
+        let Some(header) = (|| {
+            Some(Self {
+                cache_uuid,
+                data_identity,
+                data_superblock_generation: get_u64(page, IMAGE_DATA_GENERATION_OFFSET)?,
+                hash_seed: get_u64(page, IMAGE_HASH_SEED_OFFSET)?,
+                config_fingerprint: get_u64(page, IMAGE_CONFIG_FINGERPRINT_OFFSET)?,
+                image_identity,
+                image_generation: get_u64(page, IMAGE_GENERATION_OFFSET)?,
+                image_file_len: get_u64(page, IMAGE_FILE_LEN_OFFSET)?,
+                index_slots: get_u64(page, IMAGE_INDEX_SLOTS_OFFSET)?,
+                index_offset: get_u64(page, IMAGE_INDEX_OFFSET_OFFSET)?,
+                index_len: get_u64(page, IMAGE_INDEX_LEN_OFFSET)?,
+                region_table_offset: get_u64(page, IMAGE_REGION_TABLE_OFFSET_OFFSET)?,
+                region_table_len: get_u64(page, IMAGE_REGION_TABLE_LEN_OFFSET)?,
+            })
+        })() else {
+            return RecoveryImageHeaderProbe::Corrupt;
+        };
+        if !header.is_valid() {
+            return RecoveryImageHeaderProbe::Corrupt;
+        }
+        RecoveryImageHeaderProbe::Valid(header)
+    }
+
+    pub(crate) const fn image_binding(self) -> ImageBinding {
+        ImageBinding {
+            identity: self.image_identity,
+            generation: self.image_generation,
+            file_len: self.image_file_len,
+        }
+    }
+
+    pub(crate) fn matches_data(self, data: DataSuperblock) -> bool {
+        self.cache_uuid == data.cache_uuid
+            && self.data_identity == data.data_identity
+            && self.data_superblock_generation == data.generation
+            && self.hash_seed == data.hash_seed
+            && self.config_fingerprint == data.config_fingerprint
+    }
+
+    fn is_valid(self) -> bool {
+        let Some(expected_index_len) = recovery_image_index_len(self.index_slots) else {
+            return false;
+        };
+        let Some(index_end) = self.index_offset.checked_add(self.index_len) else {
+            return false;
+        };
+        let expected_file_len = (self.region_table_offset == index_end
+            && self.region_table_len % RECOVERY_PAGE_SIZE as u64 == 0
+            && self.region_table_len != 0)
+            .then(|| self.region_table_offset.checked_add(self.region_table_len))
+            .flatten();
+
+        self.data_superblock_generation != 0
+            && self.image_generation != 0
+            && self.index_slots != 0
+            && self.index_offset == RECOVERY_IMAGE_INDEX_OFFSET
+            && self.index_len == expected_index_len
+            && expected_file_len == Some(self.image_file_len)
+    }
+}
+
+/// Exact byte length of the self-checking index pages.
+pub(crate) fn recovery_image_index_len(index_slots: u64) -> Option<u64> {
+    if index_slots == 0 {
+        return None;
+    }
+    let complete_pages = index_slots / RECOVERY_IMAGE_SLOTS_PER_PAGE;
+    let partial_page = u64::from(index_slots % RECOVERY_IMAGE_SLOTS_PER_PAGE != 0);
+    complete_pages
+        .checked_add(partial_page)?
+        .checked_mul(RECOVERY_PAGE_SIZE as u64)
+}
+
+/// Values that bind one state record to an exact data file and, for `CLEAN`,
+/// an exact recovery image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateBinding {
+    pub(crate) cache_uuid: PersistentId,
+    pub(crate) data_identity: PersistentId,
+    pub(crate) data_superblock_generation: u64,
+    pub(crate) data_file_len: u64,
+    pub(crate) hash_seed: u64,
+    pub(crate) config_fingerprint: u64,
+    pub(crate) image: Option<ImageBinding>,
+}
+
+impl StateBinding {
+    pub(crate) fn from_data(data: DataSuperblock, image: Option<ImageBinding>) -> Self {
+        Self {
+            cache_uuid: data.cache_uuid,
+            data_identity: data.data_identity,
+            data_superblock_generation: data.generation,
+            data_file_len: data.geometry.data_file_len,
+            hash_seed: data.hash_seed,
+            config_fingerprint: data.config_fingerprint,
+            image,
+        }
+    }
+
+    pub(crate) fn matches_data(self, data: DataSuperblock) -> bool {
+        self.cache_uuid == data.cache_uuid
+            && self.data_identity == data.data_identity
+            && self.data_superblock_generation == data.generation
+            && self.data_file_len == data.geometry.data_file_len
+            && self.hash_seed == data.hash_seed
+            && self.config_fingerprint == data.config_fingerprint
+    }
+
+    fn is_valid(self) -> bool {
+        self.data_superblock_generation != 0
+            && self.data_file_len >= RECOVERY_PAGE_SIZE as u64
+            && self.image.is_none_or(ImageBinding::is_valid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateRecord {
+    pub(crate) generation: u64,
+    pub(crate) state: RecoveryState,
+    pub(crate) binding: StateBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateSlotProbe {
+    Empty,
+    Valid(StateRecord),
+    Corrupt,
+    Unsupported(u16),
+    Unrecognized,
+    Truncated,
+}
+
+impl StateRecord {
+    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+        if !self.is_valid() {
+            return Err(CodecError::StateRecord);
+        }
+
+        let mut page = [0_u8; RECOVERY_PAGE_SIZE];
+        page[..STATE_MAGIC.len()].copy_from_slice(&STATE_MAGIC);
+        put_u16(&mut page, STATE_VERSION_OFFSET, RECOVERY_FORMAT_VERSION);
+        put_u16(&mut page, STATE_HEADER_SIZE_OFFSET, STATE_HEADER_SIZE);
+        page[STATE_KIND_OFFSET] = self.state as u8;
+        page[STATE_FLAGS_OFFSET] = u8::from(self.binding.image.is_some()) * STATE_FLAG_HAS_IMAGE;
+        put_u64(&mut page, STATE_GENERATION_OFFSET, self.generation);
+        put_id(&mut page, STATE_CACHE_UUID_OFFSET, self.binding.cache_uuid);
+        put_id(
+            &mut page,
+            STATE_DATA_IDENTITY_OFFSET,
+            self.binding.data_identity,
+        );
+        put_u64(
+            &mut page,
+            STATE_DATA_GENERATION_OFFSET,
+            self.binding.data_superblock_generation,
+        );
+        put_u64(
+            &mut page,
+            STATE_DATA_FILE_LEN_OFFSET,
+            self.binding.data_file_len,
+        );
+        put_u64(&mut page, STATE_HASH_SEED_OFFSET, self.binding.hash_seed);
+        put_u64(
+            &mut page,
+            STATE_CONFIG_FINGERPRINT_OFFSET,
+            self.binding.config_fingerprint,
+        );
+        if let Some(image) = self.binding.image {
+            put_id(&mut page, STATE_IMAGE_IDENTITY_OFFSET, image.identity);
+            put_u64(&mut page, STATE_IMAGE_GENERATION_OFFSET, image.generation);
+            put_u64(&mut page, STATE_IMAGE_FILE_LEN_OFFSET, image.file_len);
+        }
+        write_page_crc(&mut page);
+        Ok(page)
+    }
+
+    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
+        match Self::probe(page) {
+            StateSlotProbe::Valid(record) => Some(record),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn probe(page: &[u8]) -> StateSlotProbe {
+        if page.len() != RECOVERY_PAGE_SIZE {
+            return StateSlotProbe::Truncated;
+        }
+        if page.iter().all(|byte| *byte == 0) {
+            return StateSlotProbe::Empty;
+        }
+        if page[..STATE_MAGIC.len()] != STATE_MAGIC {
+            return StateSlotProbe::Unrecognized;
+        }
+        if !page_crc_matches(page) {
+            return StateSlotProbe::Corrupt;
+        }
+        let Some(version) = get_u16(page, STATE_VERSION_OFFSET) else {
+            return StateSlotProbe::Corrupt;
+        };
+        if version != RECOVERY_FORMAT_VERSION {
+            return StateSlotProbe::Unsupported(version);
+        }
+        let flags = page[STATE_FLAGS_OFFSET];
+        if get_u16(page, STATE_HEADER_SIZE_OFFSET) != Some(STATE_HEADER_SIZE)
+            || flags & !STATE_FLAG_HAS_IMAGE != 0
+            || page[14..16].iter().any(|byte| *byte != 0)
+            || page[usize::from(STATE_HEADER_SIZE)..PAGE_CRC_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return StateSlotProbe::Corrupt;
+        }
+
+        let Some(state) = RecoveryState::decode(page[STATE_KIND_OFFSET]) else {
+            return StateSlotProbe::Corrupt;
+        };
+        let Some(cache_uuid) = get_id(page, STATE_CACHE_UUID_OFFSET) else {
+            return StateSlotProbe::Corrupt;
+        };
+        let Some(data_identity) = get_id(page, STATE_DATA_IDENTITY_OFFSET) else {
+            return StateSlotProbe::Corrupt;
+        };
+        let has_image = flags & STATE_FLAG_HAS_IMAGE != 0;
+        let image = if has_image {
+            let Some(identity) = get_id(page, STATE_IMAGE_IDENTITY_OFFSET) else {
+                return StateSlotProbe::Corrupt;
+            };
+            Some(ImageBinding {
+                identity,
+                generation: get_u64(page, STATE_IMAGE_GENERATION_OFFSET).unwrap_or(0),
+                file_len: get_u64(page, STATE_IMAGE_FILE_LEN_OFFSET).unwrap_or(0),
+            })
+        } else {
+            if page[STATE_IMAGE_IDENTITY_OFFSET..STATE_HEADER_SIZE as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return StateSlotProbe::Corrupt;
+            }
+            None
+        };
+
+        let Some(record) = (|| {
+            Some(Self {
+                generation: get_u64(page, STATE_GENERATION_OFFSET)?,
+                state,
+                binding: StateBinding {
+                    cache_uuid,
+                    data_identity,
+                    data_superblock_generation: get_u64(page, STATE_DATA_GENERATION_OFFSET)?,
+                    data_file_len: get_u64(page, STATE_DATA_FILE_LEN_OFFSET)?,
+                    hash_seed: get_u64(page, STATE_HASH_SEED_OFFSET)?,
+                    config_fingerprint: get_u64(page, STATE_CONFIG_FINGERPRINT_OFFSET)?,
+                    image,
+                },
+            })
+        })() else {
+            return StateSlotProbe::Corrupt;
+        };
+
+        if !record.is_valid() {
+            return StateSlotProbe::Corrupt;
+        }
+        StateSlotProbe::Valid(record)
+    }
+
+    pub(crate) fn matches_clean(self, data: DataSuperblock, image: ImageBinding) -> bool {
+        self.state == RecoveryState::Clean
+            && self.binding.matches_data(data)
+            && self.binding.image == Some(image)
+    }
+
+    fn is_valid(self) -> bool {
+        self.generation != 0
+            && self.binding.is_valid()
+            && (self.state != RecoveryState::Clean || self.binding.image.is_some())
+    }
+}
+
+/// Validates the state/data/image identity triad and the runtime index layout.
+///
+/// This proves that a complete-layout immutable image is the one named by
+/// `CLEAN`; the Region recovery adapter must additionally validate the
+/// contents of its mandatory Region table before restoring any cache state.
+pub(crate) fn clean_image_matches(
+    state: StateRecord,
+    data: DataSuperblock,
+    header: RecoveryImageHeader,
+    actual_file_len: u64,
+    expected_slots: u64,
+    expected_index_len: u64,
+) -> bool {
+    header.is_valid()
+        && recovery_image_index_len(expected_slots) == Some(expected_index_len)
+        && state.matches_clean(data, header.image_binding())
+        && header.matches_data(data)
+        && header.image_file_len == actual_file_len
+        && header.index_slots == expected_slots
+        && header.index_offset == RECOVERY_IMAGE_INDEX_OFFSET
+        && header.index_len == expected_index_len
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedState {
+    pub(crate) slot: u8,
+    pub(crate) record: StateRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateSelectionError {
+    ConflictingGeneration(u64),
+    UnsupportedVersion { slot: u8, version: u16 },
+}
+
+/// Selects the checksum-valid state with the greatest generation.
+///
+/// Corrupt, torn, and blank pages are ignored. A page with the state magic but
+/// an unsupported version rejects the selection: falling back to an older
+/// `CLEAN` generation would allow a newer implementation's state to be
+/// misinterpreted. Two different records with the same greatest generation are
+/// likewise rejected instead of choosing an arbitrary recovery authority.
+pub(crate) fn latest_state(
+    pages: [&[u8]; STATE_SLOT_COUNT],
+) -> Result<Option<SelectedState>, StateSelectionError> {
+    let mut selected: Option<SelectedState> = None;
+    for (slot, page) in pages.into_iter().enumerate() {
+        let record = match StateRecord::probe(page) {
+            StateSlotProbe::Valid(record) => record,
+            StateSlotProbe::Unsupported(version) => {
+                return Err(StateSelectionError::UnsupportedVersion {
+                    slot: slot as u8,
+                    version,
+                });
+            }
+            _ => continue,
+        };
+        let candidate = SelectedState {
+            slot: slot as u8,
+            record,
+        };
+        match selected {
+            None => selected = Some(candidate),
+            Some(current) if candidate.record.generation > current.record.generation => {
+                selected = Some(candidate);
+            }
+            Some(current) if candidate.record.generation == current.record.generation => {
+                if candidate.record != current.record {
+                    return Err(StateSelectionError::ConflictingGeneration(
+                        candidate.record.generation,
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(selected)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StatePageWrite {
+    pub(crate) slot: u8,
+    pub(crate) record: StateRecord,
+    pub(crate) page: [u8; RECOVERY_PAGE_SIZE],
+}
+
+/// The two writes required to invalidate every old `CLEAN` authority before
+/// opening the cache to mutations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunningBarrierWrite {
+    /// Write this page first, without an intervening sync.
+    pub(crate) first: StatePageWrite,
+    /// Write this page second, then `fdatasync` the state file once.
+    pub(crate) second: StatePageWrite,
+}
+
+impl StatePageWrite {
+    pub(crate) const fn offset(&self) -> u64 {
+        self.slot as u64 * RECOVERY_PAGE_SIZE as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepareStateError {
+    GenerationExhausted,
+    InvalidSlot(u8),
+    InvalidStateRecord,
+}
+
+/// Encodes the next monotonic state into the slot opposite the selected one.
+///
+/// With a blank state file, generation one is written to slot zero. This is a
+/// pure preparation step; publication still requires a full-page positioned
+/// write followed by `fdatasync` before the caller acts on the transition.
+pub(crate) fn prepare_next_state(
+    current: Option<SelectedState>,
+    state: RecoveryState,
+    binding: StateBinding,
+) -> Result<StatePageWrite, PrepareStateError> {
+    let (slot, generation) = match current {
+        None => (0, 1),
+        Some(current) => {
+            if usize::from(current.slot) >= STATE_SLOT_COUNT {
+                return Err(PrepareStateError::InvalidSlot(current.slot));
+            }
+            (
+                1 - current.slot,
+                current
+                    .record
+                    .generation
+                    .checked_add(1)
+                    .ok_or(PrepareStateError::GenerationExhausted)?,
+            )
+        }
+    };
+    let record = StateRecord {
+        generation,
+        state,
+        binding,
+    };
+    let page = record
+        .encode()
+        .map_err(|_| PrepareStateError::InvalidStateRecord)?;
+    Ok(StatePageWrite { slot, record, page })
+}
+
+/// Prepares a crash-safe startup `RUNNING` barrier covering both state slots.
+///
+/// A caller opening from `CLEAN` must not publish only one `RUNNING` page: if
+/// that page were later unreadable, latest-valid selection could fall back to
+/// the old `CLEAN` record after this session had mutated data. Write `first`,
+/// write `second`, and perform one `fdatasync` before admitting any operation.
+/// A failed barrier must abort open.
+pub(crate) fn prepare_running_barrier(
+    current: Option<SelectedState>,
+    binding: StateBinding,
+) -> Result<RunningBarrierWrite, PrepareStateError> {
+    let first = prepare_next_state(current, RecoveryState::Running, binding)?;
+    let first_selected = SelectedState {
+        slot: first.slot,
+        record: first.record,
+    };
+    let second = prepare_next_state(Some(first_selected), RecoveryState::Running, binding)?;
+    Ok(RunningBarrierWrite { first, second })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodecError {
+    DataSuperblock,
+    RecoveryImageHeader,
+    StateRecord,
+}
+
+fn put_id(output: &mut [u8], offset: usize, value: PersistentId) {
+    output[offset..offset + 16].copy_from_slice(&value.to_bytes());
+}
+
+fn get_id(input: &[u8], offset: usize) -> Option<PersistentId> {
+    PersistentId::from_bytes(input.get(offset..offset + 16)?.try_into().ok()?)
+}
+
+fn put_u16(output: &mut [u8], offset: usize, value: u16) {
+    output[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut [u8], offset: usize, value: u64) {
+    output[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        input
+            .get(offset..offset + size_of::<u16>())?
+            .try_into()
+            .ok()?,
+    ))
+}
+
+fn get_u32(input: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        input
+            .get(offset..offset + size_of::<u32>())?
+            .try_into()
+            .ok()?,
+    ))
+}
+
+fn get_u64(input: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        input
+            .get(offset..offset + size_of::<u64>())?
+            .try_into()
+            .ok()?,
+    ))
+}
+
+fn write_page_crc(page: &mut [u8; RECOVERY_PAGE_SIZE]) {
+    put_u32(page, PAGE_CRC_OFFSET, 0);
+    let checksum = crc32c(page);
+    put_u32(page, PAGE_CRC_OFFSET, checksum);
+}
+
+fn page_crc_matches(page: &[u8]) -> bool {
+    if page.len() != RECOVERY_PAGE_SIZE {
+        return false;
+    }
+    let Some(expected) = get_u32(page, PAGE_CRC_OFFSET) else {
+        return false;
+    };
+    let mut checksum = Crc32c::new();
+    checksum.update(&page[..PAGE_CRC_OFFSET]);
+    checksum.update(&[0; size_of::<u32>()]);
+    checksum.finish() == expected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_INDEX_SLOTS: u64 = RECOVERY_IMAGE_SLOTS_PER_PAGE * 16;
+    const TEST_INDEX_LEN: u64 = RECOVERY_PAGE_SIZE as u64 * 16;
+    const TEST_REGION_TABLE_LEN: u64 = RECOVERY_PAGE_SIZE as u64;
+    const TEST_IMAGE_FILE_LEN: u64 =
+        RECOVERY_IMAGE_INDEX_OFFSET + TEST_INDEX_LEN + TEST_REGION_TABLE_LEN;
+
+    fn id(byte: u8) -> PersistentId {
+        PersistentId::from_bytes([byte; 16]).unwrap()
+    }
+
+    fn sparse_golden(input: &str) -> Vec<u8> {
+        let mut output: Option<Vec<u8>> = None;
+        for raw_line in input.lines() {
+            let line = raw_line.split('#').next().unwrap().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let first = fields.next().unwrap();
+            if first == "length" {
+                let length = fields.next().unwrap().parse::<usize>().unwrap();
+                assert!(output.replace(vec![0_u8; length]).is_none());
+                continue;
+            }
+            let offset = usize::from_str_radix(first, 16).unwrap();
+            let encoded = fields.next().unwrap();
+            assert_eq!(encoded.len() % 2, 0);
+            let bytes = encoded
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+            let output = output.as_mut().expect("golden length must come first");
+            output[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            assert!(fields.next().is_none());
+        }
+        output.expect("golden fixture must declare its length")
+    }
+
+    fn data_superblock() -> DataSuperblock {
+        let region_size = 32 * 1024 * 1024;
+        let region_count = 128;
+        DataSuperblock {
+            generation: 7,
+            cache_uuid: id(1),
+            data_identity: id(2),
+            geometry: DataGeometry {
+                data_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
+                region_size,
+                region_count,
+            },
+            hash_seed: 0x1234_5678_9abc_def0,
+            config_fingerprint: 0x8877_6655_4433_2211,
+        }
+    }
+
+    fn image() -> ImageBinding {
+        ImageBinding {
+            identity: id(3),
+            generation: 11,
+            file_len: TEST_IMAGE_FILE_LEN,
+        }
+    }
+
+    fn image_header() -> RecoveryImageHeader {
+        let image = image();
+        let data = data_superblock();
+        RecoveryImageHeader {
+            cache_uuid: data.cache_uuid,
+            data_identity: data.data_identity,
+            data_superblock_generation: data.generation,
+            hash_seed: data.hash_seed,
+            config_fingerprint: data.config_fingerprint,
+            image_identity: image.identity,
+            image_generation: image.generation,
+            image_file_len: image.file_len,
+            index_slots: TEST_INDEX_SLOTS,
+            index_offset: RECOVERY_IMAGE_INDEX_OFFSET,
+            index_len: TEST_INDEX_LEN,
+            region_table_offset: RECOVERY_IMAGE_INDEX_OFFSET + TEST_INDEX_LEN,
+            region_table_len: TEST_REGION_TABLE_LEN,
+        }
+    }
+
+    fn record(generation: u64, state: RecoveryState) -> StateRecord {
+        StateRecord {
+            generation,
+            state,
+            binding: StateBinding::from_data(
+                data_superblock(),
+                (state == RecoveryState::Clean).then_some(image()),
+            ),
+        }
+    }
+
+    #[test]
+    fn format_1_recovery_control_pages_match_committed_golden_bytes() {
+        let data = data_superblock();
+        let clean = record(19, RecoveryState::Clean);
+        let image = image_header();
+        let data_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v1/data_superblock.golden"
+        ));
+        let clean_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v1/clean_state.golden"
+        ));
+        let image_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v1/recovery_image_header.golden"
+        ));
+
+        assert_eq!(data.encode().unwrap().as_slice(), data_golden);
+        assert_eq!(clean.encode().unwrap().as_slice(), clean_golden);
+        assert_eq!(image.encode().unwrap().as_slice(), image_golden);
+        assert_eq!(DataSuperblock::decode(&data_golden), Some(data));
+        assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
+        assert_eq!(RecoveryImageHeader::decode(&image_golden), Some(image));
+    }
+
+    #[test]
+    fn data_superblock_round_trips_without_session_state() {
+        let expected = data_superblock();
+        let encoded = expected.encode().unwrap();
+
+        assert_eq!(DataSuperblock::decode(&encoded), Some(expected));
+        assert_eq!(
+            DataSuperblock::probe(&encoded),
+            DataSuperblockProbe::Valid(expected)
+        );
+        assert_eq!(&encoded[112..PAGE_CRC_OFFSET], &[0; PAGE_CRC_OFFSET - 112]);
+    }
+
+    #[test]
+    fn data_superblock_rejects_corruption_torn_pages_and_bad_geometry() {
+        let mut corrupt = data_superblock().encode().unwrap();
+        corrupt[64] ^= 1;
+        assert_eq!(
+            DataSuperblock::probe(&corrupt),
+            DataSuperblockProbe::Corrupt
+        );
+        assert_eq!(
+            DataSuperblock::probe(&corrupt[..2048]),
+            DataSuperblockProbe::Truncated
+        );
+
+        let mut reserved = data_superblock().encode().unwrap();
+        reserved[DATA_RECORD_FORMAT_OFFSET + size_of::<u16>()] = 1;
+        write_page_crc(&mut reserved);
+        assert!(page_crc_matches(&reserved));
+        assert_eq!(
+            DataSuperblock::probe(&reserved),
+            DataSuperblockProbe::Corrupt
+        );
+
+        let mut legacy_hash = data_superblock().encode().unwrap();
+        put_u32(&mut legacy_hash, DATA_HASH_ALGORITHM_OFFSET, 0);
+        write_page_crc(&mut legacy_hash);
+        assert!(page_crc_matches(&legacy_hash));
+        assert_eq!(
+            DataSuperblock::probe(&legacy_hash),
+            DataSuperblockProbe::Corrupt
+        );
+
+        let mut bad = data_superblock();
+        bad.geometry.data_file_len += 4096;
+        assert_eq!(bad.encode(), Err(CodecError::DataSuperblock));
+
+        let mut too_many_regions = data_superblock();
+        too_many_regions.geometry.region_count = MAX_PACKED_REGION_COUNT + 1;
+        too_many_regions.geometry.data_file_len = DataGeometry::expected_file_len(
+            too_many_regions.geometry.region_size,
+            too_many_regions.geometry.region_count,
+        )
+        .unwrap();
+        assert_eq!(too_many_regions.encode(), Err(CodecError::DataSuperblock));
+
+        let mut oversized_region = data_superblock();
+        oversized_region.geometry.region_size = MAX_PACKED_REGION_SIZE + RECOVERY_PAGE_SIZE as u64;
+        oversized_region.geometry.data_file_len = DataGeometry::expected_file_len(
+            oversized_region.geometry.region_size,
+            oversized_region.geometry.region_count,
+        )
+        .unwrap();
+        assert_eq!(oversized_region.encode(), Err(CodecError::DataSuperblock));
+    }
+
+    #[test]
+    fn state_records_round_trip_all_states() {
+        for state in [
+            RecoveryState::Empty,
+            RecoveryState::Running,
+            RecoveryState::Clean,
+        ] {
+            let expected = record(19, state);
+            let encoded = expected.encode().unwrap();
+            assert_eq!(StateRecord::decode(&encoded), Some(expected));
+        }
+    }
+
+    #[test]
+    fn recovery_image_header_round_trips_and_binds_data() {
+        let expected = image_header();
+        let encoded = expected.encode().unwrap();
+
+        assert_eq!(RecoveryImageHeader::decode(&encoded), Some(expected));
+        assert!(expected.matches_data(data_superblock()));
+        assert_eq!(expected.image_binding(), image());
+        assert_eq!(
+            &encoded[usize::from(IMAGE_HEADER_SIZE)..PAGE_CRC_OFFSET],
+            &[0; PAGE_CRC_OFFSET - IMAGE_HEADER_SIZE as usize]
+        );
+    }
+
+    #[test]
+    fn recovery_image_header_rejects_corruption_and_non_page_index() {
+        let mut corrupt = image_header().encode().unwrap();
+        corrupt[IMAGE_INDEX_SLOTS_OFFSET] ^= 1;
+        assert_eq!(
+            RecoveryImageHeader::probe(&corrupt),
+            RecoveryImageHeaderProbe::Corrupt
+        );
+
+        let mut bad = image_header();
+        bad.index_offset += RECOVERY_PAGE_SIZE as u64;
+        assert_eq!(bad.encode(), Err(CodecError::RecoveryImageHeader));
+
+        let mut wrong_slot_length = image_header();
+        wrong_slot_length.index_len += RECOVERY_PAGE_SIZE as u64;
+        wrong_slot_length.region_table_offset += RECOVERY_PAGE_SIZE as u64;
+        wrong_slot_length.image_file_len += RECOVERY_PAGE_SIZE as u64;
+        assert_eq!(
+            wrong_slot_length.encode(),
+            Err(CodecError::RecoveryImageHeader)
+        );
+
+        let mut trailing_bytes = image_header();
+        trailing_bytes.image_file_len += RECOVERY_PAGE_SIZE as u64;
+        assert_eq!(
+            trailing_bytes.encode(),
+            Err(CodecError::RecoveryImageHeader)
+        );
+
+        let mut metadata_gap = image_header();
+        metadata_gap.region_table_offset += RECOVERY_PAGE_SIZE as u64;
+        metadata_gap.image_file_len += RECOVERY_PAGE_SIZE as u64;
+        assert_eq!(metadata_gap.encode(), Err(CodecError::RecoveryImageHeader));
+
+        let mut index_only = image_header();
+        index_only.region_table_offset = 0;
+        index_only.region_table_len = 0;
+        index_only.image_file_len = index_only.index_offset + index_only.index_len;
+        assert_eq!(index_only.encode(), Err(CodecError::RecoveryImageHeader));
+
+        let mut wrong_data = data_superblock();
+        wrong_data.generation += 1;
+        assert!(!image_header().matches_data(wrong_data));
+    }
+
+    #[test]
+    fn recovery_image_length_is_exact_and_checked() {
+        assert_eq!(recovery_image_index_len(0), None);
+        assert_eq!(recovery_image_index_len(1), Some(4096));
+        assert_eq!(recovery_image_index_len(126), Some(4096));
+        assert_eq!(recovery_image_index_len(127), Some(8192));
+        assert_eq!(recovery_image_index_len(u64::MAX), None);
+    }
+
+    #[test]
+    fn clean_requires_an_image_binding() {
+        let mut invalid = record(1, RecoveryState::Running);
+        invalid.state = RecoveryState::Clean;
+        assert_eq!(invalid.encode(), Err(CodecError::StateRecord));
+    }
+
+    #[test]
+    fn latest_valid_ignores_a_torn_or_corrupt_newer_slot() {
+        let older = record(8, RecoveryState::Clean).encode().unwrap();
+        let mut newer = record(9, RecoveryState::Running).encode().unwrap();
+        newer[72] ^= 1;
+
+        let selected = latest_state([&older, &newer]).unwrap().unwrap();
+        assert_eq!(selected.slot, 0);
+        assert_eq!(selected.record.generation, 8);
+        assert_eq!(selected.record.state, RecoveryState::Clean);
+
+        assert_eq!(
+            StateRecord::probe(&newer[..2048]),
+            StateSlotProbe::Truncated
+        );
+    }
+
+    #[test]
+    fn latest_valid_uses_monotonic_generation_not_slot_number() {
+        let newer = record(42, RecoveryState::Running).encode().unwrap();
+        let older = record(41, RecoveryState::Clean).encode().unwrap();
+
+        let selected = latest_state([&newer, &older]).unwrap().unwrap();
+        assert_eq!(selected.slot, 0);
+        assert_eq!(selected.record.generation, 42);
+    }
+
+    #[test]
+    fn equal_generation_with_different_records_is_ambiguous() {
+        let first = record(5, RecoveryState::Running).encode().unwrap();
+        let second = record(5, RecoveryState::Clean).encode().unwrap();
+
+        assert_eq!(
+            latest_state([&first, &second]),
+            Err(StateSelectionError::ConflictingGeneration(5))
+        );
+    }
+
+    #[test]
+    fn unsupported_state_version_never_falls_back_to_old_clean() {
+        let old_clean = record(7, RecoveryState::Clean).encode().unwrap();
+        let mut unsupported = record(8, RecoveryState::Running).encode().unwrap();
+        put_u16(&mut unsupported, STATE_VERSION_OFFSET, 99);
+        write_page_crc(&mut unsupported);
+
+        assert_eq!(
+            latest_state([&old_clean, &unsupported]),
+            Err(StateSelectionError::UnsupportedVersion {
+                slot: 1,
+                version: 99,
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_versions_require_an_intact_envelope_checksum() {
+        let mut data = data_superblock().encode().unwrap();
+        put_u16(&mut data, DATA_VERSION_OFFSET, 99);
+        assert_eq!(DataSuperblock::probe(&data), DataSuperblockProbe::Corrupt);
+        write_page_crc(&mut data);
+        assert_eq!(
+            DataSuperblock::probe(&data),
+            DataSuperblockProbe::Unsupported(99)
+        );
+
+        let mut image = image_header().encode().unwrap();
+        put_u16(&mut image, IMAGE_VERSION_OFFSET, 99);
+        assert_eq!(
+            RecoveryImageHeader::probe(&image),
+            RecoveryImageHeaderProbe::Corrupt
+        );
+        write_page_crc(&mut image);
+        assert_eq!(
+            RecoveryImageHeader::probe(&image),
+            RecoveryImageHeaderProbe::Unsupported(99)
+        );
+
+        let mut state = record(8, RecoveryState::Running).encode().unwrap();
+        put_u16(&mut state, STATE_VERSION_OFFSET, 99);
+        assert_eq!(StateRecord::probe(&state), StateSlotProbe::Corrupt);
+        write_page_crc(&mut state);
+        assert_eq!(StateRecord::probe(&state), StateSlotProbe::Unsupported(99));
+    }
+
+    #[test]
+    fn prepare_next_state_alternates_slots_and_increments_generation() {
+        let binding = StateBinding::from_data(data_superblock(), None);
+        let first = prepare_next_state(None, RecoveryState::Running, binding).unwrap();
+        assert_eq!(first.slot, 0);
+        assert_eq!(first.offset(), 0);
+        assert_eq!(first.record.generation, 1);
+
+        let selected = SelectedState {
+            slot: first.slot,
+            record: first.record,
+        };
+        let second = prepare_next_state(Some(selected), RecoveryState::Empty, binding).unwrap();
+        assert_eq!(second.slot, 1);
+        assert_eq!(second.offset(), RECOVERY_PAGE_SIZE as u64);
+        assert_eq!(second.record.generation, 2);
+        assert_eq!(StateRecord::decode(&second.page), Some(second.record));
+    }
+
+    #[test]
+    fn prepare_next_state_rejects_an_invalid_selected_slot() {
+        let current = SelectedState {
+            slot: 2,
+            record: record(10, RecoveryState::Running),
+        };
+        assert_eq!(
+            prepare_next_state(
+                Some(current),
+                RecoveryState::Running,
+                current.record.binding
+            ),
+            Err(PrepareStateError::InvalidSlot(2))
+        );
+    }
+
+    #[test]
+    fn running_barrier_replaces_both_slots_before_open() {
+        let old_clean = record(9, RecoveryState::Clean);
+        let old_running = record(8, RecoveryState::Running);
+        let current = SelectedState {
+            slot: 0,
+            record: old_clean,
+        };
+        let binding = StateBinding::from_data(data_superblock(), Some(image()));
+        let barrier = prepare_running_barrier(Some(current), binding).unwrap();
+
+        assert_eq!(barrier.first.slot, 1);
+        assert_eq!(barrier.first.record.generation, 10);
+        assert_eq!(barrier.second.slot, 0);
+        assert_eq!(barrier.second.record.generation, 11);
+        assert_eq!(barrier.first.record.state, RecoveryState::Running);
+        assert_eq!(barrier.second.record.state, RecoveryState::Running);
+
+        let mut slot0 = barrier.second.page;
+        let mut slot1 = barrier.first.page;
+        slot0[200] ^= 1;
+        let selected = latest_state([&slot0, &slot1]).unwrap().unwrap();
+        assert_eq!(selected.record.state, RecoveryState::Running);
+
+        slot0 = barrier.second.page;
+        slot1[201] ^= 1;
+        let selected = latest_state([&slot0, &slot1]).unwrap().unwrap();
+        assert_eq!(selected.record.state, RecoveryState::Running);
+
+        // Before either new page reaches storage, the old CLEAN remains safe:
+        // this session has not yet admitted mutations.
+        let old_clean_page = old_clean.encode().unwrap();
+        let old_running_page = old_running.encode().unwrap();
+        assert_eq!(
+            latest_state([&old_clean_page, &old_running_page])
+                .unwrap()
+                .unwrap()
+                .record
+                .state,
+            RecoveryState::Clean
+        );
+    }
+
+    #[test]
+    fn generation_overflow_is_rejected() {
+        let selected = SelectedState {
+            slot: 1,
+            record: record(u64::MAX, RecoveryState::Running),
+        };
+        assert_eq!(
+            prepare_next_state(
+                Some(selected),
+                RecoveryState::Running,
+                selected.record.binding
+            ),
+            Err(PrepareStateError::GenerationExhausted)
+        );
+    }
+
+    #[test]
+    fn clean_match_binds_every_identity_and_generation() {
+        let data = data_superblock();
+        let image = image();
+        let clean = record(23, RecoveryState::Clean);
+        assert!(clean.matches_clean(data, image));
+
+        let mut wrong_data = data;
+        wrong_data.data_identity = id(9);
+        assert!(!clean.matches_clean(wrong_data, image));
+
+        let mut wrong_image = image;
+        wrong_image.generation += 1;
+        assert!(!clean.matches_clean(data, wrong_image));
+
+        let mut wrong_config = data;
+        wrong_config.config_fingerprint ^= 1;
+        assert!(!clean.matches_clean(wrong_config, image));
+    }
+
+    #[test]
+    fn clean_image_match_checks_the_complete_identity_triad() {
+        let data = data_superblock();
+        let clean = record(23, RecoveryState::Clean);
+        let header = image_header();
+        assert!(clean_image_matches(
+            clean,
+            data,
+            header,
+            TEST_IMAGE_FILE_LEN,
+            TEST_INDEX_SLOTS,
+            TEST_INDEX_LEN
+        ));
+        assert!(!clean_image_matches(
+            clean,
+            data,
+            header,
+            TEST_IMAGE_FILE_LEN + 1,
+            TEST_INDEX_SLOTS,
+            TEST_INDEX_LEN
+        ));
+        assert!(!clean_image_matches(
+            clean,
+            data,
+            header,
+            TEST_IMAGE_FILE_LEN,
+            TEST_INDEX_SLOTS + 1,
+            TEST_INDEX_LEN
+        ));
+        assert!(!clean_image_matches(
+            record(24, RecoveryState::Running),
+            data,
+            header,
+            TEST_IMAGE_FILE_LEN,
+            TEST_INDEX_SLOTS,
+            TEST_INDEX_LEN
+        ));
+    }
+
+    #[test]
+    fn zero_identifiers_are_never_decoded_as_owned_data() {
+        assert_eq!(PersistentId::from_bytes([0; 16]), None);
+
+        let mut encoded = data_superblock().encode().unwrap();
+        encoded[DATA_CACHE_UUID_OFFSET..DATA_CACHE_UUID_OFFSET + 16].fill(0);
+        write_page_crc(&mut encoded);
+        assert_eq!(
+            DataSuperblock::probe(&encoded),
+            DataSuperblockProbe::Corrupt
+        );
+    }
+}

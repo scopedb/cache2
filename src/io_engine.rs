@@ -1,6 +1,6 @@
 //! Owned-buffer asynchronous I/O runtime.
 //!
-//! Requests transfer ownership of their aligned buffer to the engine.  The
+//! Requests transfer ownership of their aligned buffer to the engine. The
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
@@ -27,21 +27,32 @@ use std::time::{Duration, Instant};
         target_arch = "powerpc64"
     )
 ))]
-use crate::io_backend::{DirectIoStatsHandle, RuntimeIoPath};
+use crate::io_backend::DirectIoStatsHandle;
+#[cfg(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+use crate::io_backend::RuntimeIoPath;
 use crate::io_backend::{
     IoBackend, SyncMode, SyncPoint, WritePoint, read_exact_at_with_progress,
     write_all_at_with_progress,
 };
 #[cfg(unix)]
 use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
-use crate::resources::BufferLease;
+use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
-pub(crate) const DEFAULT_IO_QUEUE_DEPTH: usize = 128;
 pub(crate) const MAX_IO_QUEUE_DEPTH: usize = 4096;
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
-/// than a durability knob: V2 cache contents are disposable.
+/// than a durability knob: cache contents are disposable.
 pub(crate) const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cancellation is only a request. Give the target operation a short window to
 /// publish its own completion, which is the actual buffer-lifetime fence.
@@ -493,6 +504,7 @@ impl CompletionState {
         }
     }
 
+    #[cfg(test)]
     fn wait(&self) -> IoCompletion {
         let mut cell = lock_unpoisoned(&self.cell);
         loop {
@@ -574,6 +586,7 @@ impl IoRequest {
         self.request_id
     }
 
+    #[cfg(test)]
     pub(crate) fn wait(mut self) -> IoCompletion {
         let completion = self.completion.wait();
         self.finished = true;
@@ -684,7 +697,7 @@ impl IoDeadlineExceeded {
     }
 }
 
-/// Submit one V2 cache-device request with a hard end-to-end deadline.
+/// Submit one cache-device request with a hard end-to-end deadline.
 pub(crate) fn submit_cache_io(
     engine: &dyn IoEngine,
     operation: IoOperation,
@@ -710,14 +723,18 @@ fn submit_cache_io_until(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EngineKind {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FileIoEngineKind {
     Sync,
+    #[default]
+    Auto,
     IoUring,
 }
 
 pub(crate) trait IoEngine: Send + Sync {
+    #[cfg(test)]
     fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
+    #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     fn submit_wait_controlled(
         &self,
@@ -728,8 +745,8 @@ pub(crate) trait IoEngine: Send + Sync {
     fn wake_admission_waiters(&self);
     fn cancel(&self, request_id: RequestId) -> io::Result<bool>;
     fn shutdown(&self) -> io::Result<()>;
-    fn queue_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
+    #[cfg(test)]
     fn direct_active(&self) -> bool;
     /// Permanently stop admission after a target operation missed both its
     /// deadline and cancellation grace period.
@@ -740,13 +757,14 @@ pub(crate) trait IoEngine: Send + Sync {
     fn has_unfenced_mutations(&self) -> bool;
     #[cfg(test)]
     fn mark_unfenced_mutations_for_test(&self);
-    fn kind(&self) -> EngineKind;
     fn stats(&self) -> IoEngineStats;
 
+    #[cfg(test)]
     fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
         self.submit(IoOperation::read(buffer, offset))
     }
 
+    #[cfg(test)]
     fn write_all_at(
         &self,
         point: WritePoint,
@@ -756,6 +774,7 @@ pub(crate) trait IoEngine: Send + Sync {
         self.submit(IoOperation::write(point, buffer, offset))
     }
 
+    #[cfg(test)]
     fn flush(&self, point: SyncPoint, mode: SyncMode) -> Result<IoRequest, SubmitError> {
         self.submit(IoOperation::flush(point, mode))
     }
@@ -884,6 +903,7 @@ impl RuntimeShared {
         }
     }
 
+    #[cfg(test)]
     fn admit_wait(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
         let mut admission = lock_unpoisoned(&self.admission_lock);
         loop {
@@ -1151,7 +1171,6 @@ struct ShutdownState {
 }
 
 struct RuntimeInner {
-    kind: EngineKind,
     shared: Arc<RuntimeShared>,
     commands: SyncSender<DriverCommand>,
     submit_state: Arc<Mutex<SubmitState>>,
@@ -1162,7 +1181,9 @@ struct RuntimeInner {
 }
 
 enum AdmissionMode<'a> {
+    #[cfg(test)]
     Try,
+    #[cfg(test)]
     Wait,
     Controlled {
         cancelled: &'a AtomicBool,
@@ -1195,10 +1216,12 @@ impl RuntimeInner {
         }
     }
 
+    #[cfg(test)]
     fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, AdmissionMode::Try)
     }
 
+    #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, AdmissionMode::Wait)
     }
@@ -1229,13 +1252,16 @@ impl RuntimeInner {
         }
         let mutation = operation.kind().is_mutation();
         let permit = match admission_mode {
+            #[cfg(test)]
             AdmissionMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
             ),
+            #[cfg(test)]
             AdmissionMode::Try => self
                 .shared
                 .try_admit(mutation)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "I/O queue is full")),
+            #[cfg(test)]
             AdmissionMode::Wait => self.shared.admit_wait(mutation).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
             }),
@@ -1451,13 +1477,39 @@ pub(crate) struct BackendIoEngine {
 
 impl BackendIoEngine {
     #[cfg(unix)]
+    #[cfg(test)]
     pub(crate) fn new_with_files(files: RuntimeFileSet, queue_depth: usize) -> io::Result<Self> {
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
         Self::new(backend, queue_depth)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn new_with_files_and_workers(
+        files: RuntimeFileSet,
+        queue_depth: usize,
+        worker_count: usize,
+    ) -> io::Result<Self> {
+        let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
+        Self::new_with_workers(backend, queue_depth, worker_count)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(backend: Arc<dyn IoBackend>, queue_depth: usize) -> io::Result<Self> {
+        Self::new_with_workers(backend, queue_depth, queue_depth.min(4))
+    }
+
+    pub(crate) fn new_with_workers(
+        backend: Arc<dyn IoBackend>,
+        queue_depth: usize,
+        worker_count: usize,
+    ) -> io::Result<Self> {
         RuntimeInner::validate_queue_depth(queue_depth)?;
+        if worker_count == 0 || worker_count > queue_depth {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sync I/O worker count must be in 1..=queue depth",
+            ));
+        }
         let shared = Arc::new(RuntimeShared::new(queue_depth));
         let command_capacity = queue_depth
             .checked_mul(2)
@@ -1465,7 +1517,6 @@ impl BackendIoEngine {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow"))?;
         let (commands, receiver) = mpsc::sync_channel(command_capacity);
         let receiver = Arc::new(Mutex::new(receiver));
-        let worker_count = queue_depth.min(4);
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
             let worker_backend = Arc::clone(&backend);
@@ -1473,6 +1524,7 @@ impl BackendIoEngine {
             let worker_receiver = Arc::clone(&receiver);
             let spawn_result = std::thread::Builder::new()
                 .name(format!("cache-rs-sync-io-{worker_index}"))
+                .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver));
             match spawn_result {
                 Ok(worker) => workers.push(worker),
@@ -1489,7 +1541,6 @@ impl BackendIoEngine {
         }
         Ok(Self {
             inner: Arc::new(RuntimeInner {
-                kind: EngineKind::Sync,
                 shared,
                 commands,
                 submit_state: Arc::new(Mutex::new(SubmitState { accepting: true })),
@@ -1507,10 +1558,12 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
+    #[cfg(test)]
     fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.inner.submit(operation)
     }
 
+    #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.inner.submit_wait(operation)
     }
@@ -1537,14 +1590,11 @@ impl IoEngine for BackendIoEngine {
         self.inner.shutdown()
     }
 
-    fn queue_depth(&self) -> usize {
-        self.inner.shared.queue_depth
-    }
-
     fn in_flight(&self) -> usize {
         self.inner.shared.in_flight.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn direct_active(&self) -> bool {
         self.backend.direct_io_stats().direct_active
     }
@@ -1567,10 +1617,6 @@ impl IoEngine for BackendIoEngine {
     #[cfg(test)]
     fn mark_unfenced_mutations_for_test(&self) {
         self.inner.shared.mark_unfenced_mutations();
-    }
-
-    fn kind(&self) -> EngineKind {
-        self.inner.kind
     }
 
     fn stats(&self) -> IoEngineStats {
@@ -1790,6 +1836,7 @@ mod uring {
             let worker_submit_state = Arc::clone(&submit_state);
             let worker = std::thread::Builder::new()
                 .name("cache-rs-uring-io".into())
+                .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || {
                     uring_driver(
                         files,
@@ -1802,7 +1849,6 @@ mod uring {
                 })?;
             Ok(Self {
                 inner: Arc::new(RuntimeInner {
-                    kind: EngineKind::IoUring,
                     shared,
                     commands,
                     submit_state,
@@ -1829,10 +1875,12 @@ mod uring {
     }
 
     impl IoEngine for UringIoEngine {
+        #[cfg(test)]
         fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
             self.inner.submit(operation)
         }
 
+        #[cfg(test)]
         fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
             self.inner.submit_wait(operation)
         }
@@ -1859,14 +1907,11 @@ mod uring {
             self.inner.shutdown()
         }
 
-        fn queue_depth(&self) -> usize {
-            self.inner.shared.queue_depth
-        }
-
         fn in_flight(&self) -> usize {
             self.inner.shared.in_flight.load(Ordering::Acquire)
         }
 
+        #[cfg(test)]
         fn direct_active(&self) -> bool {
             self.io_stats.snapshot().direct_active
         }
@@ -1889,10 +1934,6 @@ mod uring {
         #[cfg(test)]
         fn mark_unfenced_mutations_for_test(&self) {
             self.inner.shared.mark_unfenced_mutations();
-        }
-
-        fn kind(&self) -> EngineKind {
-            self.inner.kind
         }
 
         fn stats(&self) -> IoEngineStats {
@@ -2606,12 +2647,12 @@ pub(crate) fn build_auto_file_engine(
     {
         let fallback = files.try_clone()?;
         match UringIoEngine::new_with_files(files, queue_depth) {
-            Ok(engine) => return Ok(Arc::new(engine)),
+            Ok(engine) => Ok(Arc::new(engine)),
             Err(error) if UringIoEngine::is_unavailable_error(&error) => {
-                return BackendIoEngine::new_with_files(fallback, queue_depth)
-                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>);
+                BackendIoEngine::new_with_files_and_workers(fallback, queue_depth, 1)
+                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -2627,8 +2668,58 @@ pub(crate) fn build_auto_file_engine(
         )
     )))]
     {
-        BackendIoEngine::new_with_files(files, queue_depth)
+        BackendIoEngine::new_with_files_and_workers(files, queue_depth, 1)
             .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn build_file_engine(
+    files: RuntimeFileSet,
+    queue_depth: usize,
+    kind: FileIoEngineKind,
+) -> io::Result<Arc<dyn IoEngine>> {
+    match kind {
+        FileIoEngineKind::Sync => {
+            BackendIoEngine::new_with_files_and_workers(files, queue_depth, 1)
+                .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+        }
+        FileIoEngineKind::Auto => build_auto_file_engine(files, queue_depth),
+        FileIoEngineKind::IoUring => {
+            #[cfg(all(
+                feature = "io-uring",
+                target_os = "linux",
+                any(
+                    target_arch = "x86_64",
+                    target_arch = "aarch64",
+                    target_arch = "riscv64",
+                    target_arch = "loongarch64",
+                    target_arch = "powerpc64"
+                )
+            ))]
+            {
+                UringIoEngine::new_with_files(files, queue_depth)
+                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+            }
+            #[cfg(not(all(
+                feature = "io-uring",
+                target_os = "linux",
+                any(
+                    target_arch = "x86_64",
+                    target_arch = "aarch64",
+                    target_arch = "riscv64",
+                    target_arch = "loongarch64",
+                    target_arch = "powerpc64"
+                )
+            )))]
+            {
+                let _ = files;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "io_uring is unavailable on this build or platform",
+                ))
+            }
+        }
     }
 }
 
@@ -2911,7 +3002,6 @@ mod tests {
                 write_buffer_slots: 2,
                 control_concurrency: 1,
                 backpressure: BackpressurePolicy::Reject,
-                write_budget_bytes_per_second: None,
             })
             .unwrap(),
         )
@@ -2953,7 +3043,7 @@ mod tests {
         assert_eq!(write.bytes_transferred, input.len());
 
         engine
-            .flush(SyncPoint::CheckpointData, SyncMode::Data)
+            .flush(SyncPoint::ExplicitFlush, SyncMode::Data)
             .unwrap()
             .wait();
         let read = engine
@@ -2971,7 +3061,7 @@ mod tests {
         assert!(stats.in_flight_peak >= 1);
         assert!(
             engine
-                .flush(SyncPoint::CheckpointData, SyncMode::Data)
+                .flush(SyncPoint::ExplicitFlush, SyncMode::Data)
                 .unwrap_err()
                 .error
                 .kind()

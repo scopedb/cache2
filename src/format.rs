@@ -7,12 +7,6 @@ use crate::checksum::{Crc32c, crc32c};
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-pub(crate) const SUPERBLOCK_SIZE: usize = 4 * 1024;
-pub(crate) const SUPERBLOCK_COUNT: usize = 2;
-pub(crate) const SUPERBLOCK_A_OFFSET: u64 = 0;
-pub(crate) const SUPERBLOCK_B_OFFSET: u64 = SUPERBLOCK_SIZE as u64;
-pub(crate) const SUPERBLOCK_AREA_SIZE: u64 = (SUPERBLOCK_COUNT * SUPERBLOCK_SIZE) as u64;
-
 pub(crate) const REGION_HEADER_SIZE: usize = 4 * 1024;
 pub(crate) const RECORD_HEADER_SIZE: usize = 64;
 pub(crate) const RECORD_ALIGNMENT: usize = 32;
@@ -20,23 +14,11 @@ pub(crate) const RECORD_ALIGNMENT: usize = 32;
 pub(crate) const MAX_KEY_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
-pub(crate) const SUPERBLOCK_MAGIC: [u8; 8] = *b"CACHERS\0";
 pub(crate) const REGION_HEADER_MAGIC: [u8; 8] = *b"CRREGION";
 pub(crate) const RECORD_HEADER_MAGIC: [u8; 4] = *b"CRCD";
 
-pub(crate) const SUPERBLOCK_CRC_OFFSET: usize = SUPERBLOCK_SIZE - size_of::<u32>();
 pub(crate) const REGION_HEADER_CRC_OFFSET: usize = REGION_HEADER_SIZE - size_of::<u32>();
 pub(crate) const RECORD_HEADER_CRC_OFFSET: usize = RECORD_HEADER_SIZE - size_of::<u32>();
-
-const SUPERBLOCK_VERSION_OFFSET: usize = 8;
-const SUPERBLOCK_GENERATION_OFFSET: usize = 16;
-const SUPERBLOCK_REGION_SIZE_OFFSET: usize = 24;
-const SUPERBLOCK_REGION_COUNT_OFFSET: usize = 32;
-const SUPERBLOCK_EPOCH_OFFSET: usize = 36;
-const SUPERBLOCK_EPOCH_START_SEQNO_OFFSET: usize = 40;
-const SUPERBLOCK_NEXT_SEQNO_OFFSET: usize = 48;
-const SUPERBLOCK_HASH_SEED_OFFSET: usize = 56;
-const SUPERBLOCK_CLEAN_OFFSET: usize = 64;
 
 const REGION_VERSION_OFFSET: usize = 8;
 const REGION_STATE_OFFSET: usize = 10;
@@ -61,152 +43,17 @@ const RECORD_PAYLOAD_CRC_OFFSET: usize = 56;
 
 const CODEC_NONE: u8 = 0;
 const CODEC_NAMESPACED_KEY: u8 = 1;
-const CODEC_SECOND_CHANCE_PLAIN_KEY: u8 = 2;
-const CODEC_SECOND_CHANCE_NAMESPACED_KEY: u8 = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Superblock {
-    pub(crate) generation: u64,
-    pub(crate) region_size: u64,
-    pub(crate) region_count: u32,
-    pub(crate) epoch: u32,
-    pub(crate) epoch_start_seqno: u64,
-    pub(crate) next_seqno: u64,
-    pub(crate) hash_seed: u64,
-    /// Whether the region headers and records form a durable checkpoint.
-    pub(crate) clean: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SuperblockProbe {
-    Empty,
-    InterruptedV1,
-    ValidV1(Superblock),
-    CorruptV1,
-    Unsupported(u16),
-    Unrecognized,
-}
-
-impl Superblock {
-    pub(crate) fn probe(input: &[u8]) -> SuperblockProbe {
-        if input.iter().all(|byte| *byte == 0) {
-            return SuperblockProbe::Empty;
-        }
-        if input.len() < SUPERBLOCK_MAGIC.len()
-            || input[..SUPERBLOCK_MAGIC.len()] != SUPERBLOCK_MAGIC
-        {
-            // A torn first ownership-marker write can leave only a leading
-            // magic prefix followed by zeros. This reserved prefix is
-            // interrupted V1 initialization, not an unknown format.
-            let matching_prefix = input
-                .iter()
-                .zip(SUPERBLOCK_MAGIC.iter())
-                .take_while(|(actual, expected)| actual == expected)
-                .count();
-            if matching_prefix != 0
-                && matching_prefix < SUPERBLOCK_MAGIC.len()
-                && input[matching_prefix..].iter().all(|byte| *byte == 0)
-            {
-                return SuperblockProbe::InterruptedV1;
-            }
-            return SuperblockProbe::Unrecognized;
-        }
-        let Some(version) = get_u16(input, SUPERBLOCK_VERSION_OFFSET) else {
-            return SuperblockProbe::CorruptV1;
-        };
-        if version == 0
-            && input[SUPERBLOCK_VERSION_OFFSET..]
-                .iter()
-                .all(|byte| *byte == 0)
-        {
-            return SuperblockProbe::InterruptedV1;
-        }
-        if version != FORMAT_VERSION {
-            return SuperblockProbe::Unsupported(version);
-        }
-        match Self::decode(input) {
-            Some(superblock) => SuperblockProbe::ValidV1(superblock),
-            None => SuperblockProbe::CorruptV1,
-        }
-    }
-
-    pub(crate) fn encode(&self) -> [u8; SUPERBLOCK_SIZE] {
-        let mut output = [0_u8; SUPERBLOCK_SIZE];
-        output[..SUPERBLOCK_MAGIC.len()].copy_from_slice(&SUPERBLOCK_MAGIC);
-        put_u16(&mut output, SUPERBLOCK_VERSION_OFFSET, FORMAT_VERSION);
-        put_u64(&mut output, SUPERBLOCK_GENERATION_OFFSET, self.generation);
-        put_u64(&mut output, SUPERBLOCK_REGION_SIZE_OFFSET, self.region_size);
-        put_u32(
-            &mut output,
-            SUPERBLOCK_REGION_COUNT_OFFSET,
-            self.region_count,
-        );
-        put_u32(&mut output, SUPERBLOCK_EPOCH_OFFSET, self.epoch);
-        put_u64(
-            &mut output,
-            SUPERBLOCK_EPOCH_START_SEQNO_OFFSET,
-            self.epoch_start_seqno,
-        );
-        put_u64(&mut output, SUPERBLOCK_NEXT_SEQNO_OFFSET, self.next_seqno);
-        put_u64(&mut output, SUPERBLOCK_HASH_SEED_OFFSET, self.hash_seed);
-        output[SUPERBLOCK_CLEAN_OFFSET] = u8::from(self.clean);
-
-        let checksum = crc32c(&output);
-        put_u32(&mut output, SUPERBLOCK_CRC_OFFSET, checksum);
-        output
-    }
-
-    pub(crate) fn decode(input: &[u8]) -> Option<Self> {
-        if input.len() != SUPERBLOCK_SIZE
-            || input.get(..SUPERBLOCK_MAGIC.len())? != SUPERBLOCK_MAGIC
-            || get_u16(input, SUPERBLOCK_VERSION_OFFSET)? != FORMAT_VERSION
-            || !checksum_matches(input, SUPERBLOCK_CRC_OFFSET)
-        {
-            return None;
-        }
-
-        let clean = match *input.get(SUPERBLOCK_CLEAN_OFFSET)? {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
-        let superblock = Self {
-            generation: get_u64(input, SUPERBLOCK_GENERATION_OFFSET)?,
-            region_size: get_u64(input, SUPERBLOCK_REGION_SIZE_OFFSET)?,
-            region_count: get_u32(input, SUPERBLOCK_REGION_COUNT_OFFSET)?,
-            epoch: get_u32(input, SUPERBLOCK_EPOCH_OFFSET)?,
-            epoch_start_seqno: get_u64(input, SUPERBLOCK_EPOCH_START_SEQNO_OFFSET)?,
-            next_seqno: get_u64(input, SUPERBLOCK_NEXT_SEQNO_OFFSET)?,
-            hash_seed: get_u64(input, SUPERBLOCK_HASH_SEED_OFFSET)?,
-            clean,
-        };
-
-        let minimum_region_size = u64::try_from(REGION_HEADER_SIZE)
-            .ok()?
-            .checked_add(u64::try_from(RECORD_HEADER_SIZE).ok()?)?;
-        if superblock.region_count == 0
-            || superblock.region_size < minimum_region_size
-            || superblock.region_size % SUPERBLOCK_SIZE as u64 != 0
-        {
-            return None;
-        }
-
-        Some(superblock)
-    }
-}
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionState {
-    Free = 0,
     Active = 1,
     Sealed = 2,
 }
 
 impl RegionState {
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode(value: u8) -> Option<Self> {
         match value {
-            0 => Some(Self::Free),
             1 => Some(Self::Active),
             2 => Some(Self::Sealed),
             _ => None,
@@ -225,16 +72,6 @@ pub(crate) struct RegionHeader {
 }
 
 impl RegionHeader {
-    pub(crate) fn free(region_id: u32, incarnation: u32) -> Self {
-        Self {
-            region_id,
-            incarnation,
-            state: RegionState::Free,
-            created_seqno: 0,
-            used: REGION_HEADER_SIZE as u64,
-        }
-    }
-
     pub(crate) fn encode(&self) -> [u8; REGION_HEADER_SIZE] {
         let mut output = [0_u8; REGION_HEADER_SIZE];
         output[..REGION_HEADER_MAGIC.len()].copy_from_slice(&REGION_HEADER_MAGIC);
@@ -250,6 +87,7 @@ impl RegionHeader {
         output
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn decode(input: &[u8]) -> Option<Self> {
         if input.len() != REGION_HEADER_SIZE
             || input.get(..REGION_HEADER_MAGIC.len())? != REGION_HEADER_MAGIC
@@ -282,20 +120,12 @@ pub(crate) enum RecordKind {
     Tombstone = 2,
 }
 
-/// Interpretation of the key bytes stored in a Format V1 record.
-///
-/// The codec byte has always been covered by the record-header checksum. M7
-/// assigns value `1` to a key whose first four payload bytes are a little-
-/// endian namespace id. Value `0` remains the exact pre-M7 representation.
+/// Interpretation of the key bytes stored in a record.
 #[repr(u8)]
-// Explicit names make persisted codec meaning clear at every match site.
-#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecordCodec {
     PlainKey = CODEC_NONE,
     NamespacedKey = CODEC_NAMESPACED_KEY,
-    SecondChancePlainKey = CODEC_SECOND_CHANCE_PLAIN_KEY,
-    SecondChanceNamespacedKey = CODEC_SECOND_CHANCE_NAMESPACED_KEY,
 }
 
 impl RecordCodec {
@@ -303,25 +133,7 @@ impl RecordCodec {
         match value {
             CODEC_NONE => Some(Self::PlainKey),
             CODEC_NAMESPACED_KEY => Some(Self::NamespacedKey),
-            CODEC_SECOND_CHANCE_PLAIN_KEY => Some(Self::SecondChancePlainKey),
-            CODEC_SECOND_CHANCE_NAMESPACED_KEY => Some(Self::SecondChanceNamespacedKey),
             _ => None,
-        }
-    }
-
-    pub(crate) const fn is_second_chance(self) -> bool {
-        matches!(
-            self,
-            Self::SecondChancePlainKey | Self::SecondChanceNamespacedKey
-        )
-    }
-
-    pub(crate) const fn with_second_chance(self) -> Self {
-        match self {
-            Self::PlainKey | Self::SecondChancePlainKey => Self::SecondChancePlainKey,
-            Self::NamespacedKey | Self::SecondChanceNamespacedKey => {
-                Self::SecondChanceNamespacedKey
-            }
         }
     }
 }
@@ -548,52 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn format_v1_superblock_matches_committed_golden_bytes() {
-        let clean_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/superblock.golden"
-        ));
-        let dirty_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/superblock_dirty.golden"
-        ));
-        for (golden, generation, clean) in [
-            (clean_golden, 0x0102_0304_0506_0708, true),
-            (dirty_golden, 0x0102_0304_0506_0707, false),
-        ] {
-            let superblock = Superblock {
-                generation,
-                region_size: 32 * 1024 * 1024,
-                region_count: 7,
-                epoch: 3,
-                epoch_start_seqno: 17,
-                next_seqno: 34,
-                hash_seed: 0x1122_3344_5566_7788,
-                clean,
-            };
-            assert_eq!(superblock.encode().as_slice(), golden);
-            assert_eq!(Superblock::decode(&golden), Some(superblock));
-            assert_eq!(
-                Superblock::probe(&golden),
-                SuperblockProbe::ValidV1(superblock)
-            );
-        }
-
-        let unsupported = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/superblock_v2.golden"
-        ));
-        assert!(checksum_matches(&unsupported, SUPERBLOCK_CRC_OFFSET));
-        assert_eq!(
-            Superblock::probe(&unsupported),
-            SuperblockProbe::Unsupported(2)
-        );
-    }
-
-    #[test]
-    fn format_v1_region_states_match_committed_golden_bytes() {
+    fn region_states_match_committed_golden_bytes() {
         let golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/region_headers.golden"
         ));
         let headers = [
-            RegionHeader::free(0, 0),
             RegionHeader {
                 region_id: 1,
                 incarnation: 9,
@@ -618,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn format_v1_value_and_tombstone_match_committed_golden_bytes() {
+    fn value_and_tombstone_match_committed_golden_bytes() {
         let cases = [
             (
                 include_str!("../tests/fixtures/format_v1/value_record.golden"),
@@ -667,27 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn superblock_round_trip_and_corruption_detection() {
-        let superblock = Superblock {
-            generation: 7,
-            region_size: 32 * 1024 * 1024,
-            region_count: 1024,
-            epoch: 3,
-            epoch_start_seqno: 41,
-            next_seqno: 99,
-            hash_seed: 0x0123_4567_89ab_cdef,
-            clean: true,
-        };
-        let mut encoded = superblock.encode();
-        assert_eq!(Superblock::decode(&encoded), Some(superblock));
-
-        encoded[SUPERBLOCK_HASH_SEED_OFFSET] ^= 1;
-        assert_eq!(Superblock::decode(&encoded), None);
-    }
-
-    #[test]
     fn region_headers_round_trip_in_all_persisted_states() {
-        for state in [RegionState::Free, RegionState::Active, RegionState::Sealed] {
+        for state in [RegionState::Active, RegionState::Sealed] {
             let header = RegionHeader {
                 region_id: 12,
                 incarnation: 4,
@@ -697,8 +449,6 @@ mod tests {
             };
             assert_eq!(RegionHeader::decode(&header.encode()), Some(header));
         }
-
-        assert_eq!(RegionHeader::free(4, 8).used, REGION_HEADER_SIZE as u64);
     }
 
     #[test]
@@ -724,14 +474,6 @@ mod tests {
         let mut namespaced = header;
         namespaced.codec = RecordCodec::NamespacedKey;
         assert_eq!(RecordHeader::decode(&namespaced.encode()), Some(namespaced));
-
-        let mut second_chance = header;
-        second_chance.codec = RecordCodec::SecondChancePlainKey;
-        assert!(second_chance.codec.is_second_chance());
-        assert_eq!(
-            RecordHeader::decode(&second_chance.encode()),
-            Some(second_chance)
-        );
 
         let mut with_batch_padding = header;
         with_batch_padding.record_len = 4 * 1024;

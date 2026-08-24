@@ -23,15 +23,8 @@ use std::os::unix::fs::OpenOptionsExt;
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 #[cfg(target_os = "linux")]
 const LINUX_EINTR: i32 = 4;
-#[cfg(target_os = "linux")]
-const SAFE_CACHE_OPEN_FLAGS: i32 = 0o400_000 | 0o4_000; // O_NOFOLLOW | O_NONBLOCK
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const SAFE_CACHE_OPEN_FLAGS: i32 = 0x0100 | 0x0004; // O_NOFOLLOW | O_NONBLOCK
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
-))]
-const SAFE_CACHE_OPEN_FLAGS: i32 = 0;
+#[cfg(unix)]
+const SAFE_CACHE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DirectIoMode {
@@ -161,11 +154,11 @@ impl RuntimeFileSet {
         if !allow_direct || self.direct.is_none() || !self.stats.is_active() {
             return RuntimeIoPath::Buffered;
         }
-        // Never issue malformed O_DIRECT. Unaligned Format V1 records and an
+        // Never issue malformed O_DIRECT. Unaligned record fragments and an
         // unaligned remainder after a positive short completion use the
         // buffered compatibility path in every mode. Required mode means the
         // direct descriptor must exist and aligned direct errors do not fall
-        // back; it does not make legacy 32-byte records unreadable.
+        // back; it does not make 32-byte-aligned records unreadable.
         if direct_io_aligned(buffer, length, offset) {
             RuntimeIoPath::Direct
         } else {
@@ -189,8 +182,9 @@ impl RuntimeFileSet {
         should_fallback
     }
 
-    #[cfg_attr(
-        not(all(
+    #[cfg(any(
+        test,
+        all(
             feature = "io-uring",
             target_os = "linux",
             any(
@@ -200,9 +194,8 @@ impl RuntimeFileSet {
                 target_arch = "loongarch64",
                 target_arch = "powerpc64"
             )
-        )),
-        allow(dead_code)
-    )]
+        )
+    ))]
     pub(crate) fn stats_handle(&self) -> DirectIoStatsHandle {
         self.stats.clone()
     }
@@ -254,49 +247,23 @@ pub(crate) fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -
 pub(crate) enum WritePoint {
     Record,
     RegionHeader,
-    Superblock,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2State,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2RecoveryImageHeader,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2RecoveryImageIndex,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2RecoveryImageMetadata,
-    HybridManifest,
-    HybridJournal,
-    CheckpointDirectory,
-    CheckpointPayload,
-    CheckpointHeader,
+    DataSuperblock,
+    State,
+    RecoveryImageHeader,
+    RecoveryImageIndex,
+    RecoveryImageMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyncPoint {
-    FormatDirty,
     FormatTruncate,
-    FormatRegions,
-    FormatClean,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2StateReset,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2RunningState,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2WarmData,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2RecoveryImage,
-    #[cfg_attr(not(test), allow(dead_code))]
-    V2CleanState,
-    DirtyMarker,
-    RegionRotation,
-    ClearBarrier,
-    CheckpointPayload,
-    CheckpointHeader,
-    CheckpointDirectory,
-    CheckpointData,
-    CheckpointClean,
-    HybridManifestDirty,
-    HybridJournal,
-    HybridManifestClean,
+    FormatData,
+    StateReset,
+    RunningState,
+    ExplicitFlush,
+    WarmData,
+    RecoveryImage,
+    CleanState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -945,7 +912,7 @@ mod tests {
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
             RuntimeIoPath::Buffered,
-            "required mode must preserve the buffered Format V1 compatibility path"
+            "required mode must preserve the buffered unaligned-I/O path"
         );
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, false),
@@ -1072,11 +1039,11 @@ mod tests {
         let cloned = ControlIoBackend::try_clone_control_file(&primary).unwrap();
 
         primary
-            .write_at(WritePoint::V2RecoveryImageHeader, b"image-v2", 0)
+            .write_at(WritePoint::RecoveryImageHeader, b"image-ok", 0)
             .unwrap();
         let mut observed = [0_u8; 8];
         cloned.read_at(&mut observed, 0).unwrap();
-        assert_eq!(&observed, b"image-v2");
+        assert_eq!(&observed, b"image-ok");
         assert!(ControlIoBackend::is_same_file(&primary, &alias).unwrap());
         assert!(!ControlIoBackend::is_same_file(&primary, &other).unwrap());
     }
@@ -1086,7 +1053,7 @@ mod tests {
         let image = TestFile::new("recovery-create-new");
         let backend = FileBackend::create_new_buffered(&image.0).unwrap();
         backend
-            .write_at(WritePoint::V2RecoveryImageMetadata, b"metadata", 0)
+            .write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
             .unwrap();
 
         let error = FileBackend::create_new_buffered(&image.0)
@@ -1108,34 +1075,31 @@ mod tests {
         let temp = FaultBackend::create_new_buffered_with_handle(&temp.0, faults.clone()).unwrap();
 
         faults.arm(
-            FaultEvent::Write(WritePoint::V2State),
+            FaultEvent::Write(WritePoint::State),
             2,
             FaultAction::Error(5),
         );
-        assert_eq!(
-            state.write_at(WritePoint::V2State, b"running", 0).unwrap(),
-            7
-        );
+        assert_eq!(state.write_at(WritePoint::State, b"running", 0).unwrap(), 7);
         assert_eq!(
             image
-                .write_at(WritePoint::V2State, b"clean", 0)
+                .write_at(WritePoint::State, b"clean", 0)
                 .unwrap_err()
                 .raw_os_error(),
             Some(5)
         );
 
         for (point, offset) in [
-            (WritePoint::V2RecoveryImageIndex, 0),
-            (WritePoint::V2RecoveryImageMetadata, 8),
+            (WritePoint::RecoveryImageIndex, 0),
+            (WritePoint::RecoveryImageMetadata, 8),
         ] {
             temp.write_at(point, b"12345678", offset).unwrap();
         }
         for point in [
-            SyncPoint::V2StateReset,
-            SyncPoint::V2RunningState,
-            SyncPoint::V2WarmData,
-            SyncPoint::V2RecoveryImage,
-            SyncPoint::V2CleanState,
+            SyncPoint::StateReset,
+            SyncPoint::RunningState,
+            SyncPoint::WarmData,
+            SyncPoint::RecoveryImage,
+            SyncPoint::CleanState,
         ] {
             temp.sync(point, SyncMode::Data).unwrap();
         }
@@ -1169,11 +1133,9 @@ pub(crate) mod testing {
 
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum FaultAction {
-        Short(usize),
         Torn { bytes: usize, raw_os_error: i32 },
         Error(i32),
         ErrorAlways(i32),
-        KillBefore,
         KillAfter,
     }
 
@@ -1287,31 +1249,19 @@ pub(crate) mod testing {
 
         fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
             match self.handle.action(FaultEvent::Read) {
-                Some(FaultAction::Short(bytes)) => {
-                    let limit = bytes.min(buffer.len());
-                    self.inner.read_at(&mut buffer[..limit], offset)
-                }
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
                     Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::KillBefore) => kill_self(),
-                Some(FaultAction::KillAfter) => {
-                    let result = self.inner.read_at(buffer, offset);
-                    kill_self_after(result)
                 }
                 Some(FaultAction::Torn { raw_os_error, .. }) => {
                     Err(io::Error::from_raw_os_error(raw_os_error))
                 }
+                Some(FaultAction::KillAfter) => kill_after(self.inner.read_at(buffer, offset)),
                 None => self.inner.read_at(buffer, offset),
             }
         }
 
         fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
             match self.handle.action(FaultEvent::Write(point)) {
-                Some(FaultAction::Short(bytes)) => {
-                    let limit = bytes.min(buffer.len());
-                    self.inner.write_at(point, &buffer[..limit], offset)
-                }
                 Some(FaultAction::Torn {
                     bytes,
                     raw_os_error,
@@ -1325,10 +1275,8 @@ pub(crate) mod testing {
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
                     Err(io::Error::from_raw_os_error(code))
                 }
-                Some(FaultAction::KillBefore) => kill_self(),
                 Some(FaultAction::KillAfter) => {
-                    let result = self.inner.write_at(point, buffer, offset);
-                    kill_self_after(result)
+                    kill_after(self.inner.write_at(point, buffer, offset))
                 }
                 None => self.inner.write_at(point, buffer, offset),
             }
@@ -1339,15 +1287,11 @@ pub(crate) mod testing {
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
                     Err(io::Error::from_raw_os_error(code))
                 }
-                Some(FaultAction::KillBefore) => kill_self(),
-                Some(FaultAction::KillAfter) => {
-                    let result = self.inner.sync(point, mode);
-                    kill_self_after(result)
-                }
-                Some(FaultAction::Short(_) | FaultAction::Torn { .. }) => Err(io::Error::new(
+                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "short/torn actions apply only to positioned I/O",
+                    "torn actions apply only to positioned I/O",
                 )),
+                Some(FaultAction::KillAfter) => kill_after(self.inner.sync(point, mode)),
                 None => self.inner.sync(point, mode),
             }
         }
@@ -1357,15 +1301,11 @@ pub(crate) mod testing {
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
                     Err(io::Error::from_raw_os_error(code))
                 }
-                Some(FaultAction::KillBefore) => kill_self(),
-                Some(FaultAction::KillAfter) => {
-                    let result = self.inner.try_lock_exclusive();
-                    kill_self_after(result)
-                }
-                Some(FaultAction::Short(_) | FaultAction::Torn { .. }) => Err(io::Error::new(
+                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "short/torn actions apply only to positioned I/O",
+                    "torn actions apply only to positioned I/O",
                 )),
+                Some(FaultAction::KillAfter) => kill_after(self.inner.try_lock_exclusive()),
                 None => self.inner.try_lock_exclusive(),
             }
         }
@@ -1375,15 +1315,11 @@ pub(crate) mod testing {
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
                     Err(io::Error::from_raw_os_error(code))
                 }
-                Some(FaultAction::KillBefore) => kill_self(),
-                Some(FaultAction::KillAfter) => {
-                    let result = self.inner.unlock();
-                    kill_self_after(result)
-                }
-                Some(FaultAction::Short(_) | FaultAction::Torn { .. }) => Err(io::Error::new(
+                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "short/torn actions apply only to positioned I/O",
+                    "torn actions apply only to positioned I/O",
                 )),
+                Some(FaultAction::KillAfter) => kill_after(self.inner.unlock()),
                 None => self.inner.unlock(),
             }
         }
@@ -1400,20 +1336,21 @@ pub(crate) mod testing {
         }
     }
 
-    fn kill_self_after<T>(_result: io::Result<T>) -> io::Result<T> {
-        kill_self()
+    fn kill_after<T>(result: io::Result<T>) -> io::Result<T> {
+        match result {
+            Ok(_) => kill_process(),
+            Err(error) => Err(error),
+        }
     }
 
-    fn kill_self<T>() -> T {
-        #[cfg(unix)]
-        {
-            const SIGKILL: i32 = 9;
-            // SAFETY: both functions have no pointer arguments; SIGKILL cannot
-            // run user code in the target process.
-            if unsafe { kill(getpid(), SIGKILL) } == 0 {
-                loop {
-                    std::thread::park();
-                }
+    #[cfg(unix)]
+    pub(crate) fn kill_process() -> ! {
+        const SIGKILL: i32 = 9;
+        // SAFETY: both functions have no pointer arguments; SIGKILL cannot
+        // run user code in the target process.
+        if unsafe { kill(getpid(), SIGKILL) } == 0 {
+            loop {
+                std::thread::park();
             }
         }
         std::process::abort()

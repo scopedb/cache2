@@ -1,0 +1,21 @@
+[package]
+name = "cache-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cache-rs = { path = "..", features = ["fuzzing"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "persistent_decoders"
+path = "fuzz_targets/persistent_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

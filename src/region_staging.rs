@@ -1,43 +1,23 @@
-//! Bounded lane-local residency for managed buffered Region writes.
+//! Fixed-memory, zero-copy staging for the RegionStore append path.
 //!
-//! Each append lane owns two fixed chunks: one Active and at most one
-//! Flushing. The I/O engine receives a third aligned copy, allowing reads to
-//! keep using immutable resident bytes until the write CQE makes the physical
-//! location safe. No structure grows beyond the configured chunk capacity.
+//! Region manager receipts are the only span authority.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 
-use crate::format::RECORD_ALIGNMENT;
-use crate::index::IndexEntry;
+use crate::format::{RECORD_HEADER_SIZE, RecordHeader, RecordKind};
+use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation};
+use crate::io_backend::DIRECT_IO_ALIGNMENT;
+use crate::io_engine::IoBuffer;
+use crate::recovery::{DATA_REGION_AREA_OFFSET, RECORD_ALIGNMENT, REGION_HEADER_SIZE};
+use crate::region_appender::_WRITE_BATCH_BYTES;
+use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
 use crate::resources::{
-    BufferLease, DedicatedBufferPool, ResourceBuildError, ResourceController,
+    BUFFER_ALIGNMENT, BufferLease, DedicatedBufferPool, ResourceBuildError, ResourceController,
     RuntimeMemoryReservation,
 };
 
-pub(crate) const MAX_STAGING_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StagedRecord {
-    pub(crate) hash: u64,
-    pub(crate) entry: IndexEntry,
-}
-
-pub(crate) struct StagedFlush {
-    pub(crate) lane_id: usize,
-    pub(crate) span_id: u64,
-    pub(crate) buffer: BufferLease,
-    pub(crate) length: usize,
-    pub(crate) absolute: u64,
-    pub(crate) records: usize,
-}
-
-pub(crate) enum FlushCommand {
-    Write(StagedFlush),
-    Shutdown,
-}
+pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StageAppend {
@@ -46,29 +26,42 @@ pub(crate) enum StageAppend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResidentLookup {
-    Found,
-    NotFound,
+pub(crate) struct ShardFillSnapshot {
+    pub(crate) bytes: usize,
+    pub(crate) records: usize,
+}
+
+/// One record whose exact index identity is published only after its
+/// containing device span completes. The descriptor stays owned by the
+/// completion path; staging never calls into the index while holding a shard
+/// lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StagedRecord {
+    pub(crate) hash: u64,
+    pub(crate) entry: IndexEntry,
+}
+
+/// A zero-copy write job. `buffer` is the shard's former fill lease and is
+/// therefore 4 KiB aligned. The I/O completion must return this exact buffer
+/// and the record vector to [`RegionStaging::finish_success`] or
+/// [`RegionStaging::finish_failure`].
+pub(crate) struct StagedWrite {
+    pub(crate) span: RegionWriteSpan,
+    pub(crate) buffer: IoBuffer,
+    pub(crate) absolute: u64,
+    pub(crate) records: Vec<StagedRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StagingError {
     Failed,
     Closed,
+    InvalidShard,
+    Encoding,
+    Submitted,
+    WouldBlock,
+    StaleReceipt,
     Invariant(&'static str),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RegionStagingSnapshot {
-    pub(crate) chunk_bytes: u64,
-    pub(crate) resident_bytes: u64,
-    pub(crate) flushing_bytes: u64,
-    pub(crate) sealed_spans: u64,
-    pub(crate) sealed_bytes: u64,
-    pub(crate) completion_live_records: u64,
-    pub(crate) completion_live_bytes: u64,
-    pub(crate) completion_obsolete_records: u64,
-    pub(crate) completion_obsolete_bytes: u64,
 }
 
 impl fmt::Display for StagingError {
@@ -76,484 +69,622 @@ impl fmt::Display for StagingError {
         match self {
             Self::Failed => formatter.write_str("Region staging is failed"),
             Self::Closed => formatter.write_str("Region staging is closed"),
+            Self::InvalidShard => formatter.write_str("Region staging shard is out of bounds"),
+            Self::Encoding => formatter.write_str("Region staging shard is encoding"),
+            Self::Submitted => formatter.write_str("Region staging shard has a submitted span"),
+            Self::WouldBlock => formatter.write_str("Region staging shard is busy"),
+            Self::StaleReceipt => formatter.write_str("Region staging receipt is stale"),
             Self::Invariant(message) => formatter.write_str(message),
         }
     }
 }
 
-struct ResidentChunk {
-    span_id: u64,
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum StagingEncodeError<E> {
+    Staging(StagingError),
+    Encode(E),
+}
+
+impl<E> From<StagingError> for StagingEncodeError<E> {
+    fn from(error: StagingError) -> Self {
+        Self::Staging(error)
+    }
+}
+
+struct FillChunk {
+    buffer: Option<BufferLease>,
+    records: Vec<StagedRecord>,
+    cache_epoch: u32,
     region_id: u32,
     region_incarnation: u32,
-    epoch: u32,
-    start_offset: u32,
-    absolute: u64,
-    bytes: Vec<u8>,
-    records: Vec<StagedRecord>,
+    start_offset: u64,
+    end_offset: u64,
+    max_seqno: u64,
 }
 
-impl ResidentChunk {
-    fn try_empty(chunk_bytes: usize, record_capacity: usize) -> Result<Self, ResourceBuildError> {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(chunk_bytes)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        let mut records = Vec::new();
-        records
-            .try_reserve_exact(record_capacity)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        Ok(Self {
-            span_id: 0,
+impl FillChunk {
+    fn new(buffer: BufferLease, records: Vec<StagedRecord>) -> Self {
+        Self {
+            buffer: Some(buffer),
+            records,
+            cache_epoch: 0,
             region_id: 0,
             region_incarnation: 0,
-            epoch: 0,
             start_offset: 0,
-            absolute: 0,
-            bytes,
-            records,
-        })
+            end_offset: 0,
+            max_seqno: 0,
+        }
     }
 
-    fn reset(&mut self) {
-        self.span_id = 0;
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn used(&self) -> Option<usize> {
+        usize::try_from(self.end_offset.checked_sub(self.start_offset)?).ok()
+    }
+
+    fn reset(&mut self, buffer: BufferLease) {
+        self.records.clear();
+        self.buffer = Some(buffer);
+        self.cache_epoch = 0;
         self.region_id = 0;
         self.region_incarnation = 0;
-        self.epoch = 0;
         self.start_offset = 0;
-        self.absolute = 0;
-        self.bytes.clear();
-        self.records.clear();
-    }
-
-    fn contains(&self, epoch: u32, incarnation: u32, entry: IndexEntry) -> Option<usize> {
-        if self.bytes.is_empty()
-            || self.epoch != epoch
-            || self.region_id != entry.location.region_id()
-            || self.region_incarnation != incarnation
-        {
-            return None;
-        }
-        let relative = entry.location.offset().checked_sub(self.start_offset)? as usize;
-        let end = relative.checked_add(entry.location.record_len() as usize)?;
-        (end <= self.bytes.len()).then_some(relative)
+        self.end_offset = 0;
+        self.max_seqno = 0;
     }
 }
 
-struct LaneState {
-    active: ResidentChunk,
-    flushing: Option<ResidentChunk>,
-    spare: Option<ResidentChunk>,
-    next_span_id: u64,
+struct ShardState {
+    fill: FillChunk,
+    spare_buffer: Option<BufferLease>,
+    spare_records: Option<Vec<StagedRecord>>,
+    encoding: Option<RegionAppendReservation>,
+    submitted: Option<RegionWriteSpan>,
     failed: bool,
     closed: bool,
 }
 
-struct StagingLane {
-    state: Mutex<LaneState>,
-    changed: Condvar,
-    io_pool: DedicatedBufferPool,
-    flush_tx: SyncSender<FlushCommand>,
+struct ShardStaging {
+    state: Mutex<ShardState>,
+    buffers: DedicatedBufferPool,
 }
 
-#[derive(Default)]
-struct StagingCounters {
-    sealed_spans: AtomicU64,
-    sealed_bytes: AtomicU64,
-    completion_live_records: AtomicU64,
-    completion_live_bytes: AtomicU64,
-    completion_obsolete_records: AtomicU64,
-    completion_obsolete_bytes: AtomicU64,
+/// Restores a fill lease if an encoder returns an error or unwinds. The
+/// encoder itself runs without the staging mutex held.
+struct EncodingBuffer<'a> {
+    shard: &'a ShardStaging,
+    receipt: RegionAppendReservation,
+    buffer: Option<BufferLease>,
 }
 
+impl Drop for EncodingBuffer<'_> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut state = lock_unpoisoned(&self.shard.state);
+        if state.encoding == Some(self.receipt) && state.fill.buffer.is_none() {
+            state.fill.buffer = Some(buffer);
+            state.encoding = None;
+        } else {
+            state.failed = true;
+        }
+    }
+}
+
+/// Shard-local, fixed-memory append staging.
+///
+/// Each shard owns exactly two eagerly allocated aligned leases. One is the
+/// current fill buffer; after sealing, the other immediately becomes the next
+/// fill while the former is owned by the I/O engine. There is no resident-read
+/// copy and no staging-owned span sequence: the Region manager receipt is the
+/// sole identity accepted by sealing and completion.
 pub(crate) struct RegionStaging {
-    lanes: Vec<StagingLane>,
+    shards: Vec<ShardStaging>,
     chunk_bytes: usize,
-    counters: StagingCounters,
+    region_size: u64,
     _memory: RuntimeMemoryReservation,
 }
 
 impl RegionStaging {
+    pub(crate) fn reservation_bytes(shard_count: usize, chunk_bytes: usize) -> Option<usize> {
+        let buffers_per_shard = chunk_bytes.checked_mul(2)?;
+        let records_per_shard = MAX_STAGING_RECORDS
+            .checked_mul(std::mem::size_of::<StagedRecord>())?
+            .checked_mul(2)?;
+        buffers_per_shard
+            .checked_add(records_per_shard)?
+            .checked_mul(shard_count)
+    }
+
     pub(crate) fn try_new(
-        lane_count: usize,
+        shard_count: usize,
         chunk_bytes: usize,
+        region_size: u64,
         resources: &ResourceController,
-    ) -> Result<(Self, Vec<Receiver<FlushCommand>>), ResourceBuildError> {
-        if lane_count == 0
-            || chunk_bytes == 0
-            || chunk_bytes % crate::resources::BUFFER_ALIGNMENT != 0
-            || chunk_bytes % RECORD_ALIGNMENT != 0
-        {
+    ) -> Result<Self, ResourceBuildError> {
+        if shard_count == 0 {
             return Err(ResourceBuildError::Invalid(
-                "Region staging size must be a non-zero aligned chunk",
+                "Region staging requires at least one shard",
             ));
         }
-        let record_capacity = chunk_bytes / RECORD_ALIGNMENT;
-        let resident_bytes = chunk_bytes
-            .checked_add(
-                record_capacity
-                    .checked_mul(std::mem::size_of::<StagedRecord>())
-                    .ok_or(ResourceBuildError::Allocation)?,
-            )
-            .and_then(|bytes| bytes.checked_mul(2))
+        if chunk_bytes == 0
+            || chunk_bytes > _WRITE_BATCH_BYTES
+            || chunk_bytes % BUFFER_ALIGNMENT != 0
+            || chunk_bytes % RECORD_ALIGNMENT as usize != 0
+        {
+            return Err(ResourceBuildError::Invalid(
+                "Region staging chunk must be a bounded aligned size",
+            ));
+        }
+        if region_size <= u64::from(REGION_HEADER_SIZE)
+            || region_size % BUFFER_ALIGNMENT as u64 != 0
+        {
+            return Err(ResourceBuildError::Invalid(
+                "Region staging Region size is invalid",
+            ));
+        }
+
+        let reserved = Self::reservation_bytes(shard_count, chunk_bytes)
             .ok_or(ResourceBuildError::Allocation)?;
-        let per_lane = resident_bytes
-            .checked_add(chunk_bytes)
-            .ok_or(ResourceBuildError::Allocation)?;
-        let reserved = per_lane
-            .checked_mul(lane_count)
-            .ok_or(ResourceBuildError::Allocation)?;
+        // DedicatedBufferPool has its own allocator. Keep this one aggregate
+        // reservation alive so those eager allocations and both fixed record
+        // vectors participate in the cache-wide hard memory budget.
         let memory = resources.reserve_runtime_memory(reserved)?;
 
-        let mut lanes = Vec::new();
-        lanes
-            .try_reserve_exact(lane_count)
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(shard_count)
             .map_err(|_| ResourceBuildError::Allocation)?;
-        let mut receivers = Vec::new();
-        receivers
-            .try_reserve_exact(lane_count)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        for _ in 0..lane_count {
-            let active = ResidentChunk::try_empty(chunk_bytes, record_capacity)?;
-            let spare = ResidentChunk::try_empty(chunk_bytes, record_capacity)?;
-            let io_pool = DedicatedBufferPool::try_new(1, chunk_bytes)?;
-            let (flush_tx, flush_rx) = mpsc::sync_channel(1);
-            lanes.push(StagingLane {
-                state: Mutex::new(LaneState {
-                    active,
-                    flushing: None,
-                    spare: Some(spare),
-                    next_span_id: 1,
+        for _ in 0..shard_count {
+            let buffers = DedicatedBufferPool::try_new(2, chunk_bytes)?;
+            let fill_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
+            let spare_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
+            let fill_records = try_staged_records()?;
+            let spare_records = try_staged_records()?;
+            shards.push(ShardStaging {
+                state: Mutex::new(ShardState {
+                    fill: FillChunk::new(fill_buffer, fill_records),
+                    spare_buffer: Some(spare_buffer),
+                    spare_records: Some(spare_records),
+                    encoding: None,
+                    submitted: None,
                     failed: false,
                     closed: false,
                 }),
-                changed: Condvar::new(),
-                io_pool,
-                flush_tx,
+                buffers,
             });
-            receivers.push(flush_rx);
         }
-        Ok((
-            Self {
-                lanes,
-                chunk_bytes,
-                counters: StagingCounters::default(),
-                _memory: memory,
-            },
-            receivers,
-        ))
+
+        Ok(Self {
+            shards,
+            chunk_bytes,
+            region_size,
+            _memory: memory,
+        })
     }
 
     pub(crate) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
 
-    pub(crate) fn snapshot(&self) -> RegionStagingSnapshot {
-        let mut resident_bytes = 0_u64;
-        let mut flushing_bytes = 0_u64;
-        for lane in &self.lanes {
-            let state = lock_unpoisoned(&lane.state);
-            let active = usize_to_u64(state.active.bytes.len());
-            let flushing = state
-                .flushing
-                .as_ref()
-                .map_or(0, |chunk| usize_to_u64(chunk.bytes.len()));
-            resident_bytes = resident_bytes
-                .saturating_add(active)
-                .saturating_add(flushing);
-            flushing_bytes = flushing_bytes.saturating_add(flushing);
+    /// Returns the currently sealable fill prefix without waiting for an
+    /// encoder or an earlier submitted span. `Ok(None)` is the only empty-shard
+    /// result, so a shard worker never has to probe the manager by attempting
+    /// to seal an absent span.
+    pub(crate) fn shard_fill_snapshot(
+        &self,
+        shard_id: usize,
+    ) -> Result<Option<ShardFillSnapshot>, StagingError> {
+        let shard = self
+            .shards
+            .get(shard_id)
+            .ok_or(StagingError::InvalidShard)?;
+        let state = lock_unpoisoned(&shard.state);
+        ensure_open(&state)?;
+        if state.encoding.is_some() {
+            return Err(StagingError::Encoding);
         }
-        RegionStagingSnapshot {
-            chunk_bytes: usize_to_u64(self.chunk_bytes),
-            resident_bytes,
-            flushing_bytes,
-            sealed_spans: self.counters.sealed_spans.load(Ordering::Relaxed),
-            sealed_bytes: self.counters.sealed_bytes.load(Ordering::Relaxed),
-            completion_live_records: self
-                .counters
-                .completion_live_records
-                .load(Ordering::Relaxed),
-            completion_live_bytes: self.counters.completion_live_bytes.load(Ordering::Relaxed),
-            completion_obsolete_records: self
-                .counters
-                .completion_obsolete_records
-                .load(Ordering::Relaxed),
-            completion_obsolete_bytes: self
-                .counters
-                .completion_obsolete_bytes
-                .load(Ordering::Relaxed),
+        if state.submitted.is_some() {
+            return Err(StagingError::Submitted);
         }
+        if state.fill.is_empty() {
+            return Ok(None);
+        }
+        let bytes = state
+            .fill
+            .used()
+            .filter(|bytes| *bytes != 0 && *bytes <= self.chunk_bytes)
+            .ok_or(StagingError::Invariant(
+                "staging fill snapshot has an invalid length",
+            ))?;
+        Ok(Some(ShardFillSnapshot {
+            bytes,
+            records: state.fill.records.len(),
+        }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn append_batch(
+    /// Encodes one exact manager reservation directly into the fill lease.
+    ///
+    /// The shard lock is released before `encode` runs. Until it returns, the
+    /// exact receipt fences another producer or seal attempt on this shard. An
+    /// encode error restores the lease without advancing staging state.
+    pub(crate) fn encode_reserved<E>(
         &self,
-        lane_id: usize,
-        region_id: u32,
-        region_incarnation: u32,
-        epoch: u32,
-        start_offset: u32,
-        absolute: u64,
-        encoded: &[u8],
-        records: &[StagedRecord],
-    ) -> Result<StageAppend, StagingError> {
-        if encoded.is_empty()
-            || encoded.len() > self.chunk_bytes
-            || records.is_empty()
-            || records.len() > encoded.len() / RECORD_ALIGNMENT
-        {
-            return Err(StagingError::Invariant(
-                "managed staging batch exceeds its fixed bounds",
-            ));
-        }
-        let lane = self.lane(lane_id)?;
-        let mut state = lock_unpoisoned(&lane.state);
-        Self::ensure_open(&state)?;
-        let active = &mut state.active;
-        if !active.bytes.is_empty() {
-            let expected_offset = u64::from(active.start_offset)
-                .checked_add(active.bytes.len() as u64)
-                .ok_or(StagingError::Invariant("staging offset overflow"))?;
-            let expected_absolute = active
-                .absolute
-                .checked_add(active.bytes.len() as u64)
-                .ok_or(StagingError::Invariant("staging absolute offset overflow"))?;
-            if active.region_id != region_id
-                || active.region_incarnation != region_incarnation
-                || active.epoch != epoch
-                || expected_offset != u64::from(start_offset)
-                || expected_absolute != absolute
-                || active.bytes.len() + encoded.len() > self.chunk_bytes
+        receipt: RegionAppendReservation,
+        encode: impl FnOnce(&mut [u8]) -> Result<StagedRecord, E>,
+    ) -> Result<StageAppend, StagingEncodeError<E>> {
+        self.validate_reservation(receipt)
+            .map_err(StagingEncodeError::Staging)?;
+        let shard = self
+            .shards
+            .get(receipt.shard_id)
+            .ok_or(StagingEncodeError::Staging(StagingError::InvalidShard))?;
+
+        let (start, end, buffer) = {
+            let mut state = lock_unpoisoned(&shard.state);
+            ensure_open(&state).map_err(StagingEncodeError::Staging)?;
+            if state.encoding.is_some() {
+                return Err(StagingEncodeError::Staging(StagingError::WouldBlock));
+            }
+            let fill = &state.fill;
+            let used = fill
+                .used()
+                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
+                    "staging fill length overflow",
+                )))?;
+            let record_bytes = receipt.record_bytes as usize;
+            if record_bytes > self.chunk_bytes {
+                return Err(StagingEncodeError::Staging(StagingError::Invariant(
+                    "staging record exceeds one chunk",
+                )));
+            }
+            if fill.records.len() == MAX_STAGING_RECORDS
+                || used
+                    .checked_add(record_bytes)
+                    .is_none_or(|end| end > self.chunk_bytes)
             {
                 return Ok(StageAppend::NeedsSeal);
             }
-        } else {
-            active.region_id = region_id;
-            active.region_incarnation = region_incarnation;
-            active.epoch = epoch;
-            active.start_offset = start_offset;
-            active.absolute = absolute;
+            if !fill.is_empty()
+                && (fill.cache_epoch != receipt.cache_epoch
+                    || fill.region_id != receipt.region_id
+                    || fill.region_incarnation != receipt.region_incarnation
+                    || fill.end_offset != u64::from(receipt.offset)
+                    || receipt.seqno <= fill.max_seqno)
+            {
+                return Err(StagingEncodeError::Staging(StagingError::StaleReceipt));
+            }
+            let end = used
+                .checked_add(record_bytes)
+                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
+                    "staging fill cursor overflow",
+                )))?;
+            let buffer = state.fill.buffer.take().ok_or(StagingEncodeError::Staging(
+                StagingError::Invariant("staging fill lost its buffer"),
+            ))?;
+            state.encoding = Some(receipt);
+            (used, end, buffer)
+        };
+
+        let mut encoding = EncodingBuffer {
+            shard,
+            receipt,
+            buffer: Some(buffer),
+        };
+        let encoded = encoding
+            .buffer
+            .as_mut()
+            .expect("encoding guard owns its buffer")
+            .prepared_mut(end)
+            .map_err(|()| {
+                StagingEncodeError::Staging(StagingError::Invariant(
+                    "staging fill buffer is undersized",
+                ))
+            })?;
+        let record = encode(&mut encoded[start..end]).map_err(StagingEncodeError::Encode)?;
+        self.validate_record(receipt, record)
+            .map_err(StagingEncodeError::Staging)?;
+
+        let mut state = lock_unpoisoned(&shard.state);
+        if state.encoding != Some(receipt) || state.fill.buffer.is_some() {
+            state.failed = true;
+            return Err(StagingEncodeError::Staging(StagingError::StaleReceipt));
         }
-        if active.bytes.len() + encoded.len() > active.bytes.capacity()
-            || active.records.len() + records.len() > active.records.capacity()
-        {
-            return Err(StagingError::Invariant(
-                "managed staging allocation exceeded its reservation",
-            ));
+        if let Err(error) = ensure_open(&state) {
+            return Err(StagingEncodeError::Staging(error));
         }
-        active.bytes.extend_from_slice(encoded);
-        active.records.extend_from_slice(records);
+        let buffer =
+            encoding
+                .buffer
+                .take()
+                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
+                    "staging encoding lost its buffer",
+                )))?;
+        if state.fill.is_empty() {
+            state.fill.cache_epoch = receipt.cache_epoch;
+            state.fill.region_id = receipt.region_id;
+            state.fill.region_incarnation = receipt.region_incarnation;
+            state.fill.start_offset = u64::from(receipt.offset);
+        }
+        state.fill.end_offset = reservation_end(receipt).ok_or(StagingEncodeError::Staging(
+            StagingError::Invariant("staging reservation end overflow"),
+        ))?;
+        state.fill.max_seqno = state.fill.max_seqno.max(receipt.seqno);
+        state.fill.records.push(record);
+        state.fill.buffer = Some(buffer);
+        state.encoding = None;
         Ok(StageAppend::Appended)
     }
 
-    pub(crate) fn seal_lane(&self, lane_id: usize) -> Result<bool, StagingError> {
-        let lane = self.lane(lane_id)?;
-        let mut state = lock_unpoisoned(&lane.state);
-        loop {
-            Self::ensure_open(&state)?;
-            if state.flushing.is_none() {
-                break;
+    /// Applies one exact manager-issued tail-padding receipt in place.
+    ///
+    /// Only the last record grows: its header checksum and staged
+    /// index location are rewritten together, while the added bytes are zeroed.
+    /// Any mismatch is terminal because the manager has already advanced its
+    /// exclusive reservation cursor.
+    pub(crate) fn apply_write_padding(
+        &self,
+        receipt: RegionPaddingReceipt,
+    ) -> Result<(), StagingError> {
+        let shard = self
+            .shards
+            .get(receipt.shard_id)
+            .ok_or(StagingError::InvalidShard)?;
+        let mut state = lock_unpoisoned(&shard.state);
+        ensure_open(&state)?;
+        let result = (|| {
+            if state.encoding.is_some() || state.submitted.is_some() {
+                return Err(StagingError::WouldBlock);
             }
-            state = wait_unpoisoned(&lane.changed, state);
-        }
-        if state.active.bytes.is_empty() {
-            return Ok(false);
-        }
-        let mut io = lane.io_pool.acquire().ok_or(StagingError::Closed)?;
-        let length = state.active.bytes.len();
-        let mut sealed = state.spare.take().ok_or(StagingError::Invariant(
-            "staging lane lost its spare resident chunk",
-        ))?;
-        std::mem::swap(&mut sealed, &mut state.active);
-        sealed.span_id = state.next_span_id;
-        state.next_span_id = state
-            .next_span_id
-            .checked_add(1)
-            .ok_or(StagingError::Invariant("staging span id overflow"))?;
-        io.prepared_mut(length)
-            .map_err(|()| StagingError::Invariant("staging I/O buffer is undersized"))?
-            .copy_from_slice(&sealed.bytes);
-        let job = StagedFlush {
-            lane_id,
-            span_id: sealed.span_id,
-            buffer: io,
-            length,
-            absolute: sealed.absolute,
-            records: sealed.records.len(),
-        };
-        state.flushing = Some(sealed);
-        atomic_saturating_add(&self.counters.sealed_spans, 1);
-        atomic_saturating_add(&self.counters.sealed_bytes, usize_to_u64(length));
-        drop(state);
-        if lane.flush_tx.send(FlushCommand::Write(job)).is_err() {
-            let mut state = lock_unpoisoned(&lane.state);
+            let fill = &mut state.fill;
+            let padding = receipt
+                .padding_bytes()
+                .filter(|padding| {
+                    *padding != 0
+                        && (*padding as usize) < DIRECT_IO_ALIGNMENT
+                        && *padding % RECORD_ALIGNMENT == 0
+                })
+                .ok_or(StagingError::StaleReceipt)?;
+            if receipt.cache_epoch == 0
+                || receipt.region_incarnation == 0
+                || receipt.span_start_offset >= receipt.unpadded_end_offset
+                || receipt.span_start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+                || receipt.unpadded_end_offset % u64::from(RECORD_ALIGNMENT) != 0
+                || receipt.padded_end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+                || receipt.padded_end_offset > self.region_size
+                || fill.is_empty()
+                || fill.cache_epoch != receipt.cache_epoch
+                || fill.region_id != receipt.region_id
+                || fill.region_incarnation != receipt.region_incarnation
+                || fill.start_offset != receipt.span_start_offset
+                || fill.end_offset != receipt.unpadded_end_offset
+                || fill.records.len() as u64 != receipt.record_count
+                || fill.max_seqno != receipt.max_seqno
+            {
+                return Err(StagingError::StaleReceipt);
+            }
+
+            let used = fill
+                .used()
+                .ok_or(StagingError::Invariant("staging fill length overflow"))?;
+            let padded_used = used
+                .checked_add(padding as usize)
+                .filter(|padded| *padded <= self.chunk_bytes)
+                .ok_or(StagingError::Invariant(
+                    "staging padding exceeds its fixed chunk",
+                ))?;
+            let expected_padded_used = receipt
+                .padded_end_offset
+                .checked_sub(receipt.span_start_offset)
+                .and_then(|length| usize::try_from(length).ok())
+                .ok_or(StagingError::StaleReceipt)?;
+            if padded_used != expected_padded_used {
+                return Err(StagingError::StaleReceipt);
+            }
+
+            let last = *fill.records.last().ok_or(StagingError::StaleReceipt)?;
+            let location = last.entry.location;
+            let old_record_len = location.record_len();
+            let new_record_len = old_record_len
+                .checked_add(padding)
+                .filter(|length| *length <= MAX_RECORD_LEN)
+                .ok_or(StagingError::Invariant(
+                    "padded record exceeds the record-format limit",
+                ))?;
+            let record_end = u64::from(location.offset())
+                .checked_add(u64::from(old_record_len))
+                .ok_or(StagingError::StaleReceipt)?;
+            if location.is_tombstone()
+                || location.region_id() != receipt.region_id
+                || last.entry.seqno != receipt.max_seqno
+                || record_end != receipt.unpadded_end_offset
+            {
+                return Err(StagingError::StaleReceipt);
+            }
+            let record_start = u64::from(location.offset())
+                .checked_sub(receipt.span_start_offset)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or(StagingError::StaleReceipt)?;
+            let header_end = record_start
+                .checked_add(RECORD_HEADER_SIZE)
+                .filter(|end| *end <= used)
+                .ok_or(StagingError::StaleReceipt)?;
+            let buffer = fill
+                .buffer
+                .as_mut()
+                .ok_or(StagingError::Invariant("staging fill lost its buffer"))?;
+            let bytes = buffer
+                .prepared_mut(padded_used)
+                .map_err(|()| StagingError::Invariant("staging buffer is undersized"))?;
+            let mut header = RecordHeader::decode(&bytes[record_start..header_end]).ok_or(
+                StagingError::Invariant("staging final record header is corrupt"),
+            )?;
+            if header.kind != RecordKind::Value
+                || header.record_len != old_record_len
+                || header.region_incarnation != receipt.region_incarnation
+                || header.epoch != receipt.cache_epoch
+                || header.seqno != last.entry.seqno
+                || header.key_hash != last.hash
+            {
+                return Err(StagingError::StaleReceipt);
+            }
+            let padded_location =
+                PackedLocation::new(receipt.region_id, location.offset(), new_record_len, false)
+                    .map_err(|_| StagingError::Invariant("padded location is invalid"))?;
+
+            bytes[used..padded_used].fill(0);
+            header.record_len = new_record_len;
+            bytes[record_start..header_end].copy_from_slice(&header.encode());
+            fill.records
+                .last_mut()
+                .expect("validated non-empty staging records")
+                .entry
+                .location = padded_location;
+            fill.end_offset = receipt.padded_end_offset;
+            Ok(())
+        })();
+        if result.is_err() {
             state.failed = true;
-            lane.changed.notify_all();
-            return Err(StagingError::Failed);
         }
-        Ok(true)
+        result
     }
 
-    pub(crate) fn copy_record(
+    /// Moves the current fill lease into one exact manager-owned span without
+    /// copying its bytes. The second fixed lease immediately becomes fill.
+    pub(crate) fn take_sealed(
         &self,
-        hash: u64,
-        epoch: u32,
-        incarnation: u32,
-        entry: IndexEntry,
-        output: &mut [u8],
-    ) -> Result<ResidentLookup, StagingError> {
-        let lane = self.lane(hash as usize % self.lanes.len())?;
-        let state = lock_unpoisoned(&lane.state);
-        Self::ensure_open(&state)?;
-        if output.len() != entry.location.record_len() as usize {
-            return Err(StagingError::Invariant(
-                "resident read buffer does not match the indexed record",
-            ));
+        span: RegionWriteSpan,
+    ) -> Result<Option<StagedWrite>, StagingError> {
+        let shard = self
+            .shards
+            .get(span.shard_id)
+            .ok_or(StagingError::InvalidShard)?;
+        let mut state = lock_unpoisoned(&shard.state);
+        ensure_open(&state)?;
+        if state.encoding.is_some() || state.submitted.is_some() {
+            return Err(StagingError::WouldBlock);
         }
-        let resident = state
-            .active
-            .contains(epoch, incarnation, entry)
-            .map(|start| (&state.active, start))
-            .or_else(|| {
-                state.flushing.as_ref().and_then(|chunk| {
-                    chunk
-                        .contains(epoch, incarnation, entry)
-                        .map(|start| (chunk, start))
-                })
-            });
-        if let Some((chunk, start)) = resident {
-            output.copy_from_slice(&chunk.bytes[start..start + output.len()]);
-            return Ok(ResidentLookup::Found);
+        if state.fill.is_empty() {
+            return Ok(None);
         }
-        Ok(ResidentLookup::NotFound)
+        if !span_matches_records(span, &state.fill.records)
+            || state.fill.cache_epoch != span.cache_epoch
+            || state.fill.region_id != span.region_id
+            || state.fill.region_incarnation != span.region_incarnation
+            || state.fill.start_offset != span.start_offset
+            || state.fill.end_offset != span.end_offset
+            || state.fill.max_seqno != span.max_seqno
+        {
+            state.failed = true;
+            return Err(StagingError::StaleReceipt);
+        }
+        let length = usize::try_from(
+            span.end_offset
+                .checked_sub(span.start_offset)
+                .ok_or(StagingError::StaleReceipt)?,
+        )
+        .map_err(|_| StagingError::StaleReceipt)?;
+        if length == 0 || length > self.chunk_bytes {
+            state.failed = true;
+            return Err(StagingError::StaleReceipt);
+        }
+        let absolute = self.span_absolute(span)?;
+        let fill_buffer = state.fill.buffer.take().ok_or_else(|| {
+            state.failed = true;
+            StagingError::Invariant("staging fill lost its buffer")
+        })?;
+        let buffer = match IoBuffer::from_lease(fill_buffer, length) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                state.fill.buffer = Some(error.lease);
+                state.failed = true;
+                return Err(StagingError::Invariant(
+                    "staging could not expose its fill lease",
+                ));
+            }
+        };
+        let replacement_buffer = state.spare_buffer.take().ok_or_else(|| {
+            state.failed = true;
+            StagingError::Invariant("staging lost its second fixed buffer")
+        })?;
+        let replacement_records = state.spare_records.take().ok_or_else(|| {
+            state.failed = true;
+            StagingError::Invariant("staging lost its second record vector")
+        })?;
+        let records = std::mem::replace(&mut state.fill.records, replacement_records);
+        state.fill.reset(replacement_buffer);
+        state.submitted = Some(span);
+        drop(state);
+        Ok(Some(StagedWrite {
+            span,
+            buffer,
+            absolute,
+            records,
+        }))
     }
 
     pub(crate) fn finish_success(
         &self,
-        lane_id: usize,
-        span_id: u64,
-        mut make_on_device: impl FnMut(StagedRecord) -> bool,
+        span: RegionWriteSpan,
+        buffer: IoBuffer,
+        records: Vec<StagedRecord>,
     ) -> Result<(), StagingError> {
-        let lane = self.lane(lane_id)?;
-        let mut state = lock_unpoisoned(&lane.state);
-        let flushing = state.flushing.as_ref().ok_or(StagingError::Invariant(
-            "staging completion has no resident span",
-        ))?;
-        if flushing.span_id != span_id {
+        self.finish(span, Some(buffer), records, false)
+    }
+
+    pub(crate) fn finish_failure(
+        &self,
+        span: RegionWriteSpan,
+        buffer: Option<IoBuffer>,
+        records: Vec<StagedRecord>,
+    ) -> Result<(), StagingError> {
+        self.finish(span, buffer, records, true)
+    }
+
+    fn finish(
+        &self,
+        span: RegionWriteSpan,
+        buffer: Option<IoBuffer>,
+        mut records: Vec<StagedRecord>,
+        failed: bool,
+    ) -> Result<(), StagingError> {
+        let shard = self
+            .shards
+            .get(span.shard_id)
+            .ok_or(StagingError::InvalidShard)?;
+        let expected_len = span
+            .end_offset
+            .checked_sub(span.start_offset)
+            .and_then(|length| usize::try_from(length).ok());
+        let buffer_valid = buffer
+            .as_ref()
+            .map_or(failed, |buffer| expected_len == Some(buffer.len()));
+        let completion_valid = buffer_valid
+            && records.capacity() >= MAX_STAGING_RECORDS
+            && span_matches_records(span, &records);
+        let buffer = buffer.map(IoBuffer::into_lease);
+        let mut state = lock_unpoisoned(&shard.state);
+        if state.submitted != Some(span) || !completion_valid {
+            state.failed = true;
+            return Err(StagingError::StaleReceipt);
+        }
+        if state.spare_buffer.is_some() || state.spare_records.is_some() {
+            state.failed = true;
             return Err(StagingError::Invariant(
-                "staging completion span identity mismatch",
+                "staging completion found occupied spare resources",
             ));
         }
-        let mut live_records = 0_u64;
-        let mut live_bytes = 0_u64;
-        let mut obsolete_records = 0_u64;
-        let mut obsolete_bytes = 0_u64;
-        for record in flushing.records.iter().copied() {
-            let bytes = u64::from(record.entry.location.record_len());
-            if make_on_device(record) {
-                live_records = live_records.saturating_add(1);
-                live_bytes = live_bytes.saturating_add(bytes);
-            } else {
-                obsolete_records = obsolete_records.saturating_add(1);
-                obsolete_bytes = obsolete_bytes.saturating_add(bytes);
-            }
-        }
-        let mut finished = state
-            .flushing
-            .take()
-            .expect("checked staging flushing span");
-        finished.reset();
-        if state.spare.replace(finished).is_some() {
-            return Err(StagingError::Invariant(
-                "staging completion found an occupied spare chunk",
-            ));
-        }
-        atomic_saturating_add(&self.counters.completion_live_records, live_records);
-        atomic_saturating_add(&self.counters.completion_live_bytes, live_bytes);
-        atomic_saturating_add(&self.counters.completion_obsolete_records, obsolete_records);
-        atomic_saturating_add(&self.counters.completion_obsolete_bytes, obsolete_bytes);
-        lane.changed.notify_all();
-        Ok(())
-    }
-
-    pub(crate) fn finish_failure(&self, lane_id: usize, span_id: u64) -> Result<(), StagingError> {
-        let lane = self.lane(lane_id)?;
-        let mut state = lock_unpoisoned(&lane.state);
-        let flushing = state.flushing.as_ref().ok_or(StagingError::Invariant(
-            "failed staging completion has no resident span",
-        ))?;
-        if flushing.span_id != span_id {
-            return Err(StagingError::Invariant(
-                "failed staging completion span identity mismatch",
-            ));
-        }
-        let mut finished = state
-            .flushing
-            .take()
-            .expect("checked staging flushing span");
-        finished.reset();
-        state.spare = Some(finished);
-        state.failed = true;
-        lane.changed.notify_all();
-        Ok(())
-    }
-
-    pub(crate) fn drain_lane(&self, lane_id: usize) -> Result<(), StagingError> {
-        self.seal_lane(lane_id)?;
-        self.wait_lane_drained(lane_id)
-    }
-
-    pub(crate) fn drain_all(&self) -> Result<(), StagingError> {
-        // Submit every lane before waiting so a flush/checkpoint/close fence
-        // preserves device queue depth instead of serializing lanes at QD=1.
-        for lane_id in 0..self.lanes.len() {
-            self.seal_lane(lane_id)?;
-        }
-        for lane_id in 0..self.lanes.len() {
-            self.wait_lane_drained(lane_id)?;
-        }
-        Ok(())
-    }
-
-    fn wait_lane_drained(&self, lane_id: usize) -> Result<(), StagingError> {
-        let lane = self.lane(lane_id)?;
-        let mut state = lock_unpoisoned(&lane.state);
-        while state.flushing.is_some() && !state.failed && !state.closed {
-            state = wait_unpoisoned(&lane.changed, state);
-        }
-        Self::ensure_open(&state)?;
-        if !state.active.bytes.is_empty() {
-            return Err(StagingError::Invariant(
-                "staging drain left an active resident chunk",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn shutdown(&self) -> bool {
-        let mut failed = false;
-        for lane in &self.lanes {
-            failed |= lane.flush_tx.send(FlushCommand::Shutdown).is_err();
-        }
-        failed
-    }
-
-    pub(crate) fn close(&self) {
-        for lane in &self.lanes {
-            let mut state = lock_unpoisoned(&lane.state);
-            state.closed = true;
-            lane.io_pool.close();
-            lane.changed.notify_all();
-        }
-    }
-
-    fn lane(&self, lane_id: usize) -> Result<&StagingLane, StagingError> {
-        self.lanes
-            .get(lane_id)
-            .ok_or(StagingError::Invariant("staging lane id is out of bounds"))
-    }
-
-    fn ensure_open(state: &LaneState) -> Result<(), StagingError> {
-        if state.failed {
+        records.clear();
+        state.spare_buffer = buffer;
+        state.spare_records = Some(records);
+        state.submitted = None;
+        state.failed |= failed;
+        if failed {
+            Ok(())
+        } else if state.failed {
             Err(StagingError::Failed)
         } else if state.closed {
             Err(StagingError::Closed)
@@ -561,6 +692,109 @@ impl RegionStaging {
             Ok(())
         }
     }
+
+    pub(crate) fn close(&self) {
+        for shard in &self.shards {
+            let mut state = lock_unpoisoned(&shard.state);
+            state.closed = true;
+            shard.buffers.close();
+        }
+    }
+
+    fn validate_record(
+        &self,
+        receipt: RegionAppendReservation,
+        record: StagedRecord,
+    ) -> Result<(), StagingError> {
+        self.validate_reservation(receipt)?;
+        let location = record.entry.location;
+        if location.is_tombstone()
+            || location.region_id() != receipt.region_id
+            || location.offset() != receipt.offset
+            || location.record_len() != receipt.record_bytes
+            || record.entry.seqno != receipt.seqno
+        {
+            return Err(StagingError::StaleReceipt);
+        }
+        Ok(())
+    }
+
+    fn validate_reservation(&self, receipt: RegionAppendReservation) -> Result<(), StagingError> {
+        let end = reservation_end(receipt).ok_or(StagingError::StaleReceipt)?;
+        if receipt.cache_epoch == 0
+            || receipt.region_incarnation == 0
+            || receipt.seqno == 0
+            || receipt.record_bytes == 0
+            || receipt.record_bytes % RECORD_ALIGNMENT != 0
+            || receipt.offset < REGION_HEADER_SIZE
+            || receipt.offset % RECORD_ALIGNMENT != 0
+            || end > self.region_size
+        {
+            return Err(StagingError::StaleReceipt);
+        }
+        Ok(())
+    }
+
+    fn span_absolute(&self, span: RegionWriteSpan) -> Result<u64, StagingError> {
+        if span.end_offset > self.region_size {
+            return Err(StagingError::StaleReceipt);
+        }
+        DATA_REGION_AREA_OFFSET
+            .checked_add(
+                u64::from(span.region_id)
+                    .checked_mul(self.region_size)
+                    .ok_or(StagingError::Invariant("staging Region offset overflow"))?,
+            )
+            .and_then(|base| base.checked_add(span.start_offset))
+            .ok_or(StagingError::Invariant("staging absolute offset overflow"))
+    }
+}
+
+fn try_staged_records() -> Result<Vec<StagedRecord>, ResourceBuildError> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(MAX_STAGING_RECORDS)
+        .map_err(|_| ResourceBuildError::Allocation)?;
+    Ok(records)
+}
+
+fn ensure_open(state: &ShardState) -> Result<(), StagingError> {
+    if state.failed {
+        Err(StagingError::Failed)
+    } else if state.closed {
+        Err(StagingError::Closed)
+    } else {
+        Ok(())
+    }
+}
+
+fn reservation_end(receipt: RegionAppendReservation) -> Option<u64> {
+    u64::from(receipt.offset).checked_add(u64::from(receipt.record_bytes))
+}
+
+fn span_matches_records(span: RegionWriteSpan, records: &[StagedRecord]) -> bool {
+    if span.record_count == 0 || span.record_count != records.len() as u64 {
+        return false;
+    }
+    let mut offset = span.start_offset;
+    let mut max_seqno = 0_u64;
+    for record in records {
+        let entry = record.entry;
+        if entry.location.is_tombstone()
+            || entry.location.region_id() != span.region_id
+            || u64::from(entry.location.offset()) != offset
+            || entry.seqno == 0
+            || entry.seqno <= max_seqno
+        {
+            return false;
+        }
+        let Some(end) = offset.checked_add(u64::from(entry.location.record_len())) else {
+            return false;
+        };
+        offset = end;
+        max_seqno = entry.seqno;
+    }
+    offset == span.end_offset && max_seqno == span.max_seqno
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -569,18 +803,444 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-    condvar
-        .wait(guard)
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
-fn atomic_saturating_add(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(amount))
-    });
-}
+    use super::*;
+    use crate::format::RecordCodec;
+    use crate::index::PackedLocation;
+    use crate::resources::{BackpressurePolicy, ResourceLimits};
 
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    fn resources(memory_budget_bytes: usize) -> ResourceController {
+        ResourceController::try_new(ResourceLimits {
+            memory_budget_bytes,
+            base_memory_bytes: 0,
+            max_buffer_bytes: BUFFER_ALIGNMENT,
+            read_queue_depth: 1,
+            write_queue_depth: 1,
+            read_buffer_slots: 1,
+            write_buffer_slots: 1,
+            control_concurrency: 1,
+            backpressure: BackpressurePolicy::Reject,
+        })
+        .unwrap()
+    }
+
+    fn reservation(
+        offset: u32,
+        record_bytes: u32,
+        seqno: u64,
+    ) -> (RegionAppendReservation, StagedRecord) {
+        let receipt = RegionAppendReservation {
+            shard_id: 0,
+            cache_epoch: 3,
+            region_id: 1,
+            region_incarnation: 7,
+            offset,
+            record_bytes,
+            seqno,
+        };
+        let record = StagedRecord {
+            hash: seqno.wrapping_mul(17),
+            entry: IndexEntry {
+                location: PackedLocation::new(1, offset, record_bytes, false).unwrap(),
+                seqno,
+                namespace_id: 9,
+                flags: 0,
+            },
+        };
+        (receipt, record)
+    }
+
+    fn span(
+        start_offset: u64,
+        end_offset: u64,
+        record_count: u64,
+        max_seqno: u64,
+        span_id: u64,
+    ) -> RegionWriteSpan {
+        RegionWriteSpan {
+            shard_id: 0,
+            span_id,
+            cache_epoch: 3,
+            region_id: 1,
+            region_incarnation: 7,
+            start_offset,
+            end_offset,
+            record_count,
+            max_seqno,
+        }
+    }
+
+    fn encode_test_value(
+        target: &mut [u8],
+        receipt: RegionAppendReservation,
+        record: StagedRecord,
+    ) -> Result<StagedRecord, ()> {
+        target.fill(0);
+        let header = RecordHeader {
+            kind: RecordKind::Value,
+            codec: RecordCodec::PlainKey,
+            key_len: 0,
+            value_len: 0,
+            stored_len: 0,
+            record_len: receipt.record_bytes,
+            region_incarnation: receipt.region_incarnation,
+            epoch: receipt.cache_epoch,
+            seqno: receipt.seqno,
+            key_hash: record.hash,
+            expires_at: 0,
+            payload_crc: 0,
+        };
+        target[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
+        Ok(record)
+    }
+
+    #[test]
+    fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
+        let resources = resources(4 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        assert_eq!(staging.chunk_bytes(), 4096);
+        assert_eq!(
+            resources.snapshot().memory_used_bytes,
+            (2 * 4096 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()) as u64
+        );
+
+        let (first, first_record) = reservation(REGION_HEADER_SIZE, 64, 11);
+        let mut first_pointer = 0_usize;
+        assert_eq!(
+            staging
+                .encode_reserved(first, |target| {
+                    first_pointer = target.as_ptr() as usize;
+                    target.fill(0x11);
+                    Ok::<StagedRecord, ()>(first_record)
+                })
+                .unwrap(),
+            StageAppend::Appended
+        );
+        assert_eq!(first_pointer % BUFFER_ALIGNMENT, 0);
+
+        let first_span = span(4096, 4160, 1, 11, 1);
+        let first_job = staging.take_sealed(first_span).unwrap().unwrap();
+        assert_eq!(first_job.span, first_span);
+        assert_eq!(
+            first_job.buffer.as_slice().unwrap().as_ptr() as usize,
+            first_pointer
+        );
+        assert_eq!(first_job.buffer.as_slice().unwrap(), &[0x11; 64]);
+        assert_eq!(
+            first_job.absolute,
+            DATA_REGION_AREA_OFFSET + 64 * 1024 + 4096
+        );
+
+        let (second, second_record) = reservation(4160, 96, 12);
+        let mut second_pointer = 0_usize;
+        staging
+            .encode_reserved(second, |target| {
+                second_pointer = target.as_ptr() as usize;
+                target.fill(0x22);
+                Ok::<StagedRecord, ()>(second_record)
+            })
+            .unwrap();
+        assert_ne!(second_pointer, first_pointer);
+        assert_eq!(second_pointer % BUFFER_ALIGNMENT, 0);
+        let second_span = span(4160, 4256, 1, 12, 2);
+        assert!(matches!(
+            staging.take_sealed(second_span),
+            Err(StagingError::WouldBlock)
+        ));
+
+        let StagedWrite {
+            buffer, records, ..
+        } = first_job;
+        staging.finish_success(first_span, buffer, records).unwrap();
+        let second_job = staging.take_sealed(second_span).unwrap().unwrap();
+        assert_eq!(
+            second_job.buffer.as_slice().unwrap().as_ptr() as usize,
+            second_pointer
+        );
+        let StagedWrite {
+            buffer, records, ..
+        } = second_job;
+        staging
+            .finish_success(second_span, buffer, records)
+            .unwrap();
+    }
+
+    #[test]
+    fn fill_snapshot_distinguishes_empty_ready_submitted_and_terminal_shards() {
+        let resources = resources(8 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        assert_eq!(staging.shard_fill_snapshot(0).unwrap(), None);
+        assert_eq!(
+            staging.shard_fill_snapshot(1),
+            Err(StagingError::InvalidShard)
+        );
+
+        let (receipt, record) = reservation(4096, 64, 11);
+        staging
+            .encode_reserved(receipt, |target| {
+                target.fill(0x31);
+                Ok::<StagedRecord, ()>(record)
+            })
+            .unwrap();
+        assert_eq!(
+            staging.shard_fill_snapshot(0).unwrap(),
+            Some(ShardFillSnapshot {
+                bytes: 64,
+                records: 1,
+            })
+        );
+
+        let submitted = span(4096, 4160, 1, 11, 1);
+        let job = staging.take_sealed(submitted).unwrap().unwrap();
+        assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Submitted));
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        staging.finish_success(submitted, buffer, records).unwrap();
+        assert_eq!(staging.shard_fill_snapshot(0).unwrap(), None);
+        staging.close();
+        assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Closed));
+
+        let failed = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        failed
+            .encode_reserved(receipt, |target| {
+                target.fill(0x32);
+                Ok::<StagedRecord, ()>(record)
+            })
+            .unwrap();
+        let job = failed.take_sealed(submitted).unwrap().unwrap();
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        drop(buffer);
+        failed.finish_failure(submitted, None, records).unwrap();
+        assert_eq!(failed.shard_fill_snapshot(0), Err(StagingError::Failed));
+    }
+
+    #[test]
+    fn fill_snapshot_never_observes_a_partially_encoded_record() {
+        let resources = resources(4 * 1024 * 1024);
+        let staging = Arc::new(RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap());
+        let (receipt, record) = reservation(4096, 64, 11);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let encoder_staging = Arc::clone(&staging);
+        let encoder = std::thread::spawn(move || {
+            encoder_staging.encode_reserved(receipt, |target| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                target.fill(0x41);
+                Ok::<StagedRecord, ()>(record)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Encoding));
+        release_tx.send(()).unwrap();
+        assert_eq!(encoder.join().unwrap().unwrap(), StageAppend::Appended);
+        assert_eq!(
+            staging.shard_fill_snapshot(0).unwrap(),
+            Some(ShardFillSnapshot {
+                bytes: 64,
+                records: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn padding_receipt_expands_only_the_final_record_without_copying() {
+        let resources = resources(4 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let first_len = RecordHeader::aligned_len(0, 0).unwrap();
+        assert_eq!(first_len as usize, RECORD_HEADER_SIZE);
+        let (first, mut first_record) = reservation(4096, first_len, 11);
+        first_record.entry.namespace_id = 0;
+        let mut pointer = 0_usize;
+        staging
+            .encode_reserved(first, |target| {
+                pointer = target.as_ptr() as usize;
+                encode_test_value(target, first, first_record)
+            })
+            .unwrap();
+
+        let second_offset = first.offset + first.record_bytes;
+        let (second, mut second_record) = reservation(second_offset, 128, 12);
+        second_record.entry.namespace_id = 0;
+        staging
+            .encode_reserved(second, |target| {
+                encode_test_value(target, second, second_record)
+            })
+            .unwrap();
+        let unpadded_end = u64::from(second.offset) + u64::from(second.record_bytes);
+        let padding = RegionPaddingReceipt {
+            shard_id: 0,
+            cache_epoch: 3,
+            region_id: 1,
+            region_incarnation: 7,
+            span_start_offset: 4096,
+            unpadded_end_offset: unpadded_end,
+            padded_end_offset: 8192,
+            record_count: 2,
+            max_seqno: 12,
+        };
+        let padding_bytes = u32::try_from(8192 - unpadded_end).unwrap();
+        assert_eq!(padding.padding_bytes(), Some(padding_bytes));
+        staging.apply_write_padding(padding).unwrap();
+
+        let padded_span = span(4096, 8192, 2, 12, 1);
+        let job = staging.take_sealed(padded_span).unwrap().unwrap();
+        assert_eq!(job.buffer.len(), 4096);
+        let bytes = job.buffer.as_slice().unwrap();
+        assert_eq!(bytes.as_ptr() as usize, pointer);
+        let first_header = RecordHeader::decode(&bytes[..RECORD_HEADER_SIZE]).unwrap();
+        let second_start = first_len as usize;
+        let second_header =
+            RecordHeader::decode(&bytes[second_start..second_start + RECORD_HEADER_SIZE]).unwrap();
+        assert_eq!(first_header.record_len, first_len);
+        let padded_second_len = second.record_bytes + padding_bytes;
+        assert_eq!(second_header.record_len, padded_second_len);
+        assert_eq!(job.records[0].entry.location.record_len(), first_len);
+        assert_eq!(
+            job.records[1].entry.location.record_len(),
+            padded_second_len
+        );
+        assert!(
+            bytes[unpadded_end as usize - 4096..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        staging
+            .finish_success(padded_span, buffer, records)
+            .unwrap();
+    }
+
+    #[test]
+    fn fixed_record_and_byte_bounds_request_a_seal_without_running_encoder() {
+        let resources = resources(8 * 1024 * 1024);
+        let chunk_bytes = 256 * 1024;
+        let staging = RegionStaging::try_new(1, chunk_bytes, 512 * 1024, &resources).unwrap();
+        let mut offset = REGION_HEADER_SIZE;
+        for index in 0..MAX_STAGING_RECORDS {
+            let (receipt, record) = reservation(offset, RECORD_ALIGNMENT, index as u64 + 1);
+            assert_eq!(
+                staging
+                    .encode_reserved(receipt, |target| {
+                        target.fill(index as u8);
+                        Ok::<StagedRecord, ()>(record)
+                    })
+                    .unwrap(),
+                StageAppend::Appended
+            );
+            offset += RECORD_ALIGNMENT;
+        }
+        let (overflow, overflow_record) = reservation(offset, RECORD_ALIGNMENT, 4097);
+        let mut called = false;
+        assert_eq!(
+            staging
+                .encode_reserved(overflow, |_| {
+                    called = true;
+                    Ok::<StagedRecord, ()>(overflow_record)
+                })
+                .unwrap(),
+            StageAppend::NeedsSeal
+        );
+        assert!(!called);
+
+        let metadata_span = span(4096, u64::from(offset), 4096, 4096, 1);
+        let job = staging.take_sealed(metadata_span).unwrap().unwrap();
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        staging
+            .finish_success(metadata_span, buffer, records)
+            .unwrap();
+
+        let (full, full_record) = reservation(offset, chunk_bytes as u32, 4097);
+        staging
+            .encode_reserved(full, |target| {
+                target.fill(0x5a);
+                Ok::<StagedRecord, ()>(full_record)
+            })
+            .unwrap();
+        let next_offset = offset + chunk_bytes as u32;
+        let (next, next_record) = reservation(next_offset, RECORD_ALIGNMENT, 4098);
+        called = false;
+        assert_eq!(
+            staging
+                .encode_reserved(next, |_| {
+                    called = true;
+                    Ok::<StagedRecord, ()>(next_record)
+                })
+                .unwrap(),
+            StageAppend::NeedsSeal
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn completion_fences_stale_receipts_and_write_failure_is_sticky() {
+        let resources = resources(8 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let (receipt, record) = reservation(4096, 64, 11);
+        let mut mismatched = record;
+        mismatched.entry.seqno += 1;
+        assert_eq!(
+            staging.encode_reserved(receipt, |target| {
+                target.fill(0x22);
+                Ok::<StagedRecord, ()>(mismatched)
+            }),
+            Err(StagingEncodeError::Staging(StagingError::StaleReceipt))
+        );
+        staging
+            .encode_reserved(receipt, |target| {
+                target.fill(0x33);
+                Ok::<StagedRecord, ()>(record)
+            })
+            .unwrap();
+        let submitted = span(4096, 4160, 1, 11, 1);
+        let job = staging.take_sealed(submitted).unwrap().unwrap();
+        let mut stale = submitted;
+        stale.span_id += 1;
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        assert_eq!(
+            staging.finish_success(stale, buffer, records),
+            Err(StagingError::StaleReceipt)
+        );
+        let (later, later_record) = reservation(4160, 64, 12);
+        assert_eq!(
+            staging.encode_reserved(later, |_| Ok::<StagedRecord, ()>(later_record)),
+            Err(StagingEncodeError::Staging(StagingError::Failed))
+        );
+
+        let other = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        other
+            .encode_reserved(receipt, |target| {
+                target.fill(0x44);
+                Ok::<StagedRecord, ()>(record)
+            })
+            .unwrap();
+        let job = other.take_sealed(submitted).unwrap().unwrap();
+        let StagedWrite {
+            buffer, records, ..
+        } = job;
+        // A failed driver may quarantine the owned I/O buffer. Staging still
+        // fences the exact receipt and becomes terminal without waiting for a
+        // resource which can no longer return.
+        drop(buffer);
+        other.finish_failure(submitted, None, records).unwrap();
+        assert_eq!(
+            other.encode_reserved(later, |_| Ok::<StagedRecord, ()>(later_record)),
+            Err(StagingEncodeError::Staging(StagingError::Failed))
+        );
+    }
 }

@@ -1,21 +1,40 @@
 [package]
 name = "cache-rs"
-version = "1.1.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Bounded memory, bucket, and region-log cache engines for NVMe"
+description = "Performance-first bounded RAM and NVMe hybrid cache"
 license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/cache-rs"
+keywords = ["cache", "nvme", "storage"]
+categories = ["caching", "data-structures"]
+exclude = ["fuzz/", ".github/"]
 
 [lib]
 name = "cache_rs"
 path = "src/lib.rs"
 
+[[bench]]
+name = "hybrid_cache"
+harness = false
+
+[[bench]]
+name = "hybrid_cache_soak"
+harness = false
+
+[[bench]]
+name = "recovery_scale"
+harness = false
+
 [dependencies]
 crc32c = "=0.6.8"
+xxhash-rust = { version = "=0.8.18", default-features = false, features = ["xxh3"] }
 
 [features]
 default = ["io-uring"]
 io-uring = ["dep:io-uring"]
+fuzzing = []
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
 io-uring = { version = "=0.7.14", optional = true }
