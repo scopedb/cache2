@@ -109,7 +109,7 @@ impl DirectIoStatsHandle {
 
 /// Engine-owned descriptors for one cache file. `buffered` is duplicated from
 /// the descriptor that owns flock, so retaining this set also retains the
-/// cache lock if an issued mutation cannot be fenced. `direct`, when present,
+/// cache lock if an issued write or flush cannot be fenced. `direct`, when present,
 /// is a separate O_DIRECT open used only for aligned runtime data requests.
 pub(crate) struct RuntimeFileSet {
     buffered: File,
@@ -278,6 +278,29 @@ pub(crate) trait IoBackend: Send + Sync {
         self.set_len(len)
     }
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+    /// Reads into storage that may not yet be initialized.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must be valid for writes of `length` bytes and remain live for
+    /// the duration of the call. On success, the first returned byte count must
+    /// have been initialized by the implementation.
+    unsafe fn read_at_uninit(
+        &self,
+        buffer: *mut u8,
+        length: usize,
+        offset: u64,
+    ) -> io::Result<usize> {
+        // The default keeps fault-injecting and test backends source-compatible.
+        // Production runtime files override this method with positioned kernel
+        // I/O that can initialize the destination directly.
+        // SAFETY: upheld by the caller; zeroing establishes initialized bytes
+        // before constructing the mutable slice required by `read_at`.
+        unsafe {
+            buffer.write_bytes(0, length);
+            self.read_at(std::slice::from_raw_parts_mut(buffer, length), offset)
+        }
+    }
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize>;
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
@@ -635,6 +658,49 @@ impl IoBackend for RuntimeFileBackend {
         }
     }
 
+    unsafe fn read_at_uninit(
+        &self,
+        buffer: *mut u8,
+        length: usize,
+        offset: u64,
+    ) -> io::Result<usize> {
+        let path = self
+            .files
+            .select_path(buffer.cast_const(), length, offset, true);
+        // SAFETY: the caller supplies a writable destination for `length`
+        // bytes; the selected descriptor is held by `self` for this call.
+        let result =
+            unsafe { read_file_at_uninit(self.files.file_for(path), buffer, length, offset) };
+        match result {
+            Err(error) if self.files.should_fallback(path, &error) => {
+                // SAFETY: the failed direct call did not report initialized
+                // bytes and the same destination remains valid for fallback.
+                let result = unsafe {
+                    read_file_at_uninit(
+                        self.files.file_for(RuntimeIoPath::Buffered),
+                        buffer,
+                        length,
+                        offset,
+                    )
+                };
+                if let Ok(bytes) = result {
+                    if bytes != 0 {
+                        self.files.record(RuntimeIoPath::Buffered, bytes);
+                    }
+                }
+                result
+            }
+            result => {
+                if let Ok(bytes) = result {
+                    if bytes != 0 {
+                        self.files.record(path, bytes);
+                    }
+                }
+                result
+            }
+        }
+    }
+
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
         let path = self.files.select_path(
             buffer.as_ptr(),
@@ -787,6 +853,80 @@ pub(crate) fn read_exact_at_with_progress(
         buffer = &mut buffer[read..];
     }
     (Ok(()), transferred)
+}
+
+pub(crate) fn read_exact_at_uninit_with_progress(
+    backend: &dyn IoBackend,
+    buffer: *mut u8,
+    length: usize,
+    mut offset: u64,
+) -> (io::Result<()>, usize) {
+    let mut transferred = 0_usize;
+    while transferred < length {
+        let remaining = length - transferred;
+        // SAFETY: the caller owns a destination valid for `length` bytes, and
+        // `transferred <= length` keeps this suffix inside that allocation.
+        let read =
+            match unsafe { backend.read_at_uninit(buffer.add(transferred), remaining, offset) } {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return (Err(error), transferred),
+                Ok(read) => read,
+            };
+        if read == 0 {
+            return (
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short positioned read",
+                )),
+                transferred,
+            );
+        }
+        if read > remaining {
+            return (
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "positioned read exceeds the supplied buffer",
+                )),
+                transferred,
+            );
+        }
+        transferred += read;
+        offset = match offset.checked_add(read as u64) {
+            Some(offset) => offset,
+            None => {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "offset overflow",
+                    )),
+                    transferred,
+                );
+            }
+        };
+    }
+    (Ok(()), transferred)
+}
+
+#[cfg(unix)]
+unsafe fn read_file_at_uninit(
+    file: &File,
+    buffer: *mut u8,
+    length: usize,
+    offset: u64,
+) -> io::Result<usize> {
+    if length == 0 {
+        return Ok(0);
+    }
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read offset exceeds off_t"))?;
+    // SAFETY: the caller guarantees that `buffer` is writable for `length`
+    // bytes, and `file` owns a valid descriptor for the duration of the call.
+    let result = unsafe { libc::pread(file.as_raw_fd(), buffer.cast(), length, offset) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
 }
 
 pub(crate) fn write_all_at(

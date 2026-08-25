@@ -34,10 +34,10 @@ mod region_store;
 mod resources;
 
 pub use cache::{
-    CacheHealth, CacheIoSnapshot, CacheQueueSnapshot, CacheSnapshot, CacheTier,
+    CacheHealth, CacheIoSnapshot, CacheSnapshot, CacheTier, CacheWriteSnapshot,
     DetailedCacheSnapshot, HybridCache, HybridCacheConfig, IoEngine, IoMode, PutReceipt,
     RegionSetSnapshot, Result, RuntimeConfig, StartupMode, StaticConfig, Value,
 };
 pub use eviction::EvictionPolicy;
 pub use region_layout::{RegionSetAllocation, RegionSetConfig, RegionSetId};
-pub use resources::{BackpressurePolicy, ReadBufferPolicy};
+pub use resources::WriteBackpressure;

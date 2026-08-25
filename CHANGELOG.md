@@ -53,6 +53,23 @@ version number documented in `MILESTONES.md`.
   and canonicalized physically equivalent default RegionSet configurations.
 - renamed the ambiguous snapshot `read_bytes` counter to `served_bytes` to
   distinguish bytes returned to callers from underlying device I/O bytes.
+- replaced the fixed maximum-size foreground read pool with exact-size
+  transient aligned allocations charged to the aggregate memory limit;
+  removed read-buffer admission configuration and read-side `WouldBlock`, and
+  moved I/O availability protection to write-side slot reservation.
+- removed `ReadBufferPolicy`, `with_read_buffer_slots`,
+  `with_read_buffer_policy`, the legacy split-submission alias, and read-pool
+  fields from detailed snapshots.
+- simplified write overload reporting to the `write_rejections` summary counter
+  with gate/buffer detail in `detailed_snapshot()`.
+- corrected engine slot reservation to cap write occupancy rather than total
+  occupancy, and added bounded write-waiter handoff under sustained reads.
+- reserve the read engine slot before allocating its exact aligned range, let the
+  device initialize transient read storage without a userspace pre-clear,
+  derive the maximum range from the runtime record limits, and expose
+  `l2_read_memory_misses` and `l2_read_busy_misses` counters.
+- renamed runtime settings around their actual boundaries: L1 capacity/shards,
+  aggregate memory limit, I/O concurrency, and per-shard write buffering.
 
 ### Compatibility
 

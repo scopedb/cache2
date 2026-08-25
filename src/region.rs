@@ -24,7 +24,7 @@ use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
     WritePoint, read_exact_at, write_all_at,
 };
-use crate::io_engine::IoEngine;
+use crate::io_engine::{IoEngine, ReadSlot};
 use crate::memory::MemoryStore;
 use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
@@ -54,7 +54,9 @@ use crate::region_metadata::{
 use crate::region_read::{
     RegionReadDirectory, RegionReadError, RegionReadGuard, RegionReadSnapshot,
 };
-use crate::region_reader::submit_record_read;
+#[cfg(test)]
+use crate::region_reader::plan_read;
+use crate::region_reader::{ReadPlan, submit_read};
 use crate::region_runtime::{
     HybridValueRead, RegionDataPlane, RegionPut, RegionRuntimeConfig, RuntimeDetailedSnapshot,
     RuntimeSnapshot,
@@ -335,7 +337,7 @@ impl RegionPointRead<'_> {
 
 pub(crate) struct RegionValueRead {
     buffer: BufferLease,
-    io_len: usize,
+    buffer_len: usize,
     value_range: Range<usize>,
     expires_at_unix_ms: u64,
     seqno: u64,
@@ -345,7 +347,7 @@ impl RegionValueRead {
     pub(crate) fn value(&self) -> &[u8] {
         &self
             .buffer
-            .prepared(self.io_len)
+            .prepared(self.buffer_len)
             .expect("validated read retains its prepared buffer")[self.value_range.clone()]
     }
 
@@ -551,7 +553,7 @@ impl FileRegionCore {
         self.shards.len()
     }
 
-    pub(crate) fn runtime_base_memory_bytes(&self) -> io::Result<usize> {
+    pub(crate) fn runtime_reserved_memory_bytes(&self) -> io::Result<usize> {
         let region_count = u32::try_from(self.manager.lock()?.regions().len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large")
         })?;
@@ -690,7 +692,7 @@ impl FileRegionCore {
     }
 
     /// Performs one durable value read under a per-Region generation pin.
-    /// The aligned envelope buffer is returned as the value owner, avoiding a
+    /// The aligned read buffer is returned as the value owner, avoiding a
     /// second payload copy on the disk-hit path.
     pub(crate) fn begin_value_read(
         &self,
@@ -722,24 +724,32 @@ impl FileRegionCore {
         let Some(point) = self.begin_value_read(hash, namespace_id)? else {
             return Ok(None);
         };
-        self.read_value_from_point(engine, geometry, buffer, point, namespace_id, key, clock)
+        let plan = plan_read(geometry, point.entry)?;
+        let slot = engine.try_reserve_read()?;
+        self.read_value_from_point(engine, slot, buffer, plan, point, namespace_id, key, clock)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_value_from_point(
         &self,
         engine: &dyn IoEngine,
-        geometry: crate::recovery::DataGeometry,
+        slot: ReadSlot,
         buffer: BufferLease,
+        plan: ReadPlan,
         point: RegionPointRead<'_>,
         namespace_id: u32,
         key: &[u8],
         clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = point.hash;
-        let flight = match submit_record_read(engine, geometry, point.entry, buffer) {
-            Ok(flight) => flight,
-            Err(error) if error.error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        if plan.entry != point.entry {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Region read plan does not match the pinned index entry",
+            ));
+        }
+        let pending = match submit_read(engine, slot, plan, buffer) {
+            Ok(pending) => pending,
             Err(error) => {
                 if !matches!(
                     error.error.kind(),
@@ -753,7 +763,7 @@ impl FileRegionCore {
                 return Err(error.error);
             }
         };
-        let completion = flight.wait(engine);
+        let completion = pending.wait(engine);
         if let Err(error) = completion.result {
             self.health.enter_miss_only();
             return Err(error);
@@ -811,7 +821,7 @@ impl FileRegionCore {
         };
         Ok(Some(RegionValueRead {
             buffer,
-            io_len: completion.plan.io_len,
+            buffer_len: completion.plan.aligned_len,
             value_range: value_start..value_end,
             expires_at_unix_ms: header.expires_at,
             seqno: header.seqno,
@@ -861,7 +871,7 @@ impl FileRegionCore {
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "value exceeds one fixed staging chunk",
+                "value exceeds one fixed write buffer",
             ));
         }
         let Some(_shard_mutation) = self.try_lock_shard_mutation(shard_id)? else {
@@ -1988,7 +1998,7 @@ where
             Ok(true) => {
                 self.retain_lock = true;
                 Err(io::Error::other(
-                    "I/O engine could not fence an issued mutation; lock retained",
+                    "I/O engine could not fence an issued write; lock retained",
                 ))
             }
             Err(error) => {
@@ -2005,7 +2015,7 @@ where
                 self.retain_lock = true;
                 runtime.health.enter_miss_only();
                 return Err(io::Error::other(
-                    "I/O engine could not fence an issued mutation; CLEAN rejected",
+                    "I/O engine could not fence an issued write; CLEAN rejected",
                 ));
             }
             Err(error) => {
@@ -2802,9 +2812,7 @@ mod tests {
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::io_engine::BackendIoEngine;
     use crate::recovery::{DataGeometry, PersistentId};
-    use crate::resources::{
-        BackpressurePolicy, DedicatedBufferPool, ResourceController, ResourceLimits,
-    };
+    use crate::resources::{ResourceController, ResourceLimits, WriteBackpressure};
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(unix)]
@@ -2823,7 +2831,7 @@ mod tests {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(
                         Instant::now() < deadline,
-                        "write staging did not make progress"
+                        "write buffer did not make progress"
                     );
                     std::thread::yield_now();
                 }
@@ -2980,12 +2988,10 @@ mod tests {
 
     fn data_path_resources() -> ResourceController {
         ResourceController::try_new(ResourceLimits {
-            memory_budget_bytes: 32 * 1024 * 1024,
-            base_memory_bytes: 0,
-            max_buffer_bytes: RECOVERY_PAGE_SIZE,
-            write_queue_depth: 2,
-            read_buffer_slots: 1,
-            backpressure: BackpressurePolicy::Reject,
+            memory_limit_bytes: 32 * 1024 * 1024,
+            reserved_memory_bytes: 0,
+            waiting_write_limit: 2,
+            write_backpressure: WriteBackpressure::Reject,
         })
         .unwrap()
     }
@@ -3153,7 +3159,7 @@ mod tests {
         let data = production_data_superblock(512 * 1024);
         let namespace_id = 7;
         let runtime_config = RegionRuntimeConfig {
-            memory_capacity_bytes: 0,
+            l1_capacity_bytes: 0,
             ..RegionRuntimeConfig::default()
         };
         let mut store = RegionStore::open(
@@ -3218,7 +3224,7 @@ mod tests {
             );
         }
 
-        let retained_hits: Vec<_> = (0..crate::region_runtime::_READ_BUFFER_SLOTS)
+        let retained_hits: Vec<_> = (0..129)
             .map(|_| {
                 store
                     .get_value(
@@ -3230,15 +3236,11 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let overloaded = match store.get_value(
-            namespace_id,
-            recent.last().unwrap(),
-            ExpiryClock::Fixed(u64::MAX),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("retained-hit pool exceeded its fixed slot bound"),
-        };
-        assert_eq!(overloaded.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            retained_hits
+                .iter()
+                .all(|hit| hit.value() == rotation_value)
+        );
         assert!(
             store
                 .get_value(
@@ -3251,8 +3253,8 @@ mod tests {
             "an index miss must not acquire a retained-hit buffer"
         );
 
-        // Retained zero-copy hits own their read buffers, but cannot pin the
-        // runtime operation barrier or prevent a warm shutdown.
+        // Retained exact-size hits own their transient allocations, but cannot
+        // pin the runtime operation barrier or prevent a warm shutdown.
         store.close_warm().unwrap();
         assert_eq!(retained_hits[0].value(), rotation_value);
         drop(retained_hits);
@@ -3442,12 +3444,12 @@ mod tests {
         let read_buffer_bytes = (last_entry.location.record_len() as usize)
             .div_ceil(RECOVERY_PAGE_SIZE)
             * RECOVERY_PAGE_SIZE;
-        let read_pool = DedicatedBufferPool::try_new(1, read_buffer_bytes).unwrap();
+        let memory_before_read = resources.managed_memory_snapshot().current_bytes;
         let hit = runtime
             .read_value(
                 &engine,
                 data.geometry,
-                read_pool.acquire().unwrap(),
+                resources.try_read_buffer(read_buffer_bytes).unwrap(),
                 data.hash_seed,
                 7,
                 last_key.as_bytes(),
@@ -3457,7 +3459,10 @@ mod tests {
             .expect("completed record must validate as a disk hit");
         assert_eq!(hit.value(), value);
         drop(hit);
-        assert_eq!(read_pool.snapshot().in_use, 0);
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            memory_before_read
+        );
 
         assert_eq!(
             faults.events(),
@@ -3518,13 +3523,13 @@ mod tests {
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
             * RECOVERY_PAGE_SIZE;
-        let read_pool = DedicatedBufferPool::try_new(1, read_buffer_bytes).unwrap();
+        let memory_before_read = resources.managed_memory_snapshot().current_bytes;
         assert!(
             runtime
                 .read_value(
                     &engine,
                     data.geometry,
-                    read_pool.acquire().unwrap(),
+                    resources.try_read_buffer(read_buffer_bytes).unwrap(),
                     data.hash_seed,
                     namespace_id,
                     key,
@@ -3544,7 +3549,7 @@ mod tests {
                 .read_value(
                     &engine,
                     data.geometry,
-                    read_pool.acquire().unwrap(),
+                    resources.try_read_buffer(read_buffer_bytes).unwrap(),
                     data.hash_seed,
                     namespace_id,
                     key,
@@ -3558,7 +3563,10 @@ mod tests {
             faults.events(),
             vec![FaultEvent::Write(WritePoint::Record), FaultEvent::Read]
         );
-        assert_eq!(read_pool.snapshot().in_use, 0);
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            memory_before_read
+        );
         engine.shutdown().unwrap();
     }
 
@@ -3614,11 +3622,13 @@ mod tests {
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
             * RECOVERY_PAGE_SIZE;
-        let read_pool = DedicatedBufferPool::try_new(1, read_buffer_bytes).unwrap();
+        let memory_before_read = resources.managed_memory_snapshot().current_bytes;
+        let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
         let point = runtime
             .begin_point_read(identity.hash)
             .unwrap()
             .expect("hash lookup must return the collision candidate");
+        let plan = plan_read(data.geometry, point.entry).unwrap();
 
         // Supplying a different key after the hash lookup precisely models a
         // 64-bit collision at the L2 record-validation boundary.
@@ -3626,8 +3636,9 @@ mod tests {
             runtime
                 .read_value_from_point(
                     &engine,
-                    data.geometry,
-                    read_pool.acquire().unwrap(),
+                    engine.try_reserve_read().unwrap(),
+                    read_buffer,
+                    plan,
                     point,
                     namespace_id,
                     foreign_key,
@@ -3637,13 +3648,16 @@ mod tests {
                 .is_none()
         );
         assert!(runtime.health.is_healthy());
-        assert_eq!(read_pool.snapshot().in_use, 0);
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            memory_before_read
+        );
 
         let hit = runtime
             .read_value(
                 &engine,
                 data.geometry,
-                read_pool.acquire().unwrap(),
+                resources.try_read_buffer(read_buffer_bytes).unwrap(),
                 data.hash_seed,
                 namespace_id,
                 owner_key,
@@ -3653,7 +3667,10 @@ mod tests {
             .expect("the owning full key must still hit");
         assert_eq!(hit.value(), value);
         drop(hit);
-        assert_eq!(read_pool.snapshot().in_use, 0);
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            memory_before_read
+        );
         engine.shutdown().unwrap();
     }
 

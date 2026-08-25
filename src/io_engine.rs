@@ -37,7 +37,7 @@ use crate::io_backend::DirectIoStatsHandle;
 ))]
 use crate::io_backend::RuntimeIoPath;
 use crate::io_backend::{
-    IoBackend, SyncMode, SyncPoint, WritePoint, read_exact_at_with_progress,
+    IoBackend, SyncMode, SyncPoint, WritePoint, read_exact_at_uninit_with_progress,
     write_all_at_with_progress,
 };
 #[cfg(unix)]
@@ -45,7 +45,7 @@ use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
-pub(crate) const MAX_IO_QUEUE_DEPTH: usize = 4096;
+pub(crate) const MAX_IO_REQUESTS_PER_WORKER: usize = 4096;
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
 /// than a durability knob: cache contents are disposable.
@@ -61,7 +61,7 @@ pub(crate) struct IoBuffer {
 }
 
 impl IoBuffer {
-    pub(crate) fn from_lease(mut lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
+    pub(crate) fn for_write(mut lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
         if length > u32::MAX as usize {
             return Err(IoBufferError {
                 error: io::Error::new(
@@ -72,6 +72,28 @@ impl IoBuffer {
             });
         }
         if lease.prepared_mut(length).is_err() {
+            return Err(IoBufferError {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffer lease does not contain the requested logical range",
+                ),
+                lease,
+            });
+        }
+        Ok(Self { lease, length })
+    }
+
+    pub(crate) fn for_read(lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
+        if length > u32::MAX as usize {
+            return Err(IoBufferError {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "I/O buffer length exceeds the per-request limit",
+                ),
+                lease,
+            });
+        }
+        if !lease.has_capacity(length) {
             return Err(IoBufferError {
                 error: io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -111,11 +133,20 @@ impl IoBuffer {
         })
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> io::Result<&mut [u8]> {
-        self.lease.prepared_mut(self.length).map_err(|()| {
+    fn read_target(&self) -> io::Result<*mut u8> {
+        self.lease.read_target(self.length).map_err(|()| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "buffer lease lost its prepared range",
+                "buffer lease lost its read target range",
+            )
+        })
+    }
+
+    fn mark_initialized(&mut self, length: usize) -> io::Result<()> {
+        self.lease.mark_initialized(length).map_err(|()| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "I/O completion exceeds the owned buffer",
             )
         })
     }
@@ -124,18 +155,15 @@ impl IoBuffer {
         self.lease
     }
 
-    #[cfg(any(
-        test,
-        all(
-            feature = "io-uring",
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            )
+    #[cfg(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
         )
     ))]
     fn as_ptr(&self) -> io::Result<*const u8> {
@@ -154,7 +182,7 @@ impl IoBuffer {
         )
     ))]
     fn as_mut_ptr(&mut self) -> io::Result<*mut u8> {
-        Ok(self.as_mut_slice()?.as_mut_ptr())
+        self.read_target()
     }
 }
 
@@ -222,12 +250,12 @@ pub(crate) enum OperationKind {
 }
 
 impl OperationKind {
-    const fn is_mutation(self) -> bool {
+    const fn uses_write_slot(self) -> bool {
         matches!(self, Self::Write | Self::Flush)
     }
 }
 
-/// An operation owns its buffer from admission until the target completion.
+/// An operation owns its buffer from slot reservation until target completion.
 pub(crate) enum IoOperation {
     Read {
         buffer: IoBuffer,
@@ -295,6 +323,19 @@ impl IoOperation {
         }
     }
 
+    fn mark_completed_read(&mut self, bytes_transferred: usize) -> io::Result<()> {
+        match self {
+            Self::Read { buffer, .. } if bytes_transferred == buffer.len() => {
+                buffer.mark_initialized(bytes_transferred)
+            }
+            Self::Read { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed read did not initialize its complete buffer",
+            )),
+            Self::Write { .. } | Self::Flush { .. } => Ok(()),
+        }
+    }
+
     #[cfg(all(
         feature = "io-uring",
         target_os = "linux",
@@ -320,7 +361,7 @@ impl IoOperation {
                     io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow")
                 })?;
                 Ok(files.select_path(
-                    buffer.as_ptr()?.wrapping_add(transferred),
+                    buffer.read_target()?.wrapping_add(transferred),
                     remaining,
                     offset,
                     true,
@@ -587,8 +628,8 @@ impl Drop for IoRequest {
     }
 }
 
-/// One admitted cache I/O carrying the same absolute deadline through queue
-/// admission and target completion.
+/// One cache I/O carrying the same absolute deadline through slot reservation
+/// and target completion.
 pub(crate) struct BoundedIoRequest {
     request: IoRequest,
     deadline: Instant,
@@ -616,9 +657,9 @@ impl BoundedIoRequest {
             Err(request) => {
                 // Dropping the consumer detaches it but deliberately leaves the
                 // operation and owned buffer in the driver. Stop all further
-                // admission; close will inspect the exact in-flight mutation
+                // requests; close will inspect the exact in-flight write
                 // count before deciding whether to retain flock.
-                engine.stop_admission();
+                engine.stop_accepting_requests();
                 drop(request);
                 Err(IoDeadlineExceeded::new(cancel_error, None))
             }
@@ -668,19 +709,16 @@ pub(crate) fn submit_cache_io(
     submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
 }
 
-/// Submit one cache-device request without waiting for engine capacity.
-///
-/// Foreground L2 reads use this after acquiring their fixed read buffer. A
-/// saturated engine is therefore an immediate L2 miss decision, never a
-/// second request-admission wait hidden behind the buffer admission boundary.
-pub(crate) fn submit_cache_io_nowait(
+/// Submits a read whose engine slot was reserved before allocating its buffer.
+pub(crate) fn submit_cache_read(
     engine: &dyn IoEngine,
+    slot: ReadSlot,
     operation: IoOperation,
 ) -> Result<BoundedIoRequest, SubmitError> {
     let deadline = Instant::now()
         .checked_add(CACHE_IO_COMPLETION_TIMEOUT)
         .unwrap_or_else(Instant::now);
-    let request = engine.submit_nowait(operation)?;
+    let request = engine.submit_reserved_read(slot, operation)?;
     Ok(BoundedIoRequest {
         request,
         deadline,
@@ -712,6 +750,13 @@ pub(crate) enum FileIoEngineKind {
 }
 
 pub(crate) trait IoEngine: Send + Sync {
+    fn try_reserve_read(&self) -> io::Result<ReadSlot>;
+    fn submit_reserved_read(
+        &self,
+        slot: ReadSlot,
+        operation: IoOperation,
+    ) -> Result<IoRequest, SubmitError>;
+    #[cfg(test)]
     fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     #[cfg(test)]
     fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
@@ -725,21 +770,21 @@ pub(crate) trait IoEngine: Send + Sync {
         cancelled: &AtomicBool,
         deadline: Option<Instant>,
     ) -> Result<IoRequest, SubmitError>;
-    fn wake_admission_waiters(&self);
+    fn wake_slot_waiters(&self);
     fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool>;
     fn shutdown(&self) -> io::Result<()>;
     fn in_flight(&self) -> usize;
     #[cfg(test)]
     fn direct_active(&self) -> bool;
-    /// Permanently stop admission after a target operation missed both its
+    /// Permanently stop accepting requests after a target operation missed both its
     /// deadline and cancellation grace period.
-    fn stop_admission(&self);
-    fn in_flight_mutations(&self) -> usize;
+    fn stop_accepting_requests(&self);
+    fn writes_in_flight(&self) -> usize;
     /// True means a failed driver could not fence an issued write or flush.
     /// The cache must retain its exclusive file lock for process lifetime.
-    fn has_unfenced_mutations(&self) -> bool;
+    fn has_unfenced_writes(&self) -> bool;
     #[cfg(test)]
-    fn mark_unfenced_mutations_for_test(&self);
+    fn mark_unfenced_writes_for_test(&self);
     fn stats(&self) -> IoEngineStats;
 
     #[cfg(test)]
@@ -770,9 +815,9 @@ pub(crate) struct IoEngineStats {
     pub(crate) cancel_requested: u64,
     pub(crate) cancelled: u64,
     pub(crate) errors: u64,
-    pub(crate) in_flight: u64,
-    pub(crate) in_flight_peak: u64,
-    pub(crate) submit_wait_ns: u64,
+    pub(crate) requests_in_flight: u64,
+    pub(crate) requests_in_flight_peak: u64,
+    pub(crate) slot_wait_ns: u64,
     pub(crate) completion_ns: u64,
     pub(crate) direct_operations: u64,
     pub(crate) direct_bytes: u64,
@@ -780,90 +825,168 @@ pub(crate) struct IoEngineStats {
     pub(crate) buffered_bytes: u64,
 }
 
-struct AdmissionPermit {
+struct IoSlot {
     shared: Arc<RuntimeShared>,
-    mutation: bool,
+    write: bool,
 }
 
-impl Drop for AdmissionPermit {
+/// One non-waiting read reservation against the engine's complete depth.
+/// Dropping it before submission releases the slot immediately.
+pub(crate) struct ReadSlot {
+    slot: IoSlot,
+}
+
+impl Drop for IoSlot {
     fn drop(&mut self) {
-        let _admission = lock_unpoisoned(&self.shared.admission_lock);
-        if self.mutation {
-            self.shared
-                .in_flight_mutations
-                .fetch_sub(1, Ordering::AcqRel);
-        }
-        self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
-        self.shared.admission_available.notify_one();
+        let _slot = lock_unpoisoned(&self.shared.slot_lock);
+        self.shared
+            .slot_state
+            .fetch_sub(slot_delta(self.write, false), Ordering::AcqRel);
+        self.shared.slot_available.notify_one();
     }
 }
 
+struct WriteSlotWaiter<'a> {
+    shared: &'a RuntimeShared,
+}
+
+impl<'a> WriteSlotWaiter<'a> {
+    fn new(shared: &'a RuntimeShared) -> Self {
+        shared
+            .slot_state
+            .fetch_add(slot_delta(false, true), Ordering::AcqRel);
+        Self { shared }
+    }
+}
+
+impl Drop for WriteSlotWaiter<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .slot_state
+            .fetch_sub(slot_delta(false, true), Ordering::AcqRel);
+        self.shared.slot_available.notify_all();
+    }
+}
+
+const SLOT_COUNT_BITS: u32 = 16;
+const SLOT_COUNT_MASK: u64 = (1_u64 << SLOT_COUNT_BITS) - 1;
+const WRITE_SLOT_SHIFT: u32 = SLOT_COUNT_BITS;
+const WRITE_WAITER_SHIFT: u32 = 2 * SLOT_COUNT_BITS;
+
+const fn slot_delta(write: bool, waiter: bool) -> u64 {
+    let total = if waiter { 0 } else { 1 };
+    total + ((write as u64) << WRITE_SLOT_SHIFT) + ((waiter as u64) << WRITE_WAITER_SHIFT)
+}
+
+const fn active_slots(state: u64) -> usize {
+    (state & SLOT_COUNT_MASK) as usize
+}
+
+const fn active_write_slots(state: u64) -> usize {
+    ((state >> WRITE_SLOT_SHIFT) & SLOT_COUNT_MASK) as usize
+}
+
+const fn waiting_writes(state: u64) -> usize {
+    (state >> WRITE_WAITER_SHIFT) as usize
+}
+
 struct RuntimeShared {
-    queue_depth: usize,
+    max_in_flight: usize,
     accepting: AtomicBool,
-    in_flight: AtomicUsize,
-    in_flight_mutations: AtomicUsize,
+    /// Packed total, write, and waiting-write counts. A single CAS is the slot
+    /// reservation linearization point, including read-to-write handoff.
+    slot_state: AtomicU64,
     in_flight_peak: AtomicUsize,
     submitted: AtomicU64,
     completed: AtomicU64,
     cancel_requested: AtomicU64,
     cancelled: AtomicU64,
     errors: AtomicU64,
-    submit_wait_ns: AtomicU64,
+    slot_wait_ns: AtomicU64,
     completion_ns: AtomicU64,
-    unfenced_mutations: AtomicBool,
-    admission_lock: Mutex<()>,
-    admission_available: Condvar,
+    unfenced_writes: AtomicBool,
+    slot_lock: Mutex<()>,
+    slot_available: Condvar,
 }
 
-enum AdmissionWaitError {
+enum SlotWaitError {
     Shutdown,
     Cancelled,
     TimedOut,
 }
 
 impl RuntimeShared {
-    fn new(queue_depth: usize) -> Self {
+    fn new(max_in_flight: usize) -> Self {
         Self {
-            queue_depth,
+            max_in_flight,
             accepting: AtomicBool::new(true),
-            in_flight: AtomicUsize::new(0),
-            in_flight_mutations: AtomicUsize::new(0),
+            slot_state: AtomicU64::new(0),
             in_flight_peak: AtomicUsize::new(0),
             submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             cancel_requested: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
             errors: AtomicU64::new(0),
-            submit_wait_ns: AtomicU64::new(0),
+            slot_wait_ns: AtomicU64::new(0),
             completion_ns: AtomicU64::new(0),
-            unfenced_mutations: AtomicBool::new(false),
-            admission_lock: Mutex::new(()),
-            admission_available: Condvar::new(),
+            unfenced_writes: AtomicBool::new(false),
+            slot_lock: Mutex::new(()),
+            slot_available: Condvar::new(),
         }
     }
 
-    fn try_admit(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
-        const MAX_ADMISSION_CAS_ATTEMPTS: usize = 8;
-        let mut current = self.in_flight.load(Ordering::Acquire);
-        for _ in 0..MAX_ADMISSION_CAS_ATTEMPTS {
-            if current >= self.queue_depth {
+    fn total_in_flight(&self) -> usize {
+        active_slots(self.slot_state.load(Ordering::Acquire))
+    }
+
+    fn writes_in_flight(&self) -> usize {
+        active_write_slots(self.slot_state.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    fn waiting_writes_for_test(&self) -> usize {
+        waiting_writes(self.slot_state.load(Ordering::Acquire))
+    }
+
+    fn try_reserve_slot(self: &Arc<Self>, write: bool) -> Option<IoSlot> {
+        const MAX_SLOT_CAS_ATTEMPTS: usize = 8;
+        let write_limit = if self.max_in_flight > 1 {
+            self.max_in_flight - 1
+        } else {
+            self.max_in_flight
+        };
+        // Reads may use the complete engine depth. Once a write is waiting,
+        // keep one total slot available for its handoff so a read stream cannot
+        // starve accepted write-back or an explicit drain barrier.
+        let mut current = self.slot_state.load(Ordering::Acquire);
+        for _ in 0..MAX_SLOT_CAS_ATTEMPTS {
+            let total = active_slots(current);
+            let writes = active_write_slots(current);
+            if write && writes >= write_limit {
                 return None;
             }
-            match self.in_flight.compare_exchange_weak(
+            let reserve_for_waiting_write =
+                !write && waiting_writes(current) != 0 && writes < write_limit;
+            let slot_limit = if reserve_for_waiting_write {
+                self.max_in_flight.saturating_sub(1)
+            } else {
+                self.max_in_flight
+            };
+            if total >= slot_limit {
+                return None;
+            }
+            let next = current + slot_delta(write, false);
+            match self.slot_state.compare_exchange_weak(
                 current,
-                current + 1,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if mutation {
-                        self.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
-                    }
-                    update_peak(&self.in_flight_peak, current + 1);
-                    return Some(AdmissionPermit {
+                    update_peak(&self.in_flight_peak, total + 1);
+                    return Some(IoSlot {
                         shared: Arc::clone(self),
-                        mutation,
+                        write,
                     });
                 }
                 Err(observed) => current = observed,
@@ -873,57 +996,59 @@ impl RuntimeShared {
     }
 
     #[cfg(test)]
-    fn admit_wait(self: &Arc<Self>, mutation: bool) -> Option<AdmissionPermit> {
-        let mut admission = lock_unpoisoned(&self.admission_lock);
+    fn reserve_slot_wait(self: &Arc<Self>, write: bool) -> Option<IoSlot> {
+        let mut slot = lock_unpoisoned(&self.slot_lock);
+        let _write_waiter = write.then(|| WriteSlotWaiter::new(self));
         loop {
             if !self.accepting.load(Ordering::Acquire) {
                 return None;
             }
-            if let Some(permit) = self.try_admit(mutation) {
-                return Some(permit);
+            if let Some(reserved) = self.try_reserve_slot(write) {
+                return Some(reserved);
             }
-            admission = self
-                .admission_available
-                .wait(admission)
+            slot = self
+                .slot_available
+                .wait(slot)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
-    fn admit_wait_controlled(
+    fn reserve_slot_controlled(
         self: &Arc<Self>,
-        mutation: bool,
+        write: bool,
         cancelled: &AtomicBool,
         deadline: Option<Instant>,
-    ) -> Result<AdmissionPermit, AdmissionWaitError> {
-        let mut admission = lock_unpoisoned(&self.admission_lock);
+    ) -> Result<IoSlot, SlotWaitError> {
+        let mut slot = lock_unpoisoned(&self.slot_lock);
+        let _write_waiter = write.then(|| WriteSlotWaiter::new(self));
         loop {
             if !self.accepting.load(Ordering::Acquire) {
-                return Err(AdmissionWaitError::Shutdown);
+                return Err(SlotWaitError::Shutdown);
             }
             if cancelled.load(Ordering::Acquire) {
-                self.admission_available.notify_all();
-                return Err(AdmissionWaitError::Cancelled);
+                self.slot_available.notify_all();
+                return Err(SlotWaitError::Cancelled);
             }
             let remaining =
                 deadline.map(|deadline| deadline.checked_duration_since(Instant::now()));
             if matches!(remaining, Some(None)) {
-                self.admission_available.notify_all();
-                return Err(AdmissionWaitError::TimedOut);
+                self.slot_available.notify_all();
+                return Err(SlotWaitError::TimedOut);
             }
-            if let Some(permit) = self.try_admit(mutation) {
-                return Ok(permit);
+            if let Some(reserved) = self.try_reserve_slot(write) {
+                return Ok(reserved);
             }
-            admission = match remaining {
+            slot = match remaining {
                 Some(Some(remaining)) => {
-                    self.admission_available
-                        .wait_timeout(admission, remaining)
+                    self.slot_available
+                        .wait_timeout(slot, remaining)
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .0
                 }
                 Some(None) => unreachable!("expired deadline returned above"),
                 None => self
-                    .admission_available
-                    .wait(admission)
+                    .slot_available
+                    .wait(slot)
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             };
         }
@@ -931,14 +1056,14 @@ impl RuntimeShared {
 
     /// Wake controlled waiters after publishing their cancellation flag.
     /// Taking the same mutex used around the check-and-wait transition makes
-    /// `cancelled.store(true, Release); wake_admission_waiters()` lossless.
-    fn wake_admission_waiters(&self) {
-        let _admission = lock_unpoisoned(&self.admission_lock);
-        self.admission_available.notify_all();
+    /// `cancelled.store(true, Release); wake_slot_waiters()` lossless.
+    fn wake_slot_waiters(&self) {
+        let _slot = lock_unpoisoned(&self.slot_lock);
+        self.slot_available.notify_all();
     }
 
-    fn has_unfenced_mutations(&self) -> bool {
-        self.unfenced_mutations.load(Ordering::Acquire)
+    fn has_unfenced_writes(&self) -> bool {
+        self.unfenced_writes.load(Ordering::Acquire)
     }
 
     #[cfg(any(
@@ -955,19 +1080,24 @@ impl RuntimeShared {
             )
         )
     ))]
-    fn mark_unfenced_mutations(&self) {
-        self.unfenced_mutations.store(true, Ordering::Release);
+    fn mark_unfenced_writes(&self) {
+        self.unfenced_writes.store(true, Ordering::Release);
     }
 
-    fn finish(&self, task: Task, status: CompletionStatus, bytes_transferred: usize) {
+    fn finish(&self, task: Task, mut status: CompletionStatus, bytes_transferred: usize) {
         let Task {
             request_id,
-            operation,
+            mut operation,
             completion,
-            permit,
+            slot,
             submitted_at,
         } = task;
         let kind = operation.kind();
+        if matches!(status, CompletionStatus::Completed)
+            && let Err(error) = operation.mark_completed_read(bytes_transferred)
+        {
+            status = CompletionStatus::Failed(error);
+        }
         let buffer = operation.into_buffer();
         self.publish_completion(
             request_id,
@@ -976,14 +1106,14 @@ impl RuntimeShared {
             bytes_transferred,
             buffer,
             completion,
-            permit,
+            slot,
             submitted_at,
         );
     }
 
     /// Complete a request without releasing a buffer whose kernel lifetime
     /// could not be fenced by its target CQE. Leaking at most the engine's
-    /// bounded queue depth is preferable to returning an allocation that the
+    /// bounded in-flight limit is preferable to returning an allocation that the
     /// kernel might still access to a reusable pool.
     #[cfg(any(
         test,
@@ -1004,7 +1134,7 @@ impl RuntimeShared {
             request_id,
             operation,
             completion,
-            permit,
+            slot,
             submitted_at,
         } = task;
         let kind = operation.kind();
@@ -1018,7 +1148,7 @@ impl RuntimeShared {
             bytes_transferred,
             None,
             completion,
-            permit,
+            slot,
             submitted_at,
         );
     }
@@ -1032,7 +1162,7 @@ impl RuntimeShared {
         bytes_transferred: usize,
         buffer: Option<IoBuffer>,
         completion: Arc<CompletionState>,
-        permit: AdmissionPermit,
+        slot: IoSlot,
         submitted_at: Instant,
     ) {
         self.completed.fetch_add(1, Ordering::Relaxed);
@@ -1046,7 +1176,7 @@ impl RuntimeShared {
             }
         }
         add_duration_ns(&self.completion_ns, submitted_at.elapsed());
-        drop(permit);
+        drop(slot);
         completion.complete(IoCompletion {
             request_id,
             kind,
@@ -1057,18 +1187,18 @@ impl RuntimeShared {
     }
 
     fn snapshot(&self) -> IoEngineStats {
-        let in_flight = self.in_flight.load(Ordering::Acquire);
+        let in_flight = self.total_in_flight();
         IoEngineStats {
             submitted: self.submitted.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
             cancel_requested: self.cancel_requested.load(Ordering::Relaxed),
             cancelled: self.cancelled.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            in_flight: usize_to_u64(in_flight),
-            in_flight_peak: usize_to_u64(
+            requests_in_flight: usize_to_u64(in_flight),
+            requests_in_flight_peak: usize_to_u64(
                 self.in_flight_peak.load(Ordering::Relaxed).max(in_flight),
             ),
-            submit_wait_ns: self.submit_wait_ns.load(Ordering::Relaxed),
+            slot_wait_ns: self.slot_wait_ns.load(Ordering::Relaxed),
             completion_ns: self.completion_ns.load(Ordering::Relaxed),
             direct_operations: 0,
             direct_bytes: 0,
@@ -1082,7 +1212,7 @@ struct Task {
     request_id: RequestId,
     operation: IoOperation,
     completion: Arc<CompletionState>,
-    permit: AdmissionPermit,
+    slot: IoSlot,
     submitted_at: Instant,
 }
 
@@ -1146,7 +1276,8 @@ struct RuntimeInner {
 }
 
 #[derive(Clone, Copy)]
-enum AdmissionMode<'a> {
+enum SlotMode<'a> {
+    #[cfg(test)]
     Try,
     #[cfg(test)]
     Wait,
@@ -1157,11 +1288,11 @@ enum AdmissionMode<'a> {
 }
 
 impl RuntimeInner {
-    fn validate_queue_depth(queue_depth: usize) -> io::Result<()> {
-        if !(1..=MAX_IO_QUEUE_DEPTH).contains(&queue_depth) {
+    fn validate_max_in_flight(max_in_flight: usize) -> io::Result<()> {
+        if !(1..=MAX_IO_REQUESTS_PER_WORKER).contains(&max_in_flight) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("I/O queue depth must be in 1..={MAX_IO_QUEUE_DEPTH}"),
+                format!("I/O requests per worker must be in 1..={MAX_IO_REQUESTS_PER_WORKER}"),
             ));
         }
         Ok(())
@@ -1182,13 +1313,49 @@ impl RuntimeInner {
         RequestId(next)
     }
 
+    #[cfg(test)]
     fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.submit_inner(operation, AdmissionMode::Try)
+        self.submit_inner(operation, SlotMode::Try)
+    }
+
+    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
+        if !self.shared.accepting.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "I/O engine is shut down",
+            ));
+        }
+        self.shared
+            .try_reserve_slot(false)
+            .map(|slot| ReadSlot { slot })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))
+    }
+
+    fn submit_reserved_read(
+        &self,
+        slot: ReadSlot,
+        operation: IoOperation,
+    ) -> Result<IoRequest, SubmitError> {
+        let submit_started = Instant::now();
+        if operation.kind() != OperationKind::Read || !Arc::ptr_eq(&slot.slot.shared, &self.shared)
+        {
+            return Err(SubmitError {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read slot does not match the submitted engine operation",
+                ),
+                operation,
+            });
+        }
+        if let Err(error) = operation.validate() {
+            return Err(SubmitError { error, operation });
+        }
+        self.submit_with_slot(operation, slot.slot, submit_started, true)
     }
 
     #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.submit_inner(operation, AdmissionMode::Wait)
+        self.submit_inner(operation, SlotMode::Wait)
     }
 
     fn submit_wait_controlled(
@@ -1199,7 +1366,7 @@ impl RuntimeInner {
     ) -> Result<IoRequest, SubmitError> {
         self.submit_inner(
             operation,
-            AdmissionMode::Controlled {
+            SlotMode::Controlled {
                 cancelled,
                 deadline,
             },
@@ -1209,55 +1376,74 @@ impl RuntimeInner {
     fn submit_inner(
         &self,
         operation: IoOperation,
-        admission_mode: AdmissionMode<'_>,
+        slot_mode: SlotMode<'_>,
     ) -> Result<IoRequest, SubmitError> {
         let submit_started = Instant::now();
+        let nonblocking = match slot_mode {
+            #[cfg(test)]
+            SlotMode::Try => true,
+            #[cfg(test)]
+            SlotMode::Wait => false,
+            SlotMode::Controlled { .. } => false,
+        };
         if let Err(error) = operation.validate() {
             return Err(SubmitError { error, operation });
         }
-        let mutation = operation.kind().is_mutation();
-        let permit = match admission_mode {
-            AdmissionMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(
-                io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
-            ),
-            AdmissionMode::Try => self
-                .shared
-                .try_admit(mutation)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "I/O queue is full")),
+        let write = operation.kind().uses_write_slot();
+        let slot = match slot_mode {
             #[cfg(test)]
-            AdmissionMode::Wait => self.shared.admit_wait(mutation).ok_or_else(|| {
+            SlotMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "I/O engine is shut down",
+            )),
+            #[cfg(test)]
+            SlotMode::Try => self.shared.try_reserve_slot(write).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
+            }),
+            #[cfg(test)]
+            SlotMode::Wait => self.shared.reserve_slot_wait(write).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
             }),
-            AdmissionMode::Controlled {
+            SlotMode::Controlled {
                 cancelled,
                 deadline,
             } => self
                 .shared
-                .admit_wait_controlled(mutation, cancelled, deadline)
+                .reserve_slot_controlled(write, cancelled, deadline)
                 .map_err(|error| match error {
-                    AdmissionWaitError::Shutdown => {
+                    SlotWaitError::Shutdown => {
                         io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
                     }
-                    AdmissionWaitError::Cancelled => io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "I/O admission wait was cancelled",
-                    ),
-                    AdmissionWaitError::TimedOut => {
-                        io::Error::new(io::ErrorKind::TimedOut, "I/O admission deadline expired")
+                    SlotWaitError::Cancelled => {
+                        io::Error::new(io::ErrorKind::Interrupted, "I/O slot wait was cancelled")
+                    }
+                    SlotWaitError::TimedOut => {
+                        io::Error::new(io::ErrorKind::TimedOut, "I/O slot deadline expired")
                     }
                 }),
         };
-        let permit = match permit {
-            Ok(permit) => permit,
+        let slot = match slot {
+            Ok(slot) => slot,
             Err(error) => {
                 return Err(SubmitError { error, operation });
             }
         };
-        let submit_state = match admission_mode {
-            AdmissionMode::Try => match self.submit_state.try_read() {
+
+        self.submit_with_slot(operation, slot, submit_started, nonblocking)
+    }
+
+    fn submit_with_slot(
+        &self,
+        operation: IoOperation,
+        slot: IoSlot,
+        submit_started: Instant,
+        nonblocking: bool,
+    ) -> Result<IoRequest, SubmitError> {
+        let submit_state = if nonblocking {
+            match self.submit_state.try_read() {
                 Ok(state) => state,
                 Err(TryLockError::WouldBlock) => {
-                    drop(permit);
+                    drop(slot);
                     return Err(SubmitError {
                         error: io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -1267,19 +1453,14 @@ impl RuntimeInner {
                     });
                 }
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            },
-            #[cfg(test)]
-            AdmissionMode::Wait => self
-                .submit_state
+            }
+        } else {
+            self.submit_state
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            AdmissionMode::Controlled { .. } => self
-                .submit_state
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
         if !submit_state.accepting {
-            drop(permit);
+            drop(slot);
             return Err(SubmitError {
                 error: io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
                 operation,
@@ -1291,13 +1472,13 @@ impl RuntimeInner {
             request_id,
             operation,
             completion: Arc::clone(&completion),
-            permit,
+            slot,
             submitted_at: submit_started,
         };
         self.shared.submitted.fetch_add(1, Ordering::Release);
         match self.commands.try_send(DriverCommand::Submit(task)) {
             Ok(()) => {
-                add_duration_ns(&self.shared.submit_wait_ns, submit_started.elapsed());
+                add_duration_ns(&self.shared.slot_wait_ns, submit_started.elapsed());
                 if let Some(wake) = &self.wake {
                     wake.wake();
                 }
@@ -1311,9 +1492,9 @@ impl RuntimeInner {
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
                 self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
                 let Task {
-                    operation, permit, ..
+                    operation, slot, ..
                 } = task;
-                drop(permit);
+                drop(slot);
                 Err(SubmitError {
                     error: io::Error::new(io::ErrorKind::WouldBlock, "I/O command queue is full"),
                     operation,
@@ -1322,9 +1503,9 @@ impl RuntimeInner {
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
                 self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
                 let Task {
-                    operation, permit, ..
+                    operation, slot, ..
                 } = task;
-                drop(permit);
+                drop(slot);
                 Err(SubmitError {
                     error: io::Error::new(io::ErrorKind::BrokenPipe, "I/O driver stopped"),
                     operation,
@@ -1357,16 +1538,16 @@ impl RuntimeInner {
         Ok(true)
     }
 
-    fn stop_admission(&self) {
+    fn stop_accepting_requests(&self) {
         let mut submit_state = self
             .submit_state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
         {
-            let _admission = lock_unpoisoned(&self.shared.admission_lock);
+            let _slot = lock_unpoisoned(&self.shared.slot_lock);
             self.shared.accepting.store(false, Ordering::Release);
-            self.shared.admission_available.notify_all();
+            self.shared.slot_available.notify_all();
         }
         drop(submit_state);
         if let Some(wake) = &self.wake {
@@ -1406,9 +1587,9 @@ impl RuntimeInner {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
             {
-                let _admission = lock_unpoisoned(&self.shared.admission_lock);
+                let _slot = lock_unpoisoned(&self.shared.slot_lock);
                 self.shared.accepting.store(false, Ordering::Release);
-                self.shared.admission_available.notify_all();
+                self.shared.slot_available.notify_all();
             }
             let mut error = None;
             for _ in 0..worker_count {
@@ -1460,40 +1641,40 @@ pub(crate) struct BackendIoEngine {
 impl BackendIoEngine {
     #[cfg(unix)]
     #[cfg(test)]
-    pub(crate) fn new_with_files(files: RuntimeFileSet, queue_depth: usize) -> io::Result<Self> {
+    pub(crate) fn new_with_files(files: RuntimeFileSet, max_in_flight: usize) -> io::Result<Self> {
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new(backend, queue_depth)
+        Self::new(backend, max_in_flight)
     }
 
     #[cfg(unix)]
     pub(crate) fn new_with_files_and_workers(
         files: RuntimeFileSet,
-        queue_depth: usize,
+        max_in_flight: usize,
         worker_count: usize,
     ) -> io::Result<Self> {
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new_with_workers(backend, queue_depth, worker_count)
+        Self::new_with_workers(backend, max_in_flight, worker_count)
     }
 
     #[cfg(test)]
-    pub(crate) fn new(backend: Arc<dyn IoBackend>, queue_depth: usize) -> io::Result<Self> {
-        Self::new_with_workers(backend, queue_depth, queue_depth.min(4))
+    pub(crate) fn new(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
+        Self::new_with_workers(backend, max_in_flight, max_in_flight.min(4))
     }
 
     pub(crate) fn new_with_workers(
         backend: Arc<dyn IoBackend>,
-        queue_depth: usize,
+        max_in_flight: usize,
         worker_count: usize,
     ) -> io::Result<Self> {
-        RuntimeInner::validate_queue_depth(queue_depth)?;
-        if worker_count == 0 || worker_count > queue_depth {
+        RuntimeInner::validate_max_in_flight(max_in_flight)?;
+        if worker_count == 0 || worker_count > max_in_flight {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "sync I/O worker count must be in 1..=queue depth",
+                "sync I/O worker count must not exceed the request limit",
             ));
         }
-        let shared = Arc::new(RuntimeShared::new(queue_depth));
-        let command_capacity = queue_depth
+        let shared = Arc::new(RuntimeShared::new(max_in_flight));
+        let command_capacity = max_in_flight
             .checked_mul(2)
             .and_then(|depth| depth.checked_add(1))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow"))?;
@@ -1540,6 +1721,19 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
+    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
+        self.inner.try_reserve_read()
+    }
+
+    fn submit_reserved_read(
+        &self,
+        slot: ReadSlot,
+        operation: IoOperation,
+    ) -> Result<IoRequest, SubmitError> {
+        self.inner.submit_reserved_read(slot, operation)
+    }
+
+    #[cfg(test)]
     fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.inner.submit_nowait(operation)
     }
@@ -1559,8 +1753,8 @@ impl IoEngine for BackendIoEngine {
             .submit_wait_controlled(operation, cancelled, deadline)
     }
 
-    fn wake_admission_waiters(&self) {
-        self.inner.shared.wake_admission_waiters();
+    fn wake_slot_waiters(&self) {
+        self.inner.shared.wake_slot_waiters();
     }
 
     fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
@@ -1572,7 +1766,7 @@ impl IoEngine for BackendIoEngine {
     }
 
     fn in_flight(&self) -> usize {
-        self.inner.shared.in_flight.load(Ordering::Acquire)
+        self.inner.shared.total_in_flight()
     }
 
     #[cfg(test)]
@@ -1580,24 +1774,21 @@ impl IoEngine for BackendIoEngine {
         self.backend.direct_io_stats().direct_active
     }
 
-    fn stop_admission(&self) {
-        self.inner.stop_admission();
+    fn stop_accepting_requests(&self) {
+        self.inner.stop_accepting_requests();
     }
 
-    fn in_flight_mutations(&self) -> usize {
-        self.inner
-            .shared
-            .in_flight_mutations
-            .load(Ordering::Acquire)
+    fn writes_in_flight(&self) -> usize {
+        self.inner.shared.writes_in_flight()
     }
 
-    fn has_unfenced_mutations(&self) -> bool {
-        self.inner.shared.has_unfenced_mutations()
+    fn has_unfenced_writes(&self) -> bool {
+        self.inner.shared.has_unfenced_writes()
     }
 
     #[cfg(test)]
-    fn mark_unfenced_mutations_for_test(&self) {
-        self.inner.shared.mark_unfenced_mutations();
+    fn mark_unfenced_writes_for_test(&self) {
+        self.inner.shared.mark_unfenced_writes();
     }
 
     fn stats(&self) -> IoEngineStats {
@@ -1655,9 +1846,14 @@ fn execute_backend(
     operation: &mut IoOperation,
 ) -> (CompletionStatus, usize) {
     match operation {
-        IoOperation::Read { buffer, offset } => match buffer.as_mut_slice() {
-            Ok(buffer) => {
-                let (result, transferred) = read_exact_at_with_progress(backend, buffer, *offset);
+        IoOperation::Read { buffer, offset } => match buffer.read_target() {
+            Ok(buffer_pointer) => {
+                let (result, transferred) = read_exact_at_uninit_with_progress(
+                    backend,
+                    buffer_pointer,
+                    buffer.len(),
+                    *offset,
+                );
                 backend_result(result, transferred)
             }
             Err(error) => backend_result(Err(error), 0),
@@ -1756,11 +1952,11 @@ mod uring {
     impl UringIoEngine {
         pub(crate) fn new_with_files(
             files: RuntimeFileSet,
-            queue_depth: usize,
+            max_in_flight: usize,
         ) -> io::Result<Self> {
-            RuntimeInner::validate_queue_depth(queue_depth)?;
+            RuntimeInner::validate_max_in_flight(max_in_flight)?;
             let io_stats = files.stats_handle();
-            let ring_entries = queue_depth
+            let ring_entries = max_in_flight
                 .checked_add(2)
                 .and_then(usize::checked_next_power_of_two)
                 .ok_or_else(|| {
@@ -1805,8 +2001,8 @@ mod uring {
             let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
                 sender: wake_sender,
             });
-            let shared = Arc::new(RuntimeShared::new(queue_depth));
-            let command_capacity = queue_depth
+            let shared = Arc::new(RuntimeShared::new(max_in_flight));
+            let command_capacity = max_in_flight
                 .checked_mul(2)
                 .and_then(|depth| depth.checked_add(1))
                 .ok_or_else(|| {
@@ -1857,6 +2053,19 @@ mod uring {
     }
 
     impl IoEngine for UringIoEngine {
+        fn try_reserve_read(&self) -> io::Result<ReadSlot> {
+            self.inner.try_reserve_read()
+        }
+
+        fn submit_reserved_read(
+            &self,
+            slot: ReadSlot,
+            operation: IoOperation,
+        ) -> Result<IoRequest, SubmitError> {
+            self.inner.submit_reserved_read(slot, operation)
+        }
+
+        #[cfg(test)]
         fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
             self.inner.submit_nowait(operation)
         }
@@ -1876,8 +2085,8 @@ mod uring {
                 .submit_wait_controlled(operation, cancelled, deadline)
         }
 
-        fn wake_admission_waiters(&self) {
-            self.inner.shared.wake_admission_waiters();
+        fn wake_slot_waiters(&self) {
+            self.inner.shared.wake_slot_waiters();
         }
 
         fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
@@ -1889,7 +2098,7 @@ mod uring {
         }
 
         fn in_flight(&self) -> usize {
-            self.inner.shared.in_flight.load(Ordering::Acquire)
+            self.inner.shared.total_in_flight()
         }
 
         #[cfg(test)]
@@ -1897,24 +2106,21 @@ mod uring {
             self.io_stats.snapshot().direct_active
         }
 
-        fn stop_admission(&self) {
-            self.inner.stop_admission();
+        fn stop_accepting_requests(&self) {
+            self.inner.stop_accepting_requests();
         }
 
-        fn in_flight_mutations(&self) -> usize {
-            self.inner
-                .shared
-                .in_flight_mutations
-                .load(Ordering::Acquire)
+        fn writes_in_flight(&self) -> usize {
+            self.inner.shared.writes_in_flight()
         }
 
-        fn has_unfenced_mutations(&self) -> bool {
-            self.inner.shared.has_unfenced_mutations()
+        fn has_unfenced_writes(&self) -> bool {
+            self.inner.shared.has_unfenced_writes()
         }
 
         #[cfg(test)]
-        fn mark_unfenced_mutations_for_test(&self) {
-            self.inner.shared.mark_unfenced_mutations();
+        fn mark_unfenced_writes_for_test(&self) {
+            self.inner.shared.mark_unfenced_writes();
         }
 
         fn stats(&self) -> IoEngineStats {
@@ -1973,7 +2179,7 @@ mod uring {
         submit_state: Arc<RwLock<SubmitState>>,
         receiver: Receiver<DriverCommand>,
     ) -> io::Result<()> {
-        let queue_depth = shared.queue_depth;
+        let max_in_flight = shared.max_in_flight;
         let submission_capacity = ring.submission().capacity();
         let completion_capacity = ring.completion().capacity();
         let mut driver = UringDriver {
@@ -1986,10 +2192,10 @@ mod uring {
             shared,
             submit_state,
             receiver,
-            flights: HashMap::with_capacity(queue_depth),
-            pending_targets: VecDeque::with_capacity(queue_depth),
-            pending_cancels: VecDeque::with_capacity(queue_depth),
-            requested_cancels: Vec::with_capacity(queue_depth),
+            flights: HashMap::with_capacity(max_in_flight),
+            pending_targets: VecDeque::with_capacity(max_in_flight),
+            pending_cancels: VecDeque::with_capacity(max_in_flight),
+            requested_cancels: Vec::with_capacity(max_in_flight),
             pending_entries: Vec::with_capacity(submission_capacity),
             submission_entries: Vec::with_capacity(submission_capacity),
             completion_events: Vec::with_capacity(completion_capacity),
@@ -2432,9 +2638,9 @@ mod uring {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
             {
-                let _admission = lock_unpoisoned(&self.shared.admission_lock);
+                let _slot = lock_unpoisoned(&self.shared.slot_lock);
                 self.shared.accepting.store(false, Ordering::Release);
-                self.shared.admission_available.notify_all();
+                self.shared.slot_available.notify_all();
             }
             // The false state is permanent. Release the fence before waking
             // completion consumers so a custom waker may safely re-enter the
@@ -2448,16 +2654,16 @@ mod uring {
             // target CQE, never its cancel CQE, is the release fence.
             self.try_cancel_and_drain_fatal(error, &message);
 
-            let unfenced_mutations = self
+            let unfenced_writes = self
                 .flights
                 .values()
-                .any(|flight| flight.active && flight.task.operation.kind().is_mutation());
-            if unfenced_mutations {
+                .any(|flight| flight.active && flight.task.operation.kind().uses_write_slot());
+            if unfenced_writes {
                 // A ring close does not wait for hardware writes. Preserve the
                 // duplicated open-file description (and therefore its flock)
                 // for process lifetime. The cache must also observe the flag
                 // and never issue LOCK_UN on another duplicate.
-                self.shared.mark_unfenced_mutations();
+                self.shared.mark_unfenced_writes();
                 if let Some(files) = self.files.take() {
                     std::mem::forget(files);
                 }
@@ -2677,7 +2883,7 @@ pub(crate) use uring::UringIoEngine;
 #[cfg(unix)]
 pub(crate) fn build_auto_file_engine(
     files: RuntimeFileSet,
-    queue_depth: usize,
+    max_in_flight: usize,
 ) -> io::Result<Arc<dyn IoEngine>> {
     #[cfg(all(
         feature = "io-uring",
@@ -2692,10 +2898,10 @@ pub(crate) fn build_auto_file_engine(
     ))]
     {
         let fallback = files.try_clone()?;
-        match UringIoEngine::new_with_files(files, queue_depth) {
+        match UringIoEngine::new_with_files(files, max_in_flight) {
             Ok(engine) => Ok(Arc::new(engine)),
             Err(error) if UringIoEngine::is_unavailable_error(&error) => {
-                BackendIoEngine::new_with_files_and_workers(fallback, queue_depth, 1)
+                BackendIoEngine::new_with_files_and_workers(fallback, max_in_flight, 1)
                     .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             Err(error) => Err(error),
@@ -2714,7 +2920,7 @@ pub(crate) fn build_auto_file_engine(
         )
     )))]
     {
-        BackendIoEngine::new_with_files_and_workers(files, queue_depth, 1)
+        BackendIoEngine::new_with_files_and_workers(files, max_in_flight, 1)
             .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
     }
 }
@@ -2722,15 +2928,15 @@ pub(crate) fn build_auto_file_engine(
 #[cfg(unix)]
 pub(crate) fn build_file_engine(
     files: RuntimeFileSet,
-    queue_depth: usize,
+    max_in_flight: usize,
     kind: FileIoEngineKind,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
         FileIoEngineKind::Sync => {
-            BackendIoEngine::new_with_files_and_workers(files, queue_depth, 1)
+            BackendIoEngine::new_with_files_and_workers(files, max_in_flight, 1)
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
         }
-        FileIoEngineKind::Auto => build_auto_file_engine(files, queue_depth),
+        FileIoEngineKind::Auto => build_auto_file_engine(files, max_in_flight),
         FileIoEngineKind::IoUring => {
             #[cfg(all(
                 feature = "io-uring",
@@ -2744,7 +2950,7 @@ pub(crate) fn build_file_engine(
                 )
             ))]
             {
-                UringIoEngine::new_with_files(files, queue_depth)
+                UringIoEngine::new_with_files(files, max_in_flight)
                     .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             #[cfg(not(all(
@@ -2806,8 +3012,7 @@ mod tests {
 
     use crate::io_backend::FileBackend;
     use crate::resources::{
-        BackpressurePolicy, ReadBufferTryAcquire, ResourceController, ResourceLimits,
-        aligned_buffer_capacity,
+        ResourceController, ResourceLimits, WriteBackpressure, aligned_buffer_capacity,
     };
 
     static FILE_ID: AtomicU64 = AtomicU64::new(1);
@@ -3024,37 +3229,37 @@ mod tests {
         }
     }
 
-    fn resources(maximum: usize) -> Arc<ResourceController> {
+    fn resources(_maximum: usize) -> Arc<ResourceController> {
         Arc::new(
             ResourceController::try_new(ResourceLimits {
-                memory_budget_bytes: 1024 * 1024,
-                base_memory_bytes: 0,
-                max_buffer_bytes: aligned_buffer_capacity(maximum).unwrap(),
-                write_queue_depth: 4,
-                read_buffer_slots: 2,
-                backpressure: BackpressurePolicy::Reject,
+                memory_limit_bytes: 1024 * 1024,
+                reserved_memory_bytes: 0,
+                waiting_write_limit: 4,
+                write_backpressure: WriteBackpressure::Reject,
             })
             .unwrap(),
         )
     }
 
     fn read_buffer(resources: &Arc<ResourceController>, length: usize) -> IoBuffer {
-        let mut lease = resources.test_buffer();
-        lease.prepare(length).unwrap();
-        IoBuffer::from_lease(lease, length).unwrap()
+        let lease = resources.try_read_buffer(length).unwrap();
+        IoBuffer::for_read(lease, length).unwrap()
     }
 
     fn write_buffer(resources: &Arc<ResourceController>, bytes: &[u8]) -> IoBuffer {
-        let mut lease = resources.test_buffer();
+        let mut lease = resources.try_read_buffer(bytes.len()).unwrap();
         lease.prepare(bytes.len()).unwrap().copy_from_slice(bytes);
-        IoBuffer::from_lease(lease, bytes.len()).unwrap()
+        IoBuffer::for_write(lease, bytes.len()).unwrap()
     }
 
     #[test]
     fn aligned_buffer_has_stable_alignment() {
         let resources = resources(8193);
         let buffer = read_buffer(&resources, 8193);
-        assert_eq!(buffer.as_ptr().unwrap() as usize % IO_BUFFER_ALIGNMENT, 0);
+        assert_eq!(
+            buffer.read_target().unwrap() as usize % IO_BUFFER_ALIGNMENT,
+            0
+        );
         assert_eq!(buffer.len(), 8193);
     }
 
@@ -3087,7 +3292,7 @@ mod tests {
         assert_eq!(stats.submitted, 3);
         assert_eq!(stats.completed, 3);
         assert_eq!(stats.errors, 0);
-        assert!(stats.in_flight_peak >= 1);
+        assert!(stats.requests_in_flight_peak >= 1);
         assert!(
             engine
                 .flush(SyncPoint::ExplicitFlush, SyncMode::Data)
@@ -3167,20 +3372,20 @@ mod tests {
     }
 
     #[test]
-    fn unfenced_mutation_state_remains_unsafe_after_shutdown() {
+    fn unfenced_write_state_remains_unsafe_after_shutdown() {
         let file = TestFile::new();
         let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
-        assert!(!engine.has_unfenced_mutations());
+        assert!(!engine.has_unfenced_writes());
 
-        engine.mark_unfenced_mutations_for_test();
+        engine.mark_unfenced_writes_for_test();
         engine.shutdown().unwrap();
 
-        assert!(engine.has_unfenced_mutations());
+        assert!(engine.has_unfenced_writes());
         assert_eq!(engine.in_flight(), 0);
     }
 
     #[test]
-    fn completion_deadline_stops_admission_without_releasing_an_unfenced_target() {
+    fn completion_deadline_stops_requests_without_releasing_an_unfenced_target() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(4096);
@@ -3196,13 +3401,13 @@ mod tests {
 
         let timeout = request.wait(&engine).unwrap_err();
         let pending = engine.in_flight();
-        let pending_mutations = engine.in_flight_mutations();
+        let pending_writes = engine.writes_in_flight();
         backend.release();
         let (error, buffer) = timeout.into_buffer();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(buffer.is_none());
         assert_eq!(pending, 1);
-        assert_eq!(pending_mutations, 0);
+        assert_eq!(pending_writes, 0);
 
         let rejected = engine
             .submit(IoOperation::read(read_buffer(&resources, 1), 0))
@@ -3214,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_deadline_keeps_an_issued_mutation_counted_until_target_completion() {
+    fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(4096);
@@ -3233,26 +3438,112 @@ mod tests {
 
         let timeout = request.wait(&engine).unwrap_err();
         let pending = engine.in_flight();
-        let pending_mutations = engine.in_flight_mutations();
+        let pending_writes = engine.writes_in_flight();
         backend.release();
         let (error, buffer) = timeout.into_buffer();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(buffer.is_none());
         assert_eq!(pending, 1);
-        assert_eq!(pending_mutations, 1);
+        assert_eq!(pending_writes, 1);
 
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
-        assert_eq!(engine.in_flight_mutations(), 0);
+        assert_eq!(engine.writes_in_flight(), 0);
     }
 
     #[test]
-    fn queue_depth_is_hard_bounded() {
+    fn io_concurrency_is_hard_bounded() {
         let file = TestFile::new();
         assert!(matches!(
-            BackendIoEngine::new(file.backend(), MAX_IO_QUEUE_DEPTH + 1),
+            BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_WORKER + 1),
             Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
+    }
+
+    #[test]
+    fn writes_reserve_the_final_engine_slot_for_reads() {
+        let shared = Arc::new(RuntimeShared::new(2));
+        let write = shared.try_reserve_slot(true).unwrap();
+        assert!(shared.try_reserve_slot(true).is_none());
+        let read = shared.try_reserve_slot(false).unwrap();
+        assert_eq!(shared.total_in_flight(), 2);
+        drop((write, read));
+
+        let read = shared.try_reserve_slot(false).unwrap();
+        let write = shared.try_reserve_slot(true).unwrap();
+        assert_eq!(shared.total_in_flight(), 2);
+        assert_eq!(shared.writes_in_flight(), 1);
+        drop((read, write));
+
+        let depth_one = Arc::new(RuntimeShared::new(1));
+        assert!(depth_one.try_reserve_slot(true).is_some());
+    }
+
+    #[test]
+    fn waiting_write_gets_the_next_slot_under_read_pressure() {
+        let shared = Arc::new(RuntimeShared::new(2));
+        let first = shared.try_reserve_slot(false).unwrap();
+        let second = shared.try_reserve_slot(false).unwrap();
+        let waiting = Arc::clone(&shared);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let slot = waiting.reserve_slot_wait(true).unwrap();
+            admitted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(slot);
+        });
+
+        while shared.waiting_writes_for_test() == 0 {
+            std::thread::yield_now();
+        }
+        drop(first);
+        assert!(shared.try_reserve_slot(false).is_none());
+        admitted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        drop(second);
+        writer.join().unwrap();
+        assert_eq!(shared.total_in_flight(), 0);
+        assert_eq!(shared.writes_in_flight(), 0);
+    }
+
+    #[test]
+    fn write_waiter_does_not_consume_the_read_reserved_slot() {
+        let shared = Arc::new(RuntimeShared::new(2));
+        let first_write = shared.try_reserve_slot(true).unwrap();
+        let waiting = Arc::clone(&shared);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let slot = waiting.reserve_slot_wait(true).unwrap();
+            admitted_tx.send(()).unwrap();
+            drop(slot);
+        });
+
+        while shared.waiting_writes_for_test() == 0 {
+            std::thread::yield_now();
+        }
+        let read = shared.try_reserve_slot(false).unwrap();
+        assert_eq!(shared.total_in_flight(), 2);
+        drop(read);
+        drop(first_write);
+        admitted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn unused_read_reservation_releases_its_engine_slot() {
+        let file = TestFile::new();
+        let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
+        let slot = engine.try_reserve_read().unwrap();
+        assert_eq!(engine.in_flight(), 1);
+        assert_eq!(
+            engine.try_reserve_read().err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(slot);
+        assert_eq!(engine.in_flight(), 0);
+        drop(engine.try_reserve_read().unwrap());
+        engine.shutdown().unwrap();
     }
 
     #[test]
@@ -3297,7 +3588,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_wait_blocks_at_the_hard_queue_depth_and_resumes() {
+    fn submit_wait_blocks_at_the_io_concurrency_limit_and_resumes() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(1);
@@ -3333,12 +3624,12 @@ mod tests {
         assert!(matches!(second.wait().status, CompletionStatus::Completed));
         submitter.join().unwrap();
         assert!(was_blocked);
-        assert_eq!(engine.stats().in_flight_peak, 1);
+        assert_eq!(engine.stats().requests_in_flight_peak, 1);
         engine.shutdown().unwrap();
     }
 
     #[test]
-    fn controlled_admission_observes_cancel_wake_and_absolute_deadline() {
+    fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(1);
@@ -3367,7 +3658,7 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         cancelled.store(true, Ordering::Release);
-        engine.wake_admission_waiters();
+        engine.wake_slot_waiters();
         let cancelled_error = result_receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
@@ -3420,7 +3711,7 @@ mod tests {
     #[test]
     fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
         let shared = Arc::new(RuntimeShared::new(1));
-        let permit = shared.try_admit(false).unwrap();
+        let slot = shared.try_reserve_slot(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
         shared.submitted.fetch_add(1, Ordering::Relaxed);
@@ -3430,7 +3721,7 @@ mod tests {
             request_id,
             operation: IoOperation::read(read_buffer(&resources, 1), 0),
             completion: Arc::clone(&completion),
-            permit,
+            slot,
             submitted_at: Instant::now(),
         };
         shared.finish_quarantined(
@@ -3442,15 +3733,14 @@ mod tests {
         let completed = completion.wait();
         assert!(matches!(completed.status, CompletionStatus::Failed(_)));
         assert!(completed.buffer.is_none());
-        assert_eq!(shared.snapshot().in_flight, 0);
+        assert_eq!(shared.snapshot().requests_in_flight, 0);
 
-        // One of the two fixed read slots remains quarantined instead of
-        // becoming reusable after the failure completion.
-        let remaining = resources.test_buffer();
-        assert!(matches!(
-            resources.try_read_buffer(),
-            ReadBufferTryAcquire::Exhausted
-        ));
-        drop(remaining);
+        // The uncertain buffer remains charged instead of being reused while
+        // the kernel may still own its address.
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            aligned_buffer_capacity(1).unwrap()
+        );
+        assert!(resources.try_read_buffer(1).is_some());
     }
 }

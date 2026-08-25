@@ -1,6 +1,6 @@
 //! Self-owned steady-state runtime for RegionStore .
 //!
-//! Foreground writers encode directly into the fixed per-shard staging
+//! Foreground writers encode directly into the fixed per-shard write
 //! buffers. Shard workers carry only coalesced control state, so queueing cannot
 //! duplicate payload memory or let a benchmark generator inflate the measured
 //! device path. A fixed age deadline publishes partial batches without adding
@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use crate::eviction::EvictionPolicy;
 use crate::expiry::ExpiryClock;
+use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::io_backend::{DirectIoMode, RuntimeFileSet, SyncMode, SyncPoint};
 use crate::io_engine::{
-    FileIoEngineKind, IoEngine, IoEngineStats, IoOperation, MAX_IO_QUEUE_DEPTH, OperationKind,
-    build_file_engine, submit_cache_io,
+    FileIoEngineKind, IoEngine, IoEngineStats, IoOperation, MAX_IO_REQUESTS_PER_WORKER,
+    OperationKind, build_file_engine, submit_cache_io,
 };
 use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValue};
 use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
@@ -25,45 +26,57 @@ use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionStagedValue, RegionValueRead};
 use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_manager::RegionSetRuntimeSnapshot;
+use crate::region_reader::{_READ_ALIGNMENT, plan_read};
 use crate::region_staging::{PendingFenceLookup, RegionStaging, StagingError};
 use crate::resources::{
-    BackpressurePolicy, CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_QUEUE_DEPTH,
-    ManagedMemorySnapshot, OverloadReason, ReadBufferPolicy, ReadBufferTryAcquire,
+    CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
     ResourceBuildError, ResourceController, ResourceLimits, ResourceRuntimeSnapshot,
+    WriteBackpressure, WriteOverloadReason,
 };
 
 #[cfg(test)]
 const DEFAULT_IO_WORKERS: usize = 4;
 #[cfg(test)]
-const DEFAULT_IO_QUEUE_DEPTH: usize = 128;
+const DEFAULT_IO_CONCURRENCY: usize = 128;
 #[cfg(test)]
-const DEFAULT_WRITE_QUEUE_DEPTH: usize = 128;
-#[cfg(test)]
-pub(crate) const DEFAULT_READ_BUFFER_SLOTS: usize = 128;
-#[cfg(test)]
-pub(crate) const _READ_BUFFER_SLOTS: usize = DEFAULT_READ_BUFFER_SLOTS;
+const DEFAULT_WAITING_WRITE_LIMIT: usize = 128;
 const _MAX_KEY_BYTES: usize = 4 * 1024;
 const _MAX_VALUE_BYTES: usize = 256 * 1024;
-const _READ_BUFFER_BYTES: usize = 272 * 1024;
-pub(crate) const DEFAULT_MEMORY_SHARDS: usize = 32;
+const MAX_RUNTIME_RECORD_BYTES: usize = const_align_up(
+    RECORD_HEADER_SIZE + size_of::<u32>() + _MAX_KEY_BYTES + _MAX_VALUE_BYTES,
+    RECORD_ALIGNMENT,
+);
+// A runtime record begins on a RECORD_ALIGNMENT boundary. Tail padding, when
+// present, moves the same record end to the next read boundary, so the largest
+// exact aligned read is the maximum record plus the largest possible start
+// skew, rounded once to the device-read alignment.
+const MAX_READ_BUFFER_BYTES: usize = const_align_up(
+    MAX_RUNTIME_RECORD_BYTES + (_READ_ALIGNMENT - RECORD_ALIGNMENT),
+    _READ_ALIGNMENT,
+);
+pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
 #[cfg(test)]
-const DEFAULT_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(test)]
-const DEFAULT_MEMORY_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(test)]
-const DEFAULT_PARTIAL_FLUSH_AGE: Duration = Duration::from_millis(1);
-const MAX_PARTIAL_FLUSH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
+const MAX_WRITE_FLUSH_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
 // Covers the bounded engine registry, command channel, and driver-side
 // bookkeeping for one admitted I/O operation. Payload buffers are charged by
 // ResourceController separately.
 const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 // Covers worker/shard controls and handles whose size does not scale with the
-// payload or queue depth.
+// payload or configured concurrency.
 const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
+
+const fn const_align_up(value: usize, alignment: usize) -> usize {
+    (value + alignment - 1) & !(alignment - 1)
+}
 
 struct LifecycleDrainingGuard<'a> {
     lifecycle: &'a AtomicU8,
@@ -108,20 +121,21 @@ pub(crate) enum RuntimeHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeSnapshot {
     pub(crate) health: RuntimeHealth,
-    pub(crate) stats_enabled: bool,
+    pub(crate) statistics_enabled: bool,
     pub(crate) puts: u64,
     pub(crate) written_bytes: u64,
     pub(crate) l1_hits: u64,
     pub(crate) l1_misses: u64,
     pub(crate) l2_hits: u64,
     pub(crate) l2_misses: u64,
+    pub(crate) l2_read_memory_misses: u64,
+    pub(crate) l2_read_busy_misses: u64,
     pub(crate) served_bytes: u64,
-    pub(crate) promotions: u64,
+    pub(crate) l1_promotions: u64,
     pub(crate) l1_evictions: u64,
     pub(crate) l1_bypasses: u64,
     pub(crate) l1_admission_rejections: u64,
-    pub(crate) queue_saturation: u64,
-    pub(crate) buffer_saturation: u64,
+    pub(crate) write_rejections: u64,
     pub(crate) io_failures: u64,
     pub(crate) region_rotations: u64,
     pub(crate) memory: ManagedMemorySnapshot,
@@ -133,17 +147,16 @@ pub(crate) struct RuntimeDetailedSnapshot {
     pub(crate) resources: ResourceRuntimeSnapshot,
     pub(crate) io: IoEngineStats,
     pub(crate) region_sets: Box<[RegionSetRuntimeSnapshot]>,
-    pub(crate) staging_rejections: u64,
-    pub(crate) staging_wait_ns: u64,
+    pub(crate) write_buffer_rejections: u64,
+    pub(crate) write_buffer_wait_ns: u64,
 }
 
 struct RuntimeMetrics {
     lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
-    queue_saturation: AtomicU64,
-    buffer_saturation: AtomicU64,
-    staging_rejections: AtomicU64,
-    staging_wait_ns: AtomicU64,
+    write_rejections: AtomicU64,
+    write_buffer_rejections: AtomicU64,
+    write_buffer_wait_ns: AtomicU64,
     io_failures: AtomicU64,
     region_rotations: AtomicU64,
 }
@@ -156,8 +169,10 @@ struct ActivityMetrics {
     l1_misses: AtomicU64,
     l2_hits: AtomicU64,
     l2_misses: AtomicU64,
+    l2_read_memory_misses: AtomicU64,
+    l2_read_busy_misses: AtomicU64,
     served_bytes: AtomicU64,
-    promotions: AtomicU64,
+    l1_promotions: AtomicU64,
 }
 
 impl ActivityMetrics {
@@ -169,8 +184,10 @@ impl ActivityMetrics {
             l1_misses: AtomicU64::new(0),
             l2_hits: AtomicU64::new(0),
             l2_misses: AtomicU64::new(0),
+            l2_read_memory_misses: AtomicU64::new(0),
+            l2_read_busy_misses: AtomicU64::new(0),
             served_bytes: AtomicU64::new(0),
-            promotions: AtomicU64::new(0),
+            l1_promotions: AtomicU64::new(0),
         }
     }
 }
@@ -188,10 +205,9 @@ impl RuntimeMetrics {
         Ok(Self {
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
-            queue_saturation: AtomicU64::new(0),
-            buffer_saturation: AtomicU64::new(0),
-            staging_rejections: AtomicU64::new(0),
-            staging_wait_ns: AtomicU64::new(0),
+            write_rejections: AtomicU64::new(0),
+            write_buffer_rejections: AtomicU64::new(0),
+            write_buffer_wait_ns: AtomicU64::new(0),
             io_failures: AtomicU64::new(0),
             region_rotations: AtomicU64::new(0),
         })
@@ -222,20 +238,14 @@ impl RuntimeMetrics {
         counter.fetch_add(elapsed, Ordering::Relaxed);
     }
 
-    fn record_overload(&self, reason: OverloadReason) {
-        let counter = match reason {
-            OverloadReason::WriteQueueFull | OverloadReason::WriteTimeout => &self.queue_saturation,
-            OverloadReason::ReadBufferUnavailable
-            | OverloadReason::ReadBufferTimeout
-            | OverloadReason::WriteStagingUnavailable => &self.buffer_saturation,
-        };
-        Self::increment(counter);
+    fn record_write_rejection(&self) {
+        Self::increment(&self.write_rejections);
     }
 
     fn snapshot(
         &self,
         core_healthy: bool,
-        stats_enabled: bool,
+        statistics_enabled: bool,
         memory: ManagedMemorySnapshot,
         memory_metrics: MemoryMetricsSnapshot,
     ) -> RuntimeSnapshot {
@@ -255,8 +265,10 @@ impl RuntimeMetrics {
         let mut l1_misses = 0_u64;
         let mut l2_hits = 0_u64;
         let mut l2_misses = 0_u64;
+        let mut l2_read_memory_misses = 0_u64;
+        let mut l2_read_busy_misses = 0_u64;
         let mut served_bytes = 0_u64;
-        let mut promotions = 0_u64;
+        let mut l1_promotions = 0_u64;
         for activity in &self.activity {
             puts = puts.saturating_add(activity.puts.load(Ordering::Relaxed));
             written_bytes =
@@ -265,26 +277,32 @@ impl RuntimeMetrics {
             l1_misses = l1_misses.saturating_add(activity.l1_misses.load(Ordering::Relaxed));
             l2_hits = l2_hits.saturating_add(activity.l2_hits.load(Ordering::Relaxed));
             l2_misses = l2_misses.saturating_add(activity.l2_misses.load(Ordering::Relaxed));
+            l2_read_memory_misses = l2_read_memory_misses
+                .saturating_add(activity.l2_read_memory_misses.load(Ordering::Relaxed));
+            l2_read_busy_misses = l2_read_busy_misses
+                .saturating_add(activity.l2_read_busy_misses.load(Ordering::Relaxed));
             served_bytes =
                 served_bytes.saturating_add(activity.served_bytes.load(Ordering::Relaxed));
-            promotions = promotions.saturating_add(activity.promotions.load(Ordering::Relaxed));
+            l1_promotions =
+                l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
         }
         RuntimeSnapshot {
             health,
-            stats_enabled,
+            statistics_enabled,
             puts,
             written_bytes,
             l1_hits,
             l1_misses,
             l2_hits,
             l2_misses,
+            l2_read_memory_misses,
+            l2_read_busy_misses,
             served_bytes,
-            promotions,
+            l1_promotions,
             l1_evictions: memory_metrics.evictions,
             l1_bypasses: memory_metrics.bypasses,
             l1_admission_rejections: memory_metrics.admission_rejections,
-            queue_saturation: self.queue_saturation.load(Ordering::Relaxed),
-            buffer_saturation: self.buffer_saturation.load(Ordering::Relaxed),
+            write_rejections: self.write_rejections.load(Ordering::Relaxed),
             io_failures: self.io_failures.load(Ordering::Relaxed),
             region_rotations: self.region_rotations.load(Ordering::Relaxed),
             memory,
@@ -297,19 +315,17 @@ pub(crate) struct RegionRuntimeConfig {
     pub(crate) io_engine: FileIoEngineKind,
     pub(crate) io_mode: DirectIoMode,
     pub(crate) io_workers: usize,
-    pub(crate) io_queue_depth: usize,
-    pub(crate) write_queue_depth: usize,
-    pub(crate) read_buffer_slots: usize,
-    pub(crate) read_buffer_policy: ReadBufferPolicy,
-    pub(crate) memory_capacity_bytes: usize,
-    pub(crate) memory_budget_bytes: usize,
-    pub(crate) memory_shards: usize,
+    pub(crate) io_concurrency: usize,
+    pub(crate) waiting_write_limit: usize,
+    pub(crate) l1_capacity_bytes: usize,
+    pub(crate) memory_limit_bytes: usize,
+    pub(crate) l1_shards: usize,
     pub(crate) eviction_policy: EvictionPolicy,
-    pub(crate) staging_bytes: usize,
-    pub(crate) batch_target_bytes: usize,
-    pub(crate) partial_flush_age: Duration,
-    pub(crate) backpressure: BackpressurePolicy,
-    pub(crate) stats_enabled: bool,
+    pub(crate) write_buffer_bytes: usize,
+    pub(crate) write_batch_bytes: usize,
+    pub(crate) write_flush_delay: Duration,
+    pub(crate) write_backpressure: WriteBackpressure,
+    pub(crate) statistics: bool,
 }
 
 #[cfg(test)]
@@ -319,101 +335,89 @@ impl Default for RegionRuntimeConfig {
             io_engine: FileIoEngineKind::Auto,
             io_mode: DirectIoMode::Auto,
             io_workers: DEFAULT_IO_WORKERS,
-            io_queue_depth: DEFAULT_IO_QUEUE_DEPTH,
-            write_queue_depth: DEFAULT_WRITE_QUEUE_DEPTH,
-            read_buffer_slots: DEFAULT_READ_BUFFER_SLOTS,
-            read_buffer_policy: ReadBufferPolicy::Reject,
-            memory_capacity_bytes: DEFAULT_MEMORY_CAPACITY_BYTES,
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            memory_shards: DEFAULT_MEMORY_SHARDS,
+            io_concurrency: DEFAULT_IO_CONCURRENCY,
+            waiting_write_limit: DEFAULT_WAITING_WRITE_LIMIT,
+            l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+            l1_shards: DEFAULT_L1_SHARDS,
             eviction_policy: EvictionPolicy::Clock,
-            staging_bytes: _WRITE_BATCH_BYTES,
-            batch_target_bytes: _WRITE_BATCH_BYTES,
-            partial_flush_age: DEFAULT_PARTIAL_FLUSH_AGE,
-            backpressure: BackpressurePolicy::Reject,
-            stats_enabled: false,
+            write_buffer_bytes: _WRITE_BATCH_BYTES,
+            write_batch_bytes: _WRITE_BATCH_BYTES,
+            write_flush_delay: DEFAULT_WRITE_FLUSH_DELAY,
+            write_backpressure: WriteBackpressure::Reject,
+            statistics: false,
         }
     }
 }
 
 impl RegionRuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.io_workers == 0 || self.io_workers > self.io_queue_depth {
+        if self.io_workers == 0 || self.io_workers > self.io_concurrency {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "I/O workers must be in 1..=I/O queue depth",
+                "I/O workers must be in 1..=I/O concurrency",
             ));
         }
-        if self.io_queue_depth.div_ceil(self.io_workers) > MAX_IO_QUEUE_DEPTH {
+        if self.io_concurrency.div_ceil(self.io_workers) > MAX_IO_REQUESTS_PER_WORKER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "I/O queue depth per worker exceeds 4096",
+                "I/O concurrency per worker exceeds 4096",
             ));
         }
-        if self.write_queue_depth == 0 || self.read_buffer_slots == 0 {
+        if self.waiting_write_limit == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "write queue depth and read buffer slots must be non-zero",
+                "waiting write limit must be non-zero",
             ));
         }
-        if self.write_queue_depth > MAX_QUEUE_DEPTH || self.read_buffer_slots > MAX_QUEUE_DEPTH {
+        if self.waiting_write_limit > MAX_CONFIG_COUNT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "write queue or read buffer slots exceed 65536",
+                "waiting write limit exceeds 65536",
             ));
         }
-        if self.memory_budget_bytes == 0 {
+        if self.memory_limit_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "memory budget must be non-zero",
+                "memory limit must be non-zero",
             ));
         }
-        if self.memory_capacity_bytes > self.memory_budget_bytes {
+        if self.l1_capacity_bytes > self.memory_limit_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RAM capacity must not exceed the aggregate memory budget",
+                "L1 capacity must not exceed the aggregate memory limit",
             ));
         }
-        if self.memory_shards == 0 || self.memory_shards > MAX_QUEUE_DEPTH {
+        if self.l1_shards == 0 || self.l1_shards > MAX_CONFIG_COUNT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "memory shards must be in 1..=65536",
+                "L1 shards must be in 1..=65536",
             ));
         }
         if matches!(
-            self.backpressure,
-            BackpressurePolicy::Timeout(duration) if duration > MAX_BACKPRESSURE_TIMEOUT
+            self.write_backpressure,
+            WriteBackpressure::Timeout(duration) if duration > MAX_BACKPRESSURE_TIMEOUT
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backpressure timeout must not exceed 24 hours",
             ));
         }
-        if matches!(
-            self.read_buffer_policy,
-            ReadBufferPolicy::Wait(duration)
-                if duration.is_zero() || duration > MAX_BACKPRESSURE_TIMEOUT
-        ) {
+        if self.write_flush_delay > MAX_WRITE_FLUSH_DELAY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "read buffer wait must be in 1ns..=24h",
+                "write flush delay must not exceed 24 hours",
             ));
         }
-        if self.partial_flush_age > MAX_PARTIAL_FLUSH_AGE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "partial flush age must not exceed 24 hours",
-            ));
-        }
-        if self.staging_bytes == 0
-            || self.staging_bytes > _WRITE_BATCH_BYTES
-            || self.staging_bytes % crate::resources::BUFFER_ALIGNMENT != 0
-            || self.batch_target_bytes == 0
-            || self.batch_target_bytes > self.staging_bytes
+        if self.write_buffer_bytes == 0
+            || self.write_buffer_bytes > _WRITE_BATCH_BYTES
+            || self.write_buffer_bytes % crate::resources::BUFFER_ALIGNMENT != 0
+            || self.write_batch_bytes == 0
+            || self.write_batch_bytes > self.write_buffer_bytes
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "staging and batch sizes must be aligned and within 1..=4 MiB",
+                "write buffer and batch sizes must be aligned and within 1..=4 MiB",
             ));
         }
         Ok(())
@@ -430,23 +434,28 @@ impl RegionRuntimeConfig {
             crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
                 .checked_add(layout_memory_bytes)
                 .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
-        self.validated_base_memory_bytes(geometry, shard_count, fixed_bytes)?;
+        self.validated_reserved_memory_bytes(geometry, shard_count, fixed_bytes)?;
         Ok(())
     }
 
-    fn validated_base_memory_bytes(
+    fn validated_reserved_memory_bytes(
         &self,
         geometry: DataGeometry,
         shard_count: usize,
         fixed_bytes: usize,
     ) -> io::Result<usize> {
-        let (base_memory, minimum) = self.memory_plan_bytes(geometry, shard_count, fixed_bytes)?;
-        if minimum > self.memory_budget_bytes {
-            return Err(invalid_runtime_config(
-                "memory budget cannot hold the fixed cache memory plan",
+        let (reserved_memory, minimum) =
+            self.memory_plan_bytes(geometry, shard_count, fixed_bytes)?;
+        if minimum > self.memory_limit_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "memory limit cannot hold the fixed cache memory plan: requires {minimum} bytes, configured {} bytes",
+                    self.memory_limit_bytes
+                ),
             ));
         }
-        Ok(base_memory)
+        Ok(reserved_memory)
     }
 
     fn memory_plan_bytes(
@@ -461,22 +470,22 @@ impl RegionRuntimeConfig {
         let usable_region = usize::try_from(geometry.region_size)
             .map_err(|_| invalid_runtime_config("Region size does not fit the memory plan"))?;
         let chunk_bytes =
-            usable_region.min(self.staging_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
-        let staging_bytes = RegionStaging::reservation_bytes(shard_count, chunk_bytes)
-            .ok_or_else(|| invalid_runtime_config("staging memory plan overflow"))?;
-        let base_memory = fixed_bytes
-            .checked_add(self.memory_capacity_bytes)
+            usable_region.min(self.write_buffer_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+        let write_buffer_reservation =
+            RegionStaging::reservation_bytes(shard_count, chunk_bytes)
+                .ok_or_else(|| invalid_runtime_config("write buffer memory plan overflow"))?;
+        let reserved_memory = fixed_bytes
+            .checked_add(self.l1_capacity_bytes)
             .and_then(|bytes| bytes.checked_add(topology_bytes))
-            .ok_or_else(|| invalid_runtime_config("base memory plan overflow"))?;
-        let prepared_buffers = self
-            .read_buffer_slots
-            .checked_mul(_READ_BUFFER_BYTES)
-            .ok_or_else(|| invalid_runtime_config("prepared buffer memory plan overflow"))?;
-        let minimum = base_memory
-            .checked_add(staging_bytes)
-            .and_then(|bytes| bytes.checked_add(prepared_buffers))
+            .ok_or_else(|| invalid_runtime_config("reserved memory plan overflow"))?;
+        let minimum = reserved_memory
+            .checked_add(write_buffer_reservation)
+            // Keep enough uncommitted budget for at least one maximum-size
+            // exact read. Additional reads consume only their actual aligned
+            // buffer size and fail open when the aggregate budget is full.
+            .and_then(|bytes| bytes.checked_add(MAX_READ_BUFFER_BYTES))
             .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
-        Ok((base_memory, minimum))
+        Ok((reserved_memory, minimum))
     }
 }
 
@@ -486,30 +495,30 @@ const WAKE_ROTATE: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionPut {
-    /// Bytes are resident in the bounded shard staging buffer until the shard
+    /// Bytes are resident in the bounded shard write buffer until the shard
     /// completion worker publishes the corresponding index entry.
     Buffered(RegionStagedValue),
 }
 
 pub(crate) enum HybridValueRead {
-    Memory(MemoryValue),
-    Region(RegionValueRead),
+    L1(MemoryValue),
+    L2(RegionValueRead),
     /// An L2 hit copied into the bounded L1 tier. The public tier remains
-    /// Region because that is where this lookup was served, but the transient
-    /// read buffer can return to the foreground pool before `get` returns.
-    PromotedRegion(MemoryValue),
+    /// L2 because that is where this lookup was served, but the exact-size
+    /// transient read allocation can be released before `get` returns.
+    PromotedL2(MemoryValue),
 }
 
 impl HybridValueRead {
     pub(crate) fn value(&self) -> &[u8] {
         match self {
-            Self::Memory(value) | Self::PromotedRegion(value) => value.as_ref(),
-            Self::Region(value) => value.value(),
+            Self::L1(value) | Self::PromotedL2(value) => value.as_ref(),
+            Self::L2(value) => value.value(),
         }
     }
 
-    pub(crate) const fn is_memory(&self) -> bool {
-        matches!(self, Self::Memory(_))
+    pub(crate) const fn is_l1(&self) -> bool {
+        matches!(self, Self::L1(_))
     }
 }
 
@@ -546,9 +555,9 @@ struct RunningShared {
     memory: Arc<MemoryStore>,
     staging: Arc<RegionStaging>,
     shards: Box<[Arc<ShardControl>]>,
-    batch_target_bytes: usize,
-    partial_flush_age: Duration,
-    stats_enabled: bool,
+    write_batch_bytes: usize,
+    write_flush_delay: Duration,
+    statistics: bool,
 }
 
 impl RunningShared {
@@ -735,28 +744,28 @@ impl RegionDataPlane {
         let shard_id = self.core.append_shard(namespace_id, hash);
         let control = &running.shards[shard_id];
         let activity = running
-            .stats_enabled
+            .statistics
             .then(|| running.metrics.activity_for_hash(hash));
-        let deadline = match self.config.backpressure {
-            BackpressurePolicy::Timeout(duration) => {
+        let deadline = match self.config.write_backpressure {
+            WriteBackpressure::Timeout(duration) => {
                 let now = Instant::now();
                 Some(now.checked_add(duration).unwrap_or(now))
             }
-            BackpressurePolicy::Reject | BackpressurePolicy::Block => None,
+            WriteBackpressure::Reject | WriteBackpressure::Block => None,
         };
 
         loop {
-            // Reject-mode admission is the shard staging transaction itself.
+            // Reject-mode admission is the shard write-buffer transaction itself.
             // The legacy global write gate exists only for callers that
             // explicitly selected a waiting policy.
-            let permit = if self.config.backpressure == BackpressurePolicy::Reject {
+            let permit = if self.config.write_backpressure == WriteBackpressure::Reject {
                 None
             } else {
                 match running.resources.begin_write_permit_until(deadline) {
                     Ok(permit) => Some(permit),
                     Err(reason) => {
-                        if running.stats_enabled {
-                            running.metrics.record_overload(reason);
+                        if running.statistics {
+                            running.metrics.record_write_rejection();
                         }
                         return Err(overload_runtime_error(reason));
                     }
@@ -766,9 +775,9 @@ impl RegionDataPlane {
                 Ok(operation) => operation,
                 Err(TryLockError::WouldBlock) => {
                     drop(permit);
-                    let reason = OverloadReason::WriteQueueFull;
-                    if running.stats_enabled {
-                        running.metrics.record_overload(reason);
+                    let reason = WriteOverloadReason::WriteGateBusy;
+                    if running.statistics {
+                        running.metrics.record_write_rejection();
                     }
                     return Err(overload_runtime_error(reason));
                 }
@@ -806,7 +815,7 @@ impl RegionDataPlane {
                         running,
                         control,
                         WAKE_URGENT,
-                        self.config.backpressure,
+                        self.config.write_backpressure,
                         deadline,
                         permit,
                         operation,
@@ -817,7 +826,7 @@ impl RegionDataPlane {
                         running,
                         control,
                         WAKE_ROTATE | WAKE_URGENT,
-                        self.config.backpressure,
+                        self.config.write_backpressure,
                         deadline,
                         permit,
                         operation,
@@ -830,10 +839,10 @@ impl RegionDataPlane {
                     // batch to flush. Fail fast so the caller can retry.
                     drop(operation);
                     drop(permit);
-                    let reason = OverloadReason::WriteStagingUnavailable;
-                    if running.stats_enabled {
-                        RuntimeMetrics::increment(&running.metrics.staging_rejections);
-                        running.metrics.record_overload(reason);
+                    let reason = WriteOverloadReason::WriteBufferBusy;
+                    if running.statistics {
+                        RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
+                        running.metrics.record_write_rejection();
                     }
                     return Err(overload_runtime_error(reason));
                 }
@@ -842,7 +851,7 @@ impl RegionDataPlane {
                         running,
                         control,
                         WAKE_URGENT,
-                        self.config.backpressure,
+                        self.config.write_backpressure,
                         deadline,
                         permit,
                         operation,
@@ -859,7 +868,7 @@ impl RegionDataPlane {
         clock: ExpiryClock,
     ) -> io::Result<Option<HybridValueRead>> {
         if key.len() > _MAX_KEY_BYTES {
-            if self.config.stats_enabled {
+            if self.config.statistics {
                 let activity = self.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
@@ -869,7 +878,7 @@ impl RegionDataPlane {
         let running = self.running()?;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
         let activity = running
-            .stats_enabled
+            .statistics
             .then(|| running.metrics.activity_for_hash(hash));
         if !self.core.is_healthy() {
             if let Some(activity) = activity {
@@ -903,7 +912,7 @@ impl RegionDataPlane {
                         RuntimeMetrics::increment(&activity.l1_hits);
                         RuntimeMetrics::add(&activity.served_bytes, value.len());
                     }
-                    return Ok(Some(HybridValueRead::Memory(value)));
+                    return Ok(Some(HybridValueRead::L1(value)));
                 }
                 MemoryLookup::Hidden => {
                     if let Some(activity) = activity {
@@ -925,82 +934,53 @@ impl RegionDataPlane {
             }
             return Ok(None);
         };
-        let (buffer, point) = match self.config.read_buffer_policy {
-            ReadBufferPolicy::Reject => match running.resources.try_read_buffer() {
-                ReadBufferTryAcquire::Acquired(buffer) => (buffer, initial_point),
-                ReadBufferTryAcquire::Exhausted => {
-                    running.resources.record_read_buffer_rejection();
-                    let reason = OverloadReason::ReadBufferUnavailable;
-                    if running.stats_enabled {
-                        running.metrics.record_overload(reason);
-                    }
-                    return Err(overload_runtime_error(reason));
+        let plan = match plan_read(self.data.geometry, initial_point.entry) {
+            Ok(plan) if plan.aligned_len <= MAX_READ_BUFFER_BYTES => plan,
+            Ok(_) | Err(_) => {
+                self.core.enter_miss_only();
+                if running.statistics {
+                    RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
-                ReadBufferTryAcquire::Contended => {
-                    if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.l2_misses);
-                    }
-                    return Ok(None);
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_misses);
                 }
-            },
-            ReadBufferPolicy::Wait(duration) => match running.resources.try_read_buffer() {
-                ReadBufferTryAcquire::Acquired(buffer) => (buffer, initial_point),
-                ReadBufferTryAcquire::Contended => {
-                    if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.l2_misses);
-                    }
-                    return Ok(None);
-                }
-                ReadBufferTryAcquire::Exhausted => {
-                    // A Region pin can delay background rotation. Never retain
-                    // it while waiting for caller-owned buffer capacity.
-                    drop(initial_point);
-                    let deadline = Instant::now()
-                        .checked_add(duration)
-                        .unwrap_or_else(Instant::now);
-                    let buffer = match running.resources.wait_read_buffer_until(deadline) {
-                        Ok(Some(buffer)) => buffer,
-                        Ok(None) => {
-                            if let Some(activity) = activity {
-                                RuntimeMetrics::increment(&activity.l2_misses);
-                            }
-                            return Ok(None);
-                        }
-                        Err(reason) => {
-                            if running.stats_enabled {
-                                running.metrics.record_overload(reason);
-                            }
-                            return Err(overload_runtime_error(reason));
-                        }
-                    };
-                    match running.staging.pending_fence(shard_id, hash) {
-                        PendingFenceLookup::Unfenced => {}
-                        PendingFenceLookup::Fenced(_) | PendingFenceLookup::Contended => {
-                            if let Some(activity) = activity {
-                                RuntimeMetrics::increment(&activity.l2_misses);
-                            }
-                            return Ok(None);
-                        }
-                    }
-                    // The candidate may have been replaced, removed, cleared,
-                    // or rotated while this request slept. L2 decides again;
-                    // there is no retry after this single re-probe.
-                    let Some(point) = self.core.begin_value_read(hash, namespace_id)? else {
-                        if let Some(activity) = activity {
-                            RuntimeMetrics::increment(&activity.l2_misses);
-                        }
-                        return Ok(None);
-                    };
-                    (buffer, point)
-                }
-            },
+                return Ok(None);
+            }
         };
         let engine = running.engine_for(hash);
+        let slot = match engine.try_reserve_read() {
+            Ok(slot) => slot,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_misses);
+                    RuntimeMetrics::increment(&activity.l2_read_busy_misses);
+                }
+                return Ok(None);
+            }
+            Err(_) => {
+                self.core.enter_miss_only();
+                if running.statistics {
+                    RuntimeMetrics::increment(&running.metrics.io_failures);
+                }
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_misses);
+                }
+                return Ok(None);
+            }
+        };
+        let Some(buffer) = running.resources.try_read_buffer(plan.aligned_len) else {
+            if let Some(activity) = activity {
+                RuntimeMetrics::increment(&activity.l2_misses);
+                RuntimeMetrics::increment(&activity.l2_read_memory_misses);
+            }
+            return Ok(None);
+        };
         let result = self.core.read_value_from_point(
             engine.as_ref(),
-            self.data.geometry,
+            slot,
             buffer,
-            point,
+            plan,
+            initial_point,
             namespace_id,
             key,
             clock,
@@ -1033,11 +1013,11 @@ impl RegionDataPlane {
                 );
                 if let Some(promoted) = promoted {
                     if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.promotions);
+                        RuntimeMetrics::increment(&activity.l1_promotions);
                     }
-                    return Ok(Some(HybridValueRead::PromotedRegion(promoted)));
+                    return Ok(Some(HybridValueRead::PromotedL2(promoted)));
                 }
-                Ok(Some(HybridValueRead::Region(value)))
+                Ok(Some(HybridValueRead::L2(value)))
             }
             Ok(None) => {
                 if let Some(activity) = activity {
@@ -1045,8 +1025,15 @@ impl RegionDataPlane {
                 }
                 Ok(None)
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_misses);
+                    RuntimeMetrics::increment(&activity.l2_read_busy_misses);
+                }
+                Ok(None)
+            }
             Err(error) => {
-                if running.stats_enabled {
+                if running.statistics {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 Err(error)
@@ -1080,7 +1067,7 @@ impl RegionDataPlane {
             flush_data_inode(&running.engines)?;
             Ok(())
         })();
-        if result.is_err() && self.config.stats_enabled {
+        if result.is_err() && self.config.statistics {
             RuntimeMetrics::increment(&self.metrics.io_failures);
         }
         result
@@ -1098,15 +1085,18 @@ impl RegionDataPlane {
             resources: running.resources.runtime_snapshot(),
             io: aggregate_io_stats(&running.engines),
             region_sets: self.core.region_set_snapshots()?,
-            staging_rejections: running.metrics.staging_rejections.load(Ordering::Relaxed),
-            staging_wait_ns: running.metrics.staging_wait_ns.load(Ordering::Relaxed),
+            write_buffer_rejections: running
+                .metrics
+                .write_buffer_rejections
+                .load(Ordering::Relaxed),
+            write_buffer_wait_ns: running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed),
         })
     }
 
     fn snapshot_running(&self, running: &RunningShared) -> RuntimeSnapshot {
         self.metrics.snapshot(
             self.core.is_healthy(),
-            self.config.stats_enabled,
+            self.config.statistics,
             running.resources.managed_memory_snapshot(),
             running.memory.metrics_snapshot(),
         )
@@ -1114,7 +1104,7 @@ impl RegionDataPlane {
 
     /// Fences admission, drains all workers, and shuts down the I/O engine.
     /// The return value asks the backend to retain flock for process lifetime
-    /// because an issued mutation could not be fenced.
+    /// because an issued write or flush could not be fenced.
     pub(crate) fn shutdown(self) -> io::Result<bool> {
         let _ = self.metrics.lifecycle.compare_exchange(
             LIFECYCLE_RUNNING,
@@ -1216,13 +1206,13 @@ fn aggregate_io_stats(engines: &[Arc<dyn IoEngine>]) -> IoEngineStats {
             .saturating_add(snapshot.cancel_requested);
         aggregate.cancelled = aggregate.cancelled.saturating_add(snapshot.cancelled);
         aggregate.errors = aggregate.errors.saturating_add(snapshot.errors);
-        aggregate.in_flight = aggregate.in_flight.saturating_add(snapshot.in_flight);
-        aggregate.in_flight_peak = aggregate
-            .in_flight_peak
-            .saturating_add(snapshot.in_flight_peak);
-        aggregate.submit_wait_ns = aggregate
-            .submit_wait_ns
-            .saturating_add(snapshot.submit_wait_ns);
+        aggregate.requests_in_flight = aggregate
+            .requests_in_flight
+            .saturating_add(snapshot.requests_in_flight);
+        aggregate.requests_in_flight_peak = aggregate
+            .requests_in_flight_peak
+            .saturating_add(snapshot.requests_in_flight_peak);
+        aggregate.slot_wait_ns = aggregate.slot_wait_ns.saturating_add(snapshot.slot_wait_ns);
         aggregate.completion_ns = aggregate
             .completion_ns
             .saturating_add(snapshot.completion_ns);
@@ -1247,29 +1237,25 @@ fn start_running(
     metrics: Arc<RuntimeMetrics>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
-    let base_memory = config.validated_base_memory_bytes(
+    let reserved_memory = config.validated_reserved_memory_bytes(
         data.geometry,
         shard_count,
-        core.runtime_base_memory_bytes()?,
+        core.runtime_reserved_memory_bytes()?,
     )?;
-    let memory_budget = config.memory_budget_bytes;
+    let memory_limit = config.memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
-            memory_budget_bytes: memory_budget,
-            base_memory_bytes: base_memory,
-            max_buffer_bytes: _READ_BUFFER_BYTES,
-            write_queue_depth: config.write_queue_depth,
-            read_buffer_slots: config.read_buffer_slots,
-            // HybridCache callers must never hold the shutdown read barrier while
-            // waiting for an externally retained hit buffer to return.
-            backpressure: config.backpressure,
+            memory_limit_bytes: memory_limit,
+            reserved_memory_bytes: reserved_memory,
+            waiting_write_limit: config.waiting_write_limit,
+            write_backpressure: config.write_backpressure,
         })
         .map_err(resource_build_io_error)?,
     );
     let usable_region = usize::try_from(data.geometry.region_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region size is too large"))?;
     let chunk_bytes =
-        usable_region.min(config.staging_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+        usable_region.min(config.write_buffer_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
     let staging = Arc::new(
         RegionStaging::try_new(
             shard_count,
@@ -1280,11 +1266,11 @@ fn start_running(
         .map_err(resource_build_io_error)?,
     );
     let memory = Arc::new(MemoryStore::new(
-        config.memory_capacity_bytes,
-        config.memory_shards,
+        config.l1_capacity_bytes,
+        config.l1_shards,
         shard_count,
         config.eviction_policy,
-        config.stats_enabled,
+        config.statistics,
     )?);
     let engines = build_engine_pool(files, &config)?;
     let mut shards = Vec::new();
@@ -1300,9 +1286,9 @@ fn start_running(
         memory,
         staging,
         shards: shards.into_boxed_slice(),
-        batch_target_bytes: config.batch_target_bytes,
-        partial_flush_age: config.partial_flush_age,
-        stats_enabled: config.stats_enabled,
+        write_batch_bytes: config.write_batch_bytes,
+        write_flush_delay: config.write_flush_delay,
+        statistics: config.statistics,
     });
     let mut shard_workers = Vec::new();
     shard_workers.try_reserve_exact(shard_count).map_err(|_| {
@@ -1346,12 +1332,12 @@ fn runtime_topology_memory_bytes(
     let stack_count = config.io_workers.checked_mul(2)?.checked_add(shard_count)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
     let queue = config
-        .io_queue_depth
+        .io_concurrency
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let controls = config
         .io_workers
         .checked_add(shard_count)?
-        .checked_add(config.memory_shards)?
+        .checked_add(config.l1_shards)?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
     let metrics = shard_count.checked_mul(std::mem::size_of::<ActivityMetrics>())?;
     stacks
@@ -1369,18 +1355,18 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(config.io_workers)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let base_depth = config.io_queue_depth / config.io_workers;
-    let remainder = config.io_queue_depth % config.io_workers;
+    let base_depth = config.io_concurrency / config.io_workers;
+    let remainder = config.io_concurrency % config.io_workers;
     for worker in 0..config.io_workers {
         let worker_files = if worker + 1 == config.io_workers {
             source.take().expect("last I/O worker owns file set")
         } else {
             source.as_ref().expect("I/O file set exists").try_clone()?
         };
-        let queue_depth = base_depth + usize::from(worker < remainder);
+        let worker_concurrency = base_depth + usize::from(worker < remainder);
         engines.push(build_file_engine(
             worker_files,
-            queue_depth,
+            worker_concurrency,
             config.io_engine,
         )?);
     }
@@ -1397,7 +1383,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("shard worker panicked"),
     };
-    if shared.stats_enabled {
+    if shared.statistics {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
     shared
@@ -1409,7 +1395,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     // Wake engine admission in case another shard is blocked behind work that
     // can no longer make progress after this runtime entered miss-only.
     for engine in &shared.engines {
-        engine.wake_admission_waiters();
+        engine.wake_slot_waiters();
     }
     for shard in &shared.shards {
         if !Arc::ptr_eq(shard, &control) {
@@ -1435,13 +1421,13 @@ fn shard_worker_result(
                 if deadline.is_none() {
                     deadline = Some(
                         Instant::now()
-                            .checked_add(shared.partial_flush_age)
+                            .checked_add(shared.write_flush_delay)
                             .ok_or_else(|| {
                                 invalid_runtime_config("partial flush deadline overflow")
                             })?,
                     );
                 }
-                if force_flush || fill.bytes >= shared.batch_target_bytes {
+                if force_flush || fill.bytes >= shared.write_batch_bytes {
                     let engine = shared.engine_for(shard_id as u64);
                     shared.core.flush_staging_shard(
                         &shared.staging,
@@ -1457,7 +1443,7 @@ fn shard_worker_result(
                 deadline = None;
                 if rotate {
                     let rotated = shared.core.rotate_shard(shard_id)?;
-                    if rotated && shared.stats_enabled {
+                    if rotated && shared.statistics {
                         RuntimeMetrics::increment(&shared.metrics.region_rotations);
                     }
                     advance_shard_progress(control)?;
@@ -1546,7 +1532,7 @@ fn prepare_shard_retry<Permit, Operation>(
     running: &RunningShared,
     control: &ShardControl,
     flags: u8,
-    policy: BackpressurePolicy,
+    policy: WriteBackpressure,
     deadline: Option<Instant>,
     permit: Permit,
     operation: Operation,
@@ -1555,31 +1541,31 @@ fn prepare_shard_retry<Permit, Operation>(
     control.notify(flags)?;
     drop(operation);
     drop(permit);
-    let wait_started = running.stats_enabled.then(Instant::now);
+    let wait_started = running.statistics.then(Instant::now);
     match policy {
-        BackpressurePolicy::Reject => {
-            let reason = OverloadReason::WriteStagingUnavailable;
-            if running.stats_enabled {
-                RuntimeMetrics::increment(&running.metrics.staging_rejections);
-                running.metrics.record_overload(reason);
+        WriteBackpressure::Reject => {
+            let reason = WriteOverloadReason::WriteBufferBusy;
+            if running.statistics {
+                RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
+                running.metrics.record_write_rejection();
             }
             Err(overload_runtime_error(reason))
         }
-        BackpressurePolicy::Block => {
+        WriteBackpressure::Block => {
             let result = control.wait_for_progress_until(observed, None).map(|_| ());
-            RuntimeMetrics::add_duration(&running.metrics.staging_wait_ns, wait_started);
+            RuntimeMetrics::add_duration(&running.metrics.write_buffer_wait_ns, wait_started);
             result
         }
-        BackpressurePolicy::Timeout(_) => {
+        WriteBackpressure::Timeout(_) => {
             let progressed = control.wait_for_progress_until(observed, deadline)?;
-            RuntimeMetrics::add_duration(&running.metrics.staging_wait_ns, wait_started);
+            RuntimeMetrics::add_duration(&running.metrics.write_buffer_wait_ns, wait_started);
             if progressed {
                 Ok(())
             } else {
-                let reason = OverloadReason::WriteTimeout;
-                if running.stats_enabled {
-                    RuntimeMetrics::increment(&running.metrics.staging_rejections);
-                    running.metrics.record_overload(reason);
+                let reason = WriteOverloadReason::Timeout;
+                if running.statistics {
+                    RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
+                    running.metrics.record_write_rejection();
                 }
                 Err(overload_runtime_error(reason))
             }
@@ -1634,17 +1620,17 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         .iter()
         .map(|engine| engine.in_flight())
         .sum::<usize>();
-    let in_flight_mutations = owner
+    let writes_in_flight = owner
         .shared
         .engines
         .iter()
-        .map(|engine| engine.in_flight_mutations())
+        .map(|engine| engine.writes_in_flight())
         .sum::<usize>();
     let unfenced_before = owner
         .shared
         .engines
         .iter()
-        .any(|engine| engine.has_unfenced_mutations());
+        .any(|engine| engine.has_unfenced_writes());
     // A request that missed its cancellation grace may still own a kernel
     // target and buffer. Joining that engine can wait forever. Retain only the
     // engine Arc; the runtime/core can still be released normally.
@@ -1667,14 +1653,14 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
             .shared
             .engines
             .iter()
-            .any(|engine| engine.has_unfenced_mutations());
+            .any(|engine| engine.has_unfenced_writes());
     let result = drain
         .and_then(|()| join_error.map_or(Ok(()), Err))
         .and(shutdown);
     if skip_shutdown || unfenced {
         // A merely pending target gets a detached reaper: close returns now,
         // while eventual target completion still shuts the engine down and
-        // reclaims its fd/thread/buffer set. A sticky fatal unfenced mutation
+        // reclaims its fd/thread/buffer set. A sticky fatal unfenced write
         // has no trustworthy future fence and remains process-lifetime state.
         if unfenced {
             for engine in &owner.shared.engines {
@@ -1689,7 +1675,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
                 }
             }
         }
-        let retain_lock = in_flight_mutations != 0 || unfenced;
+        let retain_lock = writes_in_flight != 0 || unfenced;
         return result.map(|()| retain_lock).or_else(|error| {
             let _ = error;
             Ok(retain_lock)
@@ -1722,13 +1708,8 @@ fn resource_build_io_error(error: ResourceBuildError) -> io::Error {
     io::Error::new(kind, error.to_string())
 }
 
-fn overload_runtime_error(error: crate::resources::OverloadReason) -> io::Error {
-    let kind = if error == OverloadReason::ReadBufferTimeout {
-        io::ErrorKind::TimedOut
-    } else {
-        io::ErrorKind::WouldBlock
-    };
-    io::Error::new(kind, error.to_string())
+fn overload_runtime_error(error: WriteOverloadReason) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
 }
 
 fn staging_runtime_error(error: StagingError) -> io::Error {
@@ -1755,6 +1736,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maximum_read_buffer_is_derived_from_runtime_limits() {
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
+            region_size: 512 * 1024,
+            region_count: 10,
+        };
+        let record_len = planned_record_bytes(1, _MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
+        assert_eq!(record_len as usize, MAX_RUNTIME_RECORD_BYTES);
+
+        let mut observed_max = 0;
+        for offset in (0.._READ_ALIGNMENT).step_by(RECORD_ALIGNMENT) {
+            let padded_end = const_align_up(offset + record_len as usize, _READ_ALIGNMENT);
+            for candidate_len in [record_len, (padded_end - offset) as u32] {
+                let entry = crate::index::IndexEntry {
+                    location: crate::index::PackedLocation::new(
+                        0,
+                        offset as u32,
+                        candidate_len,
+                        false,
+                    )
+                    .unwrap(),
+                    seqno: 1,
+                    namespace_id: 1,
+                    flags: 0,
+                };
+                let plan = plan_read(geometry, entry).unwrap();
+                observed_max = observed_max.max(plan.aligned_len);
+                assert!(plan.aligned_len <= MAX_READ_BUFFER_BYTES);
+            }
+        }
+        assert_eq!(observed_max, MAX_READ_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn read_resource_misses_remain_separately_observable() {
+        let metrics = RuntimeMetrics::new(1).unwrap();
+        let activity = metrics.activity(0);
+        RuntimeMetrics::add(&activity.l2_misses, 2);
+        RuntimeMetrics::increment(&activity.l2_read_memory_misses);
+        RuntimeMetrics::increment(&activity.l2_read_busy_misses);
+        let snapshot = metrics.snapshot(
+            true,
+            true,
+            ManagedMemorySnapshot {
+                limit_bytes: 1024,
+                current_bytes: 512,
+                peak_bytes: 768,
+            },
+            MemoryMetricsSnapshot::default(),
+        );
+
+        assert_eq!(snapshot.l2_misses, 2);
+        assert_eq!(snapshot.l2_read_memory_misses, 1);
+        assert_eq!(snapshot.l2_read_busy_misses, 1);
+    }
+
+    #[test]
     fn preopen_memory_plan_charges_region_layout() {
         let geometry = DataGeometry {
             data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
@@ -1764,7 +1802,7 @@ mod tests {
         let mut config = RegionRuntimeConfig::default();
         let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count).unwrap();
         let (_, without_layout) = config.memory_plan_bytes(geometry, 4, fixed).unwrap();
-        config.memory_budget_bytes = without_layout;
+        config.memory_limit_bytes = without_layout;
 
         config.validate_memory_plan(geometry, 4096, 4, 0).unwrap();
         let error = config

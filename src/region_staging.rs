@@ -14,8 +14,8 @@ use crate::recovery::{DATA_REGION_AREA_OFFSET, RECORD_ALIGNMENT, RECOVERY_PAGE_S
 use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
 use crate::resources::{
-    BUFFER_ALIGNMENT, BufferLease, DedicatedBufferPool, ResourceBuildError, ResourceController,
-    RuntimeMemoryReservation,
+    BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController,
+    RuntimeMemoryReservation, WriteBufferPool,
 };
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
@@ -160,7 +160,7 @@ struct ShardState {
 struct ShardStaging {
     state: Mutex<ShardState>,
     pending_fences: PendingFenceTable,
-    buffers: DedicatedBufferPool,
+    buffers: WriteBufferPool,
 }
 
 #[derive(Default)]
@@ -320,9 +320,9 @@ impl RegionStaging {
 
         let reserved = Self::reservation_bytes(shard_count, chunk_bytes)
             .ok_or(ResourceBuildError::Allocation)?;
-        // DedicatedBufferPool has its own allocator. Keep this one aggregate
+        // WriteBufferPool has its own allocator. Keep this one aggregate
         // reservation alive so those eager allocations and both fixed record
-        // vectors participate in the cache-wide hard memory budget.
+        // vectors participate in the cache-wide hard memory limit.
         let memory = resources.reserve_runtime_memory(reserved)?;
 
         let mut shards = Vec::new();
@@ -330,7 +330,7 @@ impl RegionStaging {
             .try_reserve_exact(shard_count)
             .map_err(|_| ResourceBuildError::Allocation)?;
         for _ in 0..shard_count {
-            let buffers = DedicatedBufferPool::try_new(2, chunk_bytes)?;
+            let buffers = WriteBufferPool::try_new(2, chunk_bytes)?;
             let fill_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
             let spare_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
             let fill_records = try_staged_records()?;
@@ -770,7 +770,7 @@ impl RegionStaging {
             state.failed = true;
             StagingError::Invariant("staging fill lost its buffer")
         })?;
-        let buffer = match IoBuffer::from_lease(fill_buffer, length) {
+        let buffer = match IoBuffer::for_write(fill_buffer, length) {
             Ok(buffer) => buffer,
             Err(error) => {
                 state.fill.buffer = Some(error.lease);
@@ -1002,16 +1002,14 @@ mod tests {
     use super::*;
     use crate::format::RecordCodec;
     use crate::index::PackedLocation;
-    use crate::resources::{BackpressurePolicy, ResourceLimits};
+    use crate::resources::{ResourceLimits, WriteBackpressure};
 
-    fn resources(memory_budget_bytes: usize) -> ResourceController {
+    fn resources(memory_limit_bytes: usize) -> ResourceController {
         ResourceController::try_new(ResourceLimits {
-            memory_budget_bytes,
-            base_memory_bytes: 0,
-            max_buffer_bytes: BUFFER_ALIGNMENT,
-            write_queue_depth: 1,
-            read_buffer_slots: 1,
-            backpressure: BackpressurePolicy::Reject,
+            memory_limit_bytes,
+            reserved_memory_bytes: 0,
+            waiting_write_limit: 1,
+            write_backpressure: WriteBackpressure::Reject,
         })
         .unwrap()
     }
@@ -1092,7 +1090,7 @@ mod tests {
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
             resources.managed_memory_snapshot().current_bytes,
-            (3 * 4096
+            (2 * 4096
                 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()
                 + PENDING_FENCE_SLOTS_PER_SHARD * std::mem::size_of::<PendingFenceSlot>())
         );

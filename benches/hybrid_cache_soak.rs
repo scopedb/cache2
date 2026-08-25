@@ -74,7 +74,7 @@ impl SoakConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size(32 * MIB as u64)
             .with_expected_entries(self.key_count)
-            .with_shards(self.shards)
+            .with_write_shards(self.shards)
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
@@ -82,13 +82,12 @@ impl SoakConfig {
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
-            .with_io_queue_depth(self.io_workers.saturating_mul(64))
-            .with_write_queue_depth(256)
-            .with_read_buffer_slots(32)
-            .with_memory_capacity(self.memory_bytes)
-            .with_memory_budget(self.memory_bytes.saturating_add(256 * MIB))
+            .with_io_concurrency(self.io_workers.saturating_mul(64))
+            .with_waiting_write_limit(256)
+            .with_l1_capacity(self.memory_bytes)
+            .with_memory_limit(self.memory_bytes.saturating_add(256 * MIB))
             .with_eviction_policy(self.eviction_policy)
-            .with_stats(true)
+            .with_statistics(true)
     }
 }
 
@@ -241,8 +240,8 @@ fn main() -> io::Result<()> {
                 return Err(io::Error::other("soak exceeded the logical disk bound"));
             }
             let resources = cache.snapshot()?;
-            if resources.managed_memory_bytes > resources.managed_memory_budget_bytes
-                || resources.managed_memory_peak_bytes > resources.managed_memory_budget_bytes
+            if resources.managed_memory_bytes > resources.managed_memory_limit_bytes
+                || resources.managed_memory_peak_bytes > resources.managed_memory_limit_bytes
             {
                 return Err(io::Error::other("soak exceeded the managed memory bound"));
             }
@@ -251,7 +250,7 @@ fn main() -> io::Result<()> {
             }
             max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
             println!(
-                "elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} queue_saturation={} buffer_saturation={} rotations={} managed={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+                "elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} managed={} managed_peak={} managed_limit={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
                 started.elapsed().as_secs_f64(),
                 writes,
                 write_rejections,
@@ -261,16 +260,15 @@ fn main() -> io::Result<()> {
                 resources.l1_hits,
                 resources.l2_hits,
                 resources.l2_misses,
-                resources.promotions,
+                resources.l1_promotions,
                 resources.l1_evictions,
                 resources.l1_bypasses,
                 resources.l1_admission_rejections,
-                resources.queue_saturation,
-                resources.buffer_saturation,
+                resources.write_rejections,
                 resources.region_rotations,
                 resources.managed_memory_bytes,
                 max_managed_memory,
-                resources.managed_memory_budget_bytes,
+                resources.managed_memory_limit_bytes,
                 logical_bytes,
                 peak_rss_bytes(),
                 max_put.as_micros(),
@@ -286,8 +284,8 @@ fn main() -> io::Result<()> {
         return Err(io::Error::other("soak exceeded the logical disk bound"));
     }
     let resources = cache.snapshot()?;
-    if resources.managed_memory_bytes > resources.managed_memory_budget_bytes
-        || resources.managed_memory_peak_bytes > resources.managed_memory_budget_bytes
+    if resources.managed_memory_bytes > resources.managed_memory_limit_bytes
+        || resources.managed_memory_peak_bytes > resources.managed_memory_limit_bytes
     {
         return Err(io::Error::other("soak exceeded the managed memory bound"));
     }
@@ -297,7 +295,7 @@ fn main() -> io::Result<()> {
     max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
     cache.close_fast()?;
     println!(
-        "complete elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} queue_saturation={} buffer_saturation={} rotations={} managed_peak={} managed_budget={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+        "complete elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} managed_peak={} managed_limit={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
         started.elapsed().as_secs_f64(),
         writes,
         write_rejections,
@@ -307,15 +305,14 @@ fn main() -> io::Result<()> {
         resources.l1_hits,
         resources.l2_hits,
         resources.l2_misses,
-        resources.promotions,
+        resources.l1_promotions,
         resources.l1_evictions,
         resources.l1_bypasses,
         resources.l1_admission_rejections,
-        resources.queue_saturation,
-        resources.buffer_saturation,
+        resources.write_rejections,
         resources.region_rotations,
         max_managed_memory,
-        resources.managed_memory_budget_bytes,
+        resources.managed_memory_limit_bytes,
         logical_bytes,
         peak_rss_bytes(),
         max_put.as_micros(),

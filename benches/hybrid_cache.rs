@@ -24,14 +24,14 @@ struct BenchConfig {
     read_ops: usize,
     capacity_bytes: u64,
     memory_bytes: usize,
-    memory_budget_bytes: usize,
+    memory_limit_bytes: usize,
     shards: u32,
     io_workers: usize,
     clients: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
     eviction_policy: EvictionPolicy,
-    stats_enabled: bool,
+    statistics_enabled: bool,
     directory: PathBuf,
 }
 
@@ -64,7 +64,7 @@ impl BenchConfig {
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
         let eviction_policy = parse_eviction_policy("CACHE_BENCH_EVICTION")?;
-        let stats_enabled = env_bool("CACHE_BENCH_STATS", false)?;
+        let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
         let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
@@ -94,16 +94,15 @@ impl BenchConfig {
         let estimated_index_bytes = entries
             .checked_mul(160)
             .ok_or_else(|| invalid("benchmark index estimate is too large"))?;
-        let default_memory_budget_mib = memory_bytes
+        let default_memory_limit_mib = memory_bytes
             .checked_add(estimated_index_bytes)
             .and_then(|bytes| bytes.checked_add(512 * MIB))
-            .ok_or_else(|| invalid("benchmark memory budget is too large"))?
+            .ok_or_else(|| invalid("benchmark memory limit is too large"))?
             .div_ceil(MIB);
-        let memory_budget_mib =
-            env_usize("CACHE_BENCH_MEMORY_BUDGET_MIB", default_memory_budget_mib)?;
-        let memory_budget_bytes = memory_budget_mib
+        let memory_limit_mib = env_usize("CACHE_BENCH_MEMORY_LIMIT_MIB", default_memory_limit_mib)?;
+        let memory_limit_bytes = memory_limit_mib
             .checked_mul(MIB)
-            .ok_or_else(|| invalid("benchmark memory budget is too large"))?;
+            .ok_or_else(|| invalid("benchmark memory limit is too large"))?;
         let maximum_resident_entries = memory_bytes
             .saturating_mul(3)
             .saturating_div(4)
@@ -137,14 +136,14 @@ impl BenchConfig {
             read_ops,
             capacity_bytes,
             memory_bytes,
-            memory_budget_bytes,
+            memory_limit_bytes,
             shards,
             io_workers,
             clients,
             io_engine,
             io_mode,
             eviction_policy,
-            stats_enabled,
+            statistics_enabled,
             directory,
         })
     }
@@ -155,23 +154,22 @@ impl BenchConfig {
             // Keep the benchmark's complete L2 working set comfortably below
             // every page-aligned index partition's bounded-probe capacity.
             .with_expected_entries(self.entries.saturating_mul(4))
-            .with_shards(self.shards)
+            .with_write_shards(self.shards)
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
-        let queue_depth = self.io_workers.saturating_mul(64).max(self.io_workers);
+        let io_concurrency = self.io_workers.saturating_mul(64).max(self.io_workers);
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
-            .with_io_queue_depth(queue_depth)
-            .with_write_queue_depth(256)
-            .with_read_buffer_slots(self.clients.saturating_mul(2).max(16))
-            .with_memory_capacity(self.memory_bytes)
-            .with_memory_budget(self.memory_budget_bytes)
+            .with_io_concurrency(io_concurrency)
+            .with_waiting_write_limit(256)
+            .with_l1_capacity(self.memory_bytes)
+            .with_memory_limit(self.memory_limit_bytes)
             .with_eviction_policy(self.eviction_policy)
-            .with_partial_flush_age(Duration::from_millis(1))
-            .with_stats(self.stats_enabled)
+            .with_write_flush_delay(Duration::from_millis(1))
+            .with_statistics(self.statistics_enabled)
     }
 }
 
@@ -226,20 +224,20 @@ fn main() -> io::Result<()> {
 
     println!("cache-rs HybridCache benchmark");
     println!(
-        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_budget={:.1} MiB shards={} workers={} clients={} engine={:?} mode={:?} eviction={:?} stats={}",
+        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} workers={} clients={} engine={:?} mode={:?} eviction={:?} statistics={}",
         config.entries,
         config.resident_entries,
         config.value_bytes,
         (config.entries as f64 * config.value_bytes as f64) / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
-        config.memory_budget_bytes as f64 / MIB as f64,
+        config.memory_limit_bytes as f64 / MIB as f64,
         config.shards,
         config.io_workers,
         config.clients,
         config.io_engine,
         config.io_mode,
         config.eviction_policy,
-        config.stats_enabled,
+        config.statistics_enabled,
     );
     println!("file={}", files.data.display());
 
@@ -276,7 +274,7 @@ fn main() -> io::Result<()> {
         config.resident_entries,
         config.read_ops,
         config.clients,
-        CacheTier::Memory,
+        CacheTier::L1,
     )?;
     report("resident_l1", "resident L1 get", &l1);
 
@@ -297,7 +295,7 @@ fn main() -> io::Result<()> {
         config.entries,
         config.entries,
         config.clients,
-        CacheTier::Region,
+        CacheTier::L2,
     )?;
     report("l2_promote", "L2 get + promote", &promotion);
 
@@ -315,17 +313,17 @@ fn main() -> io::Result<()> {
         config.resident_entries,
         config.read_ops,
         config.clients,
-        CacheTier::Memory,
+        CacheTier::L1,
     )?;
     report("promoted_l1", "promoted L1 get", &promoted_l1);
-    if config.stats_enabled {
+    if config.statistics_enabled {
         let snapshot = cache.snapshot()?;
         println!(
             "result phase=l1_policy evictions={} bypasses={} admission_rejections={} promotions={} l1_hits={} l1_misses={}",
             snapshot.l1_evictions,
             snapshot.l1_bypasses,
             snapshot.l1_admission_rejections,
-            snapshot.promotions,
+            snapshot.l1_promotions,
             snapshot.l1_hits,
             snapshot.l1_misses,
         );

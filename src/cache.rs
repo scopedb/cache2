@@ -29,16 +29,16 @@ use crate::region_metadata::{
     REGION_METADATA_REGIONS_PER_PAGE,
 };
 use crate::region_runtime::{
-    DEFAULT_MEMORY_SHARDS, HybridValueRead, RegionPut, RegionRuntimeConfig, RuntimeHealth,
+    DEFAULT_L1_SHARDS, HybridValueRead, RegionPut, RegionRuntimeConfig, RuntimeHealth,
     RuntimeSnapshot,
 };
 use crate::region_store::{RegionConfig, RegionStartup, RegionStore};
-use crate::resources::{BackpressurePolicy, ReadBufferPolicy};
+use crate::resources::WriteBackpressure;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const DEFAULT_SHARDS: u32 = 4;
-const DEFAULT_MEMORY_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const MIN_INDEX_SLOTS: usize = 8;
 const MAX_SHARDS: u32 = 256;
 
@@ -49,7 +49,7 @@ pub struct StaticConfig {
     capacity_bytes: u64,
     region_size: u64,
     index_slots: usize,
-    shards: u32,
+    write_shards: u32,
     hash_seed: u64,
     region_sets: Vec<RegionSetConfig>,
 }
@@ -67,7 +67,7 @@ impl StaticConfig {
             capacity_bytes,
             region_size: DEFAULT_REGION_SIZE,
             index_slots,
-            shards: DEFAULT_SHARDS,
+            write_shards: DEFAULT_SHARDS,
             hash_seed: DEFAULT_HASH_SEED,
             region_sets: Vec::new(),
         }
@@ -92,8 +92,9 @@ impl StaticConfig {
         self
     }
 
-    pub fn with_shards(mut self, shards: u32) -> Self {
-        self.shards = shards;
+    /// Sets the number of independent append paths in the on-disk layout.
+    pub fn with_write_shards(mut self, shards: u32) -> Self {
+        self.write_shards = shards;
         self
     }
 
@@ -127,8 +128,8 @@ impl StaticConfig {
         self.index_slots
     }
 
-    pub const fn shards(&self) -> u32 {
-        self.shards
+    pub const fn write_shards(&self) -> u32 {
+        self.write_shards
     }
 
     pub fn region_sets(&self) -> &[RegionSetConfig] {
@@ -199,9 +200,12 @@ impl StaticConfig {
             .ok()
             .filter(|count| *count <= MAX_PACKED_REGION_COUNT)
             .ok_or_else(|| invalid_config("cache Region count is not representable"))?;
-        if self.shards == 0 || self.shards > MAX_SHARDS || region_count <= self.shards {
+        if self.write_shards == 0
+            || self.write_shards > MAX_SHARDS
+            || region_count <= self.write_shards
+        {
             return Err(invalid_config(
-                "data shards must be in 1..=256 with one additional Region for rotation",
+                "write shards must be in 1..=256 with one additional Region for rotation",
             ));
         }
         if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
@@ -222,7 +226,7 @@ impl StaticConfig {
     }
 
     fn region_layout(&self, geometry: DataGeometry) -> Result<RegionLayout> {
-        RegionLayout::build(geometry.region_count, self.shards, &self.region_sets)
+        RegionLayout::build(geometry.region_count, self.write_shards, &self.region_sets)
     }
 
     fn fingerprint(&self, geometry: DataGeometry, layout: &RegionLayout) -> u64 {
@@ -245,7 +249,7 @@ impl StaticConfig {
             geometry.region_size,
             u64::from(geometry.region_count),
             self.index_slots as u64,
-            u64::from(self.shards),
+            u64::from(self.write_shards),
             self.hash_seed,
             hash_algorithm_id,
         ] {
@@ -309,19 +313,17 @@ pub struct RuntimeConfig {
     io_engine: IoEngine,
     io_mode: IoMode,
     io_workers: usize,
-    io_queue_depth: usize,
-    write_queue_depth: usize,
-    read_buffer_slots: usize,
-    read_buffer_policy: ReadBufferPolicy,
-    memory_capacity_bytes: usize,
-    memory_budget_bytes: usize,
-    memory_shards: usize,
+    io_concurrency: usize,
+    waiting_write_limit: usize,
+    l1_capacity_bytes: usize,
+    memory_limit_bytes: usize,
+    l1_shards: usize,
     eviction_policy: EvictionPolicy,
-    staging_bytes: usize,
-    batch_target_bytes: usize,
-    partial_flush_age: Duration,
-    backpressure: BackpressurePolicy,
-    stats_enabled: bool,
+    write_buffer_bytes: usize,
+    write_batch_bytes: usize,
+    write_flush_delay: Duration,
+    write_backpressure: WriteBackpressure,
+    statistics: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -330,19 +332,17 @@ impl Default for RuntimeConfig {
             io_engine: IoEngine::Auto,
             io_mode: IoMode::Auto,
             io_workers: 4,
-            io_queue_depth: 128,
-            write_queue_depth: 128,
-            read_buffer_slots: 128,
-            read_buffer_policy: ReadBufferPolicy::Reject,
-            memory_capacity_bytes: DEFAULT_MEMORY_CAPACITY_BYTES,
-            memory_budget_bytes: 1024 * 1024 * 1024,
-            memory_shards: DEFAULT_MEMORY_SHARDS,
+            io_concurrency: 128,
+            waiting_write_limit: 128,
+            l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
+            memory_limit_bytes: 1024 * 1024 * 1024,
+            l1_shards: DEFAULT_L1_SHARDS,
             eviction_policy: EvictionPolicy::Clock,
-            staging_bytes: _WRITE_BATCH_BYTES,
-            batch_target_bytes: _WRITE_BATCH_BYTES,
-            partial_flush_age: Duration::from_millis(1),
-            backpressure: BackpressurePolicy::Reject,
-            stats_enabled: false,
+            write_buffer_bytes: _WRITE_BATCH_BYTES,
+            write_batch_bytes: _WRITE_BATCH_BYTES,
+            write_flush_delay: Duration::from_millis(1),
+            write_backpressure: WriteBackpressure::Reject,
+            statistics: false,
         }
     }
 }
@@ -363,57 +363,31 @@ impl RuntimeConfig {
         self
     }
 
-    pub fn with_io_queue_depth(mut self, depth: usize) -> Self {
-        self.io_queue_depth = depth;
+    /// Sets the maximum number of device requests in flight across all workers.
+    pub fn with_io_concurrency(mut self, requests: usize) -> Self {
+        self.io_concurrency = requests;
         self
     }
 
-    /// Sets waiting-policy write admission depth.
+    /// Limits concurrent write attempts when `Block` or `Timeout` is selected.
     ///
-    /// The default reject policy uses shard staging as its admission boundary.
-    pub fn with_write_queue_depth(mut self, write: usize) -> Self {
-        self.write_queue_depth = write;
+    /// The default reject policy uses each shard's write buffer as its boundary.
+    pub fn with_waiting_write_limit(mut self, writes: usize) -> Self {
+        self.waiting_write_limit = writes;
         self
     }
 
-    /// Compatibility alias for the pre-M4 split submission gates.
+    pub fn with_l1_capacity(mut self, bytes: usize) -> Self {
+        self.l1_capacity_bytes = bytes;
+        self
+    }
+
+    /// Sets the aggregate cache-owned memory limit.
     ///
-    /// Foreground reads no longer have a request queue; `read` is ignored and
-    /// read concurrency is bounded solely by [`Self::with_read_buffer_slots`].
-    #[deprecated(note = "use with_write_queue_depth; reads are bounded by read-buffer slots")]
-    pub fn with_submission_queue_depths(self, _read: usize, write: usize) -> Self {
-        self.with_write_queue_depth(write)
-    }
-
-    /// Sets the hard foreground L2 read-buffer budget.
-    ///
-    /// L2 acquires a fully prepared slot only after its index finds a
-    /// candidate. Exhaustion returns `WouldBlock` immediately. A successful
-    /// L1 promotion releases the transient slot before `get` returns; when L1
-    /// promotion bypasses, the returned zero-copy Region value retains its
-    /// slot until the caller drops it.
-    pub fn with_read_buffer_slots(mut self, slots: usize) -> Self {
-        self.read_buffer_slots = slots;
-        self
-    }
-
-    /// Selects behavior when every foreground L2 read buffer is leased.
-    ///
-    /// The default is [`ReadBufferPolicy::Reject`]. Waiting is bounded and
-    /// applies only after L2 finds a candidate; it never waits for an I/O
-    /// submission slot.
-    pub fn with_read_buffer_policy(mut self, policy: ReadBufferPolicy) -> Self {
-        self.read_buffer_policy = policy;
-        self
-    }
-
-    pub fn with_memory_capacity(mut self, bytes: usize) -> Self {
-        self.memory_capacity_bytes = bytes;
-        self
-    }
-
-    pub fn with_memory_budget(mut self, bytes: usize) -> Self {
-        self.memory_budget_bytes = bytes;
+    /// This covers L1, fixed runtime structures, write buffers, and transient
+    /// exact-size L2 read buffers.
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes;
         self
     }
 
@@ -421,8 +395,8 @@ impl RuntimeConfig {
     ///
     /// This is independent of static append shards and may change on every
     /// open without invalidating a clean recovery image.
-    pub fn with_memory_shards(mut self, shards: usize) -> Self {
-        self.memory_shards = shards;
+    pub fn with_l1_shards(mut self, shards: usize) -> Self {
+        self.l1_shards = shards;
         self
     }
 
@@ -431,61 +405,90 @@ impl RuntimeConfig {
         self
     }
 
-    pub fn with_staging(mut self, bytes: usize, batch_target_bytes: usize) -> Self {
-        self.staging_bytes = bytes;
-        self.batch_target_bytes = batch_target_bytes;
+    /// Sets each append shard's fixed write-buffer size.
+    pub fn with_write_buffer_size(mut self, bytes: usize) -> Self {
+        self.write_buffer_bytes = bytes;
         self
     }
 
-    pub fn with_partial_flush_age(mut self, age: Duration) -> Self {
-        self.partial_flush_age = age;
+    /// Sets the target bytes per submitted write batch.
+    pub fn with_write_batch_size(mut self, bytes: usize) -> Self {
+        self.write_batch_bytes = bytes;
         self
     }
 
-    /// Selects write-side overload behavior. L2 reads reject only when their
-    /// fixed read-buffer pool is exhausted.
-    pub fn with_backpressure(mut self, policy: BackpressurePolicy) -> Self {
-        self.backpressure = policy;
+    /// Sets how long a partial write batch may remain open.
+    pub fn with_write_flush_delay(mut self, delay: Duration) -> Self {
+        self.write_flush_delay = delay;
         self
     }
 
-    pub fn with_stats(mut self, enabled: bool) -> Self {
-        self.stats_enabled = enabled;
+    /// Selects write-side overload behavior.
+    pub fn with_write_backpressure(mut self, policy: WriteBackpressure) -> Self {
+        self.write_backpressure = policy;
         self
+    }
+
+    /// Enables or disables optional request-path counters.
+    pub fn with_statistics(mut self, enabled: bool) -> Self {
+        self.statistics = enabled;
+        self
+    }
+
+    pub const fn io_engine(&self) -> IoEngine {
+        self.io_engine
+    }
+
+    pub const fn io_mode(&self) -> IoMode {
+        self.io_mode
     }
 
     pub const fn io_workers(&self) -> usize {
         self.io_workers
     }
 
-    /// Returns the configured foreground L2 read-buffer budget.
-    pub const fn read_buffer_slots(&self) -> usize {
-        self.read_buffer_slots
+    pub const fn io_concurrency(&self) -> usize {
+        self.io_concurrency
     }
 
-    /// Returns the configured foreground L2 read-buffer saturation policy.
-    pub const fn read_buffer_policy(&self) -> ReadBufferPolicy {
-        self.read_buffer_policy
+    pub const fn waiting_write_limit(&self) -> usize {
+        self.waiting_write_limit
     }
 
-    pub const fn memory_capacity_bytes(&self) -> usize {
-        self.memory_capacity_bytes
+    pub const fn l1_capacity_bytes(&self) -> usize {
+        self.l1_capacity_bytes
     }
 
-    pub const fn memory_budget_bytes(&self) -> usize {
-        self.memory_budget_bytes
+    pub const fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit_bytes
     }
 
-    pub const fn memory_shards(&self) -> usize {
-        self.memory_shards
+    pub const fn l1_shards(&self) -> usize {
+        self.l1_shards
     }
 
     pub const fn eviction_policy(&self) -> EvictionPolicy {
         self.eviction_policy
     }
 
-    pub const fn stats_enabled(&self) -> bool {
-        self.stats_enabled
+    pub const fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_bytes
+    }
+
+    pub const fn write_batch_bytes(&self) -> usize {
+        self.write_batch_bytes
+    }
+
+    pub const fn write_flush_delay(&self) -> Duration {
+        self.write_flush_delay
+    }
+
+    pub const fn write_backpressure(&self) -> WriteBackpressure {
+        self.write_backpressure
+    }
+
+    pub const fn statistics_enabled(&self) -> bool {
+        self.statistics
     }
 
     fn into_region(self) -> RegionRuntimeConfig {
@@ -501,19 +504,17 @@ impl RuntimeConfig {
                 IoMode::Direct => DirectIoMode::Required,
             },
             io_workers: self.io_workers,
-            io_queue_depth: self.io_queue_depth,
-            write_queue_depth: self.write_queue_depth,
-            read_buffer_slots: self.read_buffer_slots,
-            read_buffer_policy: self.read_buffer_policy,
-            memory_capacity_bytes: self.memory_capacity_bytes,
-            memory_budget_bytes: self.memory_budget_bytes,
-            memory_shards: self.memory_shards,
+            io_concurrency: self.io_concurrency,
+            waiting_write_limit: self.waiting_write_limit,
+            l1_capacity_bytes: self.l1_capacity_bytes,
+            memory_limit_bytes: self.memory_limit_bytes,
+            l1_shards: self.l1_shards,
             eviction_policy: self.eviction_policy,
-            staging_bytes: self.staging_bytes,
-            batch_target_bytes: self.batch_target_bytes,
-            partial_flush_age: self.partial_flush_age,
-            backpressure: self.backpressure,
-            stats_enabled: self.stats_enabled,
+            write_buffer_bytes: self.write_buffer_bytes,
+            write_batch_bytes: self.write_batch_bytes,
+            write_flush_delay: self.write_flush_delay,
+            write_backpressure: self.write_backpressure,
+            statistics: self.statistics,
         }
     }
 }
@@ -552,7 +553,7 @@ impl HybridCacheConfig {
         runtime_config.validate_memory_plan(
             geometry,
             self.static_config.index_slots,
-            self.static_config.shards as usize,
+            self.static_config.write_shards as usize,
             region_layout.memory_bytes(),
         )?;
         let format_data = DataSuperblock {
@@ -603,8 +604,8 @@ pub struct PutReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheTier {
-    Memory,
-    Region,
+    L1,
+    L2,
 }
 
 #[non_exhaustive]
@@ -618,7 +619,7 @@ pub enum CacheHealth {
 
 /// Lock-free point-in-time operational counters and cache-owned resource
 /// accounting. Counters are process-local, reset on every open, and remain
-/// zero unless enabled with [`RuntimeConfig::with_stats`]. Health and resource
+/// zero unless enabled with [`RuntimeConfig::with_statistics`]. Health and resource
 /// fields are always populated.
 ///
 /// Managed memory includes fixed-capacity reservations such as L1 and thread
@@ -628,47 +629,46 @@ pub enum CacheHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {
     pub health: CacheHealth,
-    pub stats_enabled: bool,
+    pub statistics_enabled: bool,
     pub puts: u64,
     pub written_bytes: u64,
     pub l1_hits: u64,
     pub l1_misses: u64,
     pub l2_hits: u64,
     pub l2_misses: u64,
+    /// L2 candidates bypassed because their exact transient allocation could
+    /// not be charged or allocated. This is a subset of `l2_misses`.
+    pub l2_read_memory_misses: u64,
+    /// L2 candidates bypassed because the I/O engine had no immediately
+    /// available slot. This is a subset of `l2_misses`.
+    pub l2_read_busy_misses: u64,
     /// Bytes returned by L1 and L2 hits combined.
     pub served_bytes: u64,
-    pub promotions: u64,
+    pub l1_promotions: u64,
     pub l1_evictions: u64,
     pub l1_bypasses: u64,
     pub l1_admission_rejections: u64,
-    pub queue_saturation: u64,
-    pub buffer_saturation: u64,
+    /// Writes rejected because a bounded write-side resource was busy.
+    pub write_rejections: u64,
     pub io_failures: u64,
     pub region_rotations: u64,
     pub managed_memory_bytes: usize,
     pub managed_memory_peak_bytes: usize,
-    pub managed_memory_budget_bytes: usize,
+    pub managed_memory_limit_bytes: usize,
     pub logical_disk_peak_bytes: u64,
 }
 
-/// Admission and buffer-pool state sampled by [`HybridCache::detailed_snapshot`].
+/// Write-side pressure sampled by [`HybridCache::detailed_snapshot`].
 /// Wait and rejection counters are cumulative for the current open.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheQueueSnapshot {
+pub struct CacheWriteSnapshot {
     pub write_requests_in_flight: u64,
     pub write_requests_peak: u64,
-    pub write_rejections: u64,
-    pub write_wait_ns: u64,
-    pub write_staging_rejections: u64,
-    pub write_staging_wait_ns: u64,
-    pub read_buffers_in_use: u64,
-    pub read_buffers_peak: u64,
-    pub read_buffer_rejections: u64,
-    pub read_buffer_timeouts: u64,
-    pub read_buffer_waiters: u64,
-    pub read_buffer_waiters_peak: u64,
-    pub read_buffer_wait_ns: u64,
+    pub write_gate_rejections: u64,
+    pub write_gate_wait_ns: u64,
+    pub write_buffer_rejections: u64,
+    pub write_buffer_wait_ns: u64,
 }
 
 /// Aggregate worker I/O state sampled by [`HybridCache::detailed_snapshot`].
@@ -681,8 +681,8 @@ pub struct CacheIoSnapshot {
     pub cancel_requested: u64,
     pub cancelled: u64,
     pub errors: u64,
-    pub in_flight: u64,
-    pub submit_wait_ns: u64,
+    pub requests_in_flight: u64,
+    pub slot_wait_ns: u64,
     pub completion_ns: u64,
     pub direct_operations: u64,
     pub direct_bytes: u64,
@@ -715,7 +715,7 @@ pub struct RegionSetSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {
     pub summary: CacheSnapshot,
-    pub queues: CacheQueueSnapshot,
+    pub writes: CacheWriteSnapshot,
     pub io: CacheIoSnapshot,
     pub region_sets: Box<[RegionSetSnapshot]>,
 }
@@ -741,13 +741,12 @@ impl AsRef<[u8]> for Value {
 impl Value {
     /// Returns the tier that served this lookup.
     ///
-    /// A Region hit may already be backed by its promoted L1 value so the
-    /// transient L2 read buffer can be released before this handle is returned.
+    /// A Region hit may already be backed by its promoted L1 value.
     pub const fn tier(&self) -> CacheTier {
-        if self.inner.is_memory() {
-            CacheTier::Memory
+        if self.inner.is_l1() {
+            CacheTier::L1
         } else {
-            CacheTier::Region
+            CacheTier::L2
         }
     }
 }
@@ -812,11 +811,11 @@ impl HybridCache {
 
     /// Looks up a value in L1 and then L2.
     ///
-    /// An L2 index miss returns directly. An L2 candidate performs one bounded
-    /// record read and exact revalidation. If no read buffer is available, the
-    /// lookup follows [`RuntimeConfig::with_read_buffer_policy`]: reject
-    /// immediately or wait for one bounded duration without retaining its
-    /// Region pin.
+    /// An L2 index miss returns directly. An L2 candidate reserves one
+    /// immediately available engine slot, allocates one exact-size aligned
+    /// buffer, performs one record read, and revalidates the record identity
+    /// before returning. Internal allocation or I/O pressure fails
+    /// open as a cache miss.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
         self.get_in(0, key)
     }
@@ -894,20 +893,13 @@ impl HybridCache {
             .into_boxed_slice();
         Ok(DetailedCacheSnapshot {
             summary: self.cache_snapshot(runtime.summary),
-            queues: CacheQueueSnapshot {
+            writes: CacheWriteSnapshot {
                 write_requests_in_flight: resources.write_requests_in_flight,
                 write_requests_peak: resources.write_requests_peak,
-                write_rejections: resources.write_rejections,
-                write_wait_ns: resources.write_wait_ns,
-                write_staging_rejections: runtime.staging_rejections,
-                write_staging_wait_ns: runtime.staging_wait_ns,
-                read_buffers_in_use: resources.read_buffers_in_use,
-                read_buffers_peak: resources.read_buffers_peak,
-                read_buffer_rejections: resources.read_buffer_rejections,
-                read_buffer_timeouts: resources.read_buffer_timeouts,
-                read_buffer_waiters: resources.read_buffer_waiters,
-                read_buffer_waiters_peak: resources.read_buffer_waiters_peak,
-                read_buffer_wait_ns: resources.read_buffer_wait_ns,
+                write_gate_rejections: resources.write_gate_rejections,
+                write_gate_wait_ns: resources.write_gate_wait_ns,
+                write_buffer_rejections: runtime.write_buffer_rejections,
+                write_buffer_wait_ns: runtime.write_buffer_wait_ns,
             },
             io: CacheIoSnapshot {
                 submitted: io.submitted,
@@ -915,8 +907,8 @@ impl HybridCache {
                 cancel_requested: io.cancel_requested,
                 cancelled: io.cancelled,
                 errors: io.errors,
-                in_flight: io.in_flight,
-                submit_wait_ns: io.submit_wait_ns,
+                requests_in_flight: io.requests_in_flight,
+                slot_wait_ns: io.slot_wait_ns,
                 completion_ns: io.completion_ns,
                 direct_operations: io.direct_operations,
                 direct_bytes: io.direct_bytes,
@@ -936,25 +928,26 @@ impl HybridCache {
         };
         CacheSnapshot {
             health,
-            stats_enabled: runtime.stats_enabled,
+            statistics_enabled: runtime.statistics_enabled,
             puts: runtime.puts,
             written_bytes: runtime.written_bytes,
             l1_hits: runtime.l1_hits,
             l1_misses: runtime.l1_misses,
             l2_hits: runtime.l2_hits,
             l2_misses: runtime.l2_misses,
+            l2_read_memory_misses: runtime.l2_read_memory_misses,
+            l2_read_busy_misses: runtime.l2_read_busy_misses,
             served_bytes: runtime.served_bytes,
-            promotions: runtime.promotions,
+            l1_promotions: runtime.l1_promotions,
             l1_evictions: runtime.l1_evictions,
             l1_bypasses: runtime.l1_bypasses,
             l1_admission_rejections: runtime.l1_admission_rejections,
-            queue_saturation: runtime.queue_saturation,
-            buffer_saturation: runtime.buffer_saturation,
+            write_rejections: runtime.write_rejections,
             io_failures: runtime.io_failures,
             region_rotations: runtime.region_rotations,
             managed_memory_bytes: runtime.memory.current_bytes,
             managed_memory_peak_bytes: runtime.memory.peak_bytes,
-            managed_memory_budget_bytes: runtime.memory.budget_bytes,
+            managed_memory_limit_bytes: runtime.memory.limit_bytes,
             logical_disk_peak_bytes: self.logical_disk_peak_bytes,
         }
     }
@@ -1001,10 +994,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_shards_are_runtime_tunable() {
+    fn l1_shards_are_runtime_tunable() {
         let default = RuntimeConfig::default();
-        assert_eq!(default.memory_shards(), DEFAULT_MEMORY_SHARDS);
-        assert_eq!(default.with_memory_shards(7).memory_shards(), 7);
+        assert_eq!(default.l1_shards(), DEFAULT_L1_SHARDS);
+        assert_eq!(default.with_l1_shards(7).l1_shards(), 7);
     }
 
     #[test]
@@ -1027,7 +1020,7 @@ mod tests {
     fn minimum_static_region_geometry_is_encodable() {
         let config = StaticConfig::new(5 * 4096)
             .with_region_size(4096)
-            .with_shards(4);
+            .with_write_shards(4);
         config.validate().unwrap();
         let geometry = config.geometry().unwrap();
         let layout = config.region_layout(geometry).unwrap();
@@ -1084,7 +1077,7 @@ mod tests {
     #[test]
     fn resolved_region_set_allocations_expose_rounding_and_shards() {
         let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE)
-            .with_shards(4)
+            .with_write_shards(4)
             .with_region_sets([
                 RegionSetConfig::new(0).with_weight(1),
                 RegionSetConfig::new(2).with_weight(3),

@@ -110,6 +110,9 @@ impl RegionSpanFlight {
     }
 }
 
+// The error returns the owned aligned buffer without another fallible
+// allocation; boxing it would violate that overload-path property.
+#[allow(clippy::result_large_err)]
 pub(crate) fn submit_span(
     engine: &dyn IoEngine,
     geometry: DataGeometry,
@@ -224,7 +227,7 @@ mod tests {
     use super::*;
     use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint};
     use crate::io_engine::BackendIoEngine;
-    use crate::resources::DedicatedBufferPool;
+    use crate::resources::WriteBufferPool;
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -297,11 +300,11 @@ mod tests {
     fn span_write_preserves_owned_buffer_and_maps_region_offset_exactly() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = DedicatedBufferPool::try_new(1, 4096).unwrap();
+        let pool = WriteBufferPool::try_new(1, 4096).unwrap();
         let mut lease = pool.acquire().unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
 
-        let buffer = IoBuffer::from_lease(lease, 4096).unwrap();
+        let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let completion = submit_span(&engine, geometry(), span(), buffer, absolute)
             .unwrap()
@@ -331,10 +334,10 @@ mod tests {
     fn invalid_span_returns_the_only_buffer_without_submitting_io() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = DedicatedBufferPool::try_new(1, 4096).unwrap();
+        let pool = WriteBufferPool::try_new(1, 4096).unwrap();
         let mut invalid = span();
         invalid.end_offset += 1;
-        let buffer = IoBuffer::from_lease(pool.acquire().unwrap(), 4096).unwrap();
+        let buffer = IoBuffer::for_write(pool.acquire().unwrap(), 4096).unwrap();
         let error = match submit_span(&engine, geometry(), invalid, buffer, 0) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),

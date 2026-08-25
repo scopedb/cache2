@@ -13,7 +13,7 @@ struct ScaleConfig {
     expected_entries: usize,
     capacity_bytes: u64,
     memory_bytes: usize,
-    memory_budget_bytes: usize,
+    memory_limit_bytes: usize,
     sentinel_count: usize,
     value_bytes: usize,
     directory: PathBuf,
@@ -28,9 +28,9 @@ impl ScaleConfig {
         let memory_bytes = env_usize("CACHE_RECOVERY_MEMORY_MIB", 16)?
             .checked_mul(MIB)
             .ok_or_else(|| invalid("recovery benchmark RAM tier is too large"))?;
-        let memory_budget_bytes = env_usize("CACHE_RECOVERY_MEMORY_BUDGET_MIB", 1_024)?
+        let memory_limit_bytes = env_usize("CACHE_RECOVERY_MEMORY_LIMIT_MIB", 1_024)?
             .checked_mul(MIB)
-            .ok_or_else(|| invalid("recovery benchmark memory budget is too large"))?;
+            .ok_or_else(|| invalid("recovery benchmark memory limit is too large"))?;
         let sentinel_count = env_usize("CACHE_RECOVERY_SENTINELS", 1_024)?;
         let value_bytes = env_usize("CACHE_RECOVERY_VALUE_BYTES", 1_024)?;
         let directory = env::var_os("CACHE_RECOVERY_DIR")
@@ -45,7 +45,7 @@ impl ScaleConfig {
             expected_entries,
             capacity_bytes,
             memory_bytes,
-            memory_budget_bytes,
+            memory_limit_bytes,
             sentinel_count,
             value_bytes,
             directory,
@@ -56,7 +56,7 @@ impl ScaleConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size(32 * MIB as u64)
             .with_expected_entries(self.expected_entries)
-            .with_shards(4)
+            .with_write_shards(4)
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
@@ -64,12 +64,11 @@ impl ScaleConfig {
             .with_io_engine(IoEngine::Sync)
             .with_io_mode(IoMode::Buffered)
             .with_io_workers(1)
-            .with_io_queue_depth(32)
-            .with_write_queue_depth(16)
-            .with_read_buffer_slots(8)
-            .with_memory_capacity(self.memory_bytes)
-            .with_memory_budget(self.memory_budget_bytes)
-            .with_stats(false)
+            .with_io_concurrency(32)
+            .with_waiting_write_limit(16)
+            .with_l1_capacity(self.memory_bytes)
+            .with_memory_limit(self.memory_limit_bytes)
+            .with_statistics(false)
     }
 }
 
@@ -152,12 +151,12 @@ fn main() -> io::Result<()> {
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
     println!(
-        "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} memory_budget_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
+        "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
         config.expected_entries,
         static_config.index_slots(),
         config.capacity_bytes,
         config.memory_bytes,
-        config.memory_budget_bytes,
+        config.memory_limit_bytes,
         config.sentinel_count,
         config.value_bytes,
         peak_disk_bytes,
@@ -170,10 +169,10 @@ fn main() -> io::Result<()> {
     require_startup(cache.startup_mode(), StartupMode::Fresh)?;
     let resources = cache.snapshot()?;
     println!(
-        "resources managed_bytes={} managed_peak_bytes={} managed_budget_bytes={}",
+        "resources managed_bytes={} managed_peak_bytes={} managed_limit_bytes={}",
         resources.managed_memory_bytes,
         resources.managed_memory_peak_bytes,
-        resources.managed_memory_budget_bytes,
+        resources.managed_memory_limit_bytes,
     );
 
     let keys: Vec<[u8; 16]> = (0..config.sentinel_count).map(sentinel_key).collect();

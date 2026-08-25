@@ -14,7 +14,7 @@ The intended 1.0 surface is deliberately small:
   completion/data-sync fences, snapshots, and explicit fast or warm close;
 - `Value`, `PutReceipt`, `CacheTier`, `StartupMode`, and `CacheHealth` describe
   results;
-- `IoEngine`, `IoMode`, and `BackpressurePolicy` select runtime behavior.
+- `IoEngine`, `IoMode`, and `WriteBackpressure` select runtime behavior.
 - `RegionSetConfig`, `RegionSetId`, and `RegionSetAllocation` define and inspect
   optional physical namespace retention partitions.
 
@@ -25,9 +25,10 @@ enums or records that are likely to gain operational variants are
 `non_exhaustive`; callers must retain a fallback arm and must not construct
 returned records directly.
 
-Public operations use `std::io::Result`. Saturation is
-`std::io::ErrorKind::WouldBlock`; persistent runtime health and saturation
-counters are available through `HybridCache::snapshot()`.
+Public operations use `std::io::Result`. Write admission saturation is
+`std::io::ErrorKind::WouldBlock`; read allocation and I/O pressure fail open as
+cache misses. Persistent runtime health and write-saturation counters are
+available through `HybridCache::snapshot()`.
 
 ## Disk format
 

@@ -544,7 +544,7 @@ impl MemoryStore {
         shard_count: usize,
         completion_shard_count: usize,
         policy: EvictionPolicy,
-        stats_enabled: bool,
+        statistics_enabled: bool,
     ) -> io::Result<Self> {
         if shard_count == 0 || completion_shard_count == 0 {
             return Err(io::Error::new(
@@ -581,7 +581,7 @@ impl MemoryStore {
             shards: shards.into_boxed_slice(),
             completed_seqnos: completed_seqnos.into_boxed_slice(),
             metrics: MemoryMetrics {
-                enabled: stats_enabled,
+                enabled: statistics_enabled,
                 evictions: AtomicU64::new(0),
                 bypasses: AtomicU64::new(0),
                 admission_rejections: AtomicU64::new(0),
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_completion_cleans_entries_across_memory_shards() {
+    fn batch_completion_cleans_entries_across_l1_shards() {
         let store = MemoryStore::new(2048, 2, 1, EvictionPolicy::Clock, true).unwrap();
         for (hash, key, seqno) in [(0, b"a".as_slice(), 1), (2, b"b", 2), (1, b"c", 3)] {
             assert!(store.publish_pending(0, hash, 0, key, b"value", 0, seqno));

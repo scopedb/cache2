@@ -2,7 +2,7 @@
 //!
 //! A packed record may start on a 32-byte boundary, while direct I/O requires
 //! a 4 KiB-aligned address, offset, and length. This seam reads one aligned
-//! envelope and reports the exact record slice inside the returned buffer.
+//! range and reports the exact record slice inside the returned buffer.
 //! Region generation and record contents are validated by the layers above.
 
 use std::fmt;
@@ -11,33 +11,33 @@ use std::ops::Range;
 
 use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
 use crate::io_engine::{
-    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId,
-    submit_cache_io_nowait,
+    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, ReadSlot, RequestId,
+    submit_cache_read,
 };
 use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT};
 use crate::resources::BufferLease;
 
 pub(crate) const _READ_ALIGNMENT: usize = 4096;
-pub(crate) const _MAX_READ_ENVELOPE_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
+pub(crate) const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegionRecordReadPlan {
+pub(crate) struct ReadPlan {
     pub(crate) entry: IndexEntry,
     pub(crate) absolute: u64,
-    pub(crate) io_len: usize,
+    pub(crate) aligned_len: usize,
     pub(crate) record_range: Range<usize>,
 }
 
-pub(crate) struct RegionRecordReadSubmitError {
+pub(crate) struct ReadSubmitError {
     pub(crate) error: io::Error,
     pub(crate) entry: IndexEntry,
     pub(crate) buffer: Option<BufferLease>,
 }
 
-impl fmt::Debug for RegionRecordReadSubmitError {
+impl fmt::Debug for ReadSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RegionRecordReadSubmitError")
+            .debug_struct("ReadSubmitError")
             .field("error", &self.error)
             .field("entry", &self.entry)
             .field("buffer_returned", &self.buffer.is_some())
@@ -45,52 +45,52 @@ impl fmt::Debug for RegionRecordReadSubmitError {
     }
 }
 
-impl fmt::Display for RegionRecordReadSubmitError {
+impl fmt::Display for ReadSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.error.fmt(formatter)
     }
 }
 
-impl std::error::Error for RegionRecordReadSubmitError {
+impl std::error::Error for ReadSubmitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
-pub(crate) struct RegionRecordReadFlight {
-    plan: RegionRecordReadPlan,
+pub(crate) struct PendingRead {
+    plan: ReadPlan,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
-pub(crate) struct RegionRecordReadCompletion {
-    pub(crate) plan: RegionRecordReadPlan,
+pub(crate) struct ReadCompletion {
+    pub(crate) plan: ReadPlan,
     pub(crate) result: io::Result<()>,
     pub(crate) buffer: Option<BufferLease>,
 }
 
-impl RegionRecordReadCompletion {
+impl ReadCompletion {
     /// Returns the exact packed-record bytes only after every completion
-    /// invariant has passed. The surrounding aligned envelope stays private.
+    /// invariant has passed. The surrounding aligned bytes stay private.
     pub(crate) fn record_bytes(&self) -> Option<&[u8]> {
         if self.result.is_err() {
             return None;
         }
         self.buffer
             .as_ref()?
-            .prepared(self.plan.io_len)
+            .prepared(self.plan.aligned_len)
             .ok()?
             .get(self.plan.record_range.clone())
     }
 }
 
-impl RegionRecordReadFlight {
-    pub(crate) fn wait(self, engine: &dyn IoEngine) -> RegionRecordReadCompletion {
+impl PendingRead {
+    pub(crate) fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
         let completion = match self.request.wait(engine) {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_lease();
-                return RegionRecordReadCompletion {
+                return ReadCompletion {
                     plan: self.plan,
                     result: Err(error),
                     buffer,
@@ -114,7 +114,7 @@ impl RegionRecordReadFlight {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(self.plan.io_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(self.plan.aligned_len).is_err())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -127,7 +127,8 @@ impl RegionRecordReadFlight {
         let result = match protocol_error {
             Some(error) => Err(error),
             None => io_result.and_then(|completed| {
-                if completed != self.plan.io_len || bytes_transferred != self.plan.io_len {
+                if completed != self.plan.aligned_len || bytes_transferred != self.plan.aligned_len
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Region record read completed with the wrong byte count",
@@ -136,7 +137,7 @@ impl RegionRecordReadFlight {
                 Ok(())
             }),
         };
-        RegionRecordReadCompletion {
+        ReadCompletion {
             plan: self.plan,
             result,
             buffer,
@@ -144,72 +145,47 @@ impl RegionRecordReadFlight {
     }
 }
 
-/// Plans and submits one exact positioned read using an owned pool lease.
+/// Submits one planned positioned read using an exact-size owned buffer.
 ///
 /// Validation happens before the lease is prepared or submitted. Every local
 /// failure returns that lease; engine failures preserve whatever buffer the
 /// engine returned with the rejected operation.
-pub(crate) fn submit_record_read(
+pub(crate) fn submit_read(
     engine: &dyn IoEngine,
-    geometry: DataGeometry,
-    entry: IndexEntry,
-    mut buffer: BufferLease,
-) -> Result<RegionRecordReadFlight, RegionRecordReadSubmitError> {
-    let plan = match plan_record_read(geometry, entry) {
-        Ok(plan) => plan,
-        Err(error) => {
-            return Err(RegionRecordReadSubmitError {
-                error,
-                entry,
-                buffer: Some(buffer),
-            });
-        }
-    };
-    // Device reads overwrite the complete envelope. Preserve initialized pool
-    // capacity instead of clearing it first; clearing would add one full
-    // memory write to every 16--256 KiB cache hit.
-    if buffer.grow_preserving(plan.io_len).is_err() {
-        return Err(RegionRecordReadSubmitError {
-            error: io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "read buffer cannot hold the aligned Region record envelope",
-            ),
-            entry,
-            buffer: Some(buffer),
-        });
-    }
-    let buffer = match IoBuffer::from_lease(buffer, plan.io_len) {
+    slot: ReadSlot,
+    plan: ReadPlan,
+    buffer: BufferLease,
+) -> Result<PendingRead, ReadSubmitError> {
+    let entry = plan.entry;
+    let buffer = match IoBuffer::for_read(buffer, plan.aligned_len) {
         Ok(buffer) => buffer,
         Err(error) => {
-            return Err(RegionRecordReadSubmitError {
+            return Err(ReadSubmitError {
                 error: error.error,
                 entry,
                 buffer: Some(error.lease),
             });
         }
     };
-    let request = match submit_cache_io_nowait(engine, IoOperation::read(buffer, plan.absolute)) {
+    let request = match submit_cache_read(engine, slot, IoOperation::read(buffer, plan.absolute)) {
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_lease();
-            return Err(RegionRecordReadSubmitError {
+            return Err(ReadSubmitError {
                 error,
                 entry,
                 buffer,
             });
         }
     };
-    Ok(RegionRecordReadFlight {
+    Ok(PendingRead {
         plan,
         request_id: request.id(),
         request,
     })
 }
 
-pub(crate) fn plan_record_read(
-    geometry: DataGeometry,
-    entry: IndexEntry,
-) -> io::Result<RegionRecordReadPlan> {
+pub(crate) fn plan_read(geometry: DataGeometry, entry: IndexEntry) -> io::Result<ReadPlan> {
     let location = entry.location;
     let offset = u64::from(location.offset());
     let record_len = usize::try_from(location.record_len()).map_err(|_| {
@@ -259,15 +235,15 @@ pub(crate) fn plan_record_read(
     let alignment = _READ_ALIGNMENT as u64;
     let absolute = record_absolute / alignment * alignment;
     let io_end = align_up(record_absolute_end, alignment)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read envelope overflow"))?;
-    let io_len = io_end
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow"))?;
+    let aligned_len = io_end
         .checked_sub(absolute)
         .and_then(|length| usize::try_from(length).ok())
         .filter(|length| *length != 0 && *length % _READ_ALIGNMENT == 0)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid aligned Region record envelope",
+                "invalid aligned Region record read",
             )
         })?;
     let record_start = record_absolute
@@ -278,27 +254,27 @@ pub(crate) fn plan_record_read(
         ..record_start.checked_add(record_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "record slice end overflow")
         })?;
-    let overhead = io_len.checked_sub(record_len).ok_or_else(|| {
+    let overhead = aligned_len.checked_sub(record_len).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "aligned Region record envelope is shorter than its record",
+            "aligned Region read is shorter than its record",
         )
     })?;
     if absolute % alignment != 0
-        || record_range.end > io_len
-        || overhead >= _MAX_READ_ENVELOPE_OVERHEAD
+        || record_range.end > aligned_len
+        || overhead >= _MAX_READ_ALIGNMENT_OVERHEAD
         || io_end > geometry.data_file_len
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "aligned Region record envelope exceeds its bounds",
+            "aligned Region read exceeds its bounds",
         ));
     }
 
-    Ok(RegionRecordReadPlan {
+    Ok(ReadPlan {
         entry,
         absolute,
-        io_len,
+        aligned_len,
         record_range,
     })
 }
@@ -317,7 +293,7 @@ mod tests {
     use crate::index::PackedLocation;
     use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint, WritePoint};
     use crate::io_engine::BackendIoEngine;
-    use crate::resources::DedicatedBufferPool;
+    use crate::resources::{ResourceController, ResourceLimits, WriteBackpressure};
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -388,13 +364,26 @@ mod tests {
     fn unaligned_record_uses_one_aligned_read_and_returns_its_exact_slice() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = DedicatedBufferPool::try_new(1, _READ_ALIGNMENT).unwrap();
+        let resources = ResourceController::try_new(ResourceLimits {
+            memory_limit_bytes: _READ_ALIGNMENT,
+            reserved_memory_bytes: 0,
+            waiting_write_limit: 1,
+            write_backpressure: WriteBackpressure::Reject,
+        })
+        .unwrap();
         let location = PackedLocation::new(1, 32, 64, false).unwrap();
         let entry = entry(location);
+        let plan = plan_read(geometry(), entry).unwrap();
 
-        let completion = submit_record_read(&engine, geometry(), entry, pool.acquire().unwrap())
-            .unwrap()
-            .wait(&engine);
+        let slot = engine.try_reserve_read().unwrap();
+        let completion = submit_read(
+            &engine,
+            slot,
+            plan,
+            resources.try_read_buffer(_READ_ALIGNMENT).unwrap(),
+        )
+        .unwrap()
+        .wait(&engine);
         assert!(completion.result.is_ok());
         assert_eq!(completion.plan.record_range, 32..96);
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
@@ -412,23 +401,17 @@ mod tests {
         drop(reads);
         drop(completion.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(pool.snapshot().in_use, 0);
+        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
     }
 
     #[test]
-    fn invalid_entry_returns_the_buffer_without_issuing_io() {
+    fn invalid_entry_is_rejected_before_allocating_or_issuing_io() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = DedicatedBufferPool::try_new(1, _READ_ALIGNMENT).unwrap();
         let invalid = entry(PackedLocation::from_raw(0));
 
-        let error = match submit_record_read(&engine, geometry(), invalid, pool.acquire().unwrap())
-        {
-            Err(error) => error,
-            Ok(_) => panic!("invalid packed entry must not be submitted"),
-        };
-        assert_eq!(error.error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.buffer.is_some());
+        let error = plan_read(geometry(), invalid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend
                 .reads
@@ -436,8 +419,6 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
         );
-        drop(error.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(pool.snapshot().in_use, 0);
     }
 }

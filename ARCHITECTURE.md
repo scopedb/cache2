@@ -25,10 +25,10 @@ one SSD format and no Bucket engine, journal, or separate write-back executor.
 
 A RegionSet is an L2 retention boundary. Static capacity weights assign each
 set a contiguous Region range; append shards are assigned contiguous ranges
-evenly across sets. Every append shard has one Active Region, two fixed staging
+evenly across sets. Every append shard has one Active Region, two fixed write
 buffers, and one ordered worker. Free and sealed FIFOs are private to their set,
 and Region rotation never borrows across sets. L1, the global index, I/O pool,
-queues, memory budget, and stats stay shared. Runtime-only L1 shards are
+I/O concurrency, memory limit, and statistics stay shared. Runtime-only L1 shards are
 independent of static append shards, so RAM concurrency can be retuned without
 changing Region assignment or recovery identity.
 
@@ -78,18 +78,18 @@ maximum entry count. Policy metadata is covered by the fixed per-entry L1
 overhead estimate; it cannot increase the configured payload/entry charge.
 
 A `get` first checks the shared RAM tier. On an L1 miss it snapshots the relevant
-revision, looks up the fixed-size L2 index, leases one bounded aligned read
-buffer, routes the request across the I/O-engine pool, reads and validates the
-record, then revalidates Region, index, append-shard authority, and that the
-Region belongs to the namespace's configured set before promoting a clean RAM
-copy. A concurrent newer `put` prevents an older L2 result from being promoted.
+revision, looks up the fixed-size L2 index, reserves one bounded engine slot,
+allocates the exact aligned read range, reads and validates the record, then
+revalidates Region, index, append-shard authority, and that the Region belongs
+to the namespace's configured set before promoting a clean RAM copy. A
+concurrent newer `put` prevents an older L2 result from being promoted.
 Expiration is lazy: the wall clock is sampled only after a matching entry with
 a nonzero expiration is found, so namespace-only and default hits do not pay
 for timekeeping.
 
 The I/O pool contains the requested number of workers. In sync mode these are
 positioned-I/O workers; with io_uring they are independent rings. Hash routing
-keeps work distributed while total queue depth remains explicitly bounded.
+keeps work distributed while total in-flight I/O remains explicitly bounded.
 
 ## Recovery path
 
@@ -138,10 +138,14 @@ layout are canonicalized to the implicit default, avoiding cold starts for
 configurations with identical physical behavior.
 
 Runtime configuration is not persisted and may change between opens. It
-includes I/O engine and mode, worker count, total and admission queue depths,
-read buffers, L1 capacity and eviction policy, staging and batch sizes,
-partial-flush age, aggregate memory budget, and backpressure policy. It is
-validated before filesystem mutation.
+includes I/O engine and mode, worker count, total I/O concurrency,
+L1 capacity and eviction policy, write-buffer and batch sizes, flush delay,
+aggregate memory limit, waiting-policy write limit, and write backpressure. Foreground L2 reads
+reserve one immediately available engine execution slot after an index hit,
+then allocate one actual-size aligned range; they have no separate public
+admission policy. Write occupancy leaves the final slot of a multi-entry I/O
+engine available to reads, while a waiting write receives a bounded handoff.
+Runtime configuration is validated before filesystem mutation.
 
 The managed logical disk peak is deterministic: the fixed data file and 8 KiB
 state file plus two fixed-size recovery images. The second image is the bounded
@@ -152,12 +156,13 @@ stack topology participates in the aggregate memory plan. The operating system
 still controls physical stack commitment. Buffered-I/O page cache, filesystem
 metadata, and allocator internals remain outside the cache-owned byte budgets.
 The public resource snapshot exposes current/peak managed reservations, their
-hard budget, and the configured logical-disk peak without adding counters to
-the foreground record path.
+hard limit, and the configured logical-disk peak. Optional activity statistics
+separately classify read-memory and busy-engine misses.
 
 `HybridCache::snapshot()` also reads relaxed process-local counters for L1/L2
-hits and misses, promotions, L1 evictions/bypasses/admission rejections,
-logical bytes, saturation, failures, and Region rotations. Health is `Running`,
+hits and misses, read-memory and busy-engine misses, L1 promotions,
+evictions/bypasses/admission rejections, logical bytes, write rejections, failures,
+and Region rotations. Health is `Running`,
 transiently `Draining`, one-way `MissOnly` for
 fail-open reads, or `Failed` after a shard worker terminates. None of this state
 is persisted or participates in format identity. Activity counters are

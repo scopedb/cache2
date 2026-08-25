@@ -4,14 +4,13 @@
 
 Use this order whenever correctness and performance goals conflict:
 
-1. Do not wait for internal capacity unless the caller explicitly selected the
-   bounded read-buffer wait policy or a waiting write policy.
+1. Do not wait for internal capacity unless the caller explicitly selected a
+   waiting write policy.
 2. Do not return a stale value.
 3. Preserve or improve hit rate.
 
 Prefer a cache miss over waiting for internal capacity or serving an obsolete
-version. Explicit bounded read-buffer waiting is the only foreground-read
-exception. An admitted L2 lookup may complete its single bounded record read so
+version. An admitted L2 lookup may complete its single bounded record read so
 L2 can decide the result.
 
 ## Performance Contract
@@ -20,14 +19,12 @@ L2 can decide the result.
   synchronization, or recovery publication.
 - Waiting is allowed only for an explicit barrier such as `drain`, `flush`, or
   graceful warm close, when the caller explicitly selects a waiting
-  write-backpressure policy, or when the caller selects the bounded
-  read-buffer wait policy. An admitted L2 hit may otherwise wait only for its
-  own single bounded record read.
+  write-backpressure policy. An admitted L2 hit may otherwise wait only for
+  its own single bounded record read.
 - Keep memory, queues, staging buffers, index probes, and eviction work strictly
   bounded. Never introduce an unbounded allocation, scan, retry loop, or queue.
 - On saturation, bypass L1, return a cache miss, or reject with an overload
-  result. Only the explicit bounded read-buffer policy and caller-selected
-  write policies may wait for capacity.
+  result. Only caller-selected write policies may wait for capacity.
 - Keep the admitted L1 path limited to shard routing and short, bounded
   in-memory critical sections. Do not add work needed only by bypass or failure
   cases to the normal hit path.
@@ -41,30 +38,25 @@ L2 can decide the result.
   and shard-local whenever possible.
 - Publish Region writes in batches. Never add per-record flushes, syncs, or
   completion waits.
+- On an I/O engine with more than one slot, write submissions must leave the
+  final slot available to reads. Apply that limit to write occupancy rather
+  than total occupancy. Reads may use the complete engine depth, but a waiting
+  waiting write must receive a bounded handoff so accepted writes and explicit
+  barriers cannot starve behind a read stream.
 - An L1 miss must always consult L2. A true L2 index miss returns immediately
   without acquiring a read buffer.
-- L2 owns the final result. By default, an L2 candidate either acquires one read
-  buffer immediately or returns `WouldBlock` when the pool is full. An explicit
-  bounded-wait policy must release the Region pin before sleeping and re-probe
-  L2 exactly once after buffer admission. After buffer admission, L2 attempts
-  one non-waiting I/O submission and owns the result: one aligned read plus
-  exact revalidation, or a miss when the engine cannot admit that read
-  immediately.
-- Read-buffer exhaustion is the only `get` throttle boundary. Do not add a read
-  admission queue, background read worker, pending/ready table, retry protocol,
-  or another throttle resource to `get`. Read waiting must be bounded; never
-  offer an unlimited read-buffer block because a returned Region value may own
-  the capacity needed to wake the same caller.
-- Distinguish an observed empty read-buffer pool from pool-lock contention.
-  Only observed exhaustion may reject or wait; bookkeeping contention is an L2
-  miss. Foreground I/O submission-fence contention is also an L2 miss.
-- Allocate every foreground read buffer to its maximum size during open. A
-  successful buffer admission must not encounter lazy allocation or growth.
-- Treat the read-buffer slot count as the sole foreground L2 read budget. A
-  successful L1 promotion returns an L1-backed value and releases the transient
-  buffer before `get` returns while preserving Region as the hit source. If
-  promotion bypasses, the zero-copy Region value may retain its slot until the
-  caller drops it.
+- L2 owns the final result. An L2 candidate plans one exact aligned record read,
+  reserves one non-waiting engine execution slot, allocates only that aligned range
+  against the aggregate memory limit, and submits under the reservation.
+  Allocation or engine pressure is a miss, not public read backpressure. An
+  admitted request completes one read plus exact revalidation.
+- Do not add a read admission policy, read-buffer pool, read wait, background
+  ready table, or retry protocol to `get`. The bounded I/O engine and aggregate
+  memory limit are execution safety boundaries, not public read admission.
+- A successful L1 promotion returns an L1-backed value and releases the
+  transient aligned buffer before `get` returns while preserving Region as the
+  hit source. If promotion bypasses, the zero-copy Region value may retain its
+  exact-size allocation until the caller drops it.
 - Under the default reject policy, shard staging is the only write admission
   boundary. Do not put a global request gate in front of it.
 - Preflight shard capacity before allocating an append receipt. Reserve the

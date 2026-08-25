@@ -191,7 +191,7 @@ configuration only on a filesystem with at least the reported peak capacity:
 ```sh
 CACHE_RECOVERY_DIR=/path/to/ram-backed-or-test-filesystem \
 CACHE_RECOVERY_EXPECTED_ENTRIES=100000000 \
-CACHE_RECOVERY_MEMORY_BUDGET_MIB=6144 \
+CACHE_RECOVERY_MEMORY_LIMIT_MIB=6144 \
 cargo bench --bench recovery_scale --no-default-features
 ```
 
