@@ -3363,12 +3363,18 @@ mod tests {
         // free Region and then exercise sealed FIFO reuse.
         let rotation_value = vec![0xa5; 256 * 1024];
         let mut recent = Vec::new();
+        let rotations_before = store.detailed_snapshot().unwrap().region_sets[0].rotations;
         for ordinal in 0..32 {
             let key = key_for_shard(data, namespace_id, 0, 100 + ordinal);
             eventually_admitted(|| store.put_value(namespace_id, &key, &rotation_value, 0));
             store.drain().unwrap();
             recent.push(key);
         }
+        assert_eq!(
+            store.detailed_snapshot().unwrap().region_sets[0].rotations - rotations_before,
+            31,
+            "one full-Region signal must cause exactly one rotation"
+        );
         for key in recent.iter().rev().take(2) {
             assert_eq!(
                 store
@@ -3805,6 +3811,13 @@ mod tests {
             backend.set_len(data.geometry.data_file_len).unwrap();
             let engine = BackendIoEngine::new(Arc::new(backend), 2).unwrap();
             let buffers = DedicatedBufferPool::try_new(1, RECOVERY_PAGE_SIZE).unwrap();
+            runtime
+                .manager
+                .inner
+                .lock()
+                .unwrap()
+                .request_rotation_for_test(0)
+                .unwrap();
             faults.arm(
                 FaultEvent::Write(WritePoint::RegionHeader),
                 failing_write,

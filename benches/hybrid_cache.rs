@@ -14,6 +14,7 @@ use cache_rs::{
 const MIB: usize = 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 256 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REGION_READ_ATTEMPTS: usize = 16;
 
 struct BenchConfig {
     entries: usize,
@@ -370,9 +371,25 @@ fn concurrent_reads(
                 for ordinal in (client..operations).step_by(clients) {
                     let key_ordinal = first_key + ordinal % key_count;
                     let key = benchmark_key(key_ordinal);
-                    let value = cache
-                        .get(black_box(key))?
-                        .ok_or_else(|| io::Error::other("benchmark key missed"))?;
+                    let mut attempts = 0;
+                    let value = loop {
+                        match cache.get(black_box(key))? {
+                            Some(value) => break value,
+                            None
+                                if expected_tier == CacheTier::Region
+                                    && attempts + 1 < MAX_REGION_READ_ATTEMPTS =>
+                            {
+                                attempts += 1;
+                                thread::yield_now();
+                            }
+                            None => {
+                                return Err(io::Error::other(format!(
+                                    "benchmark key {key_ordinal} missed on client {client} after {} attempts",
+                                    attempts + 1
+                                )));
+                            }
+                        }
+                    };
                     if value.tier() != expected_tier {
                         return Err(io::Error::other(format!(
                             "expected {expected_tier:?} hit, observed {:?}",

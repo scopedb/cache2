@@ -27,14 +27,22 @@ harness = false
 name = "recovery_scale"
 harness = false
 
+[[bench]]
+name = "memory_directory"
+harness = false
+
 [dependencies]
 crc32c = "=0.6.8"
 xxhash-rust = { version = "=0.8.18", default-features = false, features = ["xxh3"] }
+
+[dev-dependencies]
+hashbrown = "=0.17.1"
 
 [features]
 default = ["io-uring"]
 io-uring = ["dep:io-uring"]
 fuzzing = []
+experimental-l1-directory = []
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
 io-uring = { version = "=0.7.14", optional = true }

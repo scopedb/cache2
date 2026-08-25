@@ -3,7 +3,7 @@
 //! Capacity accounting, pending-write pinning, TTL, and key correctness stay
 //! in `memory`; policies only maintain access metadata and choose a clean slot.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 
 /// Maximum policy metadata inspected by one foreground victim selection.
@@ -57,6 +57,7 @@ pub(crate) enum VictimSelection {
     None,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum QueueId {
     #[default]
@@ -66,17 +67,126 @@ enum QueueId {
     Main,
 }
 
+const RESIDENT_BIT: u8 = 1 << 0;
+const EVICTABLE_BIT: u8 = 1 << 1;
+const QUEUE_SHIFT: u8 = 2;
+const QUEUE_MASK: u8 = 0b11 << QUEUE_SHIFT;
+const VISITED_BIT: u8 = 1 << 4;
+const FREQUENCY_SHIFT: u8 = 5;
+const FREQUENCY_MASK: u8 = 0b11 << FREQUENCY_SHIFT;
+const LINK_INDEX_BITS: u32 = 25;
+const LINK_INDEX_MASK: u32 = (1 << LINK_INDEX_BITS) - 1;
+const FLAGS_SHIFT: u32 = LINK_INDEX_BITS;
+pub(crate) const MAX_POLICY_SLOT_INDEX: usize = (LINK_INDEX_MASK - 1) as usize;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PolicySlot {
-    resident: bool,
-    evictable: bool,
     hash: u64,
-    weight: usize,
-    previous: Option<usize>,
-    next: Option<usize>,
-    queue: QueueId,
-    visited: bool,
-    frequency: u8,
+    previous_and_flags: u32,
+    next: u32,
+}
+
+impl PolicySlot {
+    fn new(hash: u64, evictable: bool) -> Self {
+        let mut slot = Self {
+            hash,
+            ..Self::default()
+        };
+        slot.set_flags(RESIDENT_BIT);
+        slot.set_evictable(evictable);
+        slot
+    }
+
+    pub(crate) fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    pub(crate) fn is_evictable(&self) -> bool {
+        self.flags() & EVICTABLE_BIT != 0
+    }
+
+    fn is_resident(&self) -> bool {
+        self.flags() & RESIDENT_BIT != 0
+    }
+
+    fn set_evictable(&mut self, evictable: bool) {
+        self.set_flags((self.flags() & !EVICTABLE_BIT) | (u8::from(evictable) * EVICTABLE_BIT));
+    }
+
+    fn queue(&self) -> QueueId {
+        match (self.flags() & QUEUE_MASK) >> QUEUE_SHIFT {
+            1 => QueueId::Primary,
+            2 => QueueId::Small,
+            3 => QueueId::Main,
+            _ => QueueId::None,
+        }
+    }
+
+    fn set_queue(&mut self, queue: QueueId) {
+        self.set_flags((self.flags() & !QUEUE_MASK) | ((queue as u8) << QUEUE_SHIFT));
+    }
+
+    fn is_visited(&self) -> bool {
+        self.flags() & VISITED_BIT != 0
+    }
+
+    fn set_visited(&mut self, visited: bool) {
+        self.set_flags((self.flags() & !VISITED_BIT) | (u8::from(visited) * VISITED_BIT));
+    }
+
+    fn frequency(&self) -> u8 {
+        (self.flags() & FREQUENCY_MASK) >> FREQUENCY_SHIFT
+    }
+
+    fn set_frequency(&mut self, frequency: u8) {
+        debug_assert!(frequency <= 3);
+        self.set_flags(
+            (self.flags() & !FREQUENCY_MASK) | ((frequency << FREQUENCY_SHIFT) & FREQUENCY_MASK),
+        );
+    }
+
+    fn flags(&self) -> u8 {
+        (self.previous_and_flags >> FLAGS_SHIFT) as u8
+    }
+
+    fn set_flags(&mut self, flags: u8) {
+        debug_assert!(flags <= u8::MAX >> 1);
+        self.previous_and_flags =
+            (self.previous_and_flags & LINK_INDEX_MASK) | (u32::from(flags) << FLAGS_SHIFT);
+    }
+
+    fn previous(&self) -> Option<usize> {
+        unpack_index(self.previous_and_flags)
+    }
+
+    fn set_previous(&mut self, index: Option<usize>) {
+        self.previous_and_flags =
+            (self.previous_and_flags & !LINK_INDEX_MASK) | pack_optional_index(index);
+    }
+
+    fn next(&self) -> Option<usize> {
+        unpack_index(self.next)
+    }
+
+    fn set_next(&mut self, index: Option<usize>) {
+        self.next = pack_optional_index(index);
+    }
+}
+
+fn pack_index(index: usize) -> Option<u32> {
+    let packed = u32::try_from(index).ok()?.checked_add(1)?;
+    (packed <= LINK_INDEX_MASK).then_some(packed)
+}
+
+fn pack_optional_index(index: Option<usize>) -> u32 {
+    index.map_or(0, |index| {
+        pack_index(index).expect("eviction slot index exceeds packed-link limit")
+    })
+}
+
+fn unpack_index(index: u32) -> Option<usize> {
+    let packed = index & LINK_INDEX_MASK;
+    (packed != 0).then(|| (packed - 1) as usize)
 }
 
 #[derive(Default)]
@@ -88,50 +198,56 @@ struct SlotList {
 }
 
 impl SlotList {
-    fn push_front(&mut self, slots: &mut [PolicySlot], index: usize, queue: QueueId) {
-        debug_assert!(slots[index].resident);
-        debug_assert_eq!(slots[index].queue, QueueId::None);
+    fn push_front(
+        &mut self,
+        slots: &mut [PolicySlot],
+        index: usize,
+        queue: QueueId,
+        weight: usize,
+    ) {
+        debug_assert!(slots[index].is_resident());
+        debug_assert_eq!(slots[index].queue(), QueueId::None);
         let old_head = self.head;
-        slots[index].previous = None;
-        slots[index].next = old_head;
-        slots[index].queue = queue;
+        slots[index].set_previous(None);
+        slots[index].set_next(old_head);
+        slots[index].set_queue(queue);
         if let Some(old_head) = old_head {
-            slots[old_head].previous = Some(index);
+            slots[old_head].set_previous(Some(index));
         } else {
             self.tail = Some(index);
         }
         self.head = Some(index);
         self.len += 1;
-        self.weight = self.weight.saturating_add(slots[index].weight);
+        self.weight = self.weight.saturating_add(weight);
     }
 
-    fn remove(&mut self, slots: &mut [PolicySlot], index: usize, queue: QueueId) {
-        debug_assert_eq!(slots[index].queue, queue);
-        let previous = slots[index].previous;
-        let next = slots[index].next;
+    fn remove(&mut self, slots: &mut [PolicySlot], index: usize, queue: QueueId, weight: usize) {
+        debug_assert_eq!(slots[index].queue(), queue);
+        let previous = slots[index].previous();
+        let next = slots[index].next();
         if let Some(previous) = previous {
-            slots[previous].next = next;
+            slots[previous].set_next(next);
         } else {
             self.head = next;
         }
         if let Some(next) = next {
-            slots[next].previous = previous;
+            slots[next].set_previous(previous);
         } else {
             self.tail = previous;
         }
-        slots[index].previous = None;
-        slots[index].next = None;
-        slots[index].queue = QueueId::None;
+        slots[index].set_previous(None);
+        slots[index].set_next(None);
+        slots[index].set_queue(QueueId::None);
         self.len = self.len.saturating_sub(1);
-        self.weight = self.weight.saturating_sub(slots[index].weight);
+        self.weight = self.weight.saturating_sub(weight);
     }
 
     fn move_to_front(&mut self, slots: &mut [PolicySlot], index: usize, queue: QueueId) {
         if self.head == Some(index) {
             return;
         }
-        self.remove(slots, index, queue);
-        self.push_front(slots, index, queue);
+        self.remove(slots, index, queue, 0);
+        self.push_front(slots, index, queue, 0);
     }
 
     fn oldest_evictable(&self, slots: &[PolicySlot]) -> Option<usize> {
@@ -139,10 +255,10 @@ impl SlotList {
         for _ in 0..self.len.min(MAX_POLICY_SCAN_STEPS) {
             let index = candidate?;
             let slot = &slots[index];
-            if slot.resident && slot.evictable {
+            if slot.is_resident() && slot.is_evictable() {
                 return Some(index);
             }
-            candidate = slot.previous;
+            candidate = slot.previous();
         }
         None
     }
@@ -254,45 +370,47 @@ impl EvictionState {
         evictable: bool,
         hint: AdmissionHint,
     ) {
-        debug_assert!(!slots[index].resident);
-        slots[index] = PolicySlot {
-            resident: true,
-            evictable,
-            hash,
-            weight,
-            ..PolicySlot::default()
-        };
+        debug_assert!(!slots[index].is_resident());
+        slots[index] = PolicySlot::new(hash, evictable);
         match &mut self.state {
-            PolicyState::Clock(_) => slots[index].visited = true,
+            PolicyState::Clock(_) => slots[index].set_visited(true),
             PolicyState::Lru(state) => {
-                state.entries.push_front(slots, index, QueueId::Primary);
+                state
+                    .entries
+                    .push_front(slots, index, QueueId::Primary, weight);
             }
             PolicyState::TinyLfu(state) => {
-                state.entries.push_front(slots, index, QueueId::Primary);
+                state
+                    .entries
+                    .push_front(slots, index, QueueId::Primary, weight);
             }
             PolicyState::Sieve(state) => {
-                state.entries.push_front(slots, index, QueueId::Primary);
+                state
+                    .entries
+                    .push_front(slots, index, QueueId::Primary, weight);
             }
             PolicyState::Fifo(state) => {
-                state.entries.push_front(slots, index, QueueId::Primary);
+                state
+                    .entries
+                    .push_front(slots, index, QueueId::Primary, weight);
             }
             PolicyState::S3Fifo(state) => {
                 let use_main = hint.s3_main
                     || state.small_target_bytes == 0
                     || weight > state.small_target_bytes;
                 if use_main {
-                    state.main.push_front(slots, index, QueueId::Main);
+                    state.main.push_front(slots, index, QueueId::Main, weight);
                 } else {
-                    state.small.push_front(slots, index, QueueId::Small);
+                    state.small.push_front(slots, index, QueueId::Small, weight);
                 }
             }
         }
     }
 
     pub(crate) fn record_hit(&mut self, slots: &mut [PolicySlot], index: usize) {
-        let hash = slots[index].hash;
+        let hash = slots[index].hash();
         match &mut self.state {
-            PolicyState::Clock(_) => slots[index].visited = true,
+            PolicyState::Clock(_) => slots[index].set_visited(true),
             PolicyState::Lru(state) => {
                 state.entries.move_to_front(slots, index, QueueId::Primary);
             }
@@ -300,47 +418,48 @@ impl EvictionState {
                 state.frequencies.increment(hash);
                 state.entries.move_to_front(slots, index, QueueId::Primary);
             }
-            PolicyState::Sieve(_) => slots[index].visited = true,
+            PolicyState::Sieve(_) => slots[index].set_visited(true),
             PolicyState::Fifo(_) => {}
             PolicyState::S3Fifo(_) => {
-                slots[index].frequency = slots[index].frequency.saturating_add(1).min(3);
+                let frequency = slots[index].frequency().saturating_add(1).min(3);
+                slots[index].set_frequency(frequency);
             }
         }
     }
 
     pub(crate) fn set_evictable(&mut self, slots: &mut [PolicySlot], index: usize) {
-        if slots.get(index).is_some_and(|slot| slot.resident) {
-            slots[index].evictable = true;
+        if slots.get(index).is_some_and(PolicySlot::is_resident) {
+            slots[index].set_evictable(true);
         }
     }
 
-    pub(crate) fn remove(&mut self, slots: &mut [PolicySlot], index: usize) {
-        if !slots.get(index).is_some_and(|slot| slot.resident) {
+    pub(crate) fn remove(&mut self, slots: &mut [PolicySlot], index: usize, weight: usize) {
+        if !slots.get(index).is_some_and(PolicySlot::is_resident) {
             return;
         }
         match &mut self.state {
             PolicyState::Clock(_) => {}
             PolicyState::Lru(state) => {
-                state.entries.remove(slots, index, QueueId::Primary);
+                state.entries.remove(slots, index, QueueId::Primary, weight);
             }
             PolicyState::TinyLfu(state) => {
-                state.entries.remove(slots, index, QueueId::Primary);
+                state.entries.remove(slots, index, QueueId::Primary, weight);
             }
             PolicyState::Sieve(state) => {
                 if state.hand == Some(index) {
                     state.hand = next_sieve_candidate(&state.entries, slots, index);
                 }
-                state.entries.remove(slots, index, QueueId::Primary);
+                state.entries.remove(slots, index, QueueId::Primary, weight);
                 if state.entries.len == 0 {
                     state.hand = None;
                 }
             }
             PolicyState::Fifo(state) => {
-                state.entries.remove(slots, index, QueueId::Primary);
+                state.entries.remove(slots, index, QueueId::Primary, weight);
             }
-            PolicyState::S3Fifo(state) => match slots[index].queue {
-                QueueId::Small => state.small.remove(slots, index, QueueId::Small),
-                QueueId::Main => state.main.remove(slots, index, QueueId::Main),
+            PolicyState::S3Fifo(state) => match slots[index].queue() {
+                QueueId::Small => state.small.remove(slots, index, QueueId::Small, weight),
+                QueueId::Main => state.main.remove(slots, index, QueueId::Main, weight),
                 QueueId::None | QueueId::Primary => {
                     debug_assert!(false, "S3-FIFO resident is outside its queues");
                 }
@@ -349,12 +468,16 @@ impl EvictionState {
         slots[index] = PolicySlot::default();
     }
 
-    pub(crate) fn select_victim(
+    pub(crate) fn select_victim<F>(
         &mut self,
         slots: &mut [PolicySlot],
         incoming_hash: u64,
         apply_admission: bool,
-    ) -> VictimSelection {
+        weight_of: F,
+    ) -> VictimSelection
+    where
+        F: Fn(usize) -> usize,
+    {
         match &mut self.state {
             PolicyState::Clock(state) => select_clock(state, slots),
             PolicyState::Lru(state) => state
@@ -367,7 +490,7 @@ impl EvictionState {
                 };
                 if apply_admission
                     && state.frequencies.estimate(incoming_hash)
-                        <= state.frequencies.estimate(slots[victim].hash)
+                        <= state.frequencies.estimate(slots[victim].hash())
                 {
                     VictimSelection::Reject
                 } else {
@@ -379,7 +502,7 @@ impl EvictionState {
                 .entries
                 .oldest_evictable(slots)
                 .map_or(VictimSelection::None, VictimSelection::Victim),
-            PolicyState::S3Fifo(state) => select_s3fifo(state, slots),
+            PolicyState::S3Fifo(state) => select_s3fifo(state, slots, weight_of),
         }
     }
 }
@@ -397,11 +520,11 @@ fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelec
         let index = state.hand % slots.len();
         state.hand = (index + 1) % slots.len();
         let slot = &mut slots[index];
-        if !slot.resident || !slot.evictable {
+        if !slot.is_resident() || !slot.is_evictable() {
             continue;
         }
-        if slot.visited {
-            slot.visited = false;
+        if slot.is_visited() {
+            slot.set_visited(false);
             continue;
         }
         return VictimSelection::Victim(index);
@@ -413,7 +536,7 @@ fn next_sieve_candidate(entries: &SlotList, slots: &[PolicySlot], index: usize) 
     if entries.len <= 1 {
         None
     } else {
-        slots[index].previous.or(entries.tail)
+        slots[index].previous().or(entries.tail)
     }
 }
 
@@ -432,10 +555,10 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
         let Some(index) = candidate else {
             break;
         };
-        let next = slots[index].previous.or(state.entries.tail);
-        if slots[index].evictable {
-            if slots[index].visited {
-                slots[index].visited = false;
+        let next = slots[index].previous().or(state.entries.tail);
+        if slots[index].is_evictable() {
+            if slots[index].is_visited() {
+                slots[index].set_visited(false);
             } else {
                 state.hand = next_sieve_candidate(&state.entries, slots, index);
                 return VictimSelection::Victim(index);
@@ -447,7 +570,14 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
     VictimSelection::None
 }
 
-fn select_s3fifo(state: &mut S3FifoState, slots: &mut [PolicySlot]) -> VictimSelection {
+fn select_s3fifo<F>(
+    state: &mut S3FifoState,
+    slots: &mut [PolicySlot],
+    weight_of: F,
+) -> VictimSelection
+where
+    F: Fn(usize) -> usize,
+{
     let maximum_steps = slots
         .len()
         .saturating_mul(5)
@@ -457,20 +587,22 @@ fn select_s3fifo(state: &mut S3FifoState, slots: &mut [PolicySlot]) -> VictimSel
         let prefer_main = state.main.weight > state.main_target_bytes || state.small.len == 0;
         if !prefer_main {
             if let Some(index) = state.small.oldest_evictable(slots) {
-                if slots[index].frequency >= 2 {
-                    state.small.remove(slots, index, QueueId::Small);
-                    slots[index].frequency = 0;
-                    state.main.push_front(slots, index, QueueId::Main);
+                if slots[index].frequency() >= 2 {
+                    let weight = weight_of(index);
+                    state.small.remove(slots, index, QueueId::Small, weight);
+                    slots[index].set_frequency(0);
+                    state.main.push_front(slots, index, QueueId::Main, weight);
                     continue;
                 }
-                state.ghost.insert(slots[index].hash);
+                state.ghost.insert(slots[index].hash());
                 return VictimSelection::Victim(index);
             }
         }
 
         if let Some(index) = state.main.oldest_evictable(slots) {
-            if slots[index].frequency > 0 {
-                slots[index].frequency -= 1;
+            let frequency = slots[index].frequency();
+            if frequency > 0 {
+                slots[index].set_frequency(frequency - 1);
                 state.main.move_to_front(slots, index, QueueId::Main);
                 continue;
             }
@@ -479,13 +611,14 @@ fn select_s3fifo(state: &mut S3FifoState, slots: &mut [PolicySlot]) -> VictimSel
 
         if prefer_main {
             if let Some(index) = state.small.oldest_evictable(slots) {
-                if slots[index].frequency >= 2 {
-                    state.small.remove(slots, index, QueueId::Small);
-                    slots[index].frequency = 0;
-                    state.main.push_front(slots, index, QueueId::Main);
+                if slots[index].frequency() >= 2 {
+                    let weight = weight_of(index);
+                    state.small.remove(slots, index, QueueId::Small, weight);
+                    slots[index].set_frequency(0);
+                    state.main.push_front(slots, index, QueueId::Main, weight);
                     continue;
                 }
-                state.ghost.insert(slots[index].hash);
+                state.ghost.insert(slots[index].hash());
                 return VictimSelection::Victim(index);
             }
         }
@@ -522,14 +655,15 @@ impl FrequencySketch {
         let counter_count = width.checked_mul(4).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "TinyLFU sketch size overflow")
         })?;
+        let counter_bytes = counter_count.div_ceil(2);
         let mut counters = Vec::new();
-        counters.try_reserve_exact(counter_count).map_err(|_| {
+        counters.try_reserve_exact(counter_bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "cannot allocate TinyLFU frequency sketch",
             )
         })?;
-        counters.resize(counter_count, 0_u8);
+        counters.resize(counter_bytes, 0_u8);
         Ok(Self {
             counters: counters.into_boxed_slice(),
             width,
@@ -545,7 +679,7 @@ impl FrequencySketch {
             return 0;
         }
         (0..4)
-            .map(|row| self.counters[self.position(hash, row)])
+            .map(|row| self.counter(self.position(hash, row)))
             .min()
             .unwrap_or(0)
     }
@@ -556,7 +690,8 @@ impl FrequencySketch {
         }
         for row in 0..4 {
             let position = self.position(hash, row);
-            self.counters[position] = self.counters[position].saturating_add(1).min(15);
+            let frequency = self.counter(position).saturating_add(1).min(15);
+            self.set_counter(position, frequency);
         }
         self.events += 1;
         if self.events >= self.sample_size {
@@ -565,10 +700,10 @@ impl FrequencySketch {
         if self.aging {
             let end = self
                 .age_cursor
-                .saturating_add(FREQUENCY_AGE_BATCH)
+                .saturating_add(FREQUENCY_AGE_BATCH / 2)
                 .min(self.counters.len());
-            for counter in &mut self.counters[self.age_cursor..end] {
-                *counter >>= 1;
+            for counters in &mut self.counters[self.age_cursor..end] {
+                *counters = (*counters >> 1) & 0x77;
             }
             self.age_cursor = end;
             if self.age_cursor == self.counters.len() {
@@ -589,6 +724,25 @@ impl FrequencySketch {
         let mixed = mix64(hash ^ SEEDS[row]);
         row * self.width + (mixed as usize & (self.width - 1))
     }
+
+    fn counter(&self, position: usize) -> u8 {
+        let counters = self.counters[position / 2];
+        if position & 1 == 0 {
+            counters & 0x0f
+        } else {
+            counters >> 4
+        }
+    }
+
+    fn set_counter(&mut self, position: usize, frequency: u8) {
+        debug_assert!(frequency <= 15);
+        let counters = &mut self.counters[position / 2];
+        if position & 1 == 0 {
+            *counters = (*counters & 0xf0) | frequency;
+        } else {
+            *counters = (*counters & 0x0f) | (frequency << 4);
+        }
+    }
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -601,17 +755,17 @@ fn mix64(mut value: u64) -> u64 {
 
 struct GhostQueue {
     maximum_entries: usize,
-    next_generation: u64,
-    order: VecDeque<(u64, u64)>,
-    members: HashMap<u64, u64>,
+    cursor: usize,
+    order: Vec<u64>,
+    members: HashMap<u64, usize>,
 }
 
 impl GhostQueue {
     fn new(maximum_entries: usize) -> Self {
         Self {
             maximum_entries,
-            next_generation: 0,
-            order: VecDeque::new(),
+            cursor: 0,
+            order: Vec::new(),
             members: HashMap::new(),
         }
     }
@@ -624,18 +778,21 @@ impl GhostQueue {
         if self.maximum_entries == 0 {
             return;
         }
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        let generation = self.next_generation;
-        self.members.insert(hash, generation);
-        self.order.push_back((hash, generation));
-        while self.order.len() > self.maximum_entries {
-            let Some((old_hash, old_generation)) = self.order.pop_front() else {
-                break;
-            };
-            if self.members.get(&old_hash) == Some(&old_generation) {
+        let slot = if self.order.len() < self.maximum_entries {
+            let slot = self.order.len();
+            self.order.push(hash);
+            slot
+        } else {
+            let slot = self.cursor;
+            let old_hash = self.order[slot];
+            if self.members.get(&old_hash) == Some(&slot) {
                 self.members.remove(&old_hash);
             }
-        }
+            self.order[slot] = hash;
+            self.cursor = (slot + 1) % self.maximum_entries;
+            slot
+        };
+        self.members.insert(hash, slot);
     }
 }
 
@@ -660,7 +817,7 @@ mod tests {
         policy.record_hit(&mut slots, old);
 
         assert_eq!(
-            policy.select_victim(&mut slots, 3, true),
+            policy.select_victim(&mut slots, 3, true, |_| 100),
             VictimSelection::Victim(new)
         );
     }
@@ -671,19 +828,20 @@ mod tests {
         let mut slots = Vec::new();
         let first = install(&mut policy, &mut slots, 1);
         assert_eq!(
-            policy.select_victim(&mut slots, 2, true),
+            policy.select_victim(&mut slots, 2, true, |_| 100),
             VictimSelection::Victim(first)
         );
-        policy.remove(&mut slots, first);
+        policy.remove(&mut slots, first, 100);
 
         let hint = policy.record_miss(1);
         policy.insert(&mut slots, first, 1, 100, true, hint);
-        assert_eq!(slots[first].queue, QueueId::Main);
+        assert_eq!(slots[first].queue(), QueueId::Main);
     }
 
     #[test]
     fn frequency_sketch_ages_old_accesses() {
         let mut sketch = FrequencySketch::new(2).unwrap();
+        assert_eq!(sketch.counters.len(), sketch.width * 2);
         for _ in 0..15 {
             sketch.increment(1);
         }
@@ -692,5 +850,17 @@ mod tests {
             sketch.increment(ordinal);
         }
         assert!(sketch.estimate(1) < before);
+    }
+
+    #[test]
+    fn ghost_ring_ignores_stale_duplicate_slots() {
+        let mut ghost = GhostQueue::new(2);
+        ghost.insert(1);
+        ghost.insert(1);
+        ghost.insert(2);
+
+        assert!(ghost.take(1));
+        assert!(ghost.take(2));
+        assert!(!ghost.take(1));
     }
 }

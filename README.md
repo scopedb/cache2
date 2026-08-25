@@ -188,6 +188,11 @@ bound. A returned L1 `Value` retains its charge until the caller drops it, even
 after CLOCK eviction, so slow consumers cannot push new L1 allocations past the
 configured capacity. `RuntimeConfig::with_memory_shards()` controls only the
 volatile L1 lock topology; the default is 32 and it may change on a warm reopen.
+The default L1 directory is the standard library `HashMap` with compact
+intrusive same-hash chains. The fixed-capacity owned cuckoo directory remains
+available for evaluation through the `experimental-l1-directory` Cargo feature;
+it is not enabled by default because its up-front allocation and common-load
+latency still need broader workload evidence.
 The aggregate memory budget also reserves fixed 512 KiB stacks for append-shard,
 I/O, and bounded shutdown-reaper threads plus conservative L1 shard, I/O queue,
 and fixed recovery encoding metadata.

@@ -196,6 +196,7 @@ struct ShardMutation {
     open_span: Option<OpenWriteSpan>,
     pending_padding: Option<RegionPaddingReceipt>,
     submitted_span: Option<RegionWriteSpan>,
+    rotation_requested: bool,
     rotation: Option<RegionRotationReceipt>,
     next_span_id: u64,
 }
@@ -207,6 +208,7 @@ impl Default for ShardMutation {
             open_span: None,
             pending_padding: None,
             submitted_span: None,
+            rotation_requested: false,
             rotation: None,
             next_span_id: 1,
         }
@@ -543,13 +545,17 @@ impl RegionManager {
             .checked_add(u64::from(record_bytes))
             .ok_or(RegionMutationError::ArithmeticOverflow)?;
         if end > self.region_size {
-            return Err(if shard.open_span.is_some() {
+            let error = if shard.open_span.is_some() {
                 RegionMutationError::FlushBeforeRotation
             } else if shard.submitted_span.is_some() {
                 RegionMutationError::WouldBlock
             } else {
                 RegionMutationError::RegionFull
-            });
+            };
+            if error == RegionMutationError::RegionFull {
+                self.shard_mutations[shard_id].rotation_requested = true;
+            }
+            return Err(error);
         }
         let offset = u32::try_from(region.reserved_used)
             .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
@@ -922,6 +928,19 @@ impl RegionManager {
         Ok(self.select_rotation(shard_id)?.plan)
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_rotation_for_test(
+        &mut self,
+        shard_id: usize,
+    ) -> Result<(), RegionMutationError> {
+        let shard = self
+            .shard_mutations
+            .get_mut(shard_id)
+            .ok_or(RegionMutationError::InvalidShard)?;
+        shard.rotation_requested = true;
+        Ok(())
+    }
+
     /// Starts one previously planned FIFO rotation without performing I/O.
     /// Free Regions are used first; once exhausted, the oldest sealed Region
     /// generation is reused. The outgoing Active Region is withheld from the
@@ -997,6 +1016,7 @@ impl RegionManager {
             },
             reused,
         };
+        self.shard_mutations[shard_id].rotation_requested = false;
         self.shard_mutations[shard_id].rotation = Some(receipt);
         Ok(receipt)
     }
@@ -1009,7 +1029,8 @@ impl RegionManager {
             .shard_mutations
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail.is_some()
+        if !shard.rotation_requested
+            || shard.tail.is_some()
             || shard.open_span.is_some()
             || shard.pending_padding.is_some()
             || shard.submitted_span.is_some()
@@ -1790,6 +1811,10 @@ mod tests {
         reservation
     }
 
+    fn request_rotation(manager: &mut RegionManager, shard_id: usize) {
+        manager.request_rotation_for_test(shard_id).unwrap();
+    }
+
     #[test]
     fn restores_non_id_queue_and_shard_order() {
         let manager = RegionManager::from_metadata(sample()).unwrap();
@@ -2152,6 +2177,7 @@ mod tests {
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
 
+        request_rotation(&mut manager, 0);
         let plan = manager.plan_rotation(0).unwrap();
         assert_eq!(
             plan,
@@ -2189,6 +2215,11 @@ mod tests {
 
         manager.finish_rotation(rotation).unwrap();
         assert_eq!(
+            manager.plan_rotation(0),
+            Err(RegionMutationError::WouldBlock),
+            "a delayed duplicate wake must not rotate the new empty Region"
+        );
+        assert_eq!(
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
             [4, 2, 3]
         );
@@ -2206,6 +2237,7 @@ mod tests {
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
         assert_eq!(manager.logical_accounting().unwrap().live_record_count, 1);
 
+        request_rotation(&mut manager, 0);
         let plan = manager.plan_rotation(0).unwrap();
         assert_eq!(
             plan,
@@ -2242,8 +2274,10 @@ mod tests {
     #[test]
     fn stale_rotation_plan_does_not_consume_the_next_victim_or_seqno() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
+        request_rotation(&mut manager, 0);
         let stale = manager.plan_rotation(0).unwrap();
 
+        request_rotation(&mut manager, 1);
         let other_plan = manager.plan_rotation(1).unwrap();
         let other_rotation = manager.begin_rotation(other_plan).unwrap();
         manager.finish_rotation(other_rotation).unwrap();
@@ -2272,6 +2306,7 @@ mod tests {
 
         // Region 4 is Sealed, so it cannot be selected from the Free FIFO.
         manager.set_queues[0].free[0] = 4;
+        request_rotation(&mut manager, 0);
         assert_eq!(
             manager.plan_rotation(0),
             Err(RegionMutationError::Invariant(
@@ -2290,6 +2325,7 @@ mod tests {
         manager.stage_reservation(reservation).unwrap();
         let padding = manager.reserve_write_padding(0).unwrap().unwrap();
         let span = manager.seal_write_span_with_padding(padding).unwrap();
+        request_rotation(&mut manager, 0);
         assert_eq!(
             manager.plan_rotation(0),
             Err(RegionMutationError::WouldBlock)
@@ -2314,8 +2350,9 @@ mod tests {
     fn incarnation_exhaustion_does_not_consume_fifo_or_seqno() {
         let mut metadata = sample();
         metadata.regions[5].incarnation = u32::MAX - 1;
-        let manager = RegionManager::from_metadata(metadata).unwrap();
+        let mut manager = RegionManager::from_metadata(metadata).unwrap();
         let next_seqno = manager.next_seqno();
+        request_rotation(&mut manager, 0);
         assert_eq!(
             manager.plan_rotation(0),
             Err(RegionMutationError::IncarnationExhausted)

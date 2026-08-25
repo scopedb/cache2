@@ -4,8 +4,10 @@ This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
 
 The current harness gives its fixed index extra headroom for the complete L2
-working set and retries only rejected writes. Rerun the baseline before treating
-historical thresholds as release gates.
+working set and retries rejected writes. Its concurrent post-reopen L2 phase
+also permits at most 16 immediate attempts for an allowed warm-page validation
+contention miss; exhausting that fixed budget is a hard failure. Rerun the
+baseline before treating historical thresholds as release gates.
 
 ## M1 local baseline — 2026-08-24
 
@@ -74,6 +76,42 @@ This measurement introduced runtime-only `memory_shards` with a default of 32
 and cache-line-isolated shard locks. The benchmark source is kept outside the
 crate so it cannot become an accidental release test or add Foyer to production
 dependencies.
+
+## L1 directory versus hashbrown — 2026-08-25
+
+The fixed-capacity L1 directory is compared directly with
+`hashbrown::HashTable<u32>` using the same precomputed 64-bit hashes, compact
+slot heads, 114,688 resident entries in 131,072 buckets (87.5% load), and two
+million measured operations after a warmup. `hashbrown` is a dev dependency
+only. The owned directory is an experimental alternative; the default cache
+path continues to use `HashMap`. Run the checked-in comparison with:
+
+```sh
+cargo bench --bench memory_directory
+```
+
+Exercise the complete cache with the owned directory using:
+
+```sh
+cargo bench --features experimental-l1-directory --bench hybrid_cache
+```
+
+One Apple M4 Max release run with the environment recorded above produced:
+
+| Operation | cache-rs directory | hashbrown | cache-rs / hashbrown |
+|---|---:|---:|---:|
+| hit | 5.916 ns | 4.368 ns | 1.354× |
+| miss | 4.258 ns | 12.020 ns | 0.354× |
+| remove + insert churn | 37.679 ns | 13.394 ns | 2.813× |
+
+Construction was 18.611 ns/entry versus 3.415 ns/entry; construction is an
+open-time path rather than a steady-state hit. The owned table uses five bytes
+per bucket, has no resize or tombstone state, checks at most two eight-slot
+buckets on lookup, and gives cuckoo relocation a fixed search budget. The
+benchmark fails if hit, miss, or churn crosses its checked-in 2.0×, 1.25×, or
+4.0× relative limit. These are regression bounds, not a claim that the owned
+table beats hashbrown on every operation: the trade is slower hits and writes
+for faster saturated misses, fixed memory, and bounded probe/relocation work.
 
 ## M3 observability cost — 2026-08-24
 
