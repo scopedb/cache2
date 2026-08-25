@@ -14,10 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
 use crate::expiry::ExpiryClock;
-use crate::format::{
-    RECORD_HEADER_SIZE, REGION_HEADER_SIZE, RecordCodec, RecordHeader, RecordKind, RegionHeader,
-    RegionState,
-};
+use crate::format::{RECORD_HEADER_SIZE, RecordCodec, RecordHeader};
 use crate::index::{IndexEntry, MAX_INDEX_PARTITIONS};
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, IndexStorageError,
@@ -27,16 +24,16 @@ use crate::io_backend::{
     ControlIoBackend, DirectIoMode, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint,
     WritePoint, read_exact_at, write_all_at,
 };
-use crate::io_engine::{IoBuffer, IoEngine, IoOperation, OperationKind, submit_cache_io};
+use crate::io_engine::IoEngine;
 use crate::memory::MemoryStore;
 use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
 use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
 use crate::recovery::{
-    DATA_REGION_AREA_OFFSET, DataSuperblock, DataSuperblockProbe, PersistentId,
-    RECOVERY_IMAGE_INDEX_OFFSET, RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe,
-    RecoveryState, STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedState, StateBinding, StatePageWrite,
-    StateRecord, StateSelectionError, clean_image_matches, latest_state, prepare_next_state,
+    DataSuperblock, DataSuperblockProbe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET,
+    RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe, RecoveryState,
+    STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedState, StateBinding, StatePageWrite, StateRecord,
+    StateSelectionError, clean_image_matches, latest_state, prepare_next_state,
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
@@ -100,8 +97,6 @@ impl RegionFiles {
 
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;
-const _: () = assert!(REGION_HEADER_SIZE == RECOVERY_PAGE_SIZE);
-
 /// One-way health fence shared by the live, frozen, and prepared-clean owners.
 /// Once a lazy index fault rejects the recovery image, no later phase may
 /// publish CLEAN from the partially trusted authority.
@@ -198,9 +193,15 @@ impl RegionManagerAuthority {
         })
     }
 
-    fn empty_active_headers(&self, data: DataSuperblock) -> io::Result<Vec<(u64, RegionHeader)>> {
-        let manager = self.lock()?;
-        snapshot_empty_active_region_headers(data, &manager)
+    fn try_begin_index_mutation(&self) -> io::Result<Option<RegionIndexMutationAuthority<'_>>> {
+        let Some(manager) = self.try_lock()? else {
+            return Ok(None);
+        };
+        Ok(Some(RegionIndexMutationAuthority {
+            manager,
+            health: self.health.clone(),
+            accounting_error: None,
+        }))
     }
 
     fn into_inner(self) -> io::Result<RegionManager> {
@@ -261,7 +262,7 @@ pub(crate) struct FileRegionCore {
     manager: RegionManagerAuthority,
     layout: Arc<RegionLayout>,
     shards: Box<[RegionShard]>,
-    rotation: Mutex<()>,
+    rotation: Box<[Mutex<()>]>,
     read_directory: RegionReadDirectory,
     read_epoch: AtomicU32,
     read_clear_floor: AtomicU64,
@@ -283,14 +284,12 @@ impl Deref for FileRegionRuntime {
     }
 }
 
-/// Short shard-local transaction gates. `mutation` makes manager receipts and
-/// staging transitions one operation; `completion` enforces one ordered span
-/// completion worker per shard while still allowing the second buffer to fill
-/// during device I/O.
+/// Short shard-local transaction gate. `mutation` makes manager receipts and
+/// staging transitions one operation. Span completion and rotation are already
+/// ordered by the shard's single production worker.
 #[derive(Default)]
 struct RegionShard {
     mutation: Mutex<()>,
-    completion: Mutex<()>,
 }
 
 /// Exact point identity pinned to one Region generation across record I/O.
@@ -320,6 +319,7 @@ pub(crate) enum RegionStageValue {
     Staged(RegionStagedValue),
     NeedsFlush,
     NeedsRotation,
+    ManagerBusy,
     Busy,
 }
 
@@ -431,6 +431,16 @@ impl FileRegionRuntime {
                 )
             })?;
         shards.resize_with(manager.active_regions().len(), RegionShard::default);
+        let mut rotation = Vec::new();
+        rotation
+            .try_reserve_exact(layout.sets().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate RegionSet rotation gates",
+                )
+            })?;
+        rotation.resize_with(layout.sets().len(), || Mutex::new(()));
         let health = RegionHealthLatch::healthy();
         Ok(Self {
             core: Arc::new(FileRegionCore {
@@ -440,7 +450,7 @@ impl FileRegionRuntime {
                 manager: RegionManagerAuthority::new(manager, health.clone()),
                 layout,
                 shards: shards.into_boxed_slice(),
-                rotation: Mutex::new(()),
+                rotation: rotation.into_boxed_slice(),
                 read_directory,
                 health,
             }),
@@ -592,11 +602,6 @@ impl FileRegionCore {
                 ))
             }
         }
-    }
-
-    fn lock_shard_completion(&self, shard_id: usize) -> io::Result<MutexGuard<'_, ()>> {
-        let shard = self.shard(shard_id)?;
-        self.lock_shard_gate(&shard.completion)
     }
 
     fn shard(&self, shard_id: usize) -> io::Result<&RegionShard> {
@@ -766,8 +771,7 @@ impl FileRegionCore {
                 .ok_or_else(|| corrupt_record(&self.health))?,
         )
         .ok_or_else(|| corrupt_record(&self.health))?;
-        if header.kind != RecordKind::Value
-            || header.record_len != point.entry.location.record_len()
+        if header.record_len != point.entry.location.record_len()
             || header.seqno != point.entry.seqno
             || header.key_hash != hash
             || !point.record_generation_matches(header.epoch, header.region_incarnation)
@@ -776,6 +780,7 @@ impl FileRegionCore {
             return Err(corrupt_record(&self.health));
         }
         if clock.is_expired(header.expires_at) {
+            self.try_remove_expired(hash, point.entry);
             return Ok(None);
         }
         let key_len = header.key_len as usize;
@@ -874,9 +879,18 @@ impl FileRegionCore {
                 return Err(staging_io_error(error));
             }
         }
+        match staging.preflight_pending_fence(shard_id, hash) {
+            Ok(()) => {}
+            Err(StagingError::WouldBlock) => return Ok(RegionStageValue::Busy),
+            Err(error) => {
+                self.health.enter_miss_only();
+                staging.close();
+                return Err(staging_io_error(error));
+            }
+        }
         let receipt = {
             let Some(mut manager) = self.manager.try_lock()? else {
-                return Ok(RegionStageValue::Busy);
+                return Ok(RegionStageValue::ManagerBusy);
             };
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
@@ -974,7 +988,6 @@ impl FileRegionCore {
         shard_id: usize,
         memory: Option<&MemoryStore>,
     ) -> io::Result<Option<RegionSpanPublish>> {
-        let _completion_worker = self.lock_shard_completion(shard_id)?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
@@ -1146,28 +1159,24 @@ impl FileRegionCore {
         }))
     }
 
-    /// Rotates one empty data shard through the exact read-drain and header
-    /// completion boundary. The global gate protects the FIFO plan while no
-    /// manager mutex is held waiting for readers of a reused victim.
-    pub(crate) fn rotate_shard(
-        &self,
-        engine: &dyn IoEngine,
-        geometry: crate::recovery::DataGeometry,
-        shard_id: usize,
-        buffer: BufferLease,
-    ) -> io::Result<bool> {
+    /// Rotates one empty data shard through the exact read-drain boundary. The
+    /// RegionSet-local gate protects its FIFO plan while no manager mutex is held
+    /// waiting for readers of a reused victim.
+    pub(crate) fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
         self.health.require_healthy()?;
-        if !geometry.is_valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "rotation data geometry is invalid",
-            ));
-        }
-        let completion_worker = self.lock_shard_completion(shard_id)?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
-        let rotation = self.rotation.lock().map_err(|_| {
+        let set_index = self.layout.set_index_for_shard(shard_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rotation shard is outside the RegionSet layout",
+            )
+        })?;
+        let rotation = self.rotation[set_index].lock().map_err(|_| {
             self.health.enter_miss_only();
-            io::Error::new(io::ErrorKind::InvalidData, "rotation gate is poisoned")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RegionSet rotation gate is poisoned",
+            )
         })?;
         let plan = match self.manager.lock()?.plan_rotation(shard_id) {
             Ok(plan) => plan,
@@ -1197,21 +1206,11 @@ impl FileRegionCore {
         if let Some(victim) = victim.as_mut() {
             victim.mark_unreadable().map_err(region_read_io_error)?;
         }
-        // Manager authority now carries the exact in-progress rotation receipt,
-        // so foreground staging fails fast on this shard. Release every mutex
-        // before issuing either header write.
+        // Manager authority now carries the exact in-progress rotation
+        // receipt, so foreground staging fails fast on this shard. Release the
+        // shard gates before publishing the completed in-memory rotation.
         drop(rotation);
         drop(shard_mutation);
-        drop(completion_worker);
-
-        let buffer =
-            write_region_header(engine, geometry, receipt.sealed, buffer).inspect_err(|_| {
-                self.health.enter_miss_only();
-            })?;
-        let _buffer = write_region_header(engine, geometry, receipt.activated, buffer)
-            .inspect_err(|_| {
-                self.health.enter_miss_only();
-            })?;
 
         let activated = {
             let mut manager = self.manager.lock()?;
@@ -1221,7 +1220,7 @@ impl FileRegionCore {
             })?;
             let region = manager
                 .regions()
-                .get(receipt.activated.region_id as usize)
+                .get(receipt.activated_region_id as usize)
                 .copied()
                 .ok_or_else(|| {
                     io::Error::new(
@@ -1283,9 +1282,11 @@ impl FileRegionCore {
             }
             accounting?;
             if let Some(memory) = memory {
-                for record in chunk.iter().copied() {
-                    memory.complete(shard_id, record.hash, record.entry.seqno);
+                let mut completions = [(0_u64, 0_u64); INDEX_PUBLICATION_CHUNK_RECORDS];
+                for (completion, record) in completions.iter_mut().zip(chunk) {
+                    *completion = (record.hash, record.entry.seqno);
                 }
+                memory.complete_batch(shard_id, &completions[..chunk.len()]);
             }
         }
         Ok((published, obsolete))
@@ -1321,9 +1322,20 @@ impl FileRegionCore {
         }
     }
 
-    pub(crate) fn mask_pending_value(&self, hash: u64, seqno: u64) -> io::Result<()> {
-        self.mutate_index(|index, authority| index.reserve_with_authority(hash, seqno, authority))
-            .map(|_| ())
+    fn try_remove_expired(&self, hash: u64, expected: IndexEntry) {
+        let Ok(Some(mut authority)) = self.manager.try_begin_index_mutation() else {
+            return;
+        };
+        let removal = self
+            .index
+            .try_remove_if_with_authority(hash, expected, &mut authority);
+        let accounting = authority.finish();
+        match removal {
+            Ok(_) if accounting.is_ok() => {}
+            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. })
+                if accounting.is_ok() => {}
+            Ok(_) | Err(_) => self.health.enter_miss_only(),
+        }
     }
 
     #[cfg(test)]
@@ -1352,6 +1364,7 @@ impl FileRegionCore {
         })
     }
 
+    #[cfg(test)]
     fn mutate_index<T>(
         &self,
         mutation: impl FnOnce(
@@ -1421,68 +1434,6 @@ pub(crate) fn runtime_fixed_memory_bytes(
         .checked_add(region_bytes)
         .and_then(|bytes| bytes.checked_add(recovery_scratch))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))
-}
-
-fn write_region_header(
-    engine: &dyn IoEngine,
-    geometry: crate::recovery::DataGeometry,
-    header: RegionHeader,
-    mut buffer: BufferLease,
-) -> io::Result<BufferLease> {
-    if header.region_id >= geometry.region_count {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region header target is outside the data geometry",
-        ));
-    }
-    let bytes = header.encode();
-    buffer
-        .prepare(bytes.len())
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "metadata buffer cannot hold one Region header",
-            )
-        })?
-        .copy_from_slice(&bytes);
-    let buffer = IoBuffer::from_lease(buffer, bytes.len()).map_err(|error| error.error)?;
-    let offset = u64::from(header.region_id)
-        .checked_mul(geometry.region_size)
-        .and_then(|offset| DATA_REGION_AREA_OFFSET.checked_add(offset))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "header offset overflow"))?;
-    let request = submit_cache_io(
-        engine,
-        IoOperation::write(WritePoint::RegionHeader, buffer, offset),
-    )
-    .map_err(|error| error.error)?;
-    let request_id = request.id();
-    let completion = request
-        .wait(engine)
-        .map_err(|timeout| timeout.into_buffer().0)?;
-    let identity_valid = completion.request_id == request_id
-        && completion.kind == OperationKind::Write
-        && completion.bytes_transferred == bytes.len();
-    let (result, buffer) = completion.into_io_result();
-    let completed = result?;
-    if !identity_valid || completed != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Region header write completed with the wrong identity or length",
-        ));
-    }
-    let buffer = buffer.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Region header completion lost its owned buffer",
-        )
-    })?;
-    if buffer.len() != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Region header completion returned the wrong buffer length",
-        ));
-    }
-    Ok(buffer.into_lease())
 }
 
 pub(crate) trait RegionFileSystem {
@@ -1576,7 +1527,6 @@ where
     current_state: Option<SelectedState>,
     prepared_clean: Option<(u8, StateRecord)>,
     cold_reset_needed: bool,
-    materialize_active_headers: bool,
     locked: bool,
     retain_lock: bool,
 }
@@ -1661,7 +1611,6 @@ where
             current_state: None,
             prepared_clean: None,
             cold_reset_needed: false,
-            materialize_active_headers: false,
             locked: false,
             retain_lock: false,
         }
@@ -1950,7 +1899,6 @@ where
             metadata,
             Arc::clone(&self.region_layout),
         )?;
-        self.materialize_active_headers = true;
         Ok(runtime)
     }
 
@@ -2001,7 +1949,6 @@ where
             clean.metadata,
             Arc::clone(&self.region_layout),
         )?;
-        self.materialize_active_headers = false;
         Ok(Some(runtime))
     }
 
@@ -2024,14 +1971,6 @@ where
     }
 
     fn start_runtime(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::Runtime> {
-        if self.materialize_active_headers {
-            let data = self.data_superblock()?;
-            let data_file = self.data_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "data file is not open")
-            })?;
-            materialize_empty_active_region_headers(data_file, data, &runtime.manager)?;
-            self.materialize_active_headers = false;
-        }
         let data = self.data_superblock()?;
         let data_file = self
             .data_file
@@ -2086,10 +2025,8 @@ where
             read_clear_floor,
             health,
         } = runtime.into_core()?;
-        if shards
-            .iter()
-            .any(|shard| shard.mutation.is_poisoned() || shard.completion.is_poisoned())
-            || rotation.is_poisoned()
+        if shards.iter().any(|shard| shard.mutation.is_poisoned())
+            || rotation.iter().any(Mutex::is_poisoned)
         {
             health.enter_miss_only();
             return Err(io::Error::new(
@@ -2321,7 +2258,6 @@ where
         };
         self.locked = false;
         self.prepared_clean = None;
-        self.materialize_active_headers = false;
         self.state_file.take();
         self.data_file.take();
         state_result.and(data_result)
@@ -2569,105 +2505,6 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
             })
 }
 
-/// Materializes the first page of every empty data shard after RUNNING is
-/// durable and before the runtime can admit requests.
-///
-/// This is deliberately only a positioned write boundary. The normal data
-/// durability policy will cover these pages later; startup must not add one
-/// sync per shard. Clean-recovered shards already have authoritative headers and
-/// never call this helper.
-fn materialize_empty_active_region_headers<B>(
-    data_file: &B,
-    data: DataSuperblock,
-    manager: &RegionManagerAuthority,
-) -> io::Result<()>
-where
-    B: IoBackend,
-{
-    // Snapshot under the manager lock, then release it before the first write.
-    // This keeps startup on the same lock contract as steady-state rotation.
-    for (region_offset, header) in manager.empty_active_headers(data)? {
-        write_all_at(
-            data_file,
-            WritePoint::RegionHeader,
-            &header.encode(),
-            region_offset,
-        )?;
-    }
-    Ok(())
-}
-
-fn snapshot_empty_active_region_headers(
-    data: DataSuperblock,
-    manager: &RegionManager,
-) -> io::Result<Vec<(u64, RegionHeader)>> {
-    if manager.region_size() != data.geometry.region_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "runtime Region size does not match the data geometry",
-        ));
-    }
-
-    let mut headers = Vec::new();
-    headers
-        .try_reserve_exact(manager.active_regions().len())
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate Active Region header snapshot",
-            )
-        })?;
-    for &region_id in manager.active_regions() {
-        let region_index = usize::try_from(region_id).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Active Region id is too large")
-        })?;
-        let region = manager.regions().get(region_index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Active Region is outside the data geometry",
-            )
-        })?;
-        if region.region_id != region_id
-            || region.state != RegionMetadataState::Active
-            || region.completed_used != REGION_HEADER_SIZE as u64
-            || region.reserved_used != REGION_HEADER_SIZE as u64
-            || region.max_seqno != 0
-            || region.physical_record_count != 0
-            || region.logical.live_record_count != 0
-            || region.logical.live_record_bytes != 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "anonymous Active Region is not empty",
-            ));
-        }
-
-        let region_offset = u64::from(region_id)
-            .checked_mul(data.geometry.region_size)
-            .and_then(|offset| DATA_REGION_AREA_OFFSET.checked_add(offset))
-            .ok_or_else(|| io::Error::other("Active Region offset overflow"))?;
-        let region_end = region_offset
-            .checked_add(REGION_HEADER_SIZE as u64)
-            .ok_or_else(|| io::Error::other("Active Region header end overflow"))?;
-        if region_end > data.geometry.data_file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Active Region header exceeds the data file",
-            ));
-        }
-
-        let header = RegionHeader {
-            region_id,
-            incarnation: region.incarnation,
-            state: RegionState::Active,
-            created_seqno: region.created_seqno,
-            used: region.completed_used,
-        };
-        headers.push((region_offset, header));
-    }
-    Ok(headers)
-}
-
 #[cfg(test)]
 fn empty_region_metadata(
     data: DataSuperblock,
@@ -2737,7 +2574,7 @@ fn empty_region_metadata_with_layout(
             },
             queue_ordinal,
             created_seqno: if active { u64::from(shard_id) + 1 } else { 0 },
-            durable_used_offset: RECOVERY_PAGE_SIZE as u64,
+            durable_used_offset: 0,
             max_seqno: 0,
             physical_record_count: 0,
             live_record_count: 0,
@@ -2769,8 +2606,6 @@ fn empty_region_metadata_with_layout(
             physical_masked_slots: 0,
             live_record_count: 0,
             live_record_bytes: 0,
-            write_budget_window: 0,
-            write_budget_used_bytes: 0,
             free_region_count: data.geometry.region_count - shards,
             active_region_count: shards,
             sealed_region_count: 0,
@@ -3148,11 +2983,8 @@ mod tests {
             memory_budget_bytes: 32 * 1024 * 1024,
             base_memory_bytes: 0,
             max_buffer_bytes: RECOVERY_PAGE_SIZE,
-            read_queue_depth: 2,
             write_queue_depth: 2,
             read_buffer_slots: 1,
-            write_buffer_slots: 1,
-            control_concurrency: 1,
             backpressure: BackpressurePolicy::Reject,
         })
         .unwrap()
@@ -3499,7 +3331,7 @@ mod tests {
             runtime
                 .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value", 0)
                 .unwrap(),
-            RegionStageValue::Busy
+            RegionStageValue::ManagerBusy
         );
         assert_eq!(manager.next_seqno(), next_seqno);
     }
@@ -3633,6 +3465,100 @@ mod tests {
         );
         assert_eq!(engine.stats().submitted, 2);
         assert_eq!(engine.stats().completed, 2);
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn expired_region_record_is_removed_after_its_first_read() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let resources = data_path_resources();
+        let staging = RegionStaging::try_new(
+            1,
+            crate::region_appender::_WRITE_BATCH_BYTES,
+            data.geometry.region_size,
+            &resources,
+        )
+        .unwrap();
+        let directory = TestDirectory::new();
+        let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+        backend.set_len(data.geometry.data_file_len).unwrap();
+        let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
+        let namespace_id = 7;
+        let key = b"expired-key";
+        let value = b"expired-value";
+        let hash = hash_namespaced_key(data.hash_seed, namespace_id, key);
+        let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len()).unwrap();
+        let RegionStageValue::Staged(identity) = runtime
+            .try_stage_value(
+                &staging,
+                0,
+                hash,
+                record_bytes,
+                namespace_id,
+                key,
+                value,
+                10,
+            )
+            .unwrap()
+        else {
+            panic!("expired value must stage");
+        };
+        runtime
+            .flush_staging_shard(&staging, &engine, 0, None)
+            .unwrap()
+            .expect("expired value must publish before its deadline");
+
+        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(identity.hash).unwrap() else {
+            panic!("published value must enter the Region index");
+        };
+        let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
+            * RECOVERY_PAGE_SIZE;
+        let read_pool = DedicatedBufferPool::try_new(1, read_buffer_bytes).unwrap();
+        assert!(
+            runtime
+                .read_value(
+                    &engine,
+                    data.geometry,
+                    read_pool.acquire().unwrap(),
+                    data.hash_seed,
+                    namespace_id,
+                    key,
+                    ExpiryClock::Fixed(10),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.lookup_snapshot(identity.hash).unwrap(),
+            IndexLookup::Miss
+        );
+        let submitted_after_cleanup = engine.stats().submitted;
+
+        assert!(
+            runtime
+                .read_value(
+                    &engine,
+                    data.geometry,
+                    read_pool.acquire().unwrap(),
+                    data.hash_seed,
+                    namespace_id,
+                    key,
+                    ExpiryClock::Fixed(10),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(engine.stats().submitted, submitted_after_cleanup);
+        assert_eq!(
+            faults.events(),
+            vec![FaultEvent::Write(WritePoint::Record), FaultEvent::Read]
+        );
+        assert_eq!(read_pool.snapshot().in_use, 0);
         engine.shutdown().unwrap();
     }
 
@@ -3792,49 +3718,76 @@ mod tests {
         );
         assert_eq!(
             runtime.manager.inner.lock().unwrap().regions()[0].completed_used,
-            RECOVERY_PAGE_SIZE as u64
+            0
         );
         engine.shutdown().unwrap();
     }
 
     #[test]
-    fn either_rotation_header_failure_latches_miss_only_before_victim_release() {
-        for failing_write in 1..=2 {
-            let data = data_path_superblock();
-            let runtime = FileRegionRuntime::install(
-                PartitionedIndexStorage::anonymous(64).unwrap(),
-                empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
-            )
+    fn rotation_is_committed_without_a_metadata_io_boundary() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        runtime
+            .manager
+            .inner
+            .lock()
+            .unwrap()
+            .request_rotation_for_test(0)
             .unwrap();
-            let directory = TestDirectory::new();
-            let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
-            backend.set_len(data.geometry.data_file_len).unwrap();
-            let engine = BackendIoEngine::new(Arc::new(backend), 2).unwrap();
-            let buffers = DedicatedBufferPool::try_new(1, RECOVERY_PAGE_SIZE).unwrap();
-            runtime
-                .manager
-                .inner
-                .lock()
-                .unwrap()
-                .request_rotation_for_test(0)
-                .unwrap();
-            faults.arm(
-                FaultEvent::Write(WritePoint::RegionHeader),
-                failing_write,
-                FaultAction::ErrorAlways(5),
-            );
 
-            assert_eq!(
-                runtime
-                    .rotate_shard(&engine, data.geometry, 0, buffers.acquire().unwrap(),)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(5)
-            );
-            assert!(!runtime.health.is_healthy());
-            assert_eq!(runtime.lookup_snapshot(1).unwrap(), IndexLookup::Miss);
-            engine.shutdown().unwrap();
-        }
+        assert!(runtime.rotate_shard(0).unwrap());
+        assert!(runtime.health.is_healthy());
+        let manager = runtime.manager.lock().unwrap();
+        assert_eq!(manager.active_regions()[0], REGION_SHARDS);
+        assert_eq!(manager.sealed_regions().back(), Some(&0));
+    }
+
+    #[test]
+    fn rotation_wait_in_one_region_set_does_not_block_another_set() {
+        let data = test_data_superblock_with_regions(6);
+        let layout = RegionLayout::build(
+            data.geometry.region_count,
+            2,
+            &[
+                crate::region_layout::RegionSetConfig::new(0),
+                crate::region_layout::RegionSetConfig::new(1),
+            ],
+        )
+        .unwrap();
+        let other_shard = layout.sets()[1].first_shard as usize;
+        let metadata = empty_region_metadata_with_layout(data, 64, &layout).unwrap();
+        let runtime = FileRegionRuntime::install_with_layout(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            metadata,
+            Arc::new(layout),
+        )
+        .unwrap();
+        runtime
+            .manager
+            .inner
+            .lock()
+            .unwrap()
+            .request_rotation_for_test(other_shard)
+            .unwrap();
+
+        let core = Arc::clone(&runtime.core);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let observed = std::thread::scope(|scope| {
+            let held_first_set = runtime.rotation[0].lock().unwrap();
+            let worker = scope.spawn(move || {
+                sender.send(core.rotate_shard(other_shard)).unwrap();
+            });
+            let observed = receiver.recv_timeout(Duration::from_secs(1));
+            drop(held_first_set);
+            worker.join().unwrap();
+            observed
+        });
+
+        assert!(observed.unwrap().unwrap());
     }
 
     #[test]
@@ -3923,41 +3876,21 @@ mod tests {
         assert_eq!(runtime.lookup_snapshot(7).unwrap(), IndexLookup::Miss);
     }
 
-    fn assert_active_header_startup_boundary(events: &[FaultEvent]) {
+    fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {
         let running_sync = events
             .iter()
             .rposition(|event| *event == FaultEvent::Sync(SyncPoint::RunningState))
             .expect("startup must make RUNNING durable");
-        let header_writes = events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| {
-                (*event == FaultEvent::Write(WritePoint::RegionHeader)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            header_writes.len(),
-            usize::try_from(REGION_SHARDS).unwrap(),
-            "each Active shard needs one header"
-        );
-        assert!(
-            header_writes
-                .iter()
-                .all(|header_write| running_sync < *header_write),
-            "Active headers must follow the durable RUNNING barrier"
-        );
         assert!(
             events[running_sync + 1..]
                 .iter()
-                .all(|event| !matches!(event, FaultEvent::Sync(_))),
-            "Active header materialization must not add startup syncs"
+                .all(|event| !matches!(event, FaultEvent::Write(_))),
+            "startup must not materialize recovery-only Region state in the data file"
         );
     }
 
     #[test]
-    fn fresh_and_dirty_empty_materialize_active_header_after_running_without_sync() {
-        use std::os::unix::fs::FileExt;
-
+    fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
         let directory = TestDirectory::new();
         let config = RegionConfig { index_slots: 8 };
         let data = test_data_superblock();
@@ -3973,24 +3906,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fresh.startup(), RegionStartup::FreshEmpty);
-        assert_active_header_startup_boundary(&fresh_io.events());
-
-        let file = File::open(&directory.files.data).unwrap();
-        for shard_id in 0..REGION_SHARDS {
-            let mut encoded = [0_u8; REGION_HEADER_SIZE];
-            let offset = DATA_REGION_AREA_OFFSET + u64::from(shard_id) * data.geometry.region_size;
-            file.read_exact_at(&mut encoded, offset).unwrap();
-            assert_eq!(
-                RegionHeader::decode(&encoded),
-                Some(RegionHeader {
-                    region_id: shard_id,
-                    incarnation: 1,
-                    state: RegionState::Active,
-                    created_seqno: u64::from(shard_id) + 1,
-                    used: REGION_HEADER_SIZE as u64,
-                })
-            );
-        }
+        assert_no_runtime_data_write_during_startup(&fresh_io.events());
         fresh.close_fast().unwrap();
 
         let (dirty_file_system, dirty_io, _) = FaultRegionFileSystem::new();
@@ -4004,98 +3920,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dirty.startup(), RegionStartup::DirtyEmpty);
-        assert_active_header_startup_boundary(&dirty_io.events());
+        assert_no_runtime_data_write_during_startup(&dirty_io.events());
         dirty.close_fast().unwrap();
     }
 
     #[test]
-    fn active_header_failure_aborts_open_unlocks_and_leaves_running() {
+    fn explicit_flush_syncs_the_shared_data_inode_once() {
         let directory = TestDirectory::new();
-        let config = RegionConfig { index_slots: 8 };
-        let data = test_data_superblock();
-        let (file_system, faults, _) = FaultRegionFileSystem::new();
-        faults.arm(
-            FaultEvent::Write(WritePoint::RegionHeader),
-            1,
-            FaultAction::Torn {
-                bytes: 128,
-                raw_os_error: 5,
-            },
-        );
+        let (first_backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+        let second_backend =
+            FaultBackend::open_with_handle(&directory.files.data, faults.clone()).unwrap();
+        let first: Arc<dyn IoEngine> =
+            Arc::new(BackendIoEngine::new(Arc::new(first_backend), 2).unwrap());
+        let second: Arc<dyn IoEngine> =
+            Arc::new(BackendIoEngine::new(Arc::new(second_backend), 2).unwrap());
 
-        let error = match RegionStore::open(
-            config,
-            FileRegionBackend::new_with_file_system(directory.files.clone(), data, file_system),
-        ) {
-            Ok(_) => panic!("torn Active header must abort open"),
-            Err(error) => error,
-        };
-        assert_eq!(error.raw_os_error(), Some(5));
-
-        let events = faults.events();
-        let running_sync = events
-            .iter()
-            .position(|event| *event == FaultEvent::Sync(SyncPoint::RunningState))
+        crate::region_runtime::flush_data_inode(&[Arc::clone(&first), Arc::clone(&second)])
             .unwrap();
-        let header_write = events
-            .iter()
-            .position(|event| *event == FaultEvent::Write(WritePoint::RegionHeader))
-            .unwrap();
-        let first_unlock = events
-            .iter()
-            .position(|event| *event == FaultEvent::Unlock)
-            .unwrap();
-        assert!(running_sync < header_write && header_write < first_unlock);
-
-        let state = std::fs::read(&directory.files.state).unwrap();
-        let selected = latest_state([
-            &state[..RECOVERY_PAGE_SIZE],
-            &state[RECOVERY_PAGE_SIZE..STATE_FILE_SIZE],
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.record.state, RecoveryState::Running);
-
-        let mut reopened = RegionStore::open(
-            config,
-            FileRegionBackend::new(directory.files.clone(), data),
-        )
-        .expect("failed open must release both file locks");
-        assert_eq!(reopened.startup(), RegionStartup::DirtyEmpty);
-        reopened.close_fast().unwrap();
-    }
-
-    #[test]
-    fn clean_recovery_does_not_rewrite_active_header() {
-        let directory = TestDirectory::new();
-        let config = RegionConfig { index_slots: 8 };
-        let data = test_data_superblock();
-        let mut first = RegionStore::open(
-            config,
-            FileRegionBackend::new(directory.files.clone(), data),
-        )
-        .unwrap();
-        first.close_warm().unwrap();
-
-        let (file_system, faults, _) = FaultRegionFileSystem::new();
-        faults.arm(
-            FaultEvent::Write(WritePoint::RegionHeader),
-            1,
-            FaultAction::ErrorAlways(5),
-        );
-        let mut recovered = RegionStore::open(
-            config,
-            FileRegionBackend::new_with_file_system(directory.files.clone(), data, file_system),
-        )
-        .expect("clean recovery must preserve the existing Active header");
-        assert_eq!(recovered.startup(), RegionStartup::CleanMapped);
-        assert!(
+        assert_eq!(
             faults
                 .events()
                 .iter()
-                .all(|event| *event != FaultEvent::Write(WritePoint::RegionHeader))
+                .filter(|event| **event == FaultEvent::Sync(SyncPoint::ExplicitFlush))
+                .count(),
+            1
         );
-        recovered.close_fast().unwrap();
+        first.shutdown().unwrap();
+        second.shutdown().unwrap();
     }
 
     #[test]
@@ -4132,7 +3983,6 @@ mod tests {
         )
         .unwrap();
         old.publish_running().unwrap();
-        old.materialize_active_headers = true;
         let runtime = old.start_runtime(runtime).unwrap();
         let frozen = old.freeze_warm(runtime).unwrap();
         let prepared = old.persist_frozen(&frozen).unwrap();

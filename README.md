@@ -33,7 +33,7 @@ let runtime_config = RuntimeConfig::default()
     .with_io_engine(IoEngine::Auto)
     .with_io_workers(16)
     .with_io_queue_depth(512)
-    .with_submission_queue_depths(256, 256)
+    .with_write_queue_depth(256)
     .with_partial_flush_age(Duration::from_millis(1));
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
@@ -188,11 +188,8 @@ bound. A returned L1 `Value` retains its charge until the caller drops it, even
 after CLOCK eviction, so slow consumers cannot push new L1 allocations past the
 configured capacity. `RuntimeConfig::with_memory_shards()` controls only the
 volatile L1 lock topology; the default is 32 and it may change on a warm reopen.
-The default L1 directory is the standard library `HashMap` with compact
-intrusive same-hash chains. The fixed-capacity owned cuckoo directory remains
-available for evaluation through the `experimental-l1-directory` Cargo feature;
-it is not enabled by default because its up-front allocation and common-load
-latency still need broader workload evidence.
+The L1 directory is the standard library `HashMap` with compact intrusive
+same-hash chains.
 The aggregate memory budget also reserves fixed 512 KiB stacks for append-shard,
 I/O, and bounded shutdown-reaper threads plus conservative L1 shard, I/O queue,
 and fixed recovery encoding metadata.

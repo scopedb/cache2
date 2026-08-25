@@ -12,7 +12,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::time::Duration;
 
 use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
-use crate::recovery::{CacheEpoch, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE, REGION_HEADER_SIZE};
+use crate::recovery::{CacheEpoch, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE};
 
 const READER_DRAIN_POLL: Duration = Duration::from_micros(50);
 
@@ -33,13 +33,11 @@ pub(crate) struct RegionReadSnapshot {
 
 impl RegionReadSnapshot {
     fn is_valid(self, region_size: u64) -> bool {
-        let header_size = u64::from(REGION_HEADER_SIZE);
-        let empty = self.completed_used == header_size;
+        let empty = self.completed_used == 0;
         self.cache_epoch != 0
             && self.incarnation != 0
             && self.incarnation != u32::MAX
             && self.created_seqno != 0
-            && self.completed_used >= header_size
             && self.completed_used <= region_size
             && self.completed_used % u64::from(RECORD_ALIGNMENT) == 0
             && (empty == (self.max_seqno == 0))
@@ -67,9 +65,7 @@ impl RegionReadSnapshot {
         let Some(end) = offset.checked_add(u64::from(entry.location.record_len())) else {
             return false;
         };
-        offset >= u64::from(REGION_HEADER_SIZE)
-            && offset % u64::from(RECORD_ALIGNMENT) == 0
-            && end <= self.completed_used
+        offset % u64::from(RECORD_ALIGNMENT) == 0 && end <= self.completed_used
     }
 }
 
@@ -139,7 +135,7 @@ impl RegionReadCell {
     fn empty(region_id: u32) -> Self {
         Self {
             generation: RwLock::new(RegionReadGeneration::empty(region_id)),
-            completed_used: AtomicU64::new(REGION_HEADER_SIZE as u64),
+            completed_used: AtomicU64::new(0),
             max_seqno: AtomicU64::new(0),
             readers: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -188,7 +184,7 @@ pub(crate) struct RegionReadDirectory {
 impl RegionReadDirectory {
     pub(crate) fn try_new(region_count: u32, region_size: u64) -> Result<Self, RegionReadError> {
         if region_count == 0
-            || region_size < u64::from(REGION_HEADER_SIZE + RECORD_ALIGNMENT)
+            || region_size < RECOVERY_PAGE_SIZE as u64
             || region_size % RECOVERY_PAGE_SIZE as u64 != 0
         {
             return Err(RegionReadError::InvalidGeometry);
@@ -549,7 +545,7 @@ mod tests {
 
     fn entry(region_id: u32, seqno: u64) -> IndexEntry {
         IndexEntry {
-            location: PackedLocation::new(region_id, REGION_HEADER_SIZE, 64, false).unwrap(),
+            location: PackedLocation::new(region_id, 0, 64, false).unwrap(),
             seqno,
             namespace_id: 0,
             flags: 0,
@@ -559,7 +555,7 @@ mod tests {
     #[test]
     fn readers_of_one_region_share_the_generation_pin() {
         let directory = Arc::new(directory(1));
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
         let first = directory
             .acquire_visible(entry(0, 7), 3, 1)
             .unwrap()
@@ -587,7 +583,7 @@ mod tests {
     #[test]
     fn generation_lock_contention_is_an_immediate_miss() {
         let directory = directory(1);
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
         let cell = &directory.regions[0];
         let generation = cell
             .generation
@@ -614,7 +610,7 @@ mod tests {
     #[test]
     fn active_completion_update_does_not_wait_for_an_inflight_read() {
         let directory = Arc::new(directory(1));
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
         let reader = directory
             .acquire_visible(entry(0, 7), 3, 1)
             .unwrap()
@@ -637,7 +633,7 @@ mod tests {
     #[test]
     fn draining_rejects_new_reads_while_rotation_waits_for_the_old_reader() {
         let directory = Arc::new(directory(1));
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
         let reader = directory
             .acquire_visible(entry(0, 7), 3, 1)
             .unwrap()
@@ -674,7 +670,7 @@ mod tests {
         drop(reader);
         assert_eq!(
             acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            snapshot(0, 1, 1, 4160, 7)
+            snapshot(0, 1, 1, 64, 7)
         );
         assert!(
             directory
@@ -695,8 +691,8 @@ mod tests {
     #[test]
     fn rotating_one_region_does_not_block_another_region() {
         let directory = directory(2);
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
-        directory.install(snapshot(1, 4, 8, 4160, 9)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
+        directory.install(snapshot(1, 4, 8, 64, 9)).unwrap();
 
         let _rotation = directory.acquire_rotation_write(0, 3, 1).unwrap();
         let other = directory.acquire_visible(entry(1, 9), 3, 1).unwrap();
@@ -706,12 +702,12 @@ mod tests {
     #[test]
     fn activated_generation_rejects_the_old_incarnation_and_entry() {
         let directory = directory(1);
-        let old = snapshot(0, 1, 1, 4160, 7);
+        let old = snapshot(0, 1, 1, 64, 7);
         directory.install(old).unwrap();
 
         let mut rotation = directory.acquire_rotation_write(0, 3, 1).unwrap();
         assert_eq!(rotation.mark_unreadable().unwrap(), old);
-        let activated = snapshot(0, 2, 8, 4160, 9);
+        let activated = snapshot(0, 2, 8, 64, 9);
         rotation.install(activated).unwrap();
         drop(rotation);
 
@@ -737,7 +733,7 @@ mod tests {
     #[test]
     fn clear_floor_rejects_an_older_visible_generation_entry() {
         let directory = directory(1);
-        directory.install(snapshot(0, 1, 1, 4160, 7)).unwrap();
+        directory.install(snapshot(0, 1, 1, 64, 7)).unwrap();
 
         assert!(
             directory

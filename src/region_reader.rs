@@ -14,9 +14,7 @@ use crate::io_engine::{
     BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId,
     submit_cache_io_nowait,
 };
-use crate::recovery::{
-    DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT, REGION_HEADER_SIZE,
-};
+use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT};
 use crate::resources::BufferLease;
 
 pub(crate) const _READ_ALIGNMENT: usize = 4096;
@@ -232,7 +230,6 @@ pub(crate) fn plan_record_read(
         || entry.flags & INDEX_FLAG_VOLATILE != 0
         || location.is_tombstone()
         || location.region_id() >= geometry.region_count
-        || offset < u64::from(REGION_HEADER_SIZE)
         || offset % u64::from(RECORD_ALIGNMENT) != 0
         || record_len == 0
         || record_len % RECORD_ALIGNMENT as usize != 0
@@ -392,7 +389,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let pool = DedicatedBufferPool::try_new(1, _READ_ALIGNMENT).unwrap();
-        let location = PackedLocation::new(1, REGION_HEADER_SIZE + 32, 64, false).unwrap();
+        let location = PackedLocation::new(1, 32, 64, false).unwrap();
         let entry = entry(location);
 
         let completion = submit_record_read(&engine, geometry(), entry, pool.acquire().unwrap())
@@ -402,8 +399,7 @@ mod tests {
         assert_eq!(completion.plan.record_range, 32..96);
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
 
-        let record_absolute =
-            DATA_REGION_AREA_OFFSET + geometry().region_size + u64::from(REGION_HEADER_SIZE + 32);
+        let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
         let reads = backend
             .reads
             .lock()

@@ -83,7 +83,7 @@ impl SoakConfig {
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
             .with_io_queue_depth(self.io_workers.saturating_mul(64))
-            .with_submission_queue_depths(256, 256)
+            .with_write_queue_depth(256)
             .with_read_buffer_slots(32)
             .with_memory_capacity(self.memory_bytes)
             .with_memory_budget(self.memory_bytes.saturating_add(256 * MIB))

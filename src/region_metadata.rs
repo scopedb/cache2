@@ -20,8 +20,8 @@ use std::fmt;
 pub(crate) const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 pub(crate) const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
 pub(crate) const REGION_METADATA_ROOT_SIZE: usize = 256;
-pub(crate) const REGION_METADATA_REGION_SIZE: usize = 96;
-pub(crate) const REGION_METADATA_PARTITION_SIZE: usize = 64;
+pub(crate) const REGION_METADATA_REGION_SIZE: usize = 48;
+pub(crate) const REGION_METADATA_PARTITION_SIZE: usize = 16;
 pub(crate) const REGION_METADATA_REGIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_REGION_SIZE;
 pub(crate) const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
@@ -29,8 +29,6 @@ pub(crate) const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
 
 const PAGE_MAGIC: [u8; 8] = *b"CRRMD\0\0\0";
 const FORMAT_VERSION: u16 = 1;
-const ROOT_FLAGS_SUPPORTED: u32 = ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW;
-const ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW: u32 = 1;
 const MIN_ENCODED_RECORD_SIZE: u64 = 64;
 const MAX_SHARDS: usize = 256;
 
@@ -67,14 +65,10 @@ const ROOT_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 136;
 const ROOT_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 144;
 const ROOT_PHYSICAL_MASKED_SLOTS_OFFSET: usize = 152;
 const ROOT_LIVE_RECORD_COUNT_OFFSET: usize = 160;
-const ROOT_DEPRECATED_VALUE_COUNT_OFFSET: usize = 168;
+const ROOT_RESERVED64_OFFSET: usize = 168;
 const ROOT_LIVE_RECORD_BYTES_OFFSET: usize = 176;
-const ROOT_DEPRECATED_VALUE_BYTES_OFFSET: usize = 184;
-const ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET: usize = 192;
-const ROOT_FLAGS_OFFSET: usize = 196;
-const ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET: usize = 200;
-const ROOT_WRITE_BUDGET_WINDOW_OFFSET: usize = 208;
-const ROOT_WRITE_BUDGET_USED_OFFSET: usize = 216;
+const ROOT_RESERVED_TAIL_START: usize = 184;
+const ROOT_RESERVED_TAIL_END: usize = 224;
 const ROOT_REGION_FIRST_PAGE_OFFSET: usize = 224;
 const ROOT_REGION_PAGE_COUNT_OFFSET: usize = 228;
 const ROOT_PARTITION_FIRST_PAGE_OFFSET: usize = 232;
@@ -92,27 +86,19 @@ const REGION_RESERVED16_OFFSET: usize = 10;
 const REGION_QUEUE_ORDINAL_OFFSET: usize = 12;
 const REGION_CREATED_SEQNO_OFFSET: usize = 16;
 const REGION_DURABLE_USED_OFFSET: usize = 24;
+const REGION_RECORD_COUNT_OFFSET: usize = 28;
 const REGION_MAX_SEQNO_OFFSET: usize = 32;
-const REGION_RECORD_COUNT_OFFSET: usize = 40;
-const REGION_LIVE_RECORD_COUNT_OFFSET: usize = 48;
-const REGION_DEPRECATED_VALUE_COUNT_OFFSET: usize = 56;
-const REGION_LIVE_RECORD_BYTES_OFFSET: usize = 64;
-const REGION_DEPRECATED_VALUE_BYTES_OFFSET: usize = 72;
-const REGION_RESERVED_OFFSET: usize = 80;
+const REGION_LIVE_RECORD_COUNT_OFFSET: usize = 40;
+const REGION_LIVE_RECORD_BYTES_OFFSET: usize = 44;
 
 const PARTITION_ID_OFFSET: usize = 0;
-const PARTITION_FLAGS_OFFSET: usize = 4;
-const PARTITION_FIRST_INDEX_PAGE_OFFSET: usize = 8;
-const PARTITION_INDEX_PAGE_COUNT_OFFSET: usize = 16;
-const PARTITION_FIRST_SLOT_OFFSET: usize = 24;
-const PARTITION_SLOT_COUNT_OFFSET: usize = 32;
-const PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 40;
-const PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 48;
-const PARTITION_PHYSICAL_MASKED_SLOTS_OFFSET: usize = 56;
+const PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 4;
+const PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 8;
+const PARTITION_RESERVED_OFFSET: usize = 12;
 
 const _: () = assert!(REGION_METADATA_PAGE_SIZE == INDEX_IMAGE_PAGE_SIZE);
-const _: () = assert!(REGION_METADATA_REGIONS_PER_PAGE == 42);
-const _: () = assert!(REGION_METADATA_PARTITIONS_PER_PAGE == 63);
+const _: () = assert!(REGION_METADATA_REGIONS_PER_PAGE == 84);
+const _: () = assert!(REGION_METADATA_PARTITIONS_PER_PAGE == 252);
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,9 +168,6 @@ pub(crate) struct RegionMetadataRoot {
     /// Sum of their aligned on-disk record lengths. This is the sole live-byte
     /// and admission charge used by .
     pub(crate) live_record_bytes: u64,
-    /// Zero means that no write-budget window is persisted.
-    pub(crate) write_budget_window: u64,
-    pub(crate) write_budget_used_bytes: u64,
     pub(crate) free_region_count: u32,
     pub(crate) active_region_count: u32,
     pub(crate) sealed_region_count: u32,
@@ -221,6 +204,13 @@ pub(crate) struct PartitionMetadataRecord {
     /// Transient masks must be normalized before CLEAN publication, so
     /// decoders require this count to be zero.
     pub(crate) physical_masked_slots: u64,
+}
+
+#[derive(Clone, Copy)]
+struct EncodedPartitionCounters {
+    partition_id: u32,
+    physical_value_slots: u32,
+    physical_deleted_slots: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -404,7 +394,7 @@ impl RegionMetadata {
             root.region_count as usize,
             decode_region,
         )?;
-        let partitions = decode_record_pages(
+        let counters = decode_record_pages(
             input,
             layout.partition_first_page,
             PageKind::Partition,
@@ -415,6 +405,40 @@ impl RegionMetadata {
             root.partition_count as usize,
             decode_partition,
         )?;
+        let index_slots = usize::try_from(root.index_slots)
+            .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
+        let canonical =
+            canonical_index_partition_ranges(index_slots).map_err(|error| match error {
+                IndexStorageError::SizeOverflow => RegionMetadataError::ArithmeticOverflow,
+                IndexStorageError::Io(_) => RegionMetadataError::Allocation,
+                _ => RegionMetadataError::InvalidField("canonical_partition_directory"),
+            })?;
+        if counters.len() != canonical.len() {
+            return Err(RegionMetadataError::InvalidField(
+                "canonical_partition_directory",
+            ));
+        }
+        let mut partitions = Vec::new();
+        partitions
+            .try_reserve_exact(counters.len())
+            .map_err(|_| RegionMetadataError::Allocation)?;
+        for (counter, range) in counters.into_iter().zip(canonical) {
+            if counter.partition_id as usize != range.partition_id {
+                return Err(RegionMetadataError::InvalidField(
+                    "canonical_partition_directory",
+                ));
+            }
+            partitions.push(PartitionMetadataRecord {
+                partition_id: counter.partition_id,
+                first_index_page: range.first_page as u64,
+                index_page_count: range.page_count as u64,
+                first_slot: range.first_slot as u64,
+                slot_count: range.slot_count as u64,
+                physical_value_slots: u64::from(counter.physical_value_slots),
+                physical_deleted_slots: u64::from(counter.physical_deleted_slots),
+                physical_masked_slots: 0,
+            });
+        }
         Ok(Self {
             root,
             regions: regions.into_boxed_slice(),
@@ -501,7 +525,7 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
         || root.index_slots < 8
         || root.index_slots > maximum_index_slots
         || root.index_page_count != u64::from(expected_index_pages)
-        || root.region_size < RECOVERY_PAGE_SIZE as u64 + MIN_ENCODED_RECORD_SIZE
+        || root.region_size < RECOVERY_PAGE_SIZE as u64
         || root.region_size > MAX_PACKED_REGION_SIZE
         || root.region_size % RECOVERY_PAGE_SIZE as u64 != 0
         || root.region_count == 0
@@ -540,9 +564,6 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
     if root.physical_masked_slots != 0 {
         return Err(RegionMetadataError::InvalidField("physical_masked_slots"));
     }
-    if root.write_budget_window == 0 && root.write_budget_used_bytes != 0 {
-        return Err(RegionMetadataError::InvalidField("write_budget_window"));
-    }
     if layout.region_first_page != 1
         || layout.partition_first_page
             != layout
@@ -575,7 +596,6 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
     for (expected_id, region) in regions.iter().copied().enumerate() {
         if region.region_id as usize != expected_id
             || region.incarnation == u32::MAX
-            || region.durable_used_offset < RECOVERY_PAGE_SIZE as u64
             || region.durable_used_offset > root.region_size
             || region.durable_used_offset % 32 != 0
         {
@@ -593,7 +613,7 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
         }
         if region.state == RegionMetadataState::Free {
             if region.created_seqno != 0
-                || region.durable_used_offset != RECOVERY_PAGE_SIZE as u64
+                || region.durable_used_offset != 0
                 || region.max_seqno != 0
                 || region.physical_record_count != 0
                 || region.live_record_count != 0
@@ -604,7 +624,7 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
             continue;
         }
 
-        let used_bytes = region.durable_used_offset - RECOVERY_PAGE_SIZE as u64;
+        let used_bytes = region.durable_used_offset;
         let empty = used_bytes == 0;
         if region.incarnation == 0
             || region.created_seqno == 0
@@ -1009,27 +1029,13 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
         ROOT_LIVE_RECORD_COUNT_OFFSET,
         root.live_record_count,
     );
-    put_u64(output, ROOT_DEPRECATED_VALUE_COUNT_OFFSET, 0);
+    put_u64(output, ROOT_RESERVED64_OFFSET, 0);
     put_u64(
         output,
         ROOT_LIVE_RECORD_BYTES_OFFSET,
         root.live_record_bytes,
     );
-    put_u64(output, ROOT_DEPRECATED_VALUE_BYTES_OFFSET, 0);
-    put_u32(output, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET, 0);
-    let flags = u32::from(root.write_budget_window != 0) * ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW;
-    put_u32(output, ROOT_FLAGS_OFFSET, flags);
-    put_u64(output, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET, 0);
-    put_u64(
-        output,
-        ROOT_WRITE_BUDGET_WINDOW_OFFSET,
-        root.write_budget_window,
-    );
-    put_u64(
-        output,
-        ROOT_WRITE_BUDGET_USED_OFFSET,
-        root.write_budget_used_bytes,
-    );
+    output[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END].fill(0);
     put_u32(
         output,
         ROOT_REGION_FIRST_PAGE_OFFSET,
@@ -1071,22 +1077,13 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
 fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
     if input.len() != REGION_METADATA_ROOT_SIZE
         || get_u32(input, ROOT_NAMESPACE_COUNT_OFFSET)? != 1
-        || get_u32(input, ROOT_FLAGS_OFFSET)? & !ROOT_FLAGS_SUPPORTED != 0
-        || get_u64(input, ROOT_DEPRECATED_VALUE_COUNT_OFFSET)? != 0
-        || get_u64(input, ROOT_DEPRECATED_VALUE_BYTES_OFFSET)? != 0
-        || get_u32(input, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET)? != 0
-        || get_u64(input, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET)? != 0
+        || get_u64(input, ROOT_RESERVED64_OFFSET)? != 0
+        || input[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
+            .iter()
+            .any(|byte| *byte != 0)
         || get_u32(input, ROOT_RESERVED_OFFSET)? != 0
     {
         return Err(RegionMetadataError::InvalidField("root_encoding"));
-    }
-    let flags = get_u32(input, ROOT_FLAGS_OFFSET)?;
-    let write_budget_window = get_u64(input, ROOT_WRITE_BUDGET_WINDOW_OFFSET)?;
-    let write_budget_used_bytes = get_u64(input, ROOT_WRITE_BUDGET_USED_OFFSET)?;
-    if (flags & ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW != 0) != (write_budget_window != 0)
-        || (flags & ROOT_FLAG_HAS_WRITE_BUDGET_WINDOW == 0 && write_budget_used_bytes != 0)
-    {
-        return Err(RegionMetadataError::InvalidField("root_write_budget"));
     }
     let cache_epoch = u32::try_from(get_u64(input, ROOT_CACHE_EPOCH_OFFSET)?)
         .map_err(|_| RegionMetadataError::InvalidField("cache_epoch"))?;
@@ -1111,8 +1108,6 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
         physical_masked_slots: get_u64(input, ROOT_PHYSICAL_MASKED_SLOTS_OFFSET)?,
         live_record_count: get_u64(input, ROOT_LIVE_RECORD_COUNT_OFFSET)?,
         live_record_bytes: get_u64(input, ROOT_LIVE_RECORD_BYTES_OFFSET)?,
-        write_budget_window,
-        write_budget_used_bytes,
         free_region_count: get_u32(input, ROOT_FREE_REGION_COUNT_OFFSET)?,
         active_region_count: get_u32(input, ROOT_ACTIVE_REGION_COUNT_OFFSET)?,
         sealed_region_count: get_u32(input, ROOT_SEALED_REGION_COUNT_OFFSET)?,
@@ -1120,6 +1115,14 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
 }
 
 fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
+    let durable_used = u32::try_from(region.durable_used_offset)
+        .expect("validated Region used offset fits its packed field");
+    let physical_record_count = u32::try_from(region.physical_record_count)
+        .expect("validated Region record count fits its packed field");
+    let live_record_count = u32::try_from(region.live_record_count)
+        .expect("validated live record count fits its packed field");
+    let live_record_bytes = u32::try_from(region.live_record_bytes)
+        .expect("validated live record bytes fit their packed field");
     put_u32(output, REGION_ID_OFFSET, region.region_id);
     put_u32(output, REGION_INCARNATION_OFFSET, region.incarnation);
     output[REGION_STATE_OFFSET] = region.state as u8;
@@ -1127,40 +1130,17 @@ fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
     put_u16(output, REGION_RESERVED16_OFFSET, 0);
     put_u32(output, REGION_QUEUE_ORDINAL_OFFSET, region.queue_ordinal);
     put_u64(output, REGION_CREATED_SEQNO_OFFSET, region.created_seqno);
-    put_u64(
-        output,
-        REGION_DURABLE_USED_OFFSET,
-        region.durable_used_offset,
-    );
+    put_u32(output, REGION_DURABLE_USED_OFFSET, durable_used);
+    put_u32(output, REGION_RECORD_COUNT_OFFSET, physical_record_count);
     put_u64(output, REGION_MAX_SEQNO_OFFSET, region.max_seqno);
-    put_u64(
-        output,
-        REGION_RECORD_COUNT_OFFSET,
-        region.physical_record_count,
-    );
-    put_u64(
-        output,
-        REGION_LIVE_RECORD_COUNT_OFFSET,
-        region.live_record_count,
-    );
-    put_u64(output, REGION_DEPRECATED_VALUE_COUNT_OFFSET, 0);
-    put_u64(
-        output,
-        REGION_LIVE_RECORD_BYTES_OFFSET,
-        region.live_record_bytes,
-    );
-    put_u64(output, REGION_DEPRECATED_VALUE_BYTES_OFFSET, 0);
+    put_u32(output, REGION_LIVE_RECORD_COUNT_OFFSET, live_record_count);
+    put_u32(output, REGION_LIVE_RECORD_BYTES_OFFSET, live_record_bytes);
 }
 
 fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
     if input.len() != REGION_METADATA_REGION_SIZE
         || input[REGION_FLAGS_OFFSET] != 0
         || get_u16(input, REGION_RESERVED16_OFFSET)? != 0
-        || get_u64(input, REGION_DEPRECATED_VALUE_COUNT_OFFSET)? != 0
-        || get_u64(input, REGION_DEPRECATED_VALUE_BYTES_OFFSET)? != 0
-        || input[REGION_RESERVED_OFFSET..]
-            .iter()
-            .any(|byte| *byte != 0)
     {
         return Err(RegionMetadataError::InvalidField("region_encoding"));
     }
@@ -1171,60 +1151,43 @@ fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
             .ok_or(RegionMetadataError::InvalidField("region_state"))?,
         queue_ordinal: get_u32(input, REGION_QUEUE_ORDINAL_OFFSET)?,
         created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)?,
-        durable_used_offset: get_u64(input, REGION_DURABLE_USED_OFFSET)?,
+        durable_used_offset: u64::from(get_u32(input, REGION_DURABLE_USED_OFFSET)?),
         max_seqno: get_u64(input, REGION_MAX_SEQNO_OFFSET)?,
-        physical_record_count: get_u64(input, REGION_RECORD_COUNT_OFFSET)?,
-        live_record_count: get_u64(input, REGION_LIVE_RECORD_COUNT_OFFSET)?,
-        live_record_bytes: get_u64(input, REGION_LIVE_RECORD_BYTES_OFFSET)?,
+        physical_record_count: u64::from(get_u32(input, REGION_RECORD_COUNT_OFFSET)?),
+        live_record_count: u64::from(get_u32(input, REGION_LIVE_RECORD_COUNT_OFFSET)?),
+        live_record_bytes: u64::from(get_u32(input, REGION_LIVE_RECORD_BYTES_OFFSET)?),
     })
 }
 
 fn encode_partition(partition: &PartitionMetadataRecord, output: &mut [u8]) {
+    let physical_value_slots = u32::try_from(partition.physical_value_slots)
+        .expect("validated partition value count fits its packed field");
+    let physical_deleted_slots = u32::try_from(partition.physical_deleted_slots)
+        .expect("validated partition deleted count fits its packed field");
     put_u32(output, PARTITION_ID_OFFSET, partition.partition_id);
-    put_u32(output, PARTITION_FLAGS_OFFSET, 0);
-    put_u64(
-        output,
-        PARTITION_FIRST_INDEX_PAGE_OFFSET,
-        partition.first_index_page,
-    );
-    put_u64(
-        output,
-        PARTITION_INDEX_PAGE_COUNT_OFFSET,
-        partition.index_page_count,
-    );
-    put_u64(output, PARTITION_FIRST_SLOT_OFFSET, partition.first_slot);
-    put_u64(output, PARTITION_SLOT_COUNT_OFFSET, partition.slot_count);
-    put_u64(
+    put_u32(
         output,
         PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET,
-        partition.physical_value_slots,
+        physical_value_slots,
     );
-    put_u64(
+    put_u32(
         output,
         PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET,
-        partition.physical_deleted_slots,
+        physical_deleted_slots,
     );
-    put_u64(
-        output,
-        PARTITION_PHYSICAL_MASKED_SLOTS_OFFSET,
-        partition.physical_masked_slots,
-    );
+    put_u32(output, PARTITION_RESERVED_OFFSET, 0);
 }
 
-fn decode_partition(input: &[u8]) -> Result<PartitionMetadataRecord> {
-    if input.len() != REGION_METADATA_PARTITION_SIZE || get_u32(input, PARTITION_FLAGS_OFFSET)? != 0
+fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters> {
+    if input.len() != REGION_METADATA_PARTITION_SIZE
+        || get_u32(input, PARTITION_RESERVED_OFFSET)? != 0
     {
         return Err(RegionMetadataError::InvalidField("partition_encoding"));
     }
-    Ok(PartitionMetadataRecord {
+    Ok(EncodedPartitionCounters {
         partition_id: get_u32(input, PARTITION_ID_OFFSET)?,
-        first_index_page: get_u64(input, PARTITION_FIRST_INDEX_PAGE_OFFSET)?,
-        index_page_count: get_u64(input, PARTITION_INDEX_PAGE_COUNT_OFFSET)?,
-        first_slot: get_u64(input, PARTITION_FIRST_SLOT_OFFSET)?,
-        slot_count: get_u64(input, PARTITION_SLOT_COUNT_OFFSET)?,
-        physical_value_slots: get_u64(input, PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET)?,
-        physical_deleted_slots: get_u64(input, PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET)?,
-        physical_masked_slots: get_u64(input, PARTITION_PHYSICAL_MASKED_SLOTS_OFFSET)?,
+        physical_value_slots: get_u32(input, PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET)?,
+        physical_deleted_slots: get_u32(input, PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET)?,
     })
 }
 
@@ -1345,8 +1308,6 @@ mod tests {
                 physical_masked_slots: 0,
                 live_record_count: 1,
                 live_record_bytes: 128,
-                write_budget_window: 20_000,
-                write_budget_used_bytes: 4096,
                 free_region_count: 1,
                 active_region_count: 1,
                 sealed_region_count: 2,
@@ -1358,7 +1319,7 @@ mod tests {
                     state: RegionMetadataState::Active,
                     queue_ordinal: 0,
                     created_seqno: 1,
-                    durable_used_offset: RECOVERY_PAGE_SIZE as u64,
+                    durable_used_offset: 0,
                     max_seqno: 0,
                     physical_record_count: 0,
                     live_record_count: 0,
@@ -1370,7 +1331,7 @@ mod tests {
                     state: RegionMetadataState::Sealed,
                     queue_ordinal: 0,
                     created_seqno: 2,
-                    durable_used_offset: RECOVERY_PAGE_SIZE as u64 + 128,
+                    durable_used_offset: 128,
                     max_seqno: 3,
                     physical_record_count: 2,
                     live_record_count: 1,
@@ -1382,7 +1343,7 @@ mod tests {
                     state: RegionMetadataState::Sealed,
                     queue_ordinal: 1,
                     created_seqno: 4,
-                    durable_used_offset: RECOVERY_PAGE_SIZE as u64 + 64,
+                    durable_used_offset: 64,
                     max_seqno: 4,
                     physical_record_count: 1,
                     live_record_count: 0,
@@ -1394,7 +1355,7 @@ mod tests {
                     state: RegionMetadataState::Free,
                     queue_ordinal: 0,
                     created_seqno: 0,
-                    durable_used_offset: RECOVERY_PAGE_SIZE as u64,
+                    durable_used_offset: 0,
                     max_seqno: 0,
                     physical_record_count: 0,
                     live_record_count: 0,
@@ -1457,6 +1418,8 @@ mod tests {
     fn round_trip_preserves_exact_frozen_authority() {
         let expected = sample();
         let encoded = expected.encode().unwrap();
+        assert_eq!(REGION_METADATA_REGION_SIZE, 48);
+        assert_eq!(REGION_METADATA_PARTITION_SIZE, 16);
         assert_eq!(encoded.len() as u64, expected.encoded_len().unwrap());
         assert_eq!(RegionMetadata::decode(&encoded).unwrap(), expected);
         assert_eq!(&encoded[..8], &PAGE_MAGIC);
@@ -1467,44 +1430,27 @@ mod tests {
         );
         let root = &encoded[REGION_METADATA_PAGE_HEADER_SIZE
             ..REGION_METADATA_PAGE_HEADER_SIZE + REGION_METADATA_ROOT_SIZE];
-        assert_eq!(get_u64(root, ROOT_DEPRECATED_VALUE_COUNT_OFFSET), Ok(0));
-        assert_eq!(get_u64(root, ROOT_DEPRECATED_VALUE_BYTES_OFFSET), Ok(0));
-        assert_eq!(
-            get_u32(root, ROOT_DEPRECATED_ADMISSION_NAMESPACE_OFFSET),
-            Ok(0)
-        );
-        assert_eq!(
-            get_u64(root, ROOT_DEPRECATED_ADMISSION_LIVE_BYTES_OFFSET),
-            Ok(0)
+        assert_eq!(get_u64(root, ROOT_RESERVED64_OFFSET), Ok(0));
+        assert!(
+            root[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
+                .iter()
+                .all(|byte| *byte == 0)
         );
     }
 
     #[test]
-    fn deprecated_accounting_slots_and_epoch_high_bits_are_rejected() {
+    fn reserved_root_slots_and_epoch_high_bits_are_rejected() {
         let mut root_reserved = sample().encode().unwrap();
         let root_page = page_mut(&mut root_reserved, 0).unwrap();
         put_u64(
             page_payload_mut(root_page, 0, REGION_METADATA_ROOT_SIZE),
-            ROOT_DEPRECATED_VALUE_COUNT_OFFSET,
+            ROOT_RESERVED64_OFFSET,
             1,
         );
         finish_page(root_page);
         assert_eq!(
             RegionMetadata::decode(&root_reserved),
             Err(RegionMetadataError::InvalidField("root_encoding"))
-        );
-
-        let mut region_reserved = sample().encode().unwrap();
-        let region_page = page_mut(&mut region_reserved, 1).unwrap();
-        put_u64(
-            page_payload_mut(region_page, 1, REGION_METADATA_REGION_SIZE),
-            REGION_DEPRECATED_VALUE_BYTES_OFFSET,
-            32,
-        );
-        finish_page(region_page);
-        assert_eq!(
-            RegionMetadata::decode(&region_reserved),
-            Err(RegionMetadataError::InvalidField("region_encoding"))
         );
 
         let mut wide_epoch = sample().encode().unwrap();
@@ -1590,58 +1536,14 @@ mod tests {
     }
 
     #[test]
-    fn crc_valid_page_balanced_but_non_canonical_partition_directory_is_rejected() {
+    fn compact_partition_ids_must_match_the_derived_directory() {
         let metadata = sample_with_index_slots(12 * INDEX_IMAGE_SLOTS_PER_PAGE);
-        let ranges = canonical_index_partition_ranges(metadata.root.index_slots as usize).unwrap();
-        let right = ranges
-            .iter()
-            .position(|range| range.partition_id != 0 && range.page_count >= 2)
-            .unwrap();
-        let left = right - 1;
-        assert_eq!(right / REGION_METADATA_PARTITIONS_PER_PAGE, 0);
-
         let mut encoded = metadata.encode().unwrap();
         let layout =
             MetadataLayout::new(metadata.root.region_count, metadata.root.partition_count).unwrap();
         let partition_page = page_mut(&mut encoded, layout.partition_first_page as usize).unwrap();
-        let left_record = page_payload_mut(partition_page, left, REGION_METADATA_PARTITION_SIZE);
-        let left_pages = get_u64(left_record, PARTITION_INDEX_PAGE_COUNT_OFFSET).unwrap();
-        let left_slots = get_u64(left_record, PARTITION_SLOT_COUNT_OFFSET).unwrap();
-        put_u64(
-            left_record,
-            PARTITION_INDEX_PAGE_COUNT_OFFSET,
-            left_pages + 1,
-        );
-        put_u64(
-            left_record,
-            PARTITION_SLOT_COUNT_OFFSET,
-            left_slots + INDEX_IMAGE_SLOTS_PER_PAGE as u64,
-        );
-        let right_record = page_payload_mut(partition_page, right, REGION_METADATA_PARTITION_SIZE);
-        let right_first_page = get_u64(right_record, PARTITION_FIRST_INDEX_PAGE_OFFSET).unwrap();
-        let right_pages = get_u64(right_record, PARTITION_INDEX_PAGE_COUNT_OFFSET).unwrap();
-        let right_first_slot = get_u64(right_record, PARTITION_FIRST_SLOT_OFFSET).unwrap();
-        let right_slots = get_u64(right_record, PARTITION_SLOT_COUNT_OFFSET).unwrap();
-        put_u64(
-            right_record,
-            PARTITION_FIRST_INDEX_PAGE_OFFSET,
-            right_first_page + 1,
-        );
-        put_u64(
-            right_record,
-            PARTITION_INDEX_PAGE_COUNT_OFFSET,
-            right_pages - 1,
-        );
-        put_u64(
-            right_record,
-            PARTITION_FIRST_SLOT_OFFSET,
-            right_first_slot + INDEX_IMAGE_SLOTS_PER_PAGE as u64,
-        );
-        put_u64(
-            right_record,
-            PARTITION_SLOT_COUNT_OFFSET,
-            right_slots - INDEX_IMAGE_SLOTS_PER_PAGE as u64,
-        );
+        let second = page_payload_mut(partition_page, 1, REGION_METADATA_PARTITION_SIZE);
+        put_u32(second, PARTITION_ID_OFFSET, 0);
         finish_page(partition_page);
 
         assert_eq!(

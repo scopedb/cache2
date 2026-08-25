@@ -13,8 +13,9 @@ use cache_rs::{
 
 const MIB: usize = 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 256 * 1024;
+const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REGION_READ_ATTEMPTS: usize = 16;
+const READ_RETRY_DELAY: Duration = Duration::from_micros(50);
 
 struct BenchConfig {
     entries: usize,
@@ -164,7 +165,7 @@ impl BenchConfig {
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
             .with_io_queue_depth(queue_depth)
-            .with_submission_queue_depths(256, 256)
+            .with_write_queue_depth(256)
             .with_read_buffer_slots(self.clients.saturating_mul(2).max(16))
             .with_memory_capacity(self.memory_bytes)
             .with_memory_budget(self.memory_budget_bytes)
@@ -371,22 +372,21 @@ fn concurrent_reads(
                 for ordinal in (client..operations).step_by(clients) {
                     let key_ordinal = first_key + ordinal % key_count;
                     let key = benchmark_key(key_ordinal);
-                    let mut attempts = 0;
+                    let mut attempts = 1;
+                    let mut retry_deadline = None;
                     let value = loop {
                         match cache.get(black_box(key))? {
                             Some(value) => break value,
-                            None
-                                if expected_tier == CacheTier::Region
-                                    && attempts + 1 < MAX_REGION_READ_ATTEMPTS =>
-                            {
-                                attempts += 1;
-                                thread::yield_now();
-                            }
                             None => {
-                                return Err(io::Error::other(format!(
-                                    "benchmark key {key_ordinal} missed on client {client} after {} attempts",
-                                    attempts + 1
-                                )));
+                                let deadline = retry_deadline
+                                    .get_or_insert_with(|| Instant::now() + READ_RETRY_TIMEOUT);
+                                if Instant::now() >= *deadline {
+                                    return Err(io::Error::other(format!(
+                                        "benchmark key {key_ordinal} missed on client {client} after {attempts} attempts",
+                                    )));
+                                }
+                                attempts += 1;
+                                thread::sleep(READ_RETRY_DELAY);
                             }
                         }
                     };

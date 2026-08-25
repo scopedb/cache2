@@ -11,7 +11,7 @@ use crate::io_backend::{DIRECT_IO_ALIGNMENT, WritePoint};
 use crate::io_engine::{
     BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId, submit_cache_io,
 };
-use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry, REGION_HEADER_SIZE};
+use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
 use crate::region_manager::RegionWriteSpan;
 
 pub(crate) const _WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -176,7 +176,6 @@ pub(crate) fn submit_span(
 fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(usize, u64)> {
     if !geometry.is_valid()
         || span.region_id >= geometry.region_count
-        || span.start_offset < u64::from(REGION_HEADER_SIZE)
         || span.start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
         || span.end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
         || span.end_offset <= span.start_offset
@@ -287,8 +286,8 @@ mod tests {
             cache_epoch: 3,
             region_id: 1,
             region_incarnation: 9,
-            start_offset: u64::from(REGION_HEADER_SIZE),
-            end_offset: u64::from(REGION_HEADER_SIZE) + 4096,
+            start_offset: 0,
+            end_offset: 4096,
             record_count: 3,
             max_seqno: 21,
         }
@@ -303,7 +302,7 @@ mod tests {
         lease.prepare(4096).unwrap().fill(0x5a);
 
         let buffer = IoBuffer::from_lease(lease, 4096).unwrap();
-        let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 4096;
+        let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let completion = submit_span(&engine, geometry(), span(), buffer, absolute)
             .unwrap()
             .wait(&engine);
@@ -320,7 +319,7 @@ mod tests {
         assert_eq!(writes[0].0, WritePoint::Record);
         assert_eq!(
             writes[0].1,
-            DATA_REGION_AREA_OFFSET + geometry().region_size + 4096
+            DATA_REGION_AREA_OFFSET + geometry().region_size
         );
         assert_eq!(writes[0].2, vec![0x5a; 4096]);
         drop(writes);

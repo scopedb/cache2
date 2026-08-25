@@ -1,17 +1,14 @@
-//! Owned-buffer asynchronous I/O runtime.
+//! Owned-buffer I/O runtime.
 //!
 //! Requests transfer ownership of their aligned buffer to the engine. The
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
 use std::fmt;
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
-use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -461,13 +458,14 @@ impl SubmitError {
 
 struct CompletionCell {
     completion: Option<IoCompletion>,
-    waker: Option<Waker>,
     consumer_alive: bool,
 }
 
-struct CompletionState {
+pub(crate) struct CompletionState {
     cell: Mutex<CompletionCell>,
     ready: Condvar,
+    cancel_requested: AtomicBool,
+    cancel_notified: AtomicBool,
 }
 
 impl CompletionState {
@@ -475,32 +473,24 @@ impl CompletionState {
         Self {
             cell: Mutex::new(CompletionCell {
                 completion: None,
-                waker: None,
                 consumer_alive: true,
             }),
             ready: Condvar::new(),
+            cancel_requested: AtomicBool::new(false),
+            cancel_notified: AtomicBool::new(false),
         }
     }
 
     fn complete(&self, completion: IoCompletion) {
-        let waker = {
-            let mut cell = lock_unpoisoned(&self.cell);
-            if !cell.consumer_alive {
-                drop(cell);
-                drop(completion);
-                return;
-            }
-            debug_assert!(cell.completion.is_none());
-            cell.completion = Some(completion);
-            self.ready.notify_all();
-            cell.waker.take()
-        };
-        if let Some(waker) = waker {
-            // Waker implementations are external safe Rust and may panic.
-            // Never let that unwind through a driver or interrupt fatal-path
-            // buffer quarantine.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || waker.wake()));
+        let mut cell = lock_unpoisoned(&self.cell);
+        if !cell.consumer_alive {
+            drop(cell);
+            drop(completion);
+            return;
         }
+        debug_assert!(cell.completion.is_none());
+        cell.completion = Some(completion);
+        self.ready.notify_all();
     }
 
     #[cfg(test)]
@@ -535,39 +525,21 @@ impl CompletionState {
         }
     }
 
-    fn poll(&self, context: &mut Context<'_>) -> Poll<IoCompletion> {
-        let mut cell = lock_unpoisoned(&self.cell);
-        if let Some(completion) = cell.completion.take() {
-            return Poll::Ready(completion);
-        }
-        if cell
-            .waker
-            .as_ref()
-            .is_none_or(|waker| !waker.will_wake(context.waker()))
-        {
-            cell.waker = Some(context.waker().clone());
-        }
-        Poll::Pending
-    }
-
     fn detach(&self) {
         let completion = {
             let mut cell = lock_unpoisoned(&self.cell);
             cell.consumer_alive = false;
-            cell.waker = None;
             cell.completion.take()
         };
         drop(completion);
     }
 }
 
-/// A single-consumer completion that supports both blocking callers and any
-/// standard Rust executor. Dropping it detaches the consumer; it does not
+/// A single-consumer completion. Dropping it detaches the consumer; it does not
 /// cancel the operation or release an in-flight buffer.
 pub(crate) struct IoRequest {
     request_id: RequestId,
     completion: Arc<CompletionState>,
-    control: Arc<RequestControl>,
     finished: bool,
 }
 
@@ -607,20 +579,6 @@ impl IoRequest {
     }
 }
 
-impl Future for IoRequest {
-    type Output = IoCompletion;
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.completion.poll(context) {
-            Poll::Ready(completion) => {
-                self.finished = true;
-                Poll::Ready(completion)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 impl Drop for IoRequest {
     fn drop(&mut self) {
         if !self.finished {
@@ -647,7 +605,9 @@ impl BoundedIoRequest {
             Ok(completion) => return Ok(completion),
             Err(request) => request,
         };
-        let cancel_error = engine.cancel(request.id(), request.control.as_ref()).err();
+        let cancel_error = engine
+            .cancel(request.id(), request.completion.as_ref())
+            .err();
         let grace_deadline = Instant::now()
             .checked_add(self.cancel_grace)
             .unwrap_or_else(Instant::now);
@@ -766,7 +726,7 @@ pub(crate) trait IoEngine: Send + Sync {
         deadline: Option<Instant>,
     ) -> Result<IoRequest, SubmitError>;
     fn wake_admission_waiters(&self);
-    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool>;
+    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool>;
     fn shutdown(&self) -> io::Result<()>;
     fn in_flight(&self) -> usize;
     #[cfg(test)]
@@ -818,20 +778,6 @@ pub(crate) struct IoEngineStats {
     pub(crate) direct_bytes: u64,
     pub(crate) buffered_operations: u64,
     pub(crate) buffered_bytes: u64,
-}
-
-pub(crate) struct RequestControl {
-    cancel_requested: AtomicBool,
-    cancel_notified: AtomicBool,
-}
-
-impl RequestControl {
-    fn new() -> Self {
-        Self {
-            cancel_requested: AtomicBool::new(false),
-            cancel_notified: AtomicBool::new(false),
-        }
-    }
 }
 
 struct AdmissionPermit {
@@ -1018,7 +964,6 @@ impl RuntimeShared {
             request_id,
             operation,
             completion,
-            control: _,
             permit,
             submitted_at,
         } = task;
@@ -1059,7 +1004,6 @@ impl RuntimeShared {
             request_id,
             operation,
             completion,
-            control: _,
             permit,
             submitted_at,
         } = task;
@@ -1138,7 +1082,6 @@ struct Task {
     request_id: RequestId,
     operation: IoOperation,
     completion: Arc<CompletionState>,
-    control: Arc<RequestControl>,
     permit: AdmissionPermit,
     submitted_at: Instant,
 }
@@ -1344,13 +1287,10 @@ impl RuntimeInner {
         }
         let request_id = self.next_request_id();
         let completion = Arc::new(CompletionState::new());
-        let control = Arc::new(RequestControl::new());
-        let request_control = Arc::clone(&control);
         let task = Task {
             request_id,
             operation,
             completion: Arc::clone(&completion),
-            control,
             permit,
             submitted_at: submit_started,
         };
@@ -1365,7 +1305,6 @@ impl RuntimeInner {
                 Ok(IoRequest {
                     request_id,
                     completion,
-                    control: request_control,
                     finished: false,
                 })
             }
@@ -1397,11 +1336,11 @@ impl RuntimeInner {
         }
     }
 
-    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
-        if !control.cancel_requested.swap(true, Ordering::AcqRel) {
+    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
+        if !state.cancel_requested.swap(true, Ordering::AcqRel) {
             self.shared.cancel_requested.fetch_add(1, Ordering::Relaxed);
         }
-        if !control.cancel_notified.swap(true, Ordering::AcqRel) {
+        if !state.cancel_notified.swap(true, Ordering::AcqRel) {
             match self.commands.try_send(DriverCommand::Cancel(request_id)) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => {
@@ -1624,8 +1563,8 @@ impl IoEngine for BackendIoEngine {
         self.inner.shared.wake_admission_waiters();
     }
 
-    fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
-        self.inner.cancel(request_id, control)
+    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
+        self.inner.cancel(request_id, state)
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -1684,7 +1623,7 @@ fn backend_driver(
         };
         match command {
             DriverCommand::Submit(mut task) => {
-                if task.control.cancel_requested.load(Ordering::Acquire) {
+                if task.completion.cancel_requested.load(Ordering::Acquire) {
                     shared.finish(task, CompletionStatus::Cancelled, 0);
                     continue;
                 }
@@ -1701,7 +1640,7 @@ fn backend_driver(
                 shared.finish(task, status, transferred);
             }
             DriverCommand::Cancel(request_id) => {
-                // The cancel flag is visible directly through RequestControl.
+                // The cancel flag is visible directly through CompletionState.
                 // A blocking syscall already in progress is allowed to win.
                 let _ = request_id;
             }
@@ -1941,8 +1880,8 @@ mod uring {
             self.inner.shared.wake_admission_waiters();
         }
 
-        fn cancel(&self, request_id: RequestId, control: &RequestControl) -> io::Result<bool> {
-            self.inner.cancel(request_id, control)
+        fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
+            self.inner.cancel(request_id, state)
         }
 
         fn shutdown(&self) -> io::Result<()> {
@@ -2019,18 +1958,24 @@ mod uring {
         flights: HashMap<RequestId, Flight>,
         pending_targets: VecDeque<RequestId>,
         pending_cancels: VecDeque<RequestId>,
+        requested_cancels: Vec<RequestId>,
+        pending_entries: Vec<PendingEntry>,
+        submission_entries: Vec<squeue::Entry>,
+        completion_events: Vec<(u64, i32)>,
         shutting_down: bool,
     }
 
     fn uring_driver(
         files: RuntimeFileSet,
-        ring: IoUring,
+        mut ring: IoUring,
         wake_receiver: UnixStream,
         shared: Arc<RuntimeShared>,
         submit_state: Arc<RwLock<SubmitState>>,
         receiver: Receiver<DriverCommand>,
     ) -> io::Result<()> {
         let queue_depth = shared.queue_depth;
+        let submission_capacity = ring.submission().capacity();
+        let completion_capacity = ring.completion().capacity();
         let mut driver = UringDriver {
             files: Some(files),
             ring: Some(ring),
@@ -2044,15 +1989,14 @@ mod uring {
             flights: HashMap::with_capacity(queue_depth),
             pending_targets: VecDeque::with_capacity(queue_depth),
             pending_cancels: VecDeque::with_capacity(queue_depth),
+            requested_cancels: Vec::with_capacity(queue_depth),
+            pending_entries: Vec::with_capacity(submission_capacity),
+            submission_entries: Vec::with_capacity(submission_capacity),
+            completion_events: Vec::with_capacity(completion_capacity),
             shutting_down: false,
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run()))
-            .unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "io_uring driver panicked",
-                ))
-            });
+            .unwrap_or_else(|_| Err(io::Error::other("io_uring driver panicked")));
         if let Err(error) = &result {
             driver.stop_accepting_and_fail_all(error);
         }
@@ -2100,7 +2044,7 @@ mod uring {
             loop {
                 match self.receiver.try_recv() {
                     Ok(DriverCommand::Submit(task)) => {
-                        if task.control.cancel_requested.load(Ordering::Acquire) {
+                        if task.completion.cancel_requested.load(Ordering::Acquire) {
                             self.shared.finish(task, CompletionStatus::Cancelled, 0);
                         } else if task.operation_is_empty() {
                             self.shared.finish(task, CompletionStatus::Completed, 0);
@@ -2134,17 +2078,20 @@ mod uring {
         }
 
         fn queue_requested_cancels(&mut self) {
-            let requested: Vec<_> = self
-                .flights
-                .iter()
-                .filter_map(|(request_id, flight)| {
-                    (flight.task.control.cancel_requested.load(Ordering::Acquire)
+            self.requested_cancels.clear();
+            self.requested_cancels
+                .extend(self.flights.iter().filter_map(|(request_id, flight)| {
+                    (flight
+                        .task
+                        .completion
+                        .cancel_requested
+                        .load(Ordering::Acquire)
                         && flight.active
                         && !flight.cancel_submitted)
                         .then_some(*request_id)
-                })
-                .collect();
-            for request_id in requested {
+                }));
+            for index in 0..self.requested_cancels.len() {
+                let request_id = self.requested_cancels[index];
                 self.queue_cancel_if_active(request_id);
             }
         }
@@ -2167,26 +2114,32 @@ mod uring {
             if available == 0 {
                 return self.submit_ring();
             }
-            let mut entries = Vec::with_capacity(available);
+            self.pending_entries.clear();
             if !self.shutting_down && !self.wake_active {
-                entries.push(PendingEntry::Wake);
+                self.pending_entries.push(PendingEntry::Wake);
             }
-            while entries.len() < available {
+            while self.pending_entries.len() < available {
                 let Some(request_id) = self.pending_cancels.pop_front() else {
                     break;
                 };
                 if self.flights.contains_key(&request_id) {
-                    entries.push(PendingEntry::Cancel(request_id));
+                    self.pending_entries.push(PendingEntry::Cancel(request_id));
                 }
             }
-            while entries.len() < available {
+            while self.pending_entries.len() < available {
                 let Some(request_id) = self.pending_targets.pop_front() else {
                     break;
                 };
                 let Some(flight) = self.flights.get(&request_id) else {
                     continue;
                 };
-                if flight.task.control.cancel_requested.load(Ordering::Acquire) && !flight.active {
+                if flight
+                    .task
+                    .completion
+                    .cancel_requested
+                    .load(Ordering::Acquire)
+                    && !flight.active
+                {
                     let flight = self
                         .flights
                         .remove(&request_id)
@@ -2195,76 +2148,101 @@ mod uring {
                     self.shared.finish(flight.task, status, flight.transferred);
                     continue;
                 }
-                entries.push(PendingEntry::Target(request_id));
+                self.pending_entries.push(PendingEntry::Target(request_id));
             }
-            if entries.is_empty() {
+            if self.pending_entries.is_empty() {
                 return self.submit_ring();
             }
-            self.push_entries(&entries)?;
+            self.push_pending_entries()?;
             self.submit_ring()
         }
 
+        fn push_pending_entries(&mut self) -> io::Result<()> {
+            self.submission_entries.clear();
+            for index in 0..self.pending_entries.len() {
+                let pending = self.pending_entries[index];
+                let entry = self.build_submission_entry(pending)?;
+                self.submission_entries.push(entry);
+            }
+            self.push_submission_entries()
+        }
+
         fn push_entries(&mut self, pending: &[PendingEntry]) -> io::Result<()> {
-            let wake_fd = self.wake_receiver.as_raw_fd();
-            let mut entries = Vec::with_capacity(pending.len());
+            self.submission_entries.clear();
             for pending_entry in pending {
-                let entry = match *pending_entry {
-                    PendingEntry::Target(request_id) => {
-                        let path = {
-                            let flight = self
-                                .flights
-                                .get(&request_id)
-                                .expect("pending target has a flight");
-                            if flight.force_buffered {
-                                RuntimeIoPath::Buffered
-                            } else {
-                                flight.task.operation.runtime_io_path(
-                                    self.files
-                                        .as_ref()
-                                        .expect("runtime files exist while driver runs"),
-                                    flight.transferred,
-                                )?
-                            }
-                        };
-                        let file_fd = self
-                            .files
-                            .as_ref()
-                            .expect("runtime files exist while driver runs")
-                            .file_for(path)
-                            .as_raw_fd();
+                let entry = self.build_submission_entry(*pending_entry)?;
+                self.submission_entries.push(entry);
+            }
+            self.push_submission_entries()
+        }
+
+        fn build_submission_entry(&mut self, pending: PendingEntry) -> io::Result<squeue::Entry> {
+            let wake_fd = self.wake_receiver.as_raw_fd();
+            Ok(match pending {
+                PendingEntry::Target(request_id) => {
+                    let path = {
                         let flight = self
                             .flights
-                            .get_mut(&request_id)
+                            .get(&request_id)
                             .expect("pending target has a flight");
-                        flight.active = true;
-                        flight.active_path = Some(path);
-                        build_target_entry(file_fd, request_id, flight)?
-                    }
-                    PendingEntry::Cancel(request_id) => opcode::AsyncCancel::new(request_id.get())
+                        if flight.force_buffered {
+                            RuntimeIoPath::Buffered
+                        } else {
+                            flight.task.operation.runtime_io_path(
+                                self.files
+                                    .as_ref()
+                                    .expect("runtime files exist while driver runs"),
+                                flight.transferred,
+                            )?
+                        }
+                    };
+                    let file_fd = self
+                        .files
+                        .as_ref()
+                        .expect("runtime files exist while driver runs")
+                        .file_for(path)
+                        .as_raw_fd();
+                    let flight = self
+                        .flights
+                        .get_mut(&request_id)
+                        .expect("pending target has a flight");
+                    flight.active = true;
+                    flight.active_path = Some(path);
+                    build_target_entry(file_fd, request_id, flight)?
+                }
+                PendingEntry::Cancel(request_id) => opcode::AsyncCancel::new(request_id.get())
+                    .build()
+                    .user_data(CANCEL_CQE_BIT | request_id.get()),
+                PendingEntry::Wake => {
+                    self.wake_active = true;
+                    opcode::PollAdd::new(types::Fd(wake_fd), LINUX_POLLIN)
                         .build()
-                        .user_data(CANCEL_CQE_BIT | request_id.get()),
-                    PendingEntry::Wake => {
-                        self.wake_active = true;
-                        opcode::PollAdd::new(types::Fd(wake_fd), LINUX_POLLIN)
-                            .build()
-                            .user_data(WAKE_REQUEST_ID)
-                    }
-                    PendingEntry::WakeCancel => opcode::AsyncCancel::new(WAKE_REQUEST_ID)
-                        .build()
-                        .user_data(WAKE_CANCEL_ID),
-                };
-                entries.push(entry);
-            }
-            let mut sq = self.ring_mut().submission();
+                        .user_data(WAKE_REQUEST_ID)
+                }
+                PendingEntry::WakeCancel => opcode::AsyncCancel::new(WAKE_REQUEST_ID)
+                    .build()
+                    .user_data(WAKE_CANCEL_ID),
+            })
+        }
+
+        fn push_submission_entries(&mut self) -> io::Result<()> {
+            let UringDriver {
+                ring,
+                submission_entries,
+                ..
+            } = self;
+            let mut sq = ring
+                .as_mut()
+                .expect("ring exists while driver runs")
+                .submission();
             // SAFETY: every file descriptor and data buffer is owned by this
             // driver. Target buffers remain in `flights` until their target
             // CQE; the wake entry is a pointer-free poll operation.
             unsafe {
-                sq.push_multiple(&entries).map_err(|_| {
+                sq.push_multiple(submission_entries).map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ is full")
                 })?;
             }
-            drop(sq);
             Ok(())
         }
 
@@ -2292,13 +2270,22 @@ mod uring {
         }
 
         fn drain_completions(&mut self) {
-            let completions: Vec<(u64, i32)> = {
-                let mut cq = self.ring_mut().completion();
-                cq.by_ref()
-                    .map(|entry| (entry.user_data(), entry.result()))
-                    .collect()
-            };
-            for (user_data, result) in completions {
+            self.completion_events.clear();
+            {
+                let UringDriver {
+                    ring,
+                    completion_events,
+                    ..
+                } = self;
+                let mut cq = ring
+                    .as_mut()
+                    .expect("ring exists while driver runs")
+                    .completion();
+                completion_events
+                    .extend(cq.by_ref().map(|entry| (entry.user_data(), entry.result())));
+            }
+            for index in 0..self.completion_events.len() {
+                let (user_data, result) = self.completion_events[index];
                 if user_data == WAKE_REQUEST_ID {
                     self.wake_active = false;
                     if !self.shutting_down && result >= 0 {
@@ -2341,7 +2328,11 @@ mod uring {
             if result < 0 {
                 let raw_error = result.saturating_neg();
                 let error = io::Error::from_raw_os_error(raw_error);
-                if !flight.task.control.cancel_requested.load(Ordering::Acquire)
+                if !flight
+                    .task
+                    .completion
+                    .cancel_requested
+                    .load(Ordering::Acquire)
                     && self
                         .files
                         .as_ref()
@@ -2353,7 +2344,11 @@ mod uring {
                     self.pending_targets.push_back(request_id);
                     return;
                 }
-                let cancelled = flight.task.control.cancel_requested.load(Ordering::Acquire)
+                let cancelled = flight
+                    .task
+                    .completion
+                    .cancel_requested
+                    .load(Ordering::Acquire)
                     && matches!(raw_error, LINUX_EINTR | LINUX_ECANCELED);
                 let status = if cancelled
                     && (flight.task.operation.kind() == OperationKind::Read
@@ -2410,7 +2405,12 @@ mod uring {
                                 CompletionStatus::Completed,
                                 flight.transferred,
                             );
-                        } else if flight.task.control.cancel_requested.load(Ordering::Acquire) {
+                        } else if flight
+                            .task
+                            .completion
+                            .cancel_requested
+                            .load(Ordering::Acquire)
+                        {
                             let status = cancelled_before_resubmit_status(&flight);
                             self.shared.finish(flight.task, status, flight.transferred);
                         } else {
@@ -2802,12 +2802,11 @@ mod tests {
     use std::fs::{File, OpenOptions};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
-    use std::task::Wake;
     use std::time::Duration;
 
     use crate::io_backend::FileBackend;
     use crate::resources::{
-        BackpressurePolicy, OverloadReason, ResourceController, ResourceLimits,
+        BackpressurePolicy, ReadBufferTryAcquire, ResourceController, ResourceLimits,
         aligned_buffer_capacity,
     };
 
@@ -2943,17 +2942,6 @@ mod tests {
         write_calls: AtomicUsize,
     }
 
-    struct PanicWake {
-        attempted: AtomicBool,
-    }
-
-    impl Wake for PanicWake {
-        fn wake(self: Arc<Self>) {
-            self.attempted.store(true, Ordering::Release);
-            panic!("injected waker panic");
-        }
-    }
-
     impl PanicOnceBackend {
         fn new() -> Self {
             Self {
@@ -3042,11 +3030,8 @@ mod tests {
                 memory_budget_bytes: 1024 * 1024,
                 base_memory_bytes: 0,
                 max_buffer_bytes: aligned_buffer_capacity(maximum).unwrap(),
-                read_queue_depth: 4,
                 write_queue_depth: 4,
                 read_buffer_slots: 2,
-                write_buffer_slots: 2,
-                control_concurrency: 1,
                 backpressure: BackpressurePolicy::Reject,
             })
             .unwrap(),
@@ -3054,15 +3039,13 @@ mod tests {
     }
 
     fn read_buffer(resources: &Arc<ResourceController>, length: usize) -> IoBuffer {
-        let request = resources.begin_read().unwrap();
-        let mut lease = request.buffer;
+        let mut lease = resources.test_buffer();
         lease.prepare(length).unwrap();
         IoBuffer::from_lease(lease, length).unwrap()
     }
 
     fn write_buffer(resources: &Arc<ResourceController>, bytes: &[u8]) -> IoBuffer {
-        let request = resources.begin_write().unwrap();
-        let mut lease = request.buffer;
+        let mut lease = resources.test_buffer();
         lease.prepare(bytes.len()).unwrap().copy_from_slice(bytes);
         IoBuffer::from_lease(lease, bytes.len()).unwrap()
     }
@@ -3238,7 +3221,7 @@ mod tests {
         let request = submit_cache_io_until(
             &engine,
             IoOperation::write(
-                WritePoint::RegionHeader,
+                WritePoint::Record,
                 write_buffer(&resources, &[0x5a; 4096]),
                 0,
             ),
@@ -3435,48 +3418,11 @@ mod tests {
     }
 
     #[test]
-    fn panicking_waker_cannot_unwind_through_the_driver() {
-        let backend = Arc::new(BlockingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let resources = resources(1);
-        let mut request = Box::pin(engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap());
-        assert!(backend.wait_for_entered(1));
-
-        let panic_wake = Arc::new(PanicWake {
-            attempted: AtomicBool::new(false),
-        });
-        let waker = Waker::from(Arc::clone(&panic_wake));
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
-        backend.release();
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !panic_wake.attempted.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(panic_wake.attempted.load(Ordering::Acquire));
-        let completion = match request.as_mut().poll(&mut context) {
-            Poll::Ready(completion) => completion,
-            Poll::Pending => panic!("completion must survive a panicking waker"),
-        };
-        assert!(matches!(completion.status, CompletionStatus::Completed));
-        drop(completion);
-
-        let follow_up = engine
-            .read_exact_at(read_buffer(&resources, 1), 1)
-            .unwrap()
-            .wait();
-        assert!(matches!(follow_up.status, CompletionStatus::Completed));
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
     fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
         let shared = Arc::new(RuntimeShared::new(1));
         let permit = shared.try_admit(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
-        let control = Arc::new(RequestControl::new());
         shared.submitted.fetch_add(1, Ordering::Relaxed);
 
         let resources = resources(1);
@@ -3484,7 +3430,6 @@ mod tests {
             request_id,
             operation: IoOperation::read(read_buffer(&resources, 1), 0),
             completion: Arc::clone(&completion),
-            control,
             permit,
             submitted_at: Instant::now(),
         };
@@ -3501,10 +3446,10 @@ mod tests {
 
         // One of the two fixed read slots remains quarantined instead of
         // becoming reusable after the failure completion.
-        let remaining = resources.begin_read().unwrap();
+        let remaining = resources.test_buffer();
         assert!(matches!(
-            resources.begin_read(),
-            Err(OverloadReason::ReadBufferUnavailable)
+            resources.try_read_buffer(),
+            ReadBufferTryAcquire::Exhausted
         ));
         drop(remaining);
     }

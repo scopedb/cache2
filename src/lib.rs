@@ -18,8 +18,6 @@ mod io_backend;
 mod io_engine;
 mod memory;
 mod memory_arena;
-#[cfg_attr(not(feature = "experimental-l1-directory"), allow(dead_code))]
-mod memory_directory;
 mod record_codec;
 mod recovery;
 mod region;

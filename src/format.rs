@@ -7,25 +7,15 @@ use crate::checksum::{Crc32c, crc32c};
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-pub(crate) const REGION_HEADER_SIZE: usize = 4 * 1024;
 pub(crate) const RECORD_HEADER_SIZE: usize = 64;
 pub(crate) const RECORD_ALIGNMENT: usize = 32;
 
 pub(crate) const MAX_KEY_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
-pub(crate) const REGION_HEADER_MAGIC: [u8; 8] = *b"CRREGION";
 pub(crate) const RECORD_HEADER_MAGIC: [u8; 4] = *b"CRCD";
 
-pub(crate) const REGION_HEADER_CRC_OFFSET: usize = REGION_HEADER_SIZE - size_of::<u32>();
 pub(crate) const RECORD_HEADER_CRC_OFFSET: usize = RECORD_HEADER_SIZE - size_of::<u32>();
-
-const REGION_VERSION_OFFSET: usize = 8;
-const REGION_STATE_OFFSET: usize = 10;
-const REGION_ID_OFFSET: usize = 16;
-const REGION_INCARNATION_OFFSET: usize = 20;
-const REGION_CREATED_SEQNO_OFFSET: usize = 24;
-const REGION_USED_OFFSET: usize = 32;
 
 const RECORD_VERSION_OFFSET: usize = 4;
 const RECORD_KIND_OFFSET: usize = 6;
@@ -43,82 +33,7 @@ const RECORD_PAYLOAD_CRC_OFFSET: usize = 56;
 
 const CODEC_NONE: u8 = 0;
 const CODEC_NAMESPACED_KEY: u8 = 1;
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionState {
-    Active = 1,
-    Sealed = 2,
-}
-
-impl RegionState {
-    #[cfg(any(test, feature = "fuzzing"))]
-    fn decode(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Active),
-            2 => Some(Self::Sealed),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionHeader {
-    pub(crate) region_id: u32,
-    pub(crate) incarnation: u32,
-    pub(crate) state: RegionState,
-    pub(crate) created_seqno: u64,
-    /// Absolute write cursor measured from the start of this region.
-    pub(crate) used: u64,
-}
-
-impl RegionHeader {
-    pub(crate) fn encode(&self) -> [u8; REGION_HEADER_SIZE] {
-        let mut output = [0_u8; REGION_HEADER_SIZE];
-        output[..REGION_HEADER_MAGIC.len()].copy_from_slice(&REGION_HEADER_MAGIC);
-        put_u16(&mut output, REGION_VERSION_OFFSET, FORMAT_VERSION);
-        output[REGION_STATE_OFFSET] = self.state as u8;
-        put_u32(&mut output, REGION_ID_OFFSET, self.region_id);
-        put_u32(&mut output, REGION_INCARNATION_OFFSET, self.incarnation);
-        put_u64(&mut output, REGION_CREATED_SEQNO_OFFSET, self.created_seqno);
-        put_u64(&mut output, REGION_USED_OFFSET, self.used);
-
-        let checksum = crc32c(&output);
-        put_u32(&mut output, REGION_HEADER_CRC_OFFSET, checksum);
-        output
-    }
-
-    #[cfg(any(test, feature = "fuzzing"))]
-    pub(crate) fn decode(input: &[u8]) -> Option<Self> {
-        if input.len() != REGION_HEADER_SIZE
-            || input.get(..REGION_HEADER_MAGIC.len())? != REGION_HEADER_MAGIC
-            || get_u16(input, REGION_VERSION_OFFSET)? != FORMAT_VERSION
-            || !checksum_matches(input, REGION_HEADER_CRC_OFFSET)
-        {
-            return None;
-        }
-
-        let state = RegionState::decode(*input.get(REGION_STATE_OFFSET)?)?;
-        let used = get_u64(input, REGION_USED_OFFSET)?;
-        if used < REGION_HEADER_SIZE as u64 || used % RECORD_ALIGNMENT as u64 != 0 {
-            return None;
-        }
-
-        Some(Self {
-            region_id: get_u32(input, REGION_ID_OFFSET)?,
-            incarnation: get_u32(input, REGION_INCARNATION_OFFSET)?,
-            state,
-            created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)?,
-            used,
-        })
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecordKind {
-    Value = 1,
-    Tombstone = 2,
-}
+const RECORD_KIND_VALUE: u8 = 1;
 
 /// Interpretation of the key bytes stored in a record.
 #[repr(u8)]
@@ -138,19 +53,8 @@ impl RecordCodec {
     }
 }
 
-impl RecordKind {
-    fn decode(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Value),
-            2 => Some(Self::Tombstone),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecordHeader {
-    pub(crate) kind: RecordKind,
     pub(crate) codec: RecordCodec,
     pub(crate) key_len: u32,
     pub(crate) value_len: u32,
@@ -178,7 +82,7 @@ impl RecordHeader {
         let mut output = [0_u8; RECORD_HEADER_SIZE];
         output[..RECORD_HEADER_MAGIC.len()].copy_from_slice(&RECORD_HEADER_MAGIC);
         put_u16(&mut output, RECORD_VERSION_OFFSET, FORMAT_VERSION);
-        output[RECORD_KIND_OFFSET] = self.kind as u8;
+        output[RECORD_KIND_OFFSET] = RECORD_KIND_VALUE;
         output[RECORD_CODEC_OFFSET] = self.codec as u8;
         put_u32(&mut output, RECORD_KEY_LEN_OFFSET, self.key_len);
         put_u32(&mut output, RECORD_VALUE_LEN_OFFSET, self.value_len);
@@ -204,13 +108,13 @@ impl RecordHeader {
         if input.len() != RECORD_HEADER_SIZE
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != FORMAT_VERSION
+            || *input.get(RECORD_KIND_OFFSET)? != RECORD_KIND_VALUE
             || !checksum_matches(input, RECORD_HEADER_CRC_OFFSET)
         {
             return None;
         }
 
         let header = Self {
-            kind: RecordKind::decode(*input.get(RECORD_KIND_OFFSET)?)?,
             codec: RecordCodec::decode(*input.get(RECORD_CODEC_OFFSET)?)?,
             key_len: get_u32(input, RECORD_KEY_LEN_OFFSET)?,
             value_len: get_u32(input, RECORD_VALUE_LEN_OFFSET)?,
@@ -251,10 +155,7 @@ impl RecordHeader {
         {
             return false;
         }
-        if self.kind == RecordKind::Tombstone && (value_len != 0 || stored_len != 0) {
-            return false;
-        }
-        if self.kind == RecordKind::Value && value_len != stored_len {
+        if value_len != stored_len {
             return false;
         }
 
@@ -360,101 +261,40 @@ mod tests {
     }
 
     #[test]
-    fn region_states_match_committed_golden_bytes() {
+    fn value_record_matches_committed_golden_bytes() {
+        let key = b"key";
+        let value = b"value";
+        let mut payload = key.to_vec();
+        payload.extend_from_slice(value);
+        let header = RecordHeader {
+            codec: RecordCodec::PlainKey,
+            key_len: key.len() as u32,
+            value_len: value.len() as u32,
+            stored_len: value.len() as u32,
+            record_len: 96,
+            region_incarnation: 9,
+            epoch: 3,
+            seqno: 34,
+            key_hash: 0x1122_3344_5566_7788,
+            expires_at: 0x0102_0304_0506_0708,
+            payload_crc: crc32c(&payload),
+        };
+        let mut encoded = vec![0_u8; header.record_len as usize];
+        encoded[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
+        encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()].copy_from_slice(&payload);
         let golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/region_headers.golden"
+            "../tests/fixtures/format_v1/value_record.golden"
         ));
-        let headers = [
-            RegionHeader {
-                region_id: 1,
-                incarnation: 9,
-                state: RegionState::Active,
-                created_seqno: 17,
-                used: 8192,
-            },
-            RegionHeader {
-                region_id: 2,
-                incarnation: 7,
-                state: RegionState::Sealed,
-                created_seqno: 8,
-                used: 12288,
-            },
-        ];
-        for (index, header) in headers.into_iter().enumerate() {
-            let start = index * REGION_HEADER_SIZE;
-            let end = start + REGION_HEADER_SIZE;
-            assert_eq!(header.encode().as_slice(), &golden[start..end]);
-            assert_eq!(RegionHeader::decode(&golden[start..end]), Some(header));
-        }
-    }
-
-    #[test]
-    fn value_and_tombstone_match_committed_golden_bytes() {
-        let cases = [
-            (
-                include_str!("../tests/fixtures/format_v1/value_record.golden"),
-                RecordKind::Value,
-                34,
-                b"value".as_slice(),
-                0x0102_0304_0506_0708,
-            ),
-            (
-                include_str!("../tests/fixtures/format_v1/tombstone_record.golden"),
-                RecordKind::Tombstone,
-                35,
-                b"".as_slice(),
-                0,
-            ),
-        ];
-        for (fixture, kind, seqno, value, expires_at) in cases {
-            let key = b"key";
-            let mut payload = key.to_vec();
-            payload.extend_from_slice(value);
-            let header = RecordHeader {
-                kind,
-                codec: RecordCodec::PlainKey,
-                key_len: key.len() as u32,
-                value_len: value.len() as u32,
-                stored_len: value.len() as u32,
-                record_len: 96,
-                region_incarnation: 9,
-                epoch: 3,
-                seqno,
-                key_hash: 0x1122_3344_5566_7788,
-                expires_at,
-                payload_crc: crc32c(&payload),
-            };
-            let mut encoded = vec![0_u8; header.record_len as usize];
-            encoded[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
-            encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()]
-                .copy_from_slice(&payload);
-            let golden = sparse_golden(fixture);
-            assert_eq!(encoded, golden);
-            assert_eq!(
-                RecordHeader::decode(&golden[..RECORD_HEADER_SIZE]),
-                Some(header)
-            );
-        }
-    }
-
-    #[test]
-    fn region_headers_round_trip_in_all_persisted_states() {
-        for state in [RegionState::Active, RegionState::Sealed] {
-            let header = RegionHeader {
-                region_id: 12,
-                incarnation: 4,
-                state,
-                created_seqno: 33,
-                used: (REGION_HEADER_SIZE + 4 * RECORD_ALIGNMENT) as u64,
-            };
-            assert_eq!(RegionHeader::decode(&header.encode()), Some(header));
-        }
+        assert_eq!(encoded, golden);
+        assert_eq!(
+            RecordHeader::decode(&golden[..RECORD_HEADER_SIZE]),
+            Some(header)
+        );
     }
 
     #[test]
     fn record_round_trip_and_alignment() {
         let header = RecordHeader {
-            kind: RecordKind::Value,
             codec: RecordCodec::PlainKey,
             key_len: 3,
             value_len: 5,
@@ -486,12 +326,11 @@ mod tests {
     #[test]
     fn record_decode_rejects_bad_crc_and_lengths() {
         let header = RecordHeader {
-            kind: RecordKind::Tombstone,
             codec: RecordCodec::PlainKey,
             key_len: 8,
-            value_len: 0,
-            stored_len: 0,
-            record_len: RecordHeader::aligned_len(8, 0).unwrap(),
+            value_len: 1,
+            stored_len: 1,
+            record_len: RecordHeader::aligned_len(8, 1).unwrap(),
             region_incarnation: 1,
             epoch: 1,
             seqno: 2,
@@ -508,8 +347,7 @@ mod tests {
         assert_eq!(RecordHeader::decode(&too_short.encode()), None);
 
         let mut mismatched_value = header;
-        mismatched_value.kind = RecordKind::Value;
-        mismatched_value.value_len = 1;
+        mismatched_value.value_len = 2;
         assert_eq!(RecordHeader::decode(&mismatched_value.encode()), None);
 
         assert_eq!(RecordHeader::aligned_len(usize::MAX, 1), None);

@@ -2,8 +2,8 @@
 //! reference runtime path.
 //!
 //! Persistence points are carried through the trait so tests can fail an exact
-//! record, region-header, superblock, or barrier operation without changing the
-//! cache algorithm.
+//! record, superblock, or barrier operation without changing the cache
+//! algorithm.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -246,7 +246,6 @@ pub(crate) fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WritePoint {
     Record,
-    RegionHeader,
     DataSuperblock,
     State,
     RecoveryImageHeader,
@@ -432,6 +431,30 @@ impl FileBackend {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn preallocate_macos(file: &File, len: i64) -> io::Result<()> {
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: `file` owns a valid regular-file descriptor and `store` remains
+    // live and writable for the duration of the call. F_ALLOCATEALL requires
+    // the complete request to be allocated atomically.
+    let allocated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if allocated == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if store.fst_bytesalloc < len {
+        return Err(io::Error::other(
+            "macOS physical preallocation completed with a short extent",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 impl ControlIoBackend for FileBackend {
     fn try_clone_control_file(&self) -> io::Result<File> {
@@ -471,6 +494,9 @@ impl IoBackend for FileBackend {
     }
 
     fn preallocate(&self, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return self.file.set_len(0);
+        }
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         let linux_len = i64::try_from(len).map_err(|_| {
             io::Error::new(
@@ -478,11 +504,24 @@ impl IoBackend for FileBackend {
                 "preallocation length exceeds Linux off_t",
             )
         })?;
-        // Preserve set_len's exact truncate/extend behavior before allocating
-        // physical blocks for the final extent.
-        self.file.set_len(len)?;
+        #[cfg(target_os = "macos")]
+        let macos_len = i64::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "preallocation length exceeds macOS off_t",
+            )
+        })?;
+        #[cfg(target_os = "macos")]
+        {
+            self.file.set_len(0)?;
+            preallocate_macos(&self.file, macos_len)?;
+            self.file.set_len(len)
+        }
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         {
+            // Preserve set_len's exact truncate/extend behavior before
+            // allocating physical blocks for the final extent.
+            self.file.set_len(len)?;
             let error = loop {
                 // SAFETY: `file` owns a valid regular-file descriptor and
                 // both offsets are representable non-negative off_t values.
@@ -494,16 +533,17 @@ impl IoBackend for FileBackend {
             if error == 0 {
                 return Ok(());
             }
-            let error = io::Error::from_raw_os_error(error);
-            if direct_io_unavailable(&error) {
-                return Ok(());
-            }
-            Err(error)
+            Err(io::Error::from_raw_os_error(error))
         }
-        #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+        #[cfg(not(any(
+            all(target_os = "linux", target_pointer_width = "64"),
+            target_os = "macos"
+        )))]
         {
-            let _ = self.direct_mode;
-            Ok(())
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "physical cache-file preallocation is unsupported on this platform",
+            ))
         }
     }
 
@@ -946,7 +986,7 @@ mod tests {
         assert_eq!(
             backend
                 .write_at(
-                    WritePoint::RegionHeader,
+                    WritePoint::DataSuperblock,
                     &record.0[..DIRECT_IO_ALIGNMENT],
                     DIRECT_IO_ALIGNMENT as u64,
                 )
@@ -1017,12 +1057,32 @@ mod tests {
         assert!(!required_files.should_fallback(RuntimeIoPath::Direct, &unavailable));
     }
 
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
     #[test]
     fn preallocate_sets_the_exact_file_extent() {
         let file = TestFile::new("preallocate");
         let backend = FileBackend::open(&file.0).unwrap();
-        backend.preallocate(2 * DIRECT_IO_ALIGNMENT as u64).unwrap();
-        assert_eq!(backend.len().unwrap(), 2 * DIRECT_IO_ALIGNMENT as u64);
+        let len = 2 * DIRECT_IO_ALIGNMENT as u64;
+        backend.preallocate(len).unwrap();
+        assert_eq!(backend.len().unwrap(), len);
+        #[cfg(target_os = "macos")]
+        assert!(backend.file.metadata().unwrap().blocks() * 512 >= len);
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    )))]
+    #[test]
+    fn unsupported_physical_preallocation_fails_closed() {
+        let file = TestFile::new("preallocate-unsupported");
+        let backend = FileBackend::open(&file.0).unwrap();
+        let error = backend.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(backend.len().unwrap(), 0);
     }
 
     #[test]

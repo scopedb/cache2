@@ -65,7 +65,7 @@ impl ScaleConfig {
             .with_io_mode(IoMode::Buffered)
             .with_io_workers(1)
             .with_io_queue_depth(32)
-            .with_submission_queue_depths(16, 16)
+            .with_write_queue_depth(16)
             .with_read_buffer_slots(8)
             .with_memory_capacity(self.memory_bytes)
             .with_memory_budget(self.memory_budget_bytes)

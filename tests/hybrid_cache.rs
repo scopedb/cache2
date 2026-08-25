@@ -37,7 +37,7 @@ impl TestCache {
             .with_io_engine(IoEngine::Sync)
             .with_io_workers(workers)
             .with_io_queue_depth(workers * 4)
-            .with_submission_queue_depths(16, 16)
+            .with_write_queue_depth(16)
             .with_read_buffer_slots(8)
             .with_memory_capacity(4 * 1024 * 1024)
             .with_memory_budget(32 * 1024 * 1024)
@@ -138,7 +138,12 @@ fn fast_close_always_reopens_empty() {
 #[test]
 fn latest_put_is_immediately_visible_before_drain() {
     let files = TestCache::new("latest-memory-visible");
-    let cache = files.config(2).open().unwrap();
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::Sync)
+        .with_io_workers(2)
+        .with_io_queue_depth(8)
+        .with_partial_flush_age(Duration::from_secs(60));
+    let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
     for version in 0_u8..64 {
         eventually_admitted(|| cache.put("key", [version; 1024]));
         let value = cache.get("key").unwrap().unwrap();
@@ -155,7 +160,7 @@ fn reject_returns_when_fixed_staging_needs_a_flush() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(4, 4)
+        .with_write_queue_depth(4)
         .with_read_buffer_slots(2)
         .with_memory_capacity(1024 * 1024)
         .with_memory_budget(32 * 1024 * 1024)
@@ -186,13 +191,13 @@ fn reject_returns_when_fixed_staging_needs_a_flush() {
 }
 
 #[test]
-fn l1_bypass_masks_the_old_region_value_without_waiting() {
+fn l1_bypass_fences_the_old_region_value_without_waiting() {
     let files = TestCache::new("l1-bypass-publication");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(2)
         .with_io_queue_depth(8)
-        .with_submission_queue_depths(16, 16)
+        .with_write_queue_depth(16)
         .with_read_buffer_slots(8)
         .with_memory_capacity(512)
         .with_memory_budget(32 * 1024 * 1024)
@@ -279,7 +284,7 @@ fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(7)
         .with_io_queue_depth(35)
-        .with_submission_queue_depths(7, 11)
+        .with_write_queue_depth(11)
         .with_read_buffer_slots(3)
         .with_memory_capacity(2 * 1024 * 1024)
         .with_memory_budget(32 * 1024 * 1024)
@@ -411,11 +416,11 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
                 .with_memory_budget(2 * 1024 * 1024)
                 .with_staging(256 * 1024, 128 * 1024)
         }),
-        ("submission-queue-out-of-range", |config| {
+        ("write-queue-out-of-range", |config| {
             config
                 .with_io_workers(16)
                 .with_io_queue_depth(65_536)
-                .with_submission_queue_depths(65_537, 1)
+                .with_write_queue_depth(65_537)
         }),
         ("zero-memory-shards", |config| config.with_memory_shards(0)),
         ("partial-flush-age-out-of-range", |config| {
@@ -450,6 +455,28 @@ fn cold_start_removes_stale_recovery_files() {
     assert!(!image.exists());
     assert!(!temporary.exists());
     cache.close_fast().unwrap();
+}
+
+#[test]
+fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
+    let files = TestCache::new("minimum-region");
+    let static_config = StaticConfig::new(2 * 4096)
+        .with_region_size(4096)
+        .with_index_slots(64)
+        .with_shards(1);
+    let value = vec![0x5a; 128];
+
+    let cache = files
+        .config_with_static(1, static_config.clone())
+        .open()
+        .unwrap();
+    cache.put("first", &value).unwrap();
+    cache.close_warm().unwrap();
+
+    let recovered = files.config_with_static(1, static_config).open().unwrap();
+    assert_eq!(recovered.startup_mode(), StartupMode::Warm);
+    assert_eq!(recovered.get("first").unwrap().unwrap().as_ref(), value);
+    recovered.close_fast().unwrap();
 }
 
 #[test]
@@ -511,7 +538,6 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
 
     let detailed = cache.detailed_snapshot().unwrap();
     assert_eq!(detailed.summary, resources);
-    assert_eq!(detailed.queues.read_requests_in_flight, 0);
     assert_eq!(detailed.queues.write_requests_in_flight, 0);
     assert_eq!(
         detailed.queues.write_requests_peak, 0,
@@ -591,7 +617,7 @@ fn read_io_failure_is_counted_and_latches_miss_only() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(16, 16)
+        .with_write_queue_depth(16)
         .with_read_buffer_slots(2)
         .with_memory_capacity(0)
         .with_memory_budget(32 * 1024 * 1024)
@@ -623,7 +649,7 @@ fn promoted_l2_values_release_the_read_buffer_before_return() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(1, 4)
+        .with_write_queue_depth(4)
         .with_read_buffer_slots(1)
         .with_memory_capacity(64 * 1024)
         .with_memory_budget(32 * 1024 * 1024)
@@ -671,7 +697,7 @@ fn retained_l2_value_reports_buffer_saturation() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(1, 4)
+        .with_write_queue_depth(4)
         .with_read_buffer_slots(1)
         .with_memory_capacity(0)
         .with_memory_budget(32 * 1024 * 1024)
@@ -708,7 +734,7 @@ fn bounded_read_buffer_wait_reprobes_l2_before_reading() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(1, 4)
+        .with_write_queue_depth(4)
         .with_read_buffer_slots(1)
         .with_read_buffer_policy(ReadBufferPolicy::Wait(Duration::from_secs(1)))
         .with_memory_capacity(0)
@@ -758,7 +784,7 @@ fn bounded_read_buffer_wait_reports_timeout_separately_from_reject() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_queue_depth(4)
-        .with_submission_queue_depths(1, 4)
+        .with_write_queue_depth(4)
         .with_read_buffer_slots(1)
         .with_read_buffer_policy(ReadBufferPolicy::Wait(Duration::from_millis(5)))
         .with_memory_capacity(0)

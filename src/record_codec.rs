@@ -10,11 +10,9 @@ use std::fmt;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::checksum::Crc32c;
-use crate::format::{
-    MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordCodec, RecordHeader, RecordKind,
-};
+use crate::format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordCodec, RecordHeader};
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation, PackedLocationError};
-use crate::recovery::{RECORD_ALIGNMENT, REGION_HEADER_SIZE};
+use crate::recovery::RECORD_ALIGNMENT;
 use crate::region_manager::RegionAppendReservation;
 
 const NAMESPACE_KEY_PREFIX_SIZE: usize = size_of::<u32>();
@@ -172,7 +170,6 @@ pub(crate) fn encode_value_into_hashed(
         || reservation.region_incarnation == 0
         || reservation.region_incarnation == u32::MAX
         || reservation.seqno == 0
-        || reservation.offset < REGION_HEADER_SIZE
         || reservation.offset % RECORD_ALIGNMENT != 0
     {
         return Err(RecordEncodeError::InvalidReservation);
@@ -207,7 +204,9 @@ pub(crate) fn encode_value_into_hashed(
     payload_crc.update(key);
     payload_crc.update(value);
 
-    destination.fill(0);
+    // Header, namespace/key, and value bytes are overwritten below. Clear only
+    // the alignment tail so a reused staging span cannot leak old padding.
+    destination[payload_end..].fill(0);
     let key_start = RECORD_HEADER_SIZE;
     let raw_key_start = if namespace_id == 0 {
         key_start
@@ -230,7 +229,6 @@ pub(crate) fn encode_value_into_hashed(
         RecordCodec::NamespacedKey
     };
     let header = RecordHeader {
-        kind: RecordKind::Value,
         codec,
         key_len,
         value_len,
@@ -323,7 +321,7 @@ mod tests {
             cache_epoch: 5,
             region_id: 7,
             region_incarnation: 3,
-            offset: REGION_HEADER_SIZE,
+            offset: 0,
             record_bytes: planned,
             seqno: 17,
         };
@@ -342,7 +340,7 @@ mod tests {
 
         assert_eq!(encoded.hash, 0x3c68_d7f9_bfae_9378);
         assert_eq!(encoded.entry.location.region_id(), 7);
-        assert_eq!(encoded.entry.location.offset(), REGION_HEADER_SIZE);
+        assert_eq!(encoded.entry.location.offset(), 0);
         assert_eq!(encoded.entry.location.record_len(), planned);
         assert!(!encoded.entry.location.is_tombstone());
         assert_eq!(encoded.entry.seqno, 17);
@@ -350,7 +348,6 @@ mod tests {
         assert_eq!(encoded.entry.flags, 0);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(header.kind, RecordKind::Value);
         assert_eq!(header.codec, RecordCodec::NamespacedKey);
         assert_eq!(
             header.key_len,
@@ -384,7 +381,7 @@ mod tests {
 
     #[test]
     fn target_chunk_sizes_do_not_pay_per_record_direct_io_padding() {
-        let mut cursor = usize::try_from(REGION_HEADER_SIZE).unwrap();
+        let mut cursor = 0;
         let mut saw_non_direct_boundary = false;
         for (namespace_id, key_len, value_len) in [
             (7, b"file/chunk/0007".len(), 16 * 1024),
@@ -417,7 +414,7 @@ mod tests {
             cache_epoch: 1,
             region_id: 0,
             region_incarnation: 1,
-            offset: REGION_HEADER_SIZE,
+            offset: 0,
             record_bytes: required,
             seqno: 1,
         };

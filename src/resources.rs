@@ -1,7 +1,7 @@
-//! Bounded request admission and aligned record buffers.
+//! Bounded write admission and aligned record buffers.
 //!
-//! Read and write admission are independently bounded so write pressure cannot
-//! consume the resources reserved for cache hits.
+//! Foreground reads are bounded directly by their prepared buffer pool; write
+//! waiting uses a separate request gate and cannot consume hit-path buffers.
 
 #[cfg(not(target_os = "linux"))]
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -17,13 +17,6 @@ pub(crate) const BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_QUEUE_DEPTH: usize = 65_536;
 pub(crate) const MAX_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-#[cfg(test)]
-const READ_BUFFER_SLOTS: usize = 2;
-#[cfg(test)]
-const WRITE_BUFFER_SLOTS: usize = 2;
-#[cfg(test)]
-pub(crate) const CONTROL_BUFFERS_PER_REQUEST: usize = 2;
-pub(crate) const METADATA_BUFFER_SLOTS: usize = 1;
 
 /// Behavior when a foreground write gate or fixed staging path is full.
 /// L2 reads do not use this policy: they reject only when no read buffer is
@@ -57,22 +50,15 @@ pub enum ReadBufferPolicy {
 
 /// The bounded resource that prevented an internal operation from admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum OverloadReason {
-    /// The read submission gate is at its configured depth.
-    ReadQueueFull,
     /// The write or reserved control submission gate is at capacity.
     WriteQueueFull,
     /// Every fully prepared read scratch buffer is leased.
     ReadBufferUnavailable,
     /// The bounded wait for a foreground read scratch buffer expired.
     ReadBufferTimeout,
-    /// Every write/control scratch buffer is leased or allocation failed.
-    WriteBufferUnavailable,
     /// The fixed append-shard staging buffers are full or rotating.
     WriteStagingUnavailable,
-    /// Read admission exceeded the configured timeout.
-    ReadTimeout,
     /// Write/control admission exceeded the configured timeout.
     WriteTimeout,
 }
@@ -80,13 +66,10 @@ pub(crate) enum OverloadReason {
 impl fmt::Display for OverloadReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ReadQueueFull => "read submission queue is full",
             Self::WriteQueueFull => "write submission queue is full",
             Self::ReadBufferUnavailable => "read buffer pool is exhausted",
             Self::ReadBufferTimeout => "read buffer wait expired",
-            Self::WriteBufferUnavailable => "write buffer pool is exhausted",
             Self::WriteStagingUnavailable => "write staging is unavailable",
-            Self::ReadTimeout => "read backpressure timeout expired",
             Self::WriteTimeout => "write backpressure timeout expired",
         })
     }
@@ -96,13 +79,8 @@ pub(crate) struct ResourceLimits {
     pub(crate) memory_budget_bytes: usize,
     pub(crate) base_memory_bytes: usize,
     pub(crate) max_buffer_bytes: usize,
-    pub(crate) read_queue_depth: usize,
     pub(crate) write_queue_depth: usize,
     pub(crate) read_buffer_slots: usize,
-    #[cfg(test)]
-    pub(crate) write_buffer_slots: usize,
-    #[cfg(test)]
-    pub(crate) control_concurrency: usize,
     pub(crate) backpressure: BackpressurePolicy,
 }
 
@@ -123,16 +101,8 @@ impl fmt::Display for ResourceBuildError {
 
 pub(crate) struct ResourceController {
     memory: Arc<MemoryTracker>,
-    read_gate: Arc<RequestGate>,
     write_gate: Arc<RequestGate>,
-    #[cfg(test)]
-    control_gate: Arc<RequestGate>,
     read_pool: Arc<BufferPool>,
-    #[cfg(test)]
-    write_pool: Arc<BufferPool>,
-    #[cfg(test)]
-    control_pool: Arc<BufferPool>,
-    metadata_pool: Arc<BufferPool>,
     backpressure: BackpressurePolicy,
 }
 
@@ -162,14 +132,14 @@ impl Drop for RuntimeMemoryReservation {
 
 impl ResourceController {
     pub(crate) fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
-        if limits.read_queue_depth == 0 || limits.write_queue_depth == 0 {
+        if limits.write_queue_depth == 0 {
             return Err(ResourceBuildError::Invalid(
-                "read/write queue depth must be at least 1",
+                "write queue depth must be at least 1",
             ));
         }
-        if limits.read_queue_depth > MAX_QUEUE_DEPTH || limits.write_queue_depth > MAX_QUEUE_DEPTH {
+        if limits.write_queue_depth > MAX_QUEUE_DEPTH {
             return Err(ResourceBuildError::Invalid(
-                "read/write queue depth exceeds its hard limit",
+                "write queue depth exceeds its hard limit",
             ));
         }
         if limits.read_buffer_slots == 0 {
@@ -182,26 +152,6 @@ impl ResourceController {
                 "read buffer slots exceed their hard limit",
             ));
         }
-        #[cfg(test)]
-        if limits.write_buffer_slots == 0 || limits.write_buffer_slots > MAX_QUEUE_DEPTH {
-            return Err(ResourceBuildError::Invalid(
-                "write buffer slots must be within their hard limit",
-            ));
-        }
-        #[cfg(test)]
-        if limits.control_concurrency == 0 || limits.control_concurrency > MAX_QUEUE_DEPTH {
-            return Err(ResourceBuildError::Invalid(
-                "control concurrency must be within the queue depth hard limit",
-            ));
-        }
-        #[cfg(test)]
-        let control_buffer_slots = limits
-            .control_concurrency
-            .checked_mul(CONTROL_BUFFERS_PER_REQUEST)
-            .filter(|slots| *slots <= MAX_QUEUE_DEPTH)
-            .ok_or(ResourceBuildError::Invalid(
-                "control buffer slots exceed their hard limit",
-            ))?;
         if limits.max_buffer_bytes == 0 || limits.max_buffer_bytes % BUFFER_ALIGNMENT != 0 {
             return Err(ResourceBuildError::Invalid(
                 "maximum buffer size must be a non-zero 4096-byte multiple",
@@ -230,31 +180,9 @@ impl ResourceController {
             Arc::clone(&memory),
         )?);
         read_pool.prepare_all()?;
-        let metadata_pool = Arc::new(BufferPool::try_new(
-            METADATA_BUFFER_SLOTS,
-            limits.max_buffer_bytes,
-            Arc::clone(&memory),
-        )?);
-        metadata_pool.prepare_all()?;
         Ok(Self {
-            read_gate: Arc::new(RequestGate::new(limits.read_queue_depth)),
             write_gate: Arc::new(RequestGate::new(limits.write_queue_depth)),
-            #[cfg(test)]
-            control_gate: Arc::new(RequestGate::new(limits.control_concurrency)),
             read_pool,
-            #[cfg(test)]
-            write_pool: Arc::new(BufferPool::try_new(
-                limits.write_buffer_slots,
-                limits.max_buffer_bytes,
-                Arc::clone(&memory),
-            )?),
-            #[cfg(test)]
-            control_pool: Arc::new(BufferPool::try_new(
-                control_buffer_slots,
-                limits.max_buffer_bytes,
-                Arc::clone(&memory),
-            )?),
-            metadata_pool,
             backpressure: limits.backpressure,
             memory,
         })
@@ -273,15 +201,20 @@ impl ResourceController {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn begin_read(&self) -> Result<DataResources, OverloadReason> {
-        self.acquire_read(WaitMode::new(self.backpressure))
-    }
-
     /// Acquires the sole foreground L2 throttle resource without waiting.
     /// Every returned lease already owns its maximum aligned allocation.
     pub(crate) fn try_read_buffer(&self) -> ReadBufferTryAcquire {
         self.read_pool.try_acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_buffer(&self) -> BufferLease {
+        match self.try_read_buffer() {
+            ReadBufferTryAcquire::Acquired(buffer) => buffer,
+            ReadBufferTryAcquire::Exhausted | ReadBufferTryAcquire::Contended => {
+                panic!("test requires an available prepared read buffer")
+            }
+        }
     }
 
     pub(crate) fn record_read_buffer_rejection(&self) {
@@ -300,33 +233,6 @@ impl ResourceController {
                 Err(OverloadReason::ReadBufferTimeout)
             }
         }
-    }
-
-    #[cfg(test)]
-    fn acquire_read(&self, wait: WaitMode) -> Result<DataResources, OverloadReason> {
-        let queue = self
-            .read_gate
-            .enter(wait)
-            .map_err(|failure| match failure {
-                WaitFailure::Full | WaitFailure::Busy => OverloadReason::ReadQueueFull,
-                WaitFailure::TimedOut => OverloadReason::ReadTimeout,
-            })?;
-        let buffer = self
-            .read_pool
-            .acquire(wait)
-            .map_err(|failure| match failure {
-                WaitFailure::Full | WaitFailure::Busy => OverloadReason::ReadBufferUnavailable,
-                WaitFailure::TimedOut => OverloadReason::ReadTimeout,
-            })?;
-        Ok(DataResources {
-            _queue: queue,
-            buffer,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn begin_write(&self) -> Result<DataResources, OverloadReason> {
-        self.acquire_write(WaitMode::new(self.backpressure))
     }
 
     /// Admit a write whose payload already lives in engine-owned storage.
@@ -348,22 +254,6 @@ impl ResourceController {
         self.acquire_write_permit(wait)
     }
 
-    #[cfg(test)]
-    fn acquire_write(&self, wait: WaitMode) -> Result<DataResources, OverloadReason> {
-        let queue = self.acquire_write_permit(wait)?;
-        let buffer = self
-            .write_pool
-            .acquire(wait)
-            .map_err(|failure| match failure {
-                WaitFailure::Full | WaitFailure::Busy => OverloadReason::WriteBufferUnavailable,
-                WaitFailure::TimedOut => OverloadReason::WriteTimeout,
-            })?;
-        Ok(DataResources {
-            _queue: queue,
-            buffer,
-        })
-    }
-
     fn acquire_write_permit(&self, wait: WaitMode) -> Result<QueuePermit, OverloadReason> {
         self.write_gate
             .enter(wait)
@@ -371,18 +261,6 @@ impl ResourceController {
                 WaitFailure::Full | WaitFailure::Busy => OverloadReason::WriteQueueFull,
                 WaitFailure::TimedOut => OverloadReason::WriteTimeout,
             })
-    }
-
-    /// Lease the Region manager's dedicated metadata buffer.
-    ///
-    /// This pool is independent of foreground admission so an accepted write
-    /// can always finish its region-header or superblock publication. Region
-    /// rotation is globally ordered, so one blocking slot is sufficient even
-    /// when several data shards are active.
-    pub(crate) fn metadata_buffer(&self) -> Result<BufferLease, OverloadReason> {
-        self.metadata_pool
-            .acquire(WaitMode::Block)
-            .map_err(|_| OverloadReason::WriteBufferUnavailable)
     }
 
     pub(crate) fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
@@ -396,10 +274,6 @@ impl ResourceController {
 
     pub(crate) fn runtime_snapshot(&self) -> ResourceRuntimeSnapshot {
         ResourceRuntimeSnapshot {
-            read_requests_in_flight: usize_to_u64(self.read_gate.current.load(Ordering::Relaxed)),
-            read_requests_peak: usize_to_u64(self.read_gate.peak.load(Ordering::Relaxed)),
-            read_rejections: self.read_gate.rejections.load(Ordering::Relaxed),
-            read_wait_ns: self.read_gate.wait_ns.load(Ordering::Relaxed),
             write_requests_in_flight: usize_to_u64(self.write_gate.current.load(Ordering::Relaxed)),
             write_requests_peak: usize_to_u64(self.write_gate.peak.load(Ordering::Relaxed)),
             write_rejections: self.write_gate.rejections.load(Ordering::Relaxed),
@@ -413,69 +287,6 @@ impl ResourceController {
                 self.read_pool.waiters_peak.load(Ordering::Relaxed),
             ),
             read_buffer_wait_ns: self.read_pool.wait_ns.load(Ordering::Relaxed),
-            metadata_buffers_in_use: usize_to_u64(
-                self.metadata_pool.in_use.load(Ordering::Relaxed),
-            ),
-            metadata_buffers_peak: usize_to_u64(self.metadata_pool.peak.load(Ordering::Relaxed)),
-            metadata_buffer_rejections: self.metadata_pool.rejections.load(Ordering::Relaxed),
-            metadata_buffer_wait_ns: self.metadata_pool.wait_ns.load(Ordering::Relaxed),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> ResourceSnapshot {
-        let read_queue_depth = self.read_gate.current.load(Ordering::Relaxed);
-        let write_queue_depth = self.write_gate.current.load(Ordering::Relaxed);
-        let read_buffers_in_use = self.read_pool.in_use.load(Ordering::Relaxed);
-        let write_buffers_in_use = self.write_pool.in_use.load(Ordering::Relaxed);
-        let memory_used_bytes = self.memory.current.load(Ordering::Relaxed);
-        let read_queue_wait_ns = self.read_gate.wait_ns.load(Ordering::Relaxed);
-        let write_queue_wait_ns = self.write_gate.wait_ns.load(Ordering::Relaxed);
-        let control_queue_wait_ns = self.control_gate.wait_ns.load(Ordering::Relaxed);
-        let read_buffer_wait_ns = self.read_pool.wait_ns.load(Ordering::Relaxed);
-        let write_buffer_wait_ns = self.write_pool.wait_ns.load(Ordering::Relaxed);
-        let control_buffer_wait_ns = self.control_pool.wait_ns.load(Ordering::Relaxed);
-        let metadata_buffer_wait_ns = self.metadata_pool.wait_ns.load(Ordering::Relaxed);
-        ResourceSnapshot {
-            read_queue_depth: usize_to_u64(read_queue_depth),
-            write_queue_depth: usize_to_u64(write_queue_depth),
-            read_buffers_in_use: usize_to_u64(read_buffers_in_use),
-            write_buffers_in_use: usize_to_u64(write_buffers_in_use),
-            queue_rejections: self
-                .read_gate
-                .rejections
-                .load(Ordering::Relaxed)
-                .saturating_add(self.write_gate.rejections.load(Ordering::Relaxed))
-                .saturating_add(self.control_gate.rejections.load(Ordering::Relaxed)),
-            buffer_rejections: self
-                .read_pool
-                .rejections
-                .load(Ordering::Relaxed)
-                .saturating_add(self.write_pool.rejections.load(Ordering::Relaxed))
-                .saturating_add(self.control_pool.rejections.load(Ordering::Relaxed))
-                .saturating_add(self.metadata_pool.rejections.load(Ordering::Relaxed)),
-            read_queue_wait_ns,
-            write_queue_wait_ns,
-            control_queue_wait_ns,
-            read_buffer_wait_ns,
-            write_buffer_wait_ns,
-            control_buffer_wait_ns,
-            metadata_buffer_wait_ns,
-            backpressure_wait_ns: read_queue_wait_ns
-                .saturating_add(write_queue_wait_ns)
-                .saturating_add(control_queue_wait_ns)
-                .saturating_add(read_buffer_wait_ns)
-                .saturating_add(write_buffer_wait_ns)
-                .saturating_add(control_buffer_wait_ns)
-                .saturating_add(metadata_buffer_wait_ns),
-            memory_budget_bytes: usize_to_u64(self.memory.budget),
-            memory_used_bytes: usize_to_u64(memory_used_bytes),
-            memory_peak_bytes: usize_to_u64(
-                self.memory
-                    .peak
-                    .load(Ordering::Relaxed)
-                    .max(memory_used_bytes),
-            ),
         }
     }
 }
@@ -489,10 +300,6 @@ pub(crate) struct ManagedMemorySnapshot {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResourceRuntimeSnapshot {
-    pub(crate) read_requests_in_flight: u64,
-    pub(crate) read_requests_peak: u64,
-    pub(crate) read_rejections: u64,
-    pub(crate) read_wait_ns: u64,
     pub(crate) write_requests_in_flight: u64,
     pub(crate) write_requests_peak: u64,
     pub(crate) write_rejections: u64,
@@ -504,38 +311,6 @@ pub(crate) struct ResourceRuntimeSnapshot {
     pub(crate) read_buffer_waiters: u64,
     pub(crate) read_buffer_waiters_peak: u64,
     pub(crate) read_buffer_wait_ns: u64,
-    pub(crate) metadata_buffers_in_use: u64,
-    pub(crate) metadata_buffers_peak: u64,
-    pub(crate) metadata_buffer_rejections: u64,
-    pub(crate) metadata_buffer_wait_ns: u64,
-}
-
-#[cfg(test)]
-pub(crate) struct DataResources {
-    _queue: QueuePermit,
-    pub(crate) buffer: BufferLease,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ResourceSnapshot {
-    pub(crate) read_queue_depth: u64,
-    pub(crate) write_queue_depth: u64,
-    pub(crate) read_buffers_in_use: u64,
-    pub(crate) write_buffers_in_use: u64,
-    pub(crate) queue_rejections: u64,
-    pub(crate) buffer_rejections: u64,
-    pub(crate) read_queue_wait_ns: u64,
-    pub(crate) write_queue_wait_ns: u64,
-    pub(crate) control_queue_wait_ns: u64,
-    pub(crate) read_buffer_wait_ns: u64,
-    pub(crate) write_buffer_wait_ns: u64,
-    pub(crate) control_buffer_wait_ns: u64,
-    pub(crate) metadata_buffer_wait_ns: u64,
-    pub(crate) backpressure_wait_ns: u64,
-    pub(crate) memory_budget_bytes: u64,
-    pub(crate) memory_used_bytes: u64,
-    pub(crate) memory_peak_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -543,23 +318,6 @@ enum WaitMode {
     Reject,
     Block,
     Deadline(Instant),
-}
-
-impl WaitMode {
-    #[cfg(test)]
-    fn new(policy: BackpressurePolicy) -> Self {
-        match policy {
-            BackpressurePolicy::Reject => Self::Reject,
-            BackpressurePolicy::Block => Self::Block,
-            BackpressurePolicy::Timeout(duration) => {
-                let now = Instant::now();
-                // The configuration is capped at 24 hours. Keep construction
-                // fallible in spirit even on an unusual Instant representation:
-                // an unrepresentable deadline expires immediately, never panics.
-                Self::Deadline(now.checked_add(duration).unwrap_or(now))
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1284,11 +1042,8 @@ mod tests {
             memory_budget_bytes: 128 * 1024,
             base_memory_bytes: 16 * 1024,
             max_buffer_bytes: 16 * 1024,
-            read_queue_depth: 2,
             write_queue_depth: 2,
-            read_buffer_slots: READ_BUFFER_SLOTS,
-            write_buffer_slots: WRITE_BUFFER_SLOTS,
-            control_concurrency: 1,
+            read_buffer_slots: 2,
             backpressure: policy,
         }
     }
@@ -1314,26 +1069,24 @@ mod tests {
     #[test]
     fn foreground_read_pool_is_fully_prepared_at_construction() {
         let resources = ResourceController::try_new(limits(BackpressurePolicy::Reject)).unwrap();
-        let mut first = resources.begin_read().unwrap();
-        let mut second = resources.begin_read().unwrap();
-        assert_eq!(first.buffer.prepare(5000).unwrap().len(), 5000);
-        assert_eq!(second.buffer.prepare(9000).unwrap().len(), 9000);
-        assert_eq!(first.buffer.address() % BUFFER_ALIGNMENT, 0);
-        assert_eq!(second.buffer.address() % BUFFER_ALIGNMENT, 0);
-        assert_eq!(
-            resources.begin_read().err(),
-            Some(OverloadReason::ReadQueueFull)
-        );
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.read_queue_depth, 2);
-        assert_eq!(snapshot.read_buffers_in_use, 2);
-        assert_eq!(
-            snapshot.memory_used_bytes,
-            (16 * 1024 + 3 * 16 * 1024) as u64
-        );
-        assert!(snapshot.memory_peak_bytes <= snapshot.memory_budget_bytes);
+        let mut first = resources.test_buffer();
+        let mut second = resources.test_buffer();
+        assert_eq!(first.prepare(5000).unwrap().len(), 5000);
+        assert_eq!(second.prepare(9000).unwrap().len(), 9000);
+        assert_eq!(first.address() % BUFFER_ALIGNMENT, 0);
+        assert_eq!(second.address() % BUFFER_ALIGNMENT, 0);
+        assert!(matches!(
+            resources.try_read_buffer(),
+            ReadBufferTryAcquire::Exhausted
+        ));
+        let snapshot = resources.managed_memory_snapshot();
+        assert_eq!(snapshot.current_bytes, 16 * 1024 + 2 * 16 * 1024);
+        assert!(snapshot.peak_bytes <= snapshot.budget_bytes);
         drop(first);
-        assert!(resources.begin_read().is_ok());
+        assert!(matches!(
+            resources.try_read_buffer(),
+            ReadBufferTryAcquire::Acquired(_)
+        ));
     }
 
     #[test]
@@ -1341,23 +1094,20 @@ mod tests {
         let mut configured = limits(BackpressurePolicy::Reject);
         configured.max_buffer_bytes = 3 * BUFFER_ALIGNMENT;
         let resources = ResourceController::try_new(configured).unwrap();
-        let mut request = resources.begin_read().unwrap();
+        let mut buffer = resources.test_buffer();
 
-        let first = request.buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap();
+        let first = buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap();
         assert!(first.iter().all(|byte| *byte == 0));
         first.fill(0x5a);
 
-        let grown = request
-            .buffer
-            .grow_preserving(2 * BUFFER_ALIGNMENT)
-            .unwrap();
+        let grown = buffer.grow_preserving(2 * BUFFER_ALIGNMENT).unwrap();
         assert!(grown[..BUFFER_ALIGNMENT].iter().all(|byte| *byte == 0x5a));
         assert!(grown[BUFFER_ALIGNMENT..].iter().all(|byte| *byte == 0));
-        assert_eq!(request.buffer.address() % BUFFER_ALIGNMENT, 0);
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.memory_used_bytes, (13 * BUFFER_ALIGNMENT) as u64);
-        assert_eq!(snapshot.memory_peak_bytes, (13 * BUFFER_ALIGNMENT) as u64);
-        assert!(snapshot.memory_peak_bytes <= snapshot.memory_budget_bytes);
+        assert_eq!(buffer.address() % BUFFER_ALIGNMENT, 0);
+        let snapshot = resources.managed_memory_snapshot();
+        assert_eq!(snapshot.current_bytes, 10 * BUFFER_ALIGNMENT);
+        assert_eq!(snapshot.peak_bytes, 10 * BUFFER_ALIGNMENT);
+        assert!(snapshot.peak_bytes <= snapshot.budget_bytes);
     }
 
     #[test]
@@ -1367,39 +1117,29 @@ mod tests {
         configured.memory_budget_bytes = 6 * BUFFER_ALIGNMENT;
         configured.max_buffer_bytes = 2 * BUFFER_ALIGNMENT;
         let resources = ResourceController::try_new(configured).unwrap();
-        let mut request = resources.begin_read().unwrap();
-        request
-            .buffer
-            .grow_preserving(BUFFER_ALIGNMENT)
-            .unwrap()
-            .fill(0xa5);
+        let mut buffer = resources.test_buffer();
+        buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
 
+        assert!(buffer.grow_preserving(3 * BUFFER_ALIGNMENT).is_err());
         assert!(
-            request
-                .buffer
-                .grow_preserving(3 * BUFFER_ALIGNMENT)
-                .is_err()
-        );
-        assert!(
-            request
-                .buffer
+            buffer
                 .prepared(BUFFER_ALIGNMENT)
                 .unwrap()
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.memory_used_bytes, (6 * BUFFER_ALIGNMENT) as u64);
-        assert_eq!(snapshot.memory_peak_bytes, (6 * BUFFER_ALIGNMENT) as u64);
+        let snapshot = resources.managed_memory_snapshot();
+        assert_eq!(snapshot.current_bytes, 4 * BUFFER_ALIGNMENT);
+        assert_eq!(snapshot.peak_bytes, 4 * BUFFER_ALIGNMENT);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn aligned_buffer_uses_a_shared_mapping_on_linux() {
         let resources = ResourceController::try_new(limits(BackpressurePolicy::Reject)).unwrap();
-        let mut request = resources.begin_read().unwrap();
-        request.buffer.prepare(BUFFER_ALIGNMENT).unwrap();
-        let address = request.buffer.address();
+        let mut buffer = resources.test_buffer();
+        buffer.prepare(BUFFER_ALIGNMENT).unwrap();
+        let address = buffer.address();
         let mappings = std::fs::read_to_string("/proc/self/maps").unwrap();
         let permissions = mappings
             .lines()
@@ -1418,138 +1158,58 @@ mod tests {
     }
 
     #[test]
-    fn write_saturation_does_not_consume_reserved_read_resources() {
-        let resources = ResourceController::try_new(limits(BackpressurePolicy::Reject)).unwrap();
-        let _write_a = resources.begin_write().unwrap();
-        let _write_b = resources.begin_write().unwrap();
-        assert_eq!(
-            resources.begin_write().err(),
-            Some(OverloadReason::WriteQueueFull)
-        );
-        let mut read = resources.begin_read().unwrap();
-        assert_eq!(read.buffer.prepare(4096).unwrap().len(), 4096);
-    }
-
-    #[test]
-    fn repeated_buffer_overload_is_bounded_and_leak_free() {
-        let mut configured = limits(BackpressurePolicy::Reject);
-        configured.write_queue_depth = 3;
-        let resources = ResourceController::try_new(configured).unwrap();
-        let mut first = resources.begin_write().unwrap();
-        let mut second = resources.begin_write().unwrap();
-        first.buffer.prepare(5000).unwrap();
-        second.buffer.prepare(9000).unwrap();
-        let memory_after_growth = resources.snapshot().memory_used_bytes;
-
-        for _ in 0..1024 {
-            assert_eq!(
-                resources.begin_write().err(),
-                Some(OverloadReason::WriteBufferUnavailable)
-            );
-        }
-        let saturated = resources.snapshot();
-        assert_eq!(saturated.write_queue_depth, 2);
-        assert_eq!(saturated.write_buffers_in_use, 2);
-        assert_eq!(saturated.queue_rejections, 0);
-        assert_eq!(saturated.buffer_rejections, 1024);
-        assert_eq!(saturated.memory_used_bytes, memory_after_growth);
-        assert!(saturated.memory_peak_bytes <= saturated.memory_budget_bytes);
-
-        drop((first, second));
-        let released = resources.snapshot();
-        assert_eq!(released.write_queue_depth, 0);
-        assert_eq!(released.write_buffers_in_use, 0);
-        assert_eq!(released.memory_used_bytes, memory_after_growth);
-    }
-
-    #[test]
-    fn timeout_is_bounded_and_counted() {
+    fn write_timeout_is_bounded_and_counted() {
         let resources = ResourceController::try_new(limits(BackpressurePolicy::Timeout(
             Duration::from_millis(1),
         )))
         .unwrap();
-        let _first = resources.begin_read().unwrap();
-        let _second = resources.begin_read().unwrap();
-        assert_eq!(resources.snapshot().backpressure_wait_ns, 0);
+        let deadline = || Some(Instant::now() + Duration::from_millis(20));
+        let _first = resources.begin_write_permit_until(deadline()).unwrap();
+        let _second = resources.begin_write_permit_until(deadline()).unwrap();
         assert_eq!(
-            resources.begin_read().err(),
-            Some(OverloadReason::ReadTimeout)
+            resources.begin_write_permit_until(deadline()).err(),
+            Some(OverloadReason::WriteTimeout)
         );
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.queue_rejections, 1);
-        assert!(snapshot.read_queue_wait_ns > 0);
-        assert_eq!(snapshot.write_queue_wait_ns, 0);
-        assert_eq!(snapshot.control_queue_wait_ns, 0);
-        assert_eq!(snapshot.read_buffer_wait_ns, 0);
-        assert_eq!(snapshot.write_buffer_wait_ns, 0);
-        assert_eq!(snapshot.control_buffer_wait_ns, 0);
-        assert_eq!(snapshot.metadata_buffer_wait_ns, 0);
-        assert_eq!(snapshot.backpressure_wait_ns, snapshot.read_queue_wait_ns);
+        let snapshot = resources.runtime_snapshot();
+        assert_eq!(snapshot.write_rejections, 1);
+        assert!(snapshot.write_wait_ns > 0);
     }
 
     #[test]
-    fn buffer_timeout_is_attributed_without_counting_queue_fast_path() {
-        let mut configured = limits(BackpressurePolicy::Timeout(Duration::from_millis(1)));
-        configured.read_queue_depth = 3;
-        configured.read_buffer_slots = 2;
-        let resources = ResourceController::try_new(configured).unwrap();
-        let _first = resources.begin_read().unwrap();
-        let _second = resources.begin_read().unwrap();
-
-        assert_eq!(
-            resources.begin_read().err(),
-            Some(OverloadReason::ReadTimeout)
-        );
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.read_queue_wait_ns, 0);
-        assert!(snapshot.read_buffer_wait_ns > 0);
-        assert_eq!(snapshot.backpressure_wait_ns, snapshot.read_buffer_wait_ns);
-    }
-
-    #[test]
-    fn resource_wait_snapshot_preserves_each_component_and_exact_sum() {
+    fn read_buffer_timeout_is_attributed_to_the_pool() {
         let resources = ResourceController::try_new(limits(BackpressurePolicy::Reject)).unwrap();
-        for (counter, value) in [
-            (&resources.read_gate.wait_ns, 1),
-            (&resources.write_gate.wait_ns, 2),
-            (&resources.control_gate.wait_ns, 3),
-            (&resources.read_pool.wait_ns, 4),
-            (&resources.write_pool.wait_ns, 5),
-            (&resources.control_pool.wait_ns, 6),
-            (&resources.metadata_pool.wait_ns, 7),
-        ] {
-            counter.store(value, Ordering::Relaxed);
-        }
+        let _first = resources.test_buffer();
+        let _second = resources.test_buffer();
 
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.read_queue_wait_ns, 1);
-        assert_eq!(snapshot.write_queue_wait_ns, 2);
-        assert_eq!(snapshot.control_queue_wait_ns, 3);
-        assert_eq!(snapshot.read_buffer_wait_ns, 4);
-        assert_eq!(snapshot.write_buffer_wait_ns, 5);
-        assert_eq!(snapshot.control_buffer_wait_ns, 6);
-        assert_eq!(snapshot.metadata_buffer_wait_ns, 7);
-        assert_eq!(snapshot.backpressure_wait_ns, 28);
+        assert_eq!(
+            resources
+                .wait_read_buffer_until(Instant::now() + Duration::from_millis(20))
+                .err(),
+            Some(OverloadReason::ReadBufferTimeout)
+        );
+        let snapshot = resources.runtime_snapshot();
+        assert_eq!(snapshot.read_buffer_timeouts, 1);
+        assert!(snapshot.read_buffer_wait_ns > 0);
     }
 
     #[test]
-    fn block_waits_outside_the_bounded_queue_and_resumes_on_drop() {
+    fn blocking_write_admission_resumes_after_a_permit_drops() {
         let resources =
             Arc::new(ResourceController::try_new(limits(BackpressurePolicy::Block)).unwrap());
-        let first = resources.begin_read().unwrap();
-        let _second = resources.begin_read().unwrap();
+        let first = resources.begin_write_permit_until(None).unwrap();
+        let _second = resources.begin_write_permit_until(None).unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
         let worker_resources = Arc::clone(&resources);
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let _request = worker_resources.begin_read().unwrap();
+            let _permit = worker_resources.begin_write_permit_until(None).unwrap();
             done_tx.send(()).unwrap();
         });
 
         started_rx.recv().unwrap();
         assert!(done_rx.try_recv().is_err());
-        assert_eq!(resources.snapshot().read_queue_depth, 2);
+        assert_eq!(resources.runtime_snapshot().write_requests_in_flight, 2);
         drop(first);
         done_rx.recv().unwrap();
         worker.join().unwrap();
@@ -1574,36 +1234,27 @@ mod tests {
     }
 
     #[test]
-    fn high_concurrency_small_buffers_grow_within_the_budget() {
+    fn prepared_read_buffers_stay_within_the_memory_budget() {
         let mut configured = limits(BackpressurePolicy::Reject);
         configured.max_buffer_bytes = 1024 * 1024;
-        configured.read_queue_depth = 16;
         configured.write_queue_depth = 16;
         configured.read_buffer_slots = 16;
-        configured.write_buffer_slots = 16;
         configured.memory_budget_bytes =
-            configured.base_memory_bytes + 17 * configured.max_buffer_bytes + 16 * BUFFER_ALIGNMENT;
+            configured.base_memory_bytes + 16 * configured.max_buffer_bytes;
 
         let resources = ResourceController::try_new(configured).unwrap();
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
+        let mut buffers = Vec::new();
         for _ in 0..16 {
-            let mut request = resources.begin_read().unwrap();
-            request.buffer.prepare(1).unwrap();
-            reads.push(request);
+            let mut buffer = resources.test_buffer();
+            buffer.prepare(1).unwrap();
+            buffers.push(buffer);
         }
-        for _ in 0..16 {
-            let mut request = resources.begin_write().unwrap();
-            request.buffer.prepare(1).unwrap();
-            writes.push(request);
-        }
-
-        let snapshot = resources.snapshot();
-        assert_eq!(snapshot.read_buffers_in_use, 16);
-        assert_eq!(snapshot.write_buffers_in_use, 16);
-        assert_eq!(snapshot.memory_used_bytes, snapshot.memory_budget_bytes);
-        assert!(snapshot.memory_peak_bytes <= snapshot.memory_budget_bytes);
-        drop((reads, writes));
+        let resources_snapshot = resources.runtime_snapshot();
+        let memory = resources.managed_memory_snapshot();
+        assert_eq!(resources_snapshot.read_buffers_in_use, 16);
+        assert_eq!(memory.current_bytes, memory.budget_bytes);
+        assert!(memory.peak_bytes <= memory.budget_bytes);
+        drop(buffers);
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! completes; clean entries use a small CLOCK policy and may be discarded at
 //! any time.
 
-#[cfg(not(feature = "experimental-l1-directory"))]
 use std::collections::HashMap;
 use std::io;
 use std::ops::Deref;
@@ -19,15 +18,10 @@ use crate::eviction::{
 use crate::expiry::ExpiryClock;
 use crate::memory_arena::MemoryArena;
 pub(crate) use crate::memory_arena::MemoryValue;
-#[cfg(test)]
-use crate::memory_arena::MemoryValueHeader;
-use crate::memory_directory::DirectoryUpsert;
-#[cfg(feature = "experimental-l1-directory")]
-use crate::memory_directory::MemoryDirectory;
 
 /// Charged resident metadata: the entry slot, eviction-policy slot, and the
-/// intrusive retained-value header. Container buckets and allocator metadata
-/// are excluded from managed figures, like the other runtime collections.
+/// retained-value ownership. Container buckets and allocator metadata are
+/// excluded from managed figures, like the other runtime collections.
 pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// Full-key collision work must stay bounded even when callers supply many
 /// distinct keys with the same 64-bit cache hash.
@@ -40,6 +34,7 @@ const NO_SLOT_INDEX: u32 = u32::MAX;
 /// with shard occupancy.
 const MAX_EVICTIONS_PER_INSERT: usize = 16;
 const MAX_BUDGET_CAS_ATTEMPTS: usize = 8;
+const MAX_COMPLETIONS_PER_LOCK_BATCH: usize = 32;
 
 pub(crate) struct MemoryBudget {
     pub(crate) capacity_bytes: usize,
@@ -85,11 +80,6 @@ impl MemoryBudget {
     fn used_bytes(&self) -> usize {
         self.used_bytes.load(Ordering::Acquire)
     }
-
-    pub(crate) fn release(&self, bytes: usize) {
-        let previous = self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
-        debug_assert!(previous >= bytes);
-    }
 }
 
 enum MemoryChargeAttempt {
@@ -101,16 +91,6 @@ enum MemoryChargeAttempt {
 pub(crate) struct MemoryCharge {
     budget: Option<Arc<MemoryBudget>>,
     bytes: usize,
-}
-
-impl MemoryCharge {
-    pub(crate) fn commit(mut self, expected_bytes: usize) {
-        debug_assert_eq!(self.bytes, expected_bytes);
-        let _budget = self
-            .budget
-            .take()
-            .expect("memory charge was already consumed");
-    }
 }
 
 impl Drop for MemoryCharge {
@@ -135,9 +115,6 @@ struct MemoryShard {
     arena: MemoryArena,
     eviction: EvictionState,
     revision: u64,
-    #[cfg(feature = "experimental-l1-directory")]
-    directory: MemoryDirectory,
-    #[cfg(not(feature = "experimental-l1-directory"))]
     directory: HashMap<u64, u32>,
     slots: Vec<Option<MemoryEntry>>,
     policy_slots: Vec<PolicySlot>,
@@ -150,9 +127,6 @@ impl MemoryShard {
             .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
         let budget = Arc::new(MemoryBudget::new(capacity_bytes));
         let arena = MemoryArena::new(Arc::clone(&budget))?;
-        #[cfg(feature = "experimental-l1-directory")]
-        let directory = MemoryDirectory::new(maximum_entries)?;
-        #[cfg(not(feature = "experimental-l1-directory"))]
         let directory = HashMap::new();
         Ok(Self {
             budget,
@@ -171,87 +145,18 @@ impl MemoryShard {
         Some(self.revision)
     }
 
-    #[cfg(feature = "experimental-l1-directory")]
-    fn directory_head(&self, hash: u64) -> Option<u32> {
-        let policy_slots = &self.policy_slots;
-        self.directory.get(hash, |head| {
-            usize::try_from(head)
-                .ok()
-                .and_then(|index| policy_slots.get(index))
-                .is_some_and(|slot| slot.hash() == hash)
-        })
-    }
-
-    #[cfg(not(feature = "experimental-l1-directory"))]
     fn directory_head(&self, hash: u64) -> Option<u32> {
         self.directory.get(&hash).copied()
     }
 
-    #[cfg(feature = "experimental-l1-directory")]
-    fn directory_can_upsert(&mut self, hash: u64) -> bool {
-        let policy_slots = &self.policy_slots;
-        self.directory.can_upsert(
-            hash,
-            |head| {
-                usize::try_from(head)
-                    .ok()
-                    .and_then(|index| policy_slots.get(index))
-                    .is_some_and(|slot| slot.hash() == hash)
-            },
-            |head| {
-                usize::try_from(head)
-                    .ok()
-                    .and_then(|index| policy_slots.get(index))
-                    .map_or(0, PolicySlot::hash)
-            },
-        )
-    }
-
-    #[cfg(not(feature = "experimental-l1-directory"))]
     fn directory_can_upsert(&mut self, hash: u64) -> bool {
         self.directory.contains_key(&hash) || self.directory.try_reserve(1).is_ok()
     }
 
-    #[cfg(feature = "experimental-l1-directory")]
-    fn directory_upsert(&mut self, hash: u64, head: u32) -> DirectoryUpsert {
-        let policy_slots = &self.policy_slots;
-        self.directory.upsert(
-            hash,
-            head,
-            |candidate| {
-                usize::try_from(candidate)
-                    .ok()
-                    .and_then(|index| policy_slots.get(index))
-                    .is_some_and(|slot| slot.hash() == hash)
-            },
-            |candidate| {
-                usize::try_from(candidate)
-                    .ok()
-                    .and_then(|index| policy_slots.get(index))
-                    .map_or(0, PolicySlot::hash)
-            },
-        )
+    fn directory_upsert(&mut self, hash: u64, head: u32) -> Option<u32> {
+        self.directory.insert(hash, head)
     }
 
-    #[cfg(not(feature = "experimental-l1-directory"))]
-    fn directory_upsert(&mut self, hash: u64, head: u32) -> DirectoryUpsert {
-        self.directory
-            .insert(hash, head)
-            .map_or(DirectoryUpsert::Inserted, DirectoryUpsert::Replaced)
-    }
-
-    #[cfg(feature = "experimental-l1-directory")]
-    fn directory_remove(&mut self, hash: u64) -> Option<u32> {
-        let policy_slots = &self.policy_slots;
-        self.directory.remove(hash, |head| {
-            usize::try_from(head)
-                .ok()
-                .and_then(|index| policy_slots.get(index))
-                .is_some_and(|slot| slot.hash() == hash)
-        })
-    }
-
-    #[cfg(not(feature = "experimental-l1-directory"))]
     fn directory_remove(&mut self, hash: u64) -> Option<u32> {
         self.directory.remove(&hash)
     }
@@ -270,6 +175,40 @@ impl MemoryShard {
             cursor = entry.hash_next;
         }
         None
+    }
+
+    /// Resolves one completed Region record. Any older same-hash L1 entries
+    /// must disappear before the staging fence is cleared, otherwise a put
+    /// that bypassed L1 under contention could expose an obsolete value.
+    fn resolve_completion(&mut self, hash: u64, seqno: u64) {
+        let Some(mut cursor) = self.directory_head(hash) else {
+            return;
+        };
+        let mut obsolete = [usize::MAX; MAX_SAME_HASH_ENTRIES];
+        let mut obsolete_len = 0;
+        for _ in 0..MAX_SAME_HASH_ENTRIES {
+            let Ok(index) = usize::try_from(cursor) else {
+                break;
+            };
+            let Some(entry) = self.slots.get(index).and_then(Option::as_ref) else {
+                break;
+            };
+            let entry_seqno = entry.seqno;
+            let next = entry.hash_next;
+            if entry.seqno == seqno {
+                self.eviction.set_evictable(&mut self.policy_slots, index);
+            } else if entry_seqno < seqno {
+                obsolete[obsolete_len] = index;
+                obsolete_len += 1;
+            }
+            if next == NO_SLOT_INDEX {
+                break;
+            }
+            cursor = next;
+        }
+        for index in obsolete[..obsolete_len].iter().copied() {
+            self.remove_slot(index);
+        }
     }
 
     fn hash_chain_is_full(&self, hash: u64) -> bool {
@@ -339,7 +278,7 @@ impl MemoryShard {
             debug_assert_eq!(removed, u32::try_from(index).ok());
         } else {
             let replaced = self.directory_upsert(hash, entry_next);
-            debug_assert!(matches!(replaced, DirectoryUpsert::Replaced(_)));
+            debug_assert!(replaced.is_some());
         }
 
         let weight = self.slots[index]
@@ -482,12 +421,13 @@ impl MemoryShard {
         let Ok(memory_value) = self.arena.allocate(key, value, charge) else {
             return MemoryInsertResult::rejected(evictions, false);
         };
+        let previous_head = self.directory_head(hash);
         let entry = MemoryEntry {
             value: memory_value,
             expires_at_unix_ms,
             seqno,
             namespace_id,
-            hash_next: self.directory_head(hash).unwrap_or(NO_SLOT_INDEX),
+            hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
         };
         match self.free_slots.pop() {
             Some(free_index) => {
@@ -508,8 +448,8 @@ impl MemoryShard {
             evictable,
             hint,
         );
-        let directory = self.directory_upsert(hash, packed_index);
-        debug_assert!(!matches!(directory, DirectoryUpsert::Full));
+        let previous = self.directory_upsert(hash, packed_index);
+        debug_assert_eq!(previous, previous_head);
         MemoryInsertResult {
             inserted: true,
             evictions,
@@ -663,7 +603,9 @@ impl MemoryStore {
         let Some(completed_seqno) = self.completed_seqnos.get(completion_shard_id) else {
             return false;
         };
-        let Ok(mut shard) = self.lock_hash(hash) else {
+        let shard_id = self.route(hash);
+        let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
+            self.record_insert(MemoryInsertResult::bypassed());
             return false;
         };
         let completed_seqno = completed_seqno.load(Ordering::Acquire);
@@ -700,58 +642,80 @@ impl MemoryStore {
         result.inserted
     }
 
+    #[cfg(test)]
     pub(crate) fn complete(&self, completion_shard_id: usize, hash: u64, seqno: u64) {
+        self.complete_batch(completion_shard_id, &[(hash, seqno)]);
+    }
+
+    /// Advances one append-shard completion watermark and marks exact L1
+    /// entries clean while acquiring each affected memory shard only once per
+    /// small fixed batch.
+    pub(crate) fn complete_batch(&self, completion_shard_id: usize, records: &[(u64, u64)]) {
         let Some(completed_seqno) = self.completed_seqnos.get(completion_shard_id) else {
             return;
         };
-        completed_seqno.fetch_max(seqno, Ordering::AcqRel);
-        let Ok(mut shard) = self.lock_hash(hash) else {
+        let Some(max_seqno) = records.iter().map(|record| record.1).max() else {
             return;
         };
-        let Some(mut cursor) = shard.directory_head(hash) else {
-            return;
-        };
-        let mut index = None;
-        for _ in 0..MAX_SAME_HASH_ENTRIES {
-            let Ok(candidate) = usize::try_from(cursor) else {
-                break;
-            };
-            let Some(entry) = shard.slots.get(candidate).and_then(Option::as_ref) else {
-                break;
-            };
-            if entry.seqno == seqno {
-                index = Some(candidate);
-                break;
+        completed_seqno.fetch_max(max_seqno, Ordering::AcqRel);
+
+        for batch in records.chunks(MAX_COMPLETIONS_PER_LOCK_BATCH) {
+            let mut routes = [0_usize; MAX_COMPLETIONS_PER_LOCK_BATCH];
+            for (route, (hash, _)) in routes.iter_mut().zip(batch) {
+                *route = self.route(*hash);
             }
-            if entry.hash_next == NO_SLOT_INDEX {
-                break;
+            for (record_index, memory_shard_id) in routes[..batch.len()].iter().copied().enumerate()
+            {
+                if routes[..record_index].contains(&memory_shard_id) {
+                    continue;
+                }
+                let Ok(mut shard) = self.lock_shard(memory_shard_id) else {
+                    continue;
+                };
+                for ((hash, seqno), route) in batch.iter().copied().zip(routes) {
+                    if route == memory_shard_id {
+                        shard.resolve_completion(hash, seqno);
+                    }
+                }
             }
-            cursor = entry.hash_next;
-        }
-        if let Some(index) = index {
-            let shard = &mut *shard;
-            shard.eviction.set_evictable(&mut shard.policy_slots, index);
         }
     }
 
-    pub(crate) fn lookup(
+    #[cfg(test)]
+    fn lookup(&self, hash: u64, namespace_id: u32, key: &[u8], clock: ExpiryClock) -> MemoryLookup {
+        self.lookup_with_fence(hash, namespace_id, key, clock, None)
+    }
+
+    pub(crate) fn lookup_with_fence(
         &self,
         hash: u64,
         namespace_id: u32,
         key: &[u8],
         clock: ExpiryClock,
+        minimum_seqno: Option<u64>,
     ) -> MemoryLookup {
-        let Ok(mut shard) = self.lock_hash(hash) else {
+        let shard_id = self.route(hash);
+        let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
             return MemoryLookup::Hidden;
         };
         let Some(index) = shard.find(hash, namespace_id, key) else {
+            if minimum_seqno.is_some() {
+                return MemoryLookup::Hidden;
+            }
             let admission = shard.eviction.record_miss(hash);
             return MemoryLookup::Miss(MemoryReadToken {
-                shard_id: self.route(hash),
+                shard_id,
                 revision: shard.revision,
                 admission,
             });
         };
+        if minimum_seqno.is_some_and(|minimum| {
+            shard.slots[index]
+                .as_ref()
+                .is_none_or(|entry| entry.seqno < minimum)
+        }) {
+            return MemoryLookup::Hidden;
+        }
         let expired = shard.slots[index]
             .as_ref()
             .is_some_and(|entry| clock.is_expired(entry.expires_at_unix_ms));
@@ -762,9 +726,12 @@ impl MemoryStore {
                 return MemoryLookup::Hidden;
             }
             shard.remove_slot(index);
+            if minimum_seqno.is_some() {
+                return MemoryLookup::Hidden;
+            }
             let admission = shard.eviction.record_miss(hash);
             return MemoryLookup::Miss(MemoryReadToken {
-                shard_id: self.route(hash),
+                shard_id,
                 revision: shard.revision,
                 admission,
             });
@@ -852,10 +819,6 @@ impl MemoryStore {
         (hash % self.shards.len() as u64) as usize
     }
 
-    fn lock_hash(&self, hash: u64) -> io::Result<MutexGuard<'_, MemoryShard>> {
-        self.lock_shard(self.route(hash))
-    }
-
     fn lock_shard(&self, shard_id: usize) -> io::Result<MutexGuard<'_, MemoryShard>> {
         self.shards[shard_id]
             .lock()
@@ -909,14 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn entry_charge_covers_owned_metadata_layout() {
-        let structural_bytes = std::mem::size_of::<Option<MemoryEntry>>()
-            + std::mem::size_of::<PolicySlot>()
-            + std::mem::size_of::<MemoryValueHeader>();
-        assert_eq!(MEMORY_ENTRY_OVERHEAD_BYTES, structural_bytes);
-    }
-
-    #[test]
     fn pending_value_is_visible_and_matching_completion_makes_it_evictable() {
         let store = store(512, 1);
         assert!(store.publish_pending(0, 7, 0, b"a", b"value-a", 0, 1));
@@ -930,6 +885,31 @@ mod tests {
         assert!(matches!(
             store.lookup(8, 0, b"b", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.len() == 300
+        ));
+    }
+
+    #[test]
+    fn l1_contention_bypasses_without_exposing_an_older_value() {
+        let store = store(1024, 1);
+        assert!(store.publish_pending(0, 7, 0, b"key", b"old", 0, 1));
+        store.complete(0, 7, 1);
+
+        let shard = store.shards[0].lock().unwrap();
+        assert!(matches!(
+            store.lookup(7, 0, b"key", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hidden
+        ));
+        assert!(!store.publish_pending(0, 7, 0, b"key", b"new", 0, 2));
+        drop(shard);
+
+        assert!(matches!(
+            store.lookup_with_fence(7, 0, b"key", ExpiryClock::Fixed(1), Some(2)),
+            MemoryLookup::Hidden
+        ));
+        store.complete(0, 7, 2);
+        assert!(matches!(
+            store.lookup(7, 0, b"key", ExpiryClock::Fixed(1)),
+            MemoryLookup::Miss(_)
         ));
     }
 
@@ -1106,6 +1086,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_completion_cleans_entries_across_memory_shards() {
+        let store = MemoryStore::new(2048, 2, 1, EvictionPolicy::Clock, true).unwrap();
+        for (hash, key, seqno) in [(0, b"a".as_slice(), 1), (2, b"b", 2), (1, b"c", 3)] {
+            assert!(store.publish_pending(0, hash, 0, key, b"value", 0, seqno));
+        }
+
+        store.complete_batch(0, &[(0, 1), (2, 2), (1, 3)]);
+
+        for (hash, key) in [(0, b"a".as_slice()), (2, b"b"), (1, b"c")] {
+            let shard = store.shards[store.route(hash)].lock().unwrap();
+            let index = shard.find(hash, 0, key).unwrap();
+            assert!(shard.policy_slots[index].is_evictable());
+        }
+        assert!(store.publish_pending(0, 3, 0, b"late", b"old", 0, 2));
+        assert_miss(&store, 3, b"late");
+    }
+
+    #[test]
     fn retained_value_keeps_its_capacity_charge_after_eviction() {
         let store = store(512, 1);
         assert!(store.publish_pending(0, 21, 0, b"a", &[1; 300], 0, 1));
@@ -1123,35 +1121,6 @@ mod tests {
         drop(retained);
         assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), 0);
         assert!(store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 3));
-    }
-
-    #[test]
-    fn arena_reuses_a_same_class_block_after_eviction() {
-        let store = store(400, 1);
-        assert!(store.publish_pending(0, 21, 0, b"a", &[1; 300], 0, 1));
-        store.complete(0, 21, 1);
-        let allocated = store.shards[0].lock().unwrap().arena.allocated_bytes();
-
-        assert!(store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 2));
-        assert_eq!(
-            store.shards[0].lock().unwrap().arena.allocated_bytes(),
-            allocated
-        );
-    }
-
-    #[test]
-    fn arena_reassigns_an_empty_chunk_to_a_smaller_class() {
-        let store = store(400, 1);
-        assert!(store.publish_pending(0, 21, 0, b"a", &[1; 300], 0, 1));
-        store.complete(0, 21, 1);
-        let allocated = store.shards[0].lock().unwrap().arena.allocated_bytes();
-
-        assert!(store.publish_pending(0, 22, 0, b"b", b"small", 0, 2));
-        assert_eq!(
-            store.shards[0].lock().unwrap().arena.allocated_bytes(),
-            allocated
-        );
-        assert_hit(&store, 22, b"b");
     }
 
     #[test]

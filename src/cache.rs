@@ -214,6 +214,9 @@ impl StaticConfig {
             region_size: self.region_size,
             region_count,
         };
+        if !geometry.is_valid() {
+            return Err(invalid_config("cache data geometry is not representable"));
+        }
         self.region_layout(geometry)?;
         Ok(geometry)
     }
@@ -307,7 +310,6 @@ pub struct RuntimeConfig {
     io_mode: IoMode,
     io_workers: usize,
     io_queue_depth: usize,
-    read_queue_depth: usize,
     write_queue_depth: usize,
     read_buffer_slots: usize,
     read_buffer_policy: ReadBufferPolicy,
@@ -329,7 +331,6 @@ impl Default for RuntimeConfig {
             io_mode: IoMode::Auto,
             io_workers: 4,
             io_queue_depth: 128,
-            read_queue_depth: 128,
             write_queue_depth: 128,
             read_buffer_slots: 128,
             read_buffer_policy: ReadBufferPolicy::Reject,
@@ -367,16 +368,21 @@ impl RuntimeConfig {
         self
     }
 
-    /// Sets legacy read admission depth and waiting-policy write admission depth.
+    /// Sets waiting-policy write admission depth.
     ///
-    /// `get` has no read admission queue; `read` is retained and validated for
-    /// configuration compatibility. Read concurrency is bounded solely by
-    /// [`Self::with_read_buffer_slots`]. The write depth is unused by the
-    /// default reject policy because shard staging is its admission boundary.
-    pub fn with_submission_queue_depths(mut self, read: usize, write: usize) -> Self {
-        self.read_queue_depth = read;
+    /// The default reject policy uses shard staging as its admission boundary.
+    pub fn with_write_queue_depth(mut self, write: usize) -> Self {
         self.write_queue_depth = write;
         self
+    }
+
+    /// Compatibility alias for the pre-M4 split submission gates.
+    ///
+    /// Foreground reads no longer have a request queue; `read` is ignored and
+    /// read concurrency is bounded solely by [`Self::with_read_buffer_slots`].
+    #[deprecated(note = "use with_write_queue_depth; reads are bounded by read-buffer slots")]
+    pub fn with_submission_queue_depths(self, _read: usize, write: usize) -> Self {
+        self.with_write_queue_depth(write)
     }
 
     /// Sets the hard foreground L2 read-buffer budget.
@@ -496,7 +502,6 @@ impl RuntimeConfig {
             },
             io_workers: self.io_workers,
             io_queue_depth: self.io_queue_depth,
-            read_queue_depth: self.read_queue_depth,
             write_queue_depth: self.write_queue_depth,
             read_buffer_slots: self.read_buffer_slots,
             read_buffer_policy: self.read_buffer_policy,
@@ -651,10 +656,6 @@ pub struct CacheSnapshot {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheQueueSnapshot {
-    pub read_requests_in_flight: u64,
-    pub read_requests_peak: u64,
-    pub read_rejections: u64,
-    pub read_wait_ns: u64,
     pub write_requests_in_flight: u64,
     pub write_requests_peak: u64,
     pub write_rejections: u64,
@@ -668,10 +669,6 @@ pub struct CacheQueueSnapshot {
     pub read_buffer_waiters: u64,
     pub read_buffer_waiters_peak: u64,
     pub read_buffer_wait_ns: u64,
-    pub metadata_buffers_in_use: u64,
-    pub metadata_buffers_peak: u64,
-    pub metadata_buffer_rejections: u64,
-    pub metadata_buffer_wait_ns: u64,
 }
 
 /// Aggregate worker I/O state sampled by [`HybridCache::detailed_snapshot`].
@@ -706,8 +703,7 @@ pub struct RegionSetSnapshot {
     pub live_record_count: u64,
     pub live_bytes: u64,
     pub physical_record_count: u64,
-    /// Completed Region payload bytes, including record padding but excluding
-    /// Region headers.
+    /// Completed Region bytes, including record padding.
     pub physical_bytes: u64,
     /// Successful rotations since the current open.
     pub rotations: u64,
@@ -899,10 +895,6 @@ impl HybridCache {
         Ok(DetailedCacheSnapshot {
             summary: self.cache_snapshot(runtime.summary),
             queues: CacheQueueSnapshot {
-                read_requests_in_flight: resources.read_requests_in_flight,
-                read_requests_peak: resources.read_requests_peak,
-                read_rejections: resources.read_rejections,
-                read_wait_ns: resources.read_wait_ns,
                 write_requests_in_flight: resources.write_requests_in_flight,
                 write_requests_peak: resources.write_requests_peak,
                 write_rejections: resources.write_rejections,
@@ -916,10 +908,6 @@ impl HybridCache {
                 read_buffer_waiters: resources.read_buffer_waiters,
                 read_buffer_waiters_peak: resources.read_buffer_waiters_peak,
                 read_buffer_wait_ns: resources.read_buffer_wait_ns,
-                metadata_buffers_in_use: resources.metadata_buffers_in_use,
-                metadata_buffers_peak: resources.metadata_buffers_peak,
-                metadata_buffer_rejections: resources.metadata_buffer_rejections,
-                metadata_buffer_wait_ns: resources.metadata_buffer_wait_ns,
             },
             io: CacheIoSnapshot {
                 submitted: io.submitted,
@@ -1033,6 +1021,25 @@ mod tests {
             config.fingerprint(geometry, &layout),
             config.fingerprint_with_hash_algorithm(geometry, &layout, algorithm + 1)
         );
+    }
+
+    #[test]
+    fn minimum_static_region_geometry_is_encodable() {
+        let config = StaticConfig::new(5 * 4096)
+            .with_region_size(4096)
+            .with_shards(4);
+        config.validate().unwrap();
+        let geometry = config.geometry().unwrap();
+        let layout = config.region_layout(geometry).unwrap();
+        let data = DataSuperblock {
+            generation: 1,
+            cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
+            data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
+            geometry,
+            hash_seed: config.hash_seed,
+            config_fingerprint: config.fingerprint(geometry, &layout),
+        };
+        assert!(data.encode().is_ok());
     }
 
     #[test]

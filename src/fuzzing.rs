@@ -1,7 +1,7 @@
 //! Internal libFuzzer entry points. This module is available only with the
 //! `fuzzing` feature and is not part of the supported cache API.
 
-use crate::format::{RecordHeader, RegionHeader};
+use crate::format::RecordHeader;
 use crate::index::{IndexEntry, PackedLocation};
 use crate::index_storage::{IndexSlot, PartitionedIndexStorage};
 use crate::recovery::{DataSuperblock, RecoveryImageHeader, StateRecord};
@@ -15,7 +15,6 @@ pub fn persistent_decoders_and_index_probe(input: &[u8]) {
     let _ = DataSuperblock::probe(input);
     let _ = RecoveryImageHeader::probe(input);
     let _ = StateRecord::decode(input);
-    let _ = RegionHeader::decode(input);
     let _ = RecordHeader::decode(input);
     let _ = RegionMetadata::decode(input);
 

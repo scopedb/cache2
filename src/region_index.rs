@@ -11,7 +11,9 @@
 //! index.
 
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
-use crate::index_storage::{IndexSlotState, IndexStorageError, PartitionedIndexStorage};
+use crate::index_storage::{
+    IndexPartitionWriteGuard, IndexSlotState, IndexStorageError, PartitionedIndexStorage,
+};
 
 /// One exact physical mutation committed under a partition write lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,26 +265,6 @@ impl RegionIndex {
             .map(IndexUpsert::from)
     }
 
-    /// Reserves one hash/version for an in-flight producer. The matching
-    /// value publication may replace this mask at the same sequence number.
-    pub(crate) fn reserve_with_authority(
-        &self,
-        hash: u64,
-        seqno: u64,
-        authority: &mut impl IndexMutationAuthority,
-    ) -> Result<IndexUpsert, IndexStorageError> {
-        if seqno == 0 {
-            return Ok(IndexUpsert::Ignored { current: None });
-        }
-        self.install_if_newer(
-            hash,
-            seqno,
-            IndexSlotState::Masked { hash, seqno },
-            authority,
-        )
-        .map(IndexUpsert::from)
-    }
-
     /// Reserves a hash/version for an in-flight producer.
     ///
     /// Equal or newer same-hash values and masks win. Foreign masks are never
@@ -416,6 +398,18 @@ impl RegionIndex {
         self.replace_exact_value(hash, expected, None, authority)
     }
 
+    /// Tries to remove one exact immutable record without waiting for its
+    /// index partition. Foreground expiry cleanup treats contention as a miss.
+    pub(crate) fn try_remove_if_with_authority(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        authority: &mut impl IndexMutationAuthority,
+    ) -> Result<Option<IndexTransition>, IndexStorageError> {
+        let partition = self.storage.try_write_hash_partition(hash)?;
+        self.replace_exact_value_in_partition(hash, expected, None, authority, partition)
+    }
+
     /// Physically relocates one exact immutable record identity. The new
     /// location may differ, but seqno and namespace must remain unchanged;
     /// logical updates use [`Self::upsert_with_authority`]. Runtime flag
@@ -521,7 +515,18 @@ impl RegionIndex {
         replacement: Option<IndexEntry>,
         authority: &mut impl IndexMutationAuthority,
     ) -> Result<Option<IndexTransition>, IndexStorageError> {
-        let mut partition = self.storage.write_hash_partition(hash);
+        let partition = self.storage.write_hash_partition(hash);
+        self.replace_exact_value_in_partition(hash, expected, replacement, authority, partition)
+    }
+
+    fn replace_exact_value_in_partition(
+        &self,
+        hash: u64,
+        expected: IndexEntry,
+        replacement: Option<IndexEntry>,
+        authority: &mut impl IndexMutationAuthority,
+        mut partition: IndexPartitionWriteGuard<'_>,
+    ) -> Result<Option<IndexTransition>, IndexStorageError> {
         let slot_count = partition.slot_count();
         let first_slot = partition.first_slot();
         let start = start_slot(hash, slot_count);
@@ -667,6 +672,26 @@ mod tests {
             index.lookup_raw(hash),
             Err(IndexStorageError::PartitionBusy { .. })
         ));
+    }
+
+    #[test]
+    fn expiry_cleanup_returns_busy_without_removing_the_record() {
+        let index = anonymous(8);
+        let hash = 7;
+        let current = entry(1, 8, 10);
+        assert!(matches!(
+            index.upsert(hash, current, |_| true).unwrap(),
+            IndexUpsert::Applied { .. }
+        ));
+        let mutation = index.storage().write_hash_partition(hash);
+        let mut authority = NoopAuthority;
+
+        assert!(matches!(
+            index.try_remove_if_with_authority(hash, current, &mut authority),
+            Err(IndexStorageError::PartitionBusy { .. })
+        ));
+        drop(mutation);
+        assert_eq!(index.lookup_raw(hash).unwrap(), IndexLookup::Hit(current));
     }
 
     #[derive(Default)]

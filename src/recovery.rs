@@ -17,7 +17,6 @@ pub(crate) const STATE_FILE_SIZE: usize = STATE_SLOT_COUNT * RECOVERY_PAGE_SIZE;
 pub(crate) const DATA_REGION_AREA_OFFSET: u64 = RECOVERY_PAGE_SIZE as u64;
 pub(crate) const RECOVERY_IMAGE_INDEX_OFFSET: u64 = INDEX_IMAGE_PAGE_SIZE as u64;
 pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE as u64;
-pub(crate) const REGION_HEADER_SIZE: u32 = RECOVERY_PAGE_SIZE as u32;
 pub(crate) const RECORD_ALIGNMENT: u32 = 32;
 pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
 pub(crate) const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
@@ -45,9 +44,8 @@ const DATA_FILE_LEN_OFFSET: usize = 56;
 const DATA_REGION_SIZE_OFFSET: usize = 64;
 const DATA_REGION_AREA_FIELD_OFFSET: usize = 72;
 const DATA_REGION_COUNT_OFFSET: usize = 80;
-const DATA_REGION_HEADER_SIZE_OFFSET: usize = 84;
-const DATA_RECORD_ALIGNMENT_OFFSET: usize = 88;
-const DATA_RECORD_FORMAT_OFFSET: usize = 92;
+const DATA_RECORD_ALIGNMENT_OFFSET: usize = 84;
+const DATA_RECORD_FORMAT_OFFSET: usize = 88;
 const DATA_HASH_SEED_OFFSET: usize = 96;
 const DATA_CONFIG_FINGERPRINT_OFFSET: usize = 104;
 
@@ -121,10 +119,9 @@ impl DataGeometry {
     }
 
     pub(crate) fn is_valid(self) -> bool {
-        let minimum_region_size = u64::from(REGION_HEADER_SIZE) + 64;
         self.region_count != 0
             && self.region_count <= MAX_PACKED_REGION_COUNT
-            && self.region_size >= minimum_region_size
+            && self.region_size >= RECOVERY_PAGE_SIZE as u64
             && self.region_size <= MAX_PACKED_REGION_SIZE
             && self.region_size % RECOVERY_PAGE_SIZE as u64 == 0
             && Self::expected_file_len(self.region_size, self.region_count)
@@ -190,11 +187,6 @@ impl DataSuperblock {
             DATA_REGION_COUNT_OFFSET,
             self.geometry.region_count,
         );
-        put_u32(
-            &mut page,
-            DATA_REGION_HEADER_SIZE_OFFSET,
-            REGION_HEADER_SIZE,
-        );
         put_u32(&mut page, DATA_RECORD_ALIGNMENT_OFFSET, RECORD_ALIGNMENT);
         put_u16(&mut page, DATA_RECORD_FORMAT_OFFSET, RECORD_FORMAT_VERSION);
         put_u64(&mut page, DATA_HASH_SEED_OFFSET, self.hash_seed);
@@ -237,7 +229,6 @@ impl DataSuperblock {
         if get_u16(page, DATA_HEADER_SIZE_OFFSET) != Some(DATA_HEADER_SIZE)
             || get_u32(page, DATA_HASH_ALGORITHM_OFFSET) != Some(KEY_HASH_ALGORITHM_XXH3_64)
             || get_u64(page, DATA_REGION_AREA_FIELD_OFFSET) != Some(DATA_REGION_AREA_OFFSET)
-            || get_u32(page, DATA_REGION_HEADER_SIZE_OFFSET) != Some(REGION_HEADER_SIZE)
             || get_u32(page, DATA_RECORD_ALIGNMENT_OFFSET) != Some(RECORD_ALIGNMENT)
             || get_u16(page, DATA_RECORD_FORMAT_OFFSET) != Some(RECORD_FORMAT_VERSION)
             || page[DATA_RECORD_FORMAT_OFFSET + size_of::<u16>()..DATA_HASH_SEED_OFFSET]
