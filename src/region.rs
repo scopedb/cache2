@@ -58,8 +58,7 @@ use crate::region_read::{
 use crate::region_reader::plan_read;
 use crate::region_reader::{ReadPlan, submit_read};
 use crate::region_runtime::{
-    HybridValueRead, RegionDataPlane, RegionPut, RegionRuntimeConfig, RuntimeDetailedSnapshot,
-    RuntimeSnapshot,
+    HybridValueRead, RegionDataPlane, RegionRuntimeConfig, RuntimeDetailedSnapshot, RuntimeSnapshot,
 };
 use crate::region_staging::{
     RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
@@ -311,18 +310,11 @@ pub(crate) struct RegionSpanPublish {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionStagedValue {
-    pub(crate) hash: u64,
-    pub(crate) seqno: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionStageValue {
-    Staged(RegionStagedValue),
-    NeedsFlush,
+    Staged(u64),
+    NeedsProgress,
     NeedsRotation,
     ManagerBusy,
-    Busy,
 }
 
 impl RegionPointRead<'_> {
@@ -516,7 +508,7 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         key: &[u8],
         value: &[u8],
         expires_at: u64,
-    ) -> io::Result<RegionPut> {
+    ) -> io::Result<u64> {
         self.runtime()?
             .data_plane()?
             .put(namespace_id, key, value, expires_at)
@@ -875,13 +867,13 @@ impl FileRegionCore {
             ));
         }
         let Some(_shard_mutation) = self.try_lock_shard_mutation(shard_id)? else {
-            return Ok(RegionStageValue::Busy);
+            return Ok(RegionStageValue::NeedsProgress);
         };
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended) => {}
-            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsFlush),
+            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),
             Err(StagingError::WouldBlock | StagingError::Encoding | StagingError::Submitted) => {
-                return Ok(RegionStageValue::Busy);
+                return Ok(RegionStageValue::NeedsProgress);
             }
             Err(error) => {
                 self.health.enter_miss_only();
@@ -891,7 +883,7 @@ impl FileRegionCore {
         }
         match staging.preflight_pending_fence(shard_id, hash) {
             Ok(()) => {}
-            Err(StagingError::WouldBlock) => return Ok(RegionStageValue::Busy),
+            Err(StagingError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
             Err(error) => {
                 self.health.enter_miss_only();
                 staging.close();
@@ -904,9 +896,11 @@ impl FileRegionCore {
             };
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
-                Err(RegionMutationError::WouldBlock) => return Ok(RegionStageValue::Busy),
+                Err(RegionMutationError::WouldBlock) => {
+                    return Ok(RegionStageValue::NeedsProgress);
+                }
                 Err(RegionMutationError::FlushBeforeRotation) => {
-                    return Ok(RegionStageValue::NeedsFlush);
+                    return Ok(RegionStageValue::NeedsProgress);
                 }
                 Err(RegionMutationError::RegionFull) => {
                     return Ok(RegionStageValue::NeedsRotation);
@@ -924,7 +918,6 @@ impl FileRegionCore {
             receipt
         };
 
-        let mut encoded_value = None;
         let staged = staging.encode_reserved(receipt, |destination| {
             let encoded = encode_value_into_hashed(
                 destination,
@@ -936,27 +929,13 @@ impl FileRegionCore {
                 value,
                 expires_at,
             )?;
-            encoded_value = Some(encoded);
             Ok::<StagedRecord, RecordEncodeError>(StagedRecord {
                 hash: encoded.hash,
                 entry: encoded.entry,
             })
         });
         match staged {
-            Ok(StageAppend::Appended) => {
-                let Some(encoded) = encoded_value else {
-                    self.health.enter_miss_only();
-                    staging.close();
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "encoder completed without record metadata",
-                    ));
-                };
-                Ok(RegionStageValue::Staged(RegionStagedValue {
-                    hash: encoded.hash,
-                    seqno: receipt.seqno,
-                }))
-            }
+            Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
             Ok(StageAppend::NeedsSeal) => self.fail_preflighted_stage(
                 staging,
                 "staging capacity changed after successful preflight",
@@ -3178,10 +3157,7 @@ mod tests {
         for (ordinal, size) in mixed.into_iter().enumerate() {
             let key = key_for_shard(data, namespace_id, ordinal as u64, ordinal as u64);
             let value = vec![(ordinal as u8) + 1; size];
-            assert!(matches!(
-                eventually_admitted(|| store.put_value(namespace_id, &key, &value, 0)),
-                RegionPut::Buffered(_)
-            ));
+            eventually_admitted(|| store.put_value(namespace_id, &key, &value, 0));
             expected.push((key, value));
         }
         store.drain().unwrap();
@@ -3379,22 +3355,24 @@ mod tests {
                 )
                 .unwrap()
             {
-                RegionStageValue::Staged(identity) => {
+                RegionStageValue::Staged(seqno) => {
                     if first.is_none() {
-                        first = Some((key.clone(), identity));
+                        first = Some((key.clone(), hash, seqno));
                     }
-                    last = Some((key, identity));
+                    last = Some((key, hash, seqno));
                     staged_records += 1;
                 }
-                RegionStageValue::NeedsFlush => break,
+                RegionStageValue::NeedsProgress => break,
                 outcome => panic!("unexpected staging outcome: {outcome:?}"),
             }
         }
-        let (first_key, identity) = first.expect("4 MiB span must contain target-size records");
-        let (last_key, last_identity) = last.expect("4 MiB span must retain its final record");
+        let (first_key, first_hash, first_seqno) =
+            first.expect("4 MiB span must contain target-size records");
+        let (last_key, last_hash, last_seqno) =
+            last.expect("4 MiB span must retain its final record");
         assert!(staged_records > 240);
         assert_eq!(
-            runtime.lookup_snapshot(identity.hash).unwrap(),
+            runtime.lookup_snapshot(first_hash).unwrap(),
             IndexLookup::Miss
         );
 
@@ -3408,20 +3386,19 @@ mod tests {
             (published.span.end_offset - published.span.start_offset) % RECOVERY_PAGE_SIZE as u64,
             0
         );
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(identity.hash).unwrap() else {
+        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
             panic!("completed first record must be published");
         };
-        assert_eq!(entry.seqno, identity.seqno);
+        assert_eq!(entry.seqno, first_seqno);
         assert_eq!(
             entry.location.record_len(),
             planned_record_bytes(7, first_key.len(), value.len()).unwrap()
         );
         assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
-        let IndexLookup::Hit(last_entry) = runtime.lookup_snapshot(last_identity.hash).unwrap()
-        else {
+        let IndexLookup::Hit(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
             panic!("completed final record must be published");
         };
-        assert_eq!(last_entry.seqno, last_identity.seqno);
+        assert_eq!(last_entry.seqno, last_seqno);
         assert!(
             last_entry.location.record_len()
                 > planned_record_bytes(7, last_key.len(), value.len()).unwrap()
@@ -3431,7 +3408,7 @@ mod tests {
             published.span.end_offset
         );
         let read = runtime
-            .begin_point_read(identity.hash)
+            .begin_point_read(first_hash)
             .unwrap()
             .expect("completed entry must acquire its Region read pin");
         assert!(read.record_generation_matches(
@@ -3498,7 +3475,7 @@ mod tests {
         let value = b"expired-value";
         let hash = hash_namespaced_key(data.hash_seed, namespace_id, key);
         let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len()).unwrap();
-        let RegionStageValue::Staged(identity) = runtime
+        let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
                 0,
@@ -3518,7 +3495,7 @@ mod tests {
             .unwrap()
             .expect("expired value must publish before its deadline");
 
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(identity.hash).unwrap() else {
+        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(hash).unwrap() else {
             panic!("published value must enter the Region index");
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
@@ -3538,10 +3515,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            runtime.lookup_snapshot(identity.hash).unwrap(),
-            IndexLookup::Miss
-        );
+        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), IndexLookup::Miss);
         let submitted_after_cleanup = engine.stats().submitted;
 
         assert!(
@@ -3597,7 +3571,7 @@ mod tests {
         let owner_hash = hash_namespaced_key(data.hash_seed, namespace_id, owner_key);
         let owner_record_bytes =
             planned_record_bytes(namespace_id, owner_key.len(), value.len()).unwrap();
-        let RegionStageValue::Staged(identity) = runtime
+        let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
                 0,
@@ -3617,7 +3591,7 @@ mod tests {
             .unwrap()
             .expect("collision owner must publish");
 
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(identity.hash).unwrap() else {
+        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(owner_hash).unwrap() else {
             panic!("collision owner must be indexed after publication");
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
@@ -3625,7 +3599,7 @@ mod tests {
         let memory_before_read = resources.managed_memory_snapshot().current_bytes;
         let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
         let point = runtime
-            .begin_point_read(identity.hash)
+            .begin_point_read(owner_hash)
             .unwrap()
             .expect("hash lookup must return the collision candidate");
         let plan = plan_read(data.geometry, point.entry).unwrap();
@@ -3696,7 +3670,7 @@ mod tests {
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
         let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
         let record_bytes = planned_record_bytes(0, b"key".len(), 16 * 1024).unwrap();
-        let RegionStageValue::Staged(identity) = runtime
+        let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
                 0,
@@ -3725,14 +3699,8 @@ mod tests {
             Some(5)
         );
         assert!(!runtime.health.is_healthy());
-        assert_eq!(
-            runtime.lookup_snapshot(identity.hash).unwrap(),
-            IndexLookup::Miss
-        );
-        assert_eq!(
-            runtime.index.lookup_raw(identity.hash).unwrap(),
-            IndexLookup::Miss
-        );
+        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.index.lookup_raw(hash).unwrap(), IndexLookup::Miss);
         assert_eq!(
             runtime.manager.inner.lock().unwrap().regions()[0].completed_used,
             0

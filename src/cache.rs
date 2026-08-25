@@ -29,8 +29,7 @@ use crate::region_metadata::{
     REGION_METADATA_REGIONS_PER_PAGE,
 };
 use crate::region_runtime::{
-    DEFAULT_L1_SHARDS, HybridValueRead, RegionPut, RegionRuntimeConfig, RuntimeHealth,
-    RuntimeSnapshot,
+    DEFAULT_L1_SHARDS, HybridValueRead, RegionRuntimeConfig, RuntimeHealth, RuntimeSnapshot,
 };
 use crate::region_store::{RegionConfig, RegionStartup, RegionStore};
 use crate::resources::WriteBackpressure;
@@ -799,14 +798,10 @@ impl HybridCache {
         value: impl AsRef<[u8]>,
         expires_at_unix_ms: u64,
     ) -> Result<PutReceipt> {
-        match self
-            .store
-            .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)?
-        {
-            RegionPut::Buffered(staged) => Ok(PutReceipt {
-                sequence: staged.seqno,
-            }),
-        }
+        let sequence =
+            self.store
+                .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)?;
+        Ok(PutReceipt { sequence })
     }
 
     /// Looks up a value in L1 and then L2.

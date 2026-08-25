@@ -23,7 +23,7 @@ use crate::io_engine::{
 use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValue};
 use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
-use crate::region::{FileRegionCore, RegionStageValue, RegionStagedValue, RegionValueRead};
+use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_manager::RegionSetRuntimeSnapshot;
 use crate::region_reader::{_READ_ALIGNMENT, plan_read};
@@ -493,13 +493,6 @@ const WAKE_DATA: u8 = 1;
 const WAKE_URGENT: u8 = 2;
 const WAKE_ROTATE: u8 = 4;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionPut {
-    /// Bytes are resident in the bounded shard write buffer until the shard
-    /// completion worker publishes the corresponding index entry.
-    Buffered(RegionStagedValue),
-}
-
 pub(crate) enum HybridValueRead {
     L1(MemoryValue),
     L2(RegionValueRead),
@@ -537,7 +530,7 @@ pub(crate) struct RegionDataPlane {
 }
 
 enum DataPlaneLifecycle {
-    Dormant(Option<RuntimeFileSet>),
+    Dormant(RuntimeFileSet),
     Running(RunningOwner),
     Stopped,
 }
@@ -719,7 +712,7 @@ impl RegionDataPlane {
             config,
             metrics,
             running: OnceLock::new(),
-            lifecycle: Mutex::new(DataPlaneLifecycle::Dormant(Some(files))),
+            lifecycle: Mutex::new(DataPlaneLifecycle::Dormant(files)),
             operations: RwLock::new(()),
         })
     }
@@ -730,7 +723,7 @@ impl RegionDataPlane {
         key: &[u8],
         value: &[u8],
         expires_at: u64,
-    ) -> io::Result<RegionPut> {
+    ) -> io::Result<u64> {
         if key.len() > _MAX_KEY_BYTES || value.len() > _MAX_VALUE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -793,24 +786,24 @@ impl RegionDataPlane {
                 value,
                 expires_at,
             )? {
-                RegionStageValue::Staged(staged) => {
+                RegionStageValue::Staged(seqno) => {
                     let _published = running.memory.publish_pending(
                         shard_id,
-                        staged.hash,
+                        hash,
                         namespace_id,
                         key,
                         value,
                         expires_at,
-                        staged.seqno,
+                        seqno,
                     );
                     control.notify(WAKE_DATA)?;
                     if let Some(activity) = activity {
                         RuntimeMetrics::increment(&activity.puts);
                         RuntimeMetrics::add(&activity.written_bytes, value.len());
                     }
-                    return Ok(RegionPut::Buffered(staged));
+                    return Ok(seqno);
                 }
-                RegionStageValue::NeedsFlush => {
+                RegionStageValue::NeedsProgress => {
                     prepare_shard_retry(
                         running,
                         control,
@@ -845,17 +838,6 @@ impl RegionDataPlane {
                         running.metrics.record_write_rejection();
                     }
                     return Err(overload_runtime_error(reason));
-                }
-                RegionStageValue::Busy => {
-                    prepare_shard_retry(
-                        running,
-                        control,
-                        WAKE_URGENT,
-                        self.config.write_backpressure,
-                        deadline,
-                        permit,
-                        operation,
-                    )?;
                 }
             }
         }
@@ -1143,8 +1125,8 @@ impl RegionDataPlane {
         if let Some(running) = self.running.get() {
             return Ok(running);
         }
-        let files = match &mut *lifecycle {
-            DataPlaneLifecycle::Dormant(files) => files.take().ok_or_else(closed_runtime_error)?,
+        let files = match std::mem::replace(&mut *lifecycle, DataPlaneLifecycle::Stopped) {
+            DataPlaneLifecycle::Dormant(files) => files,
             DataPlaneLifecycle::Stopped => return Err(closed_runtime_error()),
             DataPlaneLifecycle::Running(_) => {
                 unreachable!("running owner is published with its shared state")

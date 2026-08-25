@@ -164,16 +164,7 @@ impl ResourceController {
                 WaitMode::Deadline(deadline.unwrap_or_else(Instant::now))
             }
         };
-        self.acquire_write_permit(wait)
-    }
-
-    fn acquire_write_permit(&self, wait: WaitMode) -> Result<WritePermit, WriteOverloadReason> {
-        self.write_gate
-            .enter(wait)
-            .map_err(|failure| match failure {
-                WaitFailure::Full => WriteOverloadReason::WriteGateBusy,
-                WaitFailure::TimedOut => WriteOverloadReason::Timeout,
-            })
+        self.write_gate.enter(wait)
     }
 
     pub(crate) fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
@@ -217,19 +208,9 @@ enum WaitMode {
     Deadline(Instant),
 }
 
-#[derive(Clone, Copy)]
-enum WaitFailure {
-    Full,
-    TimedOut,
-}
-
-struct GateState {
-    current: usize,
-}
-
 struct WriteGate {
     limit: usize,
-    state: Mutex<GateState>,
+    state: Mutex<usize>,
     available: Condvar,
     current: AtomicUsize,
     peak: AtomicUsize,
@@ -241,7 +222,7 @@ impl WriteGate {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            state: Mutex::new(GateState { current: 0 }),
+            state: Mutex::new(0),
             available: Condvar::new(),
             current: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -250,38 +231,38 @@ impl WriteGate {
         }
     }
 
-    fn enter(self: &Arc<Self>, wait: WaitMode) -> Result<WritePermit, WaitFailure> {
+    fn enter(self: &Arc<Self>, wait: WaitMode) -> Result<WritePermit, WriteOverloadReason> {
         let mut wait_started = None;
         let mut state = lock_unpoisoned(&self.state);
-        while state.current == self.limit {
+        while *state == self.limit {
             if wait_started.is_none() && !matches!(wait, WaitMode::Reject) {
                 wait_started = Some(Instant::now());
             }
             state = match wait {
                 WaitMode::Reject => {
                     self.rejections.fetch_add(1, Ordering::Relaxed);
-                    return Err(WaitFailure::Full);
+                    return Err(WriteOverloadReason::WriteGateBusy);
                 }
                 WaitMode::Block => wait_unpoisoned(&self.available, state),
                 WaitMode::Deadline(deadline) => {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
                         add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WaitFailure::TimedOut);
+                        return Err(WriteOverloadReason::Timeout);
                     };
                     let (guard, timed_out) =
                         wait_timeout_unpoisoned(&self.available, state, remaining);
-                    if timed_out && guard.current == self.limit {
+                    if timed_out && *guard == self.limit {
                         self.rejections.fetch_add(1, Ordering::Relaxed);
                         add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WaitFailure::TimedOut);
+                        return Err(WriteOverloadReason::Timeout);
                     }
                     guard
                 }
             };
         }
-        state.current += 1;
-        let current = state.current;
+        *state += 1;
+        let current = *state;
         self.current.store(current, Ordering::Relaxed);
         update_peak(&self.peak, current);
         add_wait_duration(&self.wait_ns, wait_started);
@@ -292,11 +273,11 @@ impl WriteGate {
 
     fn release(&self) {
         let mut state = lock_unpoisoned(&self.state);
-        debug_assert!(state.current != 0);
-        if state.current != 0 {
-            state.current -= 1;
+        debug_assert!(*state != 0);
+        if *state != 0 {
+            *state -= 1;
         }
-        self.current.store(state.current, Ordering::Relaxed);
+        self.current.store(*state, Ordering::Relaxed);
         self.available.notify_one();
     }
 }
@@ -311,13 +292,9 @@ impl Drop for WritePermit {
     }
 }
 
-struct WriteBufferState {
-    free: Vec<AlignedBuffer>,
-}
-
 struct WriteBufferPoolInner {
     max_buffer_bytes: usize,
-    state: Mutex<WriteBufferState>,
+    state: Mutex<Vec<AlignedBuffer>>,
     available: Condvar,
     memory: Arc<MemoryTracker>,
     in_use: AtomicUsize,
@@ -369,7 +346,7 @@ impl WriteBufferPool {
 
         {
             let mut state = lock_unpoisoned(&inner.state);
-            for buffer in &mut state.free {
+            for buffer in &mut *state {
                 buffer
                     .ensure_capacity(buffer_size, buffer_size, &memory)
                     .map_err(|_| ResourceBuildError::Allocation)?;
@@ -385,7 +362,7 @@ impl WriteBufferPool {
 
     pub(crate) fn acquire(&self) -> Option<BufferLease> {
         let mut state = lock_unpoisoned(&self.inner.state);
-        while state.free.is_empty() && !self.closed.load(Ordering::Acquire) {
+        while state.is_empty() && !self.closed.load(Ordering::Acquire) {
             state = wait_unpoisoned(&self.inner.available, state);
         }
         if self.closed.load(Ordering::Acquire) {
@@ -393,7 +370,6 @@ impl WriteBufferPool {
             return None;
         }
         let buffer = state
-            .free
             .pop()
             .expect("write buffer wake requires a free buffer or closure");
         self.inner.in_use.fetch_add(1, Ordering::Relaxed);
@@ -441,7 +417,7 @@ impl WriteBufferPoolInner {
         free.resize_with(slots, AlignedBuffer::empty);
         Ok(Self {
             max_buffer_bytes,
-            state: Mutex::new(WriteBufferState { free }),
+            state: Mutex::new(free),
             available: Condvar::new(),
             memory,
             in_use: AtomicUsize::new(0),
@@ -451,7 +427,7 @@ impl WriteBufferPoolInner {
 
     fn release(&self, buffer: AlignedBuffer) {
         let mut state = lock_unpoisoned(&self.state);
-        state.free.push(buffer);
+        state.push(buffer);
         self.in_use.fetch_sub(1, Ordering::Relaxed);
         self.available.notify_one();
     }
@@ -460,11 +436,7 @@ impl WriteBufferPoolInner {
 impl Drop for WriteBufferPoolInner {
     fn drop(&mut self) {
         let state = lock_unpoisoned(&self.state);
-        let allocated = state
-            .free
-            .iter()
-            .map(|buffer| buffer.capacity)
-            .sum::<usize>();
+        let allocated = state.iter().map(|buffer| buffer.capacity).sum::<usize>();
         self.memory.release(allocated);
     }
 }

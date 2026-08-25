@@ -146,9 +146,12 @@ fn pending_l1_values_are_visible_and_bypasses_hide_l2() {
         .with_statistics(true);
     let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
     let mut visible = 0;
+    let mut last_sequence = 0;
     for version in 0_u8..64 {
         let bypasses_before = cache.snapshot().unwrap().l1_bypasses;
-        eventually_admitted(|| cache.put("key", [version; 1024]));
+        let receipt = eventually_admitted(|| cache.put("key", [version; 1024]));
+        assert!(receipt.sequence > last_sequence);
+        last_sequence = receipt.sequence;
         match cache.get("key").unwrap() {
             Some(value) => {
                 visible += 1;
