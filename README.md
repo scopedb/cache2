@@ -257,7 +257,9 @@ device to data-sync, but neither makes the cache recoverable.
    Region per assigned shard plus one spare. More Regions reduce turnover.
 2. Set expected entries from the intended live key count; the fixed mmap index
    uses approximately 1.25 slots per entry and 24 bytes per slot, plus one
-   64-byte header per 4 KiB page. Up to 512 million slots (about 12.2 GiB
+   64-byte header per 4 KiB page. `StaticConfig::new` assumes 16 KiB per entry;
+   override it with `with_expected_entries` when the workload differs. Up to
+   512 million slots (about 12.2 GiB
    including page headers) supports a 1 TiB cache planned near 4 KiB per entry
    with the normal probe headroom.
 3. Choose L1 capacity from the useful resident payload. The aggregate managed

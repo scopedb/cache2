@@ -32,6 +32,7 @@ use crate::runtime_config::RuntimeConfig;
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
+const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const DEFAULT_SHARDS: u32 = 4;
 const MIN_INDEX_SLOTS: usize = 8;
@@ -50,8 +51,9 @@ pub struct StaticConfig {
 }
 
 impl StaticConfig {
+    /// Creates a static configuration sized for an average 16 KiB entry.
     pub fn new(capacity_bytes: u64) -> Self {
-        let expected_entries = capacity_bytes / (64 * 1024);
+        let expected_entries = capacity_bytes / DEFAULT_EXPECTED_ENTRY_BYTES;
         let index_slots = expected_entries
             .saturating_mul(5)
             .saturating_add(3)
@@ -585,11 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn one_tib_four_kib_working_set_has_a_representable_index() {
-        let config = StaticConfig::new(1_u64 << 40)
-            .with_region_size(32 * 1024 * 1024)
-            .with_expected_entries(1 << 28)
-            .with_write_shards(8);
+    fn four_tib_default_index_matches_sixteen_kib_entries() {
+        let config = StaticConfig::new(4_u64 << 40);
 
         assert_eq!(config.index_slots(), 335_544_320);
         config.validate().unwrap();
