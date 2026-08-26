@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
 use crate::expiry::ExpiryClock;
-use crate::format::{RECORD_HEADER_SIZE, RecordCodec, RecordHeader};
+use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_INDEX_PARTITIONS};
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, IndexStorageError,
@@ -709,7 +709,7 @@ impl FileRegionCore {
             return Ok(None);
         };
         let encoded_key = &record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + key_len];
-        if !record_key_matches(header.codec, encoded_key, namespace_id, key) {
+        if header.namespace_id != namespace_id || encoded_key != key {
             return Ok(None);
         }
         if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
@@ -2427,23 +2427,6 @@ fn record_encode_io_error(error: RecordEncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
-fn record_key_matches(
-    codec: RecordCodec,
-    encoded_key: &[u8],
-    namespace_id: u32,
-    expected_key: &[u8],
-) -> bool {
-    match codec {
-        RecordCodec::PlainKey => namespace_id == 0 && encoded_key == expected_key,
-        RecordCodec::NamespacedKey => {
-            namespace_id != 0
-                && encoded_key.get(..size_of::<u32>())
-                    == Some(namespace_id.to_le_bytes().as_slice())
-                && encoded_key.get(size_of::<u32>()..) == Some(expected_key)
-        }
-    }
-}
-
 fn staging_io_error(error: StagingError) -> io::Error {
     let kind = match error {
         StagingError::Closed => io::ErrorKind::BrokenPipe,
@@ -3057,7 +3040,7 @@ mod tests {
         let manager = runtime.manager.inner.lock().unwrap();
         let next_seqno = manager.next_seqno();
         let hash = hash_namespaced_key(data.hash_seed, 7, b"key");
-        let record_bytes = required_record_bytes(7, b"key".len(), b"value".len()).unwrap();
+        let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
 
         assert_eq!(
             runtime
@@ -3095,7 +3078,7 @@ mod tests {
         loop {
             let key = format!("file/chunk/{staged_records:04}");
             let hash = hash_namespaced_key(data.hash_seed, 7, key.as_bytes());
-            let record_bytes = required_record_bytes(7, key.len(), value.len()).unwrap();
+            let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
             match runtime
                 .try_stage_value(
                     &staging,
@@ -3141,7 +3124,7 @@ mod tests {
         assert_eq!(entry.seqno, first_seqno);
         assert_eq!(
             entry.location.record_len(),
-            required_record_bytes(7, first_key.len(), value.len()).unwrap()
+            required_record_bytes(first_key.len(), value.len()).unwrap()
         );
         assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
         let Some(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
@@ -3150,7 +3133,7 @@ mod tests {
         assert_eq!(last_entry.seqno, last_seqno);
         assert!(
             last_entry.location.record_len()
-                > required_record_bytes(7, last_key.len(), value.len()).unwrap()
+                > required_record_bytes(last_key.len(), value.len()).unwrap()
         );
         assert_eq!(
             u64::from(last_entry.location.offset()) + u64::from(last_entry.location.record_len()),
@@ -3218,7 +3201,7 @@ mod tests {
         let key = b"expired-key";
         let value = b"expired-value";
         let hash = hash_namespaced_key(data.hash_seed, namespace_id, key);
-        let record_bytes = required_record_bytes(namespace_id, key.len(), value.len()).unwrap();
+        let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
@@ -3313,8 +3296,7 @@ mod tests {
         let foreign_key = b"collision-foreign";
         let value = b"owner-value-must-not-leak";
         let owner_hash = hash_namespaced_key(data.hash_seed, namespace_id, owner_key);
-        let owner_record_bytes =
-            required_record_bytes(namespace_id, owner_key.len(), value.len()).unwrap();
+        let owner_record_bytes = required_record_bytes(owner_key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
@@ -3413,7 +3395,7 @@ mod tests {
         backend.set_len(data.geometry.data_file_len).unwrap();
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
         let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
-        let record_bytes = required_record_bytes(0, b"key".len(), 16 * 1024).unwrap();
+        let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,

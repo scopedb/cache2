@@ -10,12 +10,11 @@ use std::fmt;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::checksum::Crc32c;
-use crate::format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordCodec, RecordHeader};
+use crate::format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation, PackedLocationError};
 use crate::recovery::RECORD_ALIGNMENT;
 use crate::region_manager::RegionAppendReservation;
 
-const NAMESPACE_KEY_PREFIX_SIZE: usize = size_of::<u32>();
 const NAMESPACE_HASH_DOMAIN: &[u8] = b"cache-rs/ns/v1\0";
 const NAMESPACE_HASH_CONTEXT_SIZE: usize = NAMESPACE_HASH_DOMAIN.len() + size_of::<u32>();
 
@@ -72,19 +71,17 @@ impl std::error::Error for RecordEncodeError {
 
 /// Returns the minimum 32-byte-aligned envelope for one logical value.
 pub(crate) fn required_record_bytes(
-    namespace_id: u32,
     key_len: usize,
     value_len: usize,
 ) -> Result<u32, RecordEncodeError> {
-    let encoded_key_len = encoded_key_len(namespace_id, key_len)?;
-    if encoded_key_len > MAX_KEY_SIZE {
+    if key_len > MAX_KEY_SIZE {
         return Err(RecordEncodeError::KeyTooLarge);
     }
     if value_len > MAX_VALUE_SIZE {
         return Err(RecordEncodeError::ValueTooLarge);
     }
-    let record_bytes = RecordHeader::aligned_len(encoded_key_len, value_len)
-        .ok_or(RecordEncodeError::LengthOverflow)?;
+    let record_bytes =
+        RecordHeader::aligned_len(key_len, value_len).ok_or(RecordEncodeError::LengthOverflow)?;
     if record_bytes > MAX_RECORD_LEN {
         return Err(RecordEncodeError::RecordTooLarge);
     }
@@ -111,7 +108,7 @@ pub(crate) fn encode_value_into(
     value: &[u8],
     expires_at: u64,
 ) -> Result<(u64, IndexEntry), RecordEncodeError> {
-    let required = required_record_bytes(namespace_id, key.len(), value.len())?;
+    let required = required_record_bytes(key.len(), value.len())?;
     let hash = hash_namespaced_key(hash_seed, namespace_id, key);
     let entry = encode_value_into_hashed(
         destination,
@@ -167,11 +164,10 @@ pub(crate) fn encode_value_into_hashed(
         reservation.record_bytes,
     )
     .map_err(RecordEncodeError::InvalidLocation)?;
-    let encoded_key_len = encoded_key_len(namespace_id, key.len())?;
     let value_len = u32::try_from(value.len()).map_err(|_| RecordEncodeError::ValueTooLarge)?;
-    let key_len = u32::try_from(encoded_key_len).map_err(|_| RecordEncodeError::LengthOverflow)?;
+    let key_len = u32::try_from(key.len()).map_err(|_| RecordEncodeError::LengthOverflow)?;
     let payload_end = RECORD_HEADER_SIZE
-        .checked_add(encoded_key_len)
+        .checked_add(key.len())
         .and_then(|end| end.checked_add(value.len()))
         .ok_or(RecordEncodeError::LengthOverflow)?;
     if payload_end > destination_len {
@@ -181,42 +177,24 @@ pub(crate) fn encode_value_into_hashed(
         });
     }
 
-    let namespace_bytes = namespace_id.to_le_bytes();
     let mut payload_crc = Crc32c::new();
-    if namespace_id != 0 {
-        payload_crc.update(&namespace_bytes);
-    }
     payload_crc.update(key);
     payload_crc.update(value);
 
-    // Header, namespace/key, and value bytes are overwritten below. Clear only
-    // the alignment tail so a reused staging span cannot leak old padding.
+    // Header, key, and value bytes are overwritten below. Clear only the
+    // alignment tail so a reused staging span cannot leak old padding.
     destination[payload_end..].fill(0);
     let key_start = RECORD_HEADER_SIZE;
-    let raw_key_start = if namespace_id == 0 {
-        key_start
-    } else {
-        let raw_key_start = key_start
-            .checked_add(NAMESPACE_KEY_PREFIX_SIZE)
-            .ok_or(RecordEncodeError::LengthOverflow)?;
-        destination[key_start..raw_key_start].copy_from_slice(&namespace_bytes);
-        raw_key_start
-    };
     let value_start = key_start
-        .checked_add(encoded_key_len)
+        .checked_add(key.len())
         .ok_or(RecordEncodeError::LengthOverflow)?;
-    destination[raw_key_start..value_start].copy_from_slice(key);
+    destination[key_start..value_start].copy_from_slice(key);
     destination[value_start..payload_end].copy_from_slice(value);
 
-    let codec = if namespace_id == 0 {
-        RecordCodec::PlainKey
-    } else {
-        RecordCodec::NamespacedKey
-    };
     let header = RecordHeader {
-        codec,
         key_len,
         value_len,
+        namespace_id,
         record_len: reservation.record_bytes,
         seqno: reservation.seqno,
         key_hash: hash,
@@ -230,16 +208,6 @@ pub(crate) fn encode_value_into_hashed(
         seqno: reservation.seqno,
         namespace_id,
     })
-}
-
-fn encoded_key_len(namespace_id: u32, raw_key_len: usize) -> Result<usize, RecordEncodeError> {
-    raw_key_len
-        .checked_add(if namespace_id == 0 {
-            0
-        } else {
-            NAMESPACE_KEY_PREFIX_SIZE
-        })
-        .ok_or(RecordEncodeError::LengthOverflow)
 }
 
 pub(crate) fn hash_namespaced_key(seed: u64, namespace_id: u32, key: &[u8]) -> u64 {
@@ -290,7 +258,7 @@ mod tests {
         let value = (0..16 * 1024)
             .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
             .collect::<Vec<_>>();
-        let required = required_record_bytes(namespace_id, key.len(), value.len()).unwrap();
+        let required = required_record_bytes(key.len(), value.len()).unwrap();
         assert_ne!(
             required as usize % crate::io_backend::DIRECT_IO_ALIGNMENT,
             0
@@ -324,11 +292,8 @@ mod tests {
         assert_eq!(entry.namespace_id, namespace_id);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(header.codec, RecordCodec::NamespacedKey);
-        assert_eq!(
-            header.key_len,
-            (NAMESPACE_KEY_PREFIX_SIZE + key.len()) as u32
-        );
+        assert_eq!(header.namespace_id, namespace_id);
+        assert_eq!(header.key_len, key.len() as u32);
         assert_eq!(header.value_len, value.len() as u32);
         assert_eq!(header.record_len, required);
         assert_eq!(header.seqno, 17);
@@ -336,14 +301,9 @@ mod tests {
         assert_eq!(header.expires_at, 123_456);
 
         let key_start = RECORD_HEADER_SIZE;
-        let raw_key_start = key_start + NAMESPACE_KEY_PREFIX_SIZE;
-        let value_start = raw_key_start + key.len();
+        let value_start = key_start + key.len();
         let payload_end = value_start + value.len();
-        assert_eq!(
-            &destination[key_start..raw_key_start],
-            &namespace_id.to_le_bytes()
-        );
-        assert_eq!(&destination[raw_key_start..value_start], key);
+        assert_eq!(&destination[key_start..value_start], key);
         assert_eq!(&destination[value_start..payload_end], value);
         assert_eq!(
             header.payload_crc,
@@ -356,11 +316,11 @@ mod tests {
     fn target_chunk_sizes_do_not_pay_per_record_direct_io_padding() {
         let mut cursor = 0;
         let mut saw_non_direct_boundary = false;
-        for (namespace_id, key_len, value_len) in [
-            (7, b"file/chunk/0007".len(), 16 * 1024),
-            (0, b"0123456789abcdef0123456789abcdef".len(), 256 * 1024),
+        for (key_len, value_len) in [
+            (b"file/chunk/0007".len(), 16 * 1024),
+            (b"0123456789abcdef0123456789abcdef".len(), 256 * 1024),
         ] {
-            let required = required_record_bytes(namespace_id, key_len, value_len).unwrap();
+            let required = required_record_bytes(key_len, value_len).unwrap();
             assert_eq!(required % RECORD_ALIGNMENT, 0);
             cursor += required as usize;
             saw_non_direct_boundary |= cursor % crate::io_backend::DIRECT_IO_ALIGNMENT != 0;
@@ -371,15 +331,15 @@ mod tests {
     #[test]
     fn invalid_lengths_and_reservations_return_typed_errors_without_writes() {
         assert_eq!(
-            required_record_bytes(1, MAX_KEY_SIZE, 0),
+            required_record_bytes(MAX_KEY_SIZE + 1, 0),
             Err(RecordEncodeError::KeyTooLarge)
         );
         assert_eq!(
-            required_record_bytes(0, 1, MAX_VALUE_SIZE + 1),
+            required_record_bytes(1, MAX_VALUE_SIZE + 1),
             Err(RecordEncodeError::ValueTooLarge)
         );
 
-        let required = required_record_bytes(0, 3, 16).unwrap();
+        let required = required_record_bytes(3, 16).unwrap();
         let reservation = RegionAppendReservation {
             shard_id: 0,
             region_id: 0,

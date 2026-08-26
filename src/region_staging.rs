@@ -832,7 +832,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::format::RecordCodec;
     use crate::index::PackedLocation;
     use crate::resources::ResourceLimits;
 
@@ -895,9 +894,9 @@ mod tests {
     ) -> Result<StagedRecord, ()> {
         target.fill(0);
         let header = RecordHeader {
-            codec: RecordCodec::PlainKey,
             key_len: 0,
             value_len: 0,
+            namespace_id: 0,
             record_len: receipt.record_bytes,
             seqno: receipt.seqno,
             key_hash: record.hash,

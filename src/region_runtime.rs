@@ -35,7 +35,7 @@ use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCache
 const _MAX_KEY_BYTES: usize = 4 * 1024;
 const _MAX_VALUE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_RECORD_BYTES: usize = const_align_up(
-    RECORD_HEADER_SIZE + size_of::<u32>() + _MAX_KEY_BYTES + _MAX_VALUE_BYTES,
+    RECORD_HEADER_SIZE + _MAX_KEY_BYTES + _MAX_VALUE_BYTES,
     RECORD_ALIGNMENT,
 );
 // A runtime record begins on a RECORD_ALIGNMENT boundary. Tail padding, when
@@ -643,7 +643,7 @@ impl RegionDataPlane {
                 "file-chunk entry exceeds the 4 KiB key or 256 KiB value limit",
             ));
         }
-        let record_bytes = required_record_bytes(namespace_id, key.len(), value.len())
+        let record_bytes = required_record_bytes(key.len(), value.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let running = &self.running.shared;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
@@ -1599,7 +1599,7 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let record_len = required_record_bytes(1, _MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
+        let record_len = required_record_bytes(_MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
         assert_eq!(record_len as usize, MAX_RUNTIME_RECORD_BYTES);
 
         let mut observed_max = 0;
