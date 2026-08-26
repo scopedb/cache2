@@ -15,7 +15,8 @@ const MIB: usize = 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 256 * 1024;
 const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_RETRY_DELAY: Duration = Duration::from_micros(50);
+const RETRY_DELAY: Duration = Duration::from_micros(50);
+const WRITE_YIELD_RETRIES: usize = 8;
 
 struct BenchConfig {
     entries: usize,
@@ -244,10 +245,14 @@ fn main() -> io::Result<()> {
     let cache = files.config(&config).open()?;
     let started = Instant::now();
     let mut write_checksum = 0_u64;
+    let mut write_attempts = 0_usize;
+    let mut throttled_writes = 0_usize;
     for ordinal in 0..config.entries {
         let key = benchmark_key(ordinal);
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-        let receipt = put_eventually(&cache, black_box(&key), black_box(&value))?;
+        let (receipt, attempts) = put_eventually(&cache, black_box(&key), black_box(&value))?;
+        write_attempts = write_attempts.saturating_add(attempts);
+        throttled_writes = throttled_writes.saturating_add(usize::from(attempts > 1));
         write_checksum = write_checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
     }
     cache.drain()?;
@@ -258,6 +263,10 @@ fn main() -> io::Result<()> {
         checksum: write_checksum,
     };
     report("put_drain", "put + drain", &put);
+    println!(
+        "result phase=put_admission attempts={write_attempts} retries={} throttled={throttled_writes}",
+        write_attempts.saturating_sub(config.entries),
+    );
 
     let resident_start = config.entries - config.resident_entries;
     for ordinal in resident_start..config.entries {
@@ -393,7 +402,7 @@ fn concurrent_reads(
                             )));
                         }
                         attempts += 1;
-                        thread::sleep(READ_RETRY_DELAY);
+                        thread::sleep(RETRY_DELAY);
                     };
                     bytes += value.len() as u128;
                     checksum = checksum.wrapping_add(
@@ -424,11 +433,13 @@ fn concurrent_reads(
     })
 }
 
-fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<u64> {
+fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<(u64, usize)> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
+    let mut attempts = 0_usize;
     loop {
+        attempts = attempts.saturating_add(1);
         match cache.put(key, value) {
-            Ok(receipt) => return Ok(receipt),
+            Ok(receipt) => return Ok((receipt, attempts)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -436,7 +447,11 @@ fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<u
                         "benchmark write did not enter bounded staging",
                     ));
                 }
-                thread::sleep(Duration::from_micros(50));
+                if attempts <= WRITE_YIELD_RETRIES {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(RETRY_DELAY);
+                }
             }
             Err(error) => return Err(error),
         }

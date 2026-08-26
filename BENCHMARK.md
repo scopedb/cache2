@@ -4,11 +4,37 @@ This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
 
 The current harness gives its fixed index extra headroom for the complete L2
-working set and retries rejected writes. Every measured read retries pressure
-misses for at most one second with a short delay. The L1 phases also retry a
-valid L2 fallback caused by best-effort shard-lock contention; that extra work
-remains inside the measured latency. Rerun the baseline before treating
-historical thresholds as release gates.
+working set and retries rejected writes. A write yields for up to eight brief
+admission conflicts before using a short delay for sustained pressure; the
+reported admission totals expose both retry attempts and affected writes.
+Every measured read retries pressure misses for at most one second with a short
+delay. The L1 phases also retry a valid L2 fallback caused by best-effort
+shard-lock contention; that extra work remains inside the measured latency.
+Rerun the baseline before treating historical thresholds as release gates.
+
+## Best-effort request-path baseline — 2026-08-26
+
+Five consecutive release runs used an Apple M4 Max with 16 CPU cores and
+64 GB RAM, macOS 26.5.2, and `rustc 1.98.0 (88d9e12ae 2026-08-18)`.
+The default Auto/buffered workload used 8,192 entries × 16 KiB, 4 write shards,
+4 I/O workers, and 8 read clients. Medians were:
+
+| Phase | Median latency | Median throughput |
+|---|---:|---:|
+| put + drain | 33.724 ms | 242,914 ops/s |
+| resident L1 get | 71.138 ms | 14,739,932 ops/s |
+| warm close | 75.809 ms | — |
+| L2 get + promote | 22.935 ms | 357,180 ops/s |
+| promoted L1 get | 78.045 ms | 13,435,524 ops/s |
+
+The median admission sample made 8,986 attempts for 8,192 accepted writes:
+794 retries across 178 throttled writes. Before brief conflicts used bounded
+yield retries, the same revision's fixed 50 µs retry delay produced a
+38.474 ms median for put + drain. The new result is 12.3% faster and remains
+5.0% slower than the older bounded-generator baseline. A direct control at
+`5916da6`, the last revision with a blocking foreground manager lock, measured
+29.360 ms. The library still performs exactly one non-blocking manager probe
+per foreground attempt; the retry policy belongs only to the benchmark caller.
 
 ## M1 local baseline — 2026-08-24
 
