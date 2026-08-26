@@ -2821,9 +2821,9 @@ mod tests {
             let directory = TestDirectory::new();
             let data = production_data_superblock(512 * 1024);
             let runtime_config = RuntimeConfig::default()
-                .with_io_engine(crate::runtime_config::IoEngine::Sync)
+                .with_io_engine(crate::runtime_config::IoEngine::Posix)
                 .with_io_workers(1)
-                .with_io_concurrency(4)
+                .with_io_concurrency(1)
                 .with_l1_capacity(0)
                 .with_memory_limit(32 * 1024 * 1024)
                 .with_write_batch_size(128 * 1024);

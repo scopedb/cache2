@@ -16,8 +16,8 @@ Rerun the baseline before treating historical thresholds as release gates.
 
 Five consecutive release runs used an Apple M4 Max with 16 CPU cores and
 64 GB RAM, macOS 26.5.2, and `rustc 1.98.0 (88d9e12ae 2026-08-18)`.
-The default Auto/buffered workload used 8,192 entries × 16 KiB, 4 write shards,
-4 I/O workers, and 8 read clients. Medians were:
+The then-default automatic/buffered workload used 8,192 entries × 16 KiB, 4
+write shards, 4 I/O workers, and 8 read clients. Medians were:
 
 | Phase | Median latency | Median throughput |
 |---|---:|---:|
@@ -80,8 +80,7 @@ Environment:
 - Apple M4 Max, 16 CPU cores, 64 GB RAM;
 - macOS 26.5.2, APFS temporary directory;
 - `rustc 1.96.0-nightly (55e86c996 2026-04-02)`;
-- Auto engine and Auto mode, which use the synchronous buffered fallback on
-  this platform;
+- POSIX engine and Auto I/O mode, which use buffered I/O on this platform;
 - 8,192 entries × 16 KiB, 4 shards, 4 I/O workers, 8 read clients;
 - 1,048,576 L1 read operations per measured hot-read phase.
 
@@ -205,13 +204,13 @@ hard-coded x86 `O_NOFOLLOW` value; cache opens now use the target libc constants
 
 | I/O path | put + drain | L2 + promote | warm close |
 |---|---:|---:|---:|
-| sync / buffered | 67,196 ops/s | 75,658 ops/s | 2.726 ms |
-| sync / direct | 63,603 ops/s | 60,766 ops/s | 2.492 ms |
+| POSIX / buffered | 67,196 ops/s | 75,658 ops/s | 2.726 ms |
+| POSIX / direct | 63,603 ops/s | 60,766 ops/s | 2.492 ms |
 | io_uring / direct | 64,855 ops/s | 62,016 ops/s | 2.119 ms |
 
-The 15-second io_uring/direct turnover soak completed 1,156,081 writes and 572
-Region rotations with zero stale reads or errors. Managed memory peaked at
-110,659,840 of 335,544,320 bytes; logical disk use was 268,447,744 of
+An optional 15-second io_uring/direct turnover smoke completed 1,156,081
+writes and 572 Region rotations with zero stale reads or errors. Managed memory
+peaked at 110,659,840 of 335,544,320 bytes; logical disk use was 268,447,744 of
 271,183,872 bytes. A separate live `/proc/<pid>/fdinfo` sample observed four
 active io_uring descriptors and direct cache descriptors with the target
 `O_DIRECT` bit set. The checksummed qualification result correctly reported
@@ -257,7 +256,7 @@ configuration only on a filesystem with at least the reported peak capacity:
 CACHE_RECOVERY_DIR=/path/to/ram-backed-or-test-filesystem \
 CACHE_RECOVERY_EXPECTED_ENTRIES=100000000 \
 CACHE_RECOVERY_MEMORY_LIMIT_MIB=6144 \
-cargo bench --bench recovery_scale --no-default-features
+cargo bench --bench recovery_scale
 ```
 
 These numbers are a RAM-backed control-path ceiling, not an NVMe shutdown
@@ -306,10 +305,10 @@ set in a new caller-owned report directory:
 It requires Linux, a writable cache directory, a new report path under an
 existing directory outside the source tree, and a clean worktree. It records
 the exact revision, Rust 1.98.0 toolchain, kernel, CPU, block
-device, filesystem and mount information; runs five repetitions of
-sync/buffered, sync/direct, and io_uring/direct; measures io_uring/direct with
-1/2/4/8/16 workers; calculates phase medians; then runs a four-hour
-io_uring/direct turnover soak. For an M2 result, the benchmark data set must
+device, filesystem and mount information; runs five repetitions of POSIX
+buffered and direct I/O; measures POSIX direct I/O with 1/2/4/8/16 workers;
+calculates phase medians; then runs a four-hour POSIX/direct turnover soak. For
+an M2 result, the benchmark data set must
 exceed physical RAM and the mount must resolve to a non-rotational NVMe block
 device. `qualification.status` is written with `status=m2_pass` only after
 those preconditions, all five performance gates being configured, every
@@ -372,7 +371,7 @@ Run a four-hour device soak with:
 CACHE_SOAK_SECONDS=14400 \
 CACHE_SOAK_SAMPLE_SECONDS=10 \
 CACHE_SOAK_DIR=/mnt/nvme \
-CACHE_SOAK_IO_ENGINE=io-uring \
+CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=direct \
 cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 ```

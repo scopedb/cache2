@@ -20,7 +20,8 @@ Deliver one simple bounded RAM + Region SSD architecture:
 
 - [x] one public `HybridCache` API and one Region format;
 - [x] shard-local L1, staging, ordering, and L2 ownership;
-- [x] configurable sync/automatic/io_uring engines and I/O worker count;
+- [x] default POSIX positioned-I/O engine, explicit optional io_uring engine,
+  and configurable I/O worker count;
 - [x] static file-layout configuration separated from runtime tuning;
 - [x] bounded L1 admission, I/O queues, buffers, staging, and logical disk use;
 - [x] cold-empty recovery after crash or fast close;
@@ -63,15 +64,17 @@ Exit criteria:
 **Goal:** validate the implementation on the operating systems and devices it
 is intended to serve.
 
-- [x] add Linux and macOS CI for format, check, clippy, tests, default features,
-  and no-default-features;
+- [x] add Linux and macOS CI for format, check, clippy, tests, the default POSIX
+  build, and the optional io_uring feature;
 - [x] provide one Linux NVMe qualification runner that captures hardware,
-  three-mode medians, worker scaling, a bounded soak, and checksummed evidence;
-- [x] run a RAM-backed Linux arm64 functional preflight for sync/buffered,
-  sync/direct, io_uring/direct, worker scaling, and Region turnover;
+  POSIX buffered/direct medians, worker scaling, a bounded soak, and checksummed
+  evidence;
+- [x] run a RAM-backed Linux arm64 functional preflight for POSIX buffered and
+  direct modes, optional io_uring/direct compatibility, worker scaling, and
+  Region turnover;
 - [x] validate warm recovery and both shutdown modes with a 100M-key fixed
   index in a swap-free, RAM-backed Linux VM;
-- [ ] benchmark Linux NVMe with sync/buffered, sync/direct, and io_uring/direct;
+- [ ] benchmark Linux NVMe with POSIX buffered and direct I/O;
 - [x] measure worker scaling at 1, 2, 4, 8, and 16 workers with fixed workloads;
 - [x] run external-process kill tests at open, write, drain, and warm-close
   publication boundaries;

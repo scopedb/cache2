@@ -1783,7 +1783,7 @@ impl BackendIoEngine {
         if worker_count == 0 || worker_count > max_in_flight {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "sync I/O worker count must not exceed the request limit",
+                "POSIX I/O worker count must not exceed the request limit",
             ));
         }
         let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
@@ -2151,15 +2151,6 @@ mod uring {
                 }),
                 io_stats,
             })
-        }
-
-        /// Errors that mean Auto mode may select the synchronous engine before
-        /// any request has been accepted. Runtime I/O errors are never eligible.
-        pub(crate) fn is_unavailable_error(error: &io::Error) -> bool {
-            matches!(
-                error.kind(),
-                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
-            ) || matches!(error.raw_os_error(), Some(22 | 38 | 95))
         }
     }
 
@@ -2979,55 +2970,6 @@ mod uring {
 ))]
 pub(crate) use uring::UringIoEngine;
 
-/// Builds the fastest available native file engine while preserving the
-/// positioned-I/O backend as a behaviorally identical fallback.
-#[cfg(unix)]
-pub(crate) fn build_auto_file_engine(
-    files: RuntimeFileSet,
-    max_in_flight: usize,
-    statistics_enabled: bool,
-) -> io::Result<Arc<dyn IoEngine>> {
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    {
-        let fallback = files.try_clone()?;
-        match UringIoEngine::new_with_files(files, max_in_flight, statistics_enabled) {
-            Ok(engine) => Ok(Arc::new(engine)),
-            Err(error) if UringIoEngine::is_unavailable_error(&error) => {
-                BackendIoEngine::new_with_files_and_workers(fallback, 1, 1, statistics_enabled)
-                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(not(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    )))]
-    {
-        let _ = max_in_flight;
-        BackendIoEngine::new_with_files_and_workers(files, 1, 1, statistics_enabled)
-            .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
-    }
-}
-
 #[cfg(unix)]
 pub(crate) fn build_file_engine(
     files: RuntimeFileSet,
@@ -3036,12 +2978,10 @@ pub(crate) fn build_file_engine(
     statistics_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        ConfiguredIoEngine::Sync => {
+        ConfiguredIoEngine::Posix => {
+            let _ = max_in_flight;
             BackendIoEngine::new_with_files_and_workers(files, 1, 1, statistics_enabled)
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
-        }
-        ConfiguredIoEngine::Auto => {
-            build_auto_file_engine(files, max_in_flight, statistics_enabled)
         }
         ConfiguredIoEngine::IoUring => {
             #[cfg(all(
@@ -3367,7 +3307,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_engine_round_trips_owned_buffers_and_drains() {
+    fn posix_engine_round_trips_owned_buffers_and_drains() {
         let file = TestFile::new();
         let engine = BackendIoEngine::new(file.backend(), 4).unwrap();
         let resources = resources(4096);
@@ -3403,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_engine_reports_progress_before_a_terminal_short_io_error() {
+    fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
         let engine = BackendIoEngine::new(Arc::new(ShortThenErrorBackend::default()), 2).unwrap();
         let resources = resources(4096);
 
@@ -3502,7 +3442,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sync_engine_routes_only_aligned_record_io_to_direct() {
+    fn posix_engine_routes_only_aligned_record_io_to_direct() {
         let buffered = TestFile::new();
         let direct = TestFile::new();
         let buffered_file = buffered.file();
@@ -3638,10 +3578,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn configured_sync_engine_exposes_only_its_executable_slot() {
+    fn configured_posix_engine_exposes_only_its_executable_slot() {
         let file = TestFile::new();
         let files = RuntimeFileSet::new(file.file(), None);
-        let engine = build_file_engine(files, 32, ConfiguredIoEngine::Sync, false).unwrap();
+        let engine = build_file_engine(files, 32, ConfiguredIoEngine::Posix, false).unwrap();
 
         let reserved = engine.try_reserve_read().unwrap();
         assert_eq!(

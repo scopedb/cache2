@@ -5,9 +5,10 @@ const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IoEngine {
-    Sync,
+    /// Worker-backed POSIX positioned I/O.
     #[default]
-    Auto,
+    Posix,
+    /// Linux io_uring, available only with the `io-uring` crate feature.
     IoUring,
 }
 
@@ -36,10 +37,10 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            io_engine: IoEngine::Auto,
+            io_engine: IoEngine::Posix,
             io_mode: IoMode::Auto,
             io_workers: 4,
-            io_concurrency: 128,
+            io_concurrency: 4,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
@@ -65,7 +66,7 @@ impl RuntimeConfig {
         self
     }
 
-    /// Sets aggregate asynchronous I/O admission. The synchronous engine has
+    /// Sets aggregate asynchronous I/O admission. The POSIX engine has
     /// one executable slot per `io_worker` and does not queue cache reads.
     pub fn with_io_concurrency(mut self, requests: usize) -> Self {
         self.io_concurrency = requests;
@@ -131,5 +132,17 @@ impl RuntimeConfig {
 
     pub const fn statistics_enabled(&self) -> bool {
         self.statistics
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IoEngine, RuntimeConfig};
+
+    #[test]
+    fn runtime_defaults_to_posix_io() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.io_engine(), IoEngine::Posix);
+        assert_eq!(config.io_concurrency(), config.io_workers());
     }
 }

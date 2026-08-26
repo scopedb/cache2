@@ -9,7 +9,8 @@ version number documented in `MILESTONES.md`.
 ### Added
 
 - bounded RAM + Region SSD `HybridCache` with shard-local staging and L1;
-- sync, automatic, and Linux io_uring engines with runtime worker tuning;
+- POSIX positioned-I/O and optional Linux io_uring engines with runtime worker
+  tuning;
 - fast cold restart and graceful warm-image recovery;
 - deterministic managed-memory and logical-disk bounds;
 - opt-in operational snapshots, release benchmarks, turnover soak, persistent
@@ -38,6 +39,9 @@ version number documented in `MILESTONES.md`.
 
 ### Changed
 
+- made POSIX positioned I/O the only default engine, renamed `IoEngine::Sync`
+  to `IoEngine::Posix`, removed implicit `IoEngine::Auto` selection, and made
+  io_uring an explicit opt-in crate feature;
 - made `get` and `get_in` native Tokio async operations; L1/index-miss paths
   remain immediate, while an admitted L2 read wakes the caller task directly;
 - made `open`, `drain`, and explicit close Tokio-friendly: drain uses native

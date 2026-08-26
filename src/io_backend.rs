@@ -495,7 +495,7 @@ impl ControlIoBackend for FileBackend {
     }
 }
 
-/// Positioned-I/O backend used by the synchronous reference engine. Control,
+/// Positioned-I/O backend used by the POSIX engine. Control,
 /// metadata, locking, and recovery continue to use `FileBackend`; this backend
 /// routes only aligned runtime reads and record writes to the direct fd.
 pub(crate) struct RuntimeFileBackend {
@@ -1207,9 +1207,9 @@ mod tests {
     }
 
     #[test]
-    fn sync_runtime_backend_routes_record_data_and_reports_bytes() {
-        let buffered = TestFile::new("sync-buffered-data");
-        let direct = TestFile::new("sync-direct-data");
+    fn posix_runtime_backend_routes_record_data_and_reports_bytes() {
+        let buffered = TestFile::new("posix-buffered-data");
+        let direct = TestFile::new("posix-direct-data");
         let buffered_file = buffered.open();
         let direct_file = direct.open();
         buffered_file

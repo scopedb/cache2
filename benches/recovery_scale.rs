@@ -61,10 +61,10 @@ impl ScaleConfig {
 
     fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig::default()
-            .with_io_engine(IoEngine::Sync)
+            .with_io_engine(IoEngine::Posix)
             .with_io_mode(IoMode::Buffered)
             .with_io_workers(1)
-            .with_io_concurrency(32)
+            .with_io_concurrency(1)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(false)

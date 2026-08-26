@@ -36,7 +36,7 @@ xxhash-rust = { version = "=0.8.18", default-features = false, features = ["xxh3
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["io-uring"]
+default = []
 io-uring = ["dep:io-uring"]
 fuzzing = []
 

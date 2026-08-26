@@ -34,9 +34,9 @@ impl TestCache {
 
     fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> HybridCacheConfig {
         let runtime_config = RuntimeConfig::default()
-            .with_io_engine(IoEngine::Sync)
+            .with_io_engine(IoEngine::Posix)
             .with_io_workers(workers)
-            .with_io_concurrency(workers * 4)
+            .with_io_concurrency(workers)
             .with_l1_capacity(4 * 1024 * 1024)
             .with_memory_limit(32 * 1024 * 1024)
             .with_write_batch_size(256 * 1024)
@@ -171,9 +171,9 @@ async fn fast_close_always_reopens_empty() {
 async fn immediate_l1_publication_is_best_effort() {
     let files = TestCache::new("latest-memory-visible");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(2)
-        .with_io_concurrency(8)
+        .with_io_concurrency(2)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -208,9 +208,9 @@ async fn immediate_l1_publication_is_best_effort() {
 async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(4)
+        .with_io_concurrency(1)
         .with_l1_capacity(1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -248,9 +248,9 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
 async fn l1_bypass_may_remain_stale_after_region_completion() {
     let files = TestCache::new("l1-bypass-publication");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(2)
-        .with_io_concurrency(8)
+        .with_io_concurrency(2)
         .with_l1_capacity(512)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -340,9 +340,9 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     cache.close_warm().await.unwrap();
 
     let retuned = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(7)
-        .with_io_concurrency(35)
+        .with_io_concurrency(7)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
@@ -618,7 +618,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
     let cases: [RuntimeConfigCase; 6] = [
         ("workers-exceed-queue", |config| {
             config
-                .with_io_engine(IoEngine::Sync)
+                .with_io_engine(IoEngine::Posix)
                 .with_io_workers(8)
                 .with_io_concurrency(4)
         }),
@@ -629,7 +629,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         }),
         ("fixed-plan-exceeds-budget", |config| {
             config
-                .with_io_engine(IoEngine::Sync)
+                .with_io_engine(IoEngine::Posix)
                 .with_io_workers(2)
                 .with_io_concurrency(8)
                 .with_l1_capacity(0)
@@ -884,9 +884,9 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
 async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(4)
+        .with_io_concurrency(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
@@ -919,9 +919,9 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
 async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let files = TestCache::new("promoted-l2-buffer-release");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(4)
+        .with_io_concurrency(1)
         .with_l1_capacity(64 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -964,9 +964,9 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
 async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation() {
     let files = TestCache::new("exact-transient-read-memory");
     let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Sync)
+        .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(4)
+        .with_io_concurrency(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)

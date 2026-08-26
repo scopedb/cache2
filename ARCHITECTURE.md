@@ -102,9 +102,10 @@ complete key, lengths, and checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
-The I/O pool contains the requested number of workers. In sync mode these are
-positioned-I/O workers; with io_uring they are independent rings. The sum of
-fixed lane depths never exceeds the configured global in-flight bound.
+The I/O pool contains the requested number of workers. The default engine uses
+one POSIX positioned-I/O worker per lane. Explicit io_uring builds use one ring
+per lane. The sum of fixed lane depths never exceeds the configured global
+in-flight bound.
 Two-choice read routing reduces idle-lane fragmentation without adding a shared
 admission counter to every I/O.
 

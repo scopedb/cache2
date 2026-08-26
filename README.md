@@ -29,9 +29,9 @@ let runtime_config = RuntimeConfig::default()
     .with_l1_capacity(8 * 1024 * 1024 * 1024)
     .with_memory_limit(10 * 1024 * 1024 * 1024)
     .with_l1_shards(64)
-    .with_io_engine(IoEngine::Auto)
+    .with_io_engine(IoEngine::Posix)
     .with_io_workers(16)
-    .with_io_concurrency(512)
+    .with_io_concurrency(16)
     .with_write_batch_size(4 * 1024 * 1024);
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
@@ -200,7 +200,8 @@ reads fail open as misses.
 Changing one of these values safely formats an empty cache. `RuntimeConfig`
 may change on every open without invalidating a clean image:
 
-- sync/automatic/io_uring engine selection;
+- POSIX positioned-I/O by default, with io_uring available only through an
+  explicit crate feature and engine selection;
 - buffered/automatic/direct I/O mode;
 - any positive I/O worker count within the configured total I/O concurrency;
 - total I/O concurrency;
@@ -337,6 +338,8 @@ promoted L1 set. The default data set is 8,192 × 16 KiB.
 configuration. Set
 `CACHE_BENCH_DIR` to a mounted cache device when measuring device I/O rather
 than the system temporary directory.
+`CACHE_BENCH_IO_ENGINE` accepts `posix` (the default) or `io-uring`; the latter
+requires building with `--features io-uring`.
 Keys are generated on demand and values contain their key ordinal, so a large
 L2 data set does not allocate one generator object per key and a wrong-key read
 is a hard failure. The resident L1 phase uses only the configured bounded
@@ -345,10 +348,10 @@ qualification requires an L2 data set larger than host RAM.
 The configurable turnover soak is available through
 `cargo bench --bench hybrid_cache_soak`; use the multi-hour device command in
 `BENCHMARK.md` for M2 validation. Its engine and mode are independently
-selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`. By default it
-uses four writers and four readers, periodically deletes keys, and cycles 256 B,
-4 KiB, 16 KiB, and 256 KiB values. `CACHE_SOAK_WRITERS` and
-`CACHE_SOAK_READERS` control the client mix. A validated older version is
+selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`; the engine
+defaults to `posix`. By default it uses four writers and four readers,
+periodically deletes keys, and cycles 256 B, 4 KiB, 16 KiB, and 256 KiB values.
+`CACHE_SOAK_WRITERS` and `CACHE_SOAK_READERS` control the client mix. A validated older version is
 counted as `stale_hits`; a future version, wrong key, malformed value, resource
 bound violation, or runtime failure terminates the run.
 

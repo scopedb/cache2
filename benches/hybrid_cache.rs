@@ -46,11 +46,10 @@ impl BenchConfig {
         let io_workers = env_usize("CACHE_BENCH_IO_WORKERS", 4)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
-            .unwrap_or_else(|_| "auto".to_owned())
+            .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "sync" => IoEngine::Sync,
-            "auto" => IoEngine::Auto,
+            "posix" => IoEngine::Posix,
             "io-uring" => IoEngine::IoUring,
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
@@ -156,7 +155,11 @@ impl BenchConfig {
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
-        let io_concurrency = self.io_workers.saturating_mul(64).max(self.io_workers);
+        let io_concurrency = if self.io_engine == IoEngine::Posix {
+            self.io_workers
+        } else {
+            self.io_workers.saturating_mul(64)
+        };
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
