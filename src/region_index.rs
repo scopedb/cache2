@@ -1,11 +1,14 @@
 //! Bounded point operations over the Region mmap index.
 //!
-//! This layer owns the sharded storage but deliberately does not own Region
-//! lifecycle state. A lookup returns only the raw typed point state and
+//! This layer owns the sharded storage and one monotonic created-sequence
+//! watermark per Region. A lookup returns only the raw typed point state and
 //! releases its canonical partition before record I/O. Mutations use sequence
-//! order within one bounded partition probe. Record reads validate physical
-//! Region identity locally, so index publication never needs global
-//! Region-manager authority.
+//! order within one bounded partition probe. Region reuse advances one
+//! watermark so obsolete slots become logical tombstones without an index
+//! scan or Region-manager access on point operations.
+
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hashing::route_hash;
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
@@ -16,21 +19,50 @@ use crate::index_storage::{
 /// A bounded point index over one canonical [`PartitionedIndexStorage`].
 pub(crate) struct RegionIndex {
     storage: PartitionedIndexStorage,
+    region_created_seqnos: Box<[AtomicU64]>,
 }
 
 impl RegionIndex {
-    pub(crate) const fn from_storage(storage: PartitionedIndexStorage) -> Self {
-        Self { storage }
+    pub(crate) fn try_from_storage(
+        storage: PartitionedIndexStorage,
+        created_seqnos: impl ExactSizeIterator<Item = u64>,
+    ) -> io::Result<Self> {
+        let mut region_created_seqnos = Vec::new();
+        region_created_seqnos
+            .try_reserve_exact(created_seqnos.len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate Region index generation table",
+                )
+            })?;
+        region_created_seqnos.extend(created_seqnos.map(AtomicU64::new));
+        Ok(Self {
+            storage,
+            region_created_seqnos: region_created_seqnos.into_boxed_slice(),
+        })
     }
 
     pub(crate) const fn storage(&self) -> &PartitionedIndexStorage {
         &self.storage
     }
 
-    /// Looks up the raw typed state for one same-hash identity.
+    /// Advances one Region's logical generation after reuse.
     ///
-    /// Region-generation visibility deliberately does not run here. The read
-    /// path validates the selected physical record locally after I/O.
+    /// This is the complete reclaim-side index cleanup. Point operations turn
+    /// older slots into misses or bounded-probe reuse candidates lazily.
+    pub(crate) fn publish_region_generation(&self, region_id: u32, created_seqno: u64) -> bool {
+        let Some(watermark) = self.region_created_seqnos.get(region_id as usize) else {
+            return false;
+        };
+        if created_seqno == 0 {
+            return false;
+        }
+        watermark.fetch_max(created_seqno, Ordering::Relaxed);
+        true
+    }
+
+    /// Looks up the raw typed state for one same-hash identity.
     pub(crate) fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let start = start_slot(hash, partition.slot_count());
@@ -46,7 +78,9 @@ impl RegionIndex {
                     entry,
                 } => {
                     if current_hash == hash {
-                        found = Some(entry);
+                        if !self.is_stale(entry) {
+                            found = Some(entry);
+                        }
                         true
                     } else {
                         false
@@ -59,15 +93,16 @@ impl RegionIndex {
 
     /// Installs a live value using the existing bounded replacement policy.
     ///
-    /// Deleted slots are reused first. If the window has no reusable slot, the
-    /// first foreign value becomes the bounded eviction victim. A delayed
-    /// older publication cannot replace a newer same-hash entry.
+    /// Deleted slots are reused first, followed by stale foreign slots. If the
+    /// window has no reusable slot, the first live foreign value becomes the
+    /// bounded eviction victim. A delayed older publication cannot replace a
+    /// newer same-hash entry.
     pub(crate) fn upsert(
         &self,
         hash: u64,
         supplied: IndexEntry,
     ) -> Result<bool, IndexStorageError> {
-        if supplied.seqno == 0 {
+        if supplied.seqno == 0 || self.is_stale(supplied) {
             return Ok(false);
         }
 
@@ -87,7 +122,8 @@ impl RegionIndex {
         let mut partition = self.storage.write_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let start = start_slot(hash, slot_count);
-        let mut reusable = None;
+        let mut deleted = None;
+        let mut stale = None;
         let mut victim = None;
         let mut apply = None;
         let mut rejected = false;
@@ -97,11 +133,11 @@ impl RegionIndex {
             probe_limit(slot_count),
             |local_slot, state| match state {
                 IndexSlotState::Empty => {
-                    apply = Some(reusable.unwrap_or((local_slot, state)));
+                    apply = Some(deleted.or(stale).unwrap_or((local_slot, state)));
                     true
                 }
                 IndexSlotState::Deleted => {
-                    reusable.get_or_insert((local_slot, state));
+                    deleted.get_or_insert((local_slot, state));
                     false
                 }
                 IndexSlotState::Value {
@@ -116,7 +152,9 @@ impl RegionIndex {
                         }
                         true
                     } else {
-                        if victim.is_none() {
+                        if self.is_stale(current) {
+                            stale.get_or_insert((local_slot, state));
+                        } else if victim.is_none() {
                             victim = Some((local_slot, state));
                         }
                         false
@@ -128,7 +166,7 @@ impl RegionIndex {
             return Ok(false);
         }
 
-        let Some((local_slot, previous)) = apply.or(reusable).or(victim) else {
+        let Some((local_slot, previous)) = apply.or(deleted).or(stale).or(victim) else {
             return Ok(false);
         };
         partition.replace_observed(local_slot, previous, installed)?;
@@ -189,6 +227,12 @@ impl RegionIndex {
         };
         partition.replace_observed(local_slot, previous, IndexSlotState::Deleted)?;
         Ok(true)
+    }
+
+    fn is_stale(&self, entry: IndexEntry) -> bool {
+        self.region_created_seqnos
+            .get(entry.location.region_id() as usize)
+            .is_some_and(|watermark| entry.seqno < watermark.load(Ordering::Relaxed))
     }
 }
 
@@ -256,7 +300,11 @@ mod tests {
     }
 
     fn anonymous(slot_count: usize) -> RegionIndex {
-        RegionIndex::from_storage(PartitionedIndexStorage::anonymous(slot_count).unwrap())
+        RegionIndex::try_from_storage(
+            PartitionedIndexStorage::anonymous(slot_count).unwrap(),
+            (0..16).map(|_| 0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -305,7 +353,76 @@ mod tests {
     }
 
     #[test]
-    fn raw_lookup_needs_no_visibility_callback() {
+    fn generation_advance_hides_old_slots_and_rejects_delayed_publication() {
+        let index = anonymous(8);
+        let hash = 5;
+        let current = entry(2, 16, 9);
+        assert!(index.upsert(hash, current).unwrap());
+
+        assert!(index.publish_region_generation(2, 10));
+        assert_eq!(index.lookup_raw(hash).unwrap(), None);
+        assert!(!index.upsert(hash, current).unwrap());
+
+        let replacement = entry(2, 24, 11);
+        assert!(index.upsert(hash, replacement).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn stale_foreign_slot_is_reused_before_a_live_victim() {
+        let index = anonymous(8);
+        let live = entry(0, 0, 10);
+        {
+            let mut partition = index.storage().write_hash_partition(0).unwrap();
+            partition
+                .replace_observed(
+                    0,
+                    IndexSlotState::Empty,
+                    IndexSlotState::Value {
+                        hash: 0,
+                        entry: live,
+                    },
+                )
+                .unwrap();
+            for local_slot in 1..8 {
+                partition
+                    .replace_observed(
+                        local_slot,
+                        IndexSlotState::Empty,
+                        IndexSlotState::Value {
+                            hash: local_slot as u64,
+                            entry: entry(1, local_slot as u32 * 32, 10),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(index.publish_region_generation(0, 1));
+        assert!(index.publish_region_generation(1, 20));
+
+        let supplied = entry(0, 32, 30);
+        assert!(index.upsert(8, supplied).unwrap());
+        assert_eq!(index.lookup_raw(0).unwrap(), Some(live));
+        assert_eq!(index.lookup_raw(8).unwrap(), Some(supplied));
+        assert_eq!(
+            index.storage().physical_stats().unwrap(),
+            IndexPhysicalStats {
+                value: 8,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_region_generation_is_not_published() {
+        let index = anonymous(8);
+
+        assert!(!index.publish_region_generation(16, 1));
+        assert!(!index.publish_region_generation(0, 0));
+    }
+
+    #[test]
+    fn zero_watermark_preserves_recovered_values() {
         let index = anonymous(8);
         let hash = 5;
         let current = entry(2, 16, 9);
@@ -362,7 +479,7 @@ mod tests {
             &partition_stats,
         )
         .unwrap();
-        let index = RegionIndex::from_storage(recovered);
+        let index = RegionIndex::try_from_storage(recovered, (0..16).map(|_| 0)).unwrap();
         let before = index.storage().partition_stats().unwrap();
         assert!(matches!(
             index.upsert(HASH, entry(3, 24, 20)),
@@ -393,7 +510,7 @@ mod tests {
         let mut test_file = TestFile::create();
         test_file.file.write_all(&image).unwrap();
         test_file.file.sync_all().unwrap();
-        let recovered = RegionIndex::from_storage(
+        let recovered = RegionIndex::try_from_storage(
             PartitionedIndexStorage::map_private(
                 &test_file.file,
                 0,
@@ -402,7 +519,9 @@ mod tests {
                 &partition_stats,
             )
             .unwrap(),
-        );
+            (0..16).map(|_| 0),
+        )
+        .unwrap();
 
         assert_eq!(
             recovered.lookup_raw(HASH_IN_SECOND_SHARD).unwrap(),

@@ -324,9 +324,13 @@ impl FileRegionRuntime {
             })?;
         rotation.resize_with(layout.sets().len(), || Mutex::new(()));
         let health = RegionHealthLatch::healthy();
+        let index = RegionIndex::try_from_storage(
+            index,
+            manager.regions().iter().map(|region| region.created_seqno),
+        )?;
         Ok(Self {
             core: Arc::new(FileRegionCore {
-                index: RegionIndex::from_storage(index),
+                index,
                 manager: RegionManagerAuthority::new(manager, health.clone()),
                 layout,
                 shards: shards.into_boxed_slice(),
@@ -936,6 +940,16 @@ impl FileRegionCore {
             .lock()?
             .begin_rotation(plan)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
+        if !self
+            .index
+            .publish_region_generation(receipt.activated_region_id, receipt.activated_created_seqno)
+        {
+            self.health.enter_miss_only();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rotation activated an untracked Region generation",
+            ));
+        }
         // Manager authority now carries the exact in-progress rotation
         // receipt, so foreground staging fails fast on this shard. Release the
         // shard gates before publishing the completed in-memory rotation.
@@ -3318,6 +3332,72 @@ mod tests {
         let manager = runtime.manager.lock().unwrap();
         assert_eq!(manager.active_regions()[0], REGION_SHARDS);
         assert_eq!(manager.sealed_regions().back(), Some(&0));
+    }
+
+    #[test]
+    fn reclaim_hides_the_victim_regions_old_index_slots() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let hash = 19;
+        let old = IndexEntry {
+            location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
+            seqno: u64::from(REGION_SHARDS),
+            namespace_id: 0,
+        };
+        assert!(runtime.index.upsert(hash, old).unwrap());
+
+        for expected_hit in [Some(old), None] {
+            runtime
+                .manager
+                .inner
+                .lock()
+                .unwrap()
+                .request_rotation_for_test(0)
+                .unwrap();
+            assert!(runtime.rotate_shard(0).unwrap());
+            assert_eq!(runtime.index.lookup_raw(hash).unwrap(), expected_hit);
+        }
+        assert_eq!(runtime.manager.lock().unwrap().active_regions()[0], 0);
+    }
+
+    #[test]
+    fn recovery_watermarks_hide_stale_slots_without_rebuilding_the_index() {
+        let data = data_path_superblock();
+        let index = PartitionedIndexStorage::anonymous(64).unwrap();
+        let hash = 19;
+        let stale = IndexEntry {
+            location: crate::index::PackedLocation::new(1, 0, 32).unwrap(),
+            seqno: 1,
+            namespace_id: 0,
+        };
+        {
+            let mut partition = index.write_hash_partition(hash).unwrap();
+            let local_slot = crate::hashing::route_hash(hash, partition.slot_count());
+            partition
+                .replace_observed(
+                    local_slot,
+                    crate::index_storage::IndexSlotState::Empty,
+                    crate::index_storage::IndexSlotState::Value { hash, entry: stale },
+                )
+                .unwrap();
+        }
+        let mut metadata = empty_region_metadata(data, 64, REGION_SHARDS).unwrap();
+        metadata.partitions[0].physical_value_slots = 1;
+
+        let runtime = FileRegionRuntime::install(index, metadata).unwrap();
+
+        assert_eq!(runtime.index.lookup_raw(hash).unwrap(), None);
+        assert_eq!(
+            runtime.index.storage().physical_stats().unwrap(),
+            IndexPhysicalStats {
+                value: 1,
+                deleted: 0,
+            }
+        );
     }
 
     #[test]
