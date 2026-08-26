@@ -1765,13 +1765,23 @@ mod tests {
             region_size: 32 * 1024 * 1024,
             region_count: 32 * 1024,
         };
-        let index_slots = 83_886_080;
+        let index_slots = 335_544_320;
         let base = RuntimeConfig::default()
             .with_l1_capacity(10 * GIB)
-            .with_memory_limit(12 * GIB)
+            .with_memory_limit(24 * GIB)
             .with_l1_shards(64);
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
+        base.validate_memory_plan(geometry, index_slots, 8, 0)
+            .unwrap();
+        let too_small = base.clone().with_memory_limit(20 * GIB);
+        assert_eq!(
+            too_small
+                .validate_memory_plan(geometry, index_slots, 8, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
 
         let clock = MemoryStore::allocation_bytes(
             base.l1_capacity_bytes,

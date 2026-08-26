@@ -265,7 +265,10 @@ device to data-sync, but neither makes the cache recoverable.
    read, I/O command metadata, recovery scratch, and explicit cache-thread
    stacks. Concurrent reads consume only their actual aligned read sizes.
    Invalid plans fail before creating files; inspect `detailed_snapshot().l1`
-   and `.index` to confirm the resulting entry and slot pressure.
+   and `.index` to confirm the resulting entry and slot pressure. As a concrete
+   upper-density plan, 1 TiB at 4 KiB per entry needs a 10 GiB index; paired
+   with a 10 GiB L1, the checked configuration uses a 24 GiB aggregate limit
+   rather than treating the L1 byte setting as the complete process budget.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
