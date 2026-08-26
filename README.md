@@ -117,8 +117,9 @@ continue through L2. Successful completion publishes the L2 index entry. The
 default write backpressure policy rejects immediately when the fixed shard
 write buffer is saturated; it has no global write-admission gate. Only an
 explicitly selected `Block` or `Timeout` policy may wait for write-side
-capacity. Any write may briefly wait for the shard mutation gate and Region
-manager mutex; both critical sections are bounded and never cross device I/O.
+capacity. Any write may briefly wait for the shard mutation gate. Region
+manager contention follows the selected backpressure policy after one
+non-waiting probe. Neither path holds a lock across device I/O.
 
 After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate

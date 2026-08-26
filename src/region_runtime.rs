@@ -806,7 +806,7 @@ impl RegionDataPlane {
         let engine = running.engine_for(hash);
         let slot = match engine.try_reserve_read() {
             Ok(slot) => slot,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_read_pressure(error.kind()) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                     RuntimeMetrics::increment(&activity.l2_read_busy_misses);
@@ -881,7 +881,7 @@ impl RegionDataPlane {
                 }
                 Ok(None)
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_read_pressure(error.kind()) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                     RuntimeMetrics::increment(&activity.l2_read_busy_misses);
@@ -1555,6 +1555,16 @@ fn overload_runtime_error(error: WriteOverloadReason) -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
 }
 
+fn is_read_pressure(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::OutOfMemory
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+    )
+}
+
 fn staging_runtime_error(error: StagingError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -1577,6 +1587,19 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_read_pressure_is_not_a_cache_failure() {
+        for kind in [
+            io::ErrorKind::OutOfMemory,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(is_read_pressure(kind));
+        }
+        assert!(!is_read_pressure(io::ErrorKind::InvalidData));
+    }
 
     #[test]
     fn maximum_read_buffer_is_derived_from_runtime_limits() {

@@ -716,7 +716,7 @@ impl FileRegionCore {
 
     /// Preflights, reserves, and encodes one value directly into a shard's
     /// aligned fill buffer. Region reservation and open-span accounting share
-    /// one short manager critical section; the shard mutation gate then protects encoding
+    /// one manager try-lock; the shard mutation gate then protects encoding
     /// without retaining global authority. This method performs no device I/O
     /// and never publishes an index entry.
     #[allow(clippy::too_many_arguments)]
@@ -752,7 +752,9 @@ impl FileRegionCore {
             }
         }
         let receipt = {
-            let mut manager = self.manager.lock()?;
+            let Some(mut manager) = self.manager.try_lock()? else {
+                return Ok(RegionStageValue::NeedsProgress);
+            };
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
                 Err(RegionMutationError::WouldBlock) => {
@@ -2994,6 +2996,36 @@ mod tests {
             vec![4]
         );
         assert_eq!(manager.next_seqno(), 5);
+    }
+
+    #[test]
+    fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let resources = data_path_resources();
+        let staging = RegionStaging::try_new(
+            1,
+            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
+            data.geometry.region_size,
+            &resources,
+        )
+        .unwrap();
+        let manager = runtime.manager.inner.lock().unwrap();
+        let next_seqno = manager.next_seqno();
+        let hash = hash_namespaced_key(data.hash_seed, 7, b"key");
+        let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
+
+        assert_eq!(
+            runtime
+                .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value", 0)
+                .unwrap(),
+            RegionStageValue::NeedsProgress
+        );
+        assert_eq!(manager.next_seqno(), next_seqno);
     }
 
     #[test]
