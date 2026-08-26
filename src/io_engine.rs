@@ -43,6 +43,8 @@ use crate::io_backend::{
 #[cfg(unix)]
 use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
+#[cfg(unix)]
+use crate::runtime_config::IoEngine as ConfiguredIoEngine;
 use crate::snapshot::CacheIoSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
@@ -740,14 +742,6 @@ fn submit_cache_io_until(
         deadline,
         cancel_grace,
     })
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum FileIoEngineKind {
-    Sync,
-    #[default]
-    Auto,
-    IoUring,
 }
 
 pub(crate) trait IoEngine: Send + Sync {
@@ -2913,15 +2907,15 @@ pub(crate) fn build_auto_file_engine(
 pub(crate) fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
-    kind: FileIoEngineKind,
+    kind: ConfiguredIoEngine,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        FileIoEngineKind::Sync => {
+        ConfiguredIoEngine::Sync => {
             BackendIoEngine::new_with_files_and_workers(files, max_in_flight, 1)
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
         }
-        FileIoEngineKind::Auto => build_auto_file_engine(files, max_in_flight),
-        FileIoEngineKind::IoUring => {
+        ConfiguredIoEngine::Auto => build_auto_file_engine(files, max_in_flight),
+        ConfiguredIoEngine::IoUring => {
             #[cfg(all(
                 feature = "io-uring",
                 target_os = "linux",
@@ -2995,9 +2989,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::io_backend::FileBackend;
-    use crate::resources::{
-        ResourceController, ResourceLimits, WriteBackpressure, aligned_buffer_capacity,
-    };
+    use crate::resources::{ResourceController, ResourceLimits, aligned_buffer_capacity};
 
     static FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3219,7 +3211,6 @@ mod tests {
                 memory_limit_bytes: 1024 * 1024,
                 reserved_memory_bytes: 0,
                 waiting_write_limit: 4,
-                write_backpressure: WriteBackpressure::Reject,
             })
             .unwrap(),
         )

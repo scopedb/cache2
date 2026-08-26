@@ -23,14 +23,13 @@ use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValu
 use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
-use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_reader::{_READ_ALIGNMENT, plan_read};
 use crate::region_staging::{PendingFenceLookup, RegionStaging, StagingError};
 use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
     ResourceBuildError, ResourceController, ResourceLimits, WriteBackpressure, WriteOverloadReason,
 };
-use crate::runtime_config::RuntimeConfig;
+use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, RuntimeConfig};
 use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
 
 const _MAX_KEY_BYTES: usize = 4 * 1024;
@@ -318,7 +317,7 @@ impl RuntimeConfig {
             ));
         }
         if self.write_buffer_bytes == 0
-            || self.write_buffer_bytes > _WRITE_BATCH_BYTES
+            || self.write_buffer_bytes > MAX_WRITE_BATCH_BYTES
             || self.write_buffer_bytes % crate::resources::BUFFER_ALIGNMENT != 0
             || self.write_batch_bytes == 0
             || self.write_batch_bytes > self.write_buffer_bytes
@@ -657,12 +656,15 @@ impl RegionDataPlane {
 
         loop {
             // Reject-mode admission is the shard write-buffer transaction itself.
-            // The legacy global write gate exists only for callers that
-            // explicitly selected a waiting policy.
+            // The global write gate exists only for callers that explicitly
+            // selected a waiting policy.
             let permit = if self.config.write_backpressure == WriteBackpressure::Reject {
                 None
             } else {
-                match running.resources.begin_write_permit_until(deadline) {
+                match running
+                    .resources
+                    .begin_write_permit_until(self.config.write_backpressure, deadline)
+                {
                     Ok(permit) => Some(permit),
                     Err(reason) => {
                         if running.statistics {
@@ -970,12 +972,13 @@ impl RegionDataPlane {
 
     pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         let running = self.running()?;
-        let mut writes = running.resources.runtime_snapshot();
-        writes.write_buffer_rejections = running
-            .metrics
-            .write_buffer_rejections
-            .load(Ordering::Relaxed);
-        writes.write_buffer_wait_ns = running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed);
+        let writes = running.resources.runtime_snapshot(
+            running
+                .metrics
+                .write_buffer_rejections
+                .load(Ordering::Relaxed),
+            running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed),
+        );
         Ok(DetailedCacheSnapshot {
             summary: self.snapshot_running(running),
             writes,
@@ -1139,7 +1142,6 @@ fn start_running(
             memory_limit_bytes: memory_limit,
             reserved_memory_bytes: reserved_memory,
             waiting_write_limit: config.waiting_write_limit,
-            write_backpressure: config.write_backpressure,
         })
         .map_err(resource_build_io_error)?,
     );
@@ -1255,7 +1257,7 @@ fn build_engine_pool(
         engines.push(build_file_engine(
             worker_files,
             worker_concurrency,
-            config.file_io_engine(),
+            config.io_engine(),
         )?);
     }
     Ok(engines.into_boxed_slice())

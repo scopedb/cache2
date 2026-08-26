@@ -12,8 +12,7 @@ The intended 1.0 surface is deliberately small:
   cache;
 - `HybridCache` provides point `put`/`get`, namespace and TTL variants,
   completion/data-sync fences, snapshots, and explicit fast or warm close;
-- `Value`, `PutReceipt`, `CacheTier`, `StartupMode`, and `CacheHealth` describe
-  results;
+- `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
 - `IoEngine`, `IoMode`, and `WriteBackpressure` select runtime behavior.
 - `RegionSetConfig`, `RegionSetId`, and `RegionSetAllocation` define and inspect
   optional physical namespace retention partitions.

@@ -70,6 +70,8 @@ version number documented in `MILESTONES.md`.
   `l2_read_memory_misses` and `l2_read_busy_misses` counters.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
   aggregate memory limit, I/O concurrency, and per-shard write buffering.
+- made `put`, `put_in`, and `put_until` return their mutation sequence directly
+  instead of wrapping it in a single-field `PutReceipt`.
 
 ### Compatibility
 

@@ -13,8 +13,7 @@ use crate::io_engine::{
 };
 use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
 use crate::region_manager::RegionWriteSpan;
-
-pub(crate) const _WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+use crate::runtime_config::MAX_WRITE_BATCH_BYTES;
 
 pub(crate) struct RegionSpanSubmitError {
     pub(crate) error: io::Error,
@@ -195,7 +194,7 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
         .checked_sub(span.start_offset)
         .and_then(|length| usize::try_from(length).ok())
         .filter(|length| {
-            *length != 0 && *length <= _WRITE_BATCH_BYTES && *length % DIRECT_IO_ALIGNMENT == 0
+            *length != 0 && *length <= MAX_WRITE_BATCH_BYTES && *length % DIRECT_IO_ALIGNMENT == 0
         })
         .ok_or_else(|| {
             io::Error::new(

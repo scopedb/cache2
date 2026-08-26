@@ -12,24 +12,7 @@
 use std::io;
 
 use crate::index::MAX_INDEX_SLOTS;
-
-/// Static inputs needed before recovery state is inspected.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionConfig {
-    pub(crate) index_slots: usize,
-}
-
-impl RegionConfig {
-    fn validate(self) -> io::Result<Self> {
-        if !(8..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RegionStore index slots must be in 8..=268435456",
-            ));
-        }
-        Ok(self)
-    }
-}
+use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.
 #[derive(Debug, Eq, PartialEq)]
@@ -37,15 +20,6 @@ pub(crate) enum RecoveryPlan<T> {
     Fresh,
     Running,
     Clean(T),
-}
-
-/// How this process initialized its L2 index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionStartup {
-    FreshEmpty,
-    DirtyEmpty,
-    CleanMapped,
-    CleanRejectedEmpty,
 }
 
 /// Physical lifecycle operations required by [`RegionStore`].
@@ -61,17 +35,17 @@ pub(crate) trait RegionBackend {
     /// This must not allocate or scan the full index or Region data extents.
     fn inspect_recovery(
         &mut self,
-        config: RegionConfig,
+        index_slots: usize,
     ) -> io::Result<RecoveryPlan<Self::CleanImage>>;
 
     /// Construct a provisional empty runtime without starting workers.
-    fn anonymous_runtime(&mut self, config: RegionConfig) -> io::Result<Self::Runtime>;
+    fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime>;
 
     /// `Ok(None)` rejects the complete image and selects a cold start.
     fn map_clean_runtime(
         &mut self,
         clean: Self::CleanImage,
-        config: RegionConfig,
+        index_slots: usize,
     ) -> io::Result<Option<Self::Runtime>>;
 
     /// Publish `RUNNING` durably before the runtime can be observed. The
@@ -102,33 +76,34 @@ pub(crate) trait RegionBackend {
 pub(crate) struct RegionStore<B: RegionBackend> {
     backend: B,
     runtime: Option<B::Runtime>,
-    startup: RegionStartup,
+    startup: StartupMode,
     closed: bool,
 }
 
 impl<B: RegionBackend> RegionStore<B> {
-    pub(crate) fn open(config: RegionConfig, mut backend: B) -> io::Result<Self> {
-        let config = config.validate()?;
+    pub(crate) fn open(index_slots: usize, mut backend: B) -> io::Result<Self> {
+        validate_index_slots(index_slots)?;
         backend.acquire_exclusive()?;
 
         let opened = (|| {
-            let plan = backend.inspect_recovery(config)?;
+            let plan = backend.inspect_recovery(index_slots)?;
             let (runtime, startup) = match plan {
-                RecoveryPlan::Fresh => (
-                    backend.anonymous_runtime(config)?,
-                    RegionStartup::FreshEmpty,
-                ),
+                RecoveryPlan::Fresh => {
+                    (backend.anonymous_runtime(index_slots)?, StartupMode::Fresh)
+                }
                 RecoveryPlan::Running => (
-                    backend.anonymous_runtime(config)?,
-                    RegionStartup::DirtyEmpty,
+                    backend.anonymous_runtime(index_slots)?,
+                    StartupMode::ColdAfterUncleanShutdown,
                 ),
-                RecoveryPlan::Clean(clean) => match backend.map_clean_runtime(clean, config)? {
-                    Some(runtime) => (runtime, RegionStartup::CleanMapped),
-                    None => (
-                        backend.anonymous_runtime(config)?,
-                        RegionStartup::CleanRejectedEmpty,
-                    ),
-                },
+                RecoveryPlan::Clean(clean) => {
+                    match backend.map_clean_runtime(clean, index_slots)? {
+                        Some(runtime) => (runtime, StartupMode::Warm),
+                        None => (
+                            backend.anonymous_runtime(index_slots)?,
+                            StartupMode::ColdAfterRejectedImage,
+                        ),
+                    }
+                }
             };
 
             backend.publish_running()?;
@@ -150,7 +125,7 @@ impl<B: RegionBackend> RegionStore<B> {
         }
     }
 
-    pub(crate) const fn startup(&self) -> RegionStartup {
+    pub(crate) const fn startup(&self) -> StartupMode {
         self.startup
     }
 
@@ -212,6 +187,16 @@ fn closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "RegionStore is closed")
 }
 
+fn validate_index_slots(index_slots: usize) -> io::Result<()> {
+    if !(8..=MAX_INDEX_SLOTS).contains(&index_slots) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RegionStore index slots must be in 8..=268435456",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +255,7 @@ mod tests {
 
         fn inspect_recovery(
             &mut self,
-            _config: RegionConfig,
+            _index_slots: usize,
         ) -> io::Result<RecoveryPlan<Self::CleanImage>> {
             self.record(Event::Inspect)?;
             Ok(match self.plan {
@@ -281,18 +266,18 @@ mod tests {
             })
         }
 
-        fn anonymous_runtime(&mut self, config: RegionConfig) -> io::Result<Self::Runtime> {
+        fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime> {
             self.record(Event::Anonymous)?;
-            Ok(config.index_slots)
+            Ok(index_slots)
         }
 
         fn map_clean_runtime(
             &mut self,
             clean: Self::CleanImage,
-            config: RegionConfig,
+            index_slots: usize,
         ) -> io::Result<Option<Self::Runtime>> {
             self.record(Event::Map)?;
-            Ok(clean.then_some(config.index_slots))
+            Ok(clean.then_some(index_slots))
         }
 
         fn publish_running(&mut self) -> io::Result<()> {
@@ -342,7 +327,7 @@ mod tests {
     fn invalid_capacity_is_rejected_before_ownership_or_allocation() {
         for index_slots in [0, 1, 7, MAX_INDEX_SLOTS + 1] {
             let (backend, events) = backend(Plan::Fresh, None);
-            assert!(RegionStore::open(RegionConfig { index_slots }, backend).is_err());
+            assert!(RegionStore::open(index_slots, backend).is_err());
             assert!(events.borrow().is_empty());
         }
     }
@@ -352,7 +337,7 @@ mod tests {
         for (plan, startup, expected) in [
             (
                 Plan::Fresh,
-                RegionStartup::FreshEmpty,
+                StartupMode::Fresh,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -363,7 +348,7 @@ mod tests {
             ),
             (
                 Plan::Running,
-                RegionStartup::DirtyEmpty,
+                StartupMode::ColdAfterUncleanShutdown,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -374,7 +359,7 @@ mod tests {
             ),
             (
                 Plan::Clean,
-                RegionStartup::CleanMapped,
+                StartupMode::Warm,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -385,7 +370,7 @@ mod tests {
             ),
             (
                 Plan::RejectedClean,
-                RegionStartup::CleanRejectedEmpty,
+                StartupMode::ColdAfterRejectedImage,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -397,7 +382,7 @@ mod tests {
             ),
         ] {
             let (backend, events) = backend(plan, None);
-            let mut store = RegionStore::open(RegionConfig { index_slots: 8 }, backend).unwrap();
+            let mut store = RegionStore::open(8, backend).unwrap();
             assert_eq!(store.startup(), startup);
             assert_eq!(*events.borrow(), expected);
             store.close_fast().unwrap();
@@ -414,7 +399,7 @@ mod tests {
             ),
         ] {
             let (backend, events) = backend(Plan::Fresh, None);
-            let mut store = RegionStore::open(RegionConfig { index_slots: 8 }, backend).unwrap();
+            let mut store = RegionStore::open(8, backend).unwrap();
             events.borrow_mut().clear();
             if warm {
                 store.close_warm().unwrap();
@@ -428,7 +413,7 @@ mod tests {
     #[test]
     fn drop_uses_the_non_recoverable_shutdown_path() {
         let (backend, events) = backend(Plan::Fresh, None);
-        let store = RegionStore::open(RegionConfig { index_slots: 8 }, backend).unwrap();
+        let store = RegionStore::open(8, backend).unwrap();
         events.borrow_mut().clear();
 
         drop(store);
@@ -479,7 +464,7 @@ mod tests {
             ),
         ] {
             let (backend, events) = backend(plan, Some(failed));
-            assert!(RegionStore::open(RegionConfig { index_slots: 8 }, backend).is_err());
+            assert!(RegionStore::open(8, backend).is_err());
             assert_eq!(*events.borrow(), expected, "failed at {failed:?}");
         }
     }
@@ -501,7 +486,7 @@ mod tests {
             ),
         ] {
             let (backend, events) = backend(Plan::Fresh, Some(failed));
-            let mut store = RegionStore::open(RegionConfig { index_slots: 8 }, backend).unwrap();
+            let mut store = RegionStore::open(8, backend).unwrap();
             events.borrow_mut().clear();
             let result = if warm {
                 store.close_warm()

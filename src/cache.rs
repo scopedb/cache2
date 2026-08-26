@@ -25,11 +25,11 @@ use crate::region_metadata::{
     REGION_METADATA_REGIONS_PER_PAGE,
 };
 use crate::region_runtime::HybridValueRead;
-use crate::region_store::{RegionConfig, RegionStartup, RegionStore};
+use crate::region_store::RegionStore;
 #[cfg(test)]
 use crate::runtime_config::DEFAULT_L1_SHARDS;
 use crate::runtime_config::RuntimeConfig;
-use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
+use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
@@ -341,31 +341,12 @@ impl HybridCacheConfig {
             region_layout,
             runtime_config,
         );
-        let store = RegionStore::open(
-            RegionConfig {
-                index_slots: self.static_config.index_slots,
-            },
-            backend,
-        )?;
+        let store = RegionStore::open(self.static_config.index_slots, backend)?;
         Ok(HybridCache {
             store,
             logical_disk_peak_bytes,
         })
     }
-}
-
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StartupMode {
-    Fresh,
-    ColdAfterUncleanShutdown,
-    Warm,
-    ColdAfterRejectedImage,
-}
-
-#[non_exhaustive]
-pub struct PutReceipt {
-    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,29 +402,26 @@ impl fmt::Debug for HybridCache {
 
 impl HybridCache {
     pub fn startup_mode(&self) -> StartupMode {
-        match self.store.startup() {
-            RegionStartup::FreshEmpty => StartupMode::Fresh,
-            RegionStartup::DirtyEmpty => StartupMode::ColdAfterUncleanShutdown,
-            RegionStartup::CleanMapped => StartupMode::Warm,
-            RegionStartup::CleanRejectedEmpty => StartupMode::ColdAfterRejectedImage,
-        }
+        self.store.startup()
     }
 
-    pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<PutReceipt> {
+    /// Stores a value and returns its monotonic mutation sequence.
+    pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.put_in(0, key, value)
     }
 
-    /// Stores a value in a logical namespace without expiration.
+    /// Stores a value in a logical namespace and returns its mutation sequence.
     pub fn put_in(
         &self,
         namespace: u32,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
-    ) -> Result<PutReceipt> {
+    ) -> Result<u64> {
         self.put_until(namespace, key, value, 0)
     }
 
-    /// Stores a value until an absolute Unix timestamp in milliseconds.
+    /// Stores a value until an absolute Unix timestamp and returns its mutation
+    /// sequence.
     ///
     /// An expiration of zero means that the value does not expire.
     pub fn put_until(
@@ -452,11 +430,9 @@ impl HybridCache {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
         expires_at_unix_ms: u64,
-    ) -> Result<PutReceipt> {
-        let sequence =
-            self.store
-                .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)?;
-        Ok(PutReceipt { sequence })
+    ) -> Result<u64> {
+        self.store
+            .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)
     }
 
     /// Looks up a value in L1 and then L2.

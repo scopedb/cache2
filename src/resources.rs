@@ -57,7 +57,6 @@ pub(crate) struct ResourceLimits {
     pub(crate) memory_limit_bytes: usize,
     pub(crate) reserved_memory_bytes: usize,
     pub(crate) waiting_write_limit: usize,
-    pub(crate) write_backpressure: WriteBackpressure,
 }
 
 #[derive(Debug)]
@@ -78,7 +77,6 @@ impl fmt::Display for ResourceBuildError {
 pub(crate) struct ResourceController {
     memory: Arc<MemoryTracker>,
     write_gate: Arc<WriteGate>,
-    write_backpressure: WriteBackpressure,
 }
 
 /// A fixed runtime allocation charged to the same hard memory limit as the
@@ -107,13 +105,6 @@ impl ResourceController {
                 "waiting write limit exceeds its hard limit",
             ));
         }
-        if let WriteBackpressure::Timeout(duration) = limits.write_backpressure {
-            if duration > MAX_BACKPRESSURE_TIMEOUT {
-                return Err(ResourceBuildError::Invalid(
-                    "backpressure timeout must not exceed 24 hours",
-                ));
-            }
-        }
         if limits.reserved_memory_bytes > limits.memory_limit_bytes {
             return Err(ResourceBuildError::Invalid(
                 "memory limit cannot hold the cache's reserved memory",
@@ -126,7 +117,6 @@ impl ResourceController {
         ));
         Ok(Self {
             write_gate: Arc::new(WriteGate::new(limits.waiting_write_limit)),
-            write_backpressure: limits.write_backpressure,
             memory,
         })
     }
@@ -157,9 +147,10 @@ impl ResourceController {
     /// double-account memory and reduce useful concurrency.
     pub(crate) fn begin_write_permit_until(
         &self,
+        policy: WriteBackpressure,
         deadline: Option<Instant>,
     ) -> Result<WritePermit, WriteOverloadReason> {
-        let wait = match self.write_backpressure {
+        let wait = match policy {
             WriteBackpressure::Reject => WaitMode::Reject,
             WriteBackpressure::Block => WaitMode::Block,
             WriteBackpressure::Timeout(_) => {
@@ -178,14 +169,18 @@ impl ResourceController {
         }
     }
 
-    pub(crate) fn runtime_snapshot(&self) -> CacheWriteSnapshot {
+    pub(crate) fn runtime_snapshot(
+        &self,
+        write_buffer_rejections: u64,
+        write_buffer_wait_ns: u64,
+    ) -> CacheWriteSnapshot {
         CacheWriteSnapshot {
             write_requests_in_flight: usize_to_u64(self.write_gate.current.load(Ordering::Relaxed)),
             write_requests_peak: usize_to_u64(self.write_gate.peak.load(Ordering::Relaxed)),
             write_gate_rejections: self.write_gate.rejections.load(Ordering::Relaxed),
             write_gate_wait_ns: self.write_gate.wait_ns.load(Ordering::Relaxed),
-            write_buffer_rejections: 0,
-            write_buffer_wait_ns: 0,
+            write_buffer_rejections,
+            write_buffer_wait_ns,
         }
     }
 }
@@ -624,18 +619,17 @@ fn usize_to_u64(value: usize) -> u64 {
 mod tests {
     use super::*;
 
-    fn limits(policy: WriteBackpressure) -> ResourceLimits {
+    fn limits() -> ResourceLimits {
         ResourceLimits {
             memory_limit_bytes: 128 * 1024,
             reserved_memory_bytes: 16 * 1024,
             waiting_write_limit: 2,
-            write_backpressure: policy,
         }
     }
 
     #[test]
     fn transient_read_buffers_charge_exact_aligned_bytes_and_release_them() {
-        let resources = ResourceController::try_new(limits(WriteBackpressure::Reject)).unwrap();
+        let resources = ResourceController::try_new(limits()).unwrap();
         let first = resources.try_read_buffer(5000).unwrap();
         let second = resources.try_read_buffer(9000).unwrap();
         assert_eq!(first.address() % BUFFER_ALIGNMENT, 0);
@@ -684,40 +678,47 @@ mod tests {
 
     #[test]
     fn write_timeout_is_bounded_and_counted() {
-        let resources = ResourceController::try_new(limits(WriteBackpressure::Timeout(
-            Duration::from_millis(1),
-        )))
-        .unwrap();
+        let resources = ResourceController::try_new(limits()).unwrap();
         let deadline = || Some(Instant::now() + Duration::from_millis(20));
-        let _first = resources.begin_write_permit_until(deadline()).unwrap();
-        let _second = resources.begin_write_permit_until(deadline()).unwrap();
+        let policy = WriteBackpressure::Timeout(Duration::from_millis(1));
+        let _first = resources
+            .begin_write_permit_until(policy, deadline())
+            .unwrap();
+        let _second = resources
+            .begin_write_permit_until(policy, deadline())
+            .unwrap();
         assert_eq!(
-            resources.begin_write_permit_until(deadline()).err(),
+            resources.begin_write_permit_until(policy, deadline()).err(),
             Some(WriteOverloadReason::Timeout)
         );
-        let snapshot = resources.runtime_snapshot();
+        let snapshot = resources.runtime_snapshot(0, 0);
         assert_eq!(snapshot.write_gate_rejections, 1);
         assert!(snapshot.write_gate_wait_ns > 0);
     }
 
     #[test]
     fn blocking_write_admission_resumes_after_a_permit_drops() {
-        let resources =
-            Arc::new(ResourceController::try_new(limits(WriteBackpressure::Block)).unwrap());
-        let first = resources.begin_write_permit_until(None).unwrap();
-        let _second = resources.begin_write_permit_until(None).unwrap();
+        let resources = Arc::new(ResourceController::try_new(limits()).unwrap());
+        let first = resources
+            .begin_write_permit_until(WriteBackpressure::Block, None)
+            .unwrap();
+        let _second = resources
+            .begin_write_permit_until(WriteBackpressure::Block, None)
+            .unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
         let worker_resources = Arc::clone(&resources);
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let _permit = worker_resources.begin_write_permit_until(None).unwrap();
+            let _permit = worker_resources
+                .begin_write_permit_until(WriteBackpressure::Block, None)
+                .unwrap();
             done_tx.send(()).unwrap();
         });
 
         started_rx.recv().unwrap();
         assert!(done_rx.try_recv().is_err());
-        assert_eq!(resources.runtime_snapshot().write_requests_in_flight, 2);
+        assert_eq!(resources.runtime_snapshot(0, 0).write_requests_in_flight, 2);
         drop(first);
         done_rx.recv().unwrap();
         worker.join().unwrap();
@@ -725,7 +726,7 @@ mod tests {
 
     #[test]
     fn transient_read_buffers_stay_within_the_memory_limit() {
-        let mut configured = limits(WriteBackpressure::Reject);
+        let mut configured = limits();
         configured.memory_limit_bytes = configured.reserved_memory_bytes + 3 * BUFFER_ALIGNMENT;
 
         let resources = ResourceController::try_new(configured).unwrap();
@@ -741,7 +742,7 @@ mod tests {
 
     #[test]
     fn reserved_memory_over_limit_is_rejected_before_allocating_buffers() {
-        let mut too_small = limits(WriteBackpressure::Reject);
+        let mut too_small = limits();
         too_small.memory_limit_bytes = too_small.reserved_memory_bytes - 1;
         assert!(matches!(
             ResourceController::try_new(too_small),

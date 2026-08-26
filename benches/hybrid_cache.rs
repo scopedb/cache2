@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{
-    CacheTier, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine, IoMode, PutReceipt,
-    RuntimeConfig, StartupMode, StaticConfig,
+    CacheTier, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig,
+    StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -248,8 +248,7 @@ fn main() -> io::Result<()> {
         let key = benchmark_key(ordinal);
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
         let receipt = put_eventually(&cache, black_box(&key), black_box(&value))?;
-        write_checksum =
-            write_checksum.wrapping_add(receipt.sequence.rotate_left((ordinal % 64) as u32));
+        write_checksum = write_checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
     }
     cache.drain()?;
     let put = Measurement {
@@ -424,7 +423,7 @@ fn concurrent_reads(
     })
 }
 
-fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<PutReceipt> {
+fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<u64> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
     loop {
         match cache.put(key, value) {

@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::runtime_config::IoMode;
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -25,13 +27,6 @@ pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 const LINUX_EINTR: i32 = 4;
 #[cfg(unix)]
 const SAFE_CACHE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectIoMode {
-    Buffered,
-    Auto,
-    Required,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeIoPath {
@@ -131,15 +126,15 @@ impl RuntimeFileSet {
 
     #[cfg(test)]
     pub(crate) fn new(buffered: File, direct: Option<File>) -> Self {
-        Self::with_mode(buffered, direct, DirectIoMode::Auto)
+        Self::with_mode(buffered, direct, IoMode::Auto)
     }
 
-    fn with_mode(buffered: File, direct: Option<File>, mode: DirectIoMode) -> Self {
+    fn with_mode(buffered: File, direct: Option<File>, mode: IoMode) -> Self {
         let direct_active = direct.is_some();
         Self {
             buffered,
             direct,
-            direct_required: mode == DirectIoMode::Required,
+            direct_required: mode == IoMode::Direct,
             stats: DirectIoStatsHandle::new(direct_active),
         }
     }
@@ -156,7 +151,7 @@ impl RuntimeFileSet {
         }
         // Never issue malformed O_DIRECT. Unaligned record fragments and an
         // unaligned remainder after a positive short completion use the
-        // buffered compatibility path in every mode. Required mode means the
+        // buffered compatibility path in every mode. Direct mode means the
         // direct descriptor must exist and aligned direct errors do not fall
         // back; it does not make 32-byte-aligned records unreadable.
         if direct_io_aligned(buffer, length, offset) {
@@ -343,20 +338,20 @@ pub(crate) struct FileBackend {
     file: File,
     /// Separate Linux O_DIRECT descriptor for aligned runtime data I/O.
     direct: Option<File>,
-    direct_mode: DirectIoMode,
+    direct_mode: IoMode,
 }
 
 impl FileBackend {
     #[cfg(test)]
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        Self::open_with_io_mode(path, DirectIoMode::Buffered)
+        Self::open_with_io_mode(path, IoMode::Buffered)
     }
 
-    pub(crate) fn open_with_io_mode(path: &Path, mode: DirectIoMode) -> io::Result<Self> {
+    pub(crate) fn open_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
         Self::open_with_io_mode_and_create(path, mode, true)
     }
 
-    pub(crate) fn open_existing_with_io_mode(path: &Path, mode: DirectIoMode) -> io::Result<Self> {
+    pub(crate) fn open_existing_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
         Self::open_with_io_mode_and_create(path, mode, false)
     }
 
@@ -379,15 +374,11 @@ impl FileBackend {
         Ok(Self {
             file,
             direct: None,
-            direct_mode: DirectIoMode::Buffered,
+            direct_mode: IoMode::Buffered,
         })
     }
 
-    fn open_with_io_mode_and_create(
-        path: &Path,
-        mode: DirectIoMode,
-        create: bool,
-    ) -> io::Result<Self> {
+    fn open_with_io_mode_and_create(path: &Path, mode: IoMode, create: bool) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -401,7 +392,7 @@ impl FileBackend {
                 "cache path must be a regular file",
             ));
         }
-        if mode == DirectIoMode::Buffered {
+        if mode == IoMode::Buffered {
             return Ok(Self {
                 file,
                 direct: None,
@@ -419,18 +410,14 @@ impl FileBackend {
         Self::finish_direct_open(file, mode, direct)
     }
 
-    fn finish_direct_open(
-        file: File,
-        mode: DirectIoMode,
-        direct: io::Result<File>,
-    ) -> io::Result<Self> {
+    fn finish_direct_open(file: File, mode: IoMode, direct: io::Result<File>) -> io::Result<Self> {
         match direct {
             Ok(direct) => Ok(Self {
                 file,
                 direct: Some(direct),
                 direct_mode: mode,
             }),
-            Err(error) if mode == DirectIoMode::Auto && direct_io_unavailable(&error) => Ok(Self {
+            Err(error) if mode == IoMode::Auto && direct_io_unavailable(&error) => Ok(Self {
                 file,
                 direct: None,
                 direct_mode: mode,
@@ -1088,7 +1075,7 @@ mod tests {
         );
 
         let required =
-            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), DirectIoMode::Required);
+            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::Direct);
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
             RuntimeIoPath::Buffered,
@@ -1163,14 +1150,14 @@ mod tests {
         let auto_file = TestFile::new("direct-auto");
         let auto = FileBackend::finish_direct_open(
             auto_file.open(),
-            DirectIoMode::Auto,
+            IoMode::Auto,
             Err(io::Error::from_raw_os_error(22)),
         )
         .unwrap();
         assert!(!auto.direct_active());
         let policy_denied = FileBackend::finish_direct_open(
             auto_file.open(),
-            DirectIoMode::Auto,
+            IoMode::Auto,
             Err(io::Error::from_raw_os_error(13)),
         )
         .unwrap();
@@ -1179,7 +1166,7 @@ mod tests {
         let required_file = TestFile::new("direct-required");
         let error = FileBackend::finish_direct_open(
             required_file.open(),
-            DirectIoMode::Required,
+            IoMode::Direct,
             Err(io::Error::from_raw_os_error(22)),
         )
         .err()
@@ -1190,10 +1177,10 @@ mod tests {
         let direct = TestFile::new("runtime-fallback-direct");
         let unavailable = io::Error::from_raw_os_error(22);
         let auto_files =
-            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), DirectIoMode::Auto);
+            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::Auto);
         assert!(auto_files.should_fallback(RuntimeIoPath::Direct, &unavailable));
         let required_files =
-            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), DirectIoMode::Required);
+            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::Direct);
         assert!(!required_files.should_fallback(RuntimeIoPath::Direct, &unavailable));
     }
 
@@ -1420,7 +1407,7 @@ pub(crate) mod testing {
             handle: FaultHandle,
         ) -> io::Result<Self> {
             Ok(Self {
-                inner: FileBackend::open_existing_with_io_mode(path, DirectIoMode::Buffered)?,
+                inner: FileBackend::open_existing_with_io_mode(path, IoMode::Buffered)?,
                 handle,
             })
         }

@@ -2,6 +2,15 @@ use crate::region_layout::RegionSetId;
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupMode {
+    Fresh,
+    ColdAfterUncleanShutdown,
+    Warm,
+    ColdAfterRejectedImage,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheHealth {
     Running,
     Draining,

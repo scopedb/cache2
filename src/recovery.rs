@@ -144,14 +144,16 @@ pub(crate) struct DataSuperblock {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DataSuperblockProbe {
+pub(crate) enum PageProbe<T> {
     Empty,
-    Valid(DataSuperblock),
+    Valid(T),
     Corrupt,
     Unsupported(u16),
     Unrecognized,
     Truncated,
 }
+
+pub(crate) type DataSuperblockProbe = PageProbe<DataSuperblock>;
 
 impl DataSuperblock {
     pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
@@ -330,15 +332,7 @@ pub(crate) struct RecoveryImageHeader {
     pub(crate) region_table_len: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryImageHeaderProbe {
-    Empty,
-    Valid(RecoveryImageHeader),
-    Corrupt,
-    Unsupported(u16),
-    Unrecognized,
-    Truncated,
-}
+pub(crate) type RecoveryImageHeaderProbe = PageProbe<RecoveryImageHeader>;
 
 impl RecoveryImageHeader {
     pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
@@ -553,15 +547,7 @@ pub(crate) struct StateRecord {
     pub(crate) binding: StateBinding,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StateSlotProbe {
-    Empty,
-    Valid(StateRecord),
-    Corrupt,
-    Unsupported(u16),
-    Unrecognized,
-    Truncated,
-}
+pub(crate) type StateSlotProbe = PageProbe<StateRecord>;
 
 impl StateRecord {
     pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {

@@ -11,11 +11,11 @@ use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation};
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::io_engine::IoBuffer;
 use crate::recovery::{DATA_REGION_AREA_OFFSET, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE};
-use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
 use crate::resources::{
     BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController, RuntimeMemoryReservation,
 };
+use crate::runtime_config::MAX_WRITE_BATCH_BYTES;
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
 const MAX_PENDING_FENCES_PER_SHARD: usize = 2 * MAX_STAGING_RECORDS;
@@ -298,7 +298,7 @@ impl RegionStaging {
             ));
         }
         if chunk_bytes == 0
-            || chunk_bytes > _WRITE_BATCH_BYTES
+            || chunk_bytes > MAX_WRITE_BATCH_BYTES
             || chunk_bytes % BUFFER_ALIGNMENT != 0
             || chunk_bytes % RECORD_ALIGNMENT as usize != 0
         {
@@ -989,14 +989,13 @@ mod tests {
     use super::*;
     use crate::format::RecordCodec;
     use crate::index::PackedLocation;
-    use crate::resources::{ResourceLimits, WriteBackpressure};
+    use crate::resources::ResourceLimits;
 
     fn resources(memory_limit_bytes: usize) -> ResourceController {
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes,
             reserved_memory_bytes: 0,
             waiting_write_limit: 1,
-            write_backpressure: WriteBackpressure::Reject,
         })
         .unwrap()
     }

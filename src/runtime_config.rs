@@ -1,12 +1,10 @@
 use std::time::Duration;
 
 use crate::eviction::EvictionPolicy;
-use crate::io_backend::DirectIoMode;
-use crate::io_engine::FileIoEngineKind;
-use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::resources::WriteBackpressure;
 
 pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
+pub(crate) const MAX_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 
 #[non_exhaustive]
@@ -57,8 +55,8 @@ impl Default for RuntimeConfig {
             memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
             eviction_policy: EvictionPolicy::Clock,
-            write_buffer_bytes: _WRITE_BATCH_BYTES,
-            write_batch_bytes: _WRITE_BATCH_BYTES,
+            write_buffer_bytes: MAX_WRITE_BATCH_BYTES,
+            write_batch_bytes: MAX_WRITE_BATCH_BYTES,
             write_flush_delay: Duration::from_millis(1),
             write_backpressure: WriteBackpressure::Reject,
             statistics: false,
@@ -191,21 +189,5 @@ impl RuntimeConfig {
 
     pub const fn statistics_enabled(&self) -> bool {
         self.statistics
-    }
-
-    pub(crate) const fn file_io_engine(&self) -> FileIoEngineKind {
-        match self.io_engine {
-            IoEngine::Sync => FileIoEngineKind::Sync,
-            IoEngine::Auto => FileIoEngineKind::Auto,
-            IoEngine::IoUring => FileIoEngineKind::IoUring,
-        }
-    }
-
-    pub(crate) const fn direct_io_mode(&self) -> DirectIoMode {
-        match self.io_mode {
-            IoMode::Buffered => DirectIoMode::Buffered,
-            IoMode::Auto => DirectIoMode::Auto,
-            IoMode::Direct => DirectIoMode::Required,
-        }
     }
 }

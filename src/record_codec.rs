@@ -20,12 +20,6 @@ const NAMESPACE_HASH_DOMAIN: &[u8] = b"cache-rs/ns/v1\0";
 const NAMESPACE_HASH_CONTEXT_SIZE: usize = NAMESPACE_HASH_DOMAIN.len() + size_of::<u32>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedValue {
-    pub(crate) hash: u64,
-    pub(crate) entry: IndexEntry,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecordEncodeError {
     LengthOverflow,
     KeyTooLarge,
@@ -116,10 +110,10 @@ pub(crate) fn encode_value_into(
     key: &[u8],
     value: &[u8],
     expires_at: u64,
-) -> Result<EncodedValue, RecordEncodeError> {
+) -> Result<(u64, IndexEntry), RecordEncodeError> {
     let required = required_record_bytes(namespace_id, key.len(), value.len())?;
     let hash = hash_namespaced_key(hash_seed, namespace_id, key);
-    encode_value_into_hashed(
+    let entry = encode_value_into_hashed(
         destination,
         reservation,
         hash,
@@ -128,7 +122,8 @@ pub(crate) fn encode_value_into(
         key,
         value,
         expires_at,
-    )
+    )?;
+    Ok((hash, entry))
 }
 
 /// Encodes using point metadata computed once by the public operation entry.
@@ -142,7 +137,7 @@ pub(crate) fn encode_value_into_hashed(
     key: &[u8],
     value: &[u8],
     expires_at: u64,
-) -> Result<EncodedValue, RecordEncodeError> {
+) -> Result<IndexEntry, RecordEncodeError> {
     let destination_len = destination.len();
     let reserved_len =
         usize::try_from(reservation.record_bytes).map_err(|_| RecordEncodeError::LengthOverflow)?;
@@ -234,13 +229,10 @@ pub(crate) fn encode_value_into_hashed(
     };
     destination[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
 
-    Ok(EncodedValue {
-        hash,
-        entry: IndexEntry {
-            location,
-            seqno: reservation.seqno,
-            namespace_id,
-        },
+    Ok(IndexEntry {
+        location,
+        seqno: reservation.seqno,
+        namespace_id,
     })
 }
 
@@ -318,7 +310,7 @@ mod tests {
         };
         let mut destination = vec![0xa5; required as usize];
 
-        let encoded = encode_value_into(
+        let (hash, entry) = encode_value_into(
             &mut destination,
             reservation,
             0x0123_4567_89ab_cdef,
@@ -329,12 +321,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(encoded.hash, 0x3c68_d7f9_bfae_9378);
-        assert_eq!(encoded.entry.location.region_id(), 7);
-        assert_eq!(encoded.entry.location.offset(), 0);
-        assert_eq!(encoded.entry.location.record_len(), required);
-        assert_eq!(encoded.entry.seqno, 17);
-        assert_eq!(encoded.entry.namespace_id, namespace_id);
+        assert_eq!(hash, 0x3c68_d7f9_bfae_9378);
+        assert_eq!(entry.location.region_id(), 7);
+        assert_eq!(entry.location.offset(), 0);
+        assert_eq!(entry.location.record_len(), required);
+        assert_eq!(entry.seqno, 17);
+        assert_eq!(entry.namespace_id, namespace_id);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(header.codec, RecordCodec::NamespacedKey);
@@ -348,7 +340,7 @@ mod tests {
         assert_eq!(header.region_incarnation, 3);
         assert_eq!(header.epoch, 5);
         assert_eq!(header.seqno, 17);
-        assert_eq!(header.key_hash, encoded.hash);
+        assert_eq!(header.key_hash, hash);
         assert_eq!(header.expires_at, 123_456);
 
         let key_start = RECORD_HEADER_SIZE;

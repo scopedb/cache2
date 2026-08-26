@@ -291,7 +291,7 @@ mod tests {
     use crate::index::PackedLocation;
     use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint, WritePoint};
     use crate::io_engine::BackendIoEngine;
-    use crate::resources::{ResourceController, ResourceLimits, WriteBackpressure};
+    use crate::resources::{ResourceController, ResourceLimits};
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -365,7 +365,6 @@ mod tests {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
             waiting_write_limit: 1,
-            write_backpressure: WriteBackpressure::Reject,
         })
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
