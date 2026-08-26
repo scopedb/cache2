@@ -9,7 +9,7 @@ use std::fmt;
 use std::io;
 use std::ops::Range;
 
-use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
+use crate::index::IndexEntry;
 use crate::io_engine::{
     BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, ReadSlot, RequestId,
     submit_cache_read,
@@ -203,8 +203,6 @@ pub(crate) fn plan_read(geometry: DataGeometry, entry: IndexEntry) -> io::Result
     let record_end = offset.checked_add(record_len_u64);
     if !geometry.is_valid()
         || entry.seqno == 0
-        || entry.flags & INDEX_FLAG_VOLATILE != 0
-        || location.is_tombstone()
         || location.region_id() >= geometry.region_count
         || offset % u64::from(RECORD_ALIGNMENT) != 0
         || record_len == 0
@@ -356,7 +354,6 @@ mod tests {
             location,
             seqno: 11,
             namespace_id: 0,
-            flags: 0,
         }
     }
 
@@ -371,7 +368,7 @@ mod tests {
             write_backpressure: WriteBackpressure::Reject,
         })
         .unwrap();
-        let location = PackedLocation::new(1, 32, 64, false).unwrap();
+        let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
         let plan = plan_read(geometry(), entry).unwrap();
 

@@ -101,14 +101,6 @@ pub(crate) fn required_record_bytes(
 ///
 /// Direct-I/O alignment belongs to the batch seal: staging extends only the
 /// final record under a manager-issued padding receipt.
-pub(crate) fn planned_record_bytes(
-    namespace_id: u32,
-    key_len: usize,
-    value_len: usize,
-) -> Result<u32, RecordEncodeError> {
-    required_record_bytes(namespace_id, key_len, value_len)
-}
-
 /// Encodes one value into its exact reserved range and returns its index key.
 ///
 /// `reservation.record_bytes` is the minimum record envelope on the
@@ -179,7 +171,6 @@ pub(crate) fn encode_value_into_hashed(
         reservation.region_id,
         reservation.offset,
         reservation.record_bytes,
-        false,
     )
     .map_err(RecordEncodeError::InvalidLocation)?;
     let encoded_key_len = encoded_key_len(namespace_id, key.len())?;
@@ -249,7 +240,6 @@ pub(crate) fn encode_value_into_hashed(
             location,
             seqno: reservation.seqno,
             namespace_id,
-            flags: 0,
         },
     })
 }
@@ -313,19 +303,20 @@ mod tests {
             .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
             .collect::<Vec<_>>();
         let required = required_record_bytes(namespace_id, key.len(), value.len()).unwrap();
-        let planned = planned_record_bytes(namespace_id, key.len(), value.len()).unwrap();
-        assert_eq!(planned, required);
-        assert_ne!(planned as usize % crate::io_backend::DIRECT_IO_ALIGNMENT, 0);
+        assert_ne!(
+            required as usize % crate::io_backend::DIRECT_IO_ALIGNMENT,
+            0
+        );
         let reservation = RegionAppendReservation {
             shard_id: 0,
             cache_epoch: 5,
             region_id: 7,
             region_incarnation: 3,
             offset: 0,
-            record_bytes: planned,
+            record_bytes: required,
             seqno: 17,
         };
-        let mut destination = vec![0xa5; planned as usize];
+        let mut destination = vec![0xa5; required as usize];
 
         let encoded = encode_value_into(
             &mut destination,
@@ -341,11 +332,9 @@ mod tests {
         assert_eq!(encoded.hash, 0x3c68_d7f9_bfae_9378);
         assert_eq!(encoded.entry.location.region_id(), 7);
         assert_eq!(encoded.entry.location.offset(), 0);
-        assert_eq!(encoded.entry.location.record_len(), planned);
-        assert!(!encoded.entry.location.is_tombstone());
+        assert_eq!(encoded.entry.location.record_len(), required);
         assert_eq!(encoded.entry.seqno, 17);
         assert_eq!(encoded.entry.namespace_id, namespace_id);
-        assert_eq!(encoded.entry.flags, 0);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(header.codec, RecordCodec::NamespacedKey);
@@ -355,7 +344,7 @@ mod tests {
         );
         assert_eq!(header.value_len, value.len() as u32);
         assert_eq!(header.stored_len, value.len() as u32);
-        assert_eq!(header.record_len, planned);
+        assert_eq!(header.record_len, required);
         assert_eq!(header.region_incarnation, 3);
         assert_eq!(header.epoch, 5);
         assert_eq!(header.seqno, 17);
@@ -388,10 +377,8 @@ mod tests {
             (0, b"0123456789abcdef0123456789abcdef".len(), 256 * 1024),
         ] {
             let required = required_record_bytes(namespace_id, key_len, value_len).unwrap();
-            let planned = planned_record_bytes(namespace_id, key_len, value_len).unwrap();
-            assert_eq!(planned, required);
-            assert_eq!(planned % RECORD_ALIGNMENT, 0);
-            cursor += planned as usize;
+            assert_eq!(required % RECORD_ALIGNMENT, 0);
+            cursor += required as usize;
             saw_non_direct_boundary |= cursor % crate::io_backend::DIRECT_IO_ALIGNMENT != 0;
         }
         assert!(saw_non_direct_boundary);

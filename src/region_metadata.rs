@@ -63,7 +63,7 @@ const ROOT_CLEAR_FLOOR_SEQNO_OFFSET: usize = 120;
 const ROOT_MAX_SEQNO_OFFSET: usize = 128;
 const ROOT_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 136;
 const ROOT_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 144;
-const ROOT_PHYSICAL_MASKED_SLOTS_OFFSET: usize = 152;
+const ROOT_RESERVED_INDEX_OFFSET: usize = 152;
 const ROOT_LIVE_RECORD_COUNT_OFFSET: usize = 160;
 const ROOT_RESERVED64_OFFSET: usize = 168;
 const ROOT_LIVE_RECORD_BYTES_OFFSET: usize = 176;
@@ -162,7 +162,6 @@ pub(crate) struct RegionMetadataRoot {
     pub(crate) max_seqno: u64,
     pub(crate) physical_value_slots: u64,
     pub(crate) physical_deleted_slots: u64,
-    pub(crate) physical_masked_slots: u64,
     /// Number of logically reachable Value records.
     pub(crate) live_record_count: u64,
     /// Sum of their aligned on-disk record lengths. This is the sole live-byte
@@ -201,9 +200,6 @@ pub(crate) struct PartitionMetadataRecord {
     pub(crate) slot_count: u64,
     pub(crate) physical_value_slots: u64,
     pub(crate) physical_deleted_slots: u64,
-    /// Transient masks must be normalized before CLEAN publication, so
-    /// decoders require this count to be zero.
-    pub(crate) physical_masked_slots: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -436,7 +432,6 @@ impl RegionMetadata {
                 slot_count: range.slot_count as u64,
                 physical_value_slots: u64::from(counter.physical_value_slots),
                 physical_deleted_slots: u64::from(counter.physical_deleted_slots),
-                physical_masked_slots: 0,
             });
         }
         Ok(Self {
@@ -553,17 +548,12 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
     {
         return Err(RegionMetadataError::InvalidField("root"));
     }
-    checked_sum3(
-        root.physical_value_slots,
-        root.physical_deleted_slots,
-        root.physical_masked_slots,
-    )?
-    .le(&root.index_slots)
-    .then_some(())
-    .ok_or(RegionMetadataError::InvalidField("physical_slot_counts"))?;
-    if root.physical_masked_slots != 0 {
-        return Err(RegionMetadataError::InvalidField("physical_masked_slots"));
-    }
+    root.physical_value_slots
+        .checked_add(root.physical_deleted_slots)
+        .ok_or(RegionMetadataError::ArithmeticOverflow)?
+        .le(&root.index_slots)
+        .then_some(())
+        .ok_or(RegionMetadataError::InvalidField("physical_slot_counts"))?;
     if layout.region_first_page != 1
         || layout.partition_first_page
             != layout
@@ -683,7 +673,6 @@ fn validate_partitions(
 
     let mut live = 0_u64;
     let mut deleted = 0_u64;
-    let mut masked = 0_u64;
     for (partition, expected) in partitions.iter().copied().zip(canonical.iter().copied()) {
         let expected_first_page = u64::try_from(expected.first_page)
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
@@ -703,12 +692,11 @@ fn validate_partitions(
                 "canonical_partition_directory",
             ));
         }
-        if partition.physical_masked_slots != 0
-            || checked_sum3(
-                partition.physical_value_slots,
-                partition.physical_deleted_slots,
-                partition.physical_masked_slots,
-            )? > partition.slot_count
+        if partition
+            .physical_value_slots
+            .checked_add(partition.physical_deleted_slots)
+            .ok_or(RegionMetadataError::ArithmeticOverflow)?
+            > partition.slot_count
         {
             return Err(RegionMetadataError::InvalidField("partition"));
         }
@@ -718,14 +706,8 @@ fn validate_partitions(
         deleted = deleted
             .checked_add(partition.physical_deleted_slots)
             .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-        masked = masked
-            .checked_add(partition.physical_masked_slots)
-            .ok_or(RegionMetadataError::ArithmeticOverflow)?;
     }
-    if live != root.physical_value_slots
-        || deleted != root.physical_deleted_slots
-        || masked != root.physical_masked_slots
-    {
+    if live != root.physical_value_slots || deleted != root.physical_deleted_slots {
         return Err(RegionMetadataError::InvalidField("partition_accounting"));
     }
     Ok(())
@@ -755,10 +737,6 @@ impl RegionTotals {
 fn checked_add(left: u64, right: u64) -> Result<u64> {
     left.checked_add(right)
         .ok_or(RegionMetadataError::ArithmeticOverflow)
-}
-
-fn checked_sum3(first: u64, second: u64, third: u64) -> Result<u64> {
-    checked_add(checked_add(first, second)?, third)
 }
 
 fn zeroed_bytes(len: usize) -> Result<Vec<u8>> {
@@ -1019,11 +997,7 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
         ROOT_PHYSICAL_DELETED_SLOTS_OFFSET,
         root.physical_deleted_slots,
     );
-    put_u64(
-        output,
-        ROOT_PHYSICAL_MASKED_SLOTS_OFFSET,
-        root.physical_masked_slots,
-    );
+    put_u64(output, ROOT_RESERVED_INDEX_OFFSET, 0);
     put_u64(
         output,
         ROOT_LIVE_RECORD_COUNT_OFFSET,
@@ -1078,6 +1052,7 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
     if input.len() != REGION_METADATA_ROOT_SIZE
         || get_u32(input, ROOT_NAMESPACE_COUNT_OFFSET)? != 1
         || get_u64(input, ROOT_RESERVED64_OFFSET)? != 0
+        || get_u64(input, ROOT_RESERVED_INDEX_OFFSET)? != 0
         || input[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
             .iter()
             .any(|byte| *byte != 0)
@@ -1105,7 +1080,6 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
         max_seqno: get_u64(input, ROOT_MAX_SEQNO_OFFSET)?,
         physical_value_slots: get_u64(input, ROOT_PHYSICAL_VALUE_SLOTS_OFFSET)?,
         physical_deleted_slots: get_u64(input, ROOT_PHYSICAL_DELETED_SLOTS_OFFSET)?,
-        physical_masked_slots: get_u64(input, ROOT_PHYSICAL_MASKED_SLOTS_OFFSET)?,
         live_record_count: get_u64(input, ROOT_LIVE_RECORD_COUNT_OFFSET)?,
         live_record_bytes: get_u64(input, ROOT_LIVE_RECORD_BYTES_OFFSET)?,
         free_region_count: get_u32(input, ROOT_FREE_REGION_COUNT_OFFSET)?,
@@ -1305,7 +1279,6 @@ mod tests {
                 max_seqno: 4,
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
-                physical_masked_slots: 0,
                 live_record_count: 1,
                 live_record_bytes: 128,
                 free_region_count: 1,
@@ -1372,7 +1345,6 @@ mod tests {
                     slot_count: 126,
                     physical_value_slots: 1,
                     physical_deleted_slots: 1,
-                    physical_masked_slots: 0,
                 },
                 PartitionMetadataRecord {
                     partition_id: 1,
@@ -1382,7 +1354,6 @@ mod tests {
                     slot_count: 74,
                     physical_value_slots: 0,
                     physical_deleted_slots: 1,
-                    physical_masked_slots: 0,
                 },
             ]
             .into_boxed_slice(),
@@ -1405,7 +1376,6 @@ mod tests {
                 slot_count: range.slot_count as u64,
                 physical_value_slots: 0,
                 physical_deleted_slots: 0,
-                physical_masked_slots: 0,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1567,15 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_metadata_rejects_transient_masks_and_trailing_pages() {
-        let mut masked = sample();
-        masked.root.physical_masked_slots = 1;
-        masked.partitions[0].physical_masked_slots = 1;
-        assert_eq!(
-            masked.encode(),
-            Err(RegionMetadataError::InvalidField("physical_masked_slots"))
-        );
-
+    fn clean_metadata_rejects_trailing_pages() {
         let mut trailing = sample().encode().unwrap();
         trailing.resize(trailing.len() + REGION_METADATA_PAGE_SIZE, 0);
         assert_eq!(

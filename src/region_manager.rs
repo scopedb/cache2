@@ -5,16 +5,17 @@
 //! canonical shard records from the index owner and derives every Region,
 //! queue, and root accounting field from live manager state.
 
-use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
+use crate::index::IndexEntry;
 use crate::index_storage::IndexSlotState;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::recovery::{CacheEpoch, PersistentId, RECORD_ALIGNMENT};
 use crate::region_index::IndexTransition;
-use crate::region_layout::{RegionLayout, RegionSetId};
+use crate::region_layout::RegionLayout;
 use crate::region_metadata::{
     PartitionMetadataRecord, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
     RegionMetadataRoot, RegionMetadataState,
 };
+use crate::snapshot::RegionSetSnapshot;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -244,21 +245,6 @@ struct RegionSetQueues {
     rotations: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RegionSetRuntimeSnapshot {
-    pub(crate) id: RegionSetId,
-    pub(crate) capacity_bytes: u64,
-    pub(crate) append_shard_count: u32,
-    pub(crate) active_region_count: u32,
-    pub(crate) free_region_count: u32,
-    pub(crate) sealed_region_count: u32,
-    pub(crate) live_record_count: u64,
-    pub(crate) live_bytes: u64,
-    pub(crate) physical_record_count: u64,
-    pub(crate) physical_bytes: u64,
-    pub(crate) rotations: u64,
-}
-
 #[derive(Debug)]
 pub(crate) struct RegionManager {
     binding: RegionMetadataBinding,
@@ -411,7 +397,7 @@ impl RegionManager {
 
     pub(crate) fn region_set_snapshots(
         &self,
-    ) -> Result<Box<[RegionSetRuntimeSnapshot]>, RegionMetadataError> {
+    ) -> Result<Box<[RegionSetSnapshot]>, RegionMetadataError> {
         let mut snapshots = Vec::new();
         snapshots
             .try_reserve_exact(self.layout.sets().len())
@@ -429,7 +415,7 @@ impl RegionManager {
                 .regions
                 .get(first..end)
                 .ok_or(RegionMetadataError::InvalidField("region_layout"))?;
-            let mut snapshot = RegionSetRuntimeSnapshot {
+            let mut snapshot = RegionSetSnapshot {
                 id: set.id,
                 capacity_bytes: u64::from(set.region_count)
                     .checked_mul(self.region_size)
@@ -441,7 +427,7 @@ impl RegionManager {
                 sealed_region_count: u32::try_from(queues.sealed.len())
                     .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
                 rotations: queues.rotations,
-                ..RegionSetRuntimeSnapshot::default()
+                ..RegionSetSnapshot::default()
             };
             for region in regions {
                 snapshot.live_record_count = snapshot
@@ -1154,7 +1140,7 @@ impl RegionManager {
     /// that read path exists; a plain point lookup may address only the
     /// Region's completed prefix. Invalid fields fail closed.
     pub(crate) fn is_visible(&self, entry: IndexEntry) -> bool {
-        if entry.seqno < self.clear_floor_seqno || entry.flags & INDEX_FLAG_VOLATILE != 0 {
+        if entry.seqno < self.clear_floor_seqno {
             return false;
         }
         let Ok(region_id) = usize::try_from(entry.location.region_id()) else {
@@ -1233,7 +1219,7 @@ impl RegionManager {
         let IndexSlotState::Value { entry, .. } = state else {
             return None;
         };
-        if entry.location.is_tombstone() || !self.is_visible(entry) {
+        if !self.is_visible(entry) {
             return None;
         }
         Some(RegionLogicalCharge {
@@ -1377,7 +1363,6 @@ impl RegionManager {
                 max_seqno,
                 physical_value_slots: partition_totals.physical_value_slots,
                 physical_deleted_slots: partition_totals.physical_deleted_slots,
-                physical_masked_slots: partition_totals.physical_masked_slots,
                 live_record_count: logical.live_record_count,
                 live_record_bytes: logical.live_record_bytes,
                 free_region_count,
@@ -1431,7 +1416,6 @@ struct PartitionTotals {
     slot_count: u64,
     physical_value_slots: u64,
     physical_deleted_slots: u64,
-    physical_masked_slots: u64,
 }
 
 impl PartitionTotals {
@@ -1457,10 +1441,6 @@ impl PartitionTotals {
             totals.physical_deleted_slots = totals
                 .physical_deleted_slots
                 .checked_add(partition.physical_deleted_slots)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-            totals.physical_masked_slots = totals
-                .physical_masked_slots
-                .checked_add(partition.physical_masked_slots)
                 .ok_or(RegionMetadataError::ArithmeticOverflow)?;
         }
         Ok(totals)
@@ -1641,7 +1621,6 @@ mod tests {
                 slot_count: range.slot_count as u64,
                 physical_value_slots: 0,
                 physical_deleted_slots: 0,
-                physical_masked_slots: 0,
             })
             .collect::<Vec<_>>();
         shards[0].physical_value_slots = 1;
@@ -1667,7 +1646,6 @@ mod tests {
                 max_seqno: 7,
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
-                physical_masked_slots: 0,
                 live_record_count: 1,
                 live_record_bytes: 64,
                 free_region_count: 2,
@@ -1733,27 +1711,19 @@ mod tests {
         metadata
     }
 
-    fn value_slot(
-        hash: u64,
-        region_id: u32,
-        seqno: u64,
-        record_bytes: u32,
-        tombstone: bool,
-    ) -> IndexSlotState {
+    fn value_slot(hash: u64, region_id: u32, seqno: u64, record_bytes: u32) -> IndexSlotState {
         IndexSlotState::Value {
             hash,
             entry: IndexEntry {
-                location: PackedLocation::new(region_id, 0, record_bytes, tombstone).unwrap(),
+                location: PackedLocation::new(region_id, 0, record_bytes).unwrap(),
                 seqno,
                 namespace_id: 0,
-                flags: 0,
             },
         }
     }
 
     fn index_transition(previous: IndexSlotState, installed: IndexSlotState) -> IndexTransition {
         IndexTransition {
-            global_slot: 17,
             previous,
             installed,
         }
@@ -1819,22 +1789,20 @@ mod tests {
     #[test]
     fn visibility_applies_clear_floor_region_generation_and_bounds() {
         let manager = RegionManager::from_metadata(sample()).unwrap();
-        let entry = |region_id, offset, seqno, flags| IndexEntry {
-            location: PackedLocation::new(region_id, offset, 32, false).unwrap(),
+        let entry = |region_id, offset, seqno| IndexEntry {
+            location: PackedLocation::new(region_id, offset, 32).unwrap(),
             seqno,
             namespace_id: 0,
-            flags,
         };
-        assert!(manager.is_visible(entry(4, 0, 4, 0)));
-        assert!(!manager.is_visible(entry(4, 0, 3, 0)));
-        assert!(!manager.is_visible(entry(4, 0, 6, 0)));
-        assert!(!manager.is_visible(entry(4, 8, 4, 0)));
-        assert!(!manager.is_visible(entry(4, 104, 4, 0)));
-        assert!(!manager.is_visible(entry(4, 128, 4, 0)));
-        assert!(!manager.is_visible(entry(4, 0, 4, INDEX_FLAG_VOLATILE)));
-        assert!(!manager.is_visible(entry(1, 0, 7, 0)));
-        assert!(!manager.is_visible(entry(3, 0, 1, 0)));
-        assert!(!manager.is_visible(entry(99, 0, 7, 0)));
+        assert!(manager.is_visible(entry(4, 0, 4)));
+        assert!(!manager.is_visible(entry(4, 0, 3)));
+        assert!(!manager.is_visible(entry(4, 0, 6)));
+        assert!(!manager.is_visible(entry(4, 8, 4)));
+        assert!(!manager.is_visible(entry(4, 104, 4)));
+        assert!(!manager.is_visible(entry(4, 128, 4)));
+        assert!(!manager.is_visible(entry(1, 0, 7)));
+        assert!(!manager.is_visible(entry(3, 0, 1)));
+        assert!(!manager.is_visible(entry(99, 0, 7)));
     }
 
     #[test]
@@ -1842,8 +1810,8 @@ mod tests {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         let appended = append_completed(&mut manager, 0, 96);
         assert_eq!((appended.region_id, appended.seqno), (3, 8));
-        let old = value_slot(7, 4, 4, 64, false);
-        let new = value_slot(7, 3, 8, 96, false);
+        let old = value_slot(7, 4, 4, 64);
+        let new = value_slot(7, 3, 8, 96);
 
         manager
             .apply_index_transition(index_transition(old, new))
@@ -1861,10 +1829,7 @@ mod tests {
         );
 
         manager
-            .apply_index_transition(index_transition(
-                new,
-                IndexSlotState::Masked { hash: 7, seqno: 9 },
-            ))
+            .apply_index_transition(index_transition(new, IndexSlotState::Deleted))
             .unwrap();
         assert_eq!(
             manager.regions[3].logical,
@@ -1884,13 +1849,13 @@ mod tests {
     }
 
     #[test]
-    fn invisible_and_tombstone_values_do_not_change_logical_accounting() {
+    fn invisible_values_do_not_change_logical_accounting() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         let appended = append_completed(&mut manager, 0, 32);
         assert_eq!((appended.region_id, appended.seqno), (3, 8));
         let before = manager.regions[4].logical;
-        let stale = value_slot(7, 4, 3, 64, false);
-        let installed = value_slot(7, 3, 8, 32, false);
+        let stale = value_slot(7, 4, 3, 64);
+        let installed = value_slot(7, 3, 8, 32);
 
         manager
             .apply_index_transition(index_transition(stale, installed))
@@ -1903,16 +1868,6 @@ mod tests {
                 live_record_bytes: 32,
             }
         );
-
-        let tombstone = value_slot(11, 2, 7, 64, true);
-        let all_before = manager.regions.clone();
-        manager
-            .apply_index_transition(index_transition(IndexSlotState::Deleted, tombstone))
-            .unwrap();
-        manager
-            .apply_index_transition(index_transition(tombstone, IndexSlotState::Deleted))
-            .unwrap();
-        assert_eq!(manager.regions, all_before);
     }
 
     #[test]
@@ -1920,8 +1875,8 @@ mod tests {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         let appended = append_completed(&mut manager, 0, 32);
         assert_eq!((appended.region_id, appended.seqno), (3, 8));
-        let old = value_slot(7, 3, 8, 32, false);
-        let installed = value_slot(7, 4, 4, 32, false);
+        let old = value_slot(7, 3, 8, 32);
+        let installed = value_slot(7, 4, 4, 32);
 
         assert_eq!(
             manager.apply_index_transition(index_transition(old, IndexSlotState::Deleted,)),

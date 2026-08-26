@@ -16,8 +16,6 @@ use crate::eviction::{
     VictimSelection,
 };
 use crate::expiry::ExpiryClock;
-use crate::memory_arena::MemoryArena;
-pub(crate) use crate::memory_arena::MemoryValue;
 
 /// Charged resident metadata: the entry slot, eviction-policy slot, and the
 /// retained-value ownership. Container buckets and allocator metadata are
@@ -93,6 +91,60 @@ pub(crate) struct MemoryCharge {
     bytes: usize,
 }
 
+struct MemoryValueInner {
+    bytes: Box<[u8]>,
+    key_length: usize,
+    _charge: MemoryCharge,
+}
+
+#[derive(Clone)]
+pub(crate) struct MemoryValue(Arc<MemoryValueInner>);
+
+impl MemoryValue {
+    fn try_new(key: &[u8], value: &[u8], charge: MemoryCharge) -> Result<Self, MemoryCharge> {
+        let Some(length) = key.len().checked_add(value.len()) else {
+            return Err(charge);
+        };
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(length).is_err() {
+            return Err(charge);
+        }
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(value);
+        Ok(Self(Arc::new(MemoryValueInner {
+            bytes: bytes.into_boxed_slice(),
+            key_length: key.len(),
+            _charge: charge,
+        })))
+    }
+
+    pub(crate) fn charged_bytes(&self) -> usize {
+        MEMORY_ENTRY_OVERHEAD_BYTES + self.0.bytes.len()
+    }
+
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.0.bytes[..self.0.key_length]
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.0.bytes[self.0.key_length..]
+    }
+}
+
+impl Deref for MemoryValue {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.value()
+    }
+}
+
+impl AsRef<[u8]> for MemoryValue {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 impl Drop for MemoryCharge {
     fn drop(&mut self) {
         if let Some(budget) = &self.budget {
@@ -112,7 +164,6 @@ struct MemoryEntry {
 
 struct MemoryShard {
     budget: Arc<MemoryBudget>,
-    arena: MemoryArena,
     eviction: EvictionState,
     revision: u64,
     directory: HashMap<u64, u32>,
@@ -126,11 +177,9 @@ impl MemoryShard {
         let maximum_entries = (capacity_bytes / MEMORY_ENTRY_OVERHEAD_BYTES)
             .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
         let budget = Arc::new(MemoryBudget::new(capacity_bytes));
-        let arena = MemoryArena::new(Arc::clone(&budget))?;
         let directory = HashMap::new();
         Ok(Self {
             budget,
-            arena,
             eviction: EvictionState::new(policy, capacity_bytes, maximum_entries)?,
             revision: 0,
             directory,
@@ -418,7 +467,7 @@ impl MemoryShard {
         let Ok(index) = usize::try_from(packed_index) else {
             return MemoryInsertResult::rejected(evictions, false);
         };
-        let Ok(memory_value) = self.arena.allocate(key, value, charge) else {
+        let Ok(memory_value) = MemoryValue::try_new(key, value, charge) else {
             return MemoryInsertResult::rejected(evictions, false);
         };
         let previous_head = self.directory_head(hash);

@@ -14,8 +14,7 @@ use crate::recovery::{DATA_REGION_AREA_OFFSET, RECORD_ALIGNMENT, RECOVERY_PAGE_S
 use crate::region_appender::_WRITE_BATCH_BYTES;
 use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
 use crate::resources::{
-    BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController,
-    RuntimeMemoryReservation, WriteBufferPool,
+    BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController, RuntimeMemoryReservation,
 };
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
@@ -68,8 +67,6 @@ pub(crate) enum StagingError {
     Failed,
     Closed,
     InvalidShard,
-    Encoding,
-    Submitted,
     WouldBlock,
     StaleReceipt,
     Invariant(&'static str),
@@ -81,8 +78,6 @@ impl fmt::Display for StagingError {
             Self::Failed => formatter.write_str("Region staging is failed"),
             Self::Closed => formatter.write_str("Region staging is closed"),
             Self::InvalidShard => formatter.write_str("Region staging shard is out of bounds"),
-            Self::Encoding => formatter.write_str("Region staging shard is encoding"),
-            Self::Submitted => formatter.write_str("Region staging shard has a submitted span"),
             Self::WouldBlock => formatter.write_str("Region staging shard is busy"),
             Self::StaleReceipt => formatter.write_str("Region staging receipt is stale"),
             Self::Invariant(message) => formatter.write_str(message),
@@ -160,7 +155,6 @@ struct ShardState {
 struct ShardStaging {
     state: Mutex<ShardState>,
     pending_fences: PendingFenceTable,
-    buffers: WriteBufferPool,
 }
 
 #[derive(Default)]
@@ -320,9 +314,8 @@ impl RegionStaging {
 
         let reserved = Self::reservation_bytes(shard_count, chunk_bytes)
             .ok_or(ResourceBuildError::Allocation)?;
-        // WriteBufferPool has its own allocator. Keep this one aggregate
-        // reservation alive so those eager allocations and both fixed record
-        // vectors participate in the cache-wide hard memory limit.
+        // Keep the aggregate reservation alive so eager buffers, record
+        // vectors, and pending fences participate in the hard memory limit.
         let memory = resources.reserve_runtime_memory(reserved)?;
 
         let mut shards = Vec::new();
@@ -330,9 +323,8 @@ impl RegionStaging {
             .try_reserve_exact(shard_count)
             .map_err(|_| ResourceBuildError::Allocation)?;
         for _ in 0..shard_count {
-            let buffers = WriteBufferPool::try_new(2, chunk_bytes)?;
-            let fill_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
-            let spare_buffer = buffers.acquire().ok_or(ResourceBuildError::Allocation)?;
+            let fill_buffer = BufferLease::try_fixed(chunk_bytes)?;
+            let spare_buffer = BufferLease::try_fixed(chunk_bytes)?;
             let fill_records = try_staged_records()?;
             let spare_records = try_staged_records()?;
             let pending_fences = try_pending_fences()?;
@@ -347,7 +339,6 @@ impl RegionStaging {
                     closed: false,
                 }),
                 pending_fences,
-                buffers,
             });
         }
 
@@ -451,10 +442,10 @@ impl RegionStaging {
         let state = lock_unpoisoned(&shard.state);
         ensure_open(&state)?;
         if state.encoding.is_some() {
-            return Err(StagingError::Encoding);
+            return Err(StagingError::WouldBlock);
         }
         if state.submitted.is_some() {
-            return Err(StagingError::Submitted);
+            return Err(StagingError::WouldBlock);
         }
         if state.fill.is_empty() {
             return Ok(None);
@@ -672,8 +663,7 @@ impl RegionStaging {
             let record_end = u64::from(location.offset())
                 .checked_add(u64::from(old_record_len))
                 .ok_or(StagingError::StaleReceipt)?;
-            if location.is_tombstone()
-                || location.region_id() != receipt.region_id
+            if location.region_id() != receipt.region_id
                 || last.entry.seqno != receipt.max_seqno
                 || record_end != receipt.unpadded_end_offset
             {
@@ -706,7 +696,7 @@ impl RegionStaging {
                 return Err(StagingError::StaleReceipt);
             }
             let padded_location =
-                PackedLocation::new(receipt.region_id, location.offset(), new_record_len, false)
+                PackedLocation::new(receipt.region_id, location.offset(), new_record_len)
                     .map_err(|_| StagingError::Invariant("padded location is invalid"))?;
 
             bytes[used..padded_used].fill(0);
@@ -876,7 +866,6 @@ impl RegionStaging {
         for shard in &self.shards {
             let mut state = lock_unpoisoned(&shard.state);
             state.closed = true;
-            shard.buffers.close();
         }
     }
 
@@ -887,8 +876,7 @@ impl RegionStaging {
     ) -> Result<(), StagingError> {
         self.validate_reservation(receipt)?;
         let location = record.entry.location;
-        if location.is_tombstone()
-            || location.region_id() != receipt.region_id
+        if location.region_id() != receipt.region_id
             || location.offset() != receipt.offset
             || location.record_len() != receipt.record_bytes
             || record.entry.seqno != receipt.seqno
@@ -971,8 +959,7 @@ fn span_matches_records(span: RegionWriteSpan, records: &[StagedRecord]) -> bool
     let mut max_seqno = 0_u64;
     for record in records {
         let entry = record.entry;
-        if entry.location.is_tombstone()
-            || entry.location.region_id() != span.region_id
+        if entry.location.region_id() != span.region_id
             || u64::from(entry.location.offset()) != offset
             || entry.seqno == 0
             || entry.seqno <= max_seqno
@@ -1031,10 +1018,9 @@ mod tests {
         let record = StagedRecord {
             hash: seqno.wrapping_mul(17),
             entry: IndexEntry {
-                location: PackedLocation::new(1, offset, record_bytes, false).unwrap(),
+                location: PackedLocation::new(1, offset, record_bytes).unwrap(),
                 seqno,
                 namespace_id: 9,
-                flags: 0,
             },
         };
         (receipt, record)
@@ -1228,7 +1214,10 @@ mod tests {
 
         let submitted = span(4096, 4160, 1, 11, 1);
         let job = staging.take_sealed(submitted).unwrap().unwrap();
-        assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Submitted));
+        assert_eq!(
+            staging.shard_fill_snapshot(0),
+            Err(StagingError::WouldBlock)
+        );
         let StagedWrite {
             buffer, records, ..
         } = job;
@@ -1271,7 +1260,10 @@ mod tests {
         });
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Encoding));
+        assert_eq!(
+            staging.shard_fill_snapshot(0),
+            Err(StagingError::WouldBlock)
+        );
         release_tx.send(()).unwrap();
         assert_eq!(encoder.join().unwrap().unwrap(), StageAppend::Appended);
         assert_eq!(

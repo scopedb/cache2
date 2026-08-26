@@ -9,35 +9,31 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::eviction::EvictionPolicy;
 use crate::expiry::ExpiryClock;
 use crate::index::{MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::canonical_index_partition_ranges;
-use crate::io_backend::DirectIoMode;
-use crate::io_engine::FileIoEngineKind;
 use crate::recovery::{
     DataGeometry, DataSuperblock, KEY_HASH_ALGORITHM_XXH3_64, PersistentId,
     RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE, recovery_image_index_len,
 };
 use crate::region::{FileRegionBackend, RegionFiles, SystemRegionFileSystem};
-use crate::region_appender::_WRITE_BATCH_BYTES;
-use crate::region_layout::{RegionLayout, RegionSetAllocation, RegionSetConfig, RegionSetId};
+use crate::region_layout::{RegionLayout, RegionSetAllocation, RegionSetConfig};
 use crate::region_metadata::{
     REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE,
 };
-use crate::region_runtime::{
-    DEFAULT_L1_SHARDS, HybridValueRead, RegionRuntimeConfig, RuntimeHealth, RuntimeSnapshot,
-};
+use crate::region_runtime::HybridValueRead;
 use crate::region_store::{RegionConfig, RegionStartup, RegionStore};
-use crate::resources::WriteBackpressure;
+#[cfg(test)]
+use crate::runtime_config::DEFAULT_L1_SHARDS;
+use crate::runtime_config::RuntimeConfig;
+use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const DEFAULT_SHARDS: u32 = 4;
-const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const MIN_INDEX_SLOTS: usize = 8;
 const MAX_SHARDS: u32 = 256;
 
@@ -289,235 +285,6 @@ fn hash_identity_word(hash: &mut u64, value: u64) {
     }
 }
 
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum IoEngine {
-    Sync,
-    #[default]
-    Auto,
-    IoUring,
-}
-
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum IoMode {
-    Buffered,
-    #[default]
-    Auto,
-    Direct,
-}
-
-#[derive(Clone, Debug)]
-pub struct RuntimeConfig {
-    io_engine: IoEngine,
-    io_mode: IoMode,
-    io_workers: usize,
-    io_concurrency: usize,
-    waiting_write_limit: usize,
-    l1_capacity_bytes: usize,
-    memory_limit_bytes: usize,
-    l1_shards: usize,
-    eviction_policy: EvictionPolicy,
-    write_buffer_bytes: usize,
-    write_batch_bytes: usize,
-    write_flush_delay: Duration,
-    write_backpressure: WriteBackpressure,
-    statistics: bool,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            io_engine: IoEngine::Auto,
-            io_mode: IoMode::Auto,
-            io_workers: 4,
-            io_concurrency: 128,
-            waiting_write_limit: 128,
-            l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
-            memory_limit_bytes: 1024 * 1024 * 1024,
-            l1_shards: DEFAULT_L1_SHARDS,
-            eviction_policy: EvictionPolicy::Clock,
-            write_buffer_bytes: _WRITE_BATCH_BYTES,
-            write_batch_bytes: _WRITE_BATCH_BYTES,
-            write_flush_delay: Duration::from_millis(1),
-            write_backpressure: WriteBackpressure::Reject,
-            statistics: false,
-        }
-    }
-}
-
-impl RuntimeConfig {
-    pub fn with_io_engine(mut self, engine: IoEngine) -> Self {
-        self.io_engine = engine;
-        self
-    }
-
-    pub fn with_io_mode(mut self, mode: IoMode) -> Self {
-        self.io_mode = mode;
-        self
-    }
-
-    pub fn with_io_workers(mut self, workers: usize) -> Self {
-        self.io_workers = workers;
-        self
-    }
-
-    /// Sets the maximum number of device requests in flight across all workers.
-    pub fn with_io_concurrency(mut self, requests: usize) -> Self {
-        self.io_concurrency = requests;
-        self
-    }
-
-    /// Limits concurrent write attempts when `Block` or `Timeout` is selected.
-    ///
-    /// The default reject policy uses each shard's write buffer as its boundary.
-    pub fn with_waiting_write_limit(mut self, writes: usize) -> Self {
-        self.waiting_write_limit = writes;
-        self
-    }
-
-    pub fn with_l1_capacity(mut self, bytes: usize) -> Self {
-        self.l1_capacity_bytes = bytes;
-        self
-    }
-
-    /// Sets the aggregate cache-owned memory limit.
-    ///
-    /// This covers L1, fixed runtime structures, write buffers, and transient
-    /// exact-size L2 read buffers.
-    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
-        self.memory_limit_bytes = bytes;
-        self
-    }
-
-    /// Sets the runtime-only shard count for the volatile RAM tier.
-    ///
-    /// This is independent of static append shards and may change on every
-    /// open without invalidating a clean recovery image.
-    pub fn with_l1_shards(mut self, shards: usize) -> Self {
-        self.l1_shards = shards;
-        self
-    }
-
-    pub fn with_eviction_policy(mut self, policy: EvictionPolicy) -> Self {
-        self.eviction_policy = policy;
-        self
-    }
-
-    /// Sets each append shard's fixed write-buffer size.
-    pub fn with_write_buffer_size(mut self, bytes: usize) -> Self {
-        self.write_buffer_bytes = bytes;
-        self
-    }
-
-    /// Sets the target bytes per submitted write batch.
-    pub fn with_write_batch_size(mut self, bytes: usize) -> Self {
-        self.write_batch_bytes = bytes;
-        self
-    }
-
-    /// Sets how long a partial write batch may remain open.
-    pub fn with_write_flush_delay(mut self, delay: Duration) -> Self {
-        self.write_flush_delay = delay;
-        self
-    }
-
-    /// Selects write-side overload behavior.
-    pub fn with_write_backpressure(mut self, policy: WriteBackpressure) -> Self {
-        self.write_backpressure = policy;
-        self
-    }
-
-    /// Enables or disables optional request-path counters.
-    pub fn with_statistics(mut self, enabled: bool) -> Self {
-        self.statistics = enabled;
-        self
-    }
-
-    pub const fn io_engine(&self) -> IoEngine {
-        self.io_engine
-    }
-
-    pub const fn io_mode(&self) -> IoMode {
-        self.io_mode
-    }
-
-    pub const fn io_workers(&self) -> usize {
-        self.io_workers
-    }
-
-    pub const fn io_concurrency(&self) -> usize {
-        self.io_concurrency
-    }
-
-    pub const fn waiting_write_limit(&self) -> usize {
-        self.waiting_write_limit
-    }
-
-    pub const fn l1_capacity_bytes(&self) -> usize {
-        self.l1_capacity_bytes
-    }
-
-    pub const fn memory_limit_bytes(&self) -> usize {
-        self.memory_limit_bytes
-    }
-
-    pub const fn l1_shards(&self) -> usize {
-        self.l1_shards
-    }
-
-    pub const fn eviction_policy(&self) -> EvictionPolicy {
-        self.eviction_policy
-    }
-
-    pub const fn write_buffer_bytes(&self) -> usize {
-        self.write_buffer_bytes
-    }
-
-    pub const fn write_batch_bytes(&self) -> usize {
-        self.write_batch_bytes
-    }
-
-    pub const fn write_flush_delay(&self) -> Duration {
-        self.write_flush_delay
-    }
-
-    pub const fn write_backpressure(&self) -> WriteBackpressure {
-        self.write_backpressure
-    }
-
-    pub const fn statistics_enabled(&self) -> bool {
-        self.statistics
-    }
-
-    fn into_region(self) -> RegionRuntimeConfig {
-        RegionRuntimeConfig {
-            io_engine: match self.io_engine {
-                IoEngine::Sync => FileIoEngineKind::Sync,
-                IoEngine::Auto => FileIoEngineKind::Auto,
-                IoEngine::IoUring => FileIoEngineKind::IoUring,
-            },
-            io_mode: match self.io_mode {
-                IoMode::Buffered => DirectIoMode::Buffered,
-                IoMode::Auto => DirectIoMode::Auto,
-                IoMode::Direct => DirectIoMode::Required,
-            },
-            io_workers: self.io_workers,
-            io_concurrency: self.io_concurrency,
-            waiting_write_limit: self.waiting_write_limit,
-            l1_capacity_bytes: self.l1_capacity_bytes,
-            memory_limit_bytes: self.memory_limit_bytes,
-            l1_shards: self.l1_shards,
-            eviction_policy: self.eviction_policy,
-            write_buffer_bytes: self.write_buffer_bytes,
-            write_batch_bytes: self.write_batch_bytes,
-            write_flush_delay: self.write_flush_delay,
-            write_backpressure: self.write_backpressure,
-            statistics: self.statistics,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct HybridCacheConfig {
     path: PathBuf,
@@ -548,7 +315,7 @@ impl HybridCacheConfig {
         let geometry = self.static_config.geometry()?;
         let region_layout = self.static_config.region_layout(geometry)?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
-        let runtime_config = self.runtime_config.into_region();
+        let runtime_config = self.runtime_config;
         runtime_config.validate_memory_plan(
             geometry,
             self.static_config.index_slots,
@@ -605,118 +372,6 @@ pub struct PutReceipt {
 pub enum CacheTier {
     L1,
     L2,
-}
-
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CacheHealth {
-    Running,
-    Draining,
-    MissOnly,
-    Failed,
-}
-
-/// Lock-free point-in-time operational counters and cache-owned resource
-/// accounting. Counters are process-local, reset on every open, and remain
-/// zero unless enabled with [`RuntimeConfig::with_statistics`]. Health and resource
-/// fields are always populated.
-///
-/// Managed memory includes fixed-capacity reservations such as L1 and thread
-/// stacks plus currently allocated bounded buffers. It excludes allocator
-/// metadata, buffered-I/O page cache, and filesystem metadata.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CacheSnapshot {
-    pub health: CacheHealth,
-    pub statistics_enabled: bool,
-    pub puts: u64,
-    pub written_bytes: u64,
-    pub l1_hits: u64,
-    pub l1_misses: u64,
-    pub l2_hits: u64,
-    pub l2_misses: u64,
-    /// L2 candidates bypassed because their exact transient allocation could
-    /// not be charged or allocated. This is a subset of `l2_misses`.
-    pub l2_read_memory_misses: u64,
-    /// L2 candidates bypassed because the I/O engine had no immediately
-    /// available slot. This is a subset of `l2_misses`.
-    pub l2_read_busy_misses: u64,
-    /// Bytes returned by L1 and L2 hits combined.
-    pub served_bytes: u64,
-    pub l1_promotions: u64,
-    pub l1_evictions: u64,
-    pub l1_bypasses: u64,
-    pub l1_admission_rejections: u64,
-    /// Writes rejected because a bounded write-side resource was busy.
-    pub write_rejections: u64,
-    pub io_failures: u64,
-    pub region_rotations: u64,
-    pub managed_memory_bytes: usize,
-    pub managed_memory_peak_bytes: usize,
-    pub managed_memory_limit_bytes: usize,
-    pub logical_disk_peak_bytes: u64,
-}
-
-/// Write-side pressure sampled by [`HybridCache::detailed_snapshot`].
-/// Wait and rejection counters are cumulative for the current open.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheWriteSnapshot {
-    pub write_requests_in_flight: u64,
-    pub write_requests_peak: u64,
-    pub write_gate_rejections: u64,
-    pub write_gate_wait_ns: u64,
-    pub write_buffer_rejections: u64,
-    pub write_buffer_wait_ns: u64,
-}
-
-/// Aggregate worker I/O state sampled by [`HybridCache::detailed_snapshot`].
-/// Durations and operation counters are cumulative for the current open.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheIoSnapshot {
-    pub submitted: u64,
-    pub completed: u64,
-    pub cancel_requested: u64,
-    pub cancelled: u64,
-    pub errors: u64,
-    pub requests_in_flight: u64,
-    pub slot_wait_ns: u64,
-    pub completion_ns: u64,
-    pub direct_operations: u64,
-    pub direct_bytes: u64,
-    pub buffered_operations: u64,
-    pub buffered_bytes: u64,
-}
-
-/// Runtime occupancy and rotation state for one physical RegionSet.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RegionSetSnapshot {
-    pub id: RegionSetId,
-    pub capacity_bytes: u64,
-    pub append_shard_count: u32,
-    pub active_region_count: u32,
-    pub free_region_count: u32,
-    pub sealed_region_count: u32,
-    pub live_record_count: u64,
-    pub live_bytes: u64,
-    pub physical_record_count: u64,
-    /// Completed Region bytes, including record padding.
-    pub physical_bytes: u64,
-    /// Successful rotations since the current open.
-    pub rotations: u64,
-}
-
-/// On-demand operational detail. Unlike [`CacheSnapshot`], producing this
-/// value locks Region metadata briefly and scans all Regions.
-#[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DetailedCacheSnapshot {
-    pub summary: CacheSnapshot,
-    pub writes: CacheWriteSnapshot,
-    pub io: CacheIoSnapshot,
-    pub region_sets: Box<[RegionSetSnapshot]>,
 }
 
 pub struct Value {
@@ -857,94 +512,18 @@ impl HybridCache {
     }
 
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
-        let runtime = self.store.snapshot()?;
-        Ok(self.cache_snapshot(runtime))
+        let mut snapshot = self.store.snapshot()?;
+        snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
+        Ok(snapshot)
     }
 
     /// Samples queue, I/O, and per-RegionSet state in addition to the regular
     /// cache summary. This is intended for periodic diagnostics rather than a
     /// request hot path because it briefly locks and scans Region metadata.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
-        let runtime = self.store.detailed_snapshot()?;
-        let resources = runtime.resources;
-        let io = runtime.io;
-        let region_sets = runtime
-            .region_sets
-            .iter()
-            .map(|set| RegionSetSnapshot {
-                id: set.id,
-                capacity_bytes: set.capacity_bytes,
-                append_shard_count: set.append_shard_count,
-                active_region_count: set.active_region_count,
-                free_region_count: set.free_region_count,
-                sealed_region_count: set.sealed_region_count,
-                live_record_count: set.live_record_count,
-                live_bytes: set.live_bytes,
-                physical_record_count: set.physical_record_count,
-                physical_bytes: set.physical_bytes,
-                rotations: set.rotations,
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Ok(DetailedCacheSnapshot {
-            summary: self.cache_snapshot(runtime.summary),
-            writes: CacheWriteSnapshot {
-                write_requests_in_flight: resources.write_requests_in_flight,
-                write_requests_peak: resources.write_requests_peak,
-                write_gate_rejections: resources.write_gate_rejections,
-                write_gate_wait_ns: resources.write_gate_wait_ns,
-                write_buffer_rejections: runtime.write_buffer_rejections,
-                write_buffer_wait_ns: runtime.write_buffer_wait_ns,
-            },
-            io: CacheIoSnapshot {
-                submitted: io.submitted,
-                completed: io.completed,
-                cancel_requested: io.cancel_requested,
-                cancelled: io.cancelled,
-                errors: io.errors,
-                requests_in_flight: io.requests_in_flight,
-                slot_wait_ns: io.slot_wait_ns,
-                completion_ns: io.completion_ns,
-                direct_operations: io.direct_operations,
-                direct_bytes: io.direct_bytes,
-                buffered_operations: io.buffered_operations,
-                buffered_bytes: io.buffered_bytes,
-            },
-            region_sets,
-        })
-    }
-
-    fn cache_snapshot(&self, runtime: RuntimeSnapshot) -> CacheSnapshot {
-        let health = match runtime.health {
-            RuntimeHealth::Running => CacheHealth::Running,
-            RuntimeHealth::Draining => CacheHealth::Draining,
-            RuntimeHealth::MissOnly => CacheHealth::MissOnly,
-            RuntimeHealth::Failed => CacheHealth::Failed,
-        };
-        CacheSnapshot {
-            health,
-            statistics_enabled: runtime.statistics_enabled,
-            puts: runtime.puts,
-            written_bytes: runtime.written_bytes,
-            l1_hits: runtime.l1_hits,
-            l1_misses: runtime.l1_misses,
-            l2_hits: runtime.l2_hits,
-            l2_misses: runtime.l2_misses,
-            l2_read_memory_misses: runtime.l2_read_memory_misses,
-            l2_read_busy_misses: runtime.l2_read_busy_misses,
-            served_bytes: runtime.served_bytes,
-            l1_promotions: runtime.l1_promotions,
-            l1_evictions: runtime.l1_evictions,
-            l1_bypasses: runtime.l1_bypasses,
-            l1_admission_rejections: runtime.l1_admission_rejections,
-            write_rejections: runtime.write_rejections,
-            io_failures: runtime.io_failures,
-            region_rotations: runtime.region_rotations,
-            managed_memory_bytes: runtime.memory.current_bytes,
-            managed_memory_peak_bytes: runtime.memory.peak_bytes,
-            managed_memory_limit_bytes: runtime.memory.limit_bytes,
-            logical_disk_peak_bytes: self.logical_disk_peak_bytes,
-        }
+        let mut snapshot = self.store.detailed_snapshot()?;
+        snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
+        Ok(snapshot)
     }
 
     pub fn close_fast(mut self) -> Result<()> {

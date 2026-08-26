@@ -9,7 +9,7 @@ const RECORD_LEN_BITS: u32 = 20;
 const REGION_SHIFT: u32 = 0;
 const OFFSET_SHIFT: u32 = REGION_SHIFT + REGION_BITS;
 const RECORD_LEN_SHIFT: u32 = OFFSET_SHIFT + OFFSET_BITS;
-const TOMBSTONE_SHIFT: u32 = RECORD_LEN_SHIFT + RECORD_LEN_BITS;
+const RESERVED_SHIFT: u32 = RECORD_LEN_SHIFT + RECORD_LEN_BITS;
 
 const REGION_MASK: u64 = (1_u64 << REGION_BITS) - 1;
 const OFFSET_MASK: u64 = (1_u64 << OFFSET_BITS) - 1;
@@ -28,13 +28,6 @@ pub(crate) const MAX_INDEX_SLOTS: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_INDEX_PROBES: usize = 64;
 pub(crate) const MAX_INDEX_PARTITIONS: usize = 4096;
 
-pub(crate) const INDEX_FLAG_SECOND_CHANCE_PENDING: u32 = 1;
-pub(crate) const INDEX_FLAG_SECOND_CHANCE_USED: u32 = 1 << 1;
-/// The target device write for this entry has not completed yet.
-pub(crate) const INDEX_FLAG_VOLATILE: u32 = 1 << 2;
-pub(crate) const INDEX_RUNTIME_ONLY_FLAGS: u32 =
-    INDEX_FLAG_SECOND_CHANCE_PENDING | INDEX_FLAG_VOLATILE;
-
 /// A record location packed into one machine word.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -45,7 +38,6 @@ impl PackedLocation {
         region_id: u32,
         offset: u32,
         record_len: u32,
-        tombstone: bool,
     ) -> Result<Self, PackedLocationError> {
         if region_id > MAX_REGION_ID {
             return Err(PackedLocationError::RegionOutOfRange);
@@ -71,8 +63,7 @@ impl PackedLocation {
         Ok(Self(
             u64::from(region_id)
                 | (offset_units << OFFSET_SHIFT)
-                | (record_len_units << RECORD_LEN_SHIFT)
-                | (u64::from(tombstone) << TOMBSTONE_SHIFT),
+                | (record_len_units << RECORD_LEN_SHIFT),
         ))
     }
 
@@ -81,12 +72,14 @@ impl PackedLocation {
     }
 
     pub(crate) fn try_from_raw(raw: u64) -> Result<Self, PackedLocationError> {
+        if raw & (1_u64 << RESERVED_SHIFT) != 0 {
+            return Err(PackedLocationError::ReservedBitSet);
+        }
         let location = Self::from_raw(raw);
         Self::new(
             location.region_id(),
             location.offset(),
             location.record_len(),
-            location.tombstone(),
         )
     }
 
@@ -105,14 +98,6 @@ impl PackedLocation {
     pub(crate) const fn record_len(self) -> u32 {
         (((self.0 >> RECORD_LEN_SHIFT) & RECORD_LEN_MASK) as u32) * RECORD_LEN_ALIGNMENT
     }
-
-    pub(crate) const fn tombstone(self) -> bool {
-        (self.0 & (1_u64 << TOMBSTONE_SHIFT)) != 0
-    }
-
-    pub(crate) const fn is_tombstone(self) -> bool {
-        self.tombstone()
-    }
 }
 
 impl fmt::Debug for PackedLocation {
@@ -122,7 +107,6 @@ impl fmt::Debug for PackedLocation {
             .field("region_id", &self.region_id())
             .field("offset", &self.offset())
             .field("record_len", &self.record_len())
-            .field("tombstone", &self.tombstone())
             .finish()
     }
 }
@@ -135,6 +119,7 @@ pub(crate) enum PackedLocationError {
     RecordLengthZero,
     RecordLengthUnaligned,
     RecordLengthOutOfRange,
+    ReservedBitSet,
 }
 
 impl fmt::Display for PackedLocationError {
@@ -146,6 +131,7 @@ impl fmt::Display for PackedLocationError {
             Self::RecordLengthZero => "record length must be non-zero",
             Self::RecordLengthUnaligned => "record length is not 32-byte aligned",
             Self::RecordLengthOutOfRange => "record length does not fit in 20 units",
+            Self::ReservedBitSet => "packed location reserved bit is set",
         })
     }
 }
@@ -157,7 +143,6 @@ pub(crate) struct IndexEntry {
     pub(crate) location: PackedLocation,
     pub(crate) seqno: u64,
     pub(crate) namespace_id: u32,
-    pub(crate) flags: u32,
 }
 
 impl IndexEntry {
@@ -192,20 +177,23 @@ mod tests {
 
     #[test]
     fn packed_location_round_trips_boundaries() {
-        for (region, offset, len, tombstone) in [
-            (0, 0, 32, false),
-            (MAX_REGION_ID, MAX_REGION_OFFSET, MAX_RECORD_LEN, true),
+        for (region, offset, len) in [
+            (0, 0, 32),
+            (MAX_REGION_ID, MAX_REGION_OFFSET, MAX_RECORD_LEN),
         ] {
-            let location = PackedLocation::new(region, offset, len, tombstone).unwrap();
+            let location = PackedLocation::new(region, offset, len).unwrap();
             assert_eq!(PackedLocation::try_from_raw(location.raw()), Ok(location));
             assert_eq!(location.region_id(), region);
             assert_eq!(location.offset(), offset);
             assert_eq!(location.record_len(), len);
-            assert_eq!(location.tombstone(), tombstone);
         }
         assert_eq!(
             PackedLocation::try_from_raw(0),
             Err(PackedLocationError::RecordLengthZero)
+        );
+        assert_eq!(
+            PackedLocation::try_from_raw(1_u64 << RESERVED_SHIFT),
+            Err(PackedLocationError::ReservedBitSet)
         );
     }
 

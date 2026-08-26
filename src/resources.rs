@@ -6,9 +6,11 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use crate::snapshot::CacheWriteSnapshot;
 
 pub(crate) const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured
@@ -176,12 +178,14 @@ impl ResourceController {
         }
     }
 
-    pub(crate) fn runtime_snapshot(&self) -> ResourceRuntimeSnapshot {
-        ResourceRuntimeSnapshot {
+    pub(crate) fn runtime_snapshot(&self) -> CacheWriteSnapshot {
+        CacheWriteSnapshot {
             write_requests_in_flight: usize_to_u64(self.write_gate.current.load(Ordering::Relaxed)),
             write_requests_peak: usize_to_u64(self.write_gate.peak.load(Ordering::Relaxed)),
             write_gate_rejections: self.write_gate.rejections.load(Ordering::Relaxed),
             write_gate_wait_ns: self.write_gate.wait_ns.load(Ordering::Relaxed),
+            write_buffer_rejections: 0,
+            write_buffer_wait_ns: 0,
         }
     }
 }
@@ -191,14 +195,6 @@ pub(crate) struct ManagedMemorySnapshot {
     pub(crate) limit_bytes: usize,
     pub(crate) current_bytes: usize,
     pub(crate) peak_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ResourceRuntimeSnapshot {
-    pub(crate) write_requests_in_flight: u64,
-    pub(crate) write_requests_peak: u64,
-    pub(crate) write_gate_rejections: u64,
-    pub(crate) write_gate_wait_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -292,194 +288,62 @@ impl Drop for WritePermit {
     }
 }
 
-struct WriteBufferPoolInner {
-    max_buffer_bytes: usize,
-    state: Mutex<Vec<AlignedBuffer>>,
-    available: Condvar,
-    memory: Arc<MemoryTracker>,
-    in_use: AtomicUsize,
-    rejections: AtomicU64,
-}
-
-/// A fixed-slot pool for append shards whose write unit has one constant size.
-///
-/// Unlike `ResourceController`, this wrapper has no request gate and does not
-/// create separate read/write/control pools. Every slot is allocated eagerly,
-/// so opening the engine either establishes the complete aligned memory bound
-/// or fails before the cache file is modified.
-pub(crate) struct WriteBufferPool {
-    inner: Arc<WriteBufferPoolInner>,
-    buffer_size: usize,
-    closed: AtomicBool,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WriteBufferPoolSnapshot {
-    pub(crate) in_use: u64,
-    pub(crate) rejections: u64,
-}
-
-impl WriteBufferPool {
-    pub(crate) fn try_new(slots: usize, buffer_size: usize) -> Result<Self, ResourceBuildError> {
-        if slots == 0 || slots > MAX_CONFIG_COUNT {
-            return Err(ResourceBuildError::Invalid(
-                "write buffer slots must be within the hard count limit",
-            ));
-        }
-        if buffer_size == 0 || buffer_size % BUFFER_ALIGNMENT != 0 {
-            return Err(ResourceBuildError::Invalid(
-                "write buffer size must be a non-zero 4096-byte multiple",
-            ));
-        }
-        let budget = slots
-            .checked_mul(buffer_size)
-            .ok_or(ResourceBuildError::Invalid(
-                "write buffer memory size overflow",
-            ))?;
-        let memory = Arc::new(MemoryTracker::new(budget, 0));
-        let inner = Arc::new(WriteBufferPoolInner::try_new(
-            slots,
-            buffer_size,
-            Arc::clone(&memory),
-        )?);
-
-        {
-            let mut state = lock_unpoisoned(&inner.state);
-            for buffer in &mut *state {
-                buffer
-                    .ensure_capacity(buffer_size, buffer_size, &memory)
-                    .map_err(|_| ResourceBuildError::Allocation)?;
-            }
-        }
-
-        Ok(Self {
-            inner,
-            buffer_size,
-            closed: AtomicBool::new(false),
-        })
-    }
-
-    pub(crate) fn acquire(&self) -> Option<BufferLease> {
-        let mut state = lock_unpoisoned(&self.inner.state);
-        while state.is_empty() && !self.closed.load(Ordering::Acquire) {
-            state = wait_unpoisoned(&self.inner.available, state);
-        }
-        if self.closed.load(Ordering::Acquire) {
-            self.inner.rejections.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let buffer = state
-            .pop()
-            .expect("write buffer wake requires a free buffer or closure");
-        self.inner.in_use.fetch_add(1, Ordering::Relaxed);
-        drop(state);
-        let mut lease = BufferLease {
-            owner: BufferOwner::WritePool(Arc::clone(&self.inner)),
-            buffer: Some(buffer),
-        };
-        lease
-            .prepare(self.buffer_size)
-            .expect("write buffers are fully allocated during construction");
-        Some(lease)
-    }
-
-    /// Permanently stop admission and wake every blocked caller. This is used
-    /// when a fatal asynchronous driver error quarantines one or more buffers:
-    /// no caller may remain asleep waiting for a slot that cannot return.
-    pub(crate) fn close(&self) {
-        // The condition transition and notification use the same mutex as
-        // `acquire`; otherwise close could race between its condition check
-        // and the atomic sleep inside `Condvar::wait` and lose the wakeup.
-        let _state = lock_unpoisoned(&self.inner.state);
-        self.closed.store(true, Ordering::Release);
-        self.inner.available.notify_all();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> WriteBufferPoolSnapshot {
-        WriteBufferPoolSnapshot {
-            in_use: self.inner.in_use.load(Ordering::Relaxed) as u64,
-            rejections: self.inner.rejections.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl WriteBufferPoolInner {
-    fn try_new(
-        slots: usize,
-        max_buffer_bytes: usize,
-        memory: Arc<MemoryTracker>,
-    ) -> Result<Self, ResourceBuildError> {
-        let mut free = Vec::new();
-        free.try_reserve_exact(slots)
-            .map_err(|_| ResourceBuildError::Allocation)?;
-        free.resize_with(slots, AlignedBuffer::empty);
-        Ok(Self {
-            max_buffer_bytes,
-            state: Mutex::new(free),
-            available: Condvar::new(),
-            memory,
-            in_use: AtomicUsize::new(0),
-            rejections: AtomicU64::new(0),
-        })
-    }
-
-    fn release(&self, buffer: AlignedBuffer) {
-        let mut state = lock_unpoisoned(&self.state);
-        state.push(buffer);
-        self.in_use.fetch_sub(1, Ordering::Relaxed);
-        self.available.notify_one();
-    }
-}
-
-impl Drop for WriteBufferPoolInner {
-    fn drop(&mut self) {
-        let state = lock_unpoisoned(&self.state);
-        let allocated = state.iter().map(|buffer| buffer.capacity).sum::<usize>();
-        self.memory.release(allocated);
-    }
-}
-
 pub(crate) struct BufferLease {
     owner: BufferOwner,
     buffer: Option<AlignedBuffer>,
 }
 
 enum BufferOwner {
-    WritePool(Arc<WriteBufferPoolInner>),
-    Standalone {
-        memory: Arc<MemoryTracker>,
-        maximum: usize,
-    },
+    Fixed,
+    Standalone { memory: Arc<MemoryTracker> },
 }
 
 impl BufferLease {
+    pub(crate) fn try_fixed(length: usize) -> Result<Self, ResourceBuildError> {
+        if length == 0 || length % BUFFER_ALIGNMENT != 0 || length > isize::MAX as usize {
+            return Err(ResourceBuildError::Invalid(
+                "fixed buffer size must be a non-zero 4096-byte multiple",
+            ));
+        }
+        let ptr = allocate_buffer(length).ok_or(ResourceBuildError::Allocation)?;
+        let mut buffer = AlignedBuffer {
+            ptr,
+            capacity: length,
+            initialized: 0,
+        };
+        buffer.prepare_zeroed(length);
+        Ok(Self {
+            owner: BufferOwner::Fixed,
+            buffer: Some(buffer),
+        })
+    }
+
     fn try_standalone(length: usize, memory: Arc<MemoryTracker>) -> Option<Self> {
         let maximum = align_up(length, BUFFER_ALIGNMENT)?;
         if maximum == 0 || maximum > isize::MAX as usize {
             return None;
         }
-        let mut buffer = AlignedBuffer::empty();
-        buffer.ensure_capacity(maximum, maximum, &memory).ok()?;
+        if !memory.try_reserve(maximum) {
+            return None;
+        }
+        let Some(ptr) = allocate_buffer(maximum) else {
+            memory.release(maximum);
+            return None;
+        };
         Some(Self {
-            owner: BufferOwner::Standalone { memory, maximum },
-            buffer: Some(buffer),
+            owner: BufferOwner::Standalone { memory },
+            buffer: Some(AlignedBuffer {
+                ptr,
+                capacity: maximum,
+                initialized: 0,
+            }),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let (maximum, memory, rejections) = match &self.owner {
-            BufferOwner::WritePool(pool) => {
-                (pool.max_buffer_bytes, &*pool.memory, Some(&pool.rejections))
-            }
-            BufferOwner::Standalone { memory, maximum } => (*maximum, &**memory, None),
-        };
         let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
-        if buffer.ensure_capacity(length, maximum, memory).is_err() {
-            if let Some(rejections) = rejections {
-                rejections.fetch_add(1, Ordering::Relaxed);
-            }
+        if length > buffer.capacity {
             return Err(());
         }
         // Callers encode complete records. Clearing here also fixes padding and
@@ -493,17 +357,8 @@ impl BufferLease {
     /// Fresh capacity is zeroed before it is exposed as initialized bytes.
     #[cfg(test)]
     pub(crate) fn grow_preserving(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let (maximum, memory, rejections) = match &self.owner {
-            BufferOwner::WritePool(pool) => {
-                (pool.max_buffer_bytes, &*pool.memory, Some(&pool.rejections))
-            }
-            BufferOwner::Standalone { memory, maximum } => (*maximum, &**memory, None),
-        };
         let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
-        if buffer.ensure_capacity(length, maximum, memory).is_err() {
-            if let Some(rejections) = rejections {
-                rejections.fetch_add(1, Ordering::Relaxed);
-            }
+        if length > buffer.capacity {
             return Err(());
         }
         buffer.zero_uninitialized_through(length);
@@ -565,7 +420,7 @@ impl Drop for BufferLease {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             match &self.owner {
-                BufferOwner::WritePool(pool) => pool.release(buffer),
+                BufferOwner::Fixed => drop(buffer),
                 BufferOwner::Standalone { memory, .. } => {
                     let capacity = buffer.capacity;
                     drop(buffer);
@@ -587,63 +442,6 @@ struct AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 
 impl AlignedBuffer {
-    const fn empty() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-            capacity: 0,
-            initialized: 0,
-        }
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        required: usize,
-        maximum: usize,
-        memory: &MemoryTracker,
-    ) -> Result<(), ()> {
-        if required > maximum {
-            return Err(());
-        }
-        let target = align_up(required, BUFFER_ALIGNMENT).ok_or(())?;
-        if target <= self.capacity {
-            return Ok(());
-        }
-        if target > isize::MAX as usize {
-            return Err(());
-        }
-
-        let old_capacity = self.capacity;
-        let old_initialized = self.initialized;
-        // Growth briefly owns both allocations while preserving the prefix. Count
-        // that physical overlap against the hard budget, then release the old
-        // charge after the copy. This keeps real allocation peak bounded too,
-        // not only the final logical capacity.
-        if !memory.try_reserve(target) {
-            return Err(());
-        }
-        let Some(ptr) = allocate_buffer(target) else {
-            memory.release(target);
-            return Err(());
-        };
-
-        if old_initialized != 0 {
-            // SAFETY: both allocations are valid for `old_initialized` bytes and
-            // cannot overlap. The old allocation remains live until the copy
-            // completes, so a failed growth never destroys buffered data.
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), ptr.as_ptr(), old_initialized);
-            }
-        }
-        if old_capacity != 0 {
-            self.deallocate();
-            memory.release(old_capacity);
-        }
-        self.ptr = ptr;
-        self.capacity = target;
-        self.initialized = old_initialized;
-        Ok(())
-    }
-
     fn prepare_zeroed(&mut self, length: usize) {
         debug_assert!(length <= self.capacity);
         // SAFETY: the allocation is valid for `capacity` bytes and this value
@@ -857,8 +655,7 @@ mod tests {
 
     #[test]
     fn preserving_growth_keeps_prefix_and_zeroes_fresh_capacity() {
-        let pool = WriteBufferPool::try_new(1, 3 * BUFFER_ALIGNMENT).unwrap();
-        let mut buffer = pool.acquire().unwrap();
+        let mut buffer = BufferLease::try_fixed(3 * BUFFER_ALIGNMENT).unwrap();
 
         let first = buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap();
         assert!(first.iter().all(|byte| *byte == 0));
@@ -872,8 +669,7 @@ mod tests {
 
     #[test]
     fn failed_preserving_growth_keeps_the_existing_buffer() {
-        let pool = WriteBufferPool::try_new(1, 2 * BUFFER_ALIGNMENT).unwrap();
-        let mut buffer = pool.acquire().unwrap();
+        let mut buffer = BufferLease::try_fixed(2 * BUFFER_ALIGNMENT).unwrap();
         buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
 
         assert!(buffer.grow_preserving(3 * BUFFER_ALIGNMENT).is_err());
@@ -925,24 +721,6 @@ mod tests {
         drop(first);
         done_rx.recv().unwrap();
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn closing_write_buffer_pool_wakes_waiters_when_a_slot_cannot_return() {
-        let pool = Arc::new(WriteBufferPool::try_new(1, BUFFER_ALIGNMENT).unwrap());
-        let held = pool.acquire().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
-        let worker_pool = Arc::clone(&pool);
-        let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            worker_pool.acquire().is_none()
-        });
-
-        started_rx.recv().unwrap();
-        pool.close();
-        assert!(worker.join().unwrap());
-        assert_eq!(pool.snapshot().rejections, 1);
-        drop(held);
     }
 
     #[test]

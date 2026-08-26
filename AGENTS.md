@@ -30,7 +30,7 @@ L2 can decide the result.
   cases to the normal hit path.
 - L1 lookup and pending publication retain only their short shard-local
   critical sections so an admitted `Pending` value remains immediately visible
-  and an older L1 value cannot escape a newer Region mask. Optional promotion
+  and an older L1 value cannot escape a newer pending fence. Optional promotion
   bypasses on lock contention.
 - Give every eviction selection, multi-victim admission, and frequency-aging
   operation a small constant work budget. Exhausting that budget bypasses L1.
@@ -80,11 +80,11 @@ L2 can decide the result.
   write is still in flight.
 - A `Pending` L1 value is not evictable. It becomes `Clean` only after its
   matching Region record completes.
-- If a value cannot enter L1, do not wait for Region completion. Install a
-  transient Region-index mask and return immediately.
-- While that mask is active, reads must return a miss instead of falling back
+- If a value cannot enter L1, do not wait for Region completion. Publish a
+  transient pending fence and return immediately.
+- While that fence is active, reads must return a miss instead of falling back
   to the older Region value.
-- The completed record replaces the matching mask at the same sequence number.
+- Completing the record clears the matching fence at the same sequence number.
 - The required degradation order is `new value -> miss`, never
   `new value -> stale value`.
 - Expired pending values hide the Region tier. Expired clean values may be
@@ -103,8 +103,8 @@ L2 can decide the result.
   overlap, but the final visible state must respect sequence ordering.
 - After Region I/O, revalidate the exact index record identity, Region
   generation, cache epoch, and clear floor before returning the value.
-- Transient index masks are runtime-only and must be resolved before publishing
-  a warm recovery image.
+- Pending fences are runtime-only; warm recovery images contain completed index
+  values only.
 
 ## Cache and Durability Semantics
 

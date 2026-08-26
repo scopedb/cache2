@@ -17,7 +17,6 @@ mod index_storage;
 mod io_backend;
 mod io_engine;
 mod memory;
-mod memory_arena;
 mod record_codec;
 mod recovery;
 mod region;
@@ -32,12 +31,17 @@ mod region_runtime;
 mod region_staging;
 mod region_store;
 mod resources;
+mod runtime_config;
+mod snapshot;
 
 pub use cache::{
-    CacheHealth, CacheIoSnapshot, CacheSnapshot, CacheTier, CacheWriteSnapshot,
-    DetailedCacheSnapshot, HybridCache, HybridCacheConfig, IoEngine, IoMode, PutReceipt,
-    RegionSetSnapshot, Result, RuntimeConfig, StartupMode, StaticConfig, Value,
+    CacheTier, HybridCache, HybridCacheConfig, PutReceipt, Result, StartupMode, StaticConfig, Value,
 };
 pub use eviction::EvictionPolicy;
 pub use region_layout::{RegionSetAllocation, RegionSetConfig, RegionSetId};
 pub use resources::WriteBackpressure;
+pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
+pub use snapshot::{
+    CacheHealth, CacheIoSnapshot, CacheSnapshot, CacheWriteSnapshot, DetailedCacheSnapshot,
+    RegionSetSnapshot,
+};

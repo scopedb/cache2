@@ -227,7 +227,7 @@ mod tests {
     use super::*;
     use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint};
     use crate::io_engine::BackendIoEngine;
-    use crate::resources::WriteBufferPool;
+    use crate::resources::BufferLease;
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -300,8 +300,7 @@ mod tests {
     fn span_write_preserves_owned_buffer_and_maps_region_offset_exactly() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = WriteBufferPool::try_new(1, 4096).unwrap();
-        let mut lease = pool.acquire().unwrap();
+        let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
@@ -327,17 +326,15 @@ mod tests {
         assert_eq!(writes[0].2, vec![0x5a; 4096]);
         drop(writes);
         engine.shutdown().unwrap();
-        assert_eq!(pool.snapshot().in_use, 0);
     }
 
     #[test]
     fn invalid_span_returns_the_only_buffer_without_submitting_io() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let pool = WriteBufferPool::try_new(1, 4096).unwrap();
         let mut invalid = span();
         invalid.end_offset += 1;
-        let buffer = IoBuffer::for_write(pool.acquire().unwrap(), 4096).unwrap();
+        let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();
         let error = match submit_span(&engine, geometry(), invalid, buffer, 0) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),

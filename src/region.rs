@@ -28,7 +28,7 @@ use crate::io_engine::{IoEngine, ReadSlot};
 use crate::memory::MemoryStore;
 use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
-use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
+use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{
     DataSuperblock, DataSuperblockProbe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET,
     RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe, RecoveryState,
@@ -37,15 +37,9 @@ use crate::recovery::{
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
-#[cfg(test)]
-use crate::region_index::IndexMask;
-use crate::region_index::{
-    IndexLookup, IndexMutationAuthority, IndexTransition, IndexUpsert, RegionIndex,
-};
+use crate::region_index::{IndexMutationAuthority, IndexTransition, RegionIndex};
 use crate::region_layout::RegionLayout;
-use crate::region_manager::{
-    RegionManager, RegionMutationError, RegionRuntime, RegionSetRuntimeSnapshot,
-};
+use crate::region_manager::{RegionManager, RegionMutationError, RegionRuntime};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
@@ -57,9 +51,7 @@ use crate::region_read::{
 #[cfg(test)]
 use crate::region_reader::plan_read;
 use crate::region_reader::{ReadPlan, submit_read};
-use crate::region_runtime::{
-    HybridValueRead, RegionDataPlane, RegionRuntimeConfig, RuntimeDetailedSnapshot, RuntimeSnapshot,
-};
+use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_staging::{
     RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
 };
@@ -67,6 +59,8 @@ use crate::region_staging::{
 use crate::region_store::RegionStartup;
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionConfig, RegionStore};
 use crate::resources::BufferLease;
+use crate::runtime_config::RuntimeConfig;
+use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, RegionSetSnapshot};
 
 const INDEX_PUBLICATION_CHUNK_RECORDS: usize = 32;
 
@@ -303,13 +297,6 @@ pub(crate) struct RegionPointRead<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionSpanPublish {
-    pub(crate) span: crate::region_manager::RegionWriteSpan,
-    pub(crate) published_records: u64,
-    pub(crate) obsolete_records: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionStageValue {
     Staged(u64),
     NeedsProgress,
@@ -456,7 +443,7 @@ impl FileRegionRuntime {
         &mut self,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RegionRuntimeConfig,
+        config: RuntimeConfig,
     ) -> io::Result<()> {
         if self.data_plane.is_some() {
             return Err(io::Error::new(
@@ -531,11 +518,11 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.flush()
     }
 
-    pub(crate) fn snapshot(&self) -> io::Result<RuntimeSnapshot> {
+    pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
         self.runtime()?.data_plane()?.snapshot()
     }
 
-    pub(crate) fn detailed_snapshot(&self) -> io::Result<RuntimeDetailedSnapshot> {
+    pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         self.runtime()?.data_plane()?.detailed_snapshot()
     }
 }
@@ -558,7 +545,7 @@ impl FileRegionCore {
         self.layout.append_shard(namespace_id, hash)
     }
 
-    pub(crate) fn region_set_snapshots(&self) -> io::Result<Box<[RegionSetRuntimeSnapshot]>> {
+    pub(crate) fn region_set_snapshots(&self) -> io::Result<Box<[RegionSetSnapshot]>> {
         self.manager
             .lock()?
             .region_set_snapshots()
@@ -616,23 +603,23 @@ impl FileRegionCore {
     /// point semantics. A lazy image failure latches the whole L2 miss-only;
     /// it is never surfaced as a cache hit or allowed to authorize CLEAN.
     #[cfg(test)]
-    fn lookup_snapshot(&self, hash: u64) -> io::Result<IndexLookup> {
+    fn lookup_snapshot(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
         if !self.health.is_healthy() {
-            return Ok(IndexLookup::Miss);
+            return Ok(None);
         }
         match self.index.lookup_raw(hash) {
-            Ok(IndexLookup::Hit(entry)) if self.health.is_healthy() => {
+            Ok(Some(entry)) if self.health.is_healthy() => {
                 Ok(if self.acquire_region_read(entry)?.is_some() {
-                    IndexLookup::Hit(entry)
+                    Some(entry)
                 } else {
-                    IndexLookup::Miss
+                    None
                 })
             }
             Ok(result) if self.health.is_healthy() => Ok(result),
-            Ok(_) => Ok(IndexLookup::Miss),
+            Ok(_) => Ok(None),
             Err(_) => {
                 self.health.enter_miss_only();
-                Ok(IndexLookup::Miss)
+                Ok(None)
             }
         }
     }
@@ -645,8 +632,8 @@ impl FileRegionCore {
             return Ok(None);
         }
         let entry = match self.index.lookup_raw(hash) {
-            Ok(IndexLookup::Hit(entry)) => entry,
-            Ok(_) => return Ok(None),
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Ok(None),
             Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
                 return Ok(None);
             }
@@ -872,7 +859,7 @@ impl FileRegionCore {
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended) => {}
             Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),
-            Err(StagingError::WouldBlock | StagingError::Encoding | StagingError::Submitted) => {
+            Err(StagingError::WouldBlock) => {
                 return Ok(RegionStageValue::NeedsProgress);
             }
             Err(error) => {
@@ -976,7 +963,7 @@ impl FileRegionCore {
         engine: &dyn IoEngine,
         shard_id: usize,
         memory: Option<&MemoryStore>,
-    ) -> io::Result<Option<RegionSpanPublish>> {
+    ) -> io::Result<Option<crate::region_manager::RegionWriteSpan>> {
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
@@ -1129,23 +1116,15 @@ impl FileRegionCore {
             return Err(region_read_io_error(error));
         }
 
-        let (published_records, obsolete_records) =
-            match self.publish_completed_records(shard_id, records.as_slice(), memory) {
-                Ok(counts) => counts,
-                Err(error) => {
-                    self.fail_staged_span(staging, span, Some(buffer), records);
-                    return Err(error);
-                }
-            };
+        if let Err(error) = self.publish_completed_records(shard_id, records.as_slice(), memory) {
+            self.fail_staged_span(staging, span, Some(buffer), records);
+            return Err(error);
+        }
         if let Err(error) = staging.finish_success(span, buffer, records) {
             self.health.enter_miss_only();
             return Err(staging_io_error(error));
         }
-        Ok(Some(RegionSpanPublish {
-            span,
-            published_records,
-            obsolete_records,
-        }))
+        Ok(Some(span))
     }
 
     /// Rotates one empty data shard through the exact read-drain boundary. The
@@ -1238,27 +1217,17 @@ impl FileRegionCore {
         shard_id: usize,
         records: &[StagedRecord],
         memory: Option<&MemoryStore>,
-    ) -> io::Result<(u64, u64)> {
-        let mut published = 0_u64;
-        let mut obsolete = 0_u64;
+    ) -> io::Result<()> {
         for chunk in records.chunks(INDEX_PUBLICATION_CHUNK_RECORDS) {
             let mut authority = self.manager.begin_index_mutation()?;
             let mut index_error = None;
             for record in chunk.iter().copied() {
-                let upsert =
+                if let Err(error) =
                     self.index
-                        .upsert_with_authority(record.hash, record.entry, &mut authority);
-                match upsert {
-                    Ok(IndexUpsert::Applied { .. }) => {
-                        published = published.saturating_add(1);
-                    }
-                    Ok(IndexUpsert::Ignored { .. })
-                    | Ok(IndexUpsert::Masked { .. })
-                    | Ok(IndexUpsert::Saturated) => obsolete = obsolete.saturating_add(1),
-                    Err(error) => {
-                        index_error = Some(error);
-                        break;
-                    }
+                        .upsert_with_authority(record.hash, record.entry, &mut authority)
+                {
+                    index_error = Some(error);
+                    break;
                 }
                 if authority.accounting_error.is_some() {
                     break;
@@ -1278,7 +1247,7 @@ impl FileRegionCore {
                 memory.complete_batch(shard_id, &completions[..chunk.len()]);
             }
         }
-        Ok((published, obsolete))
+        Ok(())
     }
 
     fn fail_staged_span(
@@ -1328,28 +1297,14 @@ impl FileRegionCore {
     }
 
     #[cfg(test)]
-    fn upsert_entry(&self, hash: u64, entry: IndexEntry) -> io::Result<IndexUpsert> {
+    fn upsert_entry(&self, hash: u64, entry: IndexEntry) -> io::Result<bool> {
         self.mutate_index(|index, authority| index.upsert_with_authority(hash, entry, authority))
-    }
-
-    #[cfg(test)]
-    fn mask_hash(&self, hash: u64, seqno: u64) -> io::Result<IndexMask> {
-        self.mutate_index(|index, authority| {
-            index.mask_if_newer_with_authority(hash, seqno, authority)
-        })
     }
 
     #[cfg(test)]
     fn remove_entry(&self, hash: u64, expected: IndexEntry) -> io::Result<Option<IndexTransition>> {
         self.mutate_index(|index, authority| {
             index.remove_if_with_authority(hash, expected, authority)
-        })
-    }
-
-    #[cfg(test)]
-    fn normalize_mask(&self, hash: u64, seqno: u64) -> io::Result<Option<IndexTransition>> {
-        self.mutate_index(|index, authority| {
-            index.normalize_mask_if_with_authority(hash, seqno, authority)
         })
     }
 
@@ -1508,7 +1463,7 @@ where
     /// configuration fingerprint.
     format_data: DataSuperblock,
     region_layout: Arc<RegionLayout>,
-    runtime_config: RegionRuntimeConfig,
+    runtime_config: RuntimeConfig,
     file_system: F,
     data_file: Option<F::File>,
     state_file: Option<F::File>,
@@ -1523,12 +1478,7 @@ where
 impl FileRegionBackend<SystemRegionFileSystem> {
     #[cfg(test)]
     pub(crate) fn new(files: RegionFiles, format_data: DataSuperblock) -> Self {
-        Self::new_with_configs(
-            files,
-            format_data,
-            REGION_SHARDS,
-            RegionRuntimeConfig::default(),
-        )
+        Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeConfig::default())
     }
 
     #[cfg(test)]
@@ -1536,7 +1486,7 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         files: RegionFiles,
         format_data: DataSuperblock,
         shards: u32,
-        runtime_config: RegionRuntimeConfig,
+        runtime_config: RuntimeConfig,
     ) -> Self {
         let region_layout =
             RegionLayout::single_unchecked(format_data.geometry.region_count, shards);
@@ -1547,7 +1497,7 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         files: RegionFiles,
         format_data: DataSuperblock,
         region_layout: RegionLayout,
-        runtime_config: RegionRuntimeConfig,
+        runtime_config: RuntimeConfig,
     ) -> Self {
         Self::new_with_file_system_and_configs(
             files,
@@ -1577,7 +1527,7 @@ where
                 format_data.geometry.region_count,
                 REGION_SHARDS,
             )),
-            RegionRuntimeConfig::default(),
+            RuntimeConfig::default(),
         )
     }
 
@@ -1586,7 +1536,7 @@ where
         format_data: DataSuperblock,
         file_system: F,
         region_layout: Arc<RegionLayout>,
-        runtime_config: RegionRuntimeConfig,
+        runtime_config: RuntimeConfig,
     ) -> Self {
         Self {
             files,
@@ -1674,9 +1624,11 @@ where
                 "RegionStore recovery temporary path collides with a cache file",
             ));
         }
-        let data =
-            self.file_system
-                .open_data(&self.files.data, true, self.runtime_config.io_mode)?;
+        let data = self.file_system.open_data(
+            &self.files.data,
+            true,
+            self.runtime_config.direct_io_mode(),
+        )?;
         data.try_lock_exclusive()?;
         let state = match self.file_system.open(&self.files.state, true) {
             Ok(state) => state,
@@ -2073,14 +2025,12 @@ where
         let storage = view.index.storage();
         let physical_stats = guarded_index_result(&view.health, storage.physical_stats())?;
         let partition_stats = guarded_index_result(&view.health, storage.partition_stats())?;
-        if physical_stats.masked != 0
-            || source_metadata.root.index_slots
-                != u64::try_from(storage.slot_count()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
-                })?
+        if source_metadata.root.index_slots
+            != u64::try_from(storage.slot_count()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
+            })?
             || source_metadata.root.physical_value_slots != physical_stats.value
             || source_metadata.root.physical_deleted_slots != physical_stats.deleted
-            || source_metadata.root.physical_masked_slots != physical_stats.masked
             || !metadata_partition_stats_match(source_metadata, &partition_stats)
         {
             return Err(io::Error::new(
@@ -2455,7 +2405,6 @@ fn partition_metadata_from_stats(
             })?,
             physical_value_slots: stats.value,
             physical_deleted_slots: stats.deleted,
-            physical_masked_slots: stats.masked,
         });
     }
     Ok(partitions.into_boxed_slice())
@@ -2475,7 +2424,6 @@ fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexP
         stats.push(IndexPhysicalStats {
             value: partition.physical_value_slots,
             deleted: partition.physical_deleted_slots,
-            masked: partition.physical_masked_slots,
         });
     }
     Ok(stats.into_boxed_slice())
@@ -2490,7 +2438,6 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
             .all(|(metadata, actual)| {
                 metadata.physical_value_slots == actual.value
                     && metadata.physical_deleted_slots == actual.deleted
-                    && metadata.physical_masked_slots == actual.masked
             })
 }
 
@@ -2592,7 +2539,6 @@ fn empty_region_metadata_with_layout(
             max_seqno: u64::from(shards),
             physical_value_slots: 0,
             physical_deleted_slots: 0,
-            physical_masked_slots: 0,
             live_record_count: 0,
             live_record_bytes: 0,
             free_region_count: data.geometry.region_count - shards,
@@ -3137,9 +3083,9 @@ mod tests {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
         let namespace_id = 7;
-        let runtime_config = RegionRuntimeConfig {
+        let runtime_config = RuntimeConfig {
             l1_capacity_bytes: 0,
-            ..RegionRuntimeConfig::default()
+            ..RuntimeConfig::default()
         };
         let mut store = RegionStore::open(
             RegionConfig { index_slots: 4096 },
@@ -3303,7 +3249,7 @@ mod tests {
         let manager = runtime.manager.inner.lock().unwrap();
         let next_seqno = manager.next_seqno();
         let hash = hash_namespaced_key(data.hash_seed, 7, b"key");
-        let record_bytes = planned_record_bytes(7, b"key".len(), b"value".len()).unwrap();
+        let record_bytes = required_record_bytes(7, b"key".len(), b"value".len()).unwrap();
 
         assert_eq!(
             runtime
@@ -3341,7 +3287,7 @@ mod tests {
         loop {
             let key = format!("file/chunk/{staged_records:04}");
             let hash = hash_namespaced_key(data.hash_seed, 7, key.as_bytes());
-            let record_bytes = planned_record_bytes(7, key.len(), value.len()).unwrap();
+            let record_bytes = required_record_bytes(7, key.len(), value.len()).unwrap();
             match runtime
                 .try_stage_value(
                     &staging,
@@ -3371,41 +3317,36 @@ mod tests {
         let (last_key, last_hash, last_seqno) =
             last.expect("4 MiB span must retain its final record");
         assert!(staged_records > 240);
-        assert_eq!(
-            runtime.lookup_snapshot(first_hash).unwrap(),
-            IndexLookup::Miss
-        );
+        assert_eq!(runtime.lookup_snapshot(first_hash).unwrap(), None);
 
         let published = runtime
             .flush_staging_shard(&staging, &engine, 0, None)
             .unwrap()
             .unwrap();
-        assert_eq!(published.published_records, staged_records);
-        assert_eq!(published.obsolete_records, 0);
         assert_eq!(
-            (published.span.end_offset - published.span.start_offset) % RECOVERY_PAGE_SIZE as u64,
+            (published.end_offset - published.start_offset) % RECOVERY_PAGE_SIZE as u64,
             0
         );
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
+        let Some(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
             panic!("completed first record must be published");
         };
         assert_eq!(entry.seqno, first_seqno);
         assert_eq!(
             entry.location.record_len(),
-            planned_record_bytes(7, first_key.len(), value.len()).unwrap()
+            required_record_bytes(7, first_key.len(), value.len()).unwrap()
         );
         assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
-        let IndexLookup::Hit(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
+        let Some(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
             panic!("completed final record must be published");
         };
         assert_eq!(last_entry.seqno, last_seqno);
         assert!(
             last_entry.location.record_len()
-                > planned_record_bytes(7, last_key.len(), value.len()).unwrap()
+                > required_record_bytes(7, last_key.len(), value.len()).unwrap()
         );
         assert_eq!(
             u64::from(last_entry.location.offset()) + u64::from(last_entry.location.record_len()),
-            published.span.end_offset
+            published.end_offset
         );
         let read = runtime
             .begin_point_read(first_hash)
@@ -3474,7 +3415,7 @@ mod tests {
         let key = b"expired-key";
         let value = b"expired-value";
         let hash = hash_namespaced_key(data.hash_seed, namespace_id, key);
-        let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len()).unwrap();
+        let record_bytes = required_record_bytes(namespace_id, key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
@@ -3495,7 +3436,7 @@ mod tests {
             .unwrap()
             .expect("expired value must publish before its deadline");
 
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(hash).unwrap() else {
+        let Some(entry) = runtime.lookup_snapshot(hash).unwrap() else {
             panic!("published value must enter the Region index");
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
@@ -3515,7 +3456,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), None);
         let submitted_after_cleanup = engine.stats().submitted;
 
         assert!(
@@ -3570,7 +3511,7 @@ mod tests {
         let value = b"owner-value-must-not-leak";
         let owner_hash = hash_namespaced_key(data.hash_seed, namespace_id, owner_key);
         let owner_record_bytes =
-            planned_record_bytes(namespace_id, owner_key.len(), value.len()).unwrap();
+            required_record_bytes(namespace_id, owner_key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
@@ -3591,7 +3532,7 @@ mod tests {
             .unwrap()
             .expect("collision owner must publish");
 
-        let IndexLookup::Hit(entry) = runtime.lookup_snapshot(owner_hash).unwrap() else {
+        let Some(entry) = runtime.lookup_snapshot(owner_hash).unwrap() else {
             panic!("collision owner must be indexed after publication");
         };
         let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
@@ -3669,7 +3610,7 @@ mod tests {
         backend.set_len(data.geometry.data_file_len).unwrap();
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
         let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
-        let record_bytes = planned_record_bytes(0, b"key".len(), 16 * 1024).unwrap();
+        let record_bytes = required_record_bytes(0, b"key".len(), 16 * 1024).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
                 &staging,
@@ -3699,8 +3640,8 @@ mod tests {
             Some(5)
         );
         assert!(!runtime.health.is_healthy());
-        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), IndexLookup::Miss);
-        assert_eq!(runtime.index.lookup_raw(hash).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), None);
+        assert_eq!(runtime.index.lookup_raw(hash).unwrap(), None);
         assert_eq!(
             runtime.manager.inner.lock().unwrap().regions()[0].completed_used,
             0
@@ -3798,19 +3739,14 @@ mod tests {
                 reservation.region_id,
                 reservation.offset,
                 reservation.record_bytes,
-                false,
             )
             .unwrap(),
             seqno: reservation.seqno,
             namespace_id: 0,
-            flags: 0,
         };
 
         let first = entry_for(append(&runtime));
-        assert!(matches!(
-            runtime.upsert_entry(7, first).unwrap(),
-            IndexUpsert::Applied { .. }
-        ));
+        assert!(runtime.upsert_entry(7, first).unwrap());
         assert_eq!(
             runtime
                 .manager
@@ -3822,12 +3758,7 @@ mod tests {
             64
         );
 
-        let remove_seqno = runtime.manager.lock().unwrap().allocate_seqno().unwrap();
-        assert!(matches!(
-            runtime.mask_hash(7, remove_seqno).unwrap(),
-            IndexMask::Applied { .. }
-        ));
-        runtime.normalize_mask(7, remove_seqno).unwrap();
+        runtime.remove_entry(7, first).unwrap();
         assert_eq!(
             runtime
                 .manager
@@ -3846,7 +3777,6 @@ mod tests {
             .lock()
             .unwrap()
             .apply_index_transition(IndexTransition {
-                global_slot: 0,
                 previous: crate::index_storage::IndexSlotState::Value {
                     hash: 7,
                     entry: second,
@@ -3858,7 +3788,7 @@ mod tests {
         let error = runtime.remove_entry(7, second).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!runtime.health.is_healthy());
-        assert_eq!(runtime.lookup_snapshot(7).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.lookup_snapshot(7).unwrap(), None);
     }
 
     fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {
@@ -3988,47 +3918,6 @@ mod tests {
     }
 
     #[test]
-    fn transient_index_mask_cannot_publish_a_warm_image() {
-        let directory = TestDirectory::new();
-        let config = RegionConfig { index_slots: 130 };
-        let data = test_data_superblock();
-        let mut fresh = RegionStore::open(
-            config,
-            FileRegionBackend::new(directory.files.clone(), data),
-        )
-        .unwrap();
-        assert_eq!(fresh.startup(), RegionStartup::FreshEmpty);
-        fresh
-            .runtime_mut()
-            .unwrap()
-            .index
-            .storage()
-            .write_slot(
-                0,
-                IndexSlot::from_state(crate::index_storage::IndexSlotState::Masked {
-                    hash: 11,
-                    seqno: 33,
-                }),
-            )
-            .unwrap();
-        let error = fresh.close_warm().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(!directory.files.image.exists());
-
-        let mut dirty = RegionStore::open(
-            config,
-            FileRegionBackend::new(directory.files.clone(), data),
-        )
-        .unwrap();
-        assert_eq!(dirty.startup(), RegionStartup::DirtyEmpty);
-        assert_eq!(
-            dirty.runtime().unwrap().lookup_snapshot(11).unwrap(),
-            IndexLookup::Miss
-        );
-        dirty.close_fast().unwrap();
-    }
-
-    #[test]
     fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
         use std::os::unix::fs::FileExt;
 
@@ -4152,7 +4041,7 @@ mod tests {
         assert_eq!(rejected.startup(), RegionStartup::DirtyEmpty);
         assert_eq!(
             rejected.runtime().unwrap().lookup_snapshot(0).unwrap(),
-            IndexLookup::Miss
+            None
         );
         rejected.close_fast().unwrap();
     }
@@ -4191,24 +4080,23 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.startup(), RegionStartup::CleanMapped);
         let runtime = recovered.runtime().unwrap();
-        assert_eq!(runtime.lookup_snapshot(0).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);
         assert!(runtime.health.is_healthy());
         assert!(
             !runtime
                 .revalidate_exact(
                     1,
                     IndexEntry {
-                        location: PackedLocation::new(0, 4096, 32, false).unwrap(),
+                        location: PackedLocation::new(0, 4096, 32).unwrap(),
                         seqno: 1,
                         namespace_id: 0,
-                        flags: 0,
                     },
                 )
                 .unwrap()
         );
         assert!(!runtime.health.is_healthy());
-        assert_eq!(runtime.lookup_snapshot(1).unwrap(), IndexLookup::Miss);
-        assert_eq!(runtime.lookup_snapshot(0).unwrap(), IndexLookup::Miss);
+        assert_eq!(runtime.lookup_snapshot(1).unwrap(), None);
+        assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);
         assert!(recovered.close_warm().is_err());
 
         let mut cold = RegionStore::open(
@@ -4217,10 +4105,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cold.startup(), RegionStartup::DirtyEmpty);
-        assert_eq!(
-            cold.runtime().unwrap().lookup_snapshot(1).unwrap(),
-            IndexLookup::Miss
-        );
+        assert_eq!(cold.runtime().unwrap().lookup_snapshot(1).unwrap(), None);
         cold.close_fast().unwrap();
     }
 
@@ -4386,7 +4271,7 @@ mod tests {
         ));
         assert_eq!(
             reopened.runtime().unwrap().lookup_snapshot(0).unwrap(),
-            IndexLookup::Miss
+            None
         );
         reopened.close_fast().unwrap();
     }

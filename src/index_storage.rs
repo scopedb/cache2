@@ -8,9 +8,7 @@
 
 use crate::checksum::Crc32c;
 use crate::index::{
-    INDEX_FLAG_SECOND_CHANCE_PENDING, INDEX_FLAG_SECOND_CHANCE_USED, INDEX_FLAG_VOLATILE,
-    INDEX_RUNTIME_ONLY_FLAGS, IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation,
-    PackedLocationError, index_partition_for,
+    IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation, PackedLocationError, index_partition_for,
 };
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -60,10 +58,6 @@ const PAGE_STATE_DIRTY: u8 = 3;
 const PAGE_STATE_REJECTED: u8 = 4;
 const IMAGE_STATE_USABLE: u8 = 0;
 const IMAGE_STATE_REJECTED: u8 = 1;
-
-pub(crate) const INDEX_SLOT_FLAG_MASKED: u32 = 1 << 31;
-const INDEX_SLOT_SUPPORTED_VALUE_FLAGS: u32 =
-    INDEX_FLAG_SECOND_CHANCE_PENDING | INDEX_FLAG_SECOND_CHANCE_USED | INDEX_FLAG_VOLATILE;
 
 const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 126);
 const _: () = assert!(
@@ -193,29 +187,24 @@ pub(crate) struct IndexSlot {
     pub(crate) location_raw: u64,
     pub(crate) seqno: u64,
     pub(crate) namespace_id: u32,
-    pub(crate) flags: u32,
+    pub(crate) reserved: u32,
 }
 
 /// Typed runtime meaning of one canonical Index Image slot.
 ///
-/// `Deleted` is the open-addressing probe marker, not a live record whose
-/// packed location has the record-tombstone bit set. Every `Value` has a
-/// non-zero sequence and a valid [`PackedLocation`].
+/// `Deleted` is the open-addressing probe marker. Every `Value` has a non-zero
+/// sequence and a valid [`PackedLocation`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexSlotState {
     Empty,
     Deleted,
-    Masked { hash: u64, seqno: u64 },
     Value { hash: u64, entry: IndexEntry },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexSlotSemanticError {
     NonCanonicalMarker,
-    InvalidMask,
-    UnsupportedFlags { flags: u32 },
-    RuntimeOnlyFlags { flags: u32 },
-    MaskedSlotPersisted,
+    ReservedNonZero,
     InvalidLocation(PackedLocationError),
 }
 
@@ -225,17 +214,7 @@ impl fmt::Display for IndexSlotSemanticError {
             Self::NonCanonicalMarker => {
                 formatter.write_str("zero-sequence slot is not Empty or Deleted")
             }
-            Self::InvalidMask => formatter.write_str("masked slot is not canonical"),
-            Self::UnsupportedFlags { flags } => {
-                write!(formatter, "slot contains unsupported flags {flags:#010x}")
-            }
-            Self::RuntimeOnlyFlags { flags } => write!(
-                formatter,
-                "persisted value contains runtime-only flags {flags:#010x}"
-            ),
-            Self::MaskedSlotPersisted => {
-                formatter.write_str("persisted index image contains a masked slot")
-            }
+            Self::ReservedNonZero => formatter.write_str("index slot reserved bytes are non-zero"),
             Self::InvalidLocation(error) => write!(formatter, "invalid packed location: {error}"),
         }
     }
@@ -247,7 +226,7 @@ impl IndexSlot {
         location_raw: 0,
         seqno: 0,
         namespace_id: 0,
-        flags: 0,
+        reserved: 0,
     };
 
     pub(crate) const DELETED: Self = Self {
@@ -255,26 +234,19 @@ impl IndexSlot {
         location_raw: u64::MAX,
         seqno: 0,
         namespace_id: 0,
-        flags: 0,
+        reserved: 0,
     };
 
     pub(crate) const fn from_state(state: IndexSlotState) -> Self {
         match state {
             IndexSlotState::Empty => Self::EMPTY,
             IndexSlotState::Deleted => Self::DELETED,
-            IndexSlotState::Masked { hash, seqno } => Self {
-                hash,
-                location_raw: 0,
-                seqno,
-                namespace_id: 0,
-                flags: INDEX_SLOT_FLAG_MASKED,
-            },
             IndexSlotState::Value { hash, entry } => Self {
                 hash,
                 location_raw: entry.location.raw(),
                 seqno: entry.seqno,
                 namespace_id: entry.namespace_id,
-                flags: entry.flags,
+                reserved: 0,
             },
         }
     }
@@ -284,7 +256,7 @@ impl IndexSlot {
         output[8..16].copy_from_slice(&self.location_raw.to_le_bytes());
         output[16..24].copy_from_slice(&self.seqno.to_le_bytes());
         output[24..28].copy_from_slice(&self.namespace_id.to_le_bytes());
-        output[28..32].copy_from_slice(&self.flags.to_le_bytes());
+        output[28..32].copy_from_slice(&self.reserved.to_le_bytes());
     }
 
     pub(crate) fn decode(input: &[u8; INDEX_IMAGE_SLOT_SIZE]) -> Self {
@@ -293,7 +265,7 @@ impl IndexSlot {
             location_raw: read_u64(input, 8),
             seqno: read_u64(input, 16),
             namespace_id: read_u32(input, 24),
-            flags: read_u32(input, 28),
+            reserved: read_u32(input, 28),
         }
     }
 
@@ -304,21 +276,8 @@ impl IndexSlot {
         if self == Self::DELETED {
             return Ok(IndexSlotState::Deleted);
         }
-        if self.flags & !(INDEX_SLOT_SUPPORTED_VALUE_FLAGS | INDEX_SLOT_FLAG_MASKED) != 0 {
-            return Err(IndexSlotSemanticError::UnsupportedFlags { flags: self.flags });
-        }
-        if self.flags & INDEX_SLOT_FLAG_MASKED != 0 {
-            if self.flags != INDEX_SLOT_FLAG_MASKED
-                || self.location_raw != 0
-                || self.seqno == 0
-                || self.namespace_id != 0
-            {
-                return Err(IndexSlotSemanticError::InvalidMask);
-            }
-            return Ok(IndexSlotState::Masked {
-                hash: self.hash,
-                seqno: self.seqno,
-            });
+        if self.reserved != 0 {
+            return Err(IndexSlotSemanticError::ReservedNonZero);
         }
         if self.seqno == 0 {
             return Err(IndexSlotSemanticError::NonCanonicalMarker);
@@ -331,28 +290,13 @@ impl IndexSlot {
                 location,
                 seqno: self.seqno,
                 namespace_id: self.namespace_id,
-                flags: self.flags,
             },
         })
-    }
-
-    fn persisted_state(self) -> Result<IndexSlotState, IndexSlotSemanticError> {
-        match self.runtime_state()? {
-            IndexSlotState::Masked { .. } => Err(IndexSlotSemanticError::MaskedSlotPersisted),
-            IndexSlotState::Value { entry, .. } if entry.flags & INDEX_RUNTIME_ONLY_FLAGS != 0 => {
-                Err(IndexSlotSemanticError::RuntimeOnlyFlags {
-                    flags: entry.flags & INDEX_RUNTIME_ONLY_FLAGS,
-                })
-            }
-            state => Ok(state),
-        }
     }
 
     fn physical_kind(self) -> SlotPhysicalKind {
         if self == Self::EMPTY {
             SlotPhysicalKind::Empty
-        } else if self.flags & INDEX_SLOT_FLAG_MASKED != 0 {
-            SlotPhysicalKind::Masked
         } else if self.seqno != 0 {
             SlotPhysicalKind::Value
         } else {
@@ -378,7 +322,7 @@ impl IndexImageBinding {
     }
 }
 
-/// Counts of the three non-empty physical slot states.
+/// Counts of the two non-empty physical slot states.
 ///
 /// Clean recovery metadata validates these counts before passing them to
 /// [`IndexStorage::map_private`], avoiding an O(slot-count) startup scan.
@@ -386,14 +330,11 @@ impl IndexImageBinding {
 pub(crate) struct IndexPhysicalStats {
     pub(crate) value: u64,
     pub(crate) deleted: u64,
-    pub(crate) masked: u64,
 }
 
 impl IndexPhysicalStats {
     fn total(self) -> Option<u64> {
-        self.value
-            .checked_add(self.deleted)?
-            .checked_add(self.masked)
+        self.value.checked_add(self.deleted)
     }
 
     fn is_valid_for(self, slot_count: usize) -> bool {
@@ -420,7 +361,6 @@ impl IndexPhysicalStats {
             SlotPhysicalKind::Empty => return Some(()),
             SlotPhysicalKind::Value => &mut self.value,
             SlotPhysicalKind::Deleted => &mut self.deleted,
-            SlotPhysicalKind::Masked => &mut self.masked,
         };
         *counter = counter.checked_sub(1)?;
         Some(())
@@ -431,7 +371,6 @@ impl IndexPhysicalStats {
             SlotPhysicalKind::Empty => return Some(()),
             SlotPhysicalKind::Value => &mut self.value,
             SlotPhysicalKind::Deleted => &mut self.deleted,
-            SlotPhysicalKind::Masked => &mut self.masked,
         };
         *counter = counter.checked_add(1)?;
         Some(())
@@ -443,13 +382,6 @@ enum SlotPhysicalKind {
     Empty,
     Value,
     Deleted,
-    Masked,
-}
-
-impl SlotPhysicalKind {
-    const fn is_masked(self) -> bool {
-        matches!(self, Self::Masked)
-    }
 }
 
 /// The lazy validation state of one physical image page.
@@ -562,9 +494,6 @@ pub(crate) enum IndexStorageError {
         reason: IndexSlotSemanticError,
     },
     InvalidPhysicalStats,
-    MaskedSlotsPresent {
-        count: u64,
-    },
 }
 
 impl fmt::Display for IndexStorageError {
@@ -597,9 +526,6 @@ impl fmt::Display for IndexStorageError {
             Self::InvalidPhysicalStats => {
                 formatter.write_str("index physical slot counts are inconsistent")
             }
-            Self::MaskedSlotsPresent { count } => {
-                write!(formatter, "warm index image contains {count} masked slots")
-            }
         }
     }
 }
@@ -617,8 +543,7 @@ impl std::error::Error for IndexStorageError {
             | Self::PartitionBusy { .. }
             | Self::CorruptPage { .. }
             | Self::CorruptSlot { .. }
-            | Self::InvalidPhysicalStats
-            | Self::MaskedSlotsPresent { .. } => None,
+            | Self::InvalidPhysicalStats => None,
         }
     }
 }
@@ -802,9 +727,8 @@ impl IndexStorage {
     /// Sequentially emits a new, fully checksummed Index Image .
     ///
     /// Encoding uses one 4 KiB stack page and one lazily allocated, fixed
-    /// 1 MiB write batch regardless of index size. Process-local flags are
-    /// always cleared before persistence. The destination should be an
-    /// unpublished temporary image because an error can leave a prefix written.
+    /// 1 MiB write batch regardless of index size. The destination should be
+    /// an unpublished temporary image because an error can leave a prefix written.
     #[cfg(test)]
     pub(crate) fn write_warm_image<W>(
         &self,
@@ -838,11 +762,6 @@ impl IndexStorage {
             ));
         }
         self.core.ensure_image_usable(self.range.first_page)?;
-        if self.physical_stats.masked != 0 {
-            return Err(IndexStorageError::MaskedSlotsPresent {
-                count: self.physical_stats.masked,
-            });
-        }
         let mut output = [0_u8; INDEX_IMAGE_PAGE_SIZE];
         let mut emitted_physical_stats = IndexPhysicalStats::default();
         for local_page in 0..self.range.page_count {
@@ -867,13 +786,9 @@ impl IndexStorage {
                         base.checked_add(slot_in_page.checked_mul(INDEX_IMAGE_SLOT_SIZE)?)
                     })
                     .ok_or(IndexStorageError::SizeOverflow)?;
-                let mut value = self.core.decode_at(source_offset);
-                if value.physical_kind().is_masked() {
-                    return Err(IndexStorageError::MaskedSlotsPresent { count: 1 });
-                }
-                value.flags &= !INDEX_RUNTIME_ONLY_FLAGS;
+                let value = self.core.decode_at(source_offset);
                 value
-                    .persisted_state()
+                    .runtime_state()
                     .map_err(IndexStorageError::InvalidSlot)?;
                 emitted_physical_stats = emitted_physical_stats
                     .transitioned(
@@ -1125,7 +1040,7 @@ impl IndexStorageCore {
                 .try_into()
                 .expect("validated index slot range has the fixed slot size");
             IndexSlot::decode(encoded)
-                .persisted_state()
+                .runtime_state()
                 .map_err(|reason| IndexStorageError::CorruptSlot { slot_index, reason })?;
         }
         Ok(())
@@ -1235,10 +1150,6 @@ pub(crate) struct IndexPartitionWriteGuard<'a> {
 }
 
 impl IndexPartitionWriteGuard<'_> {
-    pub(crate) const fn first_slot(&self) -> usize {
-        self.range.first_slot
-    }
-
     pub(crate) const fn slot_count(&self) -> usize {
         self.range.slot_count
     }
@@ -1432,11 +1343,6 @@ impl PartitionedIndexStorage {
         if !physical_stats.is_valid_for(self.slot_count) {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
-        if physical_stats.masked != 0 {
-            return Err(IndexStorageError::MaskedSlotsPresent {
-                count: physical_stats.masked,
-            });
-        }
         let mut total = WarmImageStats {
             pages_written: 0,
             slots_written: 0,
@@ -1549,10 +1455,6 @@ fn checked_add_physical_stats(
             .deleted
             .checked_add(right.deleted)
             .ok_or(IndexStorageError::InvalidPhysicalStats)?,
-        masked: left
-            .masked
-            .checked_add(right.masked)
-            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
     })
 }
 
@@ -1568,10 +1470,10 @@ fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 /// Fixed-memory sequential write combiner used only while producing an
 /// unpublished warm image.
 ///
-/// The buffer is allocated lazily, after the index writer has checked the
-/// image binding and transient-mask preconditions. Dropping this writer after
-/// an encoding error intentionally discards an unflushed tail; the destination
-/// image is temporary and must never be published after any error.
+/// The buffer is allocated lazily after the index writer validates the image
+/// binding. Dropping this writer after an encoding error intentionally discards
+/// an unflushed tail; the destination image is temporary and must never be
+/// published after any error.
 struct WarmImageBatchWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
     buffer: Vec<u8>,
@@ -2025,13 +1927,13 @@ mod tests {
 
     fn sample_slot(seed: u64) -> IndexSlot {
         let location =
-            PackedLocation::new((seed % 64) as u32, ((seed % 128) * 8) as u32, 32, false).unwrap();
+            PackedLocation::new((seed % 64) as u32, ((seed % 128) * 8) as u32, 32).unwrap();
         IndexSlot {
             hash: 0x0102_0304_0506_0708 ^ seed,
             location_raw: location.raw(),
             seqno: seed + 1,
             namespace_id: 0x3132_3334 ^ seed as u32,
-            flags: INDEX_FLAG_SECOND_CHANCE_USED,
+            reserved: 0,
         }
     }
 
@@ -2112,12 +2014,10 @@ mod tests {
             IndexPhysicalStats {
                 value: 1,
                 deleted: 0,
-                masked: 0,
             },
             IndexPhysicalStats {
                 value: 1,
                 deleted: 1,
-                masked: 0,
             },
         ]);
         assert_eq!(source.partition_stats().unwrap(), expected_partition_stats);
@@ -2126,7 +2026,6 @@ mod tests {
             IndexPhysicalStats {
                 value: 2,
                 deleted: 1,
-                masked: 0,
             }
         );
 
@@ -2332,7 +2231,7 @@ mod tests {
         assert_eq!(&encoded[8..16], &value.location_raw.to_le_bytes());
         assert_eq!(&encoded[16..24], &value.seqno.to_le_bytes());
         assert_eq!(&encoded[24..28], &value.namespace_id.to_le_bytes());
-        assert_eq!(&encoded[28..32], &value.flags.to_le_bytes());
+        assert_eq!(&encoded[28..32], &[0; 4]);
         assert_eq!(IndexSlot::decode(&encoded), value);
         assert_eq!(IndexSlot::decode(&[0_u8; 32]), IndexSlot::EMPTY);
     }
@@ -2348,21 +2247,6 @@ mod tests {
             IndexPhysicalStats {
                 value: 1,
                 deleted: 0,
-                masked: 0,
-            }
-        );
-
-        let live_tombstone = IndexSlot {
-            location_raw: PackedLocation::new(2, 8, 32, true).unwrap().raw(),
-            ..sample_slot(2)
-        };
-        storage.write_slot(0, live_tombstone).unwrap();
-        assert_eq!(
-            storage.physical_stats(),
-            IndexPhysicalStats {
-                value: 1,
-                deleted: 0,
-                masked: 0,
             }
         );
 
@@ -2372,24 +2256,8 @@ mod tests {
             IndexPhysicalStats {
                 value: 0,
                 deleted: 1,
-                masked: 0,
             }
         );
-
-        let masked = IndexSlot::from_state(IndexSlotState::Masked { hash: 3, seqno: 4 });
-        storage.write_slot(0, masked).unwrap();
-        assert_eq!(
-            storage.physical_stats(),
-            IndexPhysicalStats {
-                value: 0,
-                deleted: 0,
-                masked: 1,
-            }
-        );
-        assert!(matches!(
-            storage.write_warm_image(&mut Vec::new(), binding(1)),
-            Err(IndexStorageError::MaskedSlotsPresent { count: 1 })
-        ));
 
         storage.write_slot(0, IndexSlot::EMPTY).unwrap();
         assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
@@ -2418,7 +2286,6 @@ mod tests {
                 IndexPhysicalStats {
                     value: 1,
                     deleted: 1,
-                    masked: 0,
                 }
             ),
             Err(IndexStorageError::InvalidPhysicalStats)
@@ -2433,9 +2300,7 @@ mod tests {
 
         let mut source = IndexStorage::anonymous(SLOT_COUNT).unwrap();
         assert_eq!(source.read_slot(0).unwrap(), IndexSlot::EMPTY);
-        let mut runtime_slot = sample_slot(1);
-        runtime_slot.flags |= INDEX_RUNTIME_ONLY_FLAGS;
-        source.write_slot(0, runtime_slot).unwrap();
+        source.write_slot(0, sample_slot(1)).unwrap();
         source
             .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE + 2, sample_slot(2))
             .unwrap();

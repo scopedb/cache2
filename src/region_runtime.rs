@@ -12,34 +12,27 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::eviction::EvictionPolicy;
 use crate::expiry::ExpiryClock;
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
-use crate::io_backend::{DirectIoMode, RuntimeFileSet, SyncMode, SyncPoint};
+use crate::io_backend::{RuntimeFileSet, SyncMode, SyncPoint};
 use crate::io_engine::{
-    FileIoEngineKind, IoEngine, IoEngineStats, IoOperation, MAX_IO_REQUESTS_PER_WORKER,
-    OperationKind, build_file_engine, submit_cache_io,
+    IoEngine, IoOperation, MAX_IO_REQUESTS_PER_WORKER, OperationKind, build_file_engine,
+    submit_cache_io,
 };
 use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValue};
-use crate::record_codec::{hash_namespaced_key, planned_record_bytes};
+use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_appender::_WRITE_BATCH_BYTES;
-use crate::region_manager::RegionSetRuntimeSnapshot;
 use crate::region_reader::{_READ_ALIGNMENT, plan_read};
 use crate::region_staging::{PendingFenceLookup, RegionStaging, StagingError};
 use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
-    ResourceBuildError, ResourceController, ResourceLimits, ResourceRuntimeSnapshot,
-    WriteBackpressure, WriteOverloadReason,
+    ResourceBuildError, ResourceController, ResourceLimits, WriteBackpressure, WriteOverloadReason,
 };
+use crate::runtime_config::RuntimeConfig;
+use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
 
-#[cfg(test)]
-const DEFAULT_IO_WORKERS: usize = 4;
-#[cfg(test)]
-const DEFAULT_IO_CONCURRENCY: usize = 128;
-#[cfg(test)]
-const DEFAULT_WAITING_WRITE_LIMIT: usize = 128;
 const _MAX_KEY_BYTES: usize = 4 * 1024;
 const _MAX_VALUE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_RECORD_BYTES: usize = const_align_up(
@@ -54,13 +47,6 @@ const MAX_READ_BUFFER_BYTES: usize = const_align_up(
     MAX_RUNTIME_RECORD_BYTES + (_READ_ALIGNMENT - RECORD_ALIGNMENT),
     _READ_ALIGNMENT,
 );
-pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
-#[cfg(test)]
-const DEFAULT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
-#[cfg(test)]
-const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
-#[cfg(test)]
-const DEFAULT_WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const MAX_WRITE_FLUSH_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
 // Covers the bounded engine registry, command channel, and driver-side
@@ -108,47 +94,6 @@ impl Drop for LifecycleDrainingGuard<'_> {
             );
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeHealth {
-    Running,
-    Draining,
-    MissOnly,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeSnapshot {
-    pub(crate) health: RuntimeHealth,
-    pub(crate) statistics_enabled: bool,
-    pub(crate) puts: u64,
-    pub(crate) written_bytes: u64,
-    pub(crate) l1_hits: u64,
-    pub(crate) l1_misses: u64,
-    pub(crate) l2_hits: u64,
-    pub(crate) l2_misses: u64,
-    pub(crate) l2_read_memory_misses: u64,
-    pub(crate) l2_read_busy_misses: u64,
-    pub(crate) served_bytes: u64,
-    pub(crate) l1_promotions: u64,
-    pub(crate) l1_evictions: u64,
-    pub(crate) l1_bypasses: u64,
-    pub(crate) l1_admission_rejections: u64,
-    pub(crate) write_rejections: u64,
-    pub(crate) io_failures: u64,
-    pub(crate) region_rotations: u64,
-    pub(crate) memory: ManagedMemorySnapshot,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeDetailedSnapshot {
-    pub(crate) summary: RuntimeSnapshot,
-    pub(crate) resources: ResourceRuntimeSnapshot,
-    pub(crate) io: IoEngineStats,
-    pub(crate) region_sets: Box<[RegionSetRuntimeSnapshot]>,
-    pub(crate) write_buffer_rejections: u64,
-    pub(crate) write_buffer_wait_ns: u64,
 }
 
 struct RuntimeMetrics {
@@ -248,16 +193,16 @@ impl RuntimeMetrics {
         statistics_enabled: bool,
         memory: ManagedMemorySnapshot,
         memory_metrics: MemoryMetricsSnapshot,
-    ) -> RuntimeSnapshot {
+    ) -> CacheSnapshot {
         let lifecycle = self.lifecycle.load(Ordering::Acquire);
         let health = if lifecycle == LIFECYCLE_FAILED {
-            RuntimeHealth::Failed
+            CacheHealth::Failed
         } else if !core_healthy {
-            RuntimeHealth::MissOnly
+            CacheHealth::MissOnly
         } else if lifecycle == LIFECYCLE_DRAINING {
-            RuntimeHealth::Draining
+            CacheHealth::Draining
         } else {
-            RuntimeHealth::Running
+            CacheHealth::Running
         };
         let mut puts = 0_u64;
         let mut written_bytes = 0_u64;
@@ -286,7 +231,7 @@ impl RuntimeMetrics {
             l1_promotions =
                 l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
         }
-        RuntimeSnapshot {
+        CacheSnapshot {
             health,
             statistics_enabled,
             puts,
@@ -305,52 +250,15 @@ impl RuntimeMetrics {
             write_rejections: self.write_rejections.load(Ordering::Relaxed),
             io_failures: self.io_failures.load(Ordering::Relaxed),
             region_rotations: self.region_rotations.load(Ordering::Relaxed),
-            memory,
+            managed_memory_bytes: memory.current_bytes,
+            managed_memory_peak_bytes: memory.peak_bytes,
+            managed_memory_limit_bytes: memory.limit_bytes,
+            logical_disk_peak_bytes: 0,
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct RegionRuntimeConfig {
-    pub(crate) io_engine: FileIoEngineKind,
-    pub(crate) io_mode: DirectIoMode,
-    pub(crate) io_workers: usize,
-    pub(crate) io_concurrency: usize,
-    pub(crate) waiting_write_limit: usize,
-    pub(crate) l1_capacity_bytes: usize,
-    pub(crate) memory_limit_bytes: usize,
-    pub(crate) l1_shards: usize,
-    pub(crate) eviction_policy: EvictionPolicy,
-    pub(crate) write_buffer_bytes: usize,
-    pub(crate) write_batch_bytes: usize,
-    pub(crate) write_flush_delay: Duration,
-    pub(crate) write_backpressure: WriteBackpressure,
-    pub(crate) statistics: bool,
-}
-
-#[cfg(test)]
-impl Default for RegionRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            io_engine: FileIoEngineKind::Auto,
-            io_mode: DirectIoMode::Auto,
-            io_workers: DEFAULT_IO_WORKERS,
-            io_concurrency: DEFAULT_IO_CONCURRENCY,
-            waiting_write_limit: DEFAULT_WAITING_WRITE_LIMIT,
-            l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
-            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
-            l1_shards: DEFAULT_L1_SHARDS,
-            eviction_policy: EvictionPolicy::Clock,
-            write_buffer_bytes: _WRITE_BATCH_BYTES,
-            write_batch_bytes: _WRITE_BATCH_BYTES,
-            write_flush_delay: DEFAULT_WRITE_FLUSH_DELAY,
-            write_backpressure: WriteBackpressure::Reject,
-            statistics: false,
-        }
-    }
-}
-
-impl RegionRuntimeConfig {
+impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
         if self.io_workers == 0 || self.io_workers > self.io_concurrency {
             return Err(io::Error::new(
@@ -518,7 +426,7 @@ impl HybridValueRead {
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    config: RegionRuntimeConfig,
+    config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
     // Published once after lazy startup; steady-state operations borrow it
     // without taking the lifecycle mutex or cloning an Arc.
@@ -703,7 +611,7 @@ impl RegionDataPlane {
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RegionRuntimeConfig,
+        config: RuntimeConfig,
     ) -> io::Result<Self> {
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
         Ok(Self {
@@ -730,7 +638,7 @@ impl RegionDataPlane {
                 "file-chunk entry exceeds the 4 KiB key or 256 KiB value limit",
             ));
         }
-        let record_bytes = planned_record_bytes(namespace_id, key.len(), value.len())
+        let record_bytes = required_record_bytes(namespace_id, key.len(), value.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let running = self.running()?;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
@@ -1055,27 +963,28 @@ impl RegionDataPlane {
         result
     }
 
-    pub(crate) fn snapshot(&self) -> io::Result<RuntimeSnapshot> {
+    pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
         let running = self.running()?;
         Ok(self.snapshot_running(running))
     }
 
-    pub(crate) fn detailed_snapshot(&self) -> io::Result<RuntimeDetailedSnapshot> {
+    pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         let running = self.running()?;
-        Ok(RuntimeDetailedSnapshot {
+        let mut writes = running.resources.runtime_snapshot();
+        writes.write_buffer_rejections = running
+            .metrics
+            .write_buffer_rejections
+            .load(Ordering::Relaxed);
+        writes.write_buffer_wait_ns = running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed);
+        Ok(DetailedCacheSnapshot {
             summary: self.snapshot_running(running),
-            resources: running.resources.runtime_snapshot(),
+            writes,
             io: aggregate_io_stats(&running.engines),
             region_sets: self.core.region_set_snapshots()?,
-            write_buffer_rejections: running
-                .metrics
-                .write_buffer_rejections
-                .load(Ordering::Relaxed),
-            write_buffer_wait_ns: running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed),
         })
     }
 
-    fn snapshot_running(&self, running: &RunningShared) -> RuntimeSnapshot {
+    fn snapshot_running(&self, running: &RunningShared) -> CacheSnapshot {
         self.metrics.snapshot(
             self.core.is_healthy(),
             self.config.statistics,
@@ -1177,8 +1086,8 @@ pub(crate) fn flush_data_inode(engines: &[Arc<dyn IoEngine>]) -> io::Result<()> 
     Ok(())
 }
 
-fn aggregate_io_stats(engines: &[Arc<dyn IoEngine>]) -> IoEngineStats {
-    let mut aggregate = IoEngineStats::default();
+fn aggregate_io_stats(engines: &[Arc<dyn IoEngine>]) -> CacheIoSnapshot {
+    let mut aggregate = CacheIoSnapshot::default();
     for (engine_index, engine) in engines.iter().enumerate() {
         let snapshot = engine.stats();
         aggregate.submitted = aggregate.submitted.saturating_add(snapshot.submitted);
@@ -1215,7 +1124,7 @@ fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     files: RuntimeFileSet,
-    config: RegionRuntimeConfig,
+    config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
@@ -1305,10 +1214,7 @@ fn start_running(
     })
 }
 
-fn runtime_topology_memory_bytes(
-    shard_count: usize,
-    config: &RegionRuntimeConfig,
-) -> Option<usize> {
+fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> Option<usize> {
     // Each I/O engine owns one normal worker. Reserve one additional stack per
     // engine for the bounded shutdown reaper path.
     let stack_count = config.io_workers.checked_mul(2)?.checked_add(shard_count)?;
@@ -1330,7 +1236,7 @@ fn runtime_topology_memory_bytes(
 
 fn build_engine_pool(
     files: RuntimeFileSet,
-    config: &RegionRuntimeConfig,
+    config: &RuntimeConfig,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
     let mut engines = Vec::new();
@@ -1349,7 +1255,7 @@ fn build_engine_pool(
         engines.push(build_file_engine(
             worker_files,
             worker_concurrency,
-            config.io_engine,
+            config.file_io_engine(),
         )?);
     }
     Ok(engines.into_boxed_slice())
@@ -1435,7 +1341,7 @@ fn shard_worker_result(
                     advance_shard_progress(control)?;
                 }
             }
-            Err(StagingError::Encoding | StagingError::Submitted) => {
+            Err(StagingError::WouldBlock) => {
                 deadline = Some(Instant::now() + _RETRY_AGE);
             }
             Err(error) => return Err(staging_runtime_error(error)),
@@ -1724,7 +1630,7 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let record_len = planned_record_bytes(1, _MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
+        let record_len = required_record_bytes(1, _MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
         assert_eq!(record_len as usize, MAX_RUNTIME_RECORD_BYTES);
 
         let mut observed_max = 0;
@@ -1732,16 +1638,10 @@ mod tests {
             let padded_end = const_align_up(offset + record_len as usize, _READ_ALIGNMENT);
             for candidate_len in [record_len, (padded_end - offset) as u32] {
                 let entry = crate::index::IndexEntry {
-                    location: crate::index::PackedLocation::new(
-                        0,
-                        offset as u32,
-                        candidate_len,
-                        false,
-                    )
-                    .unwrap(),
+                    location: crate::index::PackedLocation::new(0, offset as u32, candidate_len)
+                        .unwrap(),
                     seqno: 1,
                     namespace_id: 1,
-                    flags: 0,
                 };
                 let plan = plan_read(geometry, entry).unwrap();
                 observed_max = observed_max.max(plan.aligned_len);
@@ -1781,7 +1681,7 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let mut config = RegionRuntimeConfig::default();
+        let mut config = RuntimeConfig::default();
         let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count).unwrap();
         let (_, without_layout) = config.memory_plan_bytes(geometry, 4, fixed).unwrap();
         config.memory_limit_bytes = without_layout;

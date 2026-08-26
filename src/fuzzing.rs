@@ -44,13 +44,12 @@ fn fuzz_index_probe(input: &[u8]) {
         let raw = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let region_id = (raw as u32) & 0x3ff;
         let offset = ((raw >> 32) as u32 & 0xffff) * 8;
-        let location = PackedLocation::new(region_id, offset, 32, false)
+        let location = PackedLocation::new(region_id, offset, 32)
             .expect("bounded aligned fuzz location is representable");
         let entry = IndexEntry {
             location,
             seqno,
             namespace_id: (raw >> 16) as u32,
-            flags: 0,
         };
         let _ = index.upsert_with_authority(hash, entry, &mut authority);
         let _ = index.lookup_raw(hash);

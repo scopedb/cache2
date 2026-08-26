@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::time::Duration;
 
-use crate::index::{INDEX_FLAG_VOLATILE, IndexEntry};
+use crate::index::IndexEntry;
 use crate::recovery::{CacheEpoch, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE};
 
 const READER_DRAIN_POLL: Duration = Duration::from_micros(50);
@@ -55,8 +55,6 @@ impl RegionReadSnapshot {
             || entry.seqno < clear_floor_seqno
             || entry.seqno < self.created_seqno
             || entry.seqno > self.max_seqno
-            || entry.flags & INDEX_FLAG_VOLATILE != 0
-            || entry.location.is_tombstone()
             || entry.location.region_id() != self.region_id
         {
             return false;
@@ -545,10 +543,9 @@ mod tests {
 
     fn entry(region_id: u32, seqno: u64) -> IndexEntry {
         IndexEntry {
-            location: PackedLocation::new(region_id, 0, 64, false).unwrap(),
+            location: PackedLocation::new(region_id, 0, 64).unwrap(),
             seqno,
             namespace_id: 0,
-            flags: 0,
         }
     }
 

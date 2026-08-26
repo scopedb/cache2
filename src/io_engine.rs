@@ -43,6 +43,7 @@ use crate::io_backend::{
 #[cfg(unix)]
 use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
+use crate::snapshot::CacheIoSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const MAX_IO_REQUESTS_PER_WORKER: usize = 4096;
@@ -785,7 +786,7 @@ pub(crate) trait IoEngine: Send + Sync {
     fn has_unfenced_writes(&self) -> bool;
     #[cfg(test)]
     fn mark_unfenced_writes_for_test(&self);
-    fn stats(&self) -> IoEngineStats;
+    fn stats(&self) -> CacheIoSnapshot;
 
     #[cfg(test)]
     fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
@@ -806,23 +807,6 @@ pub(crate) trait IoEngine: Send + Sync {
     fn flush(&self, point: SyncPoint, mode: SyncMode) -> Result<IoRequest, SubmitError> {
         self.submit(IoOperation::flush(point, mode))
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct IoEngineStats {
-    pub(crate) submitted: u64,
-    pub(crate) completed: u64,
-    pub(crate) cancel_requested: u64,
-    pub(crate) cancelled: u64,
-    pub(crate) errors: u64,
-    pub(crate) requests_in_flight: u64,
-    pub(crate) requests_in_flight_peak: u64,
-    pub(crate) slot_wait_ns: u64,
-    pub(crate) completion_ns: u64,
-    pub(crate) direct_operations: u64,
-    pub(crate) direct_bytes: u64,
-    pub(crate) buffered_operations: u64,
-    pub(crate) buffered_bytes: u64,
 }
 
 struct IoSlot {
@@ -1186,9 +1170,9 @@ impl RuntimeShared {
         });
     }
 
-    fn snapshot(&self) -> IoEngineStats {
+    fn snapshot(&self) -> CacheIoSnapshot {
         let in_flight = self.total_in_flight();
-        IoEngineStats {
+        CacheIoSnapshot {
             submitted: self.submitted.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
             cancel_requested: self.cancel_requested.load(Ordering::Relaxed),
@@ -1791,7 +1775,7 @@ impl IoEngine for BackendIoEngine {
         self.inner.shared.mark_unfenced_writes();
     }
 
-    fn stats(&self) -> IoEngineStats {
+    fn stats(&self) -> CacheIoSnapshot {
         let mut stats = self.inner.shared.snapshot();
         let direct = self.backend.direct_io_stats();
         stats.direct_operations = direct.direct_operations;
@@ -2123,7 +2107,7 @@ mod uring {
             self.inner.shared.mark_unfenced_writes();
         }
 
-        fn stats(&self) -> IoEngineStats {
+        fn stats(&self) -> CacheIoSnapshot {
             let mut stats = self.inner.shared.snapshot();
             let direct = self.io_stats.snapshot();
             stats.direct_operations = direct.direct_operations;
