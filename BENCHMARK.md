@@ -329,7 +329,9 @@ Git-less development VMs may additionally provide a hexadecimal
 preflight evidence and never permits `m2_pass`.
 The `CACHE_BENCH_*` regression gates above are inherited by every benchmark
 profile. Agree and record thresholds before the release run; an ungated result
-is measurement evidence, not M4 performance acceptance.
+is measurement evidence, not M4 performance acceptance. The qualification
+runner requires all five values to be positive and records their exact values
+in `environment.txt`; missing gates downgrade the result to preflight.
 
 ## M2 worker-scaling preflight — 2026-08-24
 

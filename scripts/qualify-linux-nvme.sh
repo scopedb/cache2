@@ -141,14 +141,20 @@ if [[ $device_qualification != nvme_non_rotational ]]; then
   qualification_status=preflight_pass
 fi
 
+performance_gates=(
+  CACHE_BENCH_MIN_PUT_OPS
+  CACHE_BENCH_MIN_RESIDENT_L1_OPS
+  CACHE_BENCH_MIN_L2_OPS
+  CACHE_BENCH_MIN_PROMOTED_L1_OPS
+  CACHE_BENCH_MAX_WARM_CLOSE_MS
+)
 performance_gate_count=0
-for gate in \
-  CACHE_BENCH_MIN_PUT_OPS \
-  CACHE_BENCH_MIN_RESIDENT_L1_OPS \
-  CACHE_BENCH_MIN_L2_OPS \
-  CACHE_BENCH_MIN_PROMOTED_L1_OPS \
-  CACHE_BENCH_MAX_WARM_CLOSE_MS; do
+for gate in "${performance_gates[@]}"; do
   if [[ -n ${!gate:-} ]]; then
+    if ! awk -v value="${!gate}" 'BEGIN { exit !(value + 0 > 0) }'; then
+      echo "$gate must be a positive number" >&2
+      exit 2
+    fi
     ((performance_gate_count += 1))
   fi
 done
@@ -205,6 +211,10 @@ record_command() {
   echo "backing_source=$backing_source"
   echo "device_qualification=$device_qualification"
   echo "performance_gates_configured=$performance_gate_count/5"
+  echo "[performance-gates]"
+  for gate in "${performance_gates[@]}"; do
+    echo "$gate=${!gate:-unset}"
+  done
   echo "[git-status]"
   printf "%s\n" "$source_status"
   echo "[uname]"
