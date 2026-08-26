@@ -22,7 +22,7 @@ use crate::index_storage::{
 };
 use crate::io_backend::{
     ControlIoBackend, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint, WritePoint,
-    read_exact_at, write_all_at,
+    read_at_bounded, read_exact_at, write_all_at,
 };
 use crate::io_engine::{IoEngine, ReadSlot};
 use crate::memory::MemoryStore;
@@ -2267,10 +2267,9 @@ where
         let mut filled = 0;
         while filled < page.len() {
             let offset = (slot * RECOVERY_PAGE_SIZE + filled) as u64;
-            match file.read_at(&mut page[filled..], offset) {
+            match read_at_bounded(file, &mut page[filled..], offset) {
                 Ok(0) => return Ok(pages),
                 Ok(read) => filled += read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2786,6 +2785,26 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_page_reads_stop_after_the_interrupted_retry_budget() {
+        let directory = TestDirectory::new();
+        let (state, faults) = FaultBackend::open(&directory.files.state).unwrap();
+        state.set_len(STATE_FILE_SIZE as u64).unwrap();
+        faults.arm(FaultEvent::Read, 1, FaultAction::ErrorAlways(libc::EINTR));
+
+        let error = read_state_pages(&state).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            faults
+                .events()
+                .iter()
+                .filter(|event| **event == FaultEvent::Read)
+                .count(),
+            crate::io_backend::MAX_INTERRUPTED_RETRIES + 1
+        );
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FileSystemFault {
         Rename,
@@ -3185,7 +3204,7 @@ mod tests {
 
     #[test]
     fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
-        for (case, poison_shard) in [("operation", false), ("shard", true)] {
+        for case in ["operation", "shard", "index"] {
             let directory = TestDirectory::new();
             let data = production_data_superblock(512 * 1024);
             let runtime_config = RuntimeConfig::default()
@@ -3208,11 +3227,16 @@ mod tests {
             )
             .unwrap();
 
-            let data_plane = store.runtime().unwrap().data_plane().unwrap();
-            if poison_shard {
-                data_plane.poison_shard_for_test(0);
-            } else {
-                data_plane.poison_operations_for_test();
+            let runtime = store.runtime().unwrap();
+            match case {
+                "operation" => runtime.data_plane().unwrap().poison_operations_for_test(),
+                "shard" => runtime.data_plane().unwrap().poison_shard_for_test(0),
+                "index" => runtime
+                    .core
+                    .index
+                    .storage()
+                    .poison_hash_partition_for_test(0),
+                _ => unreachable!(),
             }
             let error = store.close_warm().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");

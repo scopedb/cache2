@@ -23,6 +23,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
+pub(crate) const MAX_INTERRUPTED_RETRIES: usize = 4;
 #[cfg(target_os = "linux")]
 const LINUX_EINTR: i32 = 4;
 #[cfg(unix)]
@@ -532,13 +533,15 @@ impl IoBackend for FileBackend {
             // Preserve set_len's exact truncate/extend behavior before
             // allocating physical blocks for the final extent.
             self.file.set_len(len)?;
+            let mut interrupted_retries = 0;
             let error = loop {
                 // SAFETY: `file` owns a valid regular-file descriptor and
                 // both offsets are representable non-negative off_t values.
                 let error = unsafe { posix_fallocate(self.file.as_raw_fd(), 0, linux_len) };
-                if error != LINUX_EINTR {
+                if error != LINUX_EINTR || interrupted_retries == MAX_INTERRUPTED_RETRIES {
                     break error;
                 }
+                interrupted_retries += 1;
             };
             if error == 0 {
                 return Ok(());
@@ -794,6 +797,14 @@ pub(crate) fn read_exact_at(
     read_exact_at_with_progress(backend, buffer, offset).0
 }
 
+pub(crate) fn read_at_bounded(
+    backend: &dyn IoBackend,
+    buffer: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
+    retry_interrupted(|| backend.read_at(buffer, offset))
+}
+
 pub(crate) fn read_exact_at_with_progress(
     backend: &dyn IoBackend,
     mut buffer: &mut [u8],
@@ -801,8 +812,7 @@ pub(crate) fn read_exact_at_with_progress(
 ) -> (io::Result<()>, usize) {
     let mut transferred = 0_usize;
     while !buffer.is_empty() {
-        let read = match backend.read_at(buffer, offset) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+        let read = match read_at_bounded(backend, buffer, offset) {
             Err(error) => return (Err(error), transferred),
             Ok(read) => read,
         };
@@ -851,14 +861,14 @@ pub(crate) fn read_exact_at_uninit_with_progress(
     let mut transferred = 0_usize;
     while transferred < length {
         let remaining = length - transferred;
-        // SAFETY: the caller owns a destination valid for `length` bytes, and
-        // `transferred <= length` keeps this suffix inside that allocation.
-        let read =
-            match unsafe { backend.read_at_uninit(buffer.add(transferred), remaining, offset) } {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return (Err(error), transferred),
-                Ok(read) => read,
-            };
+        let read = match retry_interrupted(|| {
+            // SAFETY: the caller owns a destination valid for `length` bytes,
+            // and the unchanged suffix bounds remain valid across retries.
+            unsafe { backend.read_at_uninit(buffer.add(transferred), remaining, offset) }
+        }) {
+            Err(error) => return (Err(error), transferred),
+            Ok(read) => read,
+        };
         if read == 0 {
             return (
                 Err(io::Error::new(
@@ -933,8 +943,7 @@ pub(crate) fn write_all_at_with_progress(
 ) -> (io::Result<()>, usize) {
     let mut transferred = 0_usize;
     while !buffer.is_empty() {
-        let written = match backend.write_at(point, buffer, offset) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+        let written = match retry_interrupted(|| backend.write_at(point, buffer, offset)) {
             Err(error) => return (Err(error), transferred),
             Ok(written) => written,
         };
@@ -974,6 +983,21 @@ pub(crate) fn write_all_at_with_progress(
     (Ok(()), transferred)
 }
 
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut retries = 0_usize;
+    loop {
+        match operation() {
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted
+                    && retries < MAX_INTERRUPTED_RETRIES =>
+            {
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -987,7 +1011,7 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -1023,6 +1047,83 @@ mod tests {
 
     #[repr(align(4096))]
     struct AlignedBytes([u8; 2 * DIRECT_IO_ALIGNMENT]);
+
+    #[derive(Default)]
+    struct InterruptedBackend {
+        calls: AtomicUsize,
+    }
+
+    impl IoBackend for InterruptedBackend {
+        fn len(&self) -> io::Result<u64> {
+            Ok(0)
+        }
+
+        fn set_len(&self, _len: u64) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted read",
+            ))
+        }
+
+        fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted write",
+            ))
+        }
+
+        fn sync(&self, _point: SyncPoint, _mode: SyncMode) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_lock_exclusive(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exact_io_stops_after_the_interrupted_retry_budget() {
+        let mut initialized = [0_u8; 1];
+        let backend = InterruptedBackend::default();
+        let (result, transferred) = read_exact_at_with_progress(&backend, &mut initialized, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+
+        let mut uninitialized = std::mem::MaybeUninit::<u8>::uninit();
+        let backend = InterruptedBackend::default();
+        let (result, transferred) =
+            read_exact_at_uninit_with_progress(&backend, uninitialized.as_mut_ptr(), 1, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+
+        let backend = InterruptedBackend::default();
+        let (result, transferred) =
+            write_all_at_with_progress(&backend, WritePoint::Record, &[1], 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+    }
 
     #[test]
     fn direct_alignment_requires_pointer_length_and_offset() {

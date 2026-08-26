@@ -1892,6 +1892,7 @@ mod uring {
     const LINUX_ECANCELED: i32 = 125;
     const LINUX_POLLIN: u32 = 0x0001;
     const FATAL_DRAIN_ROUNDS: usize = 64;
+    const MAX_INTERRUPTED_RETRIES: usize = 4;
     const MAX_WAKE_ATTEMPTS: usize = 4;
 
     struct SocketWake {
@@ -2431,12 +2432,7 @@ mod uring {
         }
 
         fn submit_ring(&mut self) -> io::Result<usize> {
-            loop {
-                match self.ring_mut().submit() {
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    result => return result,
-                }
-            }
+            retry_interrupted(|| self.ring_mut().submit())
         }
 
         fn wait_for_completion(&mut self) -> io::Result<()> {
@@ -2444,13 +2440,7 @@ mod uring {
             if !self.wake_active && self.flights.is_empty() && !wake_cancel_pending {
                 return Ok(());
             }
-            loop {
-                match self.ring_mut().submit_and_wait(1) {
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Ok(_) => return Ok(()),
-                    Err(error) => return Err(error),
-                }
-            }
+            retry_interrupted(|| self.ring_mut().submit_and_wait(1)).map(|_| ())
         }
 
         fn drain_completions(&mut self) {
@@ -2492,10 +2482,9 @@ mod uring {
             }
             let mut wake_buffer = [0_u8; 64];
             loop {
-                match self.wake_receiver.read(&mut wake_buffer) {
+                match retry_interrupted(|| self.wake_receiver.read(&mut wake_buffer)) {
                     Ok(0) => break,
                     Ok(_) => continue,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
@@ -2756,6 +2745,21 @@ mod uring {
                         flight.transferred,
                     );
                 }
+            }
+        }
+    }
+
+    fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+        let mut retries = 0_usize;
+        loop {
+            match operation() {
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && retries < MAX_INTERRUPTED_RETRIES =>
+                {
+                    retries += 1;
+                }
+                result => return result,
             }
         }
     }

@@ -485,6 +485,9 @@ pub(crate) enum IndexStorageError {
     PartitionBusy {
         partition_id: usize,
     },
+    PartitionPoisoned {
+        partition_id: usize,
+    },
     CorruptPage {
         page_index: usize,
         reason: CorruptPageReason,
@@ -517,6 +520,9 @@ impl fmt::Display for IndexStorageError {
             Self::PartitionBusy { partition_id } => {
                 write!(formatter, "index partition {partition_id} is being mutated")
             }
+            Self::PartitionPoisoned { partition_id } => {
+                write!(formatter, "index partition {partition_id} is poisoned")
+            }
             Self::CorruptPage { page_index, reason } => {
                 write!(formatter, "index page {page_index} is corrupt: {reason}")
             }
@@ -541,6 +547,7 @@ impl std::error::Error for IndexStorageError {
             | Self::PageOutOfBounds { .. }
             | Self::PageBusy { .. }
             | Self::PartitionBusy { .. }
+            | Self::PartitionPoisoned { .. }
             | Self::CorruptPage { .. }
             | Self::CorruptSlot { .. }
             | Self::InvalidPhysicalStats => None,
@@ -1232,7 +1239,11 @@ impl PartitionedIndexStorage {
                     partition_id: partition,
                 });
             }
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(IndexStorageError::PartitionPoisoned {
+                    partition_id: partition,
+                });
+            }
         };
         Ok(IndexPartitionReadGuard {
             range: self.ranges[partition],
@@ -1240,12 +1251,15 @@ impl PartitionedIndexStorage {
         })
     }
 
-    pub(crate) fn write_hash_partition(&self, hash: u64) -> IndexPartitionWriteGuard<'_> {
+    pub(crate) fn write_hash_partition(
+        &self,
+        hash: u64,
+    ) -> Result<IndexPartitionWriteGuard<'_>, IndexStorageError> {
         let partition = index_partition_for(hash, self.partitions.len());
-        IndexPartitionWriteGuard {
+        Ok(IndexPartitionWriteGuard {
             range: self.ranges[partition],
-            guard: write_unpoisoned(&self.partitions[partition]),
-        }
+            guard: write_partition(&self.partitions[partition], partition)?,
+        })
     }
 
     pub(crate) fn try_write_hash_partition(
@@ -1260,7 +1274,11 @@ impl PartitionedIndexStorage {
                     partition_id: partition,
                 });
             }
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(IndexStorageError::PartitionPoisoned {
+                    partition_id: partition,
+                });
+            }
         };
         Ok(IndexPartitionWriteGuard {
             range: self.ranges[partition],
@@ -1270,8 +1288,11 @@ impl PartitionedIndexStorage {
 
     pub(crate) fn physical_stats(&self) -> Result<IndexPhysicalStats, IndexStorageError> {
         let mut stats = IndexPhysicalStats::default();
-        for partition in &self.partitions {
-            stats = checked_add_physical_stats(stats, read_unpoisoned(partition).physical_stats())?;
+        for (partition_id, partition) in self.partitions.iter().enumerate() {
+            stats = checked_add_physical_stats(
+                stats,
+                read_partition(partition, partition_id)?.physical_stats(),
+            )?;
         }
         stats
             .is_valid_for(self.slot_count)
@@ -1288,8 +1309,8 @@ impl PartitionedIndexStorage {
                     "unable to allocate index partition statistics",
                 ))
             })?;
-        for partition in &self.partitions {
-            stats.push(read_unpoisoned(partition).physical_stats());
+        for (partition_id, partition) in self.partitions.iter().enumerate() {
+            stats.push(read_partition(partition, partition_id)?.physical_stats());
         }
         Ok(stats.into_boxed_slice())
     }
@@ -1297,7 +1318,7 @@ impl PartitionedIndexStorage {
     #[cfg(test)]
     pub(crate) fn read_slot(&self, slot: usize) -> Result<IndexSlot, IndexStorageError> {
         let (partition, local_slot) = self.partition_for_slot(slot)?;
-        read_unpoisoned(&self.partitions[partition]).read_slot(local_slot)
+        read_partition(&self.partitions[partition], partition)?.read_slot(local_slot)
     }
 
     #[cfg(test)]
@@ -1307,7 +1328,7 @@ impl PartitionedIndexStorage {
         value: IndexSlot,
     ) -> Result<(), IndexStorageError> {
         let (partition, local_slot) = self.partition_for_slot(slot)?;
-        write_unpoisoned(&self.partitions[partition]).write_slot(local_slot, value)
+        write_partition(&self.partitions[partition], partition)?.write_slot(local_slot, value)
     }
 
     /// Sequentially writes all canonical ranges in global page order.
@@ -1331,8 +1352,8 @@ impl PartitionedIndexStorage {
                     "unable to allocate frozen index partition guards",
                 ))
             })?;
-        for partition in &self.partitions {
-            frozen_partitions.push(read_unpoisoned(partition));
+        for (partition_id, partition) in self.partitions.iter().enumerate() {
+            frozen_partitions.push(read_partition(partition, partition_id)?);
         }
 
         let physical_stats = frozen_partitions
@@ -1431,6 +1452,16 @@ impl PartitionedIndexStorage {
             .ok_or(IndexStorageError::SizeOverflow)?;
         Ok((partition, local_slot))
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_hash_partition_for_test(&self, hash: u64) {
+        let partition = index_partition_for(hash, self.partitions.len());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.partitions[partition].write().unwrap();
+            panic!("poison index partition for test");
+        }));
+        assert!(result.is_err());
+    }
 }
 
 fn checked_sum_physical_stats(
@@ -1458,13 +1489,20 @@ fn checked_add_physical_stats(
     })
 }
 
-fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn read_partition(
+    lock: &RwLock<IndexStorage>,
+    partition_id: usize,
+) -> Result<RwLockReadGuard<'_, IndexStorage>, IndexStorageError> {
+    lock.read()
+        .map_err(|_| IndexStorageError::PartitionPoisoned { partition_id })
 }
 
-fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+fn write_partition(
+    lock: &RwLock<IndexStorage>,
+    partition_id: usize,
+) -> Result<RwLockWriteGuard<'_, IndexStorage>, IndexStorageError> {
     lock.write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .map_err(|_| IndexStorageError::PartitionPoisoned { partition_id })
 }
 
 /// Fixed-memory sequential write combiner used only while producing an
@@ -2069,6 +2107,37 @@ mod tests {
             &[IndexPhysicalStats::default(), expected_partition_stats[1]]
         );
         assert_eq!(source.partition_stats().unwrap(), expected_partition_stats);
+    }
+
+    #[test]
+    fn poisoned_partition_is_never_read_written_or_persisted() {
+        let storage = PartitionedIndexStorage::anonymous(8).unwrap();
+        storage.poison_hash_partition_for_test(7);
+
+        assert!(matches!(
+            storage.try_read_hash_partition(7),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
+        assert!(matches!(
+            storage.try_write_hash_partition(7),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
+        assert!(matches!(
+            storage.write_hash_partition(7),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
+        assert!(matches!(
+            storage.physical_stats(),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
+        assert!(matches!(
+            storage.partition_stats(),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
+        assert!(matches!(
+            storage.write_warm_image(&mut Vec::new(), binding(1)),
+            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
+        ));
     }
 
     #[test]

@@ -159,7 +159,7 @@ impl RegionIndex {
         installed: IndexSlotState,
         authority: &mut impl IndexMutationAuthority,
     ) -> Result<bool, IndexStorageError> {
-        let mut partition = self.storage.write_hash_partition(hash);
+        let mut partition = self.storage.write_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let start = start_slot(hash, slot_count);
         let mut reusable = None;
@@ -285,7 +285,7 @@ impl RegionIndex {
         replacement: Option<IndexEntry>,
         authority: &mut impl IndexMutationAuthority,
     ) -> Result<Option<IndexTransition>, IndexStorageError> {
-        let partition = self.storage.write_hash_partition(hash);
+        let partition = self.storage.write_hash_partition(hash)?;
         self.replace_exact_value_in_partition(hash, expected, replacement, authority, partition)
     }
 
@@ -421,7 +421,7 @@ mod tests {
     fn lookup_returns_busy_instead_of_waiting_for_partition_mutation() {
         let index = anonymous(8);
         let hash = 7;
-        let _mutation = index.storage().write_hash_partition(hash);
+        let _mutation = index.storage().write_hash_partition(hash).unwrap();
 
         assert!(matches!(
             index.lookup_raw(hash),
@@ -435,7 +435,7 @@ mod tests {
         let hash = 7;
         let current = entry(1, 8, 10);
         assert!(index.upsert(hash, current, |_| true).unwrap());
-        let mutation = index.storage().write_hash_partition(hash);
+        let mutation = index.storage().write_hash_partition(hash).unwrap();
         let mut authority = NoopAuthority;
 
         assert!(matches!(
@@ -640,7 +640,7 @@ mod tests {
 
         let source = PartitionedIndexStorage::anonymous(SLOT_COUNT).unwrap();
         {
-            let mut partition = source.write_hash_partition(HASH);
+            let mut partition = source.write_hash_partition(HASH).unwrap();
             partition.replace(124, IndexSlotState::Deleted).unwrap();
             partition.replace(125, IndexSlotState::Deleted).unwrap();
         }
