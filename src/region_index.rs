@@ -34,21 +34,27 @@ impl RegionIndex {
     pub(crate) fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let start = start_slot(hash, partition.slot_count());
-        for step in 0..probe_limit(partition.slot_count()) {
-            match partition.read(probe_slot(start, step, partition.slot_count()))? {
-                IndexSlotState::Empty => return Ok(None),
-                IndexSlotState::Deleted => {}
+        let mut found = None;
+        partition.probe(
+            start,
+            probe_limit(partition.slot_count()),
+            |_, state| match state {
+                IndexSlotState::Empty => true,
+                IndexSlotState::Deleted => false,
                 IndexSlotState::Value {
                     hash: current_hash,
                     entry,
                 } => {
                     if current_hash == hash {
-                        return Ok(Some(entry));
+                        found = Some(entry);
+                        true
+                    } else {
+                        false
                     }
                 }
-            }
-        }
-        Ok(None)
+            },
+        )?;
+        Ok(found)
     }
 
     /// Installs a live value using the existing bounded replacement policy.
@@ -84,16 +90,19 @@ impl RegionIndex {
         let mut reusable = None;
         let mut victim = None;
         let mut apply = None;
+        let mut rejected = false;
 
-        for step in 0..probe_limit(slot_count) {
-            let local_slot = probe_slot(start, step, slot_count);
-            match partition.read(local_slot)? {
+        partition.probe(
+            start,
+            probe_limit(slot_count),
+            |local_slot, state| match state {
                 IndexSlotState::Empty => {
-                    apply = Some(reusable.unwrap_or(local_slot));
-                    break;
+                    apply = Some(reusable.unwrap_or((local_slot, state)));
+                    true
                 }
                 IndexSlotState::Deleted => {
-                    reusable.get_or_insert(local_slot);
+                    reusable.get_or_insert((local_slot, state));
+                    false
                 }
                 IndexSlotState::Value {
                     hash: current_hash,
@@ -101,22 +110,28 @@ impl RegionIndex {
                 } => {
                     if current_hash == hash {
                         if supplied_seqno <= current.seqno {
-                            return Ok(false);
+                            rejected = true;
+                        } else {
+                            apply = Some((local_slot, state));
                         }
-                        apply = Some(local_slot);
-                        break;
-                    }
-                    if victim.is_none() {
-                        victim = Some(local_slot);
+                        true
+                    } else {
+                        if victim.is_none() {
+                            victim = Some((local_slot, state));
+                        }
+                        false
                     }
                 }
-            }
+            },
+        )?;
+        if rejected {
+            return Ok(false);
         }
 
-        let Some(local_slot) = apply.or(reusable).or(victim) else {
+        let Some((local_slot, previous)) = apply.or(reusable).or(victim) else {
             return Ok(false);
         };
-        partition.replace(local_slot, installed)?;
+        partition.replace_observed(local_slot, previous, installed)?;
         Ok(true)
     }
 
@@ -148,28 +163,31 @@ impl RegionIndex {
         let slot_count = partition.slot_count();
         let start = start_slot(hash, slot_count);
         let mut target = None;
-        for step in 0..probe_limit(slot_count) {
-            let local_slot = probe_slot(start, step, slot_count);
-            match partition.read(local_slot)? {
-                IndexSlotState::Empty => break,
-                IndexSlotState::Deleted => {}
+        partition.probe(
+            start,
+            probe_limit(slot_count),
+            |local_slot, state| match state {
+                IndexSlotState::Empty => true,
+                IndexSlotState::Deleted => false,
                 IndexSlotState::Value {
                     hash: current_hash,
                     entry,
                 } => {
                     if current_hash == hash {
                         if entry.same_record_identity(expected) {
-                            target = Some(local_slot);
+                            target = Some((local_slot, state));
                         }
-                        break;
+                        true
+                    } else {
+                        false
                     }
                 }
-            }
-        }
-        let Some(local_slot) = target else {
+            },
+        )?;
+        let Some((local_slot, previous)) = target else {
             return Ok(false);
         };
-        partition.replace(local_slot, IndexSlotState::Deleted)?;
+        partition.replace_observed(local_slot, previous, IndexSlotState::Deleted)?;
         Ok(true)
     }
 }
@@ -181,15 +199,6 @@ fn start_slot(hash: u64, slot_count: usize) -> usize {
 
 fn probe_limit(slot_count: usize) -> usize {
     slot_count.min(MAX_INDEX_PROBES)
-}
-
-fn probe_slot(start: usize, step: usize, slot_count: usize) -> usize {
-    let index = start + step;
-    if index >= slot_count {
-        index - slot_count
-    } else {
-        index
-    }
 }
 
 #[cfg(test)]
@@ -330,8 +339,12 @@ mod tests {
         let source = PartitionedIndexStorage::anonymous(SLOT_COUNT).unwrap();
         {
             let mut partition = source.write_hash_partition(HASH).unwrap();
-            partition.replace(124, IndexSlotState::Deleted).unwrap();
-            partition.replace(125, IndexSlotState::Deleted).unwrap();
+            partition
+                .replace_observed(124, IndexSlotState::Empty, IndexSlotState::Deleted)
+                .unwrap();
+            partition
+                .replace_observed(125, IndexSlotState::Empty, IndexSlotState::Deleted)
+                .unwrap();
         }
         let partition_stats = source.partition_stats().unwrap();
         let mut image = Vec::new();

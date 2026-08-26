@@ -687,16 +687,75 @@ impl IndexStorage {
         self.core.read_slot(self.global_slot(slot)?)
     }
 
-    fn read_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
-        let global_slot = self.global_slot(slot)?;
-        let value = self.core.read_slot(global_slot)?;
-        value.runtime_state().map_err(|reason| {
-            self.core.reject_image();
-            IndexStorageError::CorruptSlot {
-                slot_index: global_slot,
-                reason,
+    fn probe_states(
+        &self,
+        start: usize,
+        limit: usize,
+        mut visit: impl FnMut(usize, IndexSlotState) -> bool,
+    ) -> Result<(), IndexStorageError> {
+        if start >= self.range.slot_count || limit > self.range.slot_count {
+            return Err(IndexStorageError::InvalidArgument(
+                "index probe exceeds its partition",
+            ));
+        }
+        // Validate only on page changes, then recheck the shared image latch
+        // once after decoding so a concurrent rejection cannot authorize a
+        // result.
+        let mut validated_page = None;
+        for step in 0..limit {
+            let index = start + step;
+            let local_slot = if index >= self.range.slot_count {
+                index - self.range.slot_count
+            } else {
+                index
+            };
+            let global_slot = self.global_slot(local_slot)?;
+            let (page, offset) = self.core.slot_address(global_slot)?;
+            if validated_page != Some(page) {
+                self.core.ensure_page_valid(page)?;
+                validated_page = Some(page);
             }
-        })
+            let state = self
+                .core
+                .decode_at(offset)
+                .runtime_state()
+                .map_err(|reason| {
+                    self.core.reject_image();
+                    IndexStorageError::CorruptSlot {
+                        slot_index: global_slot,
+                        reason,
+                    }
+                })?;
+            if visit(local_slot, state) {
+                break;
+            }
+        }
+        self.core
+            .ensure_image_usable(validated_page.unwrap_or(self.range.first_page))
+    }
+
+    fn replace_observed_state(
+        &mut self,
+        slot: usize,
+        previous: IndexSlotState,
+        state: IndexSlotState,
+    ) -> Result<(), IndexStorageError> {
+        // The exclusive partition guard keeps the state observed by the probe
+        // stable, so updating its physical count needs no second slot decode.
+        let global_slot = self.global_slot(slot)?;
+        let previous = IndexSlot::from_state(previous);
+        let value = IndexSlot::from_state(state);
+        let next_stats = self
+            .physical_stats
+            .transitioned(
+                previous.physical_kind(),
+                value.physical_kind(),
+                self.range.slot_count,
+            )
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
+        self.core.write_slot(global_slot, value)?;
+        self.physical_stats = next_stats;
+        Ok(())
     }
 
     /// Encodes one range-local slot.
@@ -704,6 +763,7 @@ impl IndexStorage {
     /// Exclusive access owns this complete page-aligned range. Canonical range
     /// construction guarantees that another view of the same core cannot
     /// address these slot bytes.
+    #[cfg(test)]
     pub(crate) fn write_slot(
         &mut self,
         slot: usize,
@@ -725,10 +785,6 @@ impl IndexStorage {
         self.core.write_slot(global_slot, value)?;
         self.physical_stats = next_stats;
         Ok(())
-    }
-
-    fn write_state(&mut self, slot: usize, state: IndexSlotState) -> Result<(), IndexStorageError> {
-        self.write_slot(slot, IndexSlot::from_state(state))
     }
 
     /// Sequentially emits a new, fully checksummed Index Image .
@@ -898,6 +954,7 @@ impl IndexStorageCore {
         })
     }
 
+    #[cfg(test)]
     fn read_slot(&self, slot: usize) -> Result<IndexSlot, IndexStorageError> {
         let (page, offset) = self.slot_address(slot)?;
         self.ensure_page_valid(page)?;
@@ -1146,8 +1203,13 @@ impl IndexPartitionReadGuard<'_> {
         self.range.slot_count
     }
 
-    pub(crate) fn read(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
-        self.guard.read_state(slot)
+    pub(crate) fn probe(
+        &self,
+        start: usize,
+        limit: usize,
+        visit: impl FnMut(usize, IndexSlotState) -> bool,
+    ) -> Result<(), IndexStorageError> {
+        self.guard.probe_states(start, limit, visit)
     }
 }
 
@@ -1161,18 +1223,22 @@ impl IndexPartitionWriteGuard<'_> {
         self.range.slot_count
     }
 
-    pub(crate) fn read(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
-        self.guard.read_state(slot)
+    pub(crate) fn probe(
+        &self,
+        start: usize,
+        limit: usize,
+        visit: impl FnMut(usize, IndexSlotState) -> bool,
+    ) -> Result<(), IndexStorageError> {
+        self.guard.probe_states(start, limit, visit)
     }
 
-    pub(crate) fn replace(
+    pub(crate) fn replace_observed(
         &mut self,
         slot: usize,
+        previous: IndexSlotState,
         state: IndexSlotState,
-    ) -> Result<IndexSlotState, IndexStorageError> {
-        let previous = self.guard.read_state(slot)?;
-        self.guard.write_state(slot, state)?;
-        Ok(previous)
+    ) -> Result<(), IndexStorageError> {
+        self.guard.replace_observed_state(slot, previous, state)
     }
 }
 
