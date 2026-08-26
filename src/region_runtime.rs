@@ -12,7 +12,6 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::expiry::ExpiryClock;
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
 use crate::io_backend::{RuntimeFileSet, SyncMode, SyncPoint};
@@ -469,7 +468,7 @@ impl HybridValueRead {
 
 #[derive(Clone, Copy)]
 enum RuntimeMutation<'a> {
-    Put { value: &'a [u8], expires_at: u64 },
+    Put(&'a [u8]),
     Delete,
 }
 
@@ -680,18 +679,8 @@ impl RegionDataPlane {
         })
     }
 
-    pub(crate) fn put(
-        &self,
-        namespace_id: u32,
-        key: &[u8],
-        value: &[u8],
-        expires_at: u64,
-    ) -> io::Result<u64> {
-        self.mutate(
-            namespace_id,
-            key,
-            RuntimeMutation::Put { value, expires_at },
-        )
+    pub(crate) fn put(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.mutate(namespace_id, key, RuntimeMutation::Put(value))
     }
 
     pub(crate) fn delete(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
@@ -705,7 +694,7 @@ impl RegionDataPlane {
         mutation: RuntimeMutation<'_>,
     ) -> io::Result<u64> {
         let value_len = match mutation {
-            RuntimeMutation::Put { value, .. } => value.len(),
+            RuntimeMutation::Put(value) => value.len(),
             RuntimeMutation::Delete => 0,
         };
         if key.len() > _MAX_KEY_BYTES || value_len > _MAX_VALUE_BYTES {
@@ -764,7 +753,7 @@ impl RegionDataPlane {
                 Err(TryLockError::Poisoned(_)) => return Err(poisoned_runtime_error()),
             };
             let staged = match mutation {
-                RuntimeMutation::Put { value, expires_at } => self.core.try_stage_value(
+                RuntimeMutation::Put(value) => self.core.try_stage_value(
                     &running.staging,
                     shard_id,
                     hash,
@@ -772,7 +761,6 @@ impl RegionDataPlane {
                     namespace_id,
                     key,
                     value,
-                    expires_at,
                 ),
                 RuntimeMutation::Delete => self.core.try_stage_delete(
                     &running.staging,
@@ -786,15 +774,11 @@ impl RegionDataPlane {
             match staged {
                 RegionStageValue::Staged(seqno) => {
                     match mutation {
-                        RuntimeMutation::Put { value, expires_at } => {
-                            let _published = running.memory.publish(
-                                hash,
-                                namespace_id,
-                                key,
-                                value,
-                                expires_at,
-                                seqno,
-                            );
+                        RuntimeMutation::Put(value) => {
+                            let _published =
+                                running
+                                    .memory
+                                    .publish(hash, namespace_id, key, value, seqno);
                         }
                         RuntimeMutation::Delete => {
                             let _removed = running.memory.delete(hash, namespace_id, key, seqno);
@@ -803,7 +787,7 @@ impl RegionDataPlane {
                     control.notify(WAKE_DATA)?;
                     if let Some(activity) = activity {
                         match mutation {
-                            RuntimeMutation::Put { value, .. } => {
+                            RuntimeMutation::Put(value) => {
                                 RuntimeMetrics::increment(&activity.puts);
                                 RuntimeMetrics::add(&activity.written_bytes, value.len());
                             }
@@ -840,12 +824,7 @@ impl RegionDataPlane {
         }
     }
 
-    pub(crate) fn get(
-        &self,
-        namespace_id: u32,
-        key: &[u8],
-        clock: ExpiryClock,
-    ) -> io::Result<Option<HybridValueRead>> {
+    pub(crate) fn get(&self, namespace_id: u32, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
         if key.len() > _MAX_KEY_BYTES {
             if self.config.statistics {
                 let activity = self.metrics.activity(0);
@@ -869,7 +848,7 @@ impl RegionDataPlane {
         // This health observation is the read's availability linearization
         // point. A later one-way transition to miss-only does not invalidate a
         // value that was already resident here.
-        let read_token = match running.memory.lookup(hash, namespace_id, key, clock) {
+        let read_token = match running.memory.lookup(hash, namespace_id, key) {
             MemoryLookup::Hit(value) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l1_hits);
@@ -931,15 +910,9 @@ impl RegionDataPlane {
             }
             return Ok(None);
         };
-        let result = self.core.read_value_from_plan(
-            engine.as_ref(),
-            slot,
-            buffer,
-            plan,
-            namespace_id,
-            key,
-            clock,
-        );
+        let result =
+            self.core
+                .read_value_from_plan(engine.as_ref(), slot, buffer, plan, namespace_id, key);
         match result {
             // MissOnly is a cache availability state, not an application data
             // error. The operation that trips the one-way health latch and all
@@ -963,7 +936,6 @@ impl RegionDataPlane {
                     namespace_id,
                     key,
                     value.value(),
-                    value.expires_at_unix_ms(),
                     value.seqno(),
                 );
                 if let Some(promoted) = promoted {

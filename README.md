@@ -55,27 +55,16 @@ cache.close_warm()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-The default path uses namespace zero and never expires, so reads do not sample
-the system clock. Namespaces and expiration are explicit extensions:
+The default path uses namespace zero. Namespaces are an explicit extension:
 
 ```rust
 let namespace = 42;
-cache.put_in(namespace, "stable-key", b"no expiration")?;
-cache.put_until(namespace, "leased-key", b"expires", expires_at_unix_ms)?;
+cache.put_in(namespace, "stable-key", b"namespaced value")?;
 cache.delete_in(namespace, "obsolete-key")?;
 
 let stable = cache.get_in(namespace, "stable-key")?;
-let leased = cache.get_in(namespace, "leased-key")?;
-
-// Deterministic tests and batch callers may supply one shared clock sample.
-let leased_at_sample = cache.get_in_at(namespace, "leased-key", now_unix_ms)?;
 # Ok::<(), std::io::Error>(())
 ```
-
-Expiration is checked lazily. A zero expiration never expires; otherwise the
-entry is a miss when `expires_at_unix_ms <= now_unix_ms`. The system clock is
-read only after a matching L1 or L2 record is found with a nonzero expiration.
-Expired disk records consume space until normal Region rotation reclaims them.
 
 Namespaces may also be assigned to physical RegionSets when workloads need
 different SSD retention. Capacity weights divide the fixed Region count; each
@@ -140,7 +129,7 @@ miss returns immediately without allocating a read buffer. An L2 candidate
 plans one exact aligned read range, reserves an immediately available engine
 slot, allocates that range, and performs one record read. The result is checked
 locally against the planned location, sequence number, hash, namespace, full
-key, lengths, expiry, and checksum. There is no second index lookup or global
+key, lengths, and checksum. There is no second index lookup or global
 freshness check; a concurrently superseded but otherwise valid record may be
 returned. There is no read admission policy, fixed foreground read pool,
 separate read queue, or background-ready state. The transient allocation is

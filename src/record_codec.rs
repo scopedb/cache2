@@ -97,7 +97,6 @@ pub(crate) fn required_record_bytes(
 /// `reservation.record_bytes` is the minimum record envelope on the
 /// path. Staging may later extend the final record of a sealed batch, rewriting
 /// its header and completion descriptor together.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn encode_value_into(
     destination: &mut [u8],
@@ -106,7 +105,6 @@ pub(crate) fn encode_value_into(
     namespace_id: u32,
     key: &[u8],
     value: &[u8],
-    expires_at: u64,
 ) -> Result<(u64, IndexEntry), RecordEncodeError> {
     let required = required_record_bytes(key.len(), value.len())?;
     let hash = hash_namespaced_key(hash_seed, namespace_id, key);
@@ -118,13 +116,11 @@ pub(crate) fn encode_value_into(
         namespace_id,
         key,
         value,
-        expires_at,
     )?;
     Ok((hash, entry))
 }
 
 /// Encodes using point metadata computed once by the public operation entry.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_value_into_hashed(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
@@ -133,7 +129,6 @@ pub(crate) fn encode_value_into_hashed(
     namespace_id: u32,
     key: &[u8],
     value: &[u8],
-    expires_at: u64,
 ) -> Result<IndexEntry, RecordEncodeError> {
     let destination_len = destination.len();
     let reserved_len =
@@ -198,7 +193,6 @@ pub(crate) fn encode_value_into_hashed(
         record_len: reservation.record_bytes,
         seqno: reservation.seqno,
         key_hash: hash,
-        expires_at,
         payload_crc: payload_crc.finish(),
     };
     destination[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
@@ -279,7 +273,6 @@ mod tests {
             namespace_id,
             key,
             &value,
-            123_456,
         )
         .unwrap();
 
@@ -296,7 +289,6 @@ mod tests {
         assert_eq!(header.record_len, required);
         assert_eq!(header.seqno, 17);
         assert_eq!(header.key_hash, hash);
-        assert_eq!(header.expires_at, 123_456);
 
         let key_start = RECORD_HEADER_SIZE;
         let value_start = key_start + key.len();
@@ -348,15 +340,7 @@ mod tests {
         };
         let mut wrong_destination = vec![0xa5; required as usize + 32];
         assert!(matches!(
-            encode_value_into(
-                &mut wrong_destination,
-                reservation,
-                0,
-                0,
-                b"key",
-                &[7; 16],
-                0,
-            ),
+            encode_value_into(&mut wrong_destination, reservation, 0, 0, b"key", &[7; 16],),
             Err(RecordEncodeError::DestinationLengthMismatch { .. })
         ));
         assert!(wrong_destination.iter().all(|byte| *byte == 0xa5));

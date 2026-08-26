@@ -10,7 +10,7 @@ The intended 1.0 surface is deliberately small:
 
 - `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and open a
   cache;
-- `HybridCache` provides point `put`/`get`/`delete`, namespace and TTL variants,
+- `HybridCache` provides point and namespace `put`/`get`/`delete` operations,
   completion/data-sync fences, snapshots, and explicit fast or warm close;
 - `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
 - `IoEngine`, `IoMode`, and `WriteBackpressure` select runtime behavior.

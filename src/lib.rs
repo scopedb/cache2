@@ -7,7 +7,6 @@
 mod cache;
 mod checksum;
 mod eviction;
-mod expiry;
 mod format;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]

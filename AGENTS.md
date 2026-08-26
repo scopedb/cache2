@@ -73,7 +73,6 @@ capacity; this is expected to be uncommon in normal operation.
 - If a value cannot enter L1, the mutation may still complete through Region.
 - L1 contention, eviction, delayed publication, and L2 promotion may expose an
   older valid value. This is an accepted best-effort outcome.
-- Expired values are misses.
 - Namespace and full-key validation remain mandatory after hash lookup so hash
   collisions cannot return another entry.
 

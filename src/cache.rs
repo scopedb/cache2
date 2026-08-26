@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::expiry::ExpiryClock;
 use crate::index::{MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::canonical_index_partition_ranges;
 use crate::recovery::{
@@ -421,23 +420,8 @@ impl HybridCache {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<u64> {
-        self.put_until(namespace, key, value, 0)
-    }
-
-    /// Stores a value until an absolute Unix timestamp and returns its mutation
-    /// sequence.
-    ///
-    /// An expiration of zero means that the value does not expire.
-    /// Keys are limited to 4 KiB and values to 256 KiB.
-    pub fn put_until(
-        &self,
-        namespace: u32,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-        expires_at_unix_ms: u64,
-    ) -> Result<u64> {
         self.store
-            .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)
+            .put_value(namespace, key.as_ref(), value.as_ref())
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
@@ -468,35 +452,9 @@ impl HybridCache {
     }
 
     /// Looks up a value in a logical namespace.
-    ///
-    /// The system clock is read lazily only when a matching value carries an
-    /// expiration timestamp. This method has the same L2 semantics as
-    /// [`Self::get`].
     pub fn get_in(&self, namespace: u32, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
-        self.get_with_clock(namespace, key.as_ref(), ExpiryClock::System)
-    }
-
-    /// Looks up a value using an explicit Unix timestamp in milliseconds.
-    ///
-    /// This is useful for deterministic tests and for callers that amortize a
-    /// coarse clock sample across a batch of cache reads.
-    pub fn get_in_at(
-        &self,
-        namespace: u32,
-        key: impl AsRef<[u8]>,
-        now_unix_ms: u64,
-    ) -> Result<Option<Value>> {
-        self.get_with_clock(namespace, key.as_ref(), ExpiryClock::Fixed(now_unix_ms))
-    }
-
-    fn get_with_clock(
-        &self,
-        namespace: u32,
-        key: &[u8],
-        clock: ExpiryClock,
-    ) -> Result<Option<Value>> {
         self.store
-            .get_value(namespace, key, clock)
+            .get_value(namespace, key.as_ref())
             .map(|value| value.map(|inner| Value { inner }))
     }
 

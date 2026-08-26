@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
-use crate::expiry::ExpiryClock;
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_INDEX_PARTITIONS};
 use crate::index_storage::{
@@ -236,7 +235,6 @@ pub(crate) struct RegionValueRead {
     buffer: BufferLease,
     buffer_len: usize,
     value_range: Range<usize>,
-    expires_at_unix_ms: u64,
     seqno: u64,
 }
 
@@ -246,10 +244,6 @@ impl RegionValueRead {
             .buffer
             .prepared(self.buffer_len)
             .expect("validated read retains its prepared buffer")[self.value_range.clone()]
-    }
-
-    pub(crate) const fn expires_at_unix_ms(&self) -> u64 {
-        self.expires_at_unix_ms
     }
 
     pub(crate) const fn seqno(&self) -> u64 {
@@ -394,25 +388,16 @@ impl FileRegionRuntime {
 }
 
 impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
-    pub(crate) fn put_value(
-        &self,
-        namespace_id: u32,
-        key: &[u8],
-        value: &[u8],
-        expires_at: u64,
-    ) -> io::Result<u64> {
-        self.runtime()?
-            .data_plane()?
-            .put(namespace_id, key, value, expires_at)
+    pub(crate) fn put_value(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.put(namespace_id, key, value)
     }
 
     pub(crate) fn get_value(
         &self,
         namespace_id: u32,
         key: &[u8],
-        clock: ExpiryClock,
     ) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?.data_plane()?.get(namespace_id, key, clock)
+        self.runtime()?.data_plane()?.get(namespace_id, key)
     }
 
     pub(crate) fn delete_value(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
@@ -547,7 +532,6 @@ impl FileRegionCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub(crate) fn read_value(
         &self,
@@ -557,7 +541,6 @@ impl FileRegionCore {
         hash_seed: u64,
         namespace_id: u32,
         key: &[u8],
-        clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = hash_namespaced_key(hash_seed, namespace_id, key);
         let Some(entry) = self.begin_value_read(hash, namespace_id) else {
@@ -565,10 +548,9 @@ impl FileRegionCore {
         };
         let plan = plan_read(geometry, hash, entry)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_plan(engine, slot, buffer, plan, namespace_id, key, clock)
+        self.read_value_from_plan(engine, slot, buffer, plan, namespace_id, key)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_value_from_plan(
         &self,
         engine: &dyn IoEngine,
@@ -577,7 +559,6 @@ impl FileRegionCore {
         plan: ReadPlan,
         namespace_id: u32,
         key: &[u8],
-        clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = plan.hash;
         let entry = plan.entry;
@@ -620,10 +601,6 @@ impl FileRegionCore {
         {
             return Ok(None);
         }
-        if clock.is_expired(header.expires_at) {
-            self.try_remove_expired(hash, entry);
-            return Ok(None);
-        }
         let key_len = header.key_len as usize;
         let value_len = header.value_len as usize;
         let Some(payload_end) = RECORD_HEADER_SIZE
@@ -655,7 +632,6 @@ impl FileRegionCore {
             buffer,
             buffer_len: completion.plan.aligned_len,
             value_range: value_start..value_end,
-            expires_at_unix_ms: header.expires_at,
             seqno: header.seqno,
         }))
     }
@@ -675,7 +651,6 @@ impl FileRegionCore {
         namespace_id: u32,
         key: &[u8],
         value: &[u8],
-        expires_at: u64,
     ) -> io::Result<RegionStageValue> {
         self.try_stage_record(
             staging,
@@ -685,7 +660,6 @@ impl FileRegionCore {
             namespace_id,
             key,
             value,
-            expires_at,
             StagedRecordKind::Value,
         )
     }
@@ -707,7 +681,6 @@ impl FileRegionCore {
             namespace_id,
             key,
             &[],
-            0,
             StagedRecordKind::Tombstone,
         )
     }
@@ -722,7 +695,6 @@ impl FileRegionCore {
         namespace_id: u32,
         key: &[u8],
         value: &[u8],
-        expires_at: u64,
         kind: StagedRecordKind,
     ) -> io::Result<RegionStageValue> {
         self.health.require_healthy()?;
@@ -782,7 +754,6 @@ impl FileRegionCore {
                 namespace_id,
                 key,
                 value,
-                expires_at,
             )?;
             Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, kind))
         });
@@ -1056,14 +1027,6 @@ impl FileRegionCore {
     ) {
         self.health.enter_miss_only();
         let _ = staging.finish_failure(span, buffer, records);
-    }
-
-    fn try_remove_expired(&self, hash: u64, expected: IndexEntry) {
-        match self.index.try_remove_if(hash, expected) {
-            Ok(_) => {}
-            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {}
-            Err(_) => self.health.enter_miss_only(),
-        }
     }
 }
 
@@ -2614,7 +2577,7 @@ mod tests {
             let mut initial =
                 RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data))
                     .unwrap();
-            initial.put_value(7, b"survivor", b"old", 0).unwrap();
+            initial.put_value(7, b"survivor", b"old").unwrap();
             initial.drain().unwrap();
             initial.close_warm().unwrap();
 
@@ -2640,11 +2603,7 @@ mod tests {
             if expect_clean {
                 assert_eq!(reopened.startup(), StartupMode::Warm, "{case}");
                 assert_eq!(
-                    reopened
-                        .get_value(7, b"survivor", ExpiryClock::Fixed(u64::MAX))
-                        .unwrap()
-                        .unwrap()
-                        .value(),
+                    reopened.get_value(7, b"survivor").unwrap().unwrap().value(),
                     b"old",
                     "{case}",
                 );
@@ -2655,10 +2614,7 @@ mod tests {
                     "{case}"
                 );
                 assert!(
-                    reopened
-                        .get_value(7, b"survivor", ExpiryClock::Fixed(u64::MAX))
-                        .unwrap()
-                        .is_none(),
+                    reopened.get_value(7, b"survivor").unwrap().is_none(),
                     "{case}",
                 );
             }
@@ -2676,7 +2632,7 @@ mod tests {
             }
             "write" | "drain" | "flush" => {
                 let store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
-                store.put_value(7, b"replacement", b"new", 0).unwrap();
+                store.put_value(7, b"replacement", b"new").unwrap();
                 if case == "drain" {
                     store.drain().unwrap();
                 } else if case == "flush" {
@@ -2758,17 +2714,13 @@ mod tests {
         for (ordinal, size) in mixed.into_iter().enumerate() {
             let key = key_for_shard(data, namespace_id, ordinal as u64, ordinal as u64);
             let value = vec![(ordinal as u8) + 1; size];
-            eventually_admitted(|| store.put_value(namespace_id, &key, &value, 0));
+            eventually_admitted(|| store.put_value(namespace_id, &key, &value));
             expected.push((key, value));
         }
         store.drain().unwrap();
         for (key, value) in &expected {
             assert_eq!(
-                store
-                    .get_value(namespace_id, key, ExpiryClock::Fixed(u64::MAX))
-                    .unwrap()
-                    .unwrap()
-                    .value(),
+                store.get_value(namespace_id, key).unwrap().unwrap().value(),
                 value
             );
         }
@@ -2781,7 +2733,7 @@ mod tests {
         let rotations_before = store.detailed_snapshot().unwrap().region_sets[0].rotations;
         for ordinal in 0..32 {
             let key = key_for_shard(data, namespace_id, 0, 100 + ordinal);
-            eventually_admitted(|| store.put_value(namespace_id, &key, &rotation_value, 0));
+            eventually_admitted(|| store.put_value(namespace_id, &key, &rotation_value));
             store.drain().unwrap();
             recent.push(key);
         }
@@ -2792,11 +2744,7 @@ mod tests {
         );
         for key in recent.iter().rev().take(2) {
             assert_eq!(
-                store
-                    .get_value(namespace_id, key, ExpiryClock::Fixed(u64::MAX))
-                    .unwrap()
-                    .unwrap()
-                    .value(),
+                store.get_value(namespace_id, key).unwrap().unwrap().value(),
                 rotation_value
             );
         }
@@ -2804,11 +2752,7 @@ mod tests {
         let retained_hits: Vec<_> = (0..129)
             .map(|_| {
                 store
-                    .get_value(
-                        namespace_id,
-                        recent.last().unwrap(),
-                        ExpiryClock::Fixed(u64::MAX),
-                    )
+                    .get_value(namespace_id, recent.last().unwrap())
                     .unwrap()
                     .unwrap()
             })
@@ -2820,11 +2764,7 @@ mod tests {
         );
         assert!(
             store
-                .get_value(
-                    namespace_id,
-                    b"definite-index-miss",
-                    ExpiryClock::Fixed(u64::MAX),
-                )
+                .get_value(namespace_id, b"definite-index-miss")
                 .unwrap()
                 .is_none(),
             "an index miss must not acquire a retained-hit buffer"
@@ -2840,11 +2780,7 @@ mod tests {
         assert_eq!(recovered.startup(), StartupMode::Warm);
         assert_eq!(
             recovered
-                .get_value(
-                    namespace_id,
-                    recent.last().unwrap(),
-                    ExpiryClock::Fixed(u64::MAX),
-                )
+                .get_value(namespace_id, recent.last().unwrap())
                 .unwrap()
                 .unwrap()
                 .value(),
@@ -2963,7 +2899,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value", 0)
+                .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value")
                 .unwrap(),
             RegionStageValue::NeedsProgress
         );
@@ -3033,16 +2969,7 @@ mod tests {
             let hash = hash_namespaced_key(data.hash_seed, 7, key.as_bytes());
             let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
             match runtime
-                .try_stage_value(
-                    &staging,
-                    0,
-                    hash,
-                    record_bytes,
-                    7,
-                    key.as_bytes(),
-                    &value,
-                    0,
-                )
+                .try_stage_value(&staging, 0, hash, record_bytes, 7, key.as_bytes(), &value)
                 .unwrap()
             {
                 RegionStageValue::Staged(seqno) => {
@@ -3109,7 +3036,6 @@ mod tests {
                 data.hash_seed,
                 7,
                 last_key.as_bytes(),
-                ExpiryClock::Fixed(1),
             )
             .unwrap()
             .expect("completed record must validate as a disk hit");
@@ -3126,100 +3052,6 @@ mod tests {
         );
         assert_eq!(engine.stats().submitted, 2);
         assert_eq!(engine.stats().completed, 2);
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
-    fn expired_region_record_is_removed_after_its_first_read() {
-        let data = data_path_superblock();
-        let runtime = FileRegionRuntime::install(
-            PartitionedIndexStorage::anonymous(64).unwrap(),
-            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
-        )
-        .unwrap();
-        let resources = data_path_resources();
-        let staging = RegionStaging::try_new(
-            1,
-            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
-            data.geometry.region_size,
-            &resources,
-        )
-        .unwrap();
-        let directory = TestDirectory::new();
-        let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
-        backend.set_len(data.geometry.data_file_len).unwrap();
-        let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
-        let namespace_id = 7;
-        let key = b"expired-key";
-        let value = b"expired-value";
-        let hash = hash_namespaced_key(data.hash_seed, namespace_id, key);
-        let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
-        let RegionStageValue::Staged(_) = runtime
-            .try_stage_value(
-                &staging,
-                0,
-                hash,
-                record_bytes,
-                namespace_id,
-                key,
-                value,
-                10,
-            )
-            .unwrap()
-        else {
-            panic!("expired value must stage");
-        };
-        runtime
-            .flush_staging_shard(&staging, &engine, 0)
-            .unwrap()
-            .expect("expired value must publish before its deadline");
-
-        let Some(entry) = runtime.lookup_snapshot(hash).unwrap() else {
-            panic!("published value must enter the Region index");
-        };
-        let read_buffer_bytes = (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE)
-            * RECOVERY_PAGE_SIZE;
-        let memory_before_read = resources.managed_memory_snapshot().current_bytes;
-        assert!(
-            runtime
-                .read_value(
-                    &engine,
-                    data.geometry,
-                    resources.try_read_buffer(read_buffer_bytes).unwrap(),
-                    data.hash_seed,
-                    namespace_id,
-                    key,
-                    ExpiryClock::Fixed(10),
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(runtime.lookup_snapshot(hash).unwrap(), None);
-        let submitted_after_cleanup = engine.stats().submitted;
-
-        assert!(
-            runtime
-                .read_value(
-                    &engine,
-                    data.geometry,
-                    resources.try_read_buffer(read_buffer_bytes).unwrap(),
-                    data.hash_seed,
-                    namespace_id,
-                    key,
-                    ExpiryClock::Fixed(10),
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(engine.stats().submitted, submitted_after_cleanup);
-        assert_eq!(
-            faults.events(),
-            vec![FaultEvent::Write(WritePoint::Record), FaultEvent::Read]
-        );
-        assert_eq!(
-            resources.managed_memory_snapshot().current_bytes,
-            memory_before_read
-        );
         engine.shutdown().unwrap();
     }
 
@@ -3258,7 +3090,6 @@ mod tests {
                 namespace_id,
                 owner_key,
                 value,
-                0,
             )
             .unwrap()
         else {
@@ -3292,7 +3123,6 @@ mod tests {
                     plan,
                     namespace_id,
                     foreign_key,
-                    ExpiryClock::Fixed(1),
                 )
                 .unwrap()
                 .is_none()
@@ -3318,7 +3148,6 @@ mod tests {
                     plan,
                     foreign_namespace,
                     owner_key,
-                    ExpiryClock::Fixed(1),
                 )
                 .unwrap()
                 .is_none()
@@ -3337,7 +3166,6 @@ mod tests {
                 data.hash_seed,
                 namespace_id,
                 owner_key,
-                ExpiryClock::Fixed(1),
             )
             .unwrap()
             .expect("the owning full key must still hit");
@@ -3373,16 +3201,7 @@ mod tests {
         let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
         let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
         let RegionStageValue::Staged(_) = runtime
-            .try_stage_value(
-                &staging,
-                0,
-                hash,
-                record_bytes,
-                0,
-                b"key",
-                &[7; 16 * 1024],
-                0,
-            )
+            .try_stage_value(&staging, 0, hash, record_bytes, 0, b"key", &[7; 16 * 1024])
             .unwrap()
         else {
             panic!("value must stage before the injected write failure");

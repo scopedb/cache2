@@ -1325,30 +1325,6 @@ impl PartitionedIndexStorage {
         })
     }
 
-    pub(crate) fn try_write_hash_partition(
-        &self,
-        hash: u64,
-    ) -> Result<IndexPartitionWriteGuard<'_>, IndexStorageError> {
-        let partition = index_partition_for(hash, self.partitions.len());
-        let guard = match self.partitions[partition].try_write() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => {
-                return Err(IndexStorageError::PartitionBusy {
-                    partition_id: partition,
-                });
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(IndexStorageError::PartitionPoisoned {
-                    partition_id: partition,
-                });
-            }
-        };
-        Ok(IndexPartitionWriteGuard {
-            range: self.ranges[partition],
-            guard,
-        })
-    }
-
     pub(crate) fn physical_stats(&self) -> Result<IndexPhysicalStats, IndexStorageError> {
         let mut stats = IndexPhysicalStats::default();
         for (partition_id, partition) in self.partitions.iter().enumerate() {
@@ -2177,10 +2153,6 @@ mod tests {
 
         assert!(matches!(
             storage.try_read_hash_partition(7),
-            Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
-        ));
-        assert!(matches!(
-            storage.try_write_hash_partition(7),
             Err(IndexStorageError::PartitionPoisoned { partition_id: 0 })
         ));
         assert!(matches!(

@@ -296,17 +296,6 @@ fn latest_put_survives_warm_recovery() {
 }
 
 #[test]
-fn expired_value_is_a_miss_before_and_after_region_publication() {
-    let files = TestCache::new("pending-expiry");
-    let cache = files.config(2).open().unwrap();
-    cache.put_until(7, "key", "value", 10).unwrap();
-    assert!(cache.get_in_at(7, "key", 10).unwrap().is_none());
-    cache.drain().unwrap();
-    assert!(cache.get_in_at(7, "key", 10).unwrap().is_none());
-    cache.close_fast().unwrap();
-}
-
-#[test]
 fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     let files = TestCache::new("warm-close");
     let cache = files.config(1).open().unwrap();

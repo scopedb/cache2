@@ -51,8 +51,8 @@ version number documented in `MILESTONES.md`.
   `std::io::ErrorKind::WouldBlock` plus snapshot saturation counters.
 - fixed Linux arm64 symbolic-link rejection by using architecture-correct libc
   values for `O_NOFOLLOW` and `O_NONBLOCK` instead of x86 constants.
-- separated namespace-only `put_in`/`get_in` from explicit `put_until` and
-  `get_in_at` expiration APIs; TTL-free hits no longer sample the system clock.
+- removed time-based expiration from the API, memory tier, request path, and
+  record format; cache lifetime is governed only by eviction and explicit delete.
 - replaced the capacity-overwriting cache builder path with
   `HybridCacheConfig::from_static`, exposed validated RegionSet allocations,
   and canonicalized physically equivalent default RegionSet configurations.
@@ -75,7 +75,7 @@ version number documented in `MILESTONES.md`.
   `l2_read_memory_misses` and `l2_read_busy_misses` counters.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
   aggregate memory limit, I/O concurrency, and per-shard write buffering.
-- made `put`, `put_in`, and `put_until` return their mutation sequence directly
+- made `put` and `put_in` return their mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
 - replaced runtime-growing L1 maps, slot vectors, policy sketches, and S3-FIFO
   ghost state with fixed startup allocations keyed directly by seeded XXH3;

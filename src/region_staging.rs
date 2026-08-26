@@ -952,7 +952,6 @@ mod tests {
             record_len: receipt.record_bytes,
             seqno: receipt.seqno,
             key_hash: record.hash(),
-            expires_at: 0,
             payload_crc: 0,
         };
         target[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
@@ -1120,7 +1119,6 @@ mod tests {
         let resources = resources(4 * 1024 * 1024);
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         let first_len = RecordHeader::aligned_len(0, 0).unwrap();
-        assert_eq!(first_len as usize, RECORD_HEADER_SIZE);
         let (first, first_record) = reservation(4096, first_len, 11);
         let mut pointer = 0_usize;
         staging

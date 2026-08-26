@@ -1,6 +1,6 @@
 //! Shard-local eviction policies for the volatile RAM tier.
 //!
-//! Capacity accounting, TTL, and key correctness stay in `memory`; policies
+//! Capacity accounting and key correctness stay in `memory`; policies
 //! only maintain access metadata and choose a resident slot.
 
 use std::io;

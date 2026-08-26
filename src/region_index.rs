@@ -12,9 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hashing::route_hash;
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
-use crate::index_storage::{
-    IndexPartitionWriteGuard, IndexSlotState, IndexStorageError, PartitionedIndexStorage,
-};
+use crate::index_storage::{IndexSlotState, IndexStorageError, PartitionedIndexStorage};
 use crate::snapshot::CacheIndexSnapshot;
 
 /// A bounded point index over one canonical [`PartitionedIndexStorage`].
@@ -284,65 +282,6 @@ impl RegionIndex {
         Ok(true)
     }
 
-    /// Replaces one exact immutable record identity with the canonical
-    /// probe-deleted marker.
-    #[cfg(test)]
-    fn remove_if(&self, hash: u64, expected: IndexEntry) -> Result<bool, IndexStorageError> {
-        let partition = self.storage.write_hash_partition(hash)?;
-        self.remove_exact_in_partition(hash, expected, partition)
-    }
-
-    /// Tries to remove one exact immutable record without waiting for its
-    /// index partition. Foreground expiry cleanup treats contention as a miss.
-    pub(crate) fn try_remove_if(
-        &self,
-        hash: u64,
-        expected: IndexEntry,
-    ) -> Result<bool, IndexStorageError> {
-        let partition = self.storage.try_write_hash_partition(hash)?;
-        self.remove_exact_in_partition(hash, expected, partition)
-    }
-
-    fn remove_exact_in_partition(
-        &self,
-        hash: u64,
-        expected: IndexEntry,
-        mut partition: IndexPartitionWriteGuard<'_>,
-    ) -> Result<bool, IndexStorageError> {
-        let slot_count = partition.slot_count();
-        let start = start_slot(hash, slot_count);
-        let mut target = None;
-        partition.probe(
-            start,
-            probe_limit(slot_count),
-            |local_slot, state| match state {
-                IndexSlotState::Empty => true,
-                IndexSlotState::Deleted => false,
-                IndexSlotState::Tombstone {
-                    hash: current_hash, ..
-                } => current_hash == hash,
-                IndexSlotState::Value {
-                    hash: current_hash,
-                    entry,
-                } => {
-                    if current_hash == hash {
-                        if entry.same_record_identity(expected) {
-                            target = Some((local_slot, state));
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-            },
-        )?;
-        let Some((local_slot, previous)) = target else {
-            return Ok(false);
-        };
-        partition.replace_observed(local_slot, previous, IndexSlotState::Deleted)?;
-        Ok(true)
-    }
-
     fn is_stale(&self, entry: IndexEntry) -> bool {
         self.region_created_seqnos
             .get(entry.location.region_id() as usize)
@@ -435,23 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_cleanup_returns_busy_without_removing_the_record() {
-        let index = anonymous(8);
-        let hash = 7;
-        let current = entry(1, 8, 10);
-        assert!(index.upsert(hash, current).unwrap());
-        let mutation = index.storage().write_hash_partition(hash).unwrap();
-
-        assert!(matches!(
-            index.try_remove_if(hash, current),
-            Err(IndexStorageError::PartitionBusy { .. })
-        ));
-        drop(mutation);
-        assert_eq!(index.lookup_raw(hash).unwrap(), Some(current));
-    }
-
-    #[test]
-    fn newer_versions_win_and_removal_matches_record_identity() {
+    fn newer_versions_win() {
         let index = anonymous(8);
         let hash = 7;
         let first = entry(1, 8, 10);
@@ -461,12 +384,6 @@ mod tests {
         assert!(!index.upsert(hash, older).unwrap());
         assert!(index.upsert(hash, second).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(second));
-
-        assert!(!index.remove_if(hash, first).unwrap());
-        assert!(index.remove_if(hash, second).unwrap());
-        assert_eq!(index.lookup_raw(hash).unwrap(), None);
-        assert!(index.upsert(15, entry(4, 32, 12)).unwrap());
-        assert_eq!(index.snapshot().unwrap().deleted_slot_reuses, 1);
     }
 
     #[test]

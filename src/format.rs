@@ -7,7 +7,7 @@ use crate::checksum::{Crc32c, crc32c};
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-pub(crate) const RECORD_HEADER_SIZE: usize = 64;
+pub(crate) const RECORD_HEADER_SIZE: usize = 56;
 pub(crate) const RECORD_ALIGNMENT: usize = 32;
 
 pub(crate) const MAX_KEY_SIZE: usize = 64 * 1024;
@@ -28,8 +28,7 @@ const RECORD_RESERVED_GENERATION_OFFSET: usize = 24;
 const RECORD_RESERVED_EPOCH_OFFSET: usize = 28;
 const RECORD_SEQNO_OFFSET: usize = 32;
 const RECORD_KEY_HASH_OFFSET: usize = 40;
-const RECORD_EXPIRES_AT_OFFSET: usize = 48;
-const RECORD_PAYLOAD_CRC_OFFSET: usize = 56;
+const RECORD_PAYLOAD_CRC_OFFSET: usize = 48;
 
 const RECORD_KIND_VALUE: u8 = 1;
 
@@ -41,7 +40,6 @@ pub(crate) struct RecordHeader {
     pub(crate) record_len: u32,
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
-    pub(crate) expires_at: u64,
     pub(crate) payload_crc: u32,
 }
 
@@ -66,7 +64,6 @@ impl RecordHeader {
         put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
         put_u64(&mut output, RECORD_SEQNO_OFFSET, self.seqno);
         put_u64(&mut output, RECORD_KEY_HASH_OFFSET, self.key_hash);
-        put_u64(&mut output, RECORD_EXPIRES_AT_OFFSET, self.expires_at);
         put_u32(&mut output, RECORD_PAYLOAD_CRC_OFFSET, self.payload_crc);
 
         let checksum = crc32c(&output);
@@ -94,7 +91,6 @@ impl RecordHeader {
             record_len: get_u32(input, RECORD_LEN_OFFSET)?,
             seqno: get_u64(input, RECORD_SEQNO_OFFSET)?,
             key_hash: get_u64(input, RECORD_KEY_HASH_OFFSET)?,
-            expires_at: get_u64(input, RECORD_EXPIRES_AT_OFFSET)?,
             payload_crc: get_u32(input, RECORD_PAYLOAD_CRC_OFFSET)?,
         };
 
@@ -235,10 +231,9 @@ mod tests {
             key_len: key.len() as u32,
             value_len: value.len() as u32,
             namespace_id: 0,
-            record_len: 96,
+            record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
-            expires_at: 0x0102_0304_0506_0708,
             payload_crc: crc32c(&payload),
         };
         let mut encoded = vec![0_u8; header.record_len as usize];
@@ -263,11 +258,10 @@ mod tests {
             record_len: RecordHeader::aligned_len(3, 5).unwrap(),
             seqno: 101,
             key_hash: 0xfedc_ba98_7654_3210,
-            expires_at: 1234,
             payload_crc: 77,
         };
 
-        assert_eq!(header.record_len, 96);
+        assert_eq!(header.record_len, 64);
         assert_eq!(RecordHeader::decode(&header.encode()), Some(header));
 
         let mut namespaced = header;
@@ -291,7 +285,6 @@ mod tests {
             record_len: RecordHeader::aligned_len(8, 1).unwrap(),
             seqno: 2,
             key_hash: 3,
-            expires_at: 0,
             payload_crc: 4,
         };
         let mut encoded = header.encode();

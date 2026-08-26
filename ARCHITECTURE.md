@@ -64,7 +64,7 @@ Each shard has exactly two staging buffers, allowing one submitted batch and one
 fill batch without allocating per request. RAM entries are byte-bounded per
 shard and immediately eligible for eviction. Victim order is selected at
 runtime from CLOCK, LRU, TinyLFU admission over LRU, SIEVE, FIFO, or S3-FIFO.
-The policy owns only slot-order metadata; capacity charging, TTL, and full-key
+The policy owns only slot-order metadata; capacity charging and full-key
 validation remain one common mechanism. Values that do not fit L1 continue
 through L2 without an additional queue. FIFO Region reuse remains the only SSD
 replacement policy.
@@ -98,12 +98,9 @@ constant probe/work budgets are exhausted.
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
 L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
 read range, and reads one record. Local validation checks the planned location,
-sequence, hash, namespace, complete key, lengths, expiration, and checksums.
+sequence, hash, namespace, complete key, lengths, and checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
-Expiration is lazy: the wall clock is sampled only after a matching entry with
-a nonzero expiration is found, so namespace-only and default hits do not pay
-for timekeeping.
 
 The I/O pool contains the requested number of workers. In sync mode these are
 positioned-I/O workers; with io_uring they are independent rings. Hash routing

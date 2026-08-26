@@ -145,12 +145,6 @@ pub(crate) struct IndexEntry {
     pub(crate) seqno: u64,
 }
 
-impl IndexEntry {
-    pub(crate) const fn same_record_identity(self, other: Self) -> bool {
-        self.location.raw() == other.location.raw() && self.seqno == other.seqno
-    }
-}
-
 /// Stable power-of-two partition routing for persisted index layouts.
 pub(crate) fn index_partition_for(hash: u64, partition_count: usize) -> usize {
     debug_assert!(partition_count.is_power_of_two());
