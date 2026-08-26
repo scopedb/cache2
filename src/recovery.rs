@@ -62,7 +62,7 @@ const STATE_IMAGE_FILE_LEN_OFFSET: usize = 112;
 
 const STATE_FLAG_HAS_IMAGE: u8 = 1;
 
-const IMAGE_FORMAT_VERSION: u16 = 2;
+const IMAGE_FORMAT_VERSION: u16 = 1;
 const IMAGE_HEADER_SIZE: u16 = 144;
 const IMAGE_VERSION_OFFSET: usize = 8;
 const IMAGE_HEADER_SIZE_OFFSET: usize = 10;
@@ -1045,9 +1045,6 @@ mod tests {
             "../tests/fixtures/format_v1/clean_state.golden"
         ));
         let image_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v2/recovery_image_header.golden"
-        ));
-        let legacy_image_golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/recovery_image_header.golden"
         ));
 
@@ -1057,10 +1054,6 @@ mod tests {
         assert_eq!(DataSuperblock::decode(&data_golden), Some(data));
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
         assert_eq!(RecoveryImageHeader::decode(&image_golden), Some(image));
-        assert_eq!(
-            RecoveryImageHeader::probe(&legacy_image_golden),
-            RecoveryImageHeaderProbe::Unsupported(1)
-        );
     }
 
     #[test]

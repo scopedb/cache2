@@ -35,7 +35,7 @@ pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
 pub(crate) const WARM_IMAGE_WRITE_BATCH_BYTES: usize = 1024 * 1024;
 
 const PAGE_MAGIC: [u8; 8] = *b"CRSIDX1\0";
-const PAGE_FORMAT_VERSION: u16 = 2;
+const PAGE_FORMAT_VERSION: u16 = 1;
 
 const PAGE_VERSION_OFFSET: usize = 8;
 const PAGE_HEADER_SIZE_OFFSET: usize = 10;
