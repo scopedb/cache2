@@ -12,6 +12,7 @@ mod format;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hashing;
 mod index;
 mod index_storage;
 mod io_backend;

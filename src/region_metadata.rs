@@ -82,8 +82,8 @@ const REGION_CREATED_SEQNO_OFFSET: usize = 16;
 const REGION_DURABLE_USED_OFFSET: usize = 24;
 const REGION_RECORD_COUNT_OFFSET: usize = 28;
 const REGION_MAX_SEQNO_OFFSET: usize = 32;
-const REGION_LIVE_RECORD_COUNT_OFFSET: usize = 40;
-const REGION_LIVE_RECORD_BYTES_OFFSET: usize = 44;
+const REGION_RESERVED_START: usize = 40;
+const REGION_RESERVED_END: usize = 48;
 
 const PARTITION_ID_OFFSET: usize = 0;
 const PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 4;
@@ -167,10 +167,6 @@ pub(crate) struct RegionMetadataRecord {
     pub(crate) durable_used_offset: u64,
     pub(crate) max_seqno: u64,
     pub(crate) physical_record_count: u64,
-    pub(crate) live_record_count: u64,
-    /// Sum of aligned record lengths for reachable Value records in this
-    /// Region.
-    pub(crate) live_record_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -434,11 +430,8 @@ impl RegionMetadata {
         if self.partitions.len() != self.root.partition_count as usize {
             return Err(RegionMetadataError::InvalidField("partition_count"));
         }
-        let region_totals = validate_regions(self.root, &self.regions)?;
-        let physical_value_slots = validate_partitions(self.root, &self.partitions)?;
-        if region_totals.live_record_count > physical_value_slots {
-            return Err(RegionMetadataError::InvalidField("live_record_count"));
-        }
+        validate_regions(self.root, &self.regions)?;
+        validate_partitions(self.root, &self.partitions)?;
         Ok(())
     }
 }
@@ -552,15 +545,10 @@ fn validate_encoded_root_directory(input: &[u8], layout: MetadataLayout) -> Resu
     Ok(())
 }
 
-fn validate_regions(
-    root: RegionMetadataRoot,
-    regions: &[RegionMetadataRecord],
-) -> Result<RegionTotals> {
+fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) -> Result<()> {
     let mut free_seen = zeroed_bytes(root.free_region_count as usize)?;
     let mut active_seen = zeroed_bytes(root.active_region_count as usize)?;
     let mut sealed_seen = zeroed_bytes(root.sealed_region_count as usize)?;
-    let mut totals = RegionTotals::default();
-
     for (expected_id, region) in regions.iter().copied().enumerate() {
         if region.region_id as usize != expected_id
             || region.incarnation == u32::MAX
@@ -584,8 +572,6 @@ fn validate_regions(
                 || region.durable_used_offset != 0
                 || region.max_seqno != 0
                 || region.physical_record_count != 0
-                || region.live_record_count != 0
-                || region.live_record_bytes != 0
             {
                 return Err(RegionMetadataError::InvalidField("free_region"));
             }
@@ -601,16 +587,10 @@ fn validate_regions(
             || (empty && region.max_seqno != 0)
             || (!empty
                 && (region.max_seqno < region.created_seqno || region.max_seqno > root.max_seqno))
-            || region.live_record_count > region.physical_record_count
-            || (region.live_record_count == 0) != (region.live_record_bytes == 0)
-            || region.live_record_bytes > used_bytes
-            || region.live_record_bytes % 32 != 0
             || !minimum_bytes_fit(region.physical_record_count, used_bytes)?
-            || !minimum_bytes_fit(region.live_record_count, region.live_record_bytes)?
         {
             return Err(RegionMetadataError::InvalidField("allocated_region"));
         }
-        totals.add(region)?;
     }
     if free_seen
         .iter()
@@ -622,13 +602,13 @@ fn validate_regions(
             "region_queue_permutation",
         ));
     }
-    Ok(totals)
+    Ok(())
 }
 
 fn validate_partitions(
     root: RegionMetadataRoot,
     partitions: &[PartitionMetadataRecord],
-) -> Result<u64> {
+) -> Result<()> {
     let index_slots =
         usize::try_from(root.index_slots).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
     let canonical = canonical_index_partition_ranges(index_slots).map_err(|error| match error {
@@ -644,7 +624,6 @@ fn validate_partitions(
         ));
     }
 
-    let mut live = 0_u64;
     for (partition, expected) in partitions.iter().copied().zip(canonical.iter().copied()) {
         let expected_first_page = u64::try_from(expected.first_page)
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
@@ -672,11 +651,8 @@ fn validate_partitions(
         {
             return Err(RegionMetadataError::InvalidField("partition"));
         }
-        live = live
-            .checked_add(partition.physical_value_slots)
-            .ok_or(RegionMetadataError::ArithmeticOverflow)?;
     }
-    Ok(live)
+    Ok(())
 }
 
 fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool> {
@@ -684,25 +660,6 @@ fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool> {
         .checked_mul(MIN_ENCODED_RECORD_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?
         <= bytes)
-}
-
-#[derive(Default)]
-struct RegionTotals {
-    live_record_count: u64,
-    live_record_bytes: u64,
-}
-
-impl RegionTotals {
-    fn add(&mut self, region: RegionMetadataRecord) -> Result<()> {
-        self.live_record_count = checked_add(self.live_record_count, region.live_record_count)?;
-        self.live_record_bytes = checked_add(self.live_record_bytes, region.live_record_bytes)?;
-        Ok(())
-    }
-}
-
-fn checked_add(left: u64, right: u64) -> Result<u64> {
-    left.checked_add(right)
-        .ok_or(RegionMetadataError::ArithmeticOverflow)
 }
 
 fn zeroed_bytes(len: usize) -> Result<Vec<u8>> {
@@ -1029,10 +986,6 @@ fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
         .expect("validated Region used offset fits its packed field");
     let physical_record_count = u32::try_from(region.physical_record_count)
         .expect("validated Region record count fits its packed field");
-    let live_record_count = u32::try_from(region.live_record_count)
-        .expect("validated live record count fits its packed field");
-    let live_record_bytes = u32::try_from(region.live_record_bytes)
-        .expect("validated live record bytes fit their packed field");
     put_u32(output, REGION_ID_OFFSET, region.region_id);
     put_u32(output, REGION_INCARNATION_OFFSET, region.incarnation);
     output[REGION_STATE_OFFSET] = region.state as u8;
@@ -1043,14 +996,16 @@ fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
     put_u32(output, REGION_DURABLE_USED_OFFSET, durable_used);
     put_u32(output, REGION_RECORD_COUNT_OFFSET, physical_record_count);
     put_u64(output, REGION_MAX_SEQNO_OFFSET, region.max_seqno);
-    put_u32(output, REGION_LIVE_RECORD_COUNT_OFFSET, live_record_count);
-    put_u32(output, REGION_LIVE_RECORD_BYTES_OFFSET, live_record_bytes);
+    output[REGION_RESERVED_START..REGION_RESERVED_END].fill(0);
 }
 
 fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
     if input.len() != REGION_METADATA_REGION_SIZE
         || input[REGION_FLAGS_OFFSET] != 0
         || get_u16(input, REGION_RESERVED16_OFFSET)? != 0
+        || input[REGION_RESERVED_START..REGION_RESERVED_END]
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(RegionMetadataError::InvalidField("region_encoding"));
     }
@@ -1064,8 +1019,6 @@ fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
         durable_used_offset: u64::from(get_u32(input, REGION_DURABLE_USED_OFFSET)?),
         max_seqno: get_u64(input, REGION_MAX_SEQNO_OFFSET)?,
         physical_record_count: u64::from(get_u32(input, REGION_RECORD_COUNT_OFFSET)?),
-        live_record_count: u64::from(get_u32(input, REGION_LIVE_RECORD_COUNT_OFFSET)?),
-        live_record_bytes: u64::from(get_u32(input, REGION_LIVE_RECORD_BYTES_OFFSET)?),
     })
 }
 
@@ -1225,8 +1178,6 @@ mod tests {
                     durable_used_offset: 0,
                     max_seqno: 0,
                     physical_record_count: 0,
-                    live_record_count: 0,
-                    live_record_bytes: 0,
                 },
                 RegionMetadataRecord {
                     region_id: 1,
@@ -1237,8 +1188,6 @@ mod tests {
                     durable_used_offset: 128,
                     max_seqno: 3,
                     physical_record_count: 2,
-                    live_record_count: 1,
-                    live_record_bytes: 128,
                 },
                 RegionMetadataRecord {
                     region_id: 2,
@@ -1249,8 +1198,6 @@ mod tests {
                     durable_used_offset: 64,
                     max_seqno: 4,
                     physical_record_count: 1,
-                    live_record_count: 0,
-                    live_record_bytes: 0,
                 },
                 RegionMetadataRecord {
                     region_id: 3,
@@ -1261,8 +1208,6 @@ mod tests {
                     durable_used_offset: 0,
                     max_seqno: 0,
                     physical_record_count: 0,
-                    live_record_count: 0,
-                    live_record_bytes: 0,
                 },
             ]
             .into_boxed_slice(),
@@ -1369,19 +1314,14 @@ mod tests {
     }
 
     #[test]
-    fn live_record_charge_is_aligned_and_bounded_by_the_index() {
-        let mut unaligned = sample();
-        unaligned.regions[1].live_record_bytes = 127;
+    fn reserved_region_slots_are_rejected() {
+        let mut encoded = sample().encode().unwrap();
+        let region_page = page_mut(&mut encoded, 1).unwrap();
+        page_payload_mut(region_page, 0, REGION_METADATA_REGION_SIZE)[REGION_RESERVED_START] = 1;
+        finish_page(region_page);
         assert_eq!(
-            unaligned.validate(),
-            Err(RegionMetadataError::InvalidField("allocated_region"))
-        );
-
-        let mut over_index = sample();
-        over_index.regions[1].live_record_count = 2;
-        assert_eq!(
-            over_index.validate(),
-            Err(RegionMetadataError::InvalidField("live_record_count"))
+            RegionMetadata::decode(&encoded),
+            Err(RegionMetadataError::InvalidField("region_encoding"))
         );
     }
 

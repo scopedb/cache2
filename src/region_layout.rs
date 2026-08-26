@@ -1,5 +1,7 @@
 use std::io;
 
+use crate::hashing::route_hash;
+
 pub(crate) const MAX_REGION_SETS: usize = 64;
 const MAX_NAMESPACE_ROUTES: usize = 4096;
 
@@ -363,7 +365,7 @@ impl RegionLayout {
 
     pub(crate) fn append_shard(&self, namespace_id: u32, hash: u64) -> usize {
         let set = self.sets[self.set_index_for_namespace(namespace_id)];
-        set.first_shard as usize + (hash % u64::from(set.shard_count)) as usize
+        set.first_shard as usize + route_hash(hash, set.shard_count as usize)
     }
 
     pub(crate) fn region_belongs_to_namespace(&self, namespace_id: u32, region_id: u32) -> bool {

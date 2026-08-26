@@ -3,8 +3,9 @@
 //! Capacity accounting, TTL, and key correctness stay in `memory`; policies
 //! only maintain access metadata and choose a resident slot.
 
-use std::collections::HashMap;
 use std::io;
+
+use crate::hashing::PrehashedMap;
 
 /// Maximum policy metadata inspected by one foreground victim selection.
 /// Exhausting this budget means L1 bypass; it never expands with cache size.
@@ -491,8 +492,16 @@ fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelec
         if slots.is_empty() {
             break;
         }
-        let index = state.hand % slots.len();
-        state.hand = (index + 1) % slots.len();
+        let index = if state.hand < slots.len() {
+            state.hand
+        } else {
+            0
+        };
+        state.hand = if index + 1 == slots.len() {
+            0
+        } else {
+            index + 1
+        };
         let slot = &mut slots[index];
         if !slot.is_resident() {
             continue;
@@ -725,7 +734,7 @@ struct GhostQueue {
     maximum_entries: usize,
     cursor: usize,
     order: Vec<u64>,
-    members: HashMap<u64, usize>,
+    members: PrehashedMap<usize>,
 }
 
 impl GhostQueue {
@@ -734,7 +743,7 @@ impl GhostQueue {
             maximum_entries,
             cursor: 0,
             order: Vec::new(),
-            members: HashMap::new(),
+            members: PrehashedMap::default(),
         }
     }
 
@@ -757,7 +766,11 @@ impl GhostQueue {
                 self.members.remove(&old_hash);
             }
             self.order[slot] = hash;
-            self.cursor = (slot + 1) % self.maximum_entries;
+            self.cursor = if slot + 1 == self.maximum_entries {
+                0
+            } else {
+                slot + 1
+            };
             slot
         };
         self.members.insert(hash, slot);

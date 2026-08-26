@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::expiry::ExpiryClock;
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
+use crate::hashing::route_hash;
 use crate::io_backend::{RuntimeFileSet, SyncMode, SyncPoint};
 use crate::io_engine::{
     IoEngine, IoOperation, MAX_IO_REQUESTS_PER_WORKER, OperationKind, build_file_engine,
@@ -162,7 +163,7 @@ impl RuntimeMetrics {
     }
 
     fn activity_for_hash(&self, hash: u64) -> &ActivityMetrics {
-        self.activity((hash % self.activity.len() as u64) as usize)
+        self.activity(route_hash(hash, self.activity.len()))
     }
 
     fn add(counter: &AtomicU64, value: usize) {
@@ -455,7 +456,7 @@ struct RunningShared {
 
 impl RunningShared {
     fn engine_for(&self, route: u64) -> &Arc<dyn IoEngine> {
-        &self.engines[route as usize % self.engines.len()]
+        &self.engines[route_hash(route, self.engines.len())]
     }
 }
 

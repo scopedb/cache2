@@ -4,7 +4,6 @@
 //! immediately, may be discarded at any time, and use a small bounded eviction
 //! policy.
 
-use std::collections::HashMap;
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +14,7 @@ use crate::eviction::{
     VictimSelection,
 };
 use crate::expiry::ExpiryClock;
+use crate::hashing::{PrehashedMap, route_hash};
 
 /// Charged resident metadata: the entry slot, eviction-policy slot, and the
 /// retained-value ownership. Container buckets and allocator metadata are
@@ -163,7 +163,7 @@ struct MemoryEntry {
 struct MemoryShard {
     budget: Arc<MemoryBudget>,
     eviction: EvictionState,
-    directory: HashMap<u64, u32>,
+    directory: PrehashedMap<u32>,
     slots: Vec<Option<MemoryEntry>>,
     policy_slots: Vec<PolicySlot>,
     free_slots: Vec<u32>,
@@ -174,7 +174,7 @@ impl MemoryShard {
         let maximum_entries = (capacity_bytes / MEMORY_ENTRY_OVERHEAD_BYTES)
             .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
         let budget = Arc::new(MemoryBudget::new(capacity_bytes));
-        let directory = HashMap::new();
+        let directory = PrehashedMap::default();
         Ok(Self {
             budget,
             eviction: EvictionState::new(policy, capacity_bytes, maximum_entries)?,
@@ -723,7 +723,7 @@ impl MemoryStore {
     }
 
     fn route(&self, hash: u64) -> usize {
-        (hash % self.shards.len() as u64) as usize
+        route_hash(hash, self.shards.len())
     }
 
     fn try_lock_shard(&self, shard_id: usize) -> Option<MutexGuard<'_, MemoryShard>> {

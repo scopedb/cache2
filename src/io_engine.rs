@@ -1881,6 +1881,7 @@ mod uring {
     use std::os::unix::net::UnixStream;
 
     use io_uring::{IoUring, Probe, opcode, squeue, types};
+    use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
     use super::*;
 
@@ -2140,7 +2141,7 @@ mod uring {
         shared: Arc<RuntimeShared>,
         submit_state: Arc<RwLock<SubmitState>>,
         receiver: Receiver<DriverCommand>,
-        flights: HashMap<RequestId, Flight>,
+        flights: HashMap<RequestId, Flight, Xxh3DefaultBuilder>,
         pending_targets: VecDeque<RequestId>,
         pending_cancels: VecDeque<RequestId>,
         requested_cancels: Vec<RequestId>,
@@ -2171,7 +2172,7 @@ mod uring {
             shared,
             submit_state,
             receiver,
-            flights: HashMap::with_capacity(max_in_flight),
+            flights: HashMap::with_capacity_and_hasher(max_in_flight, Xxh3DefaultBuilder::new()),
             pending_targets: VecDeque::with_capacity(max_in_flight),
             pending_cancels: VecDeque::with_capacity(max_in_flight),
             requested_cancels: Vec::with_capacity(max_in_flight),

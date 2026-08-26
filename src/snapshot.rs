@@ -85,8 +85,6 @@ pub struct RegionSetSnapshot {
     pub active_region_count: u32,
     pub free_region_count: u32,
     pub sealed_region_count: u32,
-    pub live_record_count: u64,
-    pub live_bytes: u64,
     pub physical_record_count: u64,
     pub physical_bytes: u64,
     pub rotations: u64,

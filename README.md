@@ -187,8 +187,9 @@ bound. A returned L1 `Value` retains its charge until the caller drops it, even
 after CLOCK eviction, so slow consumers cannot push new L1 allocations past the
 configured capacity. `RuntimeConfig::with_l1_shards()` controls only the
 volatile L1 lock topology; the default is 32 and it may change on a warm reopen.
-The L1 directory is the standard library `HashMap` with compact intrusive
-same-hash chains.
+The L1 directory is the standard library `HashMap`, but consumes the already
+computed seeded XXH3 key hash directly instead of hashing it again. Compact
+intrusive same-hash chains retain namespace and full-key validation.
 The aggregate memory limit also reserves fixed 512 KiB stacks for append-shard,
 I/O, and bounded shutdown-reaper threads plus conservative L1 shard, I/O command,
 and fixed recovery encoding metadata.

@@ -5,11 +5,8 @@
 //! canonical shard records from the index owner and derives every Region and
 //! queue field from live manager state.
 
-use crate::index::IndexEntry;
-use crate::index_storage::IndexSlotState;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::recovery::{PersistentId, RECORD_ALIGNMENT};
-use crate::region_index::IndexTransition;
 use crate::region_layout::RegionLayout;
 use crate::region_metadata::{
     PartitionMetadataRecord, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
@@ -29,34 +26,6 @@ pub(crate) struct RegionMetadataBinding {
     pub(crate) image_identity: PersistentId,
     pub(crate) image_generation: u64,
     pub(crate) config_fingerprint: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RegionLogicalAccounting {
-    pub(crate) live_record_count: u64,
-    pub(crate) live_record_bytes: u64,
-}
-
-#[cfg(test)]
-impl RegionLogicalAccounting {
-    fn checked_add_region(self, region: &RegionRuntime) -> Result<Self, RegionMetadataError> {
-        Ok(Self {
-            live_record_count: self
-                .live_record_count
-                .checked_add(region.logical.live_record_count)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-            live_record_bytes: self
-                .live_record_bytes
-                .checked_add(region.logical.live_record_bytes)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RegionLogicalCharge {
-    region_index: usize,
-    record_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,7 +197,6 @@ pub(crate) struct RegionRuntime {
     pub(crate) reserved_used: u64,
     pub(crate) max_seqno: u64,
     pub(crate) physical_record_count: u64,
-    pub(crate) logical: RegionLogicalAccounting,
 }
 
 #[derive(Debug)]
@@ -273,7 +241,7 @@ impl RegionManager {
             regions: encoded_regions,
             partitions,
         } = metadata;
-        // Shard topology and physical accounting are owned by the live index.
+        // Partition topology and slot counters are owned by the live index.
         // Do not retain the recovered copy as a second authority.
         drop(partitions);
 
@@ -310,10 +278,6 @@ impl RegionManager {
                 reserved_used: encoded.durable_used_offset,
                 max_seqno: encoded.max_seqno,
                 physical_record_count: encoded.physical_record_count,
-                logical: RegionLogicalAccounting {
-                    live_record_count: encoded.live_record_count,
-                    live_record_bytes: encoded.live_record_bytes,
-                },
             };
             install_recovered_queue_entry(
                 runtime.state,
@@ -412,12 +376,6 @@ impl RegionManager {
                 ..RegionSetSnapshot::default()
             };
             for region in regions {
-                snapshot.live_record_count = snapshot
-                    .live_record_count
-                    .saturating_add(region.logical.live_record_count);
-                snapshot.live_bytes = snapshot
-                    .live_bytes
-                    .saturating_add(region.logical.live_record_bytes);
                 snapshot.physical_record_count = snapshot
                     .physical_record_count
                     .saturating_add(region.physical_record_count);
@@ -936,7 +894,6 @@ impl RegionManager {
             reserved_used: 0,
             max_seqno: 0,
             physical_record_count: 0,
-            logical: RegionLogicalAccounting::default(),
         };
         self.active_regions[shard_id] = victim_region_id;
         let receipt = RegionRotationReceipt {
@@ -1107,146 +1064,6 @@ impl RegionManager {
         Ok(())
     }
 
-    /// Tests the Region generation which makes one completed physical index
-    /// entry logically reachable. Resident-only
-    /// values need a typed staging lookup and are deliberately rejected until
-    /// that read path exists; a plain point lookup may address only the
-    /// Region's completed prefix. Invalid fields fail closed.
-    pub(crate) fn is_visible(&self, entry: IndexEntry) -> bool {
-        let Ok(region_id) = usize::try_from(entry.location.region_id()) else {
-            return false;
-        };
-        let offset = u64::from(entry.location.offset());
-        let Some(end) = offset.checked_add(u64::from(entry.location.record_len())) else {
-            return false;
-        };
-        self.regions.get(region_id).is_some_and(|region| {
-            region.state != RegionMetadataState::Free
-                && entry.seqno >= region.created_seqno
-                && entry.seqno <= region.max_seqno
-                && offset % u64::from(RECORD_ALIGNMENT) == 0
-                && end <= region.completed_used
-        })
-    }
-
-    /// Applies one exact index mutation to per-Region logical accounting.
-    ///
-    /// The caller must keep this manager authority stable for the complete
-    /// index probe and invoke this method from the index commit callback. Both
-    /// affected Regions are checked before either is changed, so an invariant
-    /// or arithmetic failure cannot leave a partial cross-Region transfer.
-    pub(crate) fn apply_index_transition(
-        &mut self,
-        transition: IndexTransition,
-    ) -> Result<(), RegionMutationError> {
-        let previous = self.logical_charge(transition.previous);
-        let installed = self.logical_charge(transition.installed);
-
-        let mut updates = [None, None];
-        match (previous, installed) {
-            (None, None) => return Ok(()),
-            (Some(previous), Some(installed))
-                if previous.region_index == installed.region_index =>
-            {
-                updates[0] = Some((
-                    previous.region_index,
-                    self.checked_logical_update(
-                        previous.region_index,
-                        Some(previous),
-                        Some(installed),
-                    )?,
-                ));
-            }
-            (Some(previous), Some(installed)) => {
-                let previous_update =
-                    self.checked_logical_update(previous.region_index, Some(previous), None)?;
-                let installed_update =
-                    self.checked_logical_update(installed.region_index, None, Some(installed))?;
-                updates[0] = Some((previous.region_index, previous_update));
-                updates[1] = Some((installed.region_index, installed_update));
-            }
-            (Some(previous), None) => {
-                updates[0] = Some((
-                    previous.region_index,
-                    self.checked_logical_update(previous.region_index, Some(previous), None)?,
-                ));
-            }
-            (None, Some(installed)) => {
-                updates[0] = Some((
-                    installed.region_index,
-                    self.checked_logical_update(installed.region_index, None, Some(installed))?,
-                ));
-            }
-        }
-
-        for (region_index, logical) in updates.into_iter().flatten() {
-            self.regions[region_index].logical = logical;
-        }
-        Ok(())
-    }
-
-    fn logical_charge(&self, state: IndexSlotState) -> Option<RegionLogicalCharge> {
-        let IndexSlotState::Value { entry, .. } = state else {
-            return None;
-        };
-        if !self.is_visible(entry) {
-            return None;
-        }
-        Some(RegionLogicalCharge {
-            region_index: entry.location.region_id() as usize,
-            record_bytes: u64::from(entry.location.record_len()),
-        })
-    }
-
-    fn checked_logical_update(
-        &self,
-        region_index: usize,
-        previous: Option<RegionLogicalCharge>,
-        installed: Option<RegionLogicalCharge>,
-    ) -> Result<RegionLogicalAccounting, RegionMutationError> {
-        let current = self
-            .regions
-            .get(region_index)
-            .ok_or(RegionMutationError::Invariant(
-                "visible index entry has an invalid Region id",
-            ))?
-            .logical;
-        let removed_count = u64::from(previous.is_some());
-        let removed_bytes = previous.map_or(0, |charge| charge.record_bytes);
-        let added_count = u64::from(installed.is_some());
-        let added_bytes = installed.map_or(0, |charge| charge.record_bytes);
-
-        Ok(RegionLogicalAccounting {
-            live_record_count: current
-                .live_record_count
-                .checked_sub(removed_count)
-                .ok_or(RegionMutationError::Invariant(
-                    "logical record count underflow",
-                ))?
-                .checked_add(added_count)
-                .ok_or(RegionMutationError::ArithmeticOverflow)?,
-            live_record_bytes: current
-                .live_record_bytes
-                .checked_sub(removed_bytes)
-                .ok_or(RegionMutationError::Invariant(
-                    "logical record bytes underflow",
-                ))?
-                .checked_add(added_bytes)
-                .ok_or(RegionMutationError::ArithmeticOverflow)?,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn logical_accounting(
-        &self,
-    ) -> Result<RegionLogicalAccounting, RegionMetadataError> {
-        self.regions
-            .iter()
-            .try_fold(RegionLogicalAccounting::default(), |total, region| {
-                total.checked_add_region(region)
-            })
-    }
-
     /// Freezes the complete Region metadata table against the current
     /// canonical index partition directory and physical counters supplied by the
     /// index owner.
@@ -1280,8 +1097,6 @@ impl RegionManager {
                 durable_used_offset: region.completed_used,
                 max_seqno: region.max_seqno,
                 physical_record_count: region.physical_record_count,
-                live_record_count: region.logical.live_record_count,
-                live_record_bytes: region.logical.live_record_bytes,
             });
         }
 
@@ -1554,7 +1369,6 @@ fn try_unassigned_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::PackedLocation;
     use crate::index_storage::canonical_index_partition_ranges;
 
     fn id(byte: u8) -> PersistentId {
@@ -1599,19 +1413,18 @@ mod tests {
                 sealed_region_count: 2,
             },
             regions: vec![
-                region(0, 3, RegionMetadataState::Active, 1, 2, 0, 0, 0),
-                region(1, 4, RegionMetadataState::Free, 1, 0, 0, 0, 0),
-                region(2, 2, RegionMetadataState::Sealed, 1, 7, 64, 7, 0),
-                region(3, 1, RegionMetadataState::Active, 0, 1, 0, 0, 0),
-                region(4, 8, RegionMetadataState::Sealed, 0, 4, 128, 5, 1),
-                region(5, 7, RegionMetadataState::Free, 0, 0, 0, 0, 0),
+                region(0, 3, RegionMetadataState::Active, 1, 2, 0, 0),
+                region(1, 4, RegionMetadataState::Free, 1, 0, 0, 0),
+                region(2, 2, RegionMetadataState::Sealed, 1, 7, 64, 7),
+                region(3, 1, RegionMetadataState::Active, 0, 1, 0, 0),
+                region(4, 8, RegionMetadataState::Sealed, 0, 4, 128, 5),
+                region(5, 7, RegionMetadataState::Free, 0, 0, 0, 0),
             ]
             .into_boxed_slice(),
             partitions: shards.into_boxed_slice(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn region(
         region_id: u32,
         incarnation: u32,
@@ -1620,7 +1433,6 @@ mod tests {
         created_seqno: u64,
         used_bytes: u64,
         max_seqno: u64,
-        live_records: u64,
     ) -> RegionMetadataRecord {
         RegionMetadataRecord {
             region_id,
@@ -1631,8 +1443,6 @@ mod tests {
             durable_used_offset: used_bytes,
             max_seqno,
             physical_record_count: used_bytes / 64,
-            live_record_count: live_records,
-            live_record_bytes: live_records * 64,
         }
     }
 
@@ -1655,39 +1465,6 @@ mod tests {
         metadata.regions[2].queue_ordinal = 3;
         metadata.validate().unwrap();
         metadata
-    }
-
-    fn value_slot(hash: u64, region_id: u32, seqno: u64, record_bytes: u32) -> IndexSlotState {
-        IndexSlotState::Value {
-            hash,
-            entry: IndexEntry {
-                location: PackedLocation::new(region_id, 0, record_bytes).unwrap(),
-                seqno,
-                namespace_id: 0,
-            },
-        }
-    }
-
-    fn index_transition(previous: IndexSlotState, installed: IndexSlotState) -> IndexTransition {
-        IndexTransition {
-            previous,
-            installed,
-        }
-    }
-
-    fn append_completed(
-        manager: &mut RegionManager,
-        shard_id: usize,
-        record_bytes: u32,
-    ) -> RegionAppendReservation {
-        let reservation = manager.reserve_append(shard_id, record_bytes).unwrap();
-        manager.stage_reservation(reservation).unwrap();
-        let span = match manager.reserve_write_padding(shard_id).unwrap() {
-            Some(padding) => manager.seal_write_span_with_padding(padding).unwrap(),
-            None => manager.seal_write_span(shard_id).unwrap(),
-        };
-        manager.complete_write_span(span).unwrap();
-        reservation
     }
 
     fn request_rotation(manager: &mut RegionManager, shard_id: usize) {
@@ -1716,137 +1493,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_round_trip_rebuilds_all_live_accounting_and_ordinals() {
-        let expected = sample();
-        let shards = expected.partitions.clone();
-        let manager = RegionManager::from_metadata(expected.clone()).unwrap();
-        assert_eq!(
-            manager.logical_accounting().unwrap(),
-            RegionLogicalAccounting {
-                live_record_count: 1,
-                live_record_bytes: 64,
-            }
-        );
-        assert_eq!(manager.freeze_metadata(shards).unwrap(), expected);
-    }
+    fn freeze_preserves_physical_region_state() {
+        let source = sample();
+        let shards = source.partitions.clone();
+        let manager = RegionManager::from_metadata(source.clone()).unwrap();
 
-    #[test]
-    fn visibility_applies_region_generation_and_bounds() {
-        let manager = RegionManager::from_metadata(sample()).unwrap();
-        let entry = |region_id, offset, seqno| IndexEntry {
-            location: PackedLocation::new(region_id, offset, 32).unwrap(),
-            seqno,
-            namespace_id: 0,
-        };
-        assert!(manager.is_visible(entry(4, 0, 4)));
-        assert!(!manager.is_visible(entry(4, 0, 3)));
-        assert!(!manager.is_visible(entry(4, 0, 6)));
-        assert!(!manager.is_visible(entry(4, 8, 4)));
-        assert!(!manager.is_visible(entry(4, 104, 4)));
-        assert!(!manager.is_visible(entry(4, 128, 4)));
-        assert!(!manager.is_visible(entry(1, 0, 7)));
-        assert!(!manager.is_visible(entry(3, 0, 1)));
-        assert!(!manager.is_visible(entry(99, 0, 7)));
-    }
-
-    #[test]
-    fn index_transitions_move_and_remove_exact_live_record_charges() {
-        let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        let appended = append_completed(&mut manager, 0, 96);
-        assert_eq!((appended.region_id, appended.seqno), (3, 8));
-        let old = value_slot(7, 4, 4, 64);
-        let new = value_slot(7, 3, 8, 96);
-
-        manager
-            .apply_index_transition(index_transition(old, new))
-            .unwrap();
-        assert_eq!(
-            manager.regions[4].logical,
-            RegionLogicalAccounting::default()
-        );
-        assert_eq!(
-            manager.regions[3].logical,
-            RegionLogicalAccounting {
-                live_record_count: 1,
-                live_record_bytes: 96,
-            }
-        );
-
-        manager
-            .apply_index_transition(index_transition(new, IndexSlotState::Deleted))
-            .unwrap();
-        assert_eq!(
-            manager.regions[3].logical,
-            RegionLogicalAccounting::default()
-        );
-
-        manager
-            .apply_index_transition(index_transition(IndexSlotState::Deleted, new))
-            .unwrap();
-        manager
-            .apply_index_transition(index_transition(new, IndexSlotState::Deleted))
-            .unwrap();
-        assert_eq!(
-            manager.regions[3].logical,
-            RegionLogicalAccounting::default()
-        );
-    }
-
-    #[test]
-    fn invisible_values_do_not_change_logical_accounting() {
-        let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        let appended = append_completed(&mut manager, 0, 32);
-        assert_eq!((appended.region_id, appended.seqno), (3, 8));
-        let before = manager.regions[4].logical;
-        let stale = value_slot(7, 4, 3, 64);
-        let installed = value_slot(7, 3, 8, 32);
-
-        manager
-            .apply_index_transition(index_transition(stale, installed))
-            .unwrap();
-        assert_eq!(manager.regions[4].logical, before);
-        assert_eq!(
-            manager.regions[3].logical,
-            RegionLogicalAccounting {
-                live_record_count: 1,
-                live_record_bytes: 32,
-            }
-        );
-    }
-
-    #[test]
-    fn failed_logical_transition_never_partially_updates_either_region() {
-        let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        let appended = append_completed(&mut manager, 0, 32);
-        assert_eq!((appended.region_id, appended.seqno), (3, 8));
-        let old = value_slot(7, 3, 8, 32);
-        let installed = value_slot(7, 4, 4, 32);
-
-        assert_eq!(
-            manager.apply_index_transition(index_transition(old, IndexSlotState::Deleted,)),
-            Err(RegionMutationError::Invariant(
-                "logical record count underflow"
-            ))
-        );
-        assert_eq!(
-            manager.regions[3].logical,
-            RegionLogicalAccounting::default()
-        );
-
-        manager.regions[3].logical = RegionLogicalAccounting {
-            live_record_count: 1,
-            live_record_bytes: 32,
-        };
-        manager.regions[4].logical = RegionLogicalAccounting {
-            live_record_count: u64::MAX,
-            live_record_bytes: u64::MAX,
-        };
-        let before = manager.regions.clone();
-        assert_eq!(
-            manager.apply_index_transition(index_transition(old, installed)),
-            Err(RegionMutationError::ArithmeticOverflow)
-        );
-        assert_eq!(manager.regions, before);
+        assert_eq!(manager.freeze_metadata(shards).unwrap(), source);
     }
 
     #[test]
@@ -2081,12 +1733,10 @@ mod tests {
     }
 
     #[test]
-    fn fifo_reuse_bumps_generation_and_clears_live_accounting_in_constant_time() {
+    fn fifo_reuse_bumps_generation_and_resets_physical_state() {
         let metadata = sample_without_free_regions();
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
-        assert_eq!(manager.logical_accounting().unwrap().live_record_count, 1);
-
         request_rotation(&mut manager, 0);
         let plan = manager.plan_rotation(0).unwrap();
         assert_eq!(
@@ -2104,11 +1754,6 @@ mod tests {
         assert_eq!(rotation.activated_incarnation, 9);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.regions[4].physical_record_count, 0);
-        assert_eq!(
-            manager.regions[4].logical,
-            RegionLogicalAccounting::default()
-        );
-        assert_eq!(manager.logical_accounting().unwrap().live_record_count, 0);
 
         manager.finish_rotation(rotation).unwrap();
         assert_eq!(
@@ -2116,8 +1761,7 @@ mod tests {
             [1, 5, 2, 3]
         );
         let frozen = manager.freeze_metadata(shards).unwrap();
-        assert_eq!(frozen.regions[4].live_record_count, 0);
-        assert_eq!(frozen.regions[4].live_record_bytes, 0);
+        assert_eq!(frozen.regions[4].physical_record_count, 0);
     }
 
     #[test]

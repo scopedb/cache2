@@ -21,20 +21,35 @@ The default Auto/buffered workload used 8,192 entries × 16 KiB, 4 write shards,
 
 | Phase | Median latency | Median throughput |
 |---|---:|---:|
-| put + drain | 33.724 ms | 242,914 ops/s |
-| resident L1 get | 71.138 ms | 14,739,932 ops/s |
-| warm close | 75.809 ms | — |
-| L2 get + promote | 22.935 ms | 357,180 ops/s |
-| promoted L1 get | 78.045 ms | 13,435,524 ops/s |
+| put + drain | 30.107 ms | 272,098 ops/s |
+| resident L1 get | 68.949 ms | 15,207,994 ops/s |
+| warm close | 73.027 ms | — |
+| L2 get + promote | 22.877 ms | 358,084 ops/s |
+| promoted L1 get | 86.159 ms | 12,170,314 ops/s |
 
-The median admission sample made 8,986 attempts for 8,192 accepted writes:
-794 retries across 178 throttled writes. Before brief conflicts used bounded
-yield retries, the same revision's fixed 50 µs retry delay produced a
-38.474 ms median for put + drain. The new result is 12.3% faster and remains
-5.0% slower than the older bounded-generator baseline. A direct control at
-`5916da6`, the last revision with a blocking foreground manager lock, measured
-29.360 ms. The library still performs exactly one non-blocking manager probe
-per foreground attempt; the retry policy belongs only to the benchmark caller.
+The median admission sample made 8,227 attempts for 8,192 accepted writes:
+35 retries across 7 throttled writes. Internal maps consume the already
+computed seeded XXH3 key hash directly, power-of-two request routing uses a
+mask, and completed Region writes publish to the bounded index partition
+without reacquiring the global Region manager. Recovery retains only physical
+Region/FIFO state; stale index locations remain safe misses because every L2
+record is validated locally.
+
+To separate code effects from run-to-run machine drift, five old-revision runs
+at `7eadb93` were collected immediately after the five current runs. Medians
+from that same-session A/B were:
+
+| Phase | `7eadb93` | Current | Latency change |
+|---|---:|---:|---:|
+| put + drain | 34.027 ms | 30.107 ms | -11.5% |
+| resident L1 get | 76.787 ms | 68.949 ms | -10.2% |
+| warm close | 73.557 ms | 73.027 ms | -0.7% |
+| L2 get + promote | 23.434 ms | 22.877 ms | -2.4% |
+| promoted L1 get | 88.003 ms | 86.159 ms | -2.1% |
+
+The old control needed a median 767 retries across 177 throttled writes. This
+A/B is the relevant regression check; absolute hot-read latency varies enough
+between sessions that historical numbers should not be compared in isolation.
 
 ## M1 local baseline — 2026-08-24
 

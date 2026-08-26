@@ -57,7 +57,8 @@ A `put` follows a direct bounded path:
 5. publish the same sequence to RAM when it fits, before returning;
 6. seal a batch on size, age, or Region rotation;
 7. submit the owned buffer to one configured I/O engine;
-8. publish the index entry only after successful completion.
+8. publish the index entry directly to its index partition only after successful
+   completion, without reacquiring the global Region manager.
 
 Each shard has exactly two staging buffers, allowing one submitted batch and one
 fill batch without allocating per request. RAM entries are byte-bounded per

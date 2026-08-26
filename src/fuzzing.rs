@@ -5,7 +5,7 @@ use crate::format::RecordHeader;
 use crate::index::{IndexEntry, PackedLocation};
 use crate::index_storage::{IndexSlot, PartitionedIndexStorage};
 use crate::recovery::{DataSuperblock, RecoveryImageHeader, StateRecord};
-use crate::region_index::{IndexMutationAuthority, IndexTransition, RegionIndex};
+use crate::region_index::RegionIndex;
 use crate::region_metadata::RegionMetadata;
 
 /// Exercises all persistent byte decoders and a bounded canonical index probe.
@@ -34,8 +34,6 @@ fn fuzz_index_probe(input: &[u8]) {
         return;
     };
     let index = RegionIndex::from_storage(storage);
-    let mut authority = VisibleAuthority;
-
     for chunk in input.get(1..).unwrap_or_default().chunks(24).take(128) {
         let mut bytes = [0_u8; 24];
         bytes[..chunk.len()].copy_from_slice(chunk);
@@ -51,17 +49,7 @@ fn fuzz_index_probe(input: &[u8]) {
             seqno,
             namespace_id: (raw >> 16) as u32,
         };
-        let _ = index.upsert_with_authority(hash, entry, &mut authority);
+        let _ = index.upsert(hash, entry);
         let _ = index.lookup_raw(hash);
     }
-}
-
-struct VisibleAuthority;
-
-impl IndexMutationAuthority for VisibleAuthority {
-    fn is_visible(&self, _entry: IndexEntry) -> bool {
-        true
-    }
-
-    fn commit(&mut self, _transition: IndexTransition) {}
 }

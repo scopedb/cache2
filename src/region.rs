@@ -36,7 +36,7 @@ use crate::recovery::{
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
-use crate::region_index::{IndexMutationAuthority, IndexTransition, RegionIndex};
+use crate::region_index::RegionIndex;
 use crate::region_layout::RegionLayout;
 use crate::region_manager::{RegionManager, RegionMutationError};
 use crate::region_metadata::{
@@ -57,8 +57,6 @@ use crate::runtime_config::{IoMode, RuntimeConfig};
 #[cfg(test)]
 use crate::snapshot::StartupMode;
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, RegionSetSnapshot};
-
-const INDEX_PUBLICATION_CHUNK_RECORDS: usize = 32;
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -121,11 +119,9 @@ impl RegionHealthLatch {
     }
 }
 
-/// The only steady-state owner of Region visibility, FIFO state, and logical
-/// accounting. Its mutex is intentionally narrower than the index: an index
-/// mutation holds it across one bounded shard probe and the matching
-/// accounting commit, but never across record encoding, staging, queueing, or
-/// device I/O.
+/// The steady-state owner of Region allocation, FIFO rotation, and write-span
+/// accounting. Index publication is deliberately independent: sequence order
+/// selects newer entries, and reads validate the physical record locally.
 struct RegionManagerAuthority {
     inner: Mutex<RegionManager>,
     health: RegionHealthLatch,
@@ -176,25 +172,6 @@ impl RegionManagerAuthority {
         }
     }
 
-    fn begin_index_mutation(&self) -> io::Result<RegionIndexMutationAuthority<'_>> {
-        Ok(RegionIndexMutationAuthority {
-            manager: self.lock()?,
-            health: self.health.clone(),
-            accounting_error: None,
-        })
-    }
-
-    fn try_begin_index_mutation(&self) -> io::Result<Option<RegionIndexMutationAuthority<'_>>> {
-        let Some(manager) = self.try_lock()? else {
-            return Ok(None);
-        };
-        Ok(Some(RegionIndexMutationAuthority {
-            manager,
-            health: self.health.clone(),
-            accounting_error: None,
-        }))
-    }
-
     fn into_inner(self) -> io::Result<RegionManager> {
         match self.inner.into_inner() {
             Ok(manager) if self.health.is_healthy() => Ok(manager),
@@ -209,41 +186,6 @@ impl RegionManagerAuthority {
                     "RegionStore Region authority is poisoned",
                 ))
             }
-        }
-    }
-}
-
-/// One manager guard paired with one index mutation. `commit` cannot return
-/// through the index API after the physical slot is installed, so accounting
-/// failures are recorded here, latch miss-only immediately, and are surfaced
-/// when the short critical section ends.
-struct RegionIndexMutationAuthority<'a> {
-    manager: MutexGuard<'a, RegionManager>,
-    health: RegionHealthLatch,
-    accounting_error: Option<RegionMutationError>,
-}
-
-impl RegionIndexMutationAuthority<'_> {
-    fn finish(self) -> io::Result<()> {
-        drop(self.manager);
-        match self.accounting_error {
-            Some(error) => Err(region_mutation_io_error(error)),
-            None => self.health.require_healthy(),
-        }
-    }
-}
-
-impl IndexMutationAuthority for RegionIndexMutationAuthority<'_> {
-    fn is_visible(&self, entry: IndexEntry) -> bool {
-        self.manager.is_visible(entry)
-    }
-
-    fn commit(&mut self, transition: IndexTransition) {
-        if self.accounting_error.is_none()
-            && let Err(error) = self.manager.apply_index_transition(transition)
-        {
-            self.health.enter_miss_only();
-            self.accounting_error = Some(error);
         }
     }
 }
@@ -1007,31 +949,14 @@ impl FileRegionCore {
         Ok(true)
     }
 
-    /// Publishes a completed batch in small fixed chunks. The worker keeps
-    /// batching index work, but never monopolizes global Region authority for
-    /// all records in a maximum-size staging span.
+    /// Publishes a completed batch without entering global Region authority.
+    /// A delayed older completion cannot replace a newer same-hash sequence.
     fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
-        for chunk in records.chunks(INDEX_PUBLICATION_CHUNK_RECORDS) {
-            let mut authority = self.manager.begin_index_mutation()?;
-            let mut index_error = None;
-            for record in chunk.iter().copied() {
-                if let Err(error) =
-                    self.index
-                        .upsert_with_authority(record.hash, record.entry, &mut authority)
-                {
-                    index_error = Some(error);
-                    break;
-                }
-                if authority.accounting_error.is_some() {
-                    break;
-                }
-            }
-            let accounting = authority.finish();
-            if let Some(error) = index_error {
+        for record in records.iter().copied() {
+            if let Err(error) = self.index.upsert(record.hash, record.entry) {
                 self.health.enter_miss_only();
                 return Err(index_storage_io_error(error));
             }
-            accounting?;
         }
         Ok(())
     }
@@ -1048,53 +973,10 @@ impl FileRegionCore {
     }
 
     fn try_remove_expired(&self, hash: u64, expected: IndexEntry) {
-        let Ok(Some(mut authority)) = self.manager.try_begin_index_mutation() else {
-            return;
-        };
-        let removal = self
-            .index
-            .try_remove_if_with_authority(hash, expected, &mut authority);
-        let accounting = authority.finish();
-        match removal {
-            Ok(_) if accounting.is_ok() => {}
-            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. })
-                if accounting.is_ok() => {}
-            Ok(_) | Err(_) => self.health.enter_miss_only(),
-        }
-    }
-
-    #[cfg(test)]
-    fn upsert_entry(&self, hash: u64, entry: IndexEntry) -> io::Result<bool> {
-        self.mutate_index(|index, authority| index.upsert_with_authority(hash, entry, authority))
-    }
-
-    #[cfg(test)]
-    fn remove_entry(&self, hash: u64, expected: IndexEntry) -> io::Result<Option<IndexTransition>> {
-        self.mutate_index(|index, authority| {
-            index.remove_if_with_authority(hash, expected, authority)
-        })
-    }
-
-    #[cfg(test)]
-    fn mutate_index<T>(
-        &self,
-        mutation: impl FnOnce(
-            &RegionIndex,
-            &mut RegionIndexMutationAuthority<'_>,
-        ) -> Result<T, IndexStorageError>,
-    ) -> io::Result<T> {
-        let mut authority = self.manager.begin_index_mutation()?;
-        let result = mutation(&self.index, &mut authority);
-        let accounting = authority.finish();
-        match result {
-            Ok(value) => {
-                accounting?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.health.enter_miss_only();
-                Err(index_storage_io_error(error))
-            }
+        match self.index.try_remove_if(hash, expected) {
+            Ok(_) => {}
+            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {}
+            Err(_) => self.health.enter_miss_only(),
         }
     }
 }
@@ -1218,8 +1100,8 @@ impl RegionFileSystem for SystemRegionFileSystem {
 
 /// Concrete state/index lifecycle backed by one data file and two sidecars.
 ///
-/// It owns the append/read runtime, persists one complete index plus
-/// Region/FIFO/accounting view, and never scans records during open.
+/// It owns the append/read runtime, persists one complete index plus the
+/// Region/FIFO physical view, and never scans records during open.
 pub(crate) struct FileRegionBackend<F = SystemRegionFileSystem>
 where
     F: RegionFileSystem,
@@ -2243,8 +2125,6 @@ fn empty_region_metadata_with_layout(
             durable_used_offset: 0,
             max_seqno: 0,
             physical_record_count: 0,
-            live_record_count: 0,
-            live_record_bytes: 0,
         });
     }
     let partitions = empty_partition_metadata(&partition_ranges)?;
@@ -2411,7 +2291,6 @@ fn guarded_index_result<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexEntry, PackedLocation};
     use crate::index_storage::IndexSlot;
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::io_engine::BackendIoEngine;
@@ -3006,6 +2885,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_record_publication_does_not_enter_region_manager() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let core = Arc::clone(&runtime.core);
+        let manager = core.manager.inner.lock().unwrap();
+        let record = StagedRecord {
+            hash: 7,
+            entry: IndexEntry {
+                location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
+                seqno: 1,
+                namespace_id: 9,
+            },
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let publisher_core = Arc::clone(&core);
+        let publisher = std::thread::spawn(move || {
+            sender
+                .send(publisher_core.publish_completed_records(&[record]))
+                .unwrap();
+        });
+
+        let published = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        drop(manager);
+        publisher.join().unwrap();
+        published.unwrap().unwrap();
+        assert_eq!(runtime.lookup_snapshot(7).unwrap(), Some(record.entry));
+    }
+
+    #[test]
     fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntime::install(
@@ -3450,81 +3362,6 @@ mod tests {
         });
 
         assert!(observed.unwrap().unwrap());
-    }
-
-    #[test]
-    fn index_mutation_and_region_accounting_share_one_failure_fence() {
-        let data = data_path_superblock();
-        let runtime = FileRegionRuntime::install(
-            PartitionedIndexStorage::anonymous(8).unwrap(),
-            empty_region_metadata(data, 8, REGION_SHARDS).unwrap(),
-        )
-        .unwrap();
-
-        let append = |runtime: &FileRegionRuntime| {
-            let mut manager = runtime.manager.lock().unwrap();
-            let reservation = manager.reserve_append(0, 64).unwrap();
-            manager.stage_reservation(reservation).unwrap();
-            let padding = manager.reserve_write_padding(0).unwrap().unwrap();
-            let span = manager.seal_write_span_with_padding(padding).unwrap();
-            manager.complete_write_span(span).unwrap();
-            reservation
-        };
-        let entry_for = |reservation: crate::region_manager::RegionAppendReservation| IndexEntry {
-            location: PackedLocation::new(
-                reservation.region_id,
-                reservation.offset,
-                reservation.record_bytes,
-            )
-            .unwrap(),
-            seqno: reservation.seqno,
-            namespace_id: 0,
-        };
-
-        let first = entry_for(append(&runtime));
-        assert!(runtime.upsert_entry(7, first).unwrap());
-        assert_eq!(
-            runtime
-                .manager
-                .lock()
-                .unwrap()
-                .logical_accounting()
-                .unwrap()
-                .live_record_bytes,
-            64
-        );
-
-        runtime.remove_entry(7, first).unwrap();
-        assert_eq!(
-            runtime
-                .manager
-                .lock()
-                .unwrap()
-                .logical_accounting()
-                .unwrap()
-                .live_record_count,
-            0
-        );
-
-        let second = entry_for(append(&runtime));
-        runtime.upsert_entry(7, second).unwrap();
-        runtime
-            .manager
-            .lock()
-            .unwrap()
-            .apply_index_transition(IndexTransition {
-                previous: crate::index_storage::IndexSlotState::Value {
-                    hash: 7,
-                    entry: second,
-                },
-                installed: crate::index_storage::IndexSlotState::Deleted,
-            })
-            .unwrap();
-
-        let error = runtime.remove_entry(7, second).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(!runtime.health.is_healthy());
-        assert_eq!(runtime.lookup_snapshot(7).unwrap(), None);
     }
 
     fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {
