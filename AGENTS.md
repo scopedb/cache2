@@ -28,8 +28,8 @@ capacity; this is expected to be uncommon in normal operation.
   cases to the normal hit path.
 - L1 lookup and publication retain only short shard-local critical sections.
   Optional insertion and promotion may bypass on pressure.
-- Give every eviction selection, multi-victim admission, and frequency-aging
-  operation a small constant work budget. Exhausting that budget bypasses L1.
+- Give every CLOCK selection and multi-victim admission a small constant work
+  budget. Exhausting that budget bypasses L1.
 - Never hold a lock across device I/O. Keep mutation critical sections short
   and shard-local whenever possible.
 - Publish Region writes in batches. Never add per-record flushes, syncs, or
@@ -92,7 +92,6 @@ capacity; this is expected to be uncommon in normal operation.
   throttling, misses, and stale reads are valid outcomes.
 - Publish an L2 index entry only after the corresponding data write completes.
 - `drain` is an accepted-write completion barrier, not a durability sync.
-- `flush` drains accepted writes and then issues the device data-sync operation.
 - Warm close publishes a clean recovery image. Fast close or an unclean exit
   must recover safely as an empty cache rather than trust incomplete state.
 

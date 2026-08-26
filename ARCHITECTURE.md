@@ -63,16 +63,15 @@ A `put` follows a direct bounded path:
 Each shard has exactly two staging buffers, allowing one submitted batch and one
 fill batch without allocating per request. RAM entries are byte-bounded per
 shard and immediately eligible for eviction. Victim order is selected at
-runtime from CLOCK, LRU, TinyLFU admission over LRU, SIEVE, FIFO, or S3-FIFO.
-The policy owns only slot-order metadata; capacity charging and full-key
-validation remain one common mechanism. Values that do not fit L1 continue
-through L2 without an additional queue. FIFO Region reuse remains the only SSD
-replacement policy.
+runtime by shard-local CLOCK with a fixed scan budget. Capacity charging and
+full-key validation remain separate from its visited-bit metadata. Values that
+do not fit L1 continue through L2 without an additional queue. FIFO Region
+reuse remains the only SSD replacement policy.
 L1 capacity remains charged through the last returned value handle, so eviction
 cannot hide memory retained by a slow caller.
 
 A `delete` follows the same append shard, sequence allocation, fixed staging,
-batch completion, and backpressure path. Its foreground work adds only one
+batch completion, and immediate-rejection admission path. Its foreground work adds only one
 best-effort exact-key L1 removal. Completion replaces an older same-hash index
 value with a sequenced tombstone encoded in the existing 24-byte slot; a newer
 put may replace it, and an already missing delete consumes no index slot. Reads
@@ -89,11 +88,10 @@ with the L1/L2 capacity ratio, and has a 4 KiB-density floor so deliberate L2
 headroom does not make L1 unusably sparse. Fixed metadata is reserved
 separately in the aggregate memory plan.
 
-TinyLFU uses an aged four-row 4-bit frequency sketch sized from that fixed entry
-plan. S3-FIFO divides resident bytes into 10% small and 90% main targets and
-preallocates its non-resident hash-only ghost ring and membership table from the
-same plan. Both structures may discard optional admission history when their
-constant probe/work budgets are exhausted.
+CLOCK keeps one resident/visited bit per fixed policy slot. Lookup marks the
+slot visited; insertion advances one shard-local hand for at most 64 slots,
+clearing visited bits before selecting a victim. Exhausting that fixed budget
+bypasses L1 insertion.
 
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
 L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
@@ -128,9 +126,6 @@ state becomes an empty cache; intact unsupported format versions also cold-start
 empty. The data extent is never scanned. L1 is always created empty and warms through L2
 reads; it is never serialized into the clean image.
 
-`flush` drains and data-syncs current writes but deliberately does not publish
-`CLEAN`; only graceful ownership termination may create recoverable state.
-
 ## Configuration identity
 
 Static configuration is included in the data superblock fingerprint and clean
@@ -154,8 +149,8 @@ configurations with identical physical behavior.
 
 Runtime configuration is not persisted and may change between opens. It
 includes I/O engine and mode, worker count, total I/O concurrency,
-L1 capacity and eviction policy, write-buffer and batch sizes, flush delay,
-aggregate memory limit, waiting-policy write limit, and write backpressure. Foreground L2 reads
+L1 capacity and shard count, one write-batch capacity, aggregate memory limit,
+and optional statistics. Foreground L2 reads
 reserve one immediately available engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public
 admission policy. Write occupancy leaves the final slot of a multi-entry I/O
@@ -183,7 +178,7 @@ separately classify read-memory and busy-engine misses.
 
 `HybridCache::snapshot()` also reads relaxed process-local counters for puts,
 deletes, L1/L2 hits and misses, read-memory and busy-engine misses, L1 promotions,
-evictions/bypasses/admission rejections, logical bytes, write rejections, failures,
+evictions/bypasses, logical bytes, write rejections, failures,
 and Region rotations. Health is `Running`,
 transiently `Draining`, one-way `MissOnly` for
 fail-open reads, or `Failed` after a shard worker terminates. None of this state

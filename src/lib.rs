@@ -34,11 +34,9 @@ mod runtime_config;
 mod snapshot;
 
 pub use cache::{CacheTier, HybridCache, HybridCacheConfig, Result, StaticConfig, Value};
-pub use eviction::EvictionPolicy;
 pub use region_layout::{RegionSetAllocation, RegionSetConfig, RegionSetId};
-pub use resources::WriteBackpressure;
 pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot,
-    CacheWriteSnapshot, DetailedCacheSnapshot, RegionSetSnapshot, StartupMode,
+    DetailedCacheSnapshot, RegionSetSnapshot, StartupMode,
 };

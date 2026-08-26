@@ -98,13 +98,6 @@ impl FixedPrehashedMap {
         None
     }
 
-    pub(crate) fn remove_if(&mut self, hash: u64, expected: u32) -> bool {
-        if self.get(hash) != Some(expected) {
-            return false;
-        }
-        self.remove(hash) == Some(expected)
-    }
-
     fn find_upsert_slot(&self, hash: u64) -> Option<(usize, Option<u32>)> {
         let slots = &self.slots;
         if slots.is_empty() {
@@ -168,7 +161,7 @@ mod tests {
         assert_eq!(map.get(7), Some(11));
         assert_eq!(map.get(u64::MAX), Some(13));
         assert_eq!(map.insert(7, 17), Some(Some(11)));
-        assert!(map.remove_if(7, 17));
+        assert_eq!(map.remove(7), Some(17));
         assert_eq!(map.get(7), None);
         assert_eq!(map.insert(23, 19), Some(None));
         assert_eq!(map.get(23), Some(19));

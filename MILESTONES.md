@@ -73,7 +73,7 @@ is intended to serve.
   index in a swap-free, RAM-backed Linux VM;
 - [ ] benchmark Linux NVMe with sync/buffered, sync/direct, and io_uring/direct;
 - [x] measure worker scaling at 1, 2, 4, 8, and 16 workers with fixed workloads;
-- [x] run external-process kill tests at open, write, drain, flush, and warm-close
+- [x] run external-process kill tests at open, write, drain, and warm-close
   publication boundaries;
 - [ ] run capacity-turnover and mixed read/write soak tests while sampling RSS,
   managed bytes, logical disk bytes, latency, and error counts;

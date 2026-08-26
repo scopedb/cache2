@@ -16,8 +16,7 @@ The persistence contract is intentionally narrow:
 ## Usage
 
 ```rust
-use std::time::Duration;
-use cache_rs::{EvictionPolicy, HybridCacheConfig, IoEngine, RuntimeConfig, StaticConfig};
+use cache_rs::{HybridCacheConfig, IoEngine, RuntimeConfig, StaticConfig};
 
 let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
     .with_region_size(32 * 1024 * 1024)
@@ -29,12 +28,10 @@ let runtime_config = RuntimeConfig::default()
     .with_l1_capacity(8 * 1024 * 1024 * 1024)
     .with_memory_limit(10 * 1024 * 1024 * 1024)
     .with_l1_shards(64)
-    .with_eviction_policy(EvictionPolicy::Sieve)
     .with_io_engine(IoEngine::Auto)
     .with_io_workers(16)
     .with_io_concurrency(512)
-    .with_waiting_write_limit(256)
-    .with_write_flush_delay(Duration::from_millis(1));
+    .with_write_batch_size(4 * 1024 * 1024);
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
     .with_runtime_config(runtime_config)
@@ -107,15 +104,13 @@ into the bounded per-shard write buffer before returning. The value is readable
 from L1 while its device write is still in flight and is immediately eligible
 for normal eviction. Values that do not fit their RAM shard bypass L1 and
 continue through L2. Successful completion publishes the L2 index entry. The
-default write backpressure policy rejects immediately when the fixed shard
-write buffer is saturated; it has no global write-admission gate. Only an
-explicitly selected `Block` or `Timeout` policy may wait for write-side
-capacity. Any write may briefly wait for the shard mutation gate. Region
-manager contention follows the selected backpressure policy after one
-non-waiting probe. Neither path holds a lock across device I/O.
+write admission rejects immediately with `WouldBlock` when the fixed shard
+buffer is saturated or its short mutation path is contended; there is no
+global write-admission gate, wait policy, deadline, or foreground retry loop.
+Neither path holds a lock across device I/O.
 
 `delete` uses the same shard routing, monotonic sequence, fixed staging, and
-write backpressure as `put`. It performs one best-effort exact-key L1 cleanup
+write admission as `put`. It performs one best-effort exact-key L1 cleanup
 before returning, then replaces a matching L2 index candidate with a sequenced
 tombstone only after the containing Region batch completes. The tombstone uses
 the existing 24-byte slot and prevents an older same-hash index publication
@@ -147,9 +142,8 @@ rule. Point hashes and record sizes are
 computed once per operation, and L1 admits at most eight distinct full keys for
 one 64-bit hash so collision work remains constant-bounded.
 
-Use `drain` when the caller needs all accepted Region writes completed, and
-`flush` when completed data should also be issued through the device data-sync
-primitive. Neither operation creates a recovery image.
+Use `drain` when the caller needs all accepted Region writes completed. It does
+not sync data or create a recovery image.
 
 Keys are limited to 4 KiB and values to 256 KiB. Oversized mutations return
 `InvalidInput`; an oversized lookup is a miss. Each admitted device operation
@@ -163,10 +157,10 @@ reads fail open as misses.
 `StaticConfig` defines file-layout identity:
 
 - capacity and Region size;
-- index slot count;
+- expected-entry-derived index slot count;
 - write-shard count;
 - RegionSet capacity layout and namespace ownership;
-- seeded XXH3-64 key hashing and its hash seed.
+- seeded XXH3-64 key hashing with a fixed internal seed.
 
 Changing one of these values safely formats an empty cache. `RuntimeConfig`
 may change on every open without invalidating a clean image:
@@ -174,20 +168,13 @@ may change on every open without invalidating a clean image:
 - sync/automatic/io_uring engine selection;
 - buffered/automatic/direct I/O mode;
 - any positive I/O worker count within the configured total I/O concurrency;
-- total I/O concurrency and the waiting-policy write limit;
-- L1 capacity, L1 shard count, eviction policy, aggregate memory
-  limit, write-buffer size, batch size, flush delay, backpressure, and opt-in
-  operational counters.
+- total I/O concurrency;
+- L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
+  batch capacity, and opt-in operational counters.
 
-The RAM tier supports `Clock` (default), `Lru`, `TinyLfu`, `Sieve`, `Fifo`, and
-`S3Fifo`. Victim search, multi-entry eviction, and frequency aging use fixed
-per-operation work budgets; budget exhaustion bypasses L1. TinyLFU uses a
-compact incrementally aged frequency sketch to admit candidates
-against an LRU victim. S3-FIFO uses byte-targeted small/main queues and a
-bounded hash-only ghost queue; a ghost collision can affect admission but never
-key/value correctness because resident hits still verify namespace and the
-complete key. The selected policy is runtime-only and may change on a warm
-reopen without invalidating the Region image.
+The RAM tier uses shard-local CLOCK. Victim search and multi-entry eviction use
+fixed per-operation work budgets; budget exhaustion bypasses L1. Resident hits
+still verify namespace and the complete key.
 
 RAM is never recovered. A warm reopen maps the clean Region index and repopulates
 L1 through read promotion.
@@ -215,7 +202,7 @@ atomic warm publication.
 
 Invalid runtime topology is rejected before cache files are opened or created.
 `HybridCache::snapshot()` reports puts, deletes, tier hits/misses, promotions,
-L1 evictions, bypasses and TinyLFU admission rejections, served and written bytes,
+L1 evictions and bypasses, served and written bytes,
 overload/failure/rotation counters, lifecycle health, current and peak managed
 memory against its configured limit, and the configured logical-disk peak.
 Managed figures deliberately exclude allocator metadata, buffered-I/O page
@@ -225,8 +212,8 @@ Data-path counters reset on every open and are enabled with
 the performance-first path. Index reuse/replacement counters follow the same
 switch; fixed capacity and physical occupancy remain available when it is off.
 
-`HybridCache::detailed_snapshot()` adds current/peak write admission,
-cumulative write wait and rejection counters, aggregate worker I/O activity,
+`HybridCache::detailed_snapshot()` adds write-buffer rejection counters,
+aggregate worker I/O activity,
 fixed/resident/retained L1 accounting, physical index occupancy and bounded
 slot-reuse/replacement counters, and per-RegionSet capacity, occupancy, queue
 state, and process-local rotations.
@@ -244,11 +231,10 @@ allocates only its actual aligned read range against the aggregate memory
 limit; allocation or I/O-engine pressure is an observable cache miss. Write
 occupancy cannot consume the final slot of a multi-entry I/O engine.
 Promoted hits release the temporary allocation before return;
-unpromoted zero-copy Region values retain it. For writes,
-`WriteBackpressure::Reject` returns `WouldBlock` immediately from the shard
-write buffer; `Block` waits for capacity and `Timeout` waits only for the configured
-duration. `CacheSnapshot::write_rejections` counts all write-side overloads;
-`detailed_snapshot()` separates write-gate and write-buffer pressure. A
+unpromoted zero-copy Region values retain it. Writes return `WouldBlock`
+immediately on shard-buffer or mutation-path pressure.
+`CacheSnapshot::write_rejections` counts all write-side overloads;
+`detailed_snapshot()` reports shard-buffer pressure. A
 device or structural failure increments
 `io_failures` and moves health to `MissOnly` or `Failed`; reads then fail open
 as misses, while writes remain explicit errors.
@@ -256,8 +242,8 @@ as misses, while writes remain explicit errors.
 Use `close_fast` (or ordinary drop) when restart warmth is not worth an
 O(index) image write. The next open is empty. Use `close_warm` only after the
 service has stopped admitting application work and wants a recoverable clean
-image. `drain` is an I/O completion fence and `flush` additionally asks the
-device to data-sync, but neither makes the cache recoverable.
+image. `drain` is an I/O completion fence but does not make the cache
+recoverable.
 
 ## Capacity planning
 
@@ -287,8 +273,8 @@ device to data-sync, but neither makes the cache recoverable.
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
 5. Start with four workers and measure 1/2/4/8/16 on the target device. Worker
-   count, I/O concurrency, memory, write buffering, and backpressure are runtime settings and
-   may change across a warm restart.
+   count, I/O concurrency, memory, and write-batch capacity are runtime settings
+   and may change across a warm restart.
 
 The reproducible baseline, Linux NVMe matrix, regression thresholds, and soak
 procedure are in `BENCHMARK.md`.
@@ -310,7 +296,7 @@ promoted L1 set. The default data set is 8,192 × 16 KiB.
 `CACHE_BENCH_MEMORY_LIMIT_MIB`, `CACHE_BENCH_SHARDS`,
 `CACHE_BENCH_IO_WORKERS`, `CACHE_BENCH_CLIENTS`,
 `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
-`CACHE_BENCH_EVICTION`, and `CACHE_BENCH_DIR` adjust the workload and device
+`CACHE_BENCH_DIR` adjust the workload and device
 configuration. Set
 `CACHE_BENCH_DIR` to a mounted cache device when measuring device I/O rather
 than the system temporary directory.

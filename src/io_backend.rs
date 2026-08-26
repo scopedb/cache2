@@ -270,7 +270,6 @@ pub(crate) enum SyncPoint {
     FormatData,
     StateReset,
     RunningState,
-    ExplicitFlush,
     WarmData,
     RecoveryImage,
     CleanState,

@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{
-    CacheHealth, DetailedCacheSnapshot, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine,
-    IoMode, RuntimeConfig, StaticConfig,
+    CacheHealth, DetailedCacheSnapshot, HybridCache, HybridCacheConfig, IoEngine, IoMode,
+    RuntimeConfig, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -30,7 +30,6 @@ struct SoakConfig {
     readers: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
-    eviction_policy: EvictionPolicy,
     directory: PathBuf,
 }
 
@@ -55,7 +54,6 @@ impl SoakConfig {
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
-        let eviction_policy = parse_eviction_policy("CACHE_SOAK_EVICTION")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
@@ -90,7 +88,6 @@ impl SoakConfig {
             readers,
             io_engine,
             io_mode,
-            eviction_policy,
             directory,
         })
     }
@@ -108,10 +105,8 @@ impl SoakConfig {
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
             .with_io_concurrency(self.io_workers.saturating_mul(64))
-            .with_waiting_write_limit(256)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_bytes.saturating_add(256 * MIB))
-            .with_eviction_policy(self.eviction_policy)
             .with_statistics(true)
     }
 }
@@ -251,7 +246,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} delete_interval={} engine={:?} mode={:?} eviction={:?} peak_disk={} rss_slack={}",
+        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -269,7 +264,6 @@ fn main() -> io::Result<()> {
         DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
-        config.eviction_policy,
         peak_disk_bytes,
         config.rss_slack_bytes,
     );
@@ -565,10 +559,10 @@ fn resource_sample(
     files: &SoakFiles,
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,
-    flush: bool,
+    drain: bool,
 ) -> io::Result<ResourceSample> {
-    if flush {
-        cache.flush()?;
+    if drain {
+        cache.drain()?;
     }
     let logical_bytes = files.logical_bytes()?;
     if logical_bytes > peak_disk_bytes {
@@ -609,7 +603,7 @@ fn report_sample(
     let detailed = &sample.detailed;
     let resources = detailed.summary;
     println!(
-        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
+        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
         elapsed.as_secs_f64(),
         counters.writes,
         counters.deletes,
@@ -627,7 +621,6 @@ fn report_sample(
         resources.l1_promotions,
         resources.l1_evictions,
         resources.l1_bypasses,
-        resources.l1_admission_rejections,
         resources.write_rejections,
         resources.region_rotations,
         detailed.l1.resident_entries,
@@ -759,21 +752,6 @@ fn parse_io_mode(name: &str) -> io::Result<IoMode> {
         "auto" => Ok(IoMode::Auto),
         "direct" => Ok(IoMode::Direct),
         value => Err(invalid(format!("unsupported I/O mode: {value}"))),
-    }
-}
-
-fn parse_eviction_policy(name: &str) -> io::Result<EvictionPolicy> {
-    match env::var(name)
-        .unwrap_or_else(|_| "clock".to_owned())
-        .as_str()
-    {
-        "clock" => Ok(EvictionPolicy::Clock),
-        "lru" => Ok(EvictionPolicy::Lru),
-        "tinylfu" | "tiny-lfu" => Ok(EvictionPolicy::TinyLfu),
-        "sieve" => Ok(EvictionPolicy::Sieve),
-        "fifo" => Ok(EvictionPolicy::Fifo),
-        "s3fifo" | "s3-fifo" => Ok(EvictionPolicy::S3Fifo),
-        value => Err(invalid(format!("unsupported eviction policy: {value}"))),
     }
 }
 

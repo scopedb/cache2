@@ -6,57 +6,18 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
-
-use crate::snapshot::CacheWriteSnapshot;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured
 /// topology cannot inherit an environment-dependent `RUST_MIN_STACK` value.
 pub(crate) const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_CONFIG_COUNT: usize = 65_536;
-pub(crate) const MAX_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Behavior when a foreground write gate or fixed write buffer is full.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum WriteBackpressure {
-    /// Reject immediately without changing cache state or disk contents.
-    #[default]
-    Reject,
-    /// Block the calling thread until capacity becomes available.
-    Block,
-    /// Block the calling thread for at most the supplied duration.
-    Timeout(Duration),
-}
-
-/// The bounded resource that prevented an internal operation from admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WriteOverloadReason {
-    /// The write or reserved control submission gate is at capacity.
-    WriteGateBusy,
-    /// The fixed append-shard write buffers are full or rotating.
-    WriteBufferBusy,
-    /// Write/control admission exceeded the configured timeout.
-    Timeout,
-}
-
-impl fmt::Display for WriteOverloadReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::WriteGateBusy => "write gate is busy",
-            Self::WriteBufferBusy => "write buffer is busy",
-            Self::Timeout => "write backpressure timeout expired",
-        })
-    }
-}
 
 pub(crate) struct ResourceLimits {
     pub(crate) memory_limit_bytes: usize,
     pub(crate) reserved_memory_bytes: usize,
-    pub(crate) waiting_write_limit: usize,
 }
 
 #[derive(Debug)]
@@ -76,7 +37,6 @@ impl fmt::Display for ResourceBuildError {
 
 pub(crate) struct ResourceController {
     memory: Arc<MemoryTracker>,
-    write_gate: Arc<WriteGate>,
 }
 
 /// A fixed runtime allocation charged to the same hard memory limit as the
@@ -95,16 +55,6 @@ impl Drop for RuntimeMemoryReservation {
 
 impl ResourceController {
     pub(crate) fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
-        if limits.waiting_write_limit == 0 {
-            return Err(ResourceBuildError::Invalid(
-                "waiting write limit must be at least 1",
-            ));
-        }
-        if limits.waiting_write_limit > MAX_CONFIG_COUNT {
-            return Err(ResourceBuildError::Invalid(
-                "waiting write limit exceeds its hard limit",
-            ));
-        }
         if limits.reserved_memory_bytes > limits.memory_limit_bytes {
             return Err(ResourceBuildError::Invalid(
                 "memory limit cannot hold the cache's reserved memory",
@@ -115,10 +65,7 @@ impl ResourceController {
             limits.memory_limit_bytes,
             limits.reserved_memory_bytes,
         ));
-        Ok(Self {
-            write_gate: Arc::new(WriteGate::new(limits.waiting_write_limit)),
-            memory,
-        })
+        Ok(Self { memory })
     }
 
     pub(crate) fn reserve_runtime_memory(
@@ -140,47 +87,12 @@ impl ResourceController {
         BufferLease::try_standalone(length, Arc::clone(&self.memory))
     }
 
-    /// Admit a write whose payload already lives in engine-owned storage.
-    ///
-    /// RegionStore encodes directly into its fixed per-shard write
-    /// buffers, so leasing another general-purpose write buffer here would
-    /// double-account memory and reduce useful concurrency.
-    pub(crate) fn begin_write_permit_until(
-        &self,
-        policy: WriteBackpressure,
-        deadline: Option<Instant>,
-    ) -> Result<WritePermit, WriteOverloadReason> {
-        let wait = match policy {
-            WriteBackpressure::Reject => WaitMode::Reject,
-            WriteBackpressure::Block => WaitMode::Block,
-            WriteBackpressure::Timeout(_) => {
-                WaitMode::Deadline(deadline.unwrap_or_else(Instant::now))
-            }
-        };
-        self.write_gate.enter(wait)
-    }
-
     pub(crate) fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
         let current_bytes = self.memory.current.load(Ordering::Relaxed);
         ManagedMemorySnapshot {
             limit_bytes: self.memory.limit,
             current_bytes,
             peak_bytes: self.memory.peak.load(Ordering::Relaxed).max(current_bytes),
-        }
-    }
-
-    pub(crate) fn runtime_snapshot(
-        &self,
-        write_buffer_rejections: u64,
-        write_buffer_wait_ns: u64,
-    ) -> CacheWriteSnapshot {
-        CacheWriteSnapshot {
-            write_requests_in_flight: usize_to_u64(self.write_gate.current.load(Ordering::Relaxed)),
-            write_requests_peak: usize_to_u64(self.write_gate.peak.load(Ordering::Relaxed)),
-            write_gate_rejections: self.write_gate.rejections.load(Ordering::Relaxed),
-            write_gate_wait_ns: self.write_gate.wait_ns.load(Ordering::Relaxed),
-            write_buffer_rejections,
-            write_buffer_wait_ns,
         }
     }
 }
@@ -190,97 +102,6 @@ pub(crate) struct ManagedMemorySnapshot {
     pub(crate) limit_bytes: usize,
     pub(crate) current_bytes: usize,
     pub(crate) peak_bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-enum WaitMode {
-    Reject,
-    Block,
-    Deadline(Instant),
-}
-
-struct WriteGate {
-    limit: usize,
-    state: Mutex<usize>,
-    available: Condvar,
-    current: AtomicUsize,
-    peak: AtomicUsize,
-    rejections: AtomicU64,
-    wait_ns: AtomicU64,
-}
-
-impl WriteGate {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            state: Mutex::new(0),
-            available: Condvar::new(),
-            current: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            rejections: AtomicU64::new(0),
-            wait_ns: AtomicU64::new(0),
-        }
-    }
-
-    fn enter(self: &Arc<Self>, wait: WaitMode) -> Result<WritePermit, WriteOverloadReason> {
-        let mut wait_started = None;
-        let mut state = lock_unpoisoned(&self.state);
-        while *state == self.limit {
-            if wait_started.is_none() && !matches!(wait, WaitMode::Reject) {
-                wait_started = Some(Instant::now());
-            }
-            state = match wait {
-                WaitMode::Reject => {
-                    self.rejections.fetch_add(1, Ordering::Relaxed);
-                    return Err(WriteOverloadReason::WriteGateBusy);
-                }
-                WaitMode::Block => wait_unpoisoned(&self.available, state),
-                WaitMode::Deadline(deadline) => {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WriteOverloadReason::Timeout);
-                    };
-                    let (guard, timed_out) =
-                        wait_timeout_unpoisoned(&self.available, state, remaining);
-                    if timed_out && *guard == self.limit {
-                        self.rejections.fetch_add(1, Ordering::Relaxed);
-                        add_wait_duration(&self.wait_ns, wait_started);
-                        return Err(WriteOverloadReason::Timeout);
-                    }
-                    guard
-                }
-            };
-        }
-        *state += 1;
-        let current = *state;
-        self.current.store(current, Ordering::Relaxed);
-        update_peak(&self.peak, current);
-        add_wait_duration(&self.wait_ns, wait_started);
-        Ok(WritePermit {
-            gate: Arc::clone(self),
-        })
-    }
-
-    fn release(&self) {
-        let mut state = lock_unpoisoned(&self.state);
-        debug_assert!(*state != 0);
-        if *state != 0 {
-            *state -= 1;
-        }
-        self.current.store(*state, Ordering::Relaxed);
-        self.available.notify_one();
-    }
-}
-
-pub(crate) struct WritePermit {
-    gate: Arc<WriteGate>,
-}
-
-impl Drop for WritePermit {
-    fn drop(&mut self) {
-        self.gate.release();
-    }
 }
 
 pub(crate) struct BufferLease {
@@ -557,63 +378,11 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|sum| sum / alignment * alignment)
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-    condvar
-        .wait(guard)
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_timeout_unpoisoned<'a, T>(
-    condvar: &Condvar,
-    guard: MutexGuard<'a, T>,
-    duration: Duration,
-) -> (MutexGuard<'a, T>, bool) {
-    match condvar.wait_timeout(guard, duration) {
-        Ok((guard, result)) => (guard, result.timed_out()),
-        Err(poisoned) => {
-            let (guard, result) = poisoned.into_inner();
-            (guard, result.timed_out())
-        }
-    }
-}
-
 fn update_peak(peak: &AtomicUsize, candidate: usize) {
     peak.fetch_max(candidate, Ordering::Relaxed);
 }
 
-fn add_duration(counter: &AtomicU64, duration: Duration) {
-    let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
-    atomic_saturating_add(counter, nanos);
-}
-
 const MAX_ATOMIC_UPDATE_ATTEMPTS: usize = 8;
-
-fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
-    let mut current = counter.load(Ordering::Relaxed);
-    for _ in 0..MAX_ATOMIC_UPDATE_ATTEMPTS {
-        let next = current.saturating_add(value);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn add_wait_duration(counter: &AtomicU64, started: Option<Instant>) {
-    if let Some(started) = started {
-        add_duration(counter, started.elapsed());
-    }
-}
-
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
 
 #[cfg(test)]
 mod tests {
@@ -623,7 +392,6 @@ mod tests {
         ResourceLimits {
             memory_limit_bytes: 128 * 1024,
             reserved_memory_bytes: 16 * 1024,
-            waiting_write_limit: 2,
         }
     }
 
@@ -674,54 +442,6 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
-    }
-
-    #[test]
-    fn write_timeout_is_bounded_and_counted() {
-        let resources = ResourceController::try_new(limits()).unwrap();
-        let deadline = || Some(Instant::now() + Duration::from_millis(20));
-        let policy = WriteBackpressure::Timeout(Duration::from_millis(1));
-        let _first = resources
-            .begin_write_permit_until(policy, deadline())
-            .unwrap();
-        let _second = resources
-            .begin_write_permit_until(policy, deadline())
-            .unwrap();
-        assert_eq!(
-            resources.begin_write_permit_until(policy, deadline()).err(),
-            Some(WriteOverloadReason::Timeout)
-        );
-        let snapshot = resources.runtime_snapshot(0, 0);
-        assert_eq!(snapshot.write_gate_rejections, 1);
-        assert!(snapshot.write_gate_wait_ns > 0);
-    }
-
-    #[test]
-    fn blocking_write_admission_resumes_after_a_permit_drops() {
-        let resources = Arc::new(ResourceController::try_new(limits()).unwrap());
-        let first = resources
-            .begin_write_permit_until(WriteBackpressure::Block, None)
-            .unwrap();
-        let _second = resources
-            .begin_write_permit_until(WriteBackpressure::Block, None)
-            .unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
-        let worker_resources = Arc::clone(&resources);
-        let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let _permit = worker_resources
-                .begin_write_permit_until(WriteBackpressure::Block, None)
-                .unwrap();
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv().unwrap();
-        assert!(done_rx.try_recv().is_err());
-        assert_eq!(resources.runtime_snapshot(0, 0).write_requests_in_flight, 2);
-        drop(first);
-        done_rx.recv().unwrap();
-        worker.join().unwrap();
     }
 
     #[test]

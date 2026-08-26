@@ -14,11 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
-use crate::io_backend::{RuntimeFileSet, SyncMode, SyncPoint};
-use crate::io_engine::{
-    IoEngine, IoOperation, MAX_IO_REQUESTS_PER_WORKER, OperationKind, build_file_engine,
-    submit_cache_io,
-};
+use crate::io_backend::RuntimeFileSet;
+use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_WORKER, build_file_engine};
 use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValue};
 use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
@@ -26,8 +23,8 @@ use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_reader::{_READ_ALIGNMENT, plan_read};
 use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
-    CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
-    ResourceBuildError, ResourceController, ResourceLimits, WriteBackpressure, WriteOverloadReason,
+    CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
+    ResourceController, ResourceLimits,
 };
 use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, RuntimeConfig};
 use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
@@ -46,7 +43,7 @@ const MAX_READ_BUFFER_BYTES: usize = const_align_up(
     MAX_RUNTIME_RECORD_BYTES + (_READ_ALIGNMENT - RECORD_ALIGNMENT),
     _READ_ALIGNMENT,
 );
-const MAX_WRITE_FLUSH_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
 // Covers the bounded engine registry, command channel, and driver-side
 // bookkeeping for one admitted I/O operation. Payload buffers are charged by
@@ -104,7 +101,6 @@ struct RuntimeMetrics {
     activity: Box<[ActivityMetrics]>,
     write_rejections: AtomicU64,
     write_buffer_rejections: AtomicU64,
-    write_buffer_wait_ns: AtomicU64,
     io_failures: AtomicU64,
     region_rotations: AtomicU64,
 }
@@ -157,7 +153,6 @@ impl RuntimeMetrics {
             activity: activity.into_boxed_slice(),
             write_rejections: AtomicU64::new(0),
             write_buffer_rejections: AtomicU64::new(0),
-            write_buffer_wait_ns: AtomicU64::new(0),
             io_failures: AtomicU64::new(0),
             region_rotations: AtomicU64::new(0),
         })
@@ -178,14 +173,6 @@ impl RuntimeMetrics {
 
     fn increment(counter: &AtomicU64) {
         Self::add(counter, 1);
-    }
-
-    fn add_duration(counter: &AtomicU64, started: Option<Instant>) {
-        let Some(started) = started else {
-            return;
-        };
-        let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        counter.fetch_add(elapsed, Ordering::Relaxed);
     }
 
     fn record_write_rejection(&self) {
@@ -254,7 +241,6 @@ impl RuntimeMetrics {
             l1_promotions,
             l1_evictions: memory_metrics.evictions,
             l1_bypasses: memory_metrics.bypasses,
-            l1_admission_rejections: memory_metrics.admission_rejections,
             write_rejections: self.write_rejections.load(Ordering::Relaxed),
             io_failures: self.io_failures.load(Ordering::Relaxed),
             region_rotations: self.region_rotations.load(Ordering::Relaxed),
@@ -280,18 +266,6 @@ impl RuntimeConfig {
                 "I/O concurrency per worker exceeds 4096",
             ));
         }
-        if self.waiting_write_limit == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "waiting write limit must be non-zero",
-            ));
-        }
-        if self.waiting_write_limit > MAX_CONFIG_COUNT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "waiting write limit exceeds 65536",
-            ));
-        }
         if self.memory_limit_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -310,32 +284,15 @@ impl RuntimeConfig {
                 "L1 shards must be in 1..=65536",
             ));
         }
-        if matches!(
-            self.write_backpressure,
-            WriteBackpressure::Timeout(duration) if duration > MAX_BACKPRESSURE_TIMEOUT
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backpressure timeout must not exceed 24 hours",
-            ));
-        }
-        if self.write_flush_delay > MAX_WRITE_FLUSH_DELAY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "write flush delay must not exceed 24 hours",
-            ));
-        }
-        if self.write_buffer_bytes == 0
-            || self.write_buffer_bytes > MAX_WRITE_BATCH_BYTES
+        if self.write_batch_bytes == 0
+            || self.write_batch_bytes > MAX_WRITE_BATCH_BYTES
             || !self
-                .write_buffer_bytes
+                .write_batch_bytes
                 .is_multiple_of(crate::resources::BUFFER_ALIGNMENT)
-            || self.write_batch_bytes == 0
-            || self.write_batch_bytes > self.write_buffer_bytes
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "write buffer and batch sizes must be aligned and within 1..=4 MiB",
+                "write batch size must be aligned and within 1..=4 MiB",
             ));
         }
         Ok(())
@@ -353,7 +310,6 @@ impl RuntimeConfig {
             self.l1_capacity_bytes,
             l1_entry_capacity,
             self.l1_shards,
-            self.eviction_policy,
         )?;
         let fixed_bytes =
             crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
@@ -421,7 +377,7 @@ impl RuntimeConfig {
         let usable_region = usize::try_from(geometry.region_size)
             .map_err(|_| invalid_runtime_config("Region size does not fit the memory plan"))?;
         let chunk_bytes =
-            usable_region.min(self.write_buffer_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+            usable_region.min(self.write_batch_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
         let write_buffer_reservation =
             RegionStaging::reservation_bytes(shard_count, chunk_bytes)
                 .ok_or_else(|| invalid_runtime_config("write buffer memory plan overflow"))?;
@@ -497,7 +453,6 @@ struct RunningShared {
     staging: Arc<RegionStaging>,
     shards: Box<[Arc<ShardControl>]>,
     write_batch_bytes: usize,
-    write_flush_delay: Duration,
     statistics: bool,
 }
 
@@ -529,7 +484,6 @@ impl ShardFailure {
 #[derive(Default)]
 struct ShardControlState {
     wake_flags: u8,
-    progress: u64,
     drain_requested: u64,
     drain_completed: u64,
     stop: bool,
@@ -549,14 +503,6 @@ impl ShardControl {
         }
     }
 
-    fn progress(&self) -> io::Result<u64> {
-        let state = self.lock()?;
-        if let Some(failure) = &state.failure {
-            return Err(failure.to_error());
-        }
-        Ok(state.progress)
-    }
-
     fn notify(&self, flags: u8) -> io::Result<()> {
         let mut state = self.lock()?;
         if let Some(failure) = &state.failure {
@@ -568,40 +514,6 @@ impl ShardControl {
         state.wake_flags |= flags;
         self.changed.notify_one();
         Ok(())
-    }
-
-    fn wait_for_progress_until(
-        &self,
-        observed: u64,
-        deadline: Option<Instant>,
-    ) -> io::Result<bool> {
-        let mut state = self.lock()?;
-        while state.progress == observed && state.failure.is_none() && !state.stop {
-            state = if let Some(deadline) = deadline {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    return Ok(false);
-                };
-                let (next, timeout) = self
-                    .changed
-                    .wait_timeout(state, remaining)
-                    .map_err(|_| poisoned_runtime_error())?;
-                if timeout.timed_out() && next.progress == observed {
-                    return Ok(false);
-                }
-                next
-            } else {
-                self.changed
-                    .wait(state)
-                    .map_err(|_| poisoned_runtime_error())?
-            };
-        }
-        if let Some(failure) = &state.failure {
-            return Err(failure.to_error());
-        }
-        if state.progress == observed {
-            return Err(closed_runtime_error());
-        }
-        Ok(true)
     }
 
     fn request_drain(&self, stop: bool) -> io::Result<u64> {
@@ -712,114 +624,67 @@ impl RegionDataPlane {
         let activity = running
             .statistics
             .then(|| running.metrics.activity_for_hash(hash));
-        let deadline = match self.config.write_backpressure {
-            WriteBackpressure::Timeout(duration) => {
-                let now = Instant::now();
-                Some(now.checked_add(duration).unwrap_or(now))
+        let operation = match self.operations.try_read() {
+            Ok(operation) => operation,
+            Err(TryLockError::WouldBlock) => {
+                if running.statistics {
+                    running.metrics.record_write_rejection();
+                }
+                return Err(write_overload_error());
             }
-            WriteBackpressure::Reject | WriteBackpressure::Block => None,
+            Err(TryLockError::Poisoned(_)) => return Err(poisoned_runtime_error()),
         };
-
-        loop {
-            // Reject-mode admission is the shard write-buffer transaction itself.
-            // The global write gate exists only for callers that explicitly
-            // selected a waiting policy.
-            let permit = if self.config.write_backpressure == WriteBackpressure::Reject {
-                None
-            } else {
-                match running
-                    .resources
-                    .begin_write_permit_until(self.config.write_backpressure, deadline)
-                {
-                    Ok(permit) => Some(permit),
-                    Err(reason) => {
-                        if running.statistics {
-                            running.metrics.record_write_rejection();
-                        }
-                        return Err(overload_runtime_error(reason));
+        let staged = match mutation {
+            RuntimeMutation::Put(value) => self.core.try_stage_value(
+                &running.staging,
+                shard_id,
+                hash,
+                record_bytes,
+                namespace_id,
+                key,
+                value,
+            ),
+            RuntimeMutation::Delete => self.core.try_stage_delete(
+                &running.staging,
+                shard_id,
+                hash,
+                record_bytes,
+                namespace_id,
+                key,
+            ),
+        }?;
+        match staged {
+            RegionStageValue::Staged(seqno) => {
+                match mutation {
+                    RuntimeMutation::Put(value) => {
+                        let _published =
+                            running
+                                .memory
+                                .publish(hash, namespace_id, key, value, seqno);
+                    }
+                    RuntimeMutation::Delete => {
+                        let _removed = running.memory.delete(hash, namespace_id, key, seqno);
                     }
                 }
-            };
-            let operation = match self.operations.try_read() {
-                Ok(operation) => operation,
-                Err(TryLockError::WouldBlock) => {
-                    drop(permit);
-                    let reason = WriteOverloadReason::WriteGateBusy;
-                    if running.statistics {
-                        running.metrics.record_write_rejection();
-                    }
-                    return Err(overload_runtime_error(reason));
-                }
-                Err(TryLockError::Poisoned(_)) => return Err(poisoned_runtime_error()),
-            };
-            let staged = match mutation {
-                RuntimeMutation::Put(value) => self.core.try_stage_value(
-                    &running.staging,
-                    shard_id,
-                    hash,
-                    record_bytes,
-                    namespace_id,
-                    key,
-                    value,
-                ),
-                RuntimeMutation::Delete => self.core.try_stage_delete(
-                    &running.staging,
-                    shard_id,
-                    hash,
-                    record_bytes,
-                    namespace_id,
-                    key,
-                ),
-            }?;
-            match staged {
-                RegionStageValue::Staged(seqno) => {
+                control.notify(WAKE_DATA)?;
+                if let Some(activity) = activity {
                     match mutation {
                         RuntimeMutation::Put(value) => {
-                            let _published =
-                                running
-                                    .memory
-                                    .publish(hash, namespace_id, key, value, seqno);
+                            RuntimeMetrics::increment(&activity.puts);
+                            RuntimeMetrics::add(&activity.written_bytes, value.len());
                         }
                         RuntimeMutation::Delete => {
-                            let _removed = running.memory.delete(hash, namespace_id, key, seqno);
+                            RuntimeMetrics::increment(&activity.deletes);
                         }
                     }
-                    control.notify(WAKE_DATA)?;
-                    if let Some(activity) = activity {
-                        match mutation {
-                            RuntimeMutation::Put(value) => {
-                                RuntimeMetrics::increment(&activity.puts);
-                                RuntimeMetrics::add(&activity.written_bytes, value.len());
-                            }
-                            RuntimeMutation::Delete => {
-                                RuntimeMetrics::increment(&activity.deletes);
-                            }
-                        }
-                    }
-                    return Ok(seqno);
                 }
-                RegionStageValue::NeedsProgress => {
-                    prepare_shard_retry(
-                        running,
-                        control,
-                        WAKE_URGENT,
-                        self.config.write_backpressure,
-                        deadline,
-                        permit,
-                        operation,
-                    )?;
-                }
-                RegionStageValue::NeedsRotation => {
-                    prepare_shard_retry(
-                        running,
-                        control,
-                        WAKE_ROTATE | WAKE_URGENT,
-                        self.config.write_backpressure,
-                        deadline,
-                        permit,
-                        operation,
-                    )?;
-                }
+                Ok(seqno)
+            }
+            RegionStageValue::NeedsProgress => {
+                reject_staged_write(running, control, WAKE_URGENT, operation)
+            }
+            RegionStageValue::NeedsRotation => {
+                reject_staged_write(running, control, WAKE_ROTATE | WAKE_URGENT, operation)
             }
         }
     }
@@ -980,26 +845,6 @@ impl RegionDataPlane {
         drain_shards(running, false)
     }
 
-    /// Completes admitted spans and syncs the shared data inode once. This
-    /// explicit operation does not publish a recovery image.
-    pub(crate) fn flush(&self) -> io::Result<()> {
-        let result = (|| {
-            let _exclusive = self
-                .operations
-                .write()
-                .map_err(|_| poisoned_runtime_error())?;
-            let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
-            let running = &self.running.shared;
-            drain_shards(running, false)?;
-            flush_data_inode(&running.engines)?;
-            Ok(())
-        })();
-        if result.is_err() && self.config.statistics {
-            RuntimeMetrics::increment(&self.metrics.io_failures);
-        }
-        result
-    }
-
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
         let running = &self.running.shared;
         Ok(self.snapshot_running(running))
@@ -1007,16 +852,12 @@ impl RegionDataPlane {
 
     pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         let running = &self.running.shared;
-        let writes = running.resources.runtime_snapshot(
-            running
+        Ok(DetailedCacheSnapshot {
+            summary: self.snapshot_running(running),
+            write_buffer_rejections: running
                 .metrics
                 .write_buffer_rejections
                 .load(Ordering::Relaxed),
-            running.metrics.write_buffer_wait_ns.load(Ordering::Relaxed),
-        );
-        Ok(DetailedCacheSnapshot {
-            summary: self.snapshot_running(running),
-            writes,
             io: aggregate_io_stats(&running.engines),
             l1: running.memory.detailed_snapshot()?,
             index: self.core.index_snapshot()?,
@@ -1088,32 +929,6 @@ impl RegionDataPlane {
     }
 }
 
-pub(crate) fn flush_data_inode(engines: &[Arc<dyn IoEngine>]) -> io::Result<()> {
-    let engine = engines
-        .first()
-        .ok_or_else(|| io::Error::other("runtime has no I/O engine"))?;
-    let request = submit_cache_io(
-        engine.as_ref(),
-        IoOperation::flush(SyncPoint::ExplicitFlush, SyncMode::Data),
-    )
-    .map_err(|error| error.error)?;
-    let request_id = request.id();
-    let completion = request
-        .wait(engine.as_ref())
-        .map_err(|timeout| timeout.into_buffer().0)?;
-    if completion.request_id != request_id
-        || completion.kind != OperationKind::Flush
-        || completion.bytes_transferred != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "flush completion has the wrong identity",
-        ));
-    }
-    completion.into_io_result().0?;
-    Ok(())
-}
-
 fn aggregate_io_stats(engines: &[Arc<dyn IoEngine>]) -> CacheIoSnapshot {
     let mut aggregate = CacheIoSnapshot::default();
     for (engine_index, engine) in engines.iter().enumerate() {
@@ -1161,7 +976,6 @@ fn start_running(
         config.l1_capacity_bytes,
         l1_entry_capacity,
         config.l1_shards,
-        config.eviction_policy,
     )?;
     let fixed_memory = core
         .runtime_reserved_memory_bytes()?
@@ -1174,14 +988,13 @@ fn start_running(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: memory_limit,
             reserved_memory_bytes: reserved_memory,
-            waiting_write_limit: config.waiting_write_limit,
         })
         .map_err(resource_build_io_error)?,
     );
     let usable_region = usize::try_from(data.geometry.region_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region size is too large"))?;
     let chunk_bytes =
-        usable_region.min(config.write_buffer_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+        usable_region.min(config.write_batch_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
     let staging = Arc::new(
         RegionStaging::try_new(
             shard_count,
@@ -1195,7 +1008,6 @@ fn start_running(
         config.l1_capacity_bytes,
         l1_entry_capacity,
         config.l1_shards,
-        config.eviction_policy,
         config.statistics,
     )?);
     let engines = build_engine_pool(files, &config)?;
@@ -1213,7 +1025,6 @@ fn start_running(
         staging,
         shards: shards.into_boxed_slice(),
         write_batch_bytes: config.write_batch_bytes,
-        write_flush_delay: config.write_flush_delay,
         statistics: config.statistics,
     });
     let mut shard_workers = Vec::new();
@@ -1343,13 +1154,9 @@ fn shard_worker_result(
         match shared.staging.shard_fill_snapshot(shard_id) {
             Ok(Some(fill)) => {
                 if deadline.is_none() {
-                    deadline = Some(
-                        Instant::now()
-                            .checked_add(shared.write_flush_delay)
-                            .ok_or_else(|| {
-                                invalid_runtime_config("partial flush deadline overflow")
-                            })?,
-                    );
+                    deadline = Some(Instant::now().checked_add(WRITE_FLUSH_DELAY).ok_or_else(
+                        || invalid_runtime_config("partial flush deadline overflow"),
+                    )?);
                 }
                 if force_flush || fill.bytes >= shared.write_batch_bytes {
                     let engine = shared.engine_for(shard_id as u64);
@@ -1357,7 +1164,6 @@ fn shard_worker_result(
                         .core
                         .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
                     deadline = None;
-                    advance_shard_progress(control)?;
                 }
             }
             Ok(None) => {
@@ -1368,7 +1174,6 @@ fn shard_worker_result(
                         RuntimeMetrics::increment(&shared.metrics.region_rotations);
                     }
                 }
-                acknowledge_empty_shard_wake(control, flags)?;
             }
             Err(StagingError::WouldBlock) => {
                 deadline = Some(Instant::now() + _RETRY_AGE);
@@ -1389,7 +1194,6 @@ fn shard_worker_result(
                 shared
                     .core
                     .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
-                advance_shard_progress(control)?;
             }
             complete_shard_drain(control, drain_generation)?;
             if stop {
@@ -1442,69 +1246,24 @@ fn wait_for_shard_work(
     Ok((flags, drain_generation, state.stop, timed_out))
 }
 
-fn prepare_shard_retry<Permit, Operation>(
+fn reject_staged_write<Operation>(
     running: &RunningShared,
     control: &ShardControl,
     flags: u8,
-    policy: WriteBackpressure,
-    deadline: Option<Instant>,
-    permit: Permit,
     operation: Operation,
-) -> io::Result<()> {
-    let observed = control.progress()?;
+) -> io::Result<u64> {
     control.notify(flags)?;
     drop(operation);
-    drop(permit);
-    let wait_started = running.statistics.then(Instant::now);
-    match policy {
-        WriteBackpressure::Reject => {
-            let reason = WriteOverloadReason::WriteBufferBusy;
-            if running.statistics {
-                RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
-                running.metrics.record_write_rejection();
-            }
-            Err(overload_runtime_error(reason))
-        }
-        WriteBackpressure::Block => {
-            let result = control.wait_for_progress_until(observed, None).map(|_| ());
-            RuntimeMetrics::add_duration(&running.metrics.write_buffer_wait_ns, wait_started);
-            result
-        }
-        WriteBackpressure::Timeout(_) => {
-            let progressed = control.wait_for_progress_until(observed, deadline)?;
-            RuntimeMetrics::add_duration(&running.metrics.write_buffer_wait_ns, wait_started);
-            if progressed {
-                Ok(())
-            } else {
-                let reason = WriteOverloadReason::Timeout;
-                if running.statistics {
-                    RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
-                    running.metrics.record_write_rejection();
-                }
-                Err(overload_runtime_error(reason))
-            }
-        }
+    if running.statistics {
+        RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
+        running.metrics.record_write_rejection();
     }
-}
-
-fn advance_shard_progress(control: &ShardControl) -> io::Result<()> {
-    let mut state = control.lock()?;
-    state.progress = state.progress.saturating_add(1);
-    control.changed.notify_all();
-    Ok(())
-}
-
-fn acknowledge_empty_shard_wake(control: &ShardControl, flags: u8) -> io::Result<()> {
-    if flags != 0 {
-        advance_shard_progress(control)?;
-    }
-    Ok(())
+    Err(write_overload_error())
 }
 
 fn complete_shard_drain(control: &ShardControl, generation: u64) -> io::Result<()> {
     let mut state = control.lock()?;
     state.drain_completed = state.drain_completed.max(generation);
-    state.progress = state.progress.saturating_add(1);
     control.changed.notify_all();
     Ok(())
 }
@@ -1637,8 +1396,8 @@ fn resource_build_io_error(error: ResourceBuildError) -> io::Error {
     io::Error::new(kind, error.to_string())
 }
 
-fn overload_runtime_error(error: WriteOverloadReason) -> io::Error {
-    io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
+fn write_overload_error() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "write path is busy")
 }
 
 fn is_read_pressure(kind: io::ErrorKind) -> bool {
@@ -1673,12 +1432,10 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eviction::EvictionPolicy;
 
     #[test]
-    fn urgent_empty_shard_wake_releases_progress_waiters() {
+    fn urgent_empty_shard_wake_is_consumed() {
         let control = ShardControl::new();
-        let observed = control.progress().unwrap();
         control.notify(WAKE_URGENT).unwrap();
 
         let (flags, drain_generation, stop, timed_out) =
@@ -1688,12 +1445,12 @@ mod tests {
         assert!(!stop);
         assert!(!timed_out);
 
-        acknowledge_empty_shard_wake(&control, flags).unwrap();
-        assert!(
-            control
-                .wait_for_progress_until(observed, Some(Instant::now()))
-                .unwrap()
-        );
+        let (flags, drain_generation, stop, timed_out) =
+            wait_for_shard_work(&control, Some(Instant::now())).unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(drain_generation, 0);
+        assert!(!stop);
+        assert!(timed_out);
     }
 
     #[test]
@@ -1768,13 +1525,9 @@ mod tests {
         };
         let mut config = RuntimeConfig::default();
         let l1_entries = config.l1_entry_capacity(geometry, 4096).unwrap();
-        let l1_metadata = MemoryStore::allocation_bytes(
-            config.l1_capacity_bytes,
-            l1_entries,
-            config.l1_shards,
-            config.eviction_policy,
-        )
-        .unwrap();
+        let l1_metadata =
+            MemoryStore::allocation_bytes(config.l1_capacity_bytes, l1_entries, config.l1_shards)
+                .unwrap();
         let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count)
             .unwrap()
             .checked_add(l1_metadata)
@@ -1819,30 +1572,9 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
 
-        let clock = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            EvictionPolicy::Clock,
-        )
-        .unwrap();
-        let tiny_lfu = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            EvictionPolicy::TinyLfu,
-        )
-        .unwrap();
-        let s3fifo = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            EvictionPolicy::S3Fifo,
-        )
-        .unwrap();
-        assert!(clock < 384 * 1024 * 1024);
-        assert!(tiny_lfu > clock);
-        assert!(s3fifo > tiny_lfu);
-        assert!(s3fifo < 512 * 1024 * 1024);
+        let metadata =
+            MemoryStore::allocation_bytes(base.l1_capacity_bytes, entry_capacity, base.l1_shards)
+                .unwrap();
+        assert!(metadata < 384 * 1024 * 1024);
     }
 }

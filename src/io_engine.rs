@@ -37,8 +37,7 @@ use crate::io_backend::DirectIoStatsHandle;
 ))]
 use crate::io_backend::RuntimeIoPath;
 use crate::io_backend::{
-    IoBackend, SyncMode, SyncPoint, WritePoint, read_exact_at_uninit_with_progress,
-    write_all_at_with_progress,
+    IoBackend, WritePoint, read_exact_at_uninit_with_progress, write_all_at_with_progress,
 };
 #[cfg(unix)]
 use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
@@ -249,12 +248,11 @@ impl RequestId {
 pub(crate) enum OperationKind {
     Read,
     Write,
-    Flush,
 }
 
 impl OperationKind {
     const fn uses_write_slot(self) -> bool {
-        matches!(self, Self::Write | Self::Flush)
+        matches!(self, Self::Write)
     }
 }
 
@@ -268,10 +266,6 @@ pub(crate) enum IoOperation {
         point: WritePoint,
         buffer: IoBuffer,
         offset: u64,
-    },
-    Flush {
-        point: SyncPoint,
-        mode: SyncMode,
     },
 }
 
@@ -288,15 +282,10 @@ impl IoOperation {
         }
     }
 
-    pub(crate) const fn flush(point: SyncPoint, mode: SyncMode) -> Self {
-        Self::Flush { point, mode }
-    }
-
     pub(crate) const fn kind(&self) -> OperationKind {
         match self {
             Self::Read { .. } => OperationKind::Read,
             Self::Write { .. } => OperationKind::Write,
-            Self::Flush { .. } => OperationKind::Flush,
         }
     }
 
@@ -305,7 +294,6 @@ impl IoOperation {
             Self::Read { buffer, offset } | Self::Write { buffer, offset, .. } => {
                 (buffer.len(), *offset)
             }
-            Self::Flush { .. } => return Ok(()),
         };
         if length > u32::MAX as usize {
             return Err(io::Error::new(
@@ -322,7 +310,6 @@ impl IoOperation {
     fn into_buffer(self) -> Option<IoBuffer> {
         match self {
             Self::Read { buffer, .. } | Self::Write { buffer, .. } => Some(buffer),
-            Self::Flush { .. } => None,
         }
     }
 
@@ -335,7 +322,7 @@ impl IoOperation {
                 io::ErrorKind::InvalidData,
                 "completed read did not initialize its complete buffer",
             )),
-            Self::Write { .. } | Self::Flush { .. } => Ok(()),
+            Self::Write { .. } => Ok(()),
         }
     }
 
@@ -388,9 +375,6 @@ impl IoOperation {
                     *point == WritePoint::Record,
                 ))
             }
-            // Metadata and durability controls remain on the buffered flock
-            // descriptor. fsync on either descriptor covers the same inode.
-            Self::Flush { .. } => Ok(RuntimeIoPath::Buffered),
         }
     }
 }
@@ -412,11 +396,6 @@ impl fmt::Debug for IoOperation {
                 .field("point", point)
                 .field("length", &buffer.len())
                 .field("offset", offset)
-                .finish(),
-            Self::Flush { point, mode } => formatter
-                .debug_struct("Flush")
-                .field("point", point)
-                .field("mode", mode)
                 .finish(),
         }
     }
@@ -775,7 +754,7 @@ pub(crate) trait IoEngine: Send + Sync {
     /// deadline and cancellation grace period.
     fn stop_accepting_requests(&self);
     fn writes_in_flight(&self) -> usize;
-    /// True means a failed driver could not fence an issued write or flush.
+    /// True means a failed driver could not fence an issued write.
     /// The cache must retain its exclusive file lock for process lifetime.
     fn has_unfenced_writes(&self) -> bool;
     #[cfg(test)]
@@ -795,11 +774,6 @@ pub(crate) trait IoEngine: Send + Sync {
         offset: u64,
     ) -> Result<IoRequest, SubmitError> {
         self.submit(IoOperation::write(point, buffer, offset))
-    }
-
-    #[cfg(test)]
-    fn flush(&self, point: SyncPoint, mode: SyncMode) -> Result<IoRequest, SubmitError> {
-        self.submit(IoOperation::flush(point, mode))
     }
 }
 
@@ -1888,12 +1862,7 @@ fn execute_backend(
             }
             Err(error) => backend_result(Err(error), 0),
         },
-        IoOperation::Flush { point, mode } => exact_backend_result(backend.sync(*point, *mode), 0),
     }
-}
-
-fn exact_backend_result(result: io::Result<()>, length: usize) -> (CompletionStatus, usize) {
-    backend_result(result, length)
 }
 
 fn backend_result(result: io::Result<()>, transferred: usize) -> (CompletionStatus, usize) {
@@ -2582,10 +2551,6 @@ mod uring {
             }
 
             match flight.task.operation.kind() {
-                OperationKind::Flush => {
-                    self.shared
-                        .finish(flight.task, CompletionStatus::Completed, 0);
-                }
                 OperationKind::Read | OperationKind::Write => {
                     let remaining =
                         operation_length(&flight.task.operation).saturating_sub(flight.transferred);
@@ -2684,7 +2649,7 @@ mod uring {
 
             for (_, flight) in self.flights.drain() {
                 let status = CompletionStatus::Failed(copy_io_error(error, &message));
-                if flight.active && flight.task.operation.kind() != OperationKind::Flush {
+                if flight.active {
                     self.shared
                         .finish_quarantined(flight.task, status, flight.transferred);
                 } else {
@@ -2816,7 +2781,6 @@ mod uring {
                 IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => {
                     buffer.is_empty()
                 }
-                IoOperation::Flush { .. } => false,
             }
         }
     }
@@ -2831,7 +2795,6 @@ mod uring {
     fn operation_length(operation: &IoOperation) -> usize {
         match operation {
             IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len(),
-            IoOperation::Flush { .. } => 0,
         }
     }
 
@@ -2876,16 +2839,6 @@ mod uring {
                 let pointer = unsafe { buffer.as_ptr()?.add(transferred) };
                 Ok(opcode::Write::new(types::Fd(file_fd), pointer, length)
                     .offset(*offset + transferred as u64)
-                    .build()
-                    .user_data(request_id.get()))
-            }
-            IoOperation::Flush { mode, .. } => {
-                let flags = match mode {
-                    SyncMode::Data => types::FsyncFlags::DATASYNC,
-                    SyncMode::All => types::FsyncFlags::empty(),
-                };
-                Ok(opcode::Fsync::new(types::Fd(file_fd))
-                    .flags(flags)
                     .build()
                     .user_data(request_id.get()))
             }
@@ -3038,6 +2991,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io_backend::{SyncMode, SyncPoint};
     use std::fs::{File, OpenOptions};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -3265,7 +3219,6 @@ mod tests {
             ResourceController::try_new(ResourceLimits {
                 memory_limit_bytes: 1024 * 1024,
                 reserved_memory_bytes: 0,
-                waiting_write_limit: 4,
             })
             .unwrap(),
         )
@@ -3306,10 +3259,6 @@ mod tests {
         assert!(matches!(write.status, CompletionStatus::Completed));
         assert_eq!(write.bytes_transferred, input.len());
 
-        engine
-            .flush(SyncPoint::ExplicitFlush, SyncMode::Data)
-            .unwrap()
-            .wait();
         let read = engine
             .read_exact_at(read_buffer(&resources, input.len()), 4096)
             .unwrap()
@@ -3319,13 +3268,13 @@ mod tests {
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
         let stats = engine.stats();
-        assert_eq!(stats.submitted, 3);
-        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.submitted, 2);
+        assert_eq!(stats.completed, 2);
         assert_eq!(stats.errors, 0);
         assert!(stats.requests_in_flight_peak >= 1);
         assert!(
             engine
-                .flush(SyncPoint::ExplicitFlush, SyncMode::Data)
+                .read_exact_at(read_buffer(&resources, input.len()), 4096)
                 .unwrap_err()
                 .error
                 .kind()

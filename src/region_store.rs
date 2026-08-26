@@ -88,20 +88,14 @@ impl<B: RegionBackend> RegionStore<B> {
         let opened = (|| {
             let plan = backend.inspect_recovery(index_slots)?;
             let (runtime, startup) = match plan {
-                RecoveryPlan::Fresh => {
-                    (backend.anonymous_runtime(index_slots)?, StartupMode::Fresh)
+                RecoveryPlan::Fresh => (backend.anonymous_runtime(index_slots)?, StartupMode::Cold),
+                RecoveryPlan::Running => {
+                    (backend.anonymous_runtime(index_slots)?, StartupMode::Cold)
                 }
-                RecoveryPlan::Running => (
-                    backend.anonymous_runtime(index_slots)?,
-                    StartupMode::ColdAfterUncleanShutdown,
-                ),
                 RecoveryPlan::Clean(clean) => {
                     match backend.map_clean_runtime(clean, index_slots)? {
                         Some(runtime) => (runtime, StartupMode::Warm),
-                        None => (
-                            backend.anonymous_runtime(index_slots)?,
-                            StartupMode::ColdAfterRejectedImage,
-                        ),
+                        None => (backend.anonymous_runtime(index_slots)?, StartupMode::Cold),
                     }
                 }
             };
@@ -337,7 +331,7 @@ mod tests {
         for (plan, startup, expected) in [
             (
                 Plan::Fresh,
-                StartupMode::Fresh,
+                StartupMode::Cold,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -348,7 +342,7 @@ mod tests {
             ),
             (
                 Plan::Running,
-                StartupMode::ColdAfterUncleanShutdown,
+                StartupMode::Cold,
                 vec![
                     Event::Lock,
                     Event::Inspect,
@@ -370,7 +364,7 @@ mod tests {
             ),
             (
                 Plan::RejectedClean,
-                StartupMode::ColdAfterRejectedImage,
+                StartupMode::Cold,
                 vec![
                     Event::Lock,
                     Event::Inspect,

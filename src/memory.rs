@@ -9,10 +9,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::eviction::{
-    AdmissionHint, EvictionPolicy, EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX,
-    PolicySlot,
-};
+use crate::eviction::{EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX, PolicySlot};
 use crate::hashing::{FixedPrehashedMap, route_hash};
 use crate::snapshot::CacheL1Snapshot;
 
@@ -219,8 +216,6 @@ struct DetachedAdmissionEntry {
     index: usize,
     hash: u64,
     weight: usize,
-    restore_hint: AdmissionHint,
-    record_ghost: bool,
     transfers_charge: bool,
 }
 
@@ -274,11 +269,7 @@ struct MemoryShard {
 }
 
 impl MemoryShard {
-    fn new(
-        capacity_bytes: usize,
-        maximum_entries: usize,
-        policy: EvictionPolicy,
-    ) -> io::Result<Self> {
+    fn new(capacity_bytes: usize, maximum_entries: usize) -> io::Result<Self> {
         let budget = Arc::new(MemoryBudget::new(capacity_bytes));
         let directory = FixedPrehashedMap::try_new(maximum_entries)?;
         let mut slots = Vec::new();
@@ -307,7 +298,7 @@ impl MemoryShard {
         );
         Ok(Self {
             budget,
-            eviction: EvictionState::new(policy, capacity_bytes, maximum_entries)?,
+            eviction: EvictionState::new(),
             directory,
             slots: slots.into_boxed_slice(),
             policy_slots: policy_slots.into_boxed_slice(),
@@ -376,12 +367,7 @@ impl MemoryShard {
         let Some(hash) = self.policy_slots.get(index).map(PolicySlot::hash) else {
             return;
         };
-        let weight = self.slots[index]
-            .as_ref()
-            .expect("resident slot disappeared")
-            .value
-            .charged_bytes();
-        self.eviction.remove(&mut self.policy_slots, index, weight);
+        self.eviction.remove(&mut self.policy_slots, index);
         self.remove_slot_after_policy(index, hash, false);
     }
 
@@ -457,39 +443,29 @@ impl MemoryShard {
             .push(u32::try_from(index).expect("memory slot index exceeds u32"));
     }
 
-    fn detach_for_admission(&mut self, index: usize, record_ghost: bool) -> DetachedAdmissionEntry {
+    fn detach_for_admission(&mut self, index: usize) -> DetachedAdmissionEntry {
         let hash = self.policy_slots[index].hash();
         let entry = self.slots[index]
             .as_ref()
             .expect("resident policy slot has no memory entry");
         let weight = entry.value.charged_bytes();
         let transfers_charge = entry.value.releases_charge_on_remove();
-        let restore_hint =
-            self.eviction
-                .detach_for_admission(&mut self.policy_slots, index, weight);
+        self.eviction
+            .detach_for_admission(&mut self.policy_slots, index);
         DetachedAdmissionEntry {
             index,
             hash,
             weight,
-            restore_hint,
-            record_ghost,
             transfers_charge,
         }
     }
 
     fn restore_detached(&mut self, entry: DetachedAdmissionEntry) {
-        self.eviction.restore_for_admission(
-            &mut self.policy_slots,
-            entry.index,
-            entry.hash,
-            entry.weight,
-            entry.restore_hint,
-        );
+        self.eviction
+            .restore_for_admission(&mut self.policy_slots, entry.index, entry.hash);
     }
 
     fn commit_detached(&mut self, entry: DetachedAdmissionEntry) {
-        self.eviction
-            .record_admission_eviction(entry.hash, entry.record_ghost);
         self.remove_slot_after_policy(entry.index, entry.hash, entry.transfers_charge);
     }
 
@@ -509,14 +485,10 @@ impl MemoryShard {
     fn charge_with_eviction(
         &mut self,
         required: usize,
-        hash: u64,
         replacement: Option<usize>,
     ) -> ChargeResult {
         if required > self.budget.capacity_bytes {
-            return ChargeResult::Rejected {
-                evictions: 0,
-                admission: false,
-            };
+            return ChargeResult::Rejected { evictions: 0 };
         }
         let needs_slot = replacement.is_none() && self.free_slots.is_empty();
         match self.budget.try_charge(required) {
@@ -524,7 +496,7 @@ impl MemoryShard {
                 if let Some(replacement) = replacement {
                     self.remove_slot(replacement);
                 } else if needs_slot {
-                    return self.charge_with_slot_eviction(required, hash, charge);
+                    return self.charge_with_slot_eviction(charge);
                 }
                 return ChargeResult::Charged {
                     charge,
@@ -532,15 +504,12 @@ impl MemoryShard {
                 };
             }
             MemoryChargeAttempt::Contended => {
-                return ChargeResult::Rejected {
-                    evictions: 0,
-                    admission: false,
-                };
+                return ChargeResult::Rejected { evictions: 0 };
             }
             MemoryChargeAttempt::Full => {}
         }
 
-        let replacement = replacement.map(|index| self.detach_for_admission(index, false));
+        let replacement = replacement.map(|index| self.detach_for_admission(index));
         let replacement_bytes = replacement
             .filter(|entry| entry.transfers_charge)
             .map_or(0, |entry| entry.weight);
@@ -553,29 +522,19 @@ impl MemoryShard {
         {
             let candidate = {
                 let slots = &self.slots;
-                self.eviction.select_victim(
-                    &mut self.policy_slots,
-                    &mut remaining_steps,
-                    |index| {
-                        slots[index]
-                            .as_ref()
-                            .expect("resident policy slot has no memory entry")
-                            .value
-                            .charged_bytes()
-                    },
-                    |index| {
+                self.eviction
+                    .select_victim(&mut self.policy_slots, &mut remaining_steps, |index| {
                         slots[index]
                             .as_ref()
                             .expect("resident policy slot has no memory entry")
                             .value
                             .releases_charge_on_remove()
-                    },
-                )
+                    })
             };
             let Some(candidate) = candidate else {
                 break;
             };
-            let detached = self.detach_for_admission(candidate.index, candidate.record_ghost);
+            let detached = self.detach_for_admission(candidate);
             debug_assert!(detached.transfers_charge);
             plan.push(detached);
         }
@@ -583,31 +542,14 @@ impl MemoryShard {
         let required_release = required.saturating_sub(self.budget.available_bytes());
         if released < required_release {
             self.restore_admission(replacement, &plan);
-            return ChargeResult::Rejected {
-                evictions: 0,
-                admission: false,
-            };
-        }
-        if !self.eviction.admits_victims(
-            hash,
-            required,
-            plan.iter().map(|victim| (victim.hash, victim.weight)),
-        ) {
-            self.restore_admission(replacement, &plan);
-            return ChargeResult::Rejected {
-                evictions: 0,
-                admission: true,
-            };
+            return ChargeResult::Rejected { evictions: 0 };
         }
 
         let charge = match self.budget.try_transfer_charge(released, required) {
             MemoryChargeAttempt::Charged(charge) => charge,
             MemoryChargeAttempt::Full | MemoryChargeAttempt::Contended => {
                 self.restore_admission(replacement, &plan);
-                return ChargeResult::Rejected {
-                    evictions: 0,
-                    admission: false,
-                };
+                return ChargeResult::Rejected { evictions: 0 };
             }
         };
 
@@ -623,46 +565,16 @@ impl MemoryShard {
         }
     }
 
-    fn charge_with_slot_eviction(
-        &mut self,
-        required: usize,
-        hash: u64,
-        charge: MemoryCharge,
-    ) -> ChargeResult {
+    fn charge_with_slot_eviction(&mut self, charge: MemoryCharge) -> ChargeResult {
         let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
         let candidate = {
-            let slots = &self.slots;
-            self.eviction.select_victim(
-                &mut self.policy_slots,
-                &mut remaining_steps,
-                |index| {
-                    slots[index]
-                        .as_ref()
-                        .expect("resident policy slot has no memory entry")
-                        .value
-                        .charged_bytes()
-                },
-                |_| true,
-            )
+            self.eviction
+                .select_victim(&mut self.policy_slots, &mut remaining_steps, |_| true)
         };
         let Some(candidate) = candidate else {
-            return ChargeResult::Rejected {
-                evictions: 0,
-                admission: false,
-            };
+            return ChargeResult::Rejected { evictions: 0 };
         };
-        let mut victim = self.detach_for_admission(candidate.index, candidate.record_ghost);
-        if !self.eviction.admits_victims(
-            hash,
-            required,
-            std::iter::once((victim.hash, victim.weight)),
-        ) {
-            self.restore_detached(victim);
-            return ChargeResult::Rejected {
-                evictions: 0,
-                admission: true,
-            };
-        }
+        let mut victim = self.detach_for_admission(candidate);
         // The candidate was charged independently because byte capacity was
         // available. Let an exclusive victim release its own charge normally.
         victim.transfers_charge = false;
@@ -681,7 +593,6 @@ impl MemoryShard {
         key: &[u8],
         value: &[u8],
         seqno: u64,
-        hint: AdmissionHint,
         replacement: Option<usize>,
     ) -> MemoryInsertResult {
         if (replacement.is_none() && self.hash_chain_is_full(hash))
@@ -696,22 +607,20 @@ impl MemoryShard {
             return MemoryInsertResult::bypassed();
         };
 
-        let (charge, evictions) = match self.charge_with_eviction(charged_bytes, hash, replacement)
-        {
+        let (charge, evictions) = match self.charge_with_eviction(charged_bytes, replacement) {
             ChargeResult::Charged { charge, evictions } => (charge, evictions),
-            ChargeResult::Rejected {
-                evictions,
-                admission,
-            } => return MemoryInsertResult::rejected(evictions, admission),
+            ChargeResult::Rejected { evictions } => {
+                return MemoryInsertResult::rejected(evictions);
+            }
         };
         let Some(packed_index) = self.free_slots.last().copied() else {
-            return MemoryInsertResult::rejected(evictions, false);
+            return MemoryInsertResult::rejected(evictions);
         };
         let Ok(index) = usize::try_from(packed_index) else {
-            return MemoryInsertResult::rejected(evictions, false);
+            return MemoryInsertResult::rejected(evictions);
         };
         let Ok(memory_value) = MemoryValue::try_new(key, value, charge) else {
-            return MemoryInsertResult::rejected(evictions, false);
+            return MemoryInsertResult::rejected(evictions);
         };
         let previous_head = self.directory_head(hash);
         let entry = MemoryEntry {
@@ -727,14 +636,12 @@ impl MemoryShard {
         debug_assert_eq!(free_index, packed_index);
         self.slots[index] = Some(entry);
         self.resident_bytes = self.resident_bytes.saturating_add(charged_bytes);
-        self.eviction
-            .insert(&mut self.policy_slots, index, hash, charged_bytes, hint);
+        self.eviction.insert(&mut self.policy_slots, index, hash);
         let previous = self.directory_upsert(hash, packed_index);
         debug_assert_eq!(previous, previous_head);
         MemoryInsertResult {
             inserted: true,
             evictions,
-            admission_rejected: false,
         }
     }
 }
@@ -746,7 +653,6 @@ enum ChargeResult {
     },
     Rejected {
         evictions: usize,
-        admission: bool,
     },
 }
 
@@ -754,7 +660,6 @@ enum ChargeResult {
 struct MemoryInsertResult {
     inserted: bool,
     evictions: usize,
-    admission_rejected: bool,
 }
 
 impl MemoryInsertResult {
@@ -762,15 +667,13 @@ impl MemoryInsertResult {
         Self {
             inserted: false,
             evictions: 0,
-            admission_rejected: false,
         }
     }
 
-    const fn rejected(evictions: usize, admission_rejected: bool) -> Self {
+    const fn rejected(evictions: usize) -> Self {
         Self {
             inserted: false,
             evictions,
-            admission_rejected,
         }
     }
 }
@@ -778,7 +681,6 @@ impl MemoryInsertResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryReadToken {
     shard_id: usize,
-    admission: AdmissionHint,
 }
 
 pub(crate) enum MemoryLookup {
@@ -808,14 +710,12 @@ struct MemoryMetrics {
     enabled: bool,
     evictions: AtomicU64,
     bypasses: AtomicU64,
-    admission_rejections: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MemoryMetricsSnapshot {
     pub(crate) evictions: u64,
     pub(crate) bypasses: u64,
-    pub(crate) admission_rejections: u64,
 }
 
 impl MemoryStore {
@@ -835,7 +735,6 @@ impl MemoryStore {
         capacity_bytes: usize,
         entry_capacity: usize,
         shard_count: usize,
-        policy: EvictionPolicy,
         statistics_enabled: bool,
     ) -> io::Result<Self> {
         if shard_count == 0 {
@@ -844,8 +743,7 @@ impl MemoryStore {
                 "memory tier requires at least one shard",
             ));
         }
-        let metadata_bytes =
-            Self::allocation_bytes(capacity_bytes, entry_capacity, shard_count, policy)?;
+        let metadata_bytes = Self::allocation_bytes(capacity_bytes, entry_capacity, shard_count)?;
         let mut shards = Vec::new();
         shards.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -865,7 +763,6 @@ impl MemoryStore {
             shards.push(MemoryShardLock(Mutex::new(MemoryShard::new(
                 shard_capacity,
                 shard_entries,
-                policy,
             )?)));
         }
         Ok(Self {
@@ -874,7 +771,6 @@ impl MemoryStore {
                 enabled: statistics_enabled,
                 evictions: AtomicU64::new(0),
                 bypasses: AtomicU64::new(0),
-                admission_rejections: AtomicU64::new(0),
             },
             entry_capacity: actual_entry_capacity,
             metadata_bytes,
@@ -885,7 +781,6 @@ impl MemoryStore {
         capacity_bytes: usize,
         entry_capacity: usize,
         shard_count: usize,
-        policy: EvictionPolicy,
     ) -> io::Result<usize> {
         if shard_count == 0 {
             return Err(invalid_memory_plan(
@@ -912,11 +807,9 @@ impl MemoryStore {
                 })
                 .ok_or_else(|| invalid_memory_plan("L1 slot memory plan overflow"))?;
             let directory = FixedPrehashedMap::allocation_bytes(shard_entries)?;
-            let eviction = EvictionState::allocation_bytes(policy, shard_capacity, shard_entries)?;
             total = total
                 .checked_add(fixed_slots)
                 .and_then(|bytes| bytes.checked_add(directory))
-                .and_then(|bytes| bytes.checked_add(eviction))
                 .ok_or_else(|| invalid_memory_plan("L1 metadata memory plan overflow"))?;
         }
         Ok(total)
@@ -943,8 +836,7 @@ impl MemoryStore {
         }) {
             return true;
         }
-        let admission = shard.eviction.prepare_insert(hash);
-        let result = shard.insert(hash, namespace_id, key, value, seqno, admission, existing);
+        let result = shard.insert(hash, namespace_id, key, value, seqno, existing);
         drop(shard);
         self.record_insert(result);
         result.inserted
@@ -974,17 +866,10 @@ impl MemoryStore {
     pub(crate) fn lookup(&self, hash: u64, namespace_id: u32, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
-            return MemoryLookup::Miss(MemoryReadToken {
-                shard_id,
-                admission: AdmissionHint::default(),
-            });
+            return MemoryLookup::Miss(MemoryReadToken { shard_id });
         };
         let Some(index) = shard.find(hash, namespace_id, key) else {
-            let admission = shard.eviction.record_miss(hash);
-            return MemoryLookup::Miss(MemoryReadToken {
-                shard_id,
-                admission,
-            });
+            return MemoryLookup::Miss(MemoryReadToken { shard_id });
         };
         let shard = &mut *shard;
         shard.eviction.record_hit(&mut shard.policy_slots, index);
@@ -1010,7 +895,7 @@ impl MemoryStore {
         if shard.find(hash, namespace_id, key).is_some() {
             return None;
         }
-        let result = shard.insert(hash, namespace_id, key, value, seqno, token.admission, None);
+        let result = shard.insert(hash, namespace_id, key, value, seqno, None);
         let promoted = result.inserted.then(|| {
             let index = shard
                 .find(hash, namespace_id, key)
@@ -1030,7 +915,6 @@ impl MemoryStore {
         MemoryMetricsSnapshot {
             evictions: self.metrics.evictions.load(Ordering::Relaxed),
             bypasses: self.metrics.bypasses.load(Ordering::Relaxed),
-            admission_rejections: self.metrics.admission_rejections.load(Ordering::Relaxed),
         }
     }
 
@@ -1072,11 +956,6 @@ impl MemoryStore {
         if !result.inserted {
             self.metrics.bypasses.fetch_add(1, Ordering::Relaxed);
         }
-        if result.admission_rejected {
-            self.metrics
-                .admission_rejections
-                .fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     fn route(&self, hash: u64) -> usize {
@@ -1101,26 +980,13 @@ mod tests {
     use super::*;
 
     fn store(capacity_bytes: usize, shard_count: usize) -> MemoryStore {
-        store_with_policy(capacity_bytes, shard_count, EvictionPolicy::Clock)
-    }
-
-    fn store_with_policy(
-        capacity_bytes: usize,
-        shard_count: usize,
-        policy: EvictionPolicy,
-    ) -> MemoryStore {
         MemoryStore::new(
             capacity_bytes,
             capacity_bytes / MEMORY_ENTRY_OVERHEAD_BYTES,
             shard_count,
-            policy,
             true,
         )
         .unwrap()
-    }
-
-    fn publish_clean(store: &MemoryStore, hash: u64, key: &[u8], seqno: u64) {
-        assert!(store.publish(hash, 0, key, &[hash as u8], seqno));
     }
 
     fn assert_hit(store: &MemoryStore, hash: u64, key: &[u8]) {
@@ -1182,7 +1048,7 @@ mod tests {
 
     #[test]
     fn fixed_entry_capacity_replaces_without_growing_metadata() {
-        let store = MemoryStore::new(4096, 1, 1, EvictionPolicy::Clock, true).unwrap();
+        let store = MemoryStore::new(4096, 1, 1, true).unwrap();
         let metadata_bytes = store.metadata_bytes;
         let slot_len = store.shards[0].lock().unwrap().slots.len();
 
@@ -1201,7 +1067,7 @@ mod tests {
 
     #[test]
     fn retained_eviction_is_visible_in_detailed_memory_accounting() {
-        let store = MemoryStore::new(4096, 1, 1, EvictionPolicy::Clock, true).unwrap();
+        let store = MemoryStore::new(4096, 1, 1, true).unwrap();
         assert!(store.publish(1, 0, b"a", &[1; 128], 1));
         let MemoryLookup::Hit(retained) = store.lookup(1, 0, b"a") else {
             panic!("published value must be visible");
@@ -1236,29 +1102,27 @@ mod tests {
 
     #[test]
     fn same_hash_chain_disambiguates_namespace_and_full_key() {
-        for policy in EvictionPolicy::ALL {
-            let store = store_with_policy(2048, 1, policy);
-            let collision_hash = 42;
-            assert!(store.publish(collision_hash, 7, b"alpha", b"value-alpha-ns7", 1,));
-            assert!(store.publish(collision_hash, 7, b"beta", b"value-beta-ns7", 2,));
-            assert!(store.publish(collision_hash, 8, b"alpha", b"value-alpha-ns8", 3,));
-            assert!(store.publish(collision_hash, 7, b"beta", b"replacement-beta-ns7", 4,));
+        let store = store(2048, 1);
+        let collision_hash = 42;
+        assert!(store.publish(collision_hash, 7, b"alpha", b"value-alpha-ns7", 1,));
+        assert!(store.publish(collision_hash, 7, b"beta", b"value-beta-ns7", 2,));
+        assert!(store.publish(collision_hash, 8, b"alpha", b"value-alpha-ns8", 3,));
+        assert!(store.publish(collision_hash, 7, b"beta", b"replacement-beta-ns7", 4,));
 
-            for (namespace, key, expected) in [
-                (7, b"alpha".as_slice(), b"value-alpha-ns7".as_slice()),
-                (7, b"beta".as_slice(), b"replacement-beta-ns7".as_slice()),
-                (8, b"alpha".as_slice(), b"value-alpha-ns8".as_slice()),
-            ] {
-                assert!(matches!(
-                    store.lookup(collision_hash, namespace, key),
-                    MemoryLookup::Hit(value) if value.as_ref() == expected
-                ));
-            }
+        for (namespace, key, expected) in [
+            (7, b"alpha".as_slice(), b"value-alpha-ns7".as_slice()),
+            (7, b"beta".as_slice(), b"replacement-beta-ns7".as_slice()),
+            (8, b"alpha".as_slice(), b"value-alpha-ns8".as_slice()),
+        ] {
             assert!(matches!(
-                store.lookup(collision_hash, 7, b"foreign"),
-                MemoryLookup::Miss(_)
+                store.lookup(collision_hash, namespace, key),
+                MemoryLookup::Hit(value) if value.as_ref() == expected
             ));
         }
+        assert!(matches!(
+            store.lookup(collision_hash, 7, b"foreign"),
+            MemoryLookup::Miss(_)
+        ));
     }
 
     #[test]
@@ -1390,25 +1254,23 @@ mod tests {
         const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
         const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
 
-        for policy in EvictionPolicy::ALL {
-            let store = store_with_policy(CAPACITY, 1, policy);
-            for hash in 1..=VICTIM_COUNT as u64 {
-                assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
-            }
-            let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
-
-            assert!(!store.publish(100, 0, b"c", &candidate, 100));
-            for hash in 1..=VICTIM_COUNT as u64 {
-                assert_hit(&store, hash, b"k");
-            }
-            assert_eq!(
-                store.shards[0].lock().unwrap().budget.used_bytes(),
-                CAPACITY
-            );
-            let metrics = store.metrics_snapshot();
-            assert_eq!(metrics.evictions, 0, "policy={policy:?}");
-            assert_eq!(metrics.bypasses, 1, "policy={policy:?}");
+        let store = store(CAPACITY, 1);
+        for hash in 1..=VICTIM_COUNT as u64 {
+            assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
         }
+        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+        assert!(!store.publish(100, 0, b"c", &candidate, 100));
+        for hash in 1..=VICTIM_COUNT as u64 {
+            assert_hit(&store, hash, b"k");
+        }
+        assert_eq!(
+            store.shards[0].lock().unwrap().budget.used_bytes(),
+            CAPACITY
+        );
+        let metrics = store.metrics_snapshot();
+        assert_eq!(metrics.evictions, 0);
+        assert_eq!(metrics.bypasses, 1);
     }
 
     #[test]
@@ -1418,29 +1280,20 @@ mod tests {
         const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
         const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
 
-        for policy in EvictionPolicy::ALL {
-            if policy == EvictionPolicy::TinyLfu {
-                continue;
-            }
-            let store = store_with_policy(CAPACITY, 1, policy);
-            for hash in 1..=VICTIM_COUNT as u64 {
-                assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
-            }
-            let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
-
-            assert!(store.publish(100, 0, b"c", &candidate, 100));
-            assert_hit(&store, 100, b"c");
-            assert_miss(&store, 1, b"k");
-            assert_eq!(
-                store.shards[0].lock().unwrap().budget.used_bytes(),
-                CAPACITY
-            );
-            assert_eq!(
-                store.metrics_snapshot().evictions,
-                VICTIM_COUNT as u64,
-                "policy={policy:?}"
-            );
+        let store = store(CAPACITY, 1);
+        for hash in 1..=VICTIM_COUNT as u64 {
+            assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
         }
+        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+        assert!(store.publish(100, 0, b"c", &candidate, 100));
+        assert_hit(&store, 100, b"c");
+        assert_miss(&store, 1, b"k");
+        assert_eq!(
+            store.shards[0].lock().unwrap().budget.used_bytes(),
+            CAPACITY
+        );
+        assert_eq!(store.metrics_snapshot().evictions, VICTIM_COUNT as u64);
     }
 
     #[test]
@@ -1505,88 +1358,5 @@ mod tests {
                 .iter()
                 .all(|shard| { shard.lock().unwrap().budget.used_bytes() <= 512 })
         );
-    }
-
-    #[test]
-    fn lru_and_fifo_have_distinct_hit_ordering() {
-        let lru = store_with_policy(2 * MEMORY_ENTRY_OVERHEAD_BYTES + 10, 1, EvictionPolicy::Lru);
-        publish_clean(&lru, 1, b"a", 1);
-        publish_clean(&lru, 2, b"b", 2);
-        assert_hit(&lru, 1, b"a");
-        publish_clean(&lru, 3, b"c", 3);
-        assert_hit(&lru, 1, b"a");
-        assert_miss(&lru, 2, b"b");
-
-        let fifo = store_with_policy(
-            2 * MEMORY_ENTRY_OVERHEAD_BYTES + 10,
-            1,
-            EvictionPolicy::Fifo,
-        );
-        publish_clean(&fifo, 1, b"a", 1);
-        publish_clean(&fifo, 2, b"b", 2);
-        assert_hit(&fifo, 1, b"a");
-        publish_clean(&fifo, 3, b"c", 3);
-        assert_miss(&fifo, 1, b"a");
-        assert_hit(&fifo, 2, b"b");
-    }
-
-    #[test]
-    fn tinylfu_requires_a_candidate_to_outscore_the_lru_victim() {
-        let store = store_with_policy(
-            2 * MEMORY_ENTRY_OVERHEAD_BYTES + 10,
-            1,
-            EvictionPolicy::TinyLfu,
-        );
-        publish_clean(&store, 1, b"hot", 1);
-        publish_clean(&store, 2, b"cold", 2);
-        assert_hit(&store, 1, b"hot");
-
-        assert!(!store.publish(3, 0, b"cand", b"c", 3));
-        assert!(store.publish(3, 0, b"cand", b"c", 4));
-        assert_miss(&store, 2, b"cold");
-        assert_hit(&store, 3, b"cand");
-
-        let metrics = store.metrics_snapshot();
-        assert_eq!(metrics.admission_rejections, 1);
-        assert_eq!(metrics.bypasses, 1);
-        assert_eq!(metrics.evictions, 1);
-    }
-
-    #[test]
-    fn tinylfu_compares_a_candidate_with_the_complete_victim_plan() {
-        const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 2;
-        const CAPACITY: usize = 2 * VICTIM_BYTES;
-        let store = store_with_policy(CAPACITY, 1, EvictionPolicy::TinyLfu);
-        publish_clean(&store, 1, b"a", 1);
-        publish_clean(&store, 2, b"b", 2);
-        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
-
-        assert!(!store.publish(3, 0, b"c", &candidate, 3));
-        assert!(!store.publish(3, 0, b"c", &candidate, 4));
-        assert!(store.publish(3, 0, b"c", &candidate, 5));
-        assert_miss(&store, 1, b"a");
-        assert_miss(&store, 2, b"b");
-        assert_hit(&store, 3, b"c");
-
-        let metrics = store.metrics_snapshot();
-        assert_eq!(metrics.admission_rejections, 2);
-        assert_eq!(metrics.evictions, 2);
-    }
-
-    #[test]
-    fn sieve_keeps_a_visited_old_entry_and_demotes_an_unvisited_newer_one() {
-        let store = store_with_policy(
-            2 * MEMORY_ENTRY_OVERHEAD_BYTES + 10,
-            1,
-            EvictionPolicy::Sieve,
-        );
-        publish_clean(&store, 1, b"a", 1);
-        publish_clean(&store, 2, b"b", 2);
-        assert_hit(&store, 1, b"a");
-        publish_clean(&store, 3, b"c", 3);
-
-        assert_hit(&store, 1, b"a");
-        assert_miss(&store, 2, b"b");
-        assert_hit(&store, 3, b"c");
     }
 }

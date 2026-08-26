@@ -22,13 +22,12 @@ version number documented in `MILESTONES.md`.
   operational enums before the M4 freeze.
 - a bounded recovery-scale benchmark covering fresh/warm open, initial and
   recovered warm close, sentinel validation, file bounds, and fast close.
-- runtime-selectable CLOCK, LRU, TinyLFU, SIEVE, FIFO, and S3-FIFO RAM eviction
-  with shared byte bounds, immediate eviction eligibility, and collision-safe
-  lookup.
+- shard-local CLOCK RAM eviction with shared byte bounds, immediate eviction
+  eligibility, fixed scan budgets, and collision-safe lookup.
 - static namespace-to-RegionSet routing with weighted physical Region ranges,
   independent FIFO rotation, deterministic append-shard assignment, and warm
   recovery without a second disk format.
-- on-demand detailed snapshots for queue and buffer pressure, aggregate worker
+- on-demand detailed snapshots for buffer pressure, aggregate worker
   I/O, fixed/resident/retained L1 memory, index occupancy/replacement pressure,
   and per-RegionSet capacity, occupancy, and process-local rotations.
 - sequenced point deletion through the existing bounded mutation path, with
@@ -66,7 +65,7 @@ version number documented in `MILESTONES.md`.
   `with_read_buffer_policy`, the legacy split-submission alias, and read-pool
   fields from detailed snapshots.
 - simplified write overload reporting to the `write_rejections` summary counter
-  with gate/buffer detail in `detailed_snapshot()`.
+  with shard-buffer detail in `detailed_snapshot()`.
 - corrected engine slot reservation to cap write occupancy rather than total
   occupancy, and added bounded write-waiter handoff under sustained reads.
 - reserve the read engine slot before allocating its exact aligned range, let the
@@ -74,12 +73,16 @@ version number documented in `MILESTONES.md`.
   derive the maximum range from the runtime record limits, and expose
   `l2_read_memory_misses` and `l2_read_busy_misses` counters.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
-  aggregate memory limit, I/O concurrency, and per-shard write buffering.
+  aggregate memory limit, I/O concurrency, and one per-shard write-batch capacity.
 - made `put` and `put_in` return their mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
-- replaced runtime-growing L1 maps, slot vectors, policy sketches, and S3-FIFO
-  ghost state with fixed startup allocations keyed directly by seeded XXH3;
+- replaced runtime-growing L1 maps and slot vectors with fixed startup
+  allocations keyed directly by seeded XXH3;
   L1 metadata now participates in aggregate memory-plan validation.
+- collapsed the green-field RAM policy surface to CLOCK, write admission to
+  immediate `WouldBlock`, startup reporting to `Cold`/`Warm`, and write staging
+  to one capacity setting with a fixed internal flush age; removed the public
+  data-sync operation and low-level index/hash setters.
 - raised the bounded index ceiling to 512 million slots for TB-scale,
   small-entry deployments and exposed deleted/stale/live slot reuse pressure.
 - changed the turnover soak to cycle mixed entry sizes, accept and count valid

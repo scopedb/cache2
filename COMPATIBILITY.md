@@ -11,9 +11,9 @@ The intended 1.0 surface is deliberately small:
 - `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and open a
   cache;
 - `HybridCache` provides point and namespace `put`/`get`/`delete` operations,
-  completion/data-sync fences, snapshots, and explicit fast or warm close;
+  a completion fence, snapshots, and explicit fast or warm close;
 - `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
-- `IoEngine`, `IoMode`, and `WriteBackpressure` select runtime behavior.
+- `IoEngine` and `IoMode` select runtime I/O behavior.
 - `RegionSetConfig`, `RegionSetId`, and `RegionSetAllocation` define and inspect
   optional physical namespace retention partitions.
 
@@ -51,8 +51,8 @@ Static configuration defines disk identity: capacity, Region geometry, index
 slots, shard count, RegionSet capacity layout and namespace ownership, seeded
 XXH3-64 algorithm identity, and hash seed. A change intentionally cold-starts
 empty.
-Runtime configuration—including workers, queues, buffers, L1 capacity,
-backpressure, and statistics—may change across a successful warm restart
+Runtime configuration—including workers, I/O concurrency, write-batch
+capacity, L1 capacity, and statistics—may change across a successful warm restart
 without invalidating the clean image.
 
 Only `close_warm` publishes recoverable state. Fast close, process failure, and

@@ -319,7 +319,6 @@ mod tests {
         let resources = ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
-            waiting_write_limit: 1,
         })
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();

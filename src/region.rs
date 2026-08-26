@@ -408,10 +408,6 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.drain()
     }
 
-    pub(crate) fn flush(&self) -> io::Result<()> {
-        self.runtime()?.data_plane()?.flush()
-    }
-
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
         self.runtime()?.data_plane()?.snapshot()
     }
@@ -2542,7 +2538,6 @@ mod tests {
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: 32 * 1024 * 1024,
             reserved_memory_bytes: 0,
-            waiting_write_limit: 2,
         })
         .unwrap()
     }
@@ -2567,7 +2562,6 @@ mod tests {
             ("open", false),
             ("write", false),
             ("drain", false),
-            ("flush", false),
             ("warm-data", false),
             ("warm-image", false),
             ("clean-state", true),
@@ -2608,11 +2602,7 @@ mod tests {
                     "{case}",
                 );
             } else {
-                assert_eq!(
-                    reopened.startup(),
-                    StartupMode::ColdAfterUncleanShutdown,
-                    "{case}"
-                );
+                assert_eq!(reopened.startup(), StartupMode::Cold, "{case}");
                 assert!(
                     reopened.get_value(7, b"survivor").unwrap().is_none(),
                     "{case}",
@@ -2630,13 +2620,11 @@ mod tests {
                 let _store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
                 crate::io_backend::testing::kill_process();
             }
-            "write" | "drain" | "flush" => {
+            "write" | "drain" => {
                 let store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
                 store.put_value(7, b"replacement", b"new").unwrap();
                 if case == "drain" {
                     store.drain().unwrap();
-                } else if case == "flush" {
-                    store.flush().unwrap();
                 }
                 crate::io_backend::testing::kill_process();
             }
@@ -2798,10 +2786,8 @@ mod tests {
                 .with_io_engine(crate::runtime_config::IoEngine::Sync)
                 .with_io_workers(1)
                 .with_io_concurrency(4)
-                .with_waiting_write_limit(4)
                 .with_l1_capacity(0)
                 .with_memory_limit(32 * 1024 * 1024)
-                .with_write_buffer_size(256 * 1024)
                 .with_write_batch_size(128 * 1024);
             let mut store = RegionStore::open(
                 4096,
@@ -2838,11 +2824,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            assert_eq!(
-                reopened.startup(),
-                StartupMode::ColdAfterUncleanShutdown,
-                "{case}"
-            );
+            assert_eq!(reopened.startup(), StartupMode::Cold, "{case}");
             reopened.close_fast().unwrap();
         }
     }
@@ -3389,7 +3371,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(fresh.startup(), StartupMode::Fresh);
+        assert_eq!(fresh.startup(), StartupMode::Cold);
         assert_no_runtime_data_write_during_startup(&fresh_io.events());
         fresh.close_fast().unwrap();
 
@@ -3403,34 +3385,9 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(dirty.startup(), StartupMode::ColdAfterUncleanShutdown);
+        assert_eq!(dirty.startup(), StartupMode::Cold);
         assert_no_runtime_data_write_during_startup(&dirty_io.events());
         dirty.close_fast().unwrap();
-    }
-
-    #[test]
-    fn explicit_flush_syncs_the_shared_data_inode_once() {
-        let directory = TestDirectory::new();
-        let (first_backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
-        let second_backend =
-            FaultBackend::open_with_handle(&directory.files.data, faults.clone()).unwrap();
-        let first: Arc<dyn IoEngine> =
-            Arc::new(BackendIoEngine::new(Arc::new(first_backend), 2).unwrap());
-        let second: Arc<dyn IoEngine> =
-            Arc::new(BackendIoEngine::new(Arc::new(second_backend), 2).unwrap());
-
-        crate::region_runtime::flush_data_inode(&[Arc::clone(&first), Arc::clone(&second)])
-            .unwrap();
-        assert_eq!(
-            faults
-                .events()
-                .iter()
-                .filter(|event| **event == FaultEvent::Sync(SyncPoint::ExplicitFlush))
-                .count(),
-            1
-        );
-        first.shutdown().unwrap();
-        second.shutdown().unwrap();
     }
 
     #[test]
@@ -3478,7 +3435,7 @@ mod tests {
             FileRegionBackend::new(directory.files.clone(), data),
         )
         .unwrap();
-        assert_eq!(reopened.startup(), StartupMode::ColdAfterUncleanShutdown);
+        assert_eq!(reopened.startup(), StartupMode::Cold);
         let manager = reopened.runtime().unwrap().manager.lock().unwrap();
         assert_eq!(manager.active_regions(), &[0, 1, 2, 3]);
         assert_eq!(manager.free_regions().len(), 1);
@@ -3514,7 +3471,7 @@ mod tests {
             FileRegionBackend::new(directory.files.clone(), data),
         )
         .unwrap();
-        assert_eq!(cold.startup(), StartupMode::ColdAfterUncleanShutdown);
+        assert_eq!(cold.startup(), StartupMode::Cold);
         let mut observed = [0xff_u8; 12];
         File::open(&directory.files.data)
             .unwrap()
@@ -3615,7 +3572,7 @@ mod tests {
             FileRegionBackend::new(directory.files.clone(), data),
         )
         .unwrap();
-        assert_eq!(rejected.startup(), StartupMode::ColdAfterUncleanShutdown);
+        assert_eq!(rejected.startup(), StartupMode::Cold);
         assert_eq!(
             rejected.runtime().unwrap().lookup_snapshot(0).unwrap(),
             None
@@ -3670,7 +3627,7 @@ mod tests {
             FileRegionBackend::new(directory.files.clone(), data),
         )
         .unwrap();
-        assert_eq!(cold.startup(), StartupMode::ColdAfterUncleanShutdown);
+        assert_eq!(cold.startup(), StartupMode::Cold);
         assert_eq!(cold.runtime().unwrap().lookup_snapshot(1).unwrap(), None);
         cold.close_fast().unwrap();
     }
@@ -3751,11 +3708,7 @@ mod tests {
                 FileRegionBackend::new(directory.files.clone(), data),
             )
             .unwrap();
-            assert_eq!(
-                reopened.startup(),
-                StartupMode::ColdAfterUncleanShutdown,
-                "failure case {case}"
-            );
+            assert_eq!(reopened.startup(), StartupMode::Cold, "failure case {case}");
             reopened.close_fast().unwrap();
         }
     }
@@ -3800,10 +3753,7 @@ mod tests {
                 FileRegionBackend::new(directory.files.clone(), data),
             )
             .unwrap();
-            assert!(matches!(
-                cold.startup(),
-                StartupMode::Fresh | StartupMode::ColdAfterUncleanShutdown
-            ));
+            assert!(matches!(cold.startup(), StartupMode::Cold));
             cold.close_fast().unwrap();
         }
     }
@@ -3833,7 +3783,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reopened.startup(),
-            StartupMode::Warm | StartupMode::ColdAfterUncleanShutdown
+            StartupMode::Warm | StartupMode::Cold
         ));
         assert_eq!(
             reopened.runtime().unwrap().lookup_snapshot(0).unwrap(),

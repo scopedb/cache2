@@ -105,12 +105,13 @@ The median result is the baseline:
 
 ## M1 L1 shard scaling — 2026-08-24
 
-An Ubuntu arm64 OrbStack VM ran the comparison entirely from `/dev/shm` with
-16 virtual CPUs and `rustc 1.94.1`. Both implementations used 16,384 eight-byte
-keys, 256-byte values, a 32 MiB L1, XXH3, LRU, four static append/index
-shards, 4,194,304 reads per sample, and three-run medians. Reader-thread and
-runtime L1-shard counts varied while persistent topology stayed fixed; every
-returned value's embedded key ordinal was verified.
+An Ubuntu arm64 OrbStack VM ran the historical comparison entirely from
+`/dev/shm` with 16 virtual CPUs and `rustc 1.94.1`. Both implementations used
+16,384 eight-byte keys, 256-byte values, a 32 MiB L1, XXH3, four static
+append/index shards, 4,194,304 reads per sample, and three-run medians. This
+predates the current CLOCK-only API and Rust 1.98.0 qualification contract.
+Reader-thread and runtime L1-shard counts varied while persistent topology
+stayed fixed; every returned value's embedded key ordinal was verified.
 
 With 64 L1 shards, cache-rs scaled through four reader threads before the VM's
 shared-cache and scheduling costs dominated:
@@ -355,7 +356,7 @@ scheduling/page-cache contention or a device-path limit.
 The soak workload runs four writers and four readers by default while
 continuously overwriting a key ring larger than L1. Every 64th announced write
 also attempts a delete, and values cycle through 256 B, 4 KiB, 16 KiB, and
-256 KiB sizes. Periodic samples flush accepted batches, validate the embedded
+256 KiB sizes. Periodic samples drain accepted batches, validate the embedded
 version, key, length, and payload of every hit, and report an older valid
 version as `stale_hits` because freshness is best effort. A future version,
 wrong key, or malformed record is fatal. Samples
@@ -381,9 +382,7 @@ cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 `CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and
 `CACHE_SOAK_READERS` control the workload.
 `CACHE_SOAK_IO_ENGINE` and
-`CACHE_SOAK_IO_MODE` select the device path. `CACHE_SOAK_EVICTION` selects
-`clock`, `lru`, `tinylfu`, `sieve`, `fifo`, or `s3fifo`; the main benchmark uses
-the same values through `CACHE_BENCH_EVICTION`. M2 evidence must retain the
+`CACHE_SOAK_IO_MODE` select the device path. M2 evidence must retain the
 complete output and confirm zero errors, no future/wrong-key/malformed reads,
 bounded managed memory and current RSS, and bounded logical disk use. Stale-hit
 counts are workload evidence, not a correctness failure.

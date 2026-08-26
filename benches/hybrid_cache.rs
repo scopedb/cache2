@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{
-    CacheTier, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig,
-    StartupMode, StaticConfig,
+    CacheTier, HybridCache, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode,
+    StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -31,7 +31,6 @@ struct BenchConfig {
     clients: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
-    eviction_policy: EvictionPolicy,
     statistics_enabled: bool,
     directory: PathBuf,
 }
@@ -64,7 +63,6 @@ impl BenchConfig {
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
-        let eviction_policy = parse_eviction_policy("CACHE_BENCH_EVICTION")?;
         let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
         let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
@@ -143,7 +141,6 @@ impl BenchConfig {
             clients,
             io_engine,
             io_mode,
-            eviction_policy,
             statistics_enabled,
             directory,
         })
@@ -165,11 +162,8 @@ impl BenchConfig {
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
             .with_io_concurrency(io_concurrency)
-            .with_waiting_write_limit(256)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
-            .with_eviction_policy(self.eviction_policy)
-            .with_write_flush_delay(Duration::from_millis(1))
             .with_statistics(self.statistics_enabled)
     }
 }
@@ -225,7 +219,7 @@ fn main() -> io::Result<()> {
 
     println!("cache-rs HybridCache benchmark");
     println!(
-        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} workers={} clients={} engine={:?} mode={:?} eviction={:?} statistics={}",
+        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} workers={} clients={} engine={:?} mode={:?} statistics={}",
         config.entries,
         config.resident_entries,
         config.value_bytes,
@@ -237,7 +231,6 @@ fn main() -> io::Result<()> {
         config.clients,
         config.io_engine,
         config.io_mode,
-        config.eviction_policy,
         config.statistics_enabled,
     );
     println!("file={}", files.data.display());
@@ -327,10 +320,9 @@ fn main() -> io::Result<()> {
     if config.statistics_enabled {
         let snapshot = cache.snapshot()?;
         println!(
-            "result phase=l1_policy evictions={} bypasses={} admission_rejections={} promotions={} l1_hits={} l1_misses={}",
+            "result phase=l1_clock evictions={} bypasses={} promotions={} l1_hits={} l1_misses={}",
             snapshot.l1_evictions,
             snapshot.l1_bypasses,
-            snapshot.l1_admission_rejections,
             snapshot.l1_promotions,
             snapshot.l1_hits,
             snapshot.l1_misses,
@@ -341,21 +333,6 @@ fn main() -> io::Result<()> {
     enforce_thresholds(&put, &l1, warm_close, &promotion, &promoted_l1)?;
 
     Ok(())
-}
-
-fn parse_eviction_policy(name: &str) -> io::Result<EvictionPolicy> {
-    match env::var(name)
-        .unwrap_or_else(|_| "clock".to_owned())
-        .as_str()
-    {
-        "clock" => Ok(EvictionPolicy::Clock),
-        "lru" => Ok(EvictionPolicy::Lru),
-        "tinylfu" | "tiny-lfu" => Ok(EvictionPolicy::TinyLfu),
-        "sieve" => Ok(EvictionPolicy::Sieve),
-        "fifo" => Ok(EvictionPolicy::Fifo),
-        "s3fifo" | "s3-fifo" => Ok(EvictionPolicy::S3Fifo),
-        value => Err(invalid(format!("unsupported eviction policy: {value}"))),
-    }
 }
 
 fn concurrent_reads(

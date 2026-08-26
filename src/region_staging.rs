@@ -891,7 +891,6 @@ mod tests {
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes,
             reserved_memory_bytes: 0,
-            waiting_write_limit: 1,
         })
         .unwrap()
     }

@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cache_rs::{
-    CacheHealth, CacheTier, EvictionPolicy, HybridCacheConfig, IoEngine, RegionSetConfig,
-    RuntimeConfig, StartupMode, StaticConfig,
+    CacheHealth, CacheTier, HybridCacheConfig, IoEngine, RegionSetConfig, RuntimeConfig,
+    StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -27,7 +27,7 @@ impl TestCache {
     fn config(&self, workers: usize) -> HybridCacheConfig {
         let static_config = StaticConfig::new(3 * 512 * 1024)
             .with_region_size(512 * 1024)
-            .with_index_slots(4096)
+            .with_expected_entries(3277)
             .with_write_shards(2);
         self.config_with_static(workers, static_config)
     }
@@ -37,12 +37,9 @@ impl TestCache {
             .with_io_engine(IoEngine::Sync)
             .with_io_workers(workers)
             .with_io_concurrency(workers * 4)
-            .with_waiting_write_limit(16)
             .with_l1_capacity(4 * 1024 * 1024)
             .with_memory_limit(32 * 1024 * 1024)
-            .with_write_buffer_size(256 * 1024)
-            .with_write_batch_size(128 * 1024)
-            .with_write_flush_delay(Duration::from_millis(2))
+            .with_write_batch_size(256 * 1024)
             .with_statistics(true);
         HybridCacheConfig::from_static(&self.data, static_config)
             .with_runtime_config(runtime_config)
@@ -120,17 +117,14 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
 fn fast_close_always_reopens_empty() {
     let files = TestCache::new("fast-close");
     let cache = files.config(1).open().unwrap();
-    assert_eq!(cache.startup_mode(), StartupMode::Fresh);
+    assert_eq!(cache.startup_mode(), StartupMode::Cold);
     cache.put("key", "value").unwrap();
     cache.drain().unwrap();
     assert_eq!(cache.get("key").unwrap().unwrap().as_ref(), b"value");
     cache.close_fast().unwrap();
 
     let reopened = files.config(7).open().unwrap();
-    assert_eq!(
-        reopened.startup_mode(),
-        StartupMode::ColdAfterUncleanShutdown
-    );
+    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").unwrap().is_none());
     reopened.close_fast().unwrap();
 }
@@ -142,7 +136,6 @@ fn immediate_l1_publication_is_best_effort() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(2)
         .with_io_concurrency(8)
-        .with_write_flush_delay(Duration::from_secs(60))
         .with_statistics(true);
     let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
     let mut visible = 0;
@@ -175,13 +168,10 @@ fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_concurrency(4)
-        .with_waiting_write_limit(4)
         .with_l1_capacity(1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_buffer_size(256 * 1024)
         .with_write_batch_size(256 * 1024)
-        .with_write_flush_delay(Duration::from_secs(60))
         .with_statistics(true);
     let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
     let first = vec![1_u8; 200 * 1024];
@@ -195,9 +185,10 @@ fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(cache.get("key").unwrap().unwrap().as_ref(), first);
     assert_eq!(cache.snapshot().unwrap().write_rejections, 1);
-    let writes = cache.detailed_snapshot().unwrap().writes;
-    assert_eq!(writes.write_buffer_rejections, 1);
-    assert_eq!(writes.write_buffer_wait_ns, 0);
+    assert_eq!(
+        cache.detailed_snapshot().unwrap().write_buffer_rejections,
+        1
+    );
 
     cache.drain().unwrap();
     eventually_admitted(|| cache.put("key", &second));
@@ -212,13 +203,10 @@ fn l1_bypass_may_remain_stale_after_region_completion() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(2)
         .with_io_concurrency(8)
-        .with_waiting_write_limit(16)
         .with_l1_capacity(512)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_buffer_size(256 * 1024)
         .with_write_batch_size(128 * 1024)
-        .with_write_flush_delay(Duration::from_secs(60))
         .with_statistics(true);
     let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
 
@@ -256,12 +244,9 @@ fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
         .with_io_engine(IoEngine::IoUring)
         .with_io_workers(1)
         .with_io_concurrency(4)
-        .with_waiting_write_limit(16)
         .with_l1_capacity(4 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
-        .with_write_buffer_size(256 * 1024)
-        .with_write_batch_size(128 * 1024)
-        .with_write_flush_delay(Duration::from_millis(2));
+        .with_write_batch_size(128 * 1024);
 
     let error = files
         .config(1)
@@ -271,10 +256,7 @@ fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 
     let reopened = files.config(1).open().unwrap();
-    assert_eq!(
-        reopened.startup_mode(),
-        StartupMode::ColdAfterUncleanShutdown
-    );
+    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     reopened.close_fast().unwrap();
 }
 
@@ -307,14 +289,10 @@ fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(7)
         .with_io_concurrency(35)
-        .with_waiting_write_limit(11)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
-        .with_eviction_policy(EvictionPolicy::S3Fifo)
-        .with_write_buffer_size(128 * 1024)
-        .with_write_batch_size(64 * 1024)
-        .with_write_flush_delay(Duration::from_millis(7));
+        .with_write_batch_size(64 * 1024);
     let reopened = files.config(7).with_runtime_config(retuned).open().unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     let first = reopened.get("key").unwrap().unwrap();
@@ -336,7 +314,7 @@ fn namespaces_are_independent() {
     let cache = files.config(3).open().unwrap();
     cache.put_in(1, "key", "one").unwrap();
     cache.put_in(2, "key", "two").unwrap();
-    cache.flush().unwrap();
+    cache.drain().unwrap();
     assert_eq!(cache.get_in(1, "key").unwrap().unwrap().as_ref(), b"one");
     assert_eq!(cache.get_in(2, "key").unwrap().unwrap().as_ref(), b"two");
     cache.close_fast().unwrap();
@@ -485,7 +463,7 @@ fn namespace_region_sets_rotate_and_recover_independently() {
     let files = TestCache::new("region-set-isolation");
     let static_config = StaticConfig::new(6 * REGION_BYTES)
         .with_region_size(REGION_BYTES)
-        .with_index_slots(4096)
+        .with_expected_entries(3277)
         .with_write_shards(2)
         .with_region_sets([
             RegionSetConfig::new(0).with_weight(2),
@@ -568,18 +546,14 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
                 .with_io_concurrency(8)
                 .with_l1_capacity(0)
                 .with_memory_limit(2 * 1024 * 1024)
-                .with_write_buffer_size(256 * 1024)
                 .with_write_batch_size(128 * 1024)
         }),
-        ("write-queue-out-of-range", |config| {
-            config
-                .with_io_workers(16)
-                .with_io_concurrency(65_536)
-                .with_waiting_write_limit(65_537)
-        }),
         ("zero-l1-shards", |config| config.with_l1_shards(0)),
-        ("write-flush-delay-out-of-range", |config| {
-            config.with_write_flush_delay(Duration::from_secs(24 * 60 * 60 + 1))
+        ("unaligned-write-batch", |config| {
+            config.with_write_batch_size(4097)
+        }),
+        ("oversized-write-batch", |config| {
+            config.with_write_batch_size(4 * 1024 * 1024 + 4096)
         }),
     ];
 
@@ -640,7 +614,7 @@ fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
     let static_config = StaticConfig::new(2 * 4096)
         .with_region_size(4096)
-        .with_index_slots(64)
+        .with_expected_entries(51)
         .with_write_shards(1);
     let value = vec![0x5a; 128];
 
@@ -662,7 +636,7 @@ fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
     let static_config = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
-        .with_index_slots(4096)
+        .with_expected_entries(3277)
         .with_write_shards(2);
     let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
 
@@ -691,7 +665,7 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
     let files = TestCache::new("resource-snapshot");
     let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
-        .with_index_slots(4096)
+        .with_expected_entries(3277)
         .with_write_shards(2)
         .peak_disk_bytes()
         .unwrap();
@@ -716,11 +690,7 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
 
     let detailed = cache.detailed_snapshot().unwrap();
     assert_eq!(detailed.summary, resources);
-    assert_eq!(detailed.writes.write_requests_in_flight, 0);
-    assert_eq!(
-        detailed.writes.write_requests_peak, 0,
-        "reject-mode puts use shard write buffers directly"
-    );
+    assert_eq!(detailed.write_buffer_rejections, resources.write_rejections);
     assert_eq!(detailed.io.requests_in_flight, 0);
     assert_eq!(detailed.io.completed, detailed.io.submitted);
     assert!(
@@ -735,7 +705,7 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
     assert!(detailed.l1.resident_bytes <= 4 * 1024 * 1024);
     assert_eq!(detailed.l1.retained_bytes, 0);
     assert!(detailed.l1.metadata_bytes > 0);
-    assert_eq!(detailed.index.slot_capacity, 4096);
+    assert_eq!(detailed.index.slot_capacity, 4097);
     assert_eq!(
         detailed.index.physical_value_slots
             + detailed.index.deleted_slots
@@ -807,10 +777,8 @@ fn read_io_failure_is_counted_and_latches_miss_only() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_concurrency(4)
-        .with_waiting_write_limit(16)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
-        .with_write_buffer_size(256 * 1024)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
     let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
@@ -839,11 +807,9 @@ fn promoted_l2_values_release_transient_read_memory_before_return() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_concurrency(4)
-        .with_waiting_write_limit(4)
         .with_l1_capacity(64 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_buffer_size(256 * 1024)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
     let cache = files
@@ -880,10 +846,8 @@ fn retained_l2_values_use_exact_transient_memory_without_slot_saturation() {
         .with_io_engine(IoEngine::Sync)
         .with_io_workers(1)
         .with_io_concurrency(4)
-        .with_waiting_write_limit(4)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
-        .with_write_buffer_size(256 * 1024)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
     let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
@@ -920,10 +884,10 @@ fn static_config_change_discards_the_old_image() {
 
     let changed = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
-        .with_index_slots(8192)
+        .with_expected_entries(6553)
         .with_write_shards(2);
     let reopened = files.config_with_static(5, changed).open().unwrap();
-    assert_eq!(reopened.startup_mode(), StartupMode::Fresh);
+    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").unwrap().is_none());
     reopened.close_fast().unwrap();
 }
@@ -931,9 +895,9 @@ fn static_config_change_discards_the_old_image() {
 #[test]
 fn unsupported_cache_format_versions_cold_start_empty() {
     for (target, expected_startup) in [
-        ("data", StartupMode::Fresh),
-        ("state", StartupMode::ColdAfterUncleanShutdown),
-        ("image", StartupMode::ColdAfterUncleanShutdown),
+        ("data", StartupMode::Cold),
+        ("state", StartupMode::Cold),
+        ("image", StartupMode::Cold),
     ] {
         let files = TestCache::new(&format!("unsupported-{target}"));
         let cache = files.config(2).open().unwrap();

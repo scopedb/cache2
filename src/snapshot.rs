@@ -3,10 +3,8 @@ use crate::region_layout::RegionSetId;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupMode {
-    Fresh,
-    ColdAfterUncleanShutdown,
+    Cold,
     Warm,
-    ColdAfterRejectedImage,
 }
 
 #[non_exhaustive]
@@ -38,7 +36,6 @@ pub struct CacheSnapshot {
     pub l1_promotions: u64,
     pub l1_evictions: u64,
     pub l1_bypasses: u64,
-    pub l1_admission_rejections: u64,
     pub write_rejections: u64,
     pub io_failures: u64,
     pub region_rotations: u64,
@@ -46,17 +43,6 @@ pub struct CacheSnapshot {
     pub managed_memory_peak_bytes: usize,
     pub managed_memory_limit_bytes: usize,
     pub logical_disk_peak_bytes: u64,
-}
-
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheWriteSnapshot {
-    pub write_requests_in_flight: u64,
-    pub write_requests_peak: u64,
-    pub write_gate_rejections: u64,
-    pub write_gate_wait_ns: u64,
-    pub write_buffer_rejections: u64,
-    pub write_buffer_wait_ns: u64,
 }
 
 #[non_exhaustive]
@@ -119,7 +105,7 @@ pub struct RegionSetSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {
     pub summary: CacheSnapshot,
-    pub writes: CacheWriteSnapshot,
+    pub write_buffer_rejections: u64,
     pub io: CacheIoSnapshot,
     pub l1: CacheL1Snapshot,
     pub index: CacheIndexSnapshot,

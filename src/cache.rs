@@ -74,11 +74,6 @@ impl StaticConfig {
         self
     }
 
-    pub fn with_index_slots(mut self, slots: usize) -> Self {
-        self.index_slots = slots;
-        self
-    }
-
     pub fn with_expected_entries(mut self, entries: usize) -> Self {
         self.index_slots = entries
             .saturating_mul(5)
@@ -91,11 +86,6 @@ impl StaticConfig {
     /// Sets the number of independent append paths in the on-disk layout.
     pub fn with_write_shards(mut self, shards: u32) -> Self {
         self.write_shards = shards;
-        self
-    }
-
-    pub fn with_hash_seed(mut self, seed: u64) -> Self {
-        self.hash_seed = seed;
         self
     }
 
@@ -460,10 +450,6 @@ impl HybridCache {
 
     pub fn drain(&self) -> Result<()> {
         self.store.drain()
-    }
-
-    pub fn flush(&self) -> Result<()> {
-        self.store.flush()
     }
 
     pub fn snapshot(&self) -> Result<CacheSnapshot> {

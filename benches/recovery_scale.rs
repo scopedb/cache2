@@ -65,7 +65,6 @@ impl ScaleConfig {
             .with_io_mode(IoMode::Buffered)
             .with_io_workers(1)
             .with_io_concurrency(32)
-            .with_waiting_write_limit(16)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(false)
@@ -166,7 +165,7 @@ fn main() -> io::Result<()> {
     let opened = Instant::now();
     let cache = files.config(&config).open()?;
     emit("fresh_open", opened.elapsed());
-    require_startup(cache.startup_mode(), StartupMode::Fresh)?;
+    require_startup(cache.startup_mode(), StartupMode::Cold)?;
     let resources = cache.snapshot()?;
     println!(
         "resources managed_bytes={} managed_peak_bytes={} managed_limit_bytes={}",
