@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::eviction::{
     AdmissionHint, EvictionPolicy, EvictionState, MAX_POLICY_SLOT_INDEX, PolicySlot,
@@ -584,7 +584,7 @@ impl MemoryStore {
         seqno: u64,
     ) -> bool {
         let shard_id = self.route(hash);
-        let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
+        let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
         };
@@ -622,7 +622,7 @@ impl MemoryStore {
         clock: ExpiryClock,
     ) -> MemoryLookup {
         let shard_id = self.route(hash);
-        let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
+        let Some(mut shard) = self.try_lock_shard(shard_id) else {
             return MemoryLookup::Miss(MemoryReadToken {
                 shard_id,
                 admission: AdmissionHint::default(),
@@ -668,9 +668,7 @@ impl MemoryStore {
         if token.shard_id != self.route(hash) {
             return None;
         }
-        let Ok(Some(mut shard)) = self.try_lock_shard(token.shard_id) else {
-            return None;
-        };
+        let mut shard = self.try_lock_shard(token.shard_id)?;
         if shard.find(hash, namespace_id, key).is_some() {
             return None;
         }
@@ -728,14 +726,8 @@ impl MemoryStore {
         (hash % self.shards.len() as u64) as usize
     }
 
-    fn try_lock_shard(&self, shard_id: usize) -> io::Result<Option<MutexGuard<'_, MemoryShard>>> {
-        match self.shards[shard_id].try_lock() {
-            Ok(shard) => Ok(Some(shard)),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Poisoned(_)) => {
-                Err(io::Error::other("memory-tier shard is poisoned"))
-            }
-        }
+    fn try_lock_shard(&self, shard_id: usize) -> Option<MutexGuard<'_, MemoryShard>> {
+        self.shards[shard_id].try_lock().ok()
     }
 }
 

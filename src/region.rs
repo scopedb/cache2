@@ -555,38 +555,33 @@ impl FileRegionCore {
     }
 
     /// Begins one physical read with a single bounded index lookup.
-    fn begin_point_read(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
+    fn begin_point_read(&self, hash: u64) -> Option<IndexEntry> {
         if !self.health.is_healthy() {
-            return Ok(None);
+            return None;
         }
         let entry = match self.index.lookup_raw(hash) {
             Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(None),
+            Ok(None) => return None,
             Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
-                return Ok(None);
+                return None;
             }
             Err(_) => {
                 self.health.enter_miss_only();
-                return Ok(None);
+                return None;
             }
         };
-        Ok(Some(entry))
+        Some(entry)
     }
 
     /// Begins one durable value read. The aligned read buffer becomes the value
     /// owner on a hit, avoiding a second payload copy.
-    pub(crate) fn begin_value_read(
-        &self,
-        hash: u64,
-        namespace_id: u32,
-    ) -> io::Result<Option<IndexEntry>> {
-        let entry = self.begin_point_read(hash)?;
-        Ok(entry.filter(|entry| {
+    pub(crate) fn begin_value_read(&self, hash: u64, namespace_id: u32) -> Option<IndexEntry> {
+        self.begin_point_read(hash).filter(|entry| {
             entry.namespace_id == namespace_id
                 && self
                     .layout
                     .region_belongs_to_namespace(namespace_id, entry.location.region_id())
-        }))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -602,7 +597,7 @@ impl FileRegionCore {
         clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = hash_namespaced_key(hash_seed, namespace_id, key);
-        let Some(entry) = self.begin_value_read(hash, namespace_id)? else {
+        let Some(entry) = self.begin_value_read(hash, namespace_id) else {
             return Ok(None);
         };
         let plan = plan_read(geometry, hash, entry)?;
@@ -3100,7 +3095,6 @@ mod tests {
         );
         let read = runtime
             .begin_point_read(first_hash)
-            .unwrap()
             .expect("completed entry must plan a Region read");
         assert_eq!(read, entry);
 
@@ -3285,7 +3279,6 @@ mod tests {
         let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
         let entry = runtime
             .begin_point_read(owner_hash)
-            .unwrap()
             .expect("hash lookup must return the collision candidate");
         let plan = plan_read(data.geometry, owner_hash, entry).unwrap();
 

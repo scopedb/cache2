@@ -784,7 +784,7 @@ impl RegionDataPlane {
                 token
             }
         };
-        let Some(entry) = self.core.begin_value_read(hash, namespace_id)? else {
+        let Some(entry) = self.core.begin_value_read(hash, namespace_id) else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
