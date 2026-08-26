@@ -56,7 +56,9 @@ use crate::resources::BufferLease;
 use crate::runtime_config::{IoMode, RuntimeConfig};
 #[cfg(test)]
 use crate::snapshot::StartupMode;
-use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, RegionSetSnapshot};
+use crate::snapshot::{
+    CacheIndexSnapshot, CacheSnapshot, DetailedCacheSnapshot, RegionSetSnapshot,
+};
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -434,6 +436,10 @@ impl FileRegionCore {
         self.shards.len()
     }
 
+    pub(crate) const fn index_slot_count(&self) -> usize {
+        self.index.storage().slot_count()
+    }
+
     pub(crate) fn runtime_reserved_memory_bytes(&self) -> io::Result<usize> {
         let region_count = u32::try_from(self.manager.lock()?.regions().len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large")
@@ -452,6 +458,14 @@ impl FileRegionCore {
             .lock()?
             .region_set_snapshots()
             .map_err(region_metadata_io_error)
+    }
+
+    pub(crate) fn index_snapshot(&self) -> io::Result<CacheIndexSnapshot> {
+        self.index.snapshot().map_err(index_storage_io_error)
+    }
+
+    pub(crate) fn set_index_statistics_enabled(&self, enabled: bool) {
+        self.index.set_statistics_enabled(enabled);
     }
 
     pub(crate) fn enter_miss_only(&self) {

@@ -191,7 +191,7 @@ fn validate_index_slots(index_slots: usize) -> io::Result<()> {
     if !(8..=MAX_INDEX_SLOTS).contains(&index_slots) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RegionStore index slots must be in 8..=268435456",
+            "RegionStore index slots must be in 8..=536870912",
         ));
     }
     Ok(())

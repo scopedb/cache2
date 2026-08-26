@@ -14,11 +14,11 @@ use crate::eviction::{
     PolicySlot,
 };
 use crate::expiry::ExpiryClock;
-use crate::hashing::{PrehashedMap, route_hash};
+use crate::hashing::{FixedPrehashedMap, route_hash};
+use crate::snapshot::CacheL1Snapshot;
 
-/// Charged resident metadata: the entry slot, eviction-policy slot, and the
-/// retained-value ownership. Container buckets and allocator metadata are
-/// excluded from managed figures, like the other runtime collections.
+/// Charged retained-value ownership. Fixed entry, policy, free-list, and
+/// directory storage is planned and allocated separately during open.
 pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// Full-key collision work must stay bounded even when callers supply many
 /// distinct keys with the same 64-bit cache hash.
@@ -112,7 +112,6 @@ impl MemoryBudget {
         MemoryChargeAttempt::Contended
     }
 
-    #[cfg(test)]
     fn used_bytes(&self) -> usize {
         self.used_bytes.load(Ordering::Acquire)
     }
@@ -269,42 +268,72 @@ impl AdmissionPlan {
 struct MemoryShard {
     budget: Arc<MemoryBudget>,
     eviction: EvictionState,
-    directory: PrehashedMap<u32>,
-    slots: Vec<Option<MemoryEntry>>,
-    policy_slots: Vec<PolicySlot>,
+    directory: FixedPrehashedMap,
+    slots: Box<[Option<MemoryEntry>]>,
+    policy_slots: Box<[PolicySlot]>,
     free_slots: Vec<u32>,
+    resident_bytes: usize,
 }
 
 impl MemoryShard {
-    fn new(capacity_bytes: usize, policy: EvictionPolicy) -> io::Result<Self> {
-        let maximum_entries = (capacity_bytes / MEMORY_ENTRY_OVERHEAD_BYTES)
-            .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+    fn new(
+        capacity_bytes: usize,
+        maximum_entries: usize,
+        policy: EvictionPolicy,
+    ) -> io::Result<Self> {
         let budget = Arc::new(MemoryBudget::new(capacity_bytes));
-        let directory = PrehashedMap::default();
+        let directory = FixedPrehashedMap::try_new(maximum_entries)?;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(maximum_entries).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate L1 entry slots")
+        })?;
+        slots.resize_with(maximum_entries, || None);
+        let mut policy_slots = Vec::new();
+        policy_slots
+            .try_reserve_exact(maximum_entries)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate L1 policy slots",
+                )
+            })?;
+        policy_slots.resize(maximum_entries, PolicySlot::default());
+        let mut free_slots = Vec::new();
+        free_slots.try_reserve_exact(maximum_entries).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate L1 free slots")
+        })?;
+        free_slots.extend(
+            (0..maximum_entries).rev().map(|index| {
+                u32::try_from(index).expect("validated L1 entry capacity exceeds u32")
+            }),
+        );
         Ok(Self {
             budget,
             eviction: EvictionState::new(policy, capacity_bytes, maximum_entries)?,
             directory,
-            slots: Vec::new(),
-            policy_slots: Vec::new(),
-            free_slots: Vec::new(),
+            slots: slots.into_boxed_slice(),
+            policy_slots: policy_slots.into_boxed_slice(),
+            free_slots,
+            resident_bytes: 0,
         })
     }
 
     fn directory_head(&self, hash: u64) -> Option<u32> {
-        self.directory.get(&hash).copied()
+        self.directory.get(hash)
     }
 
-    fn directory_can_upsert(&mut self, hash: u64) -> bool {
-        self.directory.contains_key(&hash) || self.directory.try_reserve(1).is_ok()
+    fn directory_can_upsert(&self, hash: u64) -> bool {
+        self.directory.can_upsert(hash)
     }
 
     fn directory_upsert(&mut self, hash: u64, head: u32) -> Option<u32> {
-        self.directory.insert(hash, head)
+        self.directory
+            .insert(hash, head)
+            .expect("preflighted fixed L1 directory insertion")
     }
 
     fn directory_remove(&mut self, hash: u64) -> Option<u32> {
-        self.directory.remove(&hash)
+        self.directory.remove(hash)
     }
 
     fn find(&self, hash: u64, namespace_id: u32, key: &[u8]) -> Option<usize> {
@@ -403,6 +432,11 @@ impl MemoryShard {
             debug_assert!(replaced.is_some());
         }
 
+        let resident_bytes = self.slots[index]
+            .as_ref()
+            .expect("resident slot disappeared")
+            .value
+            .charged_bytes();
         if transfer_charge {
             let released = self.slots[index]
                 .as_mut()
@@ -419,6 +453,8 @@ impl MemoryShard {
             );
         }
         let _entry = self.slots[index].take().expect("resident slot disappeared");
+        self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
+        debug_assert!(self.free_slots.len() < self.slots.len());
         self.free_slots
             .push(u32::try_from(index).expect("memory slot index exceeds u32"));
     }
@@ -484,10 +520,13 @@ impl MemoryShard {
                 admission: false,
             };
         }
+        let needs_slot = replacement.is_none() && self.free_slots.is_empty();
         match self.budget.try_charge(required) {
             MemoryChargeAttempt::Charged(charge) => {
                 if let Some(replacement) = replacement {
                     self.remove_slot(replacement);
+                } else if needs_slot {
+                    return self.charge_with_slot_eviction(required, hash, charge);
                 }
                 return ChargeResult::Charged {
                     charge,
@@ -586,6 +625,56 @@ impl MemoryShard {
         }
     }
 
+    fn charge_with_slot_eviction(
+        &mut self,
+        required: usize,
+        hash: u64,
+        charge: MemoryCharge,
+    ) -> ChargeResult {
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+        let candidate = {
+            let slots = &self.slots;
+            self.eviction.select_victim(
+                &mut self.policy_slots,
+                &mut remaining_steps,
+                |index| {
+                    slots[index]
+                        .as_ref()
+                        .expect("resident policy slot has no memory entry")
+                        .value
+                        .charged_bytes()
+                },
+                |_| true,
+            )
+        };
+        let Some(candidate) = candidate else {
+            return ChargeResult::Rejected {
+                evictions: 0,
+                admission: false,
+            };
+        };
+        let mut victim = self.detach_for_admission(candidate.index, candidate.record_ghost);
+        if !self.eviction.admits_victims(
+            hash,
+            required,
+            std::iter::once((victim.hash, victim.weight)),
+        ) {
+            self.restore_detached(victim);
+            return ChargeResult::Rejected {
+                evictions: 0,
+                admission: true,
+            };
+        }
+        // The candidate was charged independently because byte capacity was
+        // available. Let an exclusive victim release its own charge normally.
+        victim.transfers_charge = false;
+        self.commit_detached(victim);
+        ChargeResult::Charged {
+            charge,
+            evictions: 1,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
@@ -610,18 +699,6 @@ impl MemoryShard {
             return MemoryInsertResult::bypassed();
         };
 
-        let maximum_freed_slots = MAX_EVICTIONS_PER_INSERT + usize::from(replacement.is_some());
-        if self.free_slots.try_reserve(maximum_freed_slots).is_err() {
-            return MemoryInsertResult::bypassed();
-        }
-        let may_append_without_eviction = self.free_slots.is_empty()
-            && replacement.is_none()
-            && self.budget.available_bytes() >= charged_bytes;
-        if may_append_without_eviction
-            && (self.slots.try_reserve(1).is_err() || self.policy_slots.try_reserve(1).is_err())
-        {
-            return MemoryInsertResult::bypassed();
-        }
         let (charge, evictions) = match self.charge_with_eviction(charged_bytes, hash, replacement)
         {
             ChargeResult::Charged { charge, evictions } => (charge, evictions),
@@ -630,25 +707,8 @@ impl MemoryShard {
                 admission,
             } => return MemoryInsertResult::rejected(evictions, admission),
         };
-        if self.free_slots.is_empty()
-            && (self.slots.try_reserve(1).is_err() || self.policy_slots.try_reserve(1).is_err())
-        {
+        let Some(packed_index) = self.free_slots.last().copied() else {
             return MemoryInsertResult::rejected(evictions, false);
-        }
-        let packed_index = match self.free_slots.last().copied() {
-            Some(index) => index,
-            None => {
-                if self.slots.len() > MAX_POLICY_SLOT_INDEX {
-                    return MemoryInsertResult::rejected(evictions, false);
-                }
-                let Some(index) = u32::try_from(self.slots.len())
-                    .ok()
-                    .filter(|index| *index != NO_SLOT_INDEX)
-                else {
-                    return MemoryInsertResult::rejected(evictions, false);
-                };
-                index
-            }
         };
         let Ok(index) = usize::try_from(packed_index) else {
             return MemoryInsertResult::rejected(evictions, false);
@@ -664,17 +724,13 @@ impl MemoryShard {
             namespace_id,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
         };
-        match self.free_slots.pop() {
-            Some(free_index) => {
-                debug_assert_eq!(free_index, packed_index);
-                self.slots[index] = Some(entry);
-            }
-            None => {
-                debug_assert_eq!(index, self.slots.len());
-                self.slots.push(Some(entry));
-                self.policy_slots.push(PolicySlot::default());
-            }
-        }
+        let free_index = self
+            .free_slots
+            .pop()
+            .expect("fixed L1 admission prepared one free slot");
+        debug_assert_eq!(free_index, packed_index);
+        self.slots[index] = Some(entry);
+        self.resident_bytes = self.resident_bytes.saturating_add(charged_bytes);
         self.eviction
             .insert(&mut self.policy_slots, index, hash, charged_bytes, hint);
         let previous = self.directory_upsert(hash, packed_index);
@@ -737,6 +793,8 @@ pub(crate) enum MemoryLookup {
 pub(crate) struct MemoryStore {
     shards: Box<[MemoryShardLock]>,
     metrics: MemoryMetrics,
+    entry_capacity: usize,
+    metadata_bytes: usize,
 }
 
 #[repr(align(64))]
@@ -765,8 +823,21 @@ pub(crate) struct MemoryMetricsSnapshot {
 }
 
 impl MemoryStore {
+    pub(crate) fn maximum_entry_capacity(capacity_bytes: usize, shard_count: usize) -> usize {
+        if shard_count == 0 {
+            return 0;
+        }
+        (0..shard_count).fold(0_usize, |total, shard_id| {
+            total.saturating_add(
+                (shard_share(capacity_bytes, shard_count, shard_id) / MEMORY_ENTRY_OVERHEAD_BYTES)
+                    .min(MAX_POLICY_SLOT_INDEX.saturating_add(1)),
+            )
+        })
+    }
+
     pub(crate) fn new(
         capacity_bytes: usize,
+        entry_capacity: usize,
         shard_count: usize,
         policy: EvictionPolicy,
         statistics_enabled: bool,
@@ -777,8 +848,8 @@ impl MemoryStore {
                 "memory tier requires at least one shard",
             ));
         }
-        let base = capacity_bytes / shard_count;
-        let remainder = capacity_bytes % shard_count;
+        let metadata_bytes =
+            Self::allocation_bytes(capacity_bytes, entry_capacity, shard_count, policy)?;
         let mut shards = Vec::new();
         shards.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -786,9 +857,18 @@ impl MemoryStore {
                 "cannot allocate memory-tier shards",
             )
         })?;
+        let mut actual_entry_capacity = 0_usize;
         for shard_id in 0..shard_count {
+            let shard_capacity = shard_share(capacity_bytes, shard_count, shard_id);
+            let shard_entries = shard_share(entry_capacity, shard_count, shard_id)
+                .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
+                .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+            actual_entry_capacity = actual_entry_capacity
+                .checked_add(shard_entries)
+                .ok_or_else(|| invalid_memory_plan("L1 entry capacity overflow"))?;
             shards.push(MemoryShardLock(Mutex::new(MemoryShard::new(
-                base + usize::from(shard_id < remainder),
+                shard_capacity,
+                shard_entries,
                 policy,
             )?)));
         }
@@ -800,7 +880,50 @@ impl MemoryStore {
                 bypasses: AtomicU64::new(0),
                 admission_rejections: AtomicU64::new(0),
             },
+            entry_capacity: actual_entry_capacity,
+            metadata_bytes,
         })
+    }
+
+    pub(crate) fn allocation_bytes(
+        capacity_bytes: usize,
+        entry_capacity: usize,
+        shard_count: usize,
+        policy: EvictionPolicy,
+    ) -> io::Result<usize> {
+        if shard_count == 0 {
+            return Err(invalid_memory_plan(
+                "memory tier requires at least one shard",
+            ));
+        }
+        let mut total = 0_usize;
+        for shard_id in 0..shard_count {
+            let shard_capacity = shard_share(capacity_bytes, shard_count, shard_id);
+            let shard_entries = shard_share(entry_capacity, shard_count, shard_id)
+                .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
+                .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+            let fixed_slots = shard_entries
+                .checked_mul(std::mem::size_of::<Option<MemoryEntry>>())
+                .and_then(|bytes| {
+                    shard_entries
+                        .checked_mul(std::mem::size_of::<PolicySlot>())
+                        .and_then(|policy| bytes.checked_add(policy))
+                })
+                .and_then(|bytes| {
+                    shard_entries
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .and_then(|free| bytes.checked_add(free))
+                })
+                .ok_or_else(|| invalid_memory_plan("L1 slot memory plan overflow"))?;
+            let directory = FixedPrehashedMap::allocation_bytes(shard_entries)?;
+            let eviction = EvictionState::allocation_bytes(policy, shard_capacity, shard_entries)?;
+            total = total
+                .checked_add(fixed_slots)
+                .and_then(|bytes| bytes.checked_add(directory))
+                .and_then(|bytes| bytes.checked_add(eviction))
+                .ok_or_else(|| invalid_memory_plan("L1 metadata memory plan overflow"))?;
+        }
+        Ok(total)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -933,6 +1056,33 @@ impl MemoryStore {
         }
     }
 
+    pub(crate) fn detailed_snapshot(&self) -> io::Result<CacheL1Snapshot> {
+        let mut resident_entries = 0_usize;
+        let mut resident_bytes = 0_usize;
+        let mut charged_bytes = 0_usize;
+        for shard in &self.shards {
+            let shard = shard
+                .lock()
+                .map_err(|_| io::Error::other("L1 shard is poisoned"))?;
+            resident_entries = resident_entries
+                .checked_add(shard.slots.len().saturating_sub(shard.free_slots.len()))
+                .ok_or_else(|| invalid_memory_plan("L1 resident entry count overflow"))?;
+            resident_bytes = resident_bytes
+                .checked_add(shard.resident_bytes)
+                .ok_or_else(|| invalid_memory_plan("L1 resident byte count overflow"))?;
+            charged_bytes = charged_bytes
+                .checked_add(shard.budget.used_bytes())
+                .ok_or_else(|| invalid_memory_plan("L1 charged byte count overflow"))?;
+        }
+        Ok(CacheL1Snapshot {
+            entry_capacity: self.entry_capacity,
+            resident_entries,
+            resident_bytes,
+            retained_bytes: charged_bytes.saturating_sub(resident_bytes),
+            metadata_bytes: self.metadata_bytes,
+        })
+    }
+
     fn record_insert(&self, result: MemoryInsertResult) {
         if !self.metrics.enabled {
             return;
@@ -960,6 +1110,14 @@ impl MemoryStore {
     }
 }
 
+fn shard_share(total: usize, shard_count: usize, shard_id: usize) -> usize {
+    total / shard_count + usize::from(shard_id < total % shard_count)
+}
+
+fn invalid_memory_plan(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,7 +1131,14 @@ mod tests {
         shard_count: usize,
         policy: EvictionPolicy,
     ) -> MemoryStore {
-        MemoryStore::new(capacity_bytes, shard_count, policy, true).unwrap()
+        MemoryStore::new(
+            capacity_bytes,
+            capacity_bytes / MEMORY_ENTRY_OVERHEAD_BYTES,
+            shard_count,
+            policy,
+            true,
+        )
+        .unwrap()
     }
 
     fn publish_clean(store: &MemoryStore, hash: u64, key: &[u8], seqno: u64) {
@@ -1008,6 +1173,44 @@ mod tests {
             store.lookup(8, 0, b"b", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.len() == 300
         ));
+    }
+
+    #[test]
+    fn fixed_entry_capacity_replaces_without_growing_metadata() {
+        let store = MemoryStore::new(4096, 1, 1, EvictionPolicy::Clock, true).unwrap();
+        let metadata_bytes = store.metadata_bytes;
+        let slot_len = store.shards[0].lock().unwrap().slots.len();
+
+        assert!(store.publish(1, 0, b"a", b"a", 0, 1));
+        assert!(store.publish(2, 0, b"b", &[2; 1024], 0, 2));
+
+        assert_miss(&store, 1, b"a");
+        assert_hit(&store, 2, b"b");
+        let snapshot = store.detailed_snapshot().unwrap();
+        assert_eq!(snapshot.entry_capacity, 1);
+        assert_eq!(snapshot.resident_entries, 1);
+        assert_eq!(snapshot.metadata_bytes, metadata_bytes);
+        assert_eq!(store.shards[0].lock().unwrap().slots.len(), slot_len);
+        assert_eq!(store.metrics_snapshot().evictions, 1);
+    }
+
+    #[test]
+    fn retained_eviction_is_visible_in_detailed_memory_accounting() {
+        let store = MemoryStore::new(4096, 1, 1, EvictionPolicy::Clock, true).unwrap();
+        assert!(store.publish(1, 0, b"a", &[1; 128], 0, 1));
+        let MemoryLookup::Hit(retained) = store.lookup(1, 0, b"a", ExpiryClock::Fixed(1)) else {
+            panic!("published value must be visible");
+        };
+        assert!(store.publish(2, 0, b"b", &[2; 128], 0, 2));
+
+        let snapshot = store.detailed_snapshot().unwrap();
+        assert_eq!(snapshot.resident_entries, 1);
+        assert_eq!(
+            snapshot.retained_bytes,
+            MEMORY_ENTRY_OVERHEAD_BYTES + 1 + 128
+        );
+        drop(retained);
+        assert_eq!(store.detailed_snapshot().unwrap().retained_bytes, 0);
     }
 
     #[test]

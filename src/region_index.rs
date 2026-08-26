@@ -8,18 +8,32 @@
 //! scan or Region-manager access on point operations.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hashing::route_hash;
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
 use crate::index_storage::{
     IndexPartitionWriteGuard, IndexSlotState, IndexStorageError, PartitionedIndexStorage,
 };
+use crate::snapshot::CacheIndexSnapshot;
 
 /// A bounded point index over one canonical [`PartitionedIndexStorage`].
 pub(crate) struct RegionIndex {
     storage: PartitionedIndexStorage,
     region_created_seqnos: Box<[AtomicU64]>,
+    statistics_enabled: AtomicBool,
+    deleted_slot_reuses: AtomicU64,
+    stale_slot_reuses: AtomicU64,
+    live_slot_replacements: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum InstallKind {
+    Existing,
+    Empty,
+    Deleted,
+    Stale,
+    LiveVictim,
 }
 
 impl RegionIndex {
@@ -40,11 +54,41 @@ impl RegionIndex {
         Ok(Self {
             storage,
             region_created_seqnos: region_created_seqnos.into_boxed_slice(),
+            statistics_enabled: AtomicBool::new(false),
+            deleted_slot_reuses: AtomicU64::new(0),
+            stale_slot_reuses: AtomicU64::new(0),
+            live_slot_replacements: AtomicU64::new(0),
         })
     }
 
     pub(crate) const fn storage(&self) -> &PartitionedIndexStorage {
         &self.storage
+    }
+
+    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+        self.statistics_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<CacheIndexSnapshot, IndexStorageError> {
+        let physical = self.storage.physical_stats()?;
+        let slot_capacity = u64::try_from(self.storage.slot_count())
+            .map_err(|_| IndexStorageError::SizeOverflow)?;
+        let occupied = physical
+            .value
+            .checked_add(physical.deleted)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
+        let empty_slots = slot_capacity
+            .checked_sub(occupied)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
+        Ok(CacheIndexSnapshot {
+            slot_capacity,
+            physical_value_slots: physical.value,
+            deleted_slots: physical.deleted,
+            empty_slots,
+            deleted_slot_reuses: self.deleted_slot_reuses.load(Ordering::Relaxed),
+            stale_slot_reuses: self.stale_slot_reuses.load(Ordering::Relaxed),
+            live_slot_replacements: self.live_slot_replacements.load(Ordering::Relaxed),
+        })
     }
 
     /// Advances one Region's logical generation after reuse.
@@ -133,11 +177,15 @@ impl RegionIndex {
             probe_limit(slot_count),
             |local_slot, state| match state {
                 IndexSlotState::Empty => {
-                    apply = Some(deleted.or(stale).unwrap_or((local_slot, state)));
+                    apply = Some(deleted.or(stale).unwrap_or((
+                        local_slot,
+                        state,
+                        InstallKind::Empty,
+                    )));
                     true
                 }
                 IndexSlotState::Deleted => {
-                    deleted.get_or_insert((local_slot, state));
+                    deleted.get_or_insert((local_slot, state, InstallKind::Deleted));
                     false
                 }
                 IndexSlotState::Value {
@@ -148,14 +196,14 @@ impl RegionIndex {
                         if supplied_seqno <= current.seqno {
                             rejected = true;
                         } else {
-                            apply = Some((local_slot, state));
+                            apply = Some((local_slot, state, InstallKind::Existing));
                         }
                         true
                     } else {
                         if self.is_stale(current) {
-                            stale.get_or_insert((local_slot, state));
+                            stale.get_or_insert((local_slot, state, InstallKind::Stale));
                         } else if victim.is_none() {
-                            victim = Some((local_slot, state));
+                            victim = Some((local_slot, state, InstallKind::LiveVictim));
                         }
                         false
                     }
@@ -166,10 +214,28 @@ impl RegionIndex {
             return Ok(false);
         }
 
-        let Some((local_slot, previous)) = apply.or(deleted).or(stale).or(victim) else {
+        let Some((local_slot, previous, kind)) = apply.or(deleted).or(stale).or(victim) else {
             return Ok(false);
         };
         partition.replace_observed(local_slot, previous, installed)?;
+        if matches!(
+            kind,
+            InstallKind::Deleted | InstallKind::Stale | InstallKind::LiveVictim
+        ) && self.statistics_enabled.load(Ordering::Relaxed)
+        {
+            match kind {
+                InstallKind::Deleted => {
+                    self.deleted_slot_reuses.fetch_add(1, Ordering::Relaxed);
+                }
+                InstallKind::Stale => {
+                    self.stale_slot_reuses.fetch_add(1, Ordering::Relaxed);
+                }
+                InstallKind::LiveVictim => {
+                    self.live_slot_replacements.fetch_add(1, Ordering::Relaxed);
+                }
+                InstallKind::Existing | InstallKind::Empty => {}
+            }
+        }
         Ok(true)
     }
 
@@ -300,11 +366,13 @@ mod tests {
     }
 
     fn anonymous(slot_count: usize) -> RegionIndex {
-        RegionIndex::try_from_storage(
+        let index = RegionIndex::try_from_storage(
             PartitionedIndexStorage::anonymous(slot_count).unwrap(),
             (0..16).map(|_| 0),
         )
-        .unwrap()
+        .unwrap();
+        index.set_statistics_enabled(true);
+        index
     }
 
     #[test]
@@ -350,6 +418,8 @@ mod tests {
         assert!(!index.remove_if(hash, first).unwrap());
         assert!(index.remove_if(hash, second).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
+        assert!(index.upsert(15, entry(4, 32, 12)).unwrap());
+        assert_eq!(index.snapshot().unwrap().deleted_slot_reuses, 1);
     }
 
     #[test]
@@ -411,6 +481,44 @@ mod tests {
                 deleted: 0,
             }
         );
+        let snapshot = index.snapshot().unwrap();
+        assert_eq!(snapshot.stale_slot_reuses, 1);
+        assert_eq!(snapshot.live_slot_replacements, 0);
+    }
+
+    #[test]
+    fn full_probe_window_counts_live_replacement() {
+        let index = anonymous(8);
+        for hash in 0..8 {
+            assert!(
+                index
+                    .upsert(hash, entry(0, hash as u32 * 32, hash + 1))
+                    .unwrap()
+            );
+        }
+        assert!(index.upsert(8, entry(1, 0, 20)).unwrap());
+
+        let snapshot = index.snapshot().unwrap();
+        assert_eq!(snapshot.slot_capacity, 8);
+        assert_eq!(snapshot.physical_value_slots, 8);
+        assert_eq!(snapshot.empty_slots, 0);
+        assert_eq!(snapshot.live_slot_replacements, 1);
+    }
+
+    #[test]
+    fn replacement_statistics_are_optional() {
+        let index = anonymous(8);
+        index.set_statistics_enabled(false);
+        for hash in 0..8 {
+            assert!(
+                index
+                    .upsert(hash, entry(0, hash as u32 * 32, hash + 1))
+                    .unwrap()
+            );
+        }
+        assert!(index.upsert(8, entry(1, 0, 20)).unwrap());
+
+        assert_eq!(index.snapshot().unwrap().live_slot_replacements, 0);
     }
 
     #[test]

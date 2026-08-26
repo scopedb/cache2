@@ -78,6 +78,28 @@ pub struct CacheIoSnapshot {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheL1Snapshot {
+    pub entry_capacity: usize,
+    pub resident_entries: usize,
+    pub resident_bytes: usize,
+    pub retained_bytes: usize,
+    pub metadata_bytes: usize,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheIndexSnapshot {
+    pub slot_capacity: u64,
+    pub physical_value_slots: u64,
+    pub deleted_slots: u64,
+    pub empty_slots: u64,
+    pub deleted_slot_reuses: u64,
+    pub stale_slot_reuses: u64,
+    pub live_slot_replacements: u64,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RegionSetSnapshot {
     pub id: RegionSetId,
     pub capacity_bytes: u64,
@@ -98,5 +120,7 @@ pub struct DetailedCacheSnapshot {
     pub summary: CacheSnapshot,
     pub writes: CacheWriteSnapshot,
     pub io: CacheIoSnapshot,
+    pub l1: CacheL1Snapshot,
+    pub index: CacheIndexSnapshot,
     pub region_sets: Box<[RegionSetSnapshot]>,
 }

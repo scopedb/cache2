@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::hashing::PrehashedMap;
+use crate::hashing::FixedPrehashedMap;
 
 /// Maximum policy metadata inspected by one complete foreground admission.
 /// Exhausting this budget means L1 bypass; it never expands with cache size or
@@ -336,11 +336,33 @@ impl EvictionState {
                     main: SlotList::default(),
                     main_target_bytes,
                     small_target_bytes,
-                    ghost: GhostQueue::new(ghost_entries),
+                    ghost: GhostQueue::try_new(ghost_entries)?,
                 })
             }
         };
         Ok(Self { state })
+    }
+
+    pub(crate) fn allocation_bytes(
+        policy: EvictionPolicy,
+        capacity_bytes: usize,
+        maximum_entries: usize,
+    ) -> io::Result<usize> {
+        match policy {
+            EvictionPolicy::TinyLfu => FrequencySketch::allocation_bytes(maximum_entries),
+            EvictionPolicy::S3Fifo => {
+                let main_target_bytes = capacity_bytes.saturating_sub(capacity_bytes / 10);
+                let ghost_entries = main_target_bytes
+                    .saturating_mul(maximum_entries)
+                    .checked_div(capacity_bytes.max(1))
+                    .unwrap_or(0);
+                GhostQueue::allocation_bytes(ghost_entries)
+            }
+            EvictionPolicy::Clock
+            | EvictionPolicy::Lru
+            | EvictionPolicy::Sieve
+            | EvictionPolicy::Fifo => Ok(0),
+        }
     }
 
     pub(crate) fn prepare_insert(&mut self, hash: u64) -> AdmissionHint {
@@ -808,14 +830,8 @@ impl FrequencySketch {
                 aging: false,
             });
         }
-        let width = maximum_entries
-            .max(64)
-            .checked_next_power_of_two()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TinyLFU is too large"))?;
-        let counter_count = width.checked_mul(4).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "TinyLFU sketch size overflow")
-        })?;
-        let counter_bytes = counter_count.div_ceil(2);
+        let width = frequency_sketch_width(maximum_entries)?;
+        let counter_bytes = Self::allocation_bytes(maximum_entries)?;
         let mut counters = Vec::new();
         counters.try_reserve_exact(counter_bytes).map_err(|_| {
             io::Error::new(
@@ -832,6 +848,17 @@ impl FrequencySketch {
             age_cursor: 0,
             aging: false,
         })
+    }
+
+    fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
+        if maximum_entries == 0 {
+            return Ok(0);
+        }
+        frequency_sketch_width(maximum_entries)?
+            .checked_mul(2)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "TinyLFU sketch size overflow")
+            })
     }
 
     fn estimate(&self, hash: u64) -> u8 {
@@ -905,6 +932,13 @@ impl FrequencySketch {
     }
 }
 
+fn frequency_sketch_width(maximum_entries: usize) -> io::Result<usize> {
+    maximum_entries
+        .max(64)
+        .checked_next_power_of_two()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TinyLFU is too large"))
+}
+
 fn mix64(mut value: u64) -> u64 {
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -915,39 +949,65 @@ fn mix64(mut value: u64) -> u64 {
 
 struct GhostQueue {
     maximum_entries: usize,
+    len: usize,
     cursor: usize,
-    order: Vec<u64>,
-    members: PrehashedMap<usize>,
+    order: Box<[u64]>,
+    members: FixedPrehashedMap,
 }
 
 impl GhostQueue {
-    fn new(maximum_entries: usize) -> Self {
-        Self {
+    fn try_new(maximum_entries: usize) -> io::Result<Self> {
+        let mut order = Vec::new();
+        order.try_reserve_exact(maximum_entries).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate S3-FIFO ghost queue",
+            )
+        })?;
+        order.resize(maximum_entries, 0);
+        Ok(Self {
             maximum_entries,
+            len: 0,
             cursor: 0,
-            order: Vec::new(),
-            members: PrehashedMap::default(),
-        }
+            order: order.into_boxed_slice(),
+            members: FixedPrehashedMap::try_new(maximum_entries)?,
+        })
+    }
+
+    fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
+        maximum_entries
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|bytes| {
+                FixedPrehashedMap::allocation_bytes(maximum_entries)
+                    .ok()
+                    .and_then(|map| bytes.checked_add(map))
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "S3-FIFO ghost queue is too large",
+                )
+            })
     }
 
     fn take(&mut self, hash: u64) -> bool {
-        self.members.remove(&hash).is_some()
+        self.members.remove(hash).is_some()
     }
 
     fn insert(&mut self, hash: u64) {
-        if self.maximum_entries == 0 {
+        if self.maximum_entries == 0 || !self.members.can_upsert(hash) {
             return;
         }
-        let slot = if self.order.len() < self.maximum_entries {
-            let slot = self.order.len();
-            self.order.push(hash);
+        let slot = if self.len < self.maximum_entries {
+            let slot = self.len;
+            self.order[slot] = hash;
+            self.len += 1;
             slot
         } else {
             let slot = self.cursor;
             let old_hash = self.order[slot];
-            if self.members.get(&old_hash) == Some(&slot) {
-                self.members.remove(&old_hash);
-            }
+            let packed_slot = u32::try_from(slot).expect("ghost slot exceeds fixed map value");
+            self.members.remove_if(old_hash, packed_slot);
             self.order[slot] = hash;
             self.cursor = if slot + 1 == self.maximum_entries {
                 0
@@ -956,7 +1016,9 @@ impl GhostQueue {
             };
             slot
         };
-        self.members.insert(hash, slot);
+        let packed_slot = u32::try_from(slot).expect("ghost slot exceeds fixed map value");
+        let inserted = self.members.insert(hash, packed_slot);
+        debug_assert!(inserted.is_some());
     }
 }
 
@@ -1043,7 +1105,7 @@ mod tests {
 
     #[test]
     fn ghost_ring_ignores_stale_duplicate_slots() {
-        let mut ghost = GhostQueue::new(2);
+        let mut ghost = GhostQueue::try_new(2).unwrap();
         ghost.insert(1);
         ghost.insert(1);
         ghost.insert(2);

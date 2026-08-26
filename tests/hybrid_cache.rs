@@ -580,6 +580,18 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
             .saturating_add(detailed.io.buffered_operations)
             > 0
     );
+    assert!(detailed.l1.entry_capacity > 0);
+    assert!(detailed.l1.resident_entries <= detailed.l1.entry_capacity);
+    assert!(detailed.l1.resident_bytes <= 4 * 1024 * 1024);
+    assert_eq!(detailed.l1.retained_bytes, 0);
+    assert!(detailed.l1.metadata_bytes > 0);
+    assert_eq!(detailed.index.slot_capacity, 4096);
+    assert_eq!(
+        detailed.index.physical_value_slots
+            + detailed.index.deleted_slots
+            + detailed.index.empty_slots,
+        detailed.index.slot_capacity
+    );
     assert_eq!(detailed.region_sets.len(), 1);
     let region_set = detailed.region_sets[0];
     assert_eq!(region_set.capacity_bytes, 3 * 512 * 1024);

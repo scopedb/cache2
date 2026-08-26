@@ -204,7 +204,7 @@ impl StaticConfig {
             ));
         }
         if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
-            return Err(invalid_config("index slots must be in 8..=268435456"));
+            return Err(invalid_config("index slots must be in 8..=536870912"));
         }
         let data_file_len = DataGeometry::expected_file_len(self.region_size, region_count)
             .ok_or_else(|| invalid_config("cache data length overflow"))?;
@@ -582,6 +582,17 @@ mod tests {
             config_fingerprint: config.fingerprint(geometry, &layout),
         };
         assert!(data.encode().is_ok());
+    }
+
+    #[test]
+    fn one_tib_four_kib_working_set_has_a_representable_index() {
+        let config = StaticConfig::new(1_u64 << 40)
+            .with_region_size(32 * 1024 * 1024)
+            .with_expected_entries(1 << 28)
+            .with_write_shards(8);
+
+        assert_eq!(config.index_slots(), 335_544_320);
+        config.validate().unwrap();
     }
 
     #[test]

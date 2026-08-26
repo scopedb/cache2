@@ -56,6 +56,10 @@ const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 // Covers worker/shard controls and handles whose size does not scale with the
 // payload or configured concurrency.
 const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
+// Keep the fixed L1 directory useful when the configured L2 has deliberate
+// headroom. Smaller entries may still bypass before the byte budget fills;
+// this avoids sizing metadata for the theoretical 64-byte minimum.
+const PLANNED_MIN_L1_ENTRY_BYTES: usize = 4 * 1024;
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
@@ -340,12 +344,45 @@ impl RuntimeConfig {
         shard_count: usize,
         layout_memory_bytes: usize,
     ) -> io::Result<()> {
+        let l1_entry_capacity = self.l1_entry_capacity(geometry, index_slots)?;
+        let l1_metadata_bytes = MemoryStore::allocation_bytes(
+            self.l1_capacity_bytes,
+            l1_entry_capacity,
+            self.l1_shards,
+            self.eviction_policy,
+        )?;
         let fixed_bytes =
             crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
                 .checked_add(layout_memory_bytes)
+                .and_then(|bytes| bytes.checked_add(l1_metadata_bytes))
                 .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
         self.validated_reserved_memory_bytes(geometry, shard_count, fixed_bytes)?;
         Ok(())
+    }
+
+    fn l1_entry_capacity(&self, geometry: DataGeometry, index_slots: usize) -> io::Result<usize> {
+        if self.l1_capacity_bytes == 0 {
+            return Ok(0);
+        }
+        let l2_capacity = u128::from(geometry.region_size)
+            .checked_mul(u128::from(geometry.region_count))
+            .filter(|capacity| *capacity != 0)
+            .ok_or_else(|| invalid_runtime_config("L2 capacity does not fit the L1 plan"))?;
+        let expected_entries = index_slots.saturating_mul(4).div_ceil(5).max(1);
+        let proportional = (expected_entries as u128)
+            .checked_mul(self.l1_capacity_bytes as u128)
+            .and_then(|entries| entries.checked_add(l2_capacity - 1))
+            .map(|entries| entries / l2_capacity)
+            .and_then(|entries| usize::try_from(entries).ok())
+            .ok_or_else(|| invalid_runtime_config("L1 entry capacity does not fit usize"))?;
+        let four_kib_density = self.l1_capacity_bytes.div_ceil(PLANNED_MIN_L1_ENTRY_BYTES);
+        let maximum = MemoryStore::maximum_entry_capacity(self.l1_capacity_bytes, self.l1_shards);
+        let minimum = self.l1_shards.min(maximum);
+        Ok(proportional
+            .max(four_kib_density)
+            .min(expected_entries)
+            .max(minimum)
+            .min(maximum))
     }
 
     fn validated_reserved_memory_bytes(
@@ -613,6 +650,7 @@ impl RegionDataPlane {
         files: RuntimeFileSet,
         config: RuntimeConfig,
     ) -> io::Result<Self> {
+        core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
         let running = start_running(
             Arc::clone(&core),
@@ -947,6 +985,8 @@ impl RegionDataPlane {
             summary: self.snapshot_running(running),
             writes,
             io: aggregate_io_stats(&running.engines),
+            l1: running.memory.detailed_snapshot()?,
+            index: self.core.index_snapshot()?,
             region_sets: self.core.region_set_snapshots()?,
         })
     }
@@ -1083,11 +1123,19 @@ fn start_running(
     metrics: Arc<RuntimeMetrics>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
-    let reserved_memory = config.validated_reserved_memory_bytes(
-        data.geometry,
-        shard_count,
-        core.runtime_reserved_memory_bytes()?,
+    let l1_entry_capacity = config.l1_entry_capacity(data.geometry, core.index_slot_count())?;
+    let l1_metadata_bytes = MemoryStore::allocation_bytes(
+        config.l1_capacity_bytes,
+        l1_entry_capacity,
+        config.l1_shards,
+        config.eviction_policy,
     )?;
+    let fixed_memory = core
+        .runtime_reserved_memory_bytes()?
+        .checked_add(l1_metadata_bytes)
+        .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
+    let reserved_memory =
+        config.validated_reserved_memory_bytes(data.geometry, shard_count, fixed_memory)?;
     let memory_limit = config.memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
@@ -1112,6 +1160,7 @@ fn start_running(
     );
     let memory = Arc::new(MemoryStore::new(
         config.l1_capacity_bytes,
+        l1_entry_capacity,
         config.l1_shards,
         config.eviction_policy,
         config.statistics,
@@ -1591,6 +1640,7 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eviction::EvictionPolicy;
 
     #[test]
     fn urgent_empty_shard_wake_releases_progress_waiters() {
@@ -1685,7 +1735,18 @@ mod tests {
             region_count: 10,
         };
         let mut config = RuntimeConfig::default();
-        let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count).unwrap();
+        let l1_entries = config.l1_entry_capacity(geometry, 4096).unwrap();
+        let l1_metadata = MemoryStore::allocation_bytes(
+            config.l1_capacity_bytes,
+            l1_entries,
+            config.l1_shards,
+            config.eviction_policy,
+        )
+        .unwrap();
+        let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count)
+            .unwrap()
+            .checked_add(l1_metadata)
+            .unwrap();
         let (_, without_layout) = config.memory_plan_bytes(geometry, 4, fixed).unwrap();
         config.memory_limit_bytes = without_layout;
 
@@ -1694,5 +1755,48 @@ mod tests {
             .validate_memory_plan(geometry, 4096, 4, 4096)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn production_l1_entry_plan_scales_from_the_static_index() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 32 * 1024).unwrap(),
+            region_size: 32 * 1024 * 1024,
+            region_count: 32 * 1024,
+        };
+        let index_slots = 83_886_080;
+        let base = RuntimeConfig::default()
+            .with_l1_capacity(10 * GIB)
+            .with_memory_limit(12 * GIB)
+            .with_l1_shards(64);
+        let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
+        assert_eq!(entry_capacity, 2_621_440);
+
+        let clock = MemoryStore::allocation_bytes(
+            base.l1_capacity_bytes,
+            entry_capacity,
+            base.l1_shards,
+            EvictionPolicy::Clock,
+        )
+        .unwrap();
+        let tiny_lfu = MemoryStore::allocation_bytes(
+            base.l1_capacity_bytes,
+            entry_capacity,
+            base.l1_shards,
+            EvictionPolicy::TinyLfu,
+        )
+        .unwrap();
+        let s3fifo = MemoryStore::allocation_bytes(
+            base.l1_capacity_bytes,
+            entry_capacity,
+            base.l1_shards,
+            EvictionPolicy::S3Fifo,
+        )
+        .unwrap();
+        assert!(clock < 384 * 1024 * 1024);
+        assert!(tiny_lfu > clock);
+        assert!(s3fifo > tiny_lfu);
+        assert!(s3fifo < 512 * 1024 * 1024);
     }
 }

@@ -23,8 +23,9 @@ pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMEN
 pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32) * RECORD_LEN_ALIGNMENT;
 pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
 pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
-/// 256M slots is an 8 GiB index at the stable 32-byte slot size.
-pub(crate) const MAX_INDEX_SLOTS: usize = 256 * 1024 * 1024;
+/// 512M slots is a 16 GiB index at the stable 32-byte slot size and covers a
+/// 1 TiB cache containing 4 KiB records at the recommended 1.25x load factor.
+pub(crate) const MAX_INDEX_SLOTS: usize = 512 * 1024 * 1024;
 pub(crate) const MAX_INDEX_PROBES: usize = 64;
 pub(crate) const MAX_INDEX_PARTITIONS: usize = 4096;
 
