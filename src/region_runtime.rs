@@ -1284,12 +1284,8 @@ fn shard_worker_result(
                     if rotated && shared.statistics {
                         RuntimeMetrics::increment(&shared.metrics.region_rotations);
                     }
-                    advance_shard_progress(control)?;
-                } else if flags & WAKE_DATA != 0 {
-                    // A producer may have been followed by an urgent worker
-                    // completion before this coalesced wake was observed.
-                    advance_shard_progress(control)?;
                 }
+                acknowledge_empty_shard_wake(control, flags)?;
             }
             Err(StagingError::WouldBlock) => {
                 deadline = Some(Instant::now() + _RETRY_AGE);
@@ -1412,6 +1408,13 @@ fn advance_shard_progress(control: &ShardControl) -> io::Result<()> {
     let mut state = control.lock()?;
     state.progress = state.progress.saturating_add(1);
     control.changed.notify_all();
+    Ok(())
+}
+
+fn acknowledge_empty_shard_wake(control: &ShardControl, flags: u8) -> io::Result<()> {
+    if flags != 0 {
+        advance_shard_progress(control)?;
+    }
     Ok(())
 }
 
@@ -1587,6 +1590,27 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urgent_empty_shard_wake_releases_progress_waiters() {
+        let control = ShardControl::new();
+        let observed = control.progress().unwrap();
+        control.notify(WAKE_URGENT).unwrap();
+
+        let (flags, drain_generation, stop, timed_out) =
+            wait_for_shard_work(&control, None).unwrap();
+        assert_eq!(flags, WAKE_URGENT);
+        assert_eq!(drain_generation, 0);
+        assert!(!stop);
+        assert!(!timed_out);
+
+        acknowledge_empty_shard_wake(&control, flags).unwrap();
+        assert!(
+            control
+                .wait_for_progress_until(observed, Some(Instant::now()))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn transient_read_pressure_is_not_a_cache_failure() {
