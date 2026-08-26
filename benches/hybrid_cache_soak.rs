@@ -6,13 +6,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cache_rs::{EvictionPolicy, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StaticConfig};
 
 const MIB: usize = 1024 * 1024;
+const VALUE_HEADER_BYTES: usize = 16;
+const DEFAULT_VALUE_BYTES: [usize; 4] = [256, 4 * 1024, 16 * 1024, 256 * 1024];
 
 struct SoakConfig {
     duration: Duration,
     sample_period: Duration,
     capacity_bytes: u64,
     memory_bytes: usize,
-    value_bytes: usize,
+    value_bytes: Box<[usize]>,
+    rss_slack_bytes: usize,
     key_count: usize,
     shards: u32,
     io_workers: usize,
@@ -32,7 +35,10 @@ impl SoakConfig {
         let memory_bytes = env_usize("CACHE_SOAK_MEMORY_MIB", 64)?
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
-        let value_bytes = env_usize("CACHE_SOAK_VALUE_BYTES", 16 * 1024)?;
+        let value_bytes = env_usize_list("CACHE_SOAK_VALUE_BYTES", &DEFAULT_VALUE_BYTES)?;
+        let rss_slack_bytes = env_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?
+            .checked_mul(MIB)
+            .ok_or_else(|| invalid("soak RSS slack is too large"))?;
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
         let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
         let io_workers = env_usize("CACHE_SOAK_IO_WORKERS", 4)?;
@@ -44,7 +50,10 @@ impl SoakConfig {
             .unwrap_or_else(env::temp_dir);
         if duration.is_zero()
             || sample_period.is_zero()
-            || value_bytes < 8
+            || value_bytes.is_empty()
+            || value_bytes
+                .iter()
+                .any(|bytes| !(VALUE_HEADER_BYTES..=256 * 1024).contains(bytes))
             || key_count == 0
             || shards == 0
             || io_workers == 0
@@ -60,6 +69,7 @@ impl SoakConfig {
             capacity_bytes,
             memory_bytes,
             value_bytes,
+            rss_slack_bytes,
             key_count,
             shards,
             io_workers,
@@ -155,25 +165,35 @@ fn main() -> io::Result<()> {
                 .into_boxed_slice()
         })
         .collect();
+    let key_count = u64::try_from(keys.len()).map_err(|_| invalid("soak key count exceeds u64"))?;
+    let value_size_count = u64::try_from(config.value_bytes.len())
+        .map_err(|_| invalid("soak value-size count exceeds u64"))?;
     let mut expected = vec![None; config.key_count];
-    let mut value = vec![0xa5_u8; config.value_bytes];
+    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
+    let mut value = vec![0_u8; maximum_value_bytes];
     let started = Instant::now();
     let deadline = started + config.duration;
     let mut next_sample = started + config.sample_period;
     let mut writes = 0_u64;
     let mut write_rejections = 0_u64;
     let mut hits = 0_u64;
+    let mut stale_hits = 0_u64;
     let mut misses = 0_u64;
     let mut max_put = Duration::ZERO;
     let mut max_get = Duration::ZERO;
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB value={} keys={} shards={} workers={} engine={:?} mode={:?} eviction={:?} peak_disk={}",
+        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} workers={} engine={:?} mode={:?} eviction={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
-        config.value_bytes,
+        config
+            .value_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         config.key_count,
         config.shards,
         config.io_workers,
@@ -181,13 +201,21 @@ fn main() -> io::Result<()> {
         config.io_mode,
         config.eviction_policy,
         peak_disk_bytes,
+        config.rss_slack_bytes,
     );
 
     while Instant::now() < deadline {
-        let key_index = writes as usize % keys.len();
+        let key_index = usize::try_from(writes % key_count)
+            .map_err(|_| invalid("soak key index exceeds usize"))?;
+        let value_index = usize::try_from(writes / key_count % value_size_count)
+            .map_err(|_| invalid("soak value-size index exceeds usize"))?;
+        let value_bytes = config.value_bytes[value_index];
+        let pattern = (writes ^ key_index as u64) as u8;
+        value[..value_bytes].fill(pattern);
         value[..8].copy_from_slice(&writes.to_le_bytes());
+        value[8..VALUE_HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
         let put_started = Instant::now();
-        match cache.put(&keys[key_index], &value) {
+        match cache.put(&keys[key_index], &value[..value_bytes]) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 max_put = max_put.max(put_started.elapsed());
@@ -211,17 +239,50 @@ fn main() -> io::Result<()> {
             } else {
                 u64::try_from(keys.len() / 4).unwrap_or(u64::MAX)
             };
-            let sampled = writes.saturating_sub(distance) as usize % keys.len();
+            let sampled = usize::try_from(writes.saturating_sub(distance) % key_count)
+                .map_err(|_| invalid("soak sampled key exceeds usize"))?;
             let get_started = Instant::now();
             match cache.get(&keys[sampled])? {
                 Some(observed) => {
                     max_get = max_get.max(get_started.elapsed());
-                    let sequence = u64::from_le_bytes(observed[..8].try_into().unwrap());
-                    if Some(sequence) != expected[sampled] {
+                    if observed.len() < VALUE_HEADER_BYTES {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "soak read returned a stale value",
+                            "soak read returned a truncated value",
                         ));
+                    }
+                    let sequence = u64::from_le_bytes(observed[..8].try_into().unwrap());
+                    let observed_key =
+                        u64::from_le_bytes(observed[8..VALUE_HEADER_BYTES].try_into().unwrap());
+                    let Some(latest) = expected[sampled] else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "soak read returned a value for an unwritten key",
+                        ));
+                    };
+                    if observed_key != sampled as u64 || sequence > latest {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "soak read returned a wrong-key or future value",
+                        ));
+                    }
+                    let observed_value_index =
+                        usize::try_from(sequence / key_count % value_size_count)
+                            .map_err(|_| invalid("observed value-size index exceeds usize"))?;
+                    let expected_length = config.value_bytes[observed_value_index];
+                    let expected_pattern = (sequence ^ sampled as u64) as u8;
+                    if observed.len() != expected_length
+                        || observed[VALUE_HEADER_BYTES..]
+                            .iter()
+                            .any(|byte| *byte != expected_pattern)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "soak read returned a malformed value",
+                        ));
+                    }
+                    if sequence < latest {
+                        stale_hits = stale_hits.saturating_add(1);
                     }
                     hits = hits.saturating_add(1);
                 }
@@ -239,7 +300,8 @@ fn main() -> io::Result<()> {
             if logical_bytes > peak_disk_bytes {
                 return Err(io::Error::other("soak exceeded the logical disk bound"));
             }
-            let resources = cache.snapshot()?;
+            let detailed = cache.detailed_snapshot()?;
+            let resources = detailed.summary;
             if resources.managed_memory_bytes > resources.managed_memory_limit_bytes
                 || resources.managed_memory_peak_bytes > resources.managed_memory_limit_bytes
             {
@@ -248,13 +310,20 @@ fn main() -> io::Result<()> {
             if resources.io_failures != 0 {
                 return Err(io::Error::other("soak observed a cache runtime failure"));
             }
+            let current_rss = current_rss_bytes()?;
+            let rss_limit = (resources.managed_memory_limit_bytes as u64)
+                .saturating_add(config.rss_slack_bytes as u64);
+            if current_rss != 0 && current_rss > rss_limit {
+                return Err(io::Error::other("soak exceeded the process RSS bound"));
+            }
             max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
             println!(
-                "elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} managed={} managed_peak={} managed_limit={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+                "elapsed={:.1}s writes={} write_rejections={} hits={} stale_hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_get_us={}",
                 started.elapsed().as_secs_f64(),
                 writes,
                 write_rejections,
                 hits,
+                stale_hits,
                 misses,
                 0,
                 resources.l1_hits,
@@ -266,10 +335,22 @@ fn main() -> io::Result<()> {
                 resources.l1_admission_rejections,
                 resources.write_rejections,
                 resources.region_rotations,
+                detailed.l1.resident_entries,
+                detailed.l1.entry_capacity,
+                detailed.l1.resident_bytes,
+                detailed.l1.retained_bytes,
+                detailed.l1.metadata_bytes,
+                detailed.index.physical_value_slots,
+                detailed.index.deleted_slots,
+                detailed.index.deleted_slot_reuses,
+                detailed.index.stale_slot_reuses,
+                detailed.index.live_slot_replacements,
                 resources.managed_memory_bytes,
                 max_managed_memory,
                 resources.managed_memory_limit_bytes,
                 logical_bytes,
+                current_rss,
+                rss_limit,
                 peak_rss_bytes(),
                 max_put.as_micros(),
                 max_get.as_micros(),
@@ -283,7 +364,8 @@ fn main() -> io::Result<()> {
     if logical_bytes > peak_disk_bytes {
         return Err(io::Error::other("soak exceeded the logical disk bound"));
     }
-    let resources = cache.snapshot()?;
+    let detailed = cache.detailed_snapshot()?;
+    let resources = detailed.summary;
     if resources.managed_memory_bytes > resources.managed_memory_limit_bytes
         || resources.managed_memory_peak_bytes > resources.managed_memory_limit_bytes
     {
@@ -292,14 +374,21 @@ fn main() -> io::Result<()> {
     if resources.io_failures != 0 {
         return Err(io::Error::other("soak observed a cache runtime failure"));
     }
+    let current_rss = current_rss_bytes()?;
+    let rss_limit =
+        (resources.managed_memory_limit_bytes as u64).saturating_add(config.rss_slack_bytes as u64);
+    if current_rss != 0 && current_rss > rss_limit {
+        return Err(io::Error::other("soak exceeded the process RSS bound"));
+    }
     max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
     cache.close_fast()?;
     println!(
-        "complete elapsed={:.1}s writes={} write_rejections={} hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} managed_peak={} managed_limit={} logical_disk={} peak_rss={} max_put_us={} max_get_us={}",
+        "complete elapsed={:.1}s writes={} write_rejections={} hits={} stale_hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_get_us={}",
         started.elapsed().as_secs_f64(),
         writes,
         write_rejections,
         hits,
+        stale_hits,
         misses,
         0,
         resources.l1_hits,
@@ -311,9 +400,21 @@ fn main() -> io::Result<()> {
         resources.l1_admission_rejections,
         resources.write_rejections,
         resources.region_rotations,
+        detailed.l1.resident_entries,
+        detailed.l1.entry_capacity,
+        detailed.l1.resident_bytes,
+        detailed.l1.retained_bytes,
+        detailed.l1.metadata_bytes,
+        detailed.index.physical_value_slots,
+        detailed.index.deleted_slots,
+        detailed.index.deleted_slot_reuses,
+        detailed.index.stale_slot_reuses,
+        detailed.index.live_slot_replacements,
         max_managed_memory,
         resources.managed_memory_limit_bytes,
         logical_bytes,
+        current_rss,
+        rss_limit,
         peak_rss_bytes(),
         max_put.as_micros(),
         max_get.as_micros(),
@@ -342,6 +443,24 @@ fn peak_rss_bytes() -> u64 {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> io::Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::other("cannot read current RSS from /proc/self/status"))?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| io::Error::other("current RSS byte count overflow"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> io::Result<u64> {
+    Ok(0)
+}
+
 #[cfg(not(unix))]
 fn peak_rss_bytes() -> u64 {
     0
@@ -361,6 +480,21 @@ fn env_usize(name: &str, default: usize) -> io::Result<usize> {
     env_u64(name, default as u64).and_then(|value| {
         usize::try_from(value).map_err(|_| invalid(format!("{name} does not fit usize")))
     })
+}
+
+fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
+    match env::var(name) {
+        Ok(value) => value
+            .split(',')
+            .map(|item| {
+                item.parse::<usize>()
+                    .map_err(|_| invalid(format!("{name} must be comma-separated integers")))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .map(Vec::into_boxed_slice),
+        Err(env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
+        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> io::Result<u32> {

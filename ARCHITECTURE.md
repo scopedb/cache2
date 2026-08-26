@@ -71,11 +71,20 @@ replacement policy.
 L1 capacity remains charged through the last returned value handle, so eviction
 cannot hide memory retained by a slow caller.
 
-TinyLFU uses an aged four-row 4-bit frequency sketch sized from the maximum
-charged entry count. S3-FIFO divides resident bytes into 10% small and 90% main
-targets and bounds its non-resident hash-only ghost queue by the corresponding
-maximum entry count. Policy metadata is covered by the fixed per-entry L1
-overhead estimate; it cannot increase the configured payload/entry charge.
+Each L1 shard receives fixed entry slots, policy slots, a free list, and an
+open-addressed directory during open. The directory routes the already seeded
+XXH3 hash directly and has a fixed 64-probe ceiling; pressure bypasses optional
+L1 insertion. No resident-set change reallocates or rehashes metadata under the
+shard lock. The entry plan is capped by the static expected-key plan, scales
+with the L1/L2 capacity ratio, and has a 4 KiB-density floor so deliberate L2
+headroom does not make L1 unusably sparse. Fixed metadata is reserved
+separately in the aggregate memory plan.
+
+TinyLFU uses an aged four-row 4-bit frequency sketch sized from that fixed entry
+plan. S3-FIFO divides resident bytes into 10% small and 90% main targets and
+preallocates its non-resident hash-only ghost ring and membership table from the
+same plan. Both structures may discard optional admission history when their
+constant probe/work budgets are exhausted.
 
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
 L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
@@ -156,7 +165,11 @@ stack topology participates in the aggregate memory plan. The operating system
 still controls physical stack commitment. Buffered-I/O page cache, filesystem
 metadata, and allocator internals remain outside the cache-owned byte budgets.
 The public resource snapshot exposes current/peak managed reservations, their
-hard limit, and the configured logical-disk peak. Optional activity statistics
+hard limit, and the configured logical-disk peak. The on-demand detailed
+snapshot also exposes L1 entry capacity, resident/retained/fixed-metadata bytes,
+physical index occupancy, and counts of deleted, stale-generation, and live
+slot replacement. The replacement counters follow the optional statistics
+switch; occupancy remains always available. Optional activity statistics
 separately classify read-memory and busy-engine misses.
 
 `HybridCache::snapshot()` also reads relaxed process-local counters for L1/L2

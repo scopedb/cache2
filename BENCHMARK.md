@@ -51,6 +51,28 @@ The old control needed a median 767 retries across 177 throttled writes. This
 A/B is the relevant regression check; absolute hot-read latency varies enough
 between sessions that historical numbers should not be compared in isolation.
 
+## Fixed L1 metadata A/B — 2026-08-26
+
+The fixed-capacity L1 directory, slot arrays, policy metadata, and mixed-size
+entry plan were compared against `fdc3f83` in the same session with Rust
+1.98.0. Each side used five default release runs with statistics disabled. The
+absolute L2 latency was higher than the earlier session above on both revisions,
+so this table compares only the paired revisions:
+
+| Phase | `fdc3f83` | Fixed metadata | Latency change |
+|---|---:|---:|---:|
+| put + drain | 28.436 ms | 29.074 ms | +2.2% |
+| resident L1 get | 60.352 ms | 55.928 ms | -7.3% |
+| warm close | 82.950 ms | 70.936 ms | -14.5% |
+| L2 get + promote | 40.664 ms | 41.086 ms | +1.0% |
+| promoted L1 get | 65.493 ms | 60.584 ms | -7.5% |
+
+The two foreground regressions remain below the 10% investigation threshold;
+both hot-L1 phases improved. A three-second mixed-size smoke soak additionally
+completed 208,697 accepted writes and 441 Region rotations with zero malformed,
+wrong-key, or future reads. It observed 156 valid stale hits, which are accepted
+by the cache contract.
+
 ## M1 local baseline — 2026-08-24
 
 Environment:
@@ -282,15 +304,16 @@ set in a new caller-owned report directory:
 
 It requires Linux, a writable cache directory, a new report path under an
 existing directory outside the source tree, and a clean worktree. It records
-the exact revision, Rust toolchain, kernel, CPU, block
+the exact revision, Rust 1.98.0 toolchain, kernel, CPU, block
 device, filesystem and mount information; runs five repetitions of
 sync/buffered, sync/direct, and io_uring/direct; measures io_uring/direct with
 1/2/4/8/16 workers; calculates phase medians; then runs a four-hour
 io_uring/direct turnover soak. For an M2 result, the benchmark data set must
 exceed physical RAM and the mount must resolve to a non-rotational NVMe block
 device. `qualification.status` is written with `status=m2_pass` only after
-those preconditions, every command, and the final zero-error soak record
-succeed. `SHA256SUMS` binds the retained evidence.
+those preconditions, all five performance gates being configured, every
+command, and the final zero-error soak record succeed. `SHA256SUMS` binds the
+retained evidence.
 
 `CACHE_QUAL_BENCH_RUNS`, `CACHE_QUAL_SOAK_SECONDS`, and
 `CACHE_QUAL_SAMPLE_SECONDS` tune preflight duration. The four-hour default is
@@ -327,11 +350,16 @@ scheduling/page-cache contention or a device-path limit.
 
 ## Turnover soak
 
-The soak workload continuously overwrites a key ring larger than L1, drains in
-bounded batches, validates every observed value, samples managed-memory
-current/peak/budget, peak RSS, logical disk use, and latency, and fails if a
-cache-owned bound is exceeded. It terminates on the first cache or validation
-error, so every periodic `errors=0` sample means no earlier error was ignored.
+The soak workload continuously overwrites a key ring larger than L1 and cycles
+256 B, 4 KiB, 16 KiB, and 256 KiB entries by default. It drains in bounded
+batches, validates the embedded version, key, length, and payload of every hit,
+and reports an older valid version as `stale_hits` because freshness is best
+effort. A future version, wrong key, or malformed record is fatal. Samples
+cover managed-memory current/peak/budget, L1 and index pressure, current and
+peak RSS, logical disk use, and latency. The Linux run fails when current RSS
+exceeds the managed-memory limit plus a fixed slack, or when a cache-owned bound
+is exceeded. Every periodic `errors=0` sample means no earlier error was
+ignored.
 
 Run a four-hour device soak with:
 
@@ -341,17 +369,19 @@ CACHE_SOAK_SAMPLE_SECONDS=10 \
 CACHE_SOAK_DIR=/mnt/nvme \
 CACHE_SOAK_IO_ENGINE=io-uring \
 CACHE_SOAK_IO_MODE=direct \
-cargo bench --bench hybrid_cache_soak
+cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 ```
 
-`CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`,
-`CACHE_SOAK_VALUE_BYTES`, `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`, and
-`CACHE_SOAK_IO_WORKERS` control the fixed workload. `CACHE_SOAK_IO_ENGINE` and
+`CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`, comma-separated
+`CACHE_SOAK_VALUE_BYTES`, `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
+`CACHE_SOAK_RSS_SLACK_MIB`, and `CACHE_SOAK_IO_WORKERS` control the workload.
+`CACHE_SOAK_IO_ENGINE` and
 `CACHE_SOAK_IO_MODE` select the device path. `CACHE_SOAK_EVICTION` selects
 `clock`, `lru`, `tinylfu`, `sieve`, `fifo`, or `s3fifo`; the main benchmark uses
 the same values through `CACHE_BENCH_EVICTION`. M2 evidence must retain the
-complete output and confirm zero stale reads, zero errors, bounded logical disk
-use, and no unexplained monotonic peak-RSS growth across comparable runs.
+complete output and confirm zero errors, no future/wrong-key/malformed reads,
+bounded managed memory and current RSS, and bounded logical disk use. Stale-hit
+counts are workload evidence, not a correctness failure.
 
 ## M2 decoder and unsafe-memory preflight — 2026-08-24
 

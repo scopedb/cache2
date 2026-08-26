@@ -51,6 +51,16 @@ case "$report_directory/" in
 esac
 cd -- "$project_directory"
 
+if ! rustc_version=$(rustc +1.98.0 -V 2>/dev/null) \
+  || [[ $rustc_version != "rustc 1.98.0 "* ]]; then
+  echo "qualification requires the exact Rust 1.98.0 toolchain" >&2
+  exit 2
+fi
+if ! cargo +1.98.0 -V >/dev/null 2>&1; then
+  echo "qualification cannot invoke Cargo from Rust 1.98.0" >&2
+  exit 2
+fi
+
 benchmark_runs=${CACHE_QUAL_BENCH_RUNS:-5}
 soak_seconds=${CACHE_QUAL_SOAK_SECONDS:-14400}
 sample_seconds=${CACHE_QUAL_SAMPLE_SECONDS:-10}
@@ -142,6 +152,9 @@ for gate in \
     ((performance_gate_count += 1))
   fi
 done
+if ((performance_gate_count < 5)); then
+  qualification_status=preflight_pass
+fi
 
 source_revision=
 source_status=
@@ -197,9 +210,9 @@ record_command() {
   echo "[uname]"
   uname -a
   echo "[rustc]"
-  rustc -Vv
+  rustc +1.98.0 -Vv
   echo "[cargo]"
-  cargo -V
+  cargo +1.98.0 -V
   record_command lscpu lscpu
   record_command lsblk lsblk --bytes --fs --output NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,ROTA
   record_command findmnt findmnt --target "$cache_directory"
@@ -286,13 +299,13 @@ run_benchmark_profile() {
     CACHE_BENCH_IO_ENGINE="$engine" \
     CACHE_BENCH_IO_MODE="$mode" \
     CACHE_BENCH_IO_WORKERS="$workers" \
-      cargo bench --bench hybrid_cache --quiet 2>&1 | tee -a "$log"
+      cargo +1.98.0 bench --locked --bench hybrid_cache --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
 }
 
 echo "building release benchmark targets"
-cargo build --release --benches
+cargo +1.98.0 build --locked --release --benches
 
 run_benchmark_profile sync-buffered sync buffered 4 "$benchmark_runs"
 run_benchmark_profile sync-direct sync direct 4 "$benchmark_runs"
@@ -309,7 +322,7 @@ CACHE_SOAK_SAMPLE_SECONDS="$sample_seconds" \
 CACHE_SOAK_DIR="$cache_directory" \
 CACHE_SOAK_IO_ENGINE=io-uring \
 CACHE_SOAK_IO_MODE=direct \
-  cargo bench --bench hybrid_cache_soak --quiet 2>&1 \
+  cargo +1.98.0 bench --locked --bench hybrid_cache_soak --quiet 2>&1 \
   | tee "$report_directory/soak-io-uring-direct.log"
 
 if ! grep -q '^complete .* errors=0 ' "$report_directory/soak-io-uring-direct.log"; then

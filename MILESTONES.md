@@ -100,8 +100,9 @@ on internal implementation details.
 - [x] expose a small snapshot API for L1/L2 hits and misses, promotions, bytes,
   queue saturation, I/O failures, and Region rotations;
 - [x] expose managed-memory current/peak use and configured logical-disk peak;
-- [x] expose on-demand queue, buffer, worker-I/O, and per-RegionSet occupancy
-  detail without adding latency instrumentation to the request path;
+- [x] expose on-demand queue, buffer, worker-I/O, L1/index pressure, and
+  per-RegionSet occupancy detail without adding latency instrumentation to the
+  request path;
 - [x] expose a compact lifecycle/health state for running, draining, miss-only,
   and terminal failure;
 - [x] document overload behavior, shutdown choices, capacity planning, and

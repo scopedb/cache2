@@ -187,12 +187,18 @@ bound. A returned L1 `Value` retains its charge until the caller drops it, even
 after CLOCK eviction, so slow consumers cannot push new L1 allocations past the
 configured capacity. `RuntimeConfig::with_l1_shards()` controls only the
 volatile L1 lock topology; the default is 32 and it may change on a warm reopen.
-The L1 directory is the standard library `HashMap`, but consumes the already
-computed seeded XXH3 key hash directly instead of hashing it again. Compact
-intrusive same-hash chains retain namespace and full-key validation.
+L1 entry slots, eviction metadata, free lists, and the open-addressed directory
+are sized and allocated once during open. The directory consumes the already
+computed seeded XXH3 key hash directly; it never invokes SipHash, reallocates,
+or rehashes under a shard lock. Compact intrusive same-hash chains retain
+namespace and full-key validation. The fixed entry count is derived from the
+static expected-key/index plan and the L1/L2 capacity ratio, with enough slots
+for a 4 KiB average L1 entry when the static key plan permits it. Smaller-entry
+workloads may therefore reach the entry bound before the byte bound and bypass
+or evict from L1 while continuing normally through L2.
 The aggregate memory limit also reserves fixed 512 KiB stacks for append-shard,
 I/O, and bounded shutdown-reaper threads plus conservative L1 shard, I/O command,
-and fixed recovery encoding metadata.
+fixed L1 directory/policy, and recovery encoding metadata.
 `StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound,
 including the data/state files and both recovery images that may coexist during
 atomic warm publication.
@@ -206,11 +212,14 @@ Managed figures deliberately exclude allocator metadata, buffered-I/O page
 cache, and filesystem metadata. Health and resource fields are always active.
 Data-path counters reset on every open and are enabled with
 `RuntimeConfig::with_statistics(true)`; they default off to keep atomic writes out of
-the performance-first path.
+the performance-first path. Index reuse/replacement counters follow the same
+switch; fixed capacity and physical occupancy remain available when it is off.
 
 `HybridCache::detailed_snapshot()` adds current/peak write admission,
-cumulative write wait and rejection counters, aggregate worker I/O activity, and
-per-RegionSet capacity, occupancy, queue state, and process-local rotations.
+cumulative write wait and rejection counters, aggregate worker I/O activity,
+fixed/resident/retained L1 accounting, physical index occupancy and bounded
+slot-reuse/replacement counters, and per-RegionSet capacity, occupancy, queue
+state, and process-local rotations.
 It adds no request latency instrumentation. Because it briefly locks Region
 metadata and scans all Regions, use it for periodic diagnostics rather than on
 the request hot path.
@@ -247,13 +256,16 @@ device to data-sync, but neither makes the cache recoverable.
    rule independently to every weighted assignment: each set needs one active
    Region per assigned shard plus one spare. More Regions reduce turnover.
 2. Set expected entries from the intended live key count; the fixed mmap index
-   uses approximately 1.25 slots per entry and 32 bytes per slot.
+   uses approximately 1.25 slots per entry and 32 bytes per slot. Up to
+   512 million slots (16 GiB) supports a 1 TiB cache planned near 4 KiB per
+   entry with the normal probe headroom.
 3. Choose L1 capacity from the useful resident payload. The aggregate managed
-   limit must additionally hold the index/Region metadata, two write buffers
-   per shard, at least one maximum aligned record read, I/O command
-   metadata, recovery scratch, and explicit cache-thread stacks. Concurrent
-   reads consume only their actual aligned read sizes. Invalid plans fail
-   before creating files.
+   limit must additionally hold the fixed L1 directory/policy plan, index/Region
+   metadata, two write buffers per shard, at least one maximum aligned record
+   read, I/O command metadata, recovery scratch, and explicit cache-thread
+   stacks. Concurrent reads consume only their actual aligned read sizes.
+   Invalid plans fail before creating files; inspect `detailed_snapshot().l1`
+   and `.index` to confirm the resulting entry and slot pressure.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
@@ -293,7 +305,10 @@ qualification requires an L2 data set larger than host RAM.
 The configurable turnover soak is available through
 `cargo bench --bench hybrid_cache_soak`; use the multi-hour device command in
 `BENCHMARK.md` for M2 validation. Its engine and mode are independently
-selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`.
+selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`. By default it
+cycles 256 B, 4 KiB, 16 KiB, and 256 KiB values. A validated older version is
+counted as `stale_hits`; a future version, wrong key, malformed value, resource
+bound violation, or runtime failure terminates the run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the data and recovery paths,
 [BENCHMARK.md](BENCHMARK.md) for the current reproducible baseline, and

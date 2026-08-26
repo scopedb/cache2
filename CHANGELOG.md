@@ -29,7 +29,8 @@ version number documented in `MILESTONES.md`.
   independent FIFO rotation, deterministic append-shard assignment, and warm
   recovery without a second disk format.
 - on-demand detailed snapshots for queue and buffer pressure, aggregate worker
-  I/O, and per-RegionSet capacity, occupancy, and process-local rotations.
+  I/O, fixed/resident/retained L1 memory, index occupancy/replacement pressure,
+  and per-RegionSet capacity, occupancy, and process-local rotations.
 
 ### Changed
 
@@ -73,6 +74,15 @@ version number documented in `MILESTONES.md`.
   aggregate memory limit, I/O concurrency, and per-shard write buffering.
 - made `put`, `put_in`, and `put_until` return their mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
+- replaced runtime-growing L1 maps, slot vectors, policy sketches, and S3-FIFO
+  ghost state with fixed startup allocations keyed directly by seeded XXH3;
+  L1 metadata now participates in aggregate memory-plan validation.
+- raised the bounded index ceiling to 512 million slots for TB-scale,
+  small-entry deployments and exposed deleted/stale/live slot reuse pressure.
+- changed the turnover soak to cycle mixed entry sizes, accept and count valid
+  stale hits, reject future/wrong-key/malformed values, and gate Linux current
+  RSS; production qualification now requires exact Rust 1.98.0 and all five
+  performance thresholds.
 
 ### Compatibility
 
