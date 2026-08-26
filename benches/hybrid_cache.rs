@@ -27,7 +27,8 @@ struct BenchConfig {
     memory_bytes: usize,
     memory_limit_bytes: usize,
     shards: u32,
-    io_workers: usize,
+    read_io_workers: usize,
+    write_io_workers: usize,
     clients: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
@@ -43,7 +44,8 @@ impl BenchConfig {
         let capacity_mib = env_usize("CACHE_BENCH_CAPACITY_MIB", 512)?;
         let memory_mib = env_usize("CACHE_BENCH_MEMORY_MIB", 256)?;
         let shards = env_u32("CACHE_BENCH_SHARDS", 4)?;
-        let io_workers = env_usize("CACHE_BENCH_IO_WORKERS", 4)?;
+        let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
+        let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
@@ -67,7 +69,13 @@ impl BenchConfig {
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
 
-        if entries == 0 || read_ops == 0 || io_workers == 0 || clients == 0 || shards == 0 {
+        if entries == 0
+            || read_ops == 0
+            || read_io_workers == 0
+            || write_io_workers == 0
+            || clients == 0
+            || shards == 0
+        {
             return Err(invalid(
                 "entry, operation, worker, client, and shard counts must be positive",
             ));
@@ -136,7 +144,8 @@ impl BenchConfig {
             memory_bytes,
             memory_limit_bytes,
             shards,
-            io_workers,
+            read_io_workers,
+            write_io_workers,
             clients,
             io_engine,
             io_mode,
@@ -158,7 +167,8 @@ impl BenchConfig {
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
-            .with_io_workers(self.io_workers)
+            .with_read_io_workers(self.read_io_workers)
+            .with_write_io_workers(self.write_io_workers)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(self.statistics_enabled)
@@ -225,7 +235,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("cache-rs HybridCache benchmark");
     println!(
-        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} workers={} clients={} engine={:?} mode={:?} statistics={}",
+        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} read_workers={} write_workers={} clients={} engine={:?} mode={:?} statistics={}",
         config.entries,
         config.resident_entries,
         config.value_bytes,
@@ -233,7 +243,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.memory_bytes as f64 / MIB as f64,
         config.memory_limit_bytes as f64 / MIB as f64,
         config.shards,
-        config.io_workers,
+        config.read_io_workers,
+        config.write_io_workers,
         config.clients,
         config.io_engine,
         config.io_mode,

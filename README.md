@@ -30,7 +30,8 @@ let runtime_config = RuntimeConfig::default()
     .with_memory_limit(10 * 1024 * 1024 * 1024)
     .with_l1_shards(64)
     .with_io_engine(IoEngine::Posix)
-    .with_io_workers(16)
+    .with_read_io_workers(16)
+    .with_write_io_workers(4)
     .with_write_batch_size(4 * 1024 * 1024);
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
@@ -155,24 +156,24 @@ remains an accepted best-effort cache result.
 
 After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate
-plans one exact aligned read range, reserves an immediately available engine
-slot, allocates that range, and performs one record read. The result is checked
-locally against the planned location, sequence number, hash, namespace, full
-key, lengths, and checksum. There is no second index lookup or global
+plans one exact aligned read range, reserves an immediately available
+read-engine slot, allocates that range, and performs one record read. The result
+is checked locally against the planned location, sequence number, hash,
+namespace, full key, lengths, and checksum. There is no second index lookup or global
 freshness check; a concurrently superseded but otherwise valid record may be
-returned. There is no read admission policy, fixed foreground read pool,
-separate read queue, or background-ready state. The transient allocation is
+returned. There is no public read admission policy, fixed read-buffer pool,
+read wait queue, or background-ready state. The transient allocation is
 charged to the aggregate hard memory limit; allocation or I/O submission
 pressure fails open as a cache miss instead of returning read backpressure.
-Write-side slot reservation limits write occupancy so the final slot of a
-multi-entry I/O engine remains available to reads; reads may use the complete
-engine depth. A waiting write receives the next eligible slot instead of
-starving behind a read stream. A successful L1 promotion returns a bounded
-L1-backed value and releases the transient read buffer before `get` returns
-while preserving `CacheTier::L2` as the source of that hit. If promotion
-bypasses, the zero-copy Region value retains only its exact-size allocation
-until the caller drops it. I/O submission contention follows the same fail-open
-rule. Point hashes and record sizes are
+Read and write submissions use independent bounded engine pools, so write
+pressure cannot consume read execution slots. Reads use the complete read-pool
+depth without waiting; read-pool pressure follows the same fail-open miss rule.
+Write-slot waits occur only in background append-shard workers; explicit
+completion barriers may wait for those workers. A successful L1 promotion
+returns a bounded L1-backed value and releases the transient read buffer before
+`get` returns while preserving `CacheTier::L2` as the source of that hit. If
+promotion bypasses, the zero-copy Region value retains only its exact-size allocation until the
+caller drops it. Point hashes and record sizes are
 computed once per operation, and L1 admits at most eight distinct full keys for
 one 64-bit hash so collision work remains constant-bounded.
 
@@ -202,13 +203,17 @@ may change on every open without invalidating a clean image:
 - POSIX positioned-I/O by default, with io_uring available only through an
   explicit crate feature and engine selection;
 - buffered/automatic/direct I/O mode;
-- a bounded positive I/O worker count; POSIX workers share one bounded engine
-  with one execution slot per worker, while optional io_uring uses a fixed
-  64-slot lane depth;
-- a write-occupancy reserve for reads, defaulting to one slot when an engine
-  has multiple slots; reads may use the complete engine capacity;
+- bounded positive read and write I/O worker counts; POSIX uses one dedicated
+  bounded engine per direction with one execution slot per worker, while
+  optional io_uring uses one fixed 64-slot lane per configured worker;
 - L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
   batch capacity, and opt-in operational counters.
+
+`with_write_shards` is separate from `with_write_io_workers`. A write shard is
+a static append/staging path with one Active Region, two fixed write buffers,
+and one ordered worker. The write I/O worker count is runtime-only device
+parallelism; concurrent batch submissions are bounded by the smaller of the
+write-shard and write-worker counts.
 
 The RAM tier uses shard-local CLOCK. Victim search and multi-entry eviction use
 fixed per-operation work budgets; budget exhaustion bypasses L1. Resident hits
@@ -263,15 +268,14 @@ subsets of `l2_misses` without changing the fail-open `get` result.
 
 ## Overload and health
 
-Fixed per-shard write buffers bound write admission. A true L2 miss does not allocate a
-buffer. An L2 candidate first reserves an engine execution slot and then
-allocates only its actual aligned read range against the aggregate memory
-limit. POSIX admission uses its shared engine directly. A full primary io_uring
-lane permits one non-waiting, hash-derived alternate-lane probe; there is no
-pool scan or retry loop. Allocation or I/O-engine pressure is an observable
-cache miss. `RuntimeConfig::with_read_io_reserve()` controls how many execution
-slots write occupancy cannot consume.
-Promoted hits release the temporary allocation before return;
+Fixed per-shard write buffers bound write admission. A true L2 miss does not
+allocate a buffer. An L2 candidate first reserves a read-engine execution slot
+and then allocates only its actual aligned read range against the aggregate
+memory limit. POSIX admission uses its dedicated read engine directly. A full primary
+io_uring lane permits one non-waiting, hash-derived alternate-lane probe; there
+is no pool scan or retry loop. Allocation or I/O-engine pressure is an
+observable cache miss. The dedicated write pool cannot consume read-pool
+slots. Promoted hits release the temporary allocation before return;
 unpromoted zero-copy Region values retain it. Writes return `WouldBlock`
 immediately on shard-buffer or mutation-path pressure.
 `CacheSnapshot::write_rejections` counts all write-side overloads;
@@ -313,9 +317,10 @@ recoverable.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
-5. Start with four workers and measure 1/2/4/8/16 on the target device. Worker
-   count, memory, and write-batch capacity are runtime settings and may change
-   across a warm restart.
+5. Start with four read workers and four write workers, then measure each count
+   independently on the target device. Both worker counts, memory, and
+   write-batch capacity are runtime settings and may change across a warm
+   restart. Write shards remain static layout identity.
 
 The reproducible baseline, Linux NVMe matrix, regression thresholds, and soak
 procedure are in `BENCHMARK.md`.
@@ -335,7 +340,8 @@ promoted L1 set. The default data set is 8,192 × 16 KiB.
 `CACHE_BENCH_RESIDENT_ENTRIES`, `CACHE_BENCH_READ_OPS`,
 `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`,
 `CACHE_BENCH_MEMORY_LIMIT_MIB`, `CACHE_BENCH_SHARDS`,
-`CACHE_BENCH_IO_WORKERS`, `CACHE_BENCH_CLIENTS`,
+`CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`,
+`CACHE_BENCH_CLIENTS`,
 `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
 `CACHE_BENCH_DIR` adjust the workload and device
 configuration. Set

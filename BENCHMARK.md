@@ -51,6 +51,41 @@ The old control needed a median 767 retries across 177 throttled writes. This
 A/B is the relevant regression check; absolute hot-read latency varies enough
 between sessions that historical numbers should not be compared in isolation.
 
+## Dedicated I/O-pool isolation preflight — 2026-08-27
+
+A small-capacity mixed-size soak on the same macOS developer host used a
+160 MiB L2, 1 MiB L1, 2,048 keys, four write shards, four writers, four readers,
+and 256 B/4 KiB/16 KiB/256 KiB values. These are single buffered-I/O runs for
+topology validation, not a device performance gate:
+
+| Read workers | Write workers | Duration | Accepted writes | Read busy misses | I/O peak | Errors |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 4 | 5 s | 1,019,057 | 0 | 8 | 0 |
+| 4 | 1 | 3 s | 582,459 | 0 | 5 | 0 |
+| 1 | 4 | 3 s | 650,216 | 1,884,898 | 5 | 0 |
+
+Reducing only the write pool left read-slot misses at zero; reducing only the
+read pool produced the expected fail-open pressure misses. The observed
+in-flight peaks equal the sum of the independently configured pool depths, and
+all runs stayed within the 128 MiB managed-memory limit. This validates pool
+isolation without adding read waiting or a shared-slot handoff protocol.
+
+The same three-second profile held both I/O pools at four workers and varied
+only the static write-shard count:
+
+| Write shards | Accepted writes | Approx. writes/s | Rotations | Managed peak | Read busy misses |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 388,163 | 129,388 | 708 | 17,777,044 B | 0 |
+| 2 | 542,263 | 180,754 | 1,077 | 26,886,676 B | 0 |
+| 4 | 619,939 | 206,646 | 1,285 | 45,118,228 B | 0 |
+
+One to two shards improved accepted-write throughput by 39.7%; two to four
+added another 14.3%. Each additional shard charged exactly 9,113,728 managed
+bytes in the steady topology (about 8.69 MiB with the 4 MiB batch default),
+primarily for its two staging buffers and worker stack. Write shards therefore
+remain useful append/staging parallelism, while write I/O workers independently
+bound device execution.
+
 ## Fixed L1 metadata A/B — 2026-08-26
 
 The fixed-capacity L1 directory, slot arrays, policy metadata, and mixed-size
@@ -306,7 +341,8 @@ It requires Linux, a writable cache directory, a new report path under an
 existing directory outside the source tree, and a clean worktree. It records
 the exact revision, Rust 1.98.0 toolchain, kernel, CPU, block
 device, filesystem and mount information; runs five repetitions of POSIX
-buffered and direct I/O; measures POSIX direct I/O with 1/2/4/8/16 workers;
+buffered and direct I/O; measures POSIX direct I/O with read and write worker
+counts scaled together through 1/2/4/8/16;
 calculates phase medians; then runs a four-hour POSIX/direct turnover soak. For
 an M2 result, the benchmark data set must
 exceed physical RAM and the mount must resolve to a non-rotational NVMe block
@@ -379,10 +415,9 @@ cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 `CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`,
 `CACHE_SOAK_MEMORY_LIMIT_MIB`, comma-separated `CACHE_SOAK_VALUE_BYTES`,
 `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
-`CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`,
-`CACHE_SOAK_READ_IO_RESERVE`, `CACHE_SOAK_WRITERS`, and `CACHE_SOAK_READERS`
-control the workload. The read reserve must be smaller than the POSIX worker
-count and defaults to one, except for a single-worker pool where it is zero.
+`CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_READ_IO_WORKERS`,
+`CACHE_SOAK_WRITE_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and `CACHE_SOAK_READERS`
+control the workload. Read and write I/O worker counts each default to four.
 `CACHE_SOAK_WARM_REOPEN=true`
 populates one complete pass at every configured value size, publishes a clean
 image, reopens it, and runs the measured turnover against the recovered private

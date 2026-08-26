@@ -384,26 +384,21 @@ impl RuntimeMetrics {
 
 impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.io_workers == 0 {
+        if self.read_io_workers == 0 || self.write_io_workers == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "I/O worker count must be non-zero",
+                "read and write I/O worker counts must be non-zero",
             ));
         }
         if self.io_engine == crate::runtime_config::IoEngine::Posix
-            && self.io_workers > MAX_IO_REQUESTS_PER_ENGINE
+            && (self.read_io_workers > MAX_IO_REQUESTS_PER_ENGINE
+                || self.write_io_workers > MAX_IO_REQUESTS_PER_ENGINE)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("POSIX I/O workers must be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"),
-            ));
-        }
-        let engine_depth = self.io_depth_per_engine();
-        let read_io_reserve = self.read_io_reserve();
-        if read_io_reserve >= engine_depth || (engine_depth > 1 && read_io_reserve == 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read I/O reserve must be in 1..capacity for a multi-slot engine",
+                format!(
+                    "POSIX read and write I/O workers must each be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"
+                ),
             ));
         }
         if self.memory_limit_bytes == 0 {
@@ -635,7 +630,8 @@ struct RunningOwner {
 
 struct RunningShared {
     core: Arc<FileRegionCore>,
-    engines: Box<[Arc<dyn IoEngine>]>,
+    read_engines: Box<[Arc<dyn IoEngine>]>,
+    write_engines: Box<[Arc<dyn IoEngine>]>,
     resources: Arc<ResourceController>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -646,12 +642,16 @@ struct RunningShared {
 }
 
 impl RunningShared {
-    fn engine_for(&self, route: u64) -> &Arc<dyn IoEngine> {
-        &self.engines[route_hash(route, self.engines.len())]
+    fn write_engine_for(&self, route: u64) -> &Arc<dyn IoEngine> {
+        &self.write_engines[route_hash(route, self.write_engines.len())]
     }
 
     fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-        try_reserve_read_lane(&self.engines, route)
+        try_reserve_read_lane(&self.read_engines, route)
+    }
+
+    fn engines(&self) -> impl Iterator<Item = &Arc<dyn IoEngine>> {
+        self.read_engines.iter().chain(self.write_engines.iter())
     }
 }
 
@@ -1164,7 +1164,7 @@ impl RegionDataPlane {
                 .metrics
                 .write_buffer_rejections
                 .load(Ordering::Relaxed),
-            io: aggregate_io_stats(&running.engines),
+            io: aggregate_io_stats(&running.read_engines, &running.write_engines),
             l1: running.memory.detailed_snapshot()?,
             index: self.core.index_snapshot()?,
             region_sets: self.core.region_set_snapshots()?,
@@ -1218,9 +1218,12 @@ impl RegionDataPlane {
     }
 }
 
-fn aggregate_io_stats(engines: &[Arc<dyn IoEngine>]) -> CacheIoSnapshot {
+fn aggregate_io_stats(
+    read_engines: &[Arc<dyn IoEngine>],
+    write_engines: &[Arc<dyn IoEngine>],
+) -> CacheIoSnapshot {
     let mut aggregate = CacheIoSnapshot::default();
-    for (engine_index, engine) in engines.iter().enumerate() {
+    for (engine_index, engine) in read_engines.iter().chain(write_engines).enumerate() {
         let snapshot = engine.stats();
         aggregate.submitted = aggregate.submitted.saturating_add(snapshot.submitted);
         aggregate.completed = aggregate.completed.saturating_add(snapshot.completed);
@@ -1299,7 +1302,9 @@ fn start_running(
         config.l1_shards,
         config.statistics,
     )?);
-    let engines = build_engine_pool(files, &config)?;
+    let write_files = files.try_clone()?;
+    let read_engines = build_engine_pool(files, &config, config.read_io_workers)?;
+    let write_engines = build_engine_pool(write_files, &config, config.write_io_workers)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1307,7 +1312,8 @@ fn start_running(
     shards.resize_with(shard_count, || Arc::new(ShardControl::new()));
     let shared = Arc::new(RunningShared {
         core,
-        engines,
+        read_engines,
+        write_engines,
         resources,
         metrics,
         memory,
@@ -1336,7 +1342,7 @@ fn start_running(
                     let _ = worker.join();
                 }
                 shared.staging.close();
-                for engine in &shared.engines {
+                for engine in shared.engines() {
                     let _ = engine.shutdown();
                 }
                 return Err(error);
@@ -1352,14 +1358,20 @@ fn start_running(
 fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> Option<usize> {
     // Reserve one stack per configured worker, one possible shutdown reaper per
     // engine, and one worker per append shard.
-    let engine_count = config.io_engine_count();
+    let read_engine_count = config.io_engine_count(config.read_io_workers);
+    let write_engine_count = config.io_engine_count(config.write_io_workers);
+    let engine_count = read_engine_count.checked_add(write_engine_count)?;
     let stack_count = config
-        .io_workers
+        .read_io_workers
+        .checked_add(config.write_io_workers)?
         .checked_add(engine_count)?
         .checked_add(shard_count)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let queue = engine_count
-        .checked_mul(config.io_depth_per_engine())?
+    let read_queue =
+        read_engine_count.checked_mul(config.io_depth_per_engine(config.read_io_workers))?;
+    let queue = write_engine_count
+        .checked_mul(config.io_depth_per_engine(config.write_io_workers))?
+        .checked_add(read_queue)?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let controls = engine_count
         .checked_add(shard_count)?
@@ -1375,16 +1387,17 @@ fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> 
 fn build_engine_pool(
     files: RuntimeFileSet,
     config: &RuntimeConfig,
+    workers: usize,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
-    let engine_count = config.io_engine_count();
+    let engine_count = config.io_engine_count(workers);
     let mut engines = Vec::new();
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let engine_depth = config.io_depth_per_engine();
+    let engine_depth = config.io_depth_per_engine(workers);
     let posix_workers = if config.io_engine() == crate::runtime_config::IoEngine::Posix {
-        config.io_workers
+        workers
     } else {
         1
     };
@@ -1398,7 +1411,6 @@ fn build_engine_pool(
             worker_files,
             engine_depth,
             posix_workers,
-            config.read_io_reserve(),
             config.io_engine(),
             config.statistics,
         )?);
@@ -1427,7 +1439,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     control.fail(&error);
     // Wake engine admission in case another shard is blocked behind work that
     // can no longer make progress after this runtime entered miss-only.
-    for engine in &shared.engines {
+    for engine in shared.engines() {
         engine.wake_slot_waiters();
     }
     for shard in &shared.shards {
@@ -1457,7 +1469,7 @@ fn shard_worker_result(
                     )?);
                 }
                 if force_flush || fill.bytes >= shared.write_batch_bytes {
-                    let engine = shared.engine_for(shard_id as u64);
+                    let engine = shared.write_engine_for(shard_id as u64);
                     shared
                         .core
                         .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
@@ -1488,7 +1500,7 @@ fn shard_worker_result(
                 .map_err(staging_runtime_error)?
                 .is_some()
             {
-                let engine = shared.engine_for(shard_id as u64);
+                let engine = shared.write_engine_for(shard_id as u64);
                 shared
                     .core
                     .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
@@ -1629,20 +1641,17 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     owner.shared.staging.close();
     let in_flight = owner
         .shared
-        .engines
-        .iter()
+        .engines()
         .map(|engine| engine.in_flight())
         .sum::<usize>();
     let writes_in_flight = owner
         .shared
-        .engines
-        .iter()
+        .engines()
         .map(|engine| engine.writes_in_flight())
         .sum::<usize>();
     let unfenced_before = owner
         .shared
-        .engines
-        .iter()
+        .engines()
         .any(|engine| engine.has_unfenced_writes());
     // A request that missed its cancellation grace may still own a kernel
     // target and buffer. Joining that engine can wait forever. Retain only the
@@ -1652,7 +1661,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         Ok(())
     } else {
         let mut result = Ok(());
-        for engine in &owner.shared.engines {
+        for engine in owner.shared.engines() {
             if let Err(error) = engine.shutdown()
                 && result.is_ok()
             {
@@ -1664,8 +1673,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     let unfenced = unfenced_before
         || owner
             .shared
-            .engines
-            .iter()
+            .engines()
             .any(|engine| engine.has_unfenced_writes());
     let result = drain
         .and_then(|()| join_error.map_or(Ok(()), Err))
@@ -1676,11 +1684,11 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         // reclaims its fd/thread/buffer set. A sticky fatal unfenced write
         // has no trustworthy future fence and remains process-lifetime state.
         if unfenced {
-            for engine in &owner.shared.engines {
+            for engine in owner.shared.engines() {
                 std::mem::forget(Arc::clone(engine));
             }
         } else {
-            for engine in &owner.shared.engines {
+            for engine in owner.shared.engines() {
                 if engine.in_flight() != 0 {
                     reap_engine_after_target_fence(engine);
                 } else {

@@ -26,8 +26,8 @@ pub enum IoMode {
 pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
     pub(crate) io_mode: IoMode,
-    pub(crate) io_workers: usize,
-    pub(crate) read_io_reserve: Option<usize>,
+    pub(crate) read_io_workers: usize,
+    pub(crate) write_io_workers: usize,
     pub(crate) l1_capacity_bytes: usize,
     pub(crate) memory_limit_bytes: usize,
     pub(crate) l1_shards: usize,
@@ -40,8 +40,8 @@ impl Default for RuntimeConfig {
         Self {
             io_engine: IoEngine::Posix,
             io_mode: IoMode::Auto,
-            io_workers: 4,
-            read_io_reserve: None,
+            read_io_workers: 4,
+            write_io_workers: 4,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
@@ -62,19 +62,13 @@ impl RuntimeConfig {
         self
     }
 
-    pub fn with_io_workers(mut self, workers: usize) -> Self {
-        self.io_workers = workers;
+    pub fn with_read_io_workers(mut self, workers: usize) -> Self {
+        self.read_io_workers = workers;
         self
     }
 
-    /// Reserves this many execution slots from write occupancy.
-    ///
-    /// Reads may still use the complete engine capacity. POSIX workers share
-    /// one engine, so this is a global reserve. The default is one slot when
-    /// the selected engine has more than one slot, otherwise zero. A
-    /// multi-slot engine requires a reserve in `1..capacity`.
-    pub fn with_read_io_reserve(mut self, slots: usize) -> Self {
-        self.read_io_reserve = Some(slots);
+    pub fn with_write_io_workers(mut self, workers: usize) -> Self {
+        self.write_io_workers = workers;
         self
     }
 
@@ -111,16 +105,12 @@ impl RuntimeConfig {
         self.io_mode
     }
 
-    pub const fn io_workers(&self) -> usize {
-        self.io_workers
+    pub const fn read_io_workers(&self) -> usize {
+        self.read_io_workers
     }
 
-    pub const fn read_io_reserve(&self) -> usize {
-        match self.read_io_reserve {
-            Some(slots) => slots,
-            None if self.io_depth_per_engine() > 1 => 1,
-            None => 0,
-        }
+    pub const fn write_io_workers(&self) -> usize {
+        self.write_io_workers
     }
 
     pub const fn l1_capacity_bytes(&self) -> usize {
@@ -143,16 +133,16 @@ impl RuntimeConfig {
         self.statistics
     }
 
-    pub(crate) const fn io_engine_count(&self) -> usize {
+    pub(crate) const fn io_engine_count(&self, workers: usize) -> usize {
         match self.io_engine {
             IoEngine::Posix => 1,
-            IoEngine::IoUring => self.io_workers,
+            IoEngine::IoUring => workers,
         }
     }
 
-    pub(crate) const fn io_depth_per_engine(&self) -> usize {
+    pub(crate) const fn io_depth_per_engine(&self, workers: usize) -> usize {
         match self.io_engine {
-            IoEngine::Posix => self.io_workers,
+            IoEngine::Posix => workers,
             IoEngine::IoUring => IO_URING_DEPTH_PER_WORKER,
         }
     }
@@ -166,28 +156,14 @@ mod tests {
     fn runtime_defaults_to_posix_io() {
         let config = RuntimeConfig::default();
         assert_eq!(config.io_engine(), IoEngine::Posix);
-        assert_eq!(config.io_engine_count(), 1);
-        assert_eq!(config.io_depth_per_engine(), 4);
-        assert_eq!(config.read_io_reserve(), 1);
-        assert_eq!(config.clone().with_io_workers(1).read_io_reserve(), 0);
-        assert_eq!(
-            config
-                .clone()
-                .with_io_workers(1)
-                .with_read_io_reserve(0)
-                .read_io_reserve(),
-            0
-        );
-        config
-            .clone()
-            .with_io_workers(1)
-            .with_read_io_reserve(0)
-            .validate()
-            .unwrap();
+        assert_eq!(config.read_io_workers(), 4);
+        assert_eq!(config.write_io_workers(), 4);
+        assert_eq!(config.io_engine_count(config.read_io_workers()), 1);
+        assert_eq!(config.io_depth_per_engine(config.read_io_workers()), 4);
         assert_eq!(
             config
                 .with_io_engine(IoEngine::IoUring)
-                .io_depth_per_engine(),
+                .io_depth_per_engine(4),
             64
         );
     }

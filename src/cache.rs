@@ -84,7 +84,11 @@ impl StaticConfig {
         self
     }
 
-    /// Sets the number of independent append paths in the on-disk layout.
+    /// Sets the number of independent append/staging paths in the on-disk layout.
+    ///
+    /// Each path owns one Active Region, two fixed write buffers, and one
+    /// ordered worker. This is static recovery identity and is independent of
+    /// the runtime read and write I/O worker counts.
     pub fn with_write_shards(mut self, shards: u32) -> Self {
         self.write_shards = shards;
         self

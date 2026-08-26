@@ -35,7 +35,8 @@ impl TestCache {
     fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> HybridCacheConfig {
         let runtime_config = RuntimeConfig::default()
             .with_io_engine(IoEngine::Posix)
-            .with_io_workers(workers)
+            .with_read_io_workers(workers)
+            .with_write_io_workers(workers)
             .with_l1_capacity(4 * 1024 * 1024)
             .with_memory_limit(32 * 1024 * 1024)
             .with_write_batch_size(256 * 1024)
@@ -171,7 +172,8 @@ async fn immediate_l1_publication_is_best_effort() {
     let files = TestCache::new("latest-memory-visible");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(2)
+        .with_read_io_workers(2)
+        .with_write_io_workers(2)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -207,7 +209,8 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(1)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
         .with_l1_capacity(1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -246,7 +249,8 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
     let files = TestCache::new("l1-bypass-publication");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(2)
+        .with_read_io_workers(2)
+        .with_write_io_workers(2)
         .with_l1_capacity(512)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -291,7 +295,8 @@ async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::IoUring)
-        .with_io_workers(1)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
         .with_l1_capacity(4 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024);
@@ -336,8 +341,8 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
 
     let retuned = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(7)
-        .with_read_io_reserve(2)
+        .with_read_io_workers(7)
+        .with_write_io_workers(2)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
@@ -610,11 +615,16 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 8] = [
-        ("zero-workers", |config| config.with_io_workers(0)),
-        ("zero-read-reserve", |config| config.with_read_io_reserve(0)),
-        ("read-reserve-exhausts-pool", |config| {
-            config.with_io_workers(2).with_read_io_reserve(2)
+    let cases: [RuntimeConfigCase; 9] = [
+        ("zero-read-workers", |config| config.with_read_io_workers(0)),
+        ("zero-write-workers", |config| {
+            config.with_write_io_workers(0)
+        }),
+        ("too-many-read-workers", |config| {
+            config.with_read_io_workers(4097)
+        }),
+        ("too-many-write-workers", |config| {
+            config.with_write_io_workers(4097)
         }),
         ("l1-exceeds-budget", |config| {
             config
@@ -624,7 +634,8 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         ("fixed-plan-exceeds-budget", |config| {
             config
                 .with_io_engine(IoEngine::Posix)
-                .with_io_workers(2)
+                .with_read_io_workers(2)
+                .with_write_io_workers(2)
                 .with_l1_capacity(0)
                 .with_memory_limit(2 * 1024 * 1024)
                 .with_write_batch_size(128 * 1024)
@@ -878,7 +889,8 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(1)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
@@ -912,7 +924,8 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let files = TestCache::new("promoted-l2-buffer-release");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(1)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
         .with_l1_capacity(64 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -956,7 +969,8 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
     let files = TestCache::new("exact-transient-read-memory");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
-        .with_io_workers(1)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)

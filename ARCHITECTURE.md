@@ -12,7 +12,8 @@ HybridCache
 ├── namespace → RegionSet router
 │ ├── RegionSet 0: append shards + private Region range + free/sealed FIFO
 │ └── RegionSet N: append shards + private Region range + free/sealed FIFO
-├── configurable I/O-engine pool
+├── bounded read I/O-engine pool
+├── bounded write I/O-engine pool
 └── data, state, and clean-image files
 ```
 
@@ -28,7 +29,7 @@ A RegionSet is an L2 retention boundary. Static capacity weights assign each
 set a contiguous Region range; append shards are assigned contiguous ranges
 evenly across sets. Every append shard has one Active Region, two fixed write
 buffers, and one ordered worker. Free and sealed FIFOs are private to their set,
-and Region rotation never borrows across sets. L1, the global index, I/O pool,
+and Region rotation never borrows across sets. L1, the global index, I/O pools,
 memory limit, and statistics stay shared. Runtime-only L1 shards are
 independent of static append shards, so RAM concurrency can be retuned without
 changing Region assignment or recovery identity.
@@ -56,7 +57,7 @@ A `put` follows a direct bounded path:
 4. encode directly into that shard's aligned staging buffer;
 5. publish the same sequence to RAM when it fits, before returning;
 6. seal a batch on size, age, or Region rotation;
-7. submit the owned buffer to one configured I/O engine;
+7. submit the owned buffer to one configured write I/O engine;
 8. publish the index entry directly to its index partition only after successful
    completion, without reacquiring the global Region manager.
 
@@ -94,21 +95,23 @@ clearing visited bits before selecting a victim. Exhausting that fixed budget
 bypasses L1 insertion.
 
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
-L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
-read range, and reads one record. POSIX uses one shared bounded engine, so one
-reservation observes the complete worker capacity. If an io_uring hash-selected
-lane is full, admission may probe one hash-derived alternate lane; it never
-scans or waits across the pool. Local validation checks the planned location,
-sequence, hash, namespace, complete key, lengths, and checksums.
+L2 index once, reserves one non-waiting read-engine slot, allocates the exact
+aligned read range, and reads one record. POSIX uses one dedicated bounded read
+engine, so one reservation observes the complete read-worker capacity. If an
+io_uring hash-selected read lane is full, admission may probe one hash-derived
+alternate lane; it never scans or waits across the pool. Local validation
+checks the planned location, sequence, hash, namespace, complete key, lengths,
+and checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
-The I/O pool contains the requested number of workers. The default engine uses
-one shared bounded POSIX engine with one positioned-I/O worker and execution
-slot per configured worker. Explicit io_uring builds use one ring with a fixed
-64-slot depth per lane. The sum of these fixed depths is the aggregate in-flight
-bound. A runtime-configurable read reserve caps write occupancy without
-restricting reads or adding a read wait.
+Read and write I/O use independent bounded pools. The default POSIX path uses
+one engine per direction with one positioned-I/O worker and execution slot per
+configured worker. Explicit io_uring builds use one ring with a fixed 64-slot
+depth per configured worker in each direction. Reads never wait for a slot and
+may use the complete read-pool depth; write submissions cannot consume it.
+Write-slot waits occur only in background append-shard workers; explicit
+completion barriers may wait for those workers.
 
 ## Recovery path
 
@@ -154,14 +157,13 @@ layout are canonicalized to the implicit default, avoiding cold starts for
 configurations with identical physical behavior.
 
 Runtime configuration is not persisted and may change between opens. It
-includes I/O engine and mode, worker count, read I/O reserve, L1 capacity and
-shard count, one write-batch capacity, aggregate memory limit, and optional
-statistics.
+includes I/O engine and mode, independent read and write worker counts, L1
+capacity and shard count, one write-batch capacity, aggregate memory limit, and
+optional statistics.
 Foreground L2 reads
-reserve one immediately available engine execution slot after an index hit,
+reserve one immediately available read-engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public
-admission policy. Write occupancy leaves the final slot of a multi-entry I/O
-engine available to reads, while a waiting write receives a bounded handoff.
+admission policy. The dedicated write pool cannot affect read-slot availability.
 Runtime configuration is validated before filesystem mutation.
 Keys are bounded at 4 KiB and values at 256 KiB. Device operations use a fixed
 five-second completion guardrail so a stalled cache device cannot retain a

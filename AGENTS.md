@@ -34,11 +34,10 @@ capacity; this is expected to be uncommon in normal operation.
   and shard-local whenever possible.
 - Publish Region writes in batches. Never add per-record flushes, syncs, or
   completion waits.
-- On an I/O engine with more than one slot, write submissions must leave the
-  final slot available to reads. Apply that limit to write occupancy rather
-  than total occupancy. Reads may use the complete engine depth, but a waiting
-  write must receive a bounded handoff so accepted writes and explicit
-  barriers cannot starve behind a read stream.
+- Read and write submissions use separate bounded I/O-engine pools. Writes must
+  never consume read-engine slots. Reads may use the complete read-pool depth
+  but never wait for a slot. Write-slot waits remain confined to background
+  shard workers; explicit completion barriers may wait for those workers.
 - An L1 miss must always consult L2. A true L2 index miss returns immediately
   without acquiring a read buffer.
 - L2 owns the final result. An L2 candidate plans one exact aligned record read,

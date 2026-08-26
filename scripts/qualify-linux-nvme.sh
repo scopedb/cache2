@@ -299,8 +299,9 @@ run_benchmark_profile() {
   local profile=$1
   local engine=$2
   local mode=$3
-  local workers=$4
-  local runs=$5
+  local read_workers=$4
+  local write_workers=$5
+  local runs=$6
   local log=$report_directory/benchmark-$profile.log
   local run
   for ((run = 1; run <= runs; run++)); do
@@ -308,7 +309,8 @@ run_benchmark_profile() {
     CACHE_BENCH_DIR="$cache_directory" \
     CACHE_BENCH_IO_ENGINE="$engine" \
     CACHE_BENCH_IO_MODE="$mode" \
-    CACHE_BENCH_IO_WORKERS="$workers" \
+    CACHE_BENCH_READ_IO_WORKERS="$read_workers" \
+    CACHE_BENCH_WRITE_IO_WORKERS="$write_workers" \
       cargo +1.98.0 bench --locked --bench hybrid_cache --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
@@ -317,12 +319,12 @@ run_benchmark_profile() {
 echo "building release benchmark targets"
 cargo +1.98.0 build --locked --release --benches
 
-run_benchmark_profile posix-buffered posix buffered 4 "$benchmark_runs"
-run_benchmark_profile posix-direct posix direct 4 "$benchmark_runs"
+run_benchmark_profile posix-buffered posix buffered 4 4 "$benchmark_runs"
+run_benchmark_profile posix-direct posix direct 4 4 "$benchmark_runs"
 
 for workers in 1 2 4 8 16; do
   run_benchmark_profile "posix-direct-workers-$workers" \
-    posix direct "$workers" 1
+    posix direct "$workers" "$workers" 1
 done
 
 echo "starting ${soak_seconds}s POSIX/direct turnover soak"

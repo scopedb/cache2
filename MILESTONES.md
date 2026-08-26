@@ -21,7 +21,7 @@ Deliver one simple bounded RAM + Region SSD architecture:
 - [x] one public `HybridCache` API and one Region format;
 - [x] shard-local L1, staging, ordering, and L2 ownership;
 - [x] default POSIX positioned-I/O engine, explicit optional io_uring engine,
-  and configurable I/O worker count;
+  and independently configurable read/write I/O worker counts;
 - [x] static file-layout configuration separated from runtime tuning;
 - [x] bounded L1 admission, I/O queues, buffers, staging, and logical disk use;
 - [x] cold-empty recovery after crash or fast close;

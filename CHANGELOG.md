@@ -42,16 +42,17 @@ version number documented in `MILESTONES.md`.
 - made POSIX positioned I/O the only default engine, renamed `IoEngine::Sync`
   to `IoEngine::Posix`, removed implicit `IoEngine::Auto` selection, and made
   io_uring an explicit opt-in crate feature;
-- removed the public `io_concurrency` setting; POSIX capacity now equals worker
-  count and optional io_uring uses a fixed 64-request depth per worker;
+- removed the public `io_concurrency` setting; read and write worker counts now
+  independently bound dedicated POSIX pools, while optional io_uring uses a
+  fixed 64-request depth per configured worker in each pool;
 - made `get` and `get_in` native Tokio async operations; L1/index-miss paths
   remain immediate, while an admitted L2 read wakes the caller task directly;
 - made `open`, `drain`, and explicit close Tokio-friendly: drain uses native
   shard notifications and blocking recovery/filesystem work stays off runtime
   workers;
-- pooled POSIX workers behind one bounded execution budget and added a runtime
-  read-slot reserve that caps write occupancy; optional multi-ring io_uring
-  reads retain one bounded alternate-lane probe;
+- separated read and write submissions into dedicated bounded worker pools so
+  write pressure cannot consume read slots; optional multi-ring io_uring reads
+  retain one bounded alternate-lane probe;
 - stopped requiring the unused io_uring `fsync` opcode after the public data-sync
   operation was removed;
 - replaced FNV-1a key hashing with seeded XXH3-64 and bound the algorithm
@@ -78,20 +79,19 @@ version number documented in `MILESTONES.md`.
 - replaced the fixed maximum-size foreground read pool with exact-size
   transient aligned allocations charged to the aggregate memory limit;
   removed read-buffer admission configuration and read-side `WouldBlock`, and
-  moved I/O availability protection to write-side slot reservation.
+  made read-engine pressure a fail-open cache miss.
 - removed `ReadBufferPolicy`, `with_read_buffer_slots`,
   `with_read_buffer_policy`, the legacy split-submission alias, and read-pool
   fields from detailed snapshots.
 - simplified write overload reporting to the `write_rejections` summary counter
   with shard-buffer detail in `detailed_snapshot()`.
-- corrected engine slot reservation to cap write occupancy rather than total
-  occupancy, and added bounded write-waiter handoff under sustained reads.
 - reserve the read engine slot before allocating its exact aligned range, let the
   device initialize transient read storage without a userspace pre-clear,
   derive the maximum range from the runtime record limits, and expose
   `l2_read_memory_misses` and `l2_read_busy_misses` counters.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
-  aggregate memory limit, I/O workers, and one per-shard write-batch capacity.
+  aggregate memory limit, separate read/write I/O workers, and one per-shard
+  write-batch capacity.
 - made `put` and `put_in` return their mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
 - replaced runtime-growing L1 maps and slot vectors with fixed startup
