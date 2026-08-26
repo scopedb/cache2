@@ -870,6 +870,7 @@ const fn waiting_writes(state: u64) -> usize {
 
 struct RuntimeShared {
     max_in_flight: usize,
+    statistics_enabled: bool,
     accepting: AtomicBool,
     /// Packed total, write, and waiting-write counts. A single CAS is the slot
     /// reservation linearization point, including read-to-write handoff.
@@ -882,6 +883,7 @@ struct RuntimeShared {
     errors: AtomicU64,
     slot_wait_ns: AtomicU64,
     completion_ns: AtomicU64,
+    cancel_scan_needed: AtomicBool,
     unfenced_writes: AtomicBool,
     slot_lock: Mutex<()>,
     slot_available: Condvar,
@@ -894,9 +896,10 @@ enum SlotWaitError {
 }
 
 impl RuntimeShared {
-    fn new(max_in_flight: usize) -> Self {
+    fn new(max_in_flight: usize, statistics_enabled: bool) -> Self {
         Self {
             max_in_flight,
+            statistics_enabled,
             accepting: AtomicBool::new(true),
             slot_state: AtomicU64::new(0),
             in_flight_peak: AtomicUsize::new(0),
@@ -907,6 +910,7 @@ impl RuntimeShared {
             errors: AtomicU64::new(0),
             slot_wait_ns: AtomicU64::new(0),
             completion_ns: AtomicU64::new(0),
+            cancel_scan_needed: AtomicBool::new(false),
             unfenced_writes: AtomicBool::new(false),
             slot_lock: Mutex::new(()),
             slot_available: Condvar::new(),
@@ -961,7 +965,9 @@ impl RuntimeShared {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    update_peak(&self.in_flight_peak, total + 1);
+                    if self.statistics_enabled {
+                        update_peak(&self.in_flight_peak, total + 1);
+                    }
                     return Some(IoSlot {
                         shared: Arc::clone(self),
                         write,
@@ -1141,19 +1147,23 @@ impl RuntimeShared {
         buffer: Option<IoBuffer>,
         completion: Arc<CompletionState>,
         slot: IoSlot,
-        submitted_at: Instant,
+        submitted_at: Option<Instant>,
     ) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-        match &status {
-            CompletionStatus::Completed => {}
-            CompletionStatus::Cancelled => {
-                self.cancelled.fetch_add(1, Ordering::Relaxed);
+        if self.statistics_enabled {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+            match &status {
+                CompletionStatus::Completed => {}
+                CompletionStatus::Cancelled => {
+                    self.cancelled.fetch_add(1, Ordering::Relaxed);
+                }
+                CompletionStatus::Failed(_) => {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CompletionStatus::Failed(_) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+            if let Some(submitted_at) = submitted_at {
+                add_duration_ns(&self.completion_ns, submitted_at.elapsed());
             }
         }
-        add_duration_ns(&self.completion_ns, submitted_at.elapsed());
         drop(slot);
         completion.complete(IoCompletion {
             request_id,
@@ -1191,7 +1201,7 @@ struct Task {
     operation: IoOperation,
     completion: Arc<CompletionState>,
     slot: IoSlot,
-    submitted_at: Instant,
+    submitted_at: Option<Instant>,
 }
 
 enum DriverCommand {
@@ -1314,7 +1324,7 @@ impl RuntimeInner {
         slot: ReadSlot,
         operation: IoOperation,
     ) -> Result<IoRequest, SubmitError> {
-        let submit_started = Instant::now();
+        let submit_started = self.shared.statistics_enabled.then(Instant::now);
         if operation.kind() != OperationKind::Read || !Arc::ptr_eq(&slot.slot.shared, &self.shared)
         {
             return Err(SubmitError {
@@ -1356,7 +1366,7 @@ impl RuntimeInner {
         operation: IoOperation,
         slot_mode: SlotMode<'_>,
     ) -> Result<IoRequest, SubmitError> {
-        let submit_started = Instant::now();
+        let submit_started = self.shared.statistics_enabled.then(Instant::now);
         let nonblocking = match slot_mode {
             #[cfg(test)]
             SlotMode::Try => true,
@@ -1414,7 +1424,7 @@ impl RuntimeInner {
         &self,
         operation: IoOperation,
         slot: IoSlot,
-        submit_started: Instant,
+        submit_started: Option<Instant>,
         nonblocking: bool,
     ) -> Result<IoRequest, SubmitError> {
         let submit_state = if nonblocking {
@@ -1453,10 +1463,14 @@ impl RuntimeInner {
             slot,
             submitted_at: submit_started,
         };
-        self.shared.submitted.fetch_add(1, Ordering::Release);
+        if self.shared.statistics_enabled {
+            self.shared.submitted.fetch_add(1, Ordering::Release);
+        }
         match self.commands.try_send(DriverCommand::Submit(task)) {
             Ok(()) => {
-                add_duration_ns(&self.shared.slot_wait_ns, submit_started.elapsed());
+                if let Some(submit_started) = submit_started {
+                    add_duration_ns(&self.shared.slot_wait_ns, submit_started.elapsed());
+                }
                 if let Some(wake) = &self.wake {
                     wake.wake();
                 }
@@ -1468,7 +1482,9 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
-                self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                if self.shared.statistics_enabled {
+                    self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                }
                 let Task {
                     operation, slot, ..
                 } = task;
@@ -1479,7 +1495,9 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
-                self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                if self.shared.statistics_enabled {
+                    self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                }
                 let Task {
                     operation, slot, ..
                 } = task;
@@ -1496,12 +1514,17 @@ impl RuntimeInner {
     }
 
     fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        if !state.cancel_requested.swap(true, Ordering::AcqRel) {
+        if !state.cancel_requested.swap(true, Ordering::AcqRel) && self.shared.statistics_enabled {
             self.shared.cancel_requested.fetch_add(1, Ordering::Relaxed);
         }
         if !state.cancel_notified.swap(true, Ordering::AcqRel) {
             match self.commands.try_send(DriverCommand::Cancel(request_id)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.shared
+                        .cancel_scan_needed
+                        .store(true, Ordering::Release);
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -1629,9 +1652,16 @@ impl BackendIoEngine {
         files: RuntimeFileSet,
         max_in_flight: usize,
         worker_count: usize,
+        statistics_enabled: bool,
     ) -> io::Result<Self> {
+        files.set_statistics_enabled(statistics_enabled);
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new_with_workers(backend, max_in_flight, worker_count)
+        Self::new_with_workers_and_statistics(
+            backend,
+            max_in_flight,
+            worker_count,
+            statistics_enabled,
+        )
     }
 
     #[cfg(test)]
@@ -1639,10 +1669,20 @@ impl BackendIoEngine {
         Self::new_with_workers(backend, max_in_flight, max_in_flight.min(4))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_workers(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
+    ) -> io::Result<Self> {
+        Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true)
+    }
+
+    fn new_with_workers_and_statistics(
+        backend: Arc<dyn IoBackend>,
+        max_in_flight: usize,
+        worker_count: usize,
+        statistics_enabled: bool,
     ) -> io::Result<Self> {
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
         if worker_count == 0 || worker_count > max_in_flight {
@@ -1651,7 +1691,7 @@ impl BackendIoEngine {
                 "sync I/O worker count must not exceed the request limit",
             ));
         }
-        let shared = Arc::new(RuntimeShared::new(max_in_flight));
+        let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
         let command_capacity = max_in_flight
             .checked_mul(2)
             .and_then(|depth| depth.checked_add(1))
@@ -1933,8 +1973,10 @@ mod uring {
         pub(crate) fn new_with_files(
             files: RuntimeFileSet,
             max_in_flight: usize,
+            statistics_enabled: bool,
         ) -> io::Result<Self> {
             RuntimeInner::validate_max_in_flight(max_in_flight)?;
+            files.set_statistics_enabled(statistics_enabled);
             let io_stats = files.stats_handle();
             let ring_entries = max_in_flight
                 .checked_add(2)
@@ -1981,7 +2023,7 @@ mod uring {
             let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
                 sender: wake_sender,
             });
-            let shared = Arc::new(RuntimeShared::new(max_in_flight));
+            let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
             let command_capacity = max_in_flight
                 .checked_mul(2)
                 .and_then(|depth| depth.checked_add(1))
@@ -2264,6 +2306,9 @@ mod uring {
         }
 
         fn queue_requested_cancels(&mut self) {
+            if !self.shared.cancel_scan_needed.swap(false, Ordering::AcqRel) {
+                return;
+            }
             self.requested_cancels.clear();
             self.requested_cancels
                 .extend(self.flights.iter().filter_map(|(request_id, flight)| {
@@ -2867,6 +2912,7 @@ pub(crate) use uring::UringIoEngine;
 pub(crate) fn build_auto_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
+    statistics_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     #[cfg(all(
         feature = "io-uring",
@@ -2881,10 +2927,10 @@ pub(crate) fn build_auto_file_engine(
     ))]
     {
         let fallback = files.try_clone()?;
-        match UringIoEngine::new_with_files(files, max_in_flight) {
+        match UringIoEngine::new_with_files(files, max_in_flight, statistics_enabled) {
             Ok(engine) => Ok(Arc::new(engine)),
             Err(error) if UringIoEngine::is_unavailable_error(&error) => {
-                BackendIoEngine::new_with_files_and_workers(fallback, max_in_flight, 1)
+                BackendIoEngine::new_with_files_and_workers(fallback, 1, 1, statistics_enabled)
                     .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             Err(error) => Err(error),
@@ -2903,7 +2949,8 @@ pub(crate) fn build_auto_file_engine(
         )
     )))]
     {
-        BackendIoEngine::new_with_files_and_workers(files, max_in_flight, 1)
+        let _ = max_in_flight;
+        BackendIoEngine::new_with_files_and_workers(files, 1, 1, statistics_enabled)
             .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
     }
 }
@@ -2913,13 +2960,16 @@ pub(crate) fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
     kind: ConfiguredIoEngine,
+    statistics_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
         ConfiguredIoEngine::Sync => {
-            BackendIoEngine::new_with_files_and_workers(files, max_in_flight, 1)
+            BackendIoEngine::new_with_files_and_workers(files, 1, 1, statistics_enabled)
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
         }
-        ConfiguredIoEngine::Auto => build_auto_file_engine(files, max_in_flight),
+        ConfiguredIoEngine::Auto => {
+            build_auto_file_engine(files, max_in_flight, statistics_enabled)
+        }
         ConfiguredIoEngine::IoUring => {
             #[cfg(all(
                 feature = "io-uring",
@@ -2933,7 +2983,7 @@ pub(crate) fn build_file_engine(
                 )
             ))]
             {
-                UringIoEngine::new_with_files(files, max_in_flight)
+                UringIoEngine::new_with_files(files, max_in_flight, statistics_enabled)
                     .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             #[cfg(not(all(
@@ -3440,9 +3490,41 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn configured_sync_engine_exposes_only_its_executable_slot() {
+        let file = TestFile::new();
+        let files = RuntimeFileSet::new(file.file(), None);
+        let engine = build_file_engine(files, 32, ConfiguredIoEngine::Sync, false).unwrap();
+
+        let reserved = engine.try_reserve_read().unwrap();
+        assert_eq!(
+            engine.try_reserve_read().err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(reserved);
+        drop(engine.try_reserve_read().unwrap());
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn disabled_io_statistics_skip_cumulative_engine_counters() {
+        let file = TestFile::new();
+        let engine =
+            BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false).unwrap();
+        let resources = resources(1);
+        let completion = engine
+            .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x5a]), 0)
+            .unwrap()
+            .wait();
+        assert!(matches!(completion.status, CompletionStatus::Completed));
+        assert_eq!(engine.stats(), CacheIoSnapshot::default());
+        engine.shutdown().unwrap();
+    }
+
     #[test]
     fn writes_reserve_the_final_engine_slot_for_reads() {
-        let shared = Arc::new(RuntimeShared::new(2));
+        let shared = Arc::new(RuntimeShared::new(2, true));
         let write = shared.try_reserve_slot(true).unwrap();
         assert!(shared.try_reserve_slot(true).is_none());
         let read = shared.try_reserve_slot(false).unwrap();
@@ -3455,13 +3537,13 @@ mod tests {
         assert_eq!(shared.writes_in_flight(), 1);
         drop((read, write));
 
-        let depth_one = Arc::new(RuntimeShared::new(1));
+        let depth_one = Arc::new(RuntimeShared::new(1, true));
         assert!(depth_one.try_reserve_slot(true).is_some());
     }
 
     #[test]
     fn waiting_write_gets_the_next_slot_under_read_pressure() {
-        let shared = Arc::new(RuntimeShared::new(2));
+        let shared = Arc::new(RuntimeShared::new(2, true));
         let first = shared.try_reserve_slot(false).unwrap();
         let second = shared.try_reserve_slot(false).unwrap();
         let waiting = Arc::clone(&shared);
@@ -3489,7 +3571,7 @@ mod tests {
 
     #[test]
     fn write_waiter_does_not_consume_the_read_reserved_slot() {
-        let shared = Arc::new(RuntimeShared::new(2));
+        let shared = Arc::new(RuntimeShared::new(2, true));
         let first_write = shared.try_reserve_slot(true).unwrap();
         let waiting = Arc::clone(&shared);
         let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
@@ -3690,7 +3772,7 @@ mod tests {
 
     #[test]
     fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
-        let shared = Arc::new(RuntimeShared::new(1));
+        let shared = Arc::new(RuntimeShared::new(1, true));
         let slot = shared.try_reserve_slot(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
@@ -3702,7 +3784,7 @@ mod tests {
             operation: IoOperation::read(read_buffer(&resources, 1), 0),
             completion: Arc::clone(&completion),
             slot,
-            submitted_at: Instant::now(),
+            submitted_at: Some(Instant::now()),
         };
         shared.finish_quarantined(
             task,

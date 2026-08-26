@@ -1209,6 +1209,7 @@ fn build_engine_pool(
             worker_files,
             worker_concurrency,
             config.io_engine(),
+            config.statistics,
         )?);
     }
     Ok(engines.into_boxed_slice())

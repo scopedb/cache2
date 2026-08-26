@@ -80,6 +80,8 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets aggregate asynchronous I/O admission. The synchronous engine has
+    /// one executable slot per `io_worker` and does not queue cache reads.
     pub fn with_io_concurrency(mut self, requests: usize) -> Self {
         self.io_concurrency = requests;
         self

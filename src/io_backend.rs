@@ -51,6 +51,7 @@ pub(crate) struct DirectIoStatsHandle {
 
 struct DirectIoCounters {
     direct_active: AtomicBool,
+    statistics_enabled: AtomicBool,
     direct_operations: AtomicU64,
     direct_bytes: AtomicU64,
     buffered_operations: AtomicU64,
@@ -62,6 +63,7 @@ impl DirectIoStatsHandle {
         Self {
             inner: Arc::new(DirectIoCounters {
                 direct_active: AtomicBool::new(direct_active),
+                statistics_enabled: AtomicBool::new(true),
                 direct_operations: AtomicU64::new(0),
                 direct_bytes: AtomicU64::new(0),
                 buffered_operations: AtomicU64::new(0),
@@ -71,6 +73,9 @@ impl DirectIoStatsHandle {
     }
 
     fn record(&self, path: RuntimeIoPath, length: usize) {
+        if !self.inner.statistics_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let bytes = u64::try_from(length).unwrap_or(u64::MAX);
         match path {
             RuntimeIoPath::Direct => {
@@ -90,6 +95,12 @@ impl DirectIoStatsHandle {
 
     fn is_active(&self) -> bool {
         self.inner.direct_active.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+        self.inner
+            .statistics_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> DirectIoStats {
@@ -194,6 +205,10 @@ impl RuntimeFileSet {
     ))]
     pub(crate) fn stats_handle(&self) -> DirectIoStatsHandle {
         self.stats.clone()
+    }
+
+    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+        self.stats.set_statistics_enabled(enabled);
     }
 
     #[cfg_attr(
@@ -1167,6 +1182,9 @@ mod tests {
         );
         let cloned = files.try_clone().unwrap();
         cloned.record(RuntimeIoPath::Direct, DIRECT_IO_ALIGNMENT);
+        assert_eq!(files.stats_handle().snapshot().direct_operations, 1);
+        cloned.set_statistics_enabled(false);
+        files.record(RuntimeIoPath::Direct, DIRECT_IO_ALIGNMENT);
         assert_eq!(files.stats_handle().snapshot().direct_operations, 1);
 
         let buffered_only = RuntimeFileSet::buffered(buffered.open());
