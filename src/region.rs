@@ -1779,8 +1779,6 @@ where
             != u64::try_from(storage.slot_count()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
             })?
-            || source_metadata.root.physical_value_slots != physical_stats.value
-            || source_metadata.root.physical_deleted_slots != physical_stats.deleted
             || !metadata_partition_stats_match(source_metadata, &partition_stats)
         {
             return Err(io::Error::new(
@@ -2284,10 +2282,6 @@ fn empty_region_metadata_with_layout(
             })?,
             shard_count: shards,
             max_seqno: u64::from(shards),
-            physical_value_slots: 0,
-            physical_deleted_slots: 0,
-            live_record_count: 0,
-            live_record_bytes: 0,
             free_region_count: data.geometry.region_count - shards,
             active_region_count: shards,
             sealed_region_count: 0,

@@ -37,6 +37,7 @@ pub(crate) struct RegionLogicalAccounting {
     pub(crate) live_record_bytes: u64,
 }
 
+#[cfg(test)]
 impl RegionLogicalAccounting {
     fn checked_add_region(self, region: &RegionRuntime) -> Result<Self, RegionMetadataError> {
         Ok(Self {
@@ -1263,7 +1264,6 @@ impl RegionManager {
         let partition_totals = PartitionTotals::from_records(&partitions)?;
         let queue_ordinals = self.freeze_queue_ordinals()?;
         let mut records = try_vec(self.regions.len())?;
-        let mut logical = RegionLogicalAccounting::default();
 
         for (expected_id, region) in self.regions.iter().enumerate() {
             if region.region_id as usize != expected_id
@@ -1271,7 +1271,6 @@ impl RegionManager {
             {
                 return Err(RegionMetadataError::InvalidField("live_region_authority"));
             }
-            logical = logical.checked_add_region(region)?;
             records.push(RegionMetadataRecord {
                 region_id: region.region_id,
                 incarnation: region.incarnation,
@@ -1328,10 +1327,6 @@ impl RegionManager {
                 partition_count: partition_totals.partition_count,
                 shard_count,
                 max_seqno,
-                physical_value_slots: partition_totals.physical_value_slots,
-                physical_deleted_slots: partition_totals.physical_deleted_slots,
-                live_record_count: logical.live_record_count,
-                live_record_bytes: logical.live_record_bytes,
                 free_region_count,
                 active_region_count: shard_count,
                 sealed_region_count,
@@ -1381,8 +1376,6 @@ struct PartitionTotals {
     partition_count: u32,
     page_count: u64,
     slot_count: u64,
-    physical_value_slots: u64,
-    physical_deleted_slots: u64,
 }
 
 impl PartitionTotals {
@@ -1400,14 +1393,6 @@ impl PartitionTotals {
             totals.slot_count = totals
                 .slot_count
                 .checked_add(partition.slot_count)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-            totals.physical_value_slots = totals
-                .physical_value_slots
-                .checked_add(partition.physical_value_slots)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-            totals.physical_deleted_slots = totals
-                .physical_deleted_slots
-                .checked_add(partition.physical_deleted_slots)
                 .ok_or(RegionMetadataError::ArithmeticOverflow)?;
         }
         Ok(totals)
@@ -1609,10 +1594,6 @@ mod tests {
                 partition_count: 2,
                 shard_count: 2,
                 max_seqno: 7,
-                physical_value_slots: 1,
-                physical_deleted_slots: 2,
-                live_record_count: 1,
-                live_record_bytes: 64,
                 free_region_count: 2,
                 active_region_count: 2,
                 sealed_region_count: 2,
@@ -2135,8 +2116,8 @@ mod tests {
             [1, 5, 2, 3]
         );
         let frozen = manager.freeze_metadata(shards).unwrap();
-        assert_eq!(frozen.root.live_record_count, 0);
-        assert_eq!(frozen.root.live_record_bytes, 0);
+        assert_eq!(frozen.regions[4].live_record_count, 0);
+        assert_eq!(frozen.regions[4].live_record_bytes, 0);
     }
 
     #[test]
