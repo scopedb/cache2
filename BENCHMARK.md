@@ -376,10 +376,14 @@ CACHE_SOAK_IO_MODE=direct \
 cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 ```
 
-`CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`, comma-separated
-`CACHE_SOAK_VALUE_BYTES`, `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
+`CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`,
+`CACHE_SOAK_MEMORY_LIMIT_MIB`, comma-separated `CACHE_SOAK_VALUE_BYTES`,
+`CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
 `CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and
-`CACHE_SOAK_READERS` control the workload.
+`CACHE_SOAK_READERS` control the workload. `CACHE_SOAK_WARM_REOPEN=true`
+populates one complete pass at every configured value size, publishes a clean
+image, reopens it, and runs the measured turnover against the recovered private
+index mapping.
 `CACHE_SOAK_IO_ENGINE` and
 `CACHE_SOAK_IO_MODE` select the device path. M2 evidence must retain the
 complete output and confirm zero errors, no future/wrong-key/malformed reads,

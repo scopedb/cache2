@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache_rs::{
     CacheHealth, DetailedCacheSnapshot, HybridCache, HybridCacheConfig, IoEngine, IoMode,
-    RuntimeConfig, StaticConfig,
+    RuntimeConfig, StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -21,6 +21,7 @@ struct SoakConfig {
     sample_period: Duration,
     capacity_bytes: u64,
     memory_bytes: usize,
+    memory_limit_bytes: usize,
     value_bytes: Box<[usize]>,
     rss_slack_bytes: usize,
     key_count: usize,
@@ -28,6 +29,7 @@ struct SoakConfig {
     io_workers: usize,
     writers: usize,
     readers: usize,
+    warm_reopen: bool,
     io_engine: IoEngine,
     io_mode: IoMode,
     directory: PathBuf,
@@ -40,9 +42,16 @@ impl SoakConfig {
         let capacity_bytes = env_u64("CACHE_SOAK_CAPACITY_MIB", 256)?
             .checked_mul(MIB as u64)
             .ok_or_else(|| invalid("soak capacity is too large"))?;
-        let memory_bytes = env_usize("CACHE_SOAK_MEMORY_MIB", 64)?
+        let memory_mib = env_usize("CACHE_SOAK_MEMORY_MIB", 64)?;
+        let memory_bytes = memory_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
+        let memory_limit_bytes = env_usize(
+            "CACHE_SOAK_MEMORY_LIMIT_MIB",
+            memory_mib.saturating_add(256),
+        )?
+        .checked_mul(MIB)
+        .ok_or_else(|| invalid("soak memory limit is too large"))?;
         let value_bytes = env_usize_list("CACHE_SOAK_VALUE_BYTES", &DEFAULT_VALUE_BYTES)?;
         let rss_slack_bytes = env_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?
             .checked_mul(MIB)
@@ -52,6 +61,7 @@ impl SoakConfig {
         let io_workers = env_usize("CACHE_SOAK_IO_WORKERS", 4)?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
+        let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -79,6 +89,7 @@ impl SoakConfig {
             sample_period,
             capacity_bytes,
             memory_bytes,
+            memory_limit_bytes,
             value_bytes,
             rss_slack_bytes,
             key_count,
@@ -86,6 +97,7 @@ impl SoakConfig {
             io_workers,
             writers,
             readers,
+            warm_reopen,
             io_engine,
             io_mode,
             directory,
@@ -105,7 +117,7 @@ impl SoakConfig {
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
             .with_l1_capacity(self.memory_bytes)
-            .with_memory_limit(self.memory_bytes.saturating_add(256 * MIB))
+            .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(true)
     }
 }
@@ -221,12 +233,7 @@ fn main() -> io::Result<()> {
     let files = SoakFiles::new(&config.directory);
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
-    let cache = runtime.block_on(async {
-        HybridCacheConfig::from_static(&files.data, static_config)
-            .with_runtime_config(config.runtime_config())
-            .open()
-            .await
-    })?;
+    let mut cache = open_cache(&runtime, &files, &config)?;
     let keys: Vec<Box<[u8]>> = (0..config.key_count)
         .map(|ordinal| {
             format!("soak-key-{ordinal:016x}")
@@ -238,7 +245,28 @@ fn main() -> io::Result<()> {
     let value_size_count = u64::try_from(config.value_bytes.len())
         .map_err(|_| invalid("soak value-size count exceeds u64"))?;
     let expected: Vec<_> = (0..config.key_count).map(|_| AtomicU64::new(0)).collect();
-    let next_write = AtomicU64::new(0);
+    let first_write = if config.warm_reopen {
+        let next = populate_for_warm_reopen(
+            &cache,
+            &config,
+            &keys,
+            &expected,
+            key_count,
+            value_size_count,
+        )?;
+        runtime.block_on(cache.drain())?;
+        runtime.block_on(cache.close_warm())?;
+        cache = open_cache(&runtime, &files, &config)?;
+        if cache.startup_mode() != StartupMode::Warm {
+            return Err(io::Error::other(
+                "soak warm-reopen preparation did not recover a clean image",
+            ));
+        }
+        next
+    } else {
+        0
+    };
+    let next_write = AtomicU64::new(first_write);
     let next_read = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let client_count = config
@@ -253,10 +281,11 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
+        config.memory_limit_bytes as f64 / MIB as f64,
         config
             .value_bytes
             .iter()
@@ -268,6 +297,7 @@ fn main() -> io::Result<()> {
         config.io_workers,
         config.writers,
         config.readers,
+        config.warm_reopen,
         DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
@@ -403,6 +433,59 @@ fn main() -> io::Result<()> {
         max_managed_memory,
     );
     Ok(())
+}
+
+fn open_cache(
+    runtime: &tokio::runtime::Runtime,
+    files: &SoakFiles,
+    config: &SoakConfig,
+) -> io::Result<HybridCache> {
+    runtime.block_on(async {
+        HybridCacheConfig::from_static(&files.data, config.static_config())
+            .with_runtime_config(config.runtime_config())
+            .open()
+            .await
+    })
+}
+
+fn populate_for_warm_reopen(
+    cache: &HybridCache,
+    config: &SoakConfig,
+    keys: &[Box<[u8]>],
+    expected: &[AtomicU64],
+    key_count: u64,
+    value_size_count: u64,
+) -> io::Result<u64> {
+    let total = key_count
+        .checked_mul(value_size_count)
+        .ok_or_else(|| invalid("warm-reopen population count overflow"))?;
+    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
+    let mut value = vec![0_u8; maximum_value_bytes];
+    for ordinal in 0..total {
+        let announced = ordinal
+            .checked_add(1)
+            .ok_or_else(|| invalid("warm-reopen write ordinal exhausted"))?;
+        let key_index = usize::try_from(ordinal % key_count)
+            .map_err(|_| invalid("warm-reopen key index exceeds usize"))?;
+        let value_index = usize::try_from(ordinal / key_count % value_size_count)
+            .map_err(|_| invalid("warm-reopen value-size index exceeds usize"))?;
+        let value_bytes = config.value_bytes[value_index];
+        let pattern = (ordinal ^ key_index as u64) as u8;
+        value[..value_bytes].fill(pattern);
+        value[..8].copy_from_slice(&ordinal.to_le_bytes());
+        value[8..VALUE_HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
+        expected[key_index].fetch_max(announced, Ordering::SeqCst);
+        loop {
+            match cache.put(&keys[key_index], &value[..value_bytes]) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(OVERLOAD_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,7 +699,7 @@ fn report_sample(
     let detailed = &sample.detailed;
     let resources = detailed.summary;
     println!(
-        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
+        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} io_submitted={} io_completed={} io_errors={} io_in_flight_peak={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
         elapsed.as_secs_f64(),
         counters.writes,
         counters.deletes,
@@ -631,6 +714,8 @@ fn report_sample(
         resources.l1_hits,
         resources.l2_hits,
         resources.l2_misses,
+        resources.l2_read_memory_misses,
+        resources.l2_read_busy_misses,
         resources.l1_promotions,
         resources.l1_evictions,
         resources.l1_bypasses,
@@ -646,6 +731,10 @@ fn report_sample(
         detailed.index.deleted_slot_reuses,
         detailed.index.stale_slot_reuses,
         detailed.index.live_slot_replacements,
+        detailed.io.submitted,
+        detailed.io.completed,
+        detailed.io.errors,
+        detailed.io.requests_in_flight_peak,
         resources.managed_memory_bytes,
         max_managed_memory,
         resources.managed_memory_limit_bytes,
@@ -742,6 +831,16 @@ fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
 fn env_u32(name: &str, default: u32) -> io::Result<u32> {
     env_u64(name, u64::from(default))
         .and_then(|value| u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds u32"))))
+}
+
+fn env_bool(name: &str, default: bool) -> io::Result<bool> {
+    match env::var(name) {
+        Ok(value) if value == "true" || value == "1" => Ok(true),
+        Ok(value) if value == "false" || value == "0" => Ok(false),
+        Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
+    }
 }
 
 fn parse_io_engine(name: &str) -> io::Result<IoEngine> {
