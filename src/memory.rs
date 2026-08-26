@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::eviction::{
-    AdmissionHint, EvictionPolicy, EvictionState, MAX_POLICY_SLOT_INDEX, PolicySlot,
-    VictimSelection,
+    AdmissionHint, EvictionPolicy, EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX,
+    PolicySlot,
 };
 use crate::expiry::ExpiryClock;
 use crate::hashing::{PrehashedMap, route_hash};
@@ -64,6 +64,46 @@ impl MemoryBudget {
                     return MemoryChargeAttempt::Charged(MemoryCharge {
                         budget: Some(Arc::clone(self)),
                         bytes,
+                    });
+                }
+                Err(observed) => used = observed,
+            }
+        }
+        MemoryChargeAttempt::Contended
+    }
+
+    fn available_bytes(&self) -> usize {
+        self.capacity_bytes
+            .saturating_sub(self.used_bytes.load(Ordering::Acquire))
+    }
+
+    /// Atomically transfers exclusive victim charges to one candidate before
+    /// any resident entry is removed. A failed CAS leaves both accounting and
+    /// the resident set unchanged.
+    fn try_transfer_charge(
+        self: &Arc<Self>,
+        released: usize,
+        required: usize,
+    ) -> MemoryChargeAttempt {
+        let mut used = self.used_bytes.load(Ordering::Acquire);
+        for _ in 0..MAX_BUDGET_CAS_ATTEMPTS {
+            let Some(next) = used
+                .checked_sub(released)
+                .and_then(|retained| retained.checked_add(required))
+            else {
+                return MemoryChargeAttempt::Full;
+            };
+            if next > self.capacity_bytes {
+                return MemoryChargeAttempt::Full;
+            }
+            match self
+                .used_bytes
+                .compare_exchange(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return MemoryChargeAttempt::Charged(MemoryCharge {
+                        budget: Some(Arc::clone(self)),
+                        bytes: required,
                     });
                 }
                 Err(observed) => used = observed,
@@ -127,6 +167,15 @@ impl MemoryValue {
     fn value(&self) -> &[u8] {
         &self.0.bytes[self.0.key_length..]
     }
+
+    fn releases_charge_on_remove(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
+    fn disarm_exclusive_charge(&mut self) -> usize {
+        let inner = Arc::get_mut(&mut self.0).expect("exclusive resident value gained an owner");
+        inner._charge.disarm()
+    }
 }
 
 impl Deref for MemoryValue {
@@ -152,12 +201,69 @@ impl Drop for MemoryCharge {
     }
 }
 
+impl MemoryCharge {
+    fn disarm(&mut self) -> usize {
+        let was_charged = self.budget.take().is_some();
+        debug_assert!(was_charged);
+        self.bytes
+    }
+}
+
 struct MemoryEntry {
     value: MemoryValue,
     expires_at_unix_ms: u64,
     seqno: u64,
     namespace_id: u32,
     hash_next: u32,
+}
+
+#[derive(Clone, Copy)]
+struct DetachedAdmissionEntry {
+    index: usize,
+    hash: u64,
+    weight: usize,
+    restore_hint: AdmissionHint,
+    record_ghost: bool,
+    transfers_charge: bool,
+}
+
+struct AdmissionPlan {
+    victims: [Option<DetachedAdmissionEntry>; MAX_EVICTIONS_PER_INSERT],
+    len: usize,
+    released_bytes: usize,
+}
+
+impl AdmissionPlan {
+    const fn new() -> Self {
+        Self {
+            victims: [None; MAX_EVICTIONS_PER_INSERT],
+            len: 0,
+            released_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, victim: DetachedAdmissionEntry) {
+        let slot = self
+            .victims
+            .get_mut(self.len)
+            .expect("admission plan exceeds its fixed victim budget");
+        *slot = Some(victim);
+        self.len += 1;
+        self.released_bytes = self.released_bytes.saturating_add(victim.weight);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = DetachedAdmissionEntry> + '_ {
+        self.victims[..self.len]
+            .iter()
+            .map(|victim| victim.expect("planned victim slot is populated"))
+    }
+
+    fn iter_rev(&self) -> impl Iterator<Item = DetachedAdmissionEntry> + '_ {
+        self.victims[..self.len]
+            .iter()
+            .rev()
+            .map(|victim| victim.expect("planned victim slot is populated"))
+    }
 }
 
 struct MemoryShard {
@@ -243,6 +349,16 @@ impl MemoryShard {
         let Some(hash) = self.policy_slots.get(index).map(PolicySlot::hash) else {
             return;
         };
+        let weight = self.slots[index]
+            .as_ref()
+            .expect("resident slot disappeared")
+            .value
+            .charged_bytes();
+        self.eviction.remove(&mut self.policy_slots, index, weight);
+        self.remove_slot_after_policy(index, hash, false);
+    }
+
+    fn remove_slot_after_policy(&mut self, index: usize, hash: u64, transfer_charge: bool) {
         let Some(mut cursor) = self.directory_head(hash) else {
             return;
         };
@@ -287,18 +403,81 @@ impl MemoryShard {
             debug_assert!(replaced.is_some());
         }
 
-        let weight = self.slots[index]
-            .as_ref()
-            .expect("resident slot disappeared")
-            .value
-            .charged_bytes();
-        self.eviction.remove(&mut self.policy_slots, index, weight);
+        if transfer_charge {
+            let released = self.slots[index]
+                .as_mut()
+                .expect("resident slot disappeared")
+                .value
+                .disarm_exclusive_charge();
+            debug_assert_eq!(
+                released,
+                self.slots[index]
+                    .as_ref()
+                    .expect("resident slot disappeared")
+                    .value
+                    .charged_bytes()
+            );
+        }
         let _entry = self.slots[index].take().expect("resident slot disappeared");
         self.free_slots
             .push(u32::try_from(index).expect("memory slot index exceeds u32"));
     }
 
-    fn charge_with_eviction(&mut self, required: usize, hash: u64) -> ChargeResult {
+    fn detach_for_admission(&mut self, index: usize, record_ghost: bool) -> DetachedAdmissionEntry {
+        let hash = self.policy_slots[index].hash();
+        let entry = self.slots[index]
+            .as_ref()
+            .expect("resident policy slot has no memory entry");
+        let weight = entry.value.charged_bytes();
+        let transfers_charge = entry.value.releases_charge_on_remove();
+        let restore_hint =
+            self.eviction
+                .detach_for_admission(&mut self.policy_slots, index, weight);
+        DetachedAdmissionEntry {
+            index,
+            hash,
+            weight,
+            restore_hint,
+            record_ghost,
+            transfers_charge,
+        }
+    }
+
+    fn restore_detached(&mut self, entry: DetachedAdmissionEntry) {
+        self.eviction.restore_for_admission(
+            &mut self.policy_slots,
+            entry.index,
+            entry.hash,
+            entry.weight,
+            entry.restore_hint,
+        );
+    }
+
+    fn commit_detached(&mut self, entry: DetachedAdmissionEntry) {
+        self.eviction
+            .record_admission_eviction(entry.hash, entry.record_ghost);
+        self.remove_slot_after_policy(entry.index, entry.hash, entry.transfers_charge);
+    }
+
+    fn restore_admission(
+        &mut self,
+        replacement: Option<DetachedAdmissionEntry>,
+        plan: &AdmissionPlan,
+    ) {
+        for victim in plan.iter_rev() {
+            self.restore_detached(victim);
+        }
+        if let Some(replacement) = replacement {
+            self.restore_detached(replacement);
+        }
+    }
+
+    fn charge_with_eviction(
+        &mut self,
+        required: usize,
+        hash: u64,
+        replacement: Option<usize>,
+    ) -> ChargeResult {
         if required > self.budget.capacity_bytes {
             return ChargeResult::Rejected {
                 evictions: 0,
@@ -307,6 +486,9 @@ impl MemoryShard {
         }
         match self.budget.try_charge(required) {
             MemoryChargeAttempt::Charged(charge) => {
+                if let Some(replacement) = replacement {
+                    self.remove_slot(replacement);
+                }
                 return ChargeResult::Charged {
                     charge,
                     evictions: 0,
@@ -320,15 +502,23 @@ impl MemoryShard {
             }
             MemoryChargeAttempt::Full => {}
         }
-        let mut evictions = 0_usize;
-        let mut apply_admission = true;
-        for _ in 0..MAX_EVICTIONS_PER_INSERT {
-            let victim = {
+
+        let replacement = replacement.map(|index| self.detach_for_admission(index, false));
+        let replacement_bytes = replacement
+            .filter(|entry| entry.transfers_charge)
+            .map_or(0, |entry| entry.weight);
+        let mut plan = AdmissionPlan::new();
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+        while replacement_bytes.saturating_add(plan.released_bytes)
+            < required.saturating_sub(self.budget.available_bytes())
+            && plan.len < MAX_EVICTIONS_PER_INSERT
+            && remaining_steps > 0
+        {
+            let candidate = {
                 let slots = &self.slots;
-                match self.eviction.select_victim(
+                self.eviction.select_victim(
                     &mut self.policy_slots,
-                    hash,
-                    apply_admission,
+                    &mut remaining_steps,
                     |index| {
                         slots[index]
                             .as_ref()
@@ -336,36 +526,63 @@ impl MemoryShard {
                             .value
                             .charged_bytes()
                     },
-                ) {
-                    VictimSelection::Victim(index) => index,
-                    VictimSelection::Reject => {
-                        return ChargeResult::Rejected {
-                            evictions,
-                            admission: true,
-                        };
-                    }
-                    VictimSelection::None => break,
-                }
+                    |index| {
+                        slots[index]
+                            .as_ref()
+                            .expect("resident policy slot has no memory entry")
+                            .value
+                            .releases_charge_on_remove()
+                    },
+                )
             };
-            self.remove_slot(victim);
-            evictions += 1;
-            apply_admission = false;
-            match self.budget.try_charge(required) {
-                MemoryChargeAttempt::Charged(charge) => {
-                    return ChargeResult::Charged { charge, evictions };
-                }
-                MemoryChargeAttempt::Full => {}
-                MemoryChargeAttempt::Contended => {
-                    return ChargeResult::Rejected {
-                        evictions,
-                        admission: false,
-                    };
-                }
-            }
+            let Some(candidate) = candidate else {
+                break;
+            };
+            let detached = self.detach_for_admission(candidate.index, candidate.record_ghost);
+            debug_assert!(detached.transfers_charge);
+            plan.push(detached);
         }
-        ChargeResult::Rejected {
-            evictions,
-            admission: false,
+        let released = replacement_bytes.saturating_add(plan.released_bytes);
+        let required_release = required.saturating_sub(self.budget.available_bytes());
+        if released < required_release {
+            self.restore_admission(replacement, &plan);
+            return ChargeResult::Rejected {
+                evictions: 0,
+                admission: false,
+            };
+        }
+        if !self.eviction.admits_victims(
+            hash,
+            required,
+            plan.iter().map(|victim| (victim.hash, victim.weight)),
+        ) {
+            self.restore_admission(replacement, &plan);
+            return ChargeResult::Rejected {
+                evictions: 0,
+                admission: true,
+            };
+        }
+
+        let charge = match self.budget.try_transfer_charge(released, required) {
+            MemoryChargeAttempt::Charged(charge) => charge,
+            MemoryChargeAttempt::Full | MemoryChargeAttempt::Contended => {
+                self.restore_admission(replacement, &plan);
+                return ChargeResult::Rejected {
+                    evictions: 0,
+                    admission: false,
+                };
+            }
+        };
+
+        if let Some(replacement) = replacement {
+            self.commit_detached(replacement);
+        }
+        for victim in plan.iter() {
+            self.commit_detached(victim);
+        }
+        ChargeResult::Charged {
+            charge,
+            evictions: plan.len,
         }
     }
 
@@ -379,8 +596,11 @@ impl MemoryShard {
         expires_at_unix_ms: u64,
         seqno: u64,
         hint: AdmissionHint,
+        replacement: Option<usize>,
     ) -> MemoryInsertResult {
-        if self.hash_chain_is_full(hash) || !self.directory_can_upsert(hash) {
+        if (replacement.is_none() && self.hash_chain_is_full(hash))
+            || !self.directory_can_upsert(hash)
+        {
             return MemoryInsertResult::bypassed();
         }
         let Some(charged_bytes) = MEMORY_ENTRY_OVERHEAD_BYTES
@@ -389,19 +609,29 @@ impl MemoryShard {
         else {
             return MemoryInsertResult::bypassed();
         };
-        let (charge, evictions) = match self.charge_with_eviction(charged_bytes, hash) {
+
+        let maximum_freed_slots = MAX_EVICTIONS_PER_INSERT + usize::from(replacement.is_some());
+        if self.free_slots.try_reserve(maximum_freed_slots).is_err() {
+            return MemoryInsertResult::bypassed();
+        }
+        let may_append_without_eviction = self.free_slots.is_empty()
+            && replacement.is_none()
+            && self.budget.available_bytes() >= charged_bytes;
+        if may_append_without_eviction
+            && (self.slots.try_reserve(1).is_err() || self.policy_slots.try_reserve(1).is_err())
+        {
+            return MemoryInsertResult::bypassed();
+        }
+        let (charge, evictions) = match self.charge_with_eviction(charged_bytes, hash, replacement)
+        {
             ChargeResult::Charged { charge, evictions } => (charge, evictions),
             ChargeResult::Rejected {
                 evictions,
                 admission,
             } => return MemoryInsertResult::rejected(evictions, admission),
         };
-
-        let needs_slot = self.free_slots.is_empty();
-        if needs_slot
-            && (self.slots.try_reserve(1).is_err()
-                || self.policy_slots.try_reserve(1).is_err()
-                || self.free_slots.try_reserve(1).is_err())
+        if self.free_slots.is_empty()
+            && (self.slots.try_reserve(1).is_err() || self.policy_slots.try_reserve(1).is_err())
         {
             return MemoryInsertResult::rejected(evictions, false);
         }
@@ -597,9 +827,6 @@ impl MemoryStore {
             return true;
         }
         let admission = shard.eviction.prepare_insert(hash);
-        if let Some(index) = existing {
-            shard.remove_slot(index);
-        }
         let result = shard.insert(
             hash,
             namespace_id,
@@ -608,6 +835,7 @@ impl MemoryStore {
             expires_at_unix_ms,
             seqno,
             admission,
+            existing,
         );
         drop(shard);
         self.record_insert(result);
@@ -680,6 +908,7 @@ impl MemoryStore {
             expires_at_unix_ms,
             seqno,
             token.admission,
+            None,
         );
         let promoted = result.inserted.then(|| {
             let index = shard
@@ -898,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_value_keeps_its_capacity_charge_after_eviction() {
+    fn failed_admission_preserves_a_retained_value_and_its_charge() {
         let store = store(512, 1);
         assert!(store.publish(21, 0, b"a", &[1; 300], 0, 1));
         let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)) else {
@@ -906,18 +1135,22 @@ mod tests {
         };
 
         assert!(!store.publish(22, 0, b"b", &[2; 300], 0, 2));
+        assert_hit(&store, 21, b"a");
         assert_eq!(
             store.shards[0].lock().unwrap().budget.used_bytes(),
             MEMORY_ENTRY_OVERHEAD_BYTES + 301
         );
 
         drop(retained);
-        assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), 0);
+        assert_eq!(
+            store.shards[0].lock().unwrap().budget.used_bytes(),
+            MEMORY_ENTRY_OVERHEAD_BYTES + 301
+        );
         assert!(store.publish(22, 0, b"b", &[2; 300], 0, 3));
     }
 
     #[test]
-    fn concurrent_retained_value_drops_release_the_charge_once() {
+    fn concurrent_retained_value_drops_leave_the_resident_charge_intact() {
         let store = store(512, 1);
         assert!(store.publish(21, 0, b"a", &[1; 300], 0, 1));
         let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)) else {
@@ -939,8 +1172,119 @@ mod tests {
             barrier.wait();
         });
 
-        assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), 0);
+        assert_hit(&store, 21, b"a");
+        assert_eq!(
+            store.shards[0].lock().unwrap().budget.used_bytes(),
+            MEMORY_ENTRY_OVERHEAD_BYTES + 301
+        );
         assert!(store.publish(22, 0, b"b", &[2; 300], 0, 3));
+    }
+
+    #[test]
+    fn admission_requiring_seventeen_victims_bypasses_without_eviction() {
+        const VICTIM_COUNT: usize = MAX_EVICTIONS_PER_INSERT + 1;
+        const VICTIM_VALUE_BYTES: usize = 32;
+        const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
+        const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
+
+        for policy in EvictionPolicy::ALL {
+            let store = store_with_policy(CAPACITY, 1, policy);
+            for hash in 1..=VICTIM_COUNT as u64 {
+                assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], 0, hash,));
+            }
+            let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+            assert!(!store.publish(100, 0, b"c", &candidate, 0, 100));
+            for hash in 1..=VICTIM_COUNT as u64 {
+                assert_hit(&store, hash, b"k");
+            }
+            assert_eq!(
+                store.shards[0].lock().unwrap().budget.used_bytes(),
+                CAPACITY
+            );
+            let metrics = store.metrics_snapshot();
+            assert_eq!(metrics.evictions, 0, "policy={policy:?}");
+            assert_eq!(metrics.bypasses, 1, "policy={policy:?}");
+        }
+    }
+
+    #[test]
+    fn admission_requiring_sixteen_victims_commits_once_planned() {
+        const VICTIM_COUNT: usize = MAX_EVICTIONS_PER_INSERT;
+        const VICTIM_VALUE_BYTES: usize = 32;
+        const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
+        const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
+
+        for policy in EvictionPolicy::ALL {
+            if policy == EvictionPolicy::TinyLfu {
+                continue;
+            }
+            let store = store_with_policy(CAPACITY, 1, policy);
+            for hash in 1..=VICTIM_COUNT as u64 {
+                assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], 0, hash,));
+            }
+            let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+            assert!(store.publish(100, 0, b"c", &candidate, 0, 100));
+            assert_hit(&store, 100, b"c");
+            assert_miss(&store, 1, b"k");
+            assert_eq!(
+                store.shards[0].lock().unwrap().budget.used_bytes(),
+                CAPACITY
+            );
+            assert_eq!(
+                store.metrics_snapshot().evictions,
+                VICTIM_COUNT as u64,
+                "policy={policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_exact_key_expansion_preserves_the_old_value() {
+        const ENTRY_COUNT: usize = MAX_EVICTIONS_PER_INSERT + 2;
+        const VALUE_BYTES: usize = 32;
+        const ENTRY_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VALUE_BYTES;
+        const CAPACITY: usize = ENTRY_COUNT * ENTRY_BYTES;
+
+        let store = store(CAPACITY, 1);
+        for hash in 1..=ENTRY_COUNT as u64 {
+            assert!(store.publish(hash, 0, b"k", &[hash as u8; VALUE_BYTES], 0, hash));
+        }
+        let replacement = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+        assert!(!store.publish(1, 0, b"k", &replacement, 0, 100));
+        assert!(matches!(
+            store.lookup(1, 0, b"k", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hit(value) if value.as_ref() == [1; VALUE_BYTES]
+        ));
+        assert_eq!(
+            store.shards[0].lock().unwrap().budget.used_bytes(),
+            CAPACITY
+        );
+        assert_eq!(store.metrics_snapshot().evictions, 0);
+    }
+
+    #[test]
+    fn retained_exact_key_replacement_keeps_the_old_value_until_reclaimable() {
+        let store = store(512, 1);
+        assert!(store.publish(21, 0, b"a", &[1; 300], 0, 1));
+        let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)) else {
+            panic!("expected retained value");
+        };
+
+        assert!(!store.publish(21, 0, b"a", &[2; 300], 0, 2));
+        assert!(matches!(
+            store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hit(value) if value.as_ref() == [1; 300]
+        ));
+
+        drop(retained);
+        assert!(store.publish(21, 0, b"a", &[2; 300], 0, 3));
+        assert!(matches!(
+            store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hit(value) if value.as_ref() == [2; 300]
+        ));
     }
 
     #[test]
@@ -1003,6 +1347,27 @@ mod tests {
         assert_eq!(metrics.admission_rejections, 1);
         assert_eq!(metrics.bypasses, 1);
         assert_eq!(metrics.evictions, 1);
+    }
+
+    #[test]
+    fn tinylfu_compares_a_candidate_with_the_complete_victim_plan() {
+        const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 2;
+        const CAPACITY: usize = 2 * VICTIM_BYTES;
+        let store = store_with_policy(CAPACITY, 1, EvictionPolicy::TinyLfu);
+        publish_clean(&store, 1, b"a", 1);
+        publish_clean(&store, 2, b"b", 2);
+        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+
+        assert!(!store.publish(3, 0, b"c", &candidate, 0, 3));
+        assert!(!store.publish(3, 0, b"c", &candidate, 0, 4));
+        assert!(store.publish(3, 0, b"c", &candidate, 0, 5));
+        assert_miss(&store, 1, b"a");
+        assert_miss(&store, 2, b"b");
+        assert_hit(&store, 3, b"c");
+
+        let metrics = store.metrics_snapshot();
+        assert_eq!(metrics.admission_rejections, 2);
+        assert_eq!(metrics.evictions, 2);
     }
 
     #[test]

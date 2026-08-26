@@ -7,9 +7,10 @@ use std::io;
 
 use crate::hashing::PrehashedMap;
 
-/// Maximum policy metadata inspected by one foreground victim selection.
-/// Exhausting this budget means L1 bypass; it never expands with cache size.
-const MAX_POLICY_SCAN_STEPS: usize = 64;
+/// Maximum policy metadata inspected by one complete foreground admission.
+/// Exhausting this budget means L1 bypass; it never expands with cache size or
+/// the number of victims required by a mixed-size candidate.
+pub(crate) const MAX_POLICY_SCAN_STEPS: usize = 64;
 const FREQUENCY_AGE_BATCH: usize = 64;
 
 /// Runtime-selectable RAM-tier eviction policy.
@@ -52,10 +53,9 @@ pub(crate) struct AdmissionHint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VictimSelection {
-    Victim(usize),
-    Reject,
-    None,
+pub(crate) struct VictimCandidate {
+    pub(crate) index: usize,
+    pub(crate) record_ghost: bool,
 }
 
 #[repr(u8)]
@@ -208,6 +208,23 @@ impl SlotList {
             self.tail = Some(index);
         }
         self.head = Some(index);
+        self.len += 1;
+        self.weight = self.weight.saturating_add(weight);
+    }
+
+    fn push_back(&mut self, slots: &mut [PolicySlot], index: usize, queue: QueueId, weight: usize) {
+        debug_assert!(slots[index].is_resident());
+        debug_assert_eq!(slots[index].queue(), QueueId::None);
+        let old_tail = self.tail;
+        slots[index].set_previous(old_tail);
+        slots[index].set_next(None);
+        slots[index].set_queue(queue);
+        if let Some(old_tail) = old_tail {
+            slots[old_tail].set_next(Some(index));
+        } else {
+            self.head = Some(index);
+        }
+        self.tail = Some(index);
         self.len += 1;
         self.weight = self.weight.saturating_add(weight);
     }
@@ -443,53 +460,186 @@ impl EvictionState {
         slots[index] = PolicySlot::default();
     }
 
-    pub(crate) fn select_victim<F>(
+    /// Detaches a resident only from policy topology while an admission plan
+    /// is assembled. The memory directory and value remain intact so a failed
+    /// plan can restore the entry without losing a cache hit.
+    pub(crate) fn detach_for_admission(
         &mut self,
         slots: &mut [PolicySlot],
-        incoming_hash: u64,
-        apply_admission: bool,
-        weight_of: F,
-    ) -> VictimSelection
-    where
-        F: Fn(usize) -> usize,
-    {
+        index: usize,
+        weight: usize,
+    ) -> AdmissionHint {
+        let hint = match &self.state {
+            PolicyState::S3Fifo(_) => AdmissionHint {
+                s3_main: slots[index].queue() == QueueId::Main,
+            },
+            _ => AdmissionHint::default(),
+        };
+        self.remove(slots, index, weight);
+        hint
+    }
+
+    /// Restores a detached entry at the oldest end. Admission planning always
+    /// walks oldest candidates first, so callers restore planned victims in
+    /// reverse order to preserve their relative replacement order.
+    pub(crate) fn restore_for_admission(
+        &mut self,
+        slots: &mut [PolicySlot],
+        index: usize,
+        hash: u64,
+        weight: usize,
+        hint: AdmissionHint,
+    ) {
+        debug_assert!(!slots[index].is_resident());
+        slots[index] = PolicySlot::new(hash);
         match &mut self.state {
-            PolicyState::Clock(state) => select_clock(state, slots),
-            PolicyState::Lru(state) => state
-                .entries
-                .oldest(slots)
-                .map_or(VictimSelection::None, VictimSelection::Victim),
+            PolicyState::Clock(_) => slots[index].set_visited(true),
+            PolicyState::Lru(state) => {
+                state
+                    .entries
+                    .push_back(slots, index, QueueId::Primary, weight);
+            }
             PolicyState::TinyLfu(state) => {
-                let Some(victim) = state.entries.oldest(slots) else {
-                    return VictimSelection::None;
-                };
-                if apply_admission
-                    && state.frequencies.estimate(incoming_hash)
-                        <= state.frequencies.estimate(slots[victim].hash())
-                {
-                    VictimSelection::Reject
+                state
+                    .entries
+                    .push_back(slots, index, QueueId::Primary, weight);
+            }
+            PolicyState::Sieve(state) => {
+                state
+                    .entries
+                    .push_back(slots, index, QueueId::Primary, weight);
+            }
+            PolicyState::Fifo(state) => {
+                state
+                    .entries
+                    .push_back(slots, index, QueueId::Primary, weight);
+            }
+            PolicyState::S3Fifo(state) => {
+                if hint.s3_main {
+                    state.main.push_back(slots, index, QueueId::Main, weight);
                 } else {
-                    VictimSelection::Victim(victim)
+                    state.small.push_back(slots, index, QueueId::Small, weight);
                 }
             }
-            PolicyState::Sieve(state) => select_sieve(state, slots),
-            PolicyState::Fifo(state) => state
-                .entries
-                .oldest(slots)
-                .map_or(VictimSelection::None, VictimSelection::Victim),
-            PolicyState::S3Fifo(state) => select_s3fifo(state, slots, weight_of),
+        }
+    }
+
+    pub(crate) fn record_admission_eviction(&mut self, hash: u64, record_ghost: bool) {
+        if record_ghost && let PolicyState::S3Fifo(state) = &mut self.state {
+            state.ghost.insert(hash);
+        }
+    }
+
+    /// Applies TinyLFU admission to the complete byte-reclaim plan. Other
+    /// policies always accept a plan selected by their replacement order.
+    pub(crate) fn admits_victims(
+        &self,
+        incoming_hash: u64,
+        incoming_weight: usize,
+        victims: impl Iterator<Item = (u64, usize)>,
+    ) -> bool {
+        let PolicyState::TinyLfu(state) = &self.state else {
+            return true;
+        };
+        let (victim_frequency, victim_weight) =
+            victims.fold((0_u64, 0_usize), |(frequency, weight), (hash, bytes)| {
+                (
+                    frequency.saturating_add(u64::from(state.frequencies.estimate(hash))),
+                    weight.saturating_add(bytes),
+                )
+            });
+        victim_weight == 0
+            || u128::from(state.frequencies.estimate(incoming_hash)) * victim_weight as u128
+                > u128::from(victim_frequency) * incoming_weight as u128
+    }
+
+    pub(crate) fn select_victim<F, G>(
+        &mut self,
+        slots: &mut [PolicySlot],
+        remaining_steps: &mut usize,
+        weight_of: F,
+        can_reclaim: G,
+    ) -> Option<VictimCandidate>
+    where
+        F: Fn(usize) -> usize,
+        G: Fn(usize) -> bool,
+    {
+        match &mut self.state {
+            PolicyState::Clock(state) => select_clock(state, slots, remaining_steps, can_reclaim),
+            PolicyState::Lru(state) => {
+                select_oldest(&state.entries, slots, remaining_steps, can_reclaim)
+            }
+            PolicyState::TinyLfu(state) => {
+                select_oldest(&state.entries, slots, remaining_steps, can_reclaim)
+            }
+            PolicyState::Sieve(state) => select_sieve(state, slots, remaining_steps, can_reclaim),
+            PolicyState::Fifo(state) => {
+                select_oldest(&state.entries, slots, remaining_steps, can_reclaim)
+            }
+            PolicyState::S3Fifo(state) => {
+                select_s3fifo(state, slots, remaining_steps, weight_of, can_reclaim)
+            }
         }
     }
 }
 
-fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelection {
+fn take_scan_step(remaining_steps: &mut usize) -> bool {
+    if *remaining_steps == 0 {
+        false
+    } else {
+        *remaining_steps -= 1;
+        true
+    }
+}
+
+fn candidate(index: usize, record_ghost: bool) -> Option<VictimCandidate> {
+    Some(VictimCandidate {
+        index,
+        record_ghost,
+    })
+}
+
+fn select_oldest<F>(
+    entries: &SlotList,
+    slots: &[PolicySlot],
+    remaining_steps: &mut usize,
+    can_reclaim: F,
+) -> Option<VictimCandidate>
+where
+    F: Fn(usize) -> bool,
+{
+    let mut candidate = entries.oldest(slots);
+    while let Some(index) = candidate {
+        if !take_scan_step(remaining_steps) {
+            break;
+        }
+        if can_reclaim(index) {
+            return Some(VictimCandidate {
+                index,
+                record_ghost: false,
+            });
+        }
+        candidate = slots[index].previous();
+    }
+    None
+}
+
+fn select_clock<F>(
+    state: &mut ClockState,
+    slots: &mut [PolicySlot],
+    remaining_steps: &mut usize,
+    can_reclaim: F,
+) -> Option<VictimCandidate>
+where
+    F: Fn(usize) -> bool,
+{
     let maximum_steps = slots
         .len()
         .saturating_mul(2)
         .saturating_add(1)
         .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
-        if slots.is_empty() {
+        if slots.is_empty() || !take_scan_step(remaining_steps) {
             break;
         }
         let index = if state.hand < slots.len() {
@@ -510,9 +660,12 @@ fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelec
             slot.set_visited(false);
             continue;
         }
-        return VictimSelection::Victim(index);
+        if !can_reclaim(index) {
+            continue;
+        }
+        return candidate(index, false);
     }
-    VictimSelection::None
+    None
 }
 
 fn next_sieve_candidate(entries: &SlotList, slots: &[PolicySlot], index: usize) -> Option<usize> {
@@ -523,9 +676,17 @@ fn next_sieve_candidate(entries: &SlotList, slots: &[PolicySlot], index: usize) 
     }
 }
 
-fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelection {
+fn select_sieve<F>(
+    state: &mut SieveState,
+    slots: &mut [PolicySlot],
+    remaining_steps: &mut usize,
+    can_reclaim: F,
+) -> Option<VictimCandidate>
+where
+    F: Fn(usize) -> bool,
+{
     if state.entries.len == 0 {
-        return VictimSelection::None;
+        return None;
     }
     let mut candidate = state.hand.or(state.entries.tail);
     let maximum_steps = state
@@ -538,26 +699,35 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
         let Some(index) = candidate else {
             break;
         };
+        if !take_scan_step(remaining_steps) {
+            break;
+        }
         let next = slots[index].previous().or(state.entries.tail);
         if slots[index].is_visited() {
             slots[index].set_visited(false);
-        } else {
+        } else if can_reclaim(index) {
             state.hand = next_sieve_candidate(&state.entries, slots, index);
-            return VictimSelection::Victim(index);
+            return Some(VictimCandidate {
+                index,
+                record_ghost: false,
+            });
         }
         candidate = next;
     }
     state.hand = candidate;
-    VictimSelection::None
+    None
 }
 
-fn select_s3fifo<F>(
+fn select_s3fifo<F, G>(
     state: &mut S3FifoState,
     slots: &mut [PolicySlot],
+    remaining_steps: &mut usize,
     weight_of: F,
-) -> VictimSelection
+    can_reclaim: G,
+) -> Option<VictimCandidate>
 where
     F: Fn(usize) -> usize,
+    G: Fn(usize) -> bool,
 {
     let maximum_steps = slots
         .len()
@@ -565,8 +735,15 @@ where
         .saturating_add(1)
         .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
+        if !take_scan_step(remaining_steps) {
+            break;
+        }
         let prefer_main = state.main.weight > state.main_target_bytes || state.small.len == 0;
         if !prefer_main && let Some(index) = state.small.oldest(slots) {
+            if !can_reclaim(index) {
+                state.small.move_to_front(slots, index, QueueId::Small);
+                continue;
+            }
             if slots[index].frequency() >= 2 {
                 let weight = weight_of(index);
                 state.small.remove(slots, index, QueueId::Small, weight);
@@ -574,21 +751,28 @@ where
                 state.main.push_front(slots, index, QueueId::Main, weight);
                 continue;
             }
-            state.ghost.insert(slots[index].hash());
-            return VictimSelection::Victim(index);
+            return candidate(index, true);
         }
 
         if let Some(index) = state.main.oldest(slots) {
+            if !can_reclaim(index) {
+                state.main.move_to_front(slots, index, QueueId::Main);
+                continue;
+            }
             let frequency = slots[index].frequency();
             if frequency > 0 {
                 slots[index].set_frequency(frequency - 1);
                 state.main.move_to_front(slots, index, QueueId::Main);
                 continue;
             }
-            return VictimSelection::Victim(index);
+            return candidate(index, false);
         }
 
         if prefer_main && let Some(index) = state.small.oldest(slots) {
+            if !can_reclaim(index) {
+                state.small.move_to_front(slots, index, QueueId::Small);
+                continue;
+            }
             if slots[index].frequency() >= 2 {
                 let weight = weight_of(index);
                 state.small.remove(slots, index, QueueId::Small, weight);
@@ -596,12 +780,11 @@ where
                 state.main.push_front(slots, index, QueueId::Main, weight);
                 continue;
             }
-            state.ghost.insert(slots[index].hash());
-            return VictimSelection::Victim(index);
+            return candidate(index, true);
         }
-        return VictimSelection::None;
+        return None;
     }
-    VictimSelection::None
+    None
 }
 
 struct FrequencySketch {
@@ -796,10 +979,14 @@ mod tests {
         let old = install(&mut policy, &mut slots, 1);
         let new = install(&mut policy, &mut slots, 2);
         policy.record_hit(&mut slots, old);
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
 
         assert_eq!(
-            policy.select_victim(&mut slots, 3, true, |_| 100),
-            VictimSelection::Victim(new)
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| 100, |_| true),
+            Some(VictimCandidate {
+                index: new,
+                record_ghost: false,
+            })
         );
     }
 
@@ -808,15 +995,36 @@ mod tests {
         let mut policy = EvictionState::new(EvictionPolicy::S3Fifo, 10_000, 100).unwrap();
         let mut slots = Vec::new();
         let first = install(&mut policy, &mut slots, 1);
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
         assert_eq!(
-            policy.select_victim(&mut slots, 2, true, |_| 100),
-            VictimSelection::Victim(first)
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| 100, |_| true),
+            Some(VictimCandidate {
+                index: first,
+                record_ghost: true,
+            })
         );
+        policy.record_admission_eviction(1, true);
         policy.remove(&mut slots, first, 100);
 
         let hint = policy.record_miss(1);
         policy.insert(&mut slots, first, 1, 100, hint);
         assert_eq!(slots[first].queue(), QueueId::Main);
+    }
+
+    #[test]
+    fn one_admission_shares_one_policy_scan_budget() {
+        let mut policy = EvictionState::new(EvictionPolicy::Clock, 100_000, 100).unwrap();
+        let mut slots = Vec::new();
+        for hash in 0..100 {
+            install(&mut policy, &mut slots, hash);
+        }
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+
+        assert_eq!(
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| 100, |_| true),
+            None
+        );
+        assert_eq!(remaining_steps, 0);
     }
 
     #[test]
