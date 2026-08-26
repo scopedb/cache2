@@ -12,9 +12,7 @@ use crate::index_storage::{
     INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE, IndexStorageError,
     canonical_index_partition_ranges,
 };
-use crate::recovery::{
-    CacheEpoch, DataSuperblock, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeader,
-};
+use crate::recovery::{DataSuperblock, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeader};
 use std::fmt;
 
 pub(crate) const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
@@ -58,8 +56,8 @@ const ROOT_REGION_COUNT_OFFSET: usize = 96;
 const ROOT_PARTITION_COUNT_OFFSET: usize = 100;
 const ROOT_SHARD_COUNT_OFFSET: usize = 104;
 const ROOT_NAMESPACE_COUNT_OFFSET: usize = 108;
-const ROOT_CACHE_EPOCH_OFFSET: usize = 112;
-const ROOT_CLEAR_FLOOR_SEQNO_OFFSET: usize = 120;
+const ROOT_RESERVED_EPOCH_OFFSET: usize = 112;
+const ROOT_RESERVED_CLEAR_FLOOR_OFFSET: usize = 120;
 const ROOT_MAX_SEQNO_OFFSET: usize = 128;
 const ROOT_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 136;
 const ROOT_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 144;
@@ -154,11 +152,6 @@ pub(crate) struct RegionMetadataRoot {
     pub(crate) region_count: u32,
     pub(crate) partition_count: u32,
     pub(crate) shard_count: u32,
-    /// Matches the fixed-width epoch in the record header. The physical
-    /// root slot remains eight bytes so the metadata page layout stays fixed;
-    /// its high 32 bits are reserved and must be zero.
-    pub(crate) cache_epoch: CacheEpoch,
-    pub(crate) clear_floor_seqno: u64,
     pub(crate) max_seqno: u64,
     pub(crate) physical_value_slots: u64,
     pub(crate) physical_deleted_slots: u64,
@@ -534,9 +527,6 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
         || root.shard_count == 0
         || root.shard_count as usize > MAX_SHARDS
         || root.shard_count >= root.region_count
-        || root.cache_epoch == 0
-        || root.clear_floor_seqno == 0
-        || root.clear_floor_seqno > root.max_seqno
         || root.max_seqno == u64::MAX
         || (root.live_record_count == 0) != (root.live_record_bytes == 0)
         || root.live_record_count > root.physical_value_slots
@@ -982,12 +972,8 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
     put_u32(output, ROOT_PARTITION_COUNT_OFFSET, root.partition_count);
     put_u32(output, ROOT_SHARD_COUNT_OFFSET, root.shard_count);
     put_u32(output, ROOT_NAMESPACE_COUNT_OFFSET, 1);
-    put_u64(output, ROOT_CACHE_EPOCH_OFFSET, u64::from(root.cache_epoch));
-    put_u64(
-        output,
-        ROOT_CLEAR_FLOOR_SEQNO_OFFSET,
-        root.clear_floor_seqno,
-    );
+    put_u64(output, ROOT_RESERVED_EPOCH_OFFSET, 0);
+    put_u64(output, ROOT_RESERVED_CLEAR_FLOOR_OFFSET, 0);
     put_u64(output, ROOT_MAX_SEQNO_OFFSET, root.max_seqno);
     put_u64(
         output,
@@ -1055,6 +1041,8 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
         || get_u32(input, ROOT_NAMESPACE_COUNT_OFFSET)? != 1
         || get_u64(input, ROOT_RESERVED64_OFFSET)? != 0
         || get_u64(input, ROOT_RESERVED_INDEX_OFFSET)? != 0
+        || get_u64(input, ROOT_RESERVED_EPOCH_OFFSET)? != 0
+        || get_u64(input, ROOT_RESERVED_CLEAR_FLOOR_OFFSET)? != 0
         || input[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
             .iter()
             .any(|byte| *byte != 0)
@@ -1062,8 +1050,6 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
     {
         return Err(RegionMetadataError::InvalidField("root_encoding"));
     }
-    let cache_epoch = u32::try_from(get_u64(input, ROOT_CACHE_EPOCH_OFFSET)?)
-        .map_err(|_| RegionMetadataError::InvalidField("cache_epoch"))?;
     Ok(RegionMetadataRoot {
         cache_uuid: get_id(input, ROOT_CACHE_UUID_OFFSET)?,
         data_identity: get_id(input, ROOT_DATA_IDENTITY_OFFSET)?,
@@ -1077,8 +1063,6 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
         region_count: get_u32(input, ROOT_REGION_COUNT_OFFSET)?,
         partition_count: get_u32(input, ROOT_PARTITION_COUNT_OFFSET)?,
         shard_count: get_u32(input, ROOT_SHARD_COUNT_OFFSET)?,
-        cache_epoch,
-        clear_floor_seqno: get_u64(input, ROOT_CLEAR_FLOOR_SEQNO_OFFSET)?,
         max_seqno: get_u64(input, ROOT_MAX_SEQNO_OFFSET)?,
         physical_value_slots: get_u64(input, ROOT_PHYSICAL_VALUE_SLOTS_OFFSET)?,
         physical_deleted_slots: get_u64(input, ROOT_PHYSICAL_DELETED_SLOTS_OFFSET)?,
@@ -1276,8 +1260,6 @@ mod tests {
                 region_count: 4,
                 partition_count: 2,
                 shard_count: 1,
-                cache_epoch: 1,
-                clear_floor_seqno: 1,
                 max_seqno: 4,
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
@@ -1411,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_root_slots_and_epoch_high_bits_are_rejected() {
+    fn reserved_root_slots_are_rejected() {
         let mut root_reserved = sample().encode().unwrap();
         let root_page = page_mut(&mut root_reserved, 0).unwrap();
         put_u64(
@@ -1425,17 +1407,17 @@ mod tests {
             Err(RegionMetadataError::InvalidField("root_encoding"))
         );
 
-        let mut wide_epoch = sample().encode().unwrap();
-        let root_page = page_mut(&mut wide_epoch, 0).unwrap();
+        let mut reserved_epoch = sample().encode().unwrap();
+        let root_page = page_mut(&mut reserved_epoch, 0).unwrap();
         put_u64(
             page_payload_mut(root_page, 0, REGION_METADATA_ROOT_SIZE),
-            ROOT_CACHE_EPOCH_OFFSET,
-            u64::from(u32::MAX) + 1,
+            ROOT_RESERVED_EPOCH_OFFSET,
+            1,
         );
         finish_page(root_page);
         assert_eq!(
-            RegionMetadata::decode(&wide_epoch),
-            Err(RegionMetadataError::InvalidField("cache_epoch"))
+            RegionMetadata::decode(&reserved_epoch),
+            Err(RegionMetadataError::InvalidField("root_encoding"))
         );
     }
 

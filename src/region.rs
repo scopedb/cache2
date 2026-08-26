@@ -2306,8 +2306,6 @@ fn empty_region_metadata_with_layout(
                 io::Error::new(io::ErrorKind::InvalidInput, "too many index partitions")
             })?,
             shard_count: shards,
-            cache_epoch: 1,
-            clear_floor_seqno: 1,
             max_seqno: u64::from(shards),
             physical_value_slots: 0,
             physical_deleted_slots: 0,

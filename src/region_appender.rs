@@ -285,7 +285,6 @@ mod tests {
         RegionWriteSpan {
             shard_id: 0,
             span_id: 7,
-            cache_epoch: 3,
             region_id: 1,
             region_incarnation: 9,
             start_offset: 0,

@@ -153,8 +153,7 @@ pub(crate) fn encode_value_into_hashed(
             reserved: reservation.record_bytes,
         });
     }
-    if reservation.cache_epoch == 0
-        || reservation.region_incarnation == 0
+    if reservation.region_incarnation == 0
         || reservation.region_incarnation == u32::MAX
         || reservation.seqno == 0
         || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT)
@@ -221,7 +220,6 @@ pub(crate) fn encode_value_into_hashed(
         stored_len: value_len,
         record_len: reservation.record_bytes,
         region_incarnation: reservation.region_incarnation,
-        epoch: reservation.cache_epoch,
         seqno: reservation.seqno,
         key_hash: hash,
         expires_at,
@@ -301,7 +299,6 @@ mod tests {
         );
         let reservation = RegionAppendReservation {
             shard_id: 0,
-            cache_epoch: 5,
             region_id: 7,
             region_incarnation: 3,
             offset: 0,
@@ -338,7 +335,6 @@ mod tests {
         assert_eq!(header.stored_len, value.len() as u32);
         assert_eq!(header.record_len, required);
         assert_eq!(header.region_incarnation, 3);
-        assert_eq!(header.epoch, 5);
         assert_eq!(header.seqno, 17);
         assert_eq!(header.key_hash, hash);
         assert_eq!(header.expires_at, 123_456);
@@ -390,7 +386,6 @@ mod tests {
         let required = required_record_bytes(0, 3, 16).unwrap();
         let reservation = RegionAppendReservation {
             shard_id: 0,
-            cache_epoch: 1,
             region_id: 0,
             region_incarnation: 1,
             offset: 0,

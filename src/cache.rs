@@ -439,9 +439,8 @@ impl HybridCache {
     ///
     /// An L2 index miss returns directly. An L2 candidate reserves one
     /// immediately available engine slot, allocates one exact-size aligned
-    /// buffer, performs one record read, and revalidates the record identity
-    /// before returning. Internal allocation or I/O pressure fails
-    /// open as a cache miss.
+    /// buffer, performs one record read, and validates it locally. Internal
+    /// allocation or I/O pressure fails open as a cache miss.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
         self.get_in(0, key)
     }

@@ -20,11 +20,6 @@ pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE
 pub(crate) const RECORD_ALIGNMENT: u32 = 32;
 pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
 pub(crate) const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
-/// HybridCache-wide generation carried by both recovery metadata and every record.
-///
-/// Keeping one fixed width avoids an implicit truncation boundary when a
-/// runtime epoch is encoded into the record header.
-pub(crate) type CacheEpoch = u32;
 
 const DATA_MAGIC: [u8; 8] = *b"CRDATA\0\0";
 const STATE_MAGIC: [u8; 8] = *b"CRSTATE\0";

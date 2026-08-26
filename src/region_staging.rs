@@ -89,7 +89,6 @@ impl<E> From<StagingError> for StagingEncodeError<E> {
 struct FillChunk {
     buffer: Option<BufferLease>,
     records: Vec<StagedRecord>,
-    cache_epoch: u32,
     region_id: u32,
     region_incarnation: u32,
     start_offset: u64,
@@ -102,7 +101,6 @@ impl FillChunk {
         Self {
             buffer: Some(buffer),
             records,
-            cache_epoch: 0,
             region_id: 0,
             region_incarnation: 0,
             start_offset: 0,
@@ -122,7 +120,6 @@ impl FillChunk {
     fn reset(&mut self, buffer: BufferLease) {
         self.records.clear();
         self.buffer = Some(buffer);
-        self.cache_epoch = 0;
         self.region_id = 0;
         self.region_incarnation = 0;
         self.start_offset = 0;
@@ -383,8 +380,7 @@ impl RegionStaging {
                 return Ok(StageAppend::NeedsSeal);
             }
             if !fill.is_empty()
-                && (fill.cache_epoch != receipt.cache_epoch
-                    || fill.region_id != receipt.region_id
+                && (fill.region_id != receipt.region_id
                     || fill.region_incarnation != receipt.region_incarnation
                     || fill.end_offset != u64::from(receipt.offset)
                     || receipt.seqno <= fill.max_seqno)
@@ -438,7 +434,6 @@ impl RegionStaging {
                     "staging encoding lost its buffer",
                 )))?;
         if state.fill.is_empty() {
-            state.fill.cache_epoch = receipt.cache_epoch;
             state.fill.region_id = receipt.region_id;
             state.fill.region_incarnation = receipt.region_incarnation;
             state.fill.start_offset = u64::from(receipt.offset);
@@ -482,8 +477,7 @@ impl RegionStaging {
                         && *padding % RECORD_ALIGNMENT == 0
                 })
                 .ok_or(StagingError::StaleReceipt)?;
-            if receipt.cache_epoch == 0
-                || receipt.region_incarnation == 0
+            if receipt.region_incarnation == 0
                 || receipt.span_start_offset >= receipt.unpadded_end_offset
                 || !receipt
                     .span_start_offset
@@ -496,7 +490,6 @@ impl RegionStaging {
                     .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
                 || receipt.padded_end_offset > self.region_size
                 || fill.is_empty()
-                || fill.cache_epoch != receipt.cache_epoch
                 || fill.region_id != receipt.region_id
                 || fill.region_incarnation != receipt.region_incarnation
                 || fill.start_offset != receipt.span_start_offset
@@ -563,7 +556,6 @@ impl RegionStaging {
             )?;
             if header.record_len != old_record_len
                 || header.region_incarnation != receipt.region_incarnation
-                || header.epoch != receipt.cache_epoch
                 || header.seqno != last.entry.seqno
                 || header.key_hash != last.hash
             {
@@ -609,7 +601,6 @@ impl RegionStaging {
             return Ok(None);
         }
         if !span_matches_records(span, &state.fill.records)
-            || state.fill.cache_epoch != span.cache_epoch
             || state.fill.region_id != span.region_id
             || state.fill.region_incarnation != span.region_incarnation
             || state.fill.start_offset != span.start_offset
@@ -757,8 +748,7 @@ impl RegionStaging {
 
     fn validate_reservation(&self, receipt: RegionAppendReservation) -> Result<(), StagingError> {
         let end = reservation_end(receipt).ok_or(StagingError::StaleReceipt)?;
-        if receipt.cache_epoch == 0
-            || receipt.region_incarnation == 0
+        if receipt.region_incarnation == 0
             || receipt.seqno == 0
             || receipt.record_bytes == 0
             || !receipt.record_bytes.is_multiple_of(RECORD_ALIGNMENT)
@@ -863,7 +853,6 @@ mod tests {
     ) -> (RegionAppendReservation, StagedRecord) {
         let receipt = RegionAppendReservation {
             shard_id: 0,
-            cache_epoch: 3,
             region_id: 1,
             region_incarnation: 7,
             offset,
@@ -891,7 +880,6 @@ mod tests {
         RegionWriteSpan {
             shard_id: 0,
             span_id,
-            cache_epoch: 3,
             region_id: 1,
             region_incarnation: 7,
             start_offset,
@@ -914,7 +902,6 @@ mod tests {
             stored_len: 0,
             record_len: receipt.record_bytes,
             region_incarnation: receipt.region_incarnation,
-            epoch: receipt.cache_epoch,
             seqno: receipt.seqno,
             key_hash: record.hash,
             expires_at: 0,
@@ -1106,7 +1093,6 @@ mod tests {
         let unpadded_end = u64::from(second.offset) + u64::from(second.record_bytes);
         let padding = RegionPaddingReceipt {
             shard_id: 0,
-            cache_epoch: 3,
             region_id: 1,
             region_incarnation: 7,
             span_start_offset: 4096,

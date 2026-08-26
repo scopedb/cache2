@@ -8,7 +8,7 @@
 use crate::index::IndexEntry;
 use crate::index_storage::IndexSlotState;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
-use crate::recovery::{CacheEpoch, PersistentId, RECORD_ALIGNMENT};
+use crate::recovery::{PersistentId, RECORD_ALIGNMENT};
 use crate::region_index::IndexTransition;
 use crate::region_layout::RegionLayout;
 use crate::region_metadata::{
@@ -79,7 +79,6 @@ pub(crate) enum RegionMutationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionAppendReservation {
     pub(crate) shard_id: usize,
-    pub(crate) cache_epoch: CacheEpoch,
     pub(crate) region_id: u32,
     pub(crate) region_incarnation: u32,
     pub(crate) offset: u32,
@@ -99,7 +98,6 @@ impl RegionAppendReservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionPaddingReceipt {
     pub(crate) shard_id: usize,
-    pub(crate) cache_epoch: CacheEpoch,
     pub(crate) region_id: u32,
     pub(crate) region_incarnation: u32,
     pub(crate) span_start_offset: u64,
@@ -125,7 +123,6 @@ impl RegionPaddingReceipt {
 pub(crate) struct RegionWriteSpan {
     pub(crate) shard_id: usize,
     pub(crate) span_id: u64,
-    pub(crate) cache_epoch: CacheEpoch,
     pub(crate) region_id: u32,
     pub(crate) region_incarnation: u32,
     pub(crate) start_offset: u64,
@@ -140,7 +137,6 @@ pub(crate) struct RegionWriteSpan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionRotationReceipt {
     pub(crate) shard_id: usize,
-    pub(crate) cache_epoch: CacheEpoch,
     pub(crate) sealed_region_id: u32,
     pub(crate) activated_region_id: u32,
     pub(crate) activated_incarnation: u32,
@@ -150,16 +146,14 @@ pub(crate) struct RegionRotationReceipt {
 
 /// Read-only selection of the next FIFO rotation victim.
 ///
-/// A caller may retain this value while it drops manager authority and drains
-/// readers of a reused Region generation. It must hold the process-wide
-/// rotation gate for the selected RegionSet until
+/// A caller may retain this value while it drops manager authority. It must
+/// hold the process-wide rotation gate for the selected RegionSet until
 /// [`RegionManager::begin_rotation`] consumes the plan.
 /// `victim_incarnation` identifies the generation being replaced; the newly
 /// activated generation advances it by exactly one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionRotationPlan {
     pub(crate) shard_id: usize,
-    pub(crate) cache_epoch: CacheEpoch,
     pub(crate) victim_region_id: u32,
     pub(crate) victim_incarnation: u32,
     pub(crate) reused: bool,
@@ -176,7 +170,6 @@ struct RegionRotationSelection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OpenWriteSpan {
-    cache_epoch: CacheEpoch,
     region_id: u32,
     region_incarnation: u32,
     start_offset: u64,
@@ -249,8 +242,6 @@ struct RegionSetQueues {
 pub(crate) struct RegionManager {
     binding: RegionMetadataBinding,
     region_size: u64,
-    cache_epoch: CacheEpoch,
-    clear_floor_seqno: u64,
     next_seqno: u64,
     regions: Vec<RegionRuntime>,
     layout: Arc<RegionLayout>,
@@ -359,8 +350,6 @@ impl RegionManager {
                 config_fingerprint: root.config_fingerprint,
             },
             region_size: root.region_size,
-            cache_epoch: root.cache_epoch,
-            clear_floor_seqno: root.clear_floor_seqno,
             next_seqno,
             regions,
             layout,
@@ -372,14 +361,6 @@ impl RegionManager {
 
     pub(crate) const fn region_size(&self) -> u64 {
         self.region_size
-    }
-
-    pub(crate) const fn cache_epoch(&self) -> CacheEpoch {
-        self.cache_epoch
-    }
-
-    pub(crate) const fn clear_floor_seqno(&self) -> u64 {
-        self.clear_floor_seqno
     }
 
     #[cfg(test)]
@@ -530,7 +511,6 @@ impl RegionManager {
         let seqno = self.allocate_seqno()?;
         let receipt = RegionAppendReservation {
             shard_id,
-            cache_epoch: self.cache_epoch,
             region_id,
             region_incarnation: region.incarnation,
             offset,
@@ -557,7 +537,7 @@ impl RegionManager {
             .shard_mutations
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+        if shard.tail != Some(receipt) {
             return Err(RegionMutationError::StaleReceipt);
         }
         let end = receipt
@@ -565,8 +545,7 @@ impl RegionManager {
             .ok_or(RegionMutationError::ArithmeticOverflow)?;
         let next_span = match shard.open_span {
             Some(span)
-                if span.cache_epoch == receipt.cache_epoch
-                    && span.region_id == receipt.region_id
+                if span.region_id == receipt.region_id
                     && span.region_incarnation == receipt.region_incarnation
                     && span.end_offset == u64::from(receipt.offset) =>
             {
@@ -581,7 +560,6 @@ impl RegionManager {
                 }
             }
             None => OpenWriteSpan {
-                cache_epoch: receipt.cache_epoch,
                 region_id: receipt.region_id,
                 region_incarnation: receipt.region_incarnation,
                 start_offset: u64::from(receipt.offset),
@@ -623,8 +601,7 @@ impl RegionManager {
         let open = shard.open_span.ok_or(RegionMutationError::Invariant(
             "data shard has no staged records",
         ))?;
-        if open.cache_epoch != self.cache_epoch
-            || open.start_offset >= open.end_offset
+        if open.start_offset >= open.end_offset
             || open.start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
             || open.end_offset % u64::from(RECORD_ALIGNMENT) != 0
             || open.record_count == 0
@@ -673,7 +650,6 @@ impl RegionManager {
         }
         let receipt = RegionPaddingReceipt {
             shard_id,
-            cache_epoch: open.cache_epoch,
             region_id: open.region_id,
             region_incarnation: open.region_incarnation,
             span_start_offset: open.start_offset,
@@ -699,7 +675,7 @@ impl RegionManager {
             .shard_mutations
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+        if shard.tail != Some(receipt) {
             return Err(RegionMutationError::StaleReceipt);
         }
         let region_index = usize::try_from(receipt.region_id)
@@ -763,13 +739,11 @@ impl RegionManager {
             || shard.rotation.is_some()
             || shard.submitted_span.is_some()
             || shard.pending_padding != Some(padding)
-            || padding.cache_epoch != self.cache_epoch
         {
             return Err(RegionMutationError::StaleReceipt);
         }
         let open = shard.open_span.ok_or(RegionMutationError::StaleReceipt)?;
-        if open.cache_epoch != padding.cache_epoch
-            || open.region_id != padding.region_id
+        if open.region_id != padding.region_id
             || open.region_incarnation != padding.region_incarnation
             || open.start_offset != padding.span_start_offset
             || open.end_offset != padding.unpadded_end_offset
@@ -827,7 +801,6 @@ impl RegionManager {
         let receipt = RegionWriteSpan {
             shard_id,
             span_id: shard.next_span_id,
-            cache_epoch: open.cache_epoch,
             region_id: open.region_id,
             region_incarnation: open.region_incarnation,
             start_offset: open.start_offset,
@@ -854,7 +827,7 @@ impl RegionManager {
             .shard_mutations
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.submitted_span != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+        if shard.submitted_span != Some(receipt) {
             return Err(RegionMutationError::StaleReceipt);
         }
         let region_index = usize::try_from(receipt.region_id)
@@ -888,9 +861,8 @@ impl RegionManager {
 
     /// Selects the next FIFO victim without changing manager authority.
     ///
-    /// The returned generation is suitable for draining the read projection
-    /// without holding the manager mutex. [`Self::begin_rotation`] validates
-    /// the same FIFO selection again before it mutates any state.
+    /// [`Self::begin_rotation`] validates the same FIFO selection again before
+    /// it mutates any state.
     pub(crate) fn plan_rotation(
         &self,
         shard_id: usize,
@@ -968,7 +940,6 @@ impl RegionManager {
         self.active_regions[shard_id] = victim_region_id;
         let receipt = RegionRotationReceipt {
             shard_id,
-            cache_epoch: self.cache_epoch,
             sealed_region_id: old.region_id,
             activated_region_id: victim_region_id,
             activated_incarnation: incarnation,
@@ -1069,7 +1040,6 @@ impl RegionManager {
         Ok(RegionRotationSelection {
             plan: RegionRotationPlan {
                 shard_id,
-                cache_epoch: self.cache_epoch,
                 victim_region_id,
                 victim_incarnation: victim.incarnation,
                 reused,
@@ -1092,7 +1062,7 @@ impl RegionManager {
             .shard_mutations
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.rotation != Some(receipt) || receipt.cache_epoch != self.cache_epoch {
+        if shard.rotation != Some(receipt) {
             return Err(RegionMutationError::StaleReceipt);
         }
         let sealed_index = usize::try_from(receipt.sealed_region_id)
@@ -1136,15 +1106,12 @@ impl RegionManager {
         Ok(())
     }
 
-    /// Tests the Region generation and global clear fence which make one
-    /// completed physical index entry logically reachable. Resident-only
+    /// Tests the Region generation which makes one completed physical index
+    /// entry logically reachable. Resident-only
     /// values need a typed staging lookup and are deliberately rejected until
     /// that read path exists; a plain point lookup may address only the
     /// Region's completed prefix. Invalid fields fail closed.
     pub(crate) fn is_visible(&self, entry: IndexEntry) -> bool {
-        if entry.seqno < self.clear_floor_seqno {
-            return false;
-        }
         let Ok(region_id) = usize::try_from(entry.location.region_id()) else {
             return false;
         };
@@ -1360,8 +1327,6 @@ impl RegionManager {
                 region_count,
                 partition_count: partition_totals.partition_count,
                 shard_count,
-                cache_epoch: self.cache_epoch,
-                clear_floor_seqno: self.clear_floor_seqno,
                 max_seqno,
                 physical_value_slots: partition_totals.physical_value_slots,
                 physical_deleted_slots: partition_totals.physical_deleted_slots,
@@ -1643,8 +1608,6 @@ mod tests {
                 region_count: 6,
                 partition_count: 2,
                 shard_count: 2,
-                cache_epoch: 3,
-                clear_floor_seqno: 2,
                 max_seqno: 7,
                 physical_value_slots: 1,
                 physical_deleted_slots: 2,
@@ -1768,8 +1731,6 @@ mod tests {
                 .iter()
                 .all(|region| region.reserved_used == region.completed_used)
         );
-        assert_eq!(manager.cache_epoch(), 3);
-        assert_eq!(manager.clear_floor_seqno(), 2);
         assert_eq!(manager.next_seqno(), 8);
     }
 
@@ -1789,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn visibility_applies_clear_floor_region_generation_and_bounds() {
+    fn visibility_applies_region_generation_and_bounds() {
         let manager = RegionManager::from_metadata(sample()).unwrap();
         let entry = |region_id, offset, seqno| IndexEntry {
             location: PackedLocation::new(region_id, offset, 32).unwrap(),
@@ -1951,7 +1912,6 @@ mod tests {
             reservation,
             RegionAppendReservation {
                 shard_id: 0,
-                cache_epoch: 3,
                 region_id: 3,
                 region_incarnation: 1,
                 offset: 0,
@@ -2093,7 +2053,6 @@ mod tests {
             plan,
             RegionRotationPlan {
                 shard_id: 0,
-                cache_epoch: 3,
                 victim_region_id: 5,
                 victim_incarnation: 7,
                 reused: false,
@@ -2153,7 +2112,6 @@ mod tests {
             plan,
             RegionRotationPlan {
                 shard_id: 0,
-                cache_epoch: 3,
                 victim_region_id: 4,
                 victim_incarnation: 8,
                 reused: true,

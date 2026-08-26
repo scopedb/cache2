@@ -109,22 +109,24 @@ either intentionally cold-starts empty.
 `region_set_allocations()` reports the resolved Region count, capacity bytes,
 and append-shard count for capacity planning.
 
-`put` attempts to publish a pending RAM value and encodes the same sequence into
-the bounded per-shard write buffer before returning. An admitted value is
-immediately readable from L1 even though its device write may still be pending.
-Values that do not fit their RAM shard bypass L1 and continue through L2.
-Successful completion publishes the L2 index entry and marks the matching RAM
-version clean. The default write backpressure policy rejects immediately when
-the fixed shard write buffer is saturated; it has no global write-admission
-gate. Only an explicitly selected `Block` or `Timeout` policy may wait for
-write-side capacity.
+`put` publishes an admitted RAM value immediately and encodes the same sequence
+into the bounded per-shard write buffer before returning. The value is readable
+from L1 while its device write is still in flight and is immediately eligible
+for normal eviction. Values that do not fit their RAM shard bypass L1 and
+continue through L2. Successful completion publishes the L2 index entry. The
+default write backpressure policy rejects immediately when the fixed shard
+write buffer is saturated; it has no global write-admission gate. Only an
+explicitly selected `Block` or `Timeout` policy may wait for write-side
+capacity.
 
 After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate
 plans one exact aligned read range, reserves an immediately available engine
-slot, allocates that range, performs one record read, and
-revalidates the exact index record, Region generation, cache epoch, and clear floor before
-returning. There is no read admission policy, fixed foreground read pool,
+slot, allocates that range, and performs one record read. The result is checked
+locally against the planned location, sequence number, hash, namespace, full
+key, lengths, expiry, and checksum. There is no second index lookup or global
+freshness check; a concurrently superseded but otherwise valid record may be
+returned. There is no read admission policy, fixed foreground read pool,
 separate read queue, or background-ready state. The transient allocation is
 charged to the aggregate hard memory limit; allocation or I/O submission
 pressure fails open as a cache miss instead of returning read backpressure.
@@ -135,8 +137,8 @@ starving behind a read stream. A successful L1 promotion returns a bounded
 L1-backed value and releases the transient read buffer before `get` returns
 while preserving `CacheTier::L2` as the source of that hit. If promotion
 bypasses, the zero-copy Region value retains only its exact-size allocation
-until the caller drops it. Region-generation and I/O submission-fence
-contention follow the same fail-open rule. Point hashes and record sizes are
+until the caller drops it. I/O submission contention follows the same fail-open
+rule. Point hashes and record sizes are
 computed once per operation, and L1 admits at most eight distinct full keys for
 one 64-bit hash so collision work remains constant-bounded.
 

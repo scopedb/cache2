@@ -25,7 +25,7 @@ const RECORD_VALUE_LEN_OFFSET: usize = 12;
 const RECORD_STORED_LEN_OFFSET: usize = 16;
 const RECORD_LEN_OFFSET: usize = 20;
 const RECORD_REGION_INCARNATION_OFFSET: usize = 24;
-const RECORD_EPOCH_OFFSET: usize = 28;
+const RECORD_RESERVED_OFFSET: usize = 28;
 const RECORD_SEQNO_OFFSET: usize = 32;
 const RECORD_KEY_HASH_OFFSET: usize = 40;
 const RECORD_EXPIRES_AT_OFFSET: usize = 48;
@@ -61,7 +61,6 @@ pub(crate) struct RecordHeader {
     pub(crate) stored_len: u32,
     pub(crate) record_len: u32,
     pub(crate) region_incarnation: u32,
-    pub(crate) epoch: u32,
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
     pub(crate) expires_at: u64,
@@ -93,7 +92,7 @@ impl RecordHeader {
             RECORD_REGION_INCARNATION_OFFSET,
             self.region_incarnation,
         );
-        put_u32(&mut output, RECORD_EPOCH_OFFSET, self.epoch);
+        put_u32(&mut output, RECORD_RESERVED_OFFSET, 0);
         put_u64(&mut output, RECORD_SEQNO_OFFSET, self.seqno);
         put_u64(&mut output, RECORD_KEY_HASH_OFFSET, self.key_hash);
         put_u64(&mut output, RECORD_EXPIRES_AT_OFFSET, self.expires_at);
@@ -109,6 +108,7 @@ impl RecordHeader {
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != FORMAT_VERSION
             || *input.get(RECORD_KIND_OFFSET)? != RECORD_KIND_VALUE
+            || get_u32(input, RECORD_RESERVED_OFFSET)? != 0
             || !checksum_matches(input, RECORD_HEADER_CRC_OFFSET)
         {
             return None;
@@ -121,7 +121,6 @@ impl RecordHeader {
             stored_len: get_u32(input, RECORD_STORED_LEN_OFFSET)?,
             record_len: get_u32(input, RECORD_LEN_OFFSET)?,
             region_incarnation: get_u32(input, RECORD_REGION_INCARNATION_OFFSET)?,
-            epoch: get_u32(input, RECORD_EPOCH_OFFSET)?,
             seqno: get_u64(input, RECORD_SEQNO_OFFSET)?,
             key_hash: get_u64(input, RECORD_KEY_HASH_OFFSET)?,
             expires_at: get_u64(input, RECORD_EXPIRES_AT_OFFSET)?,
@@ -275,7 +274,6 @@ mod tests {
             stored_len: value.len() as u32,
             record_len: 96,
             region_incarnation: 9,
-            epoch: 3,
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
             expires_at: 0x0102_0304_0506_0708,
@@ -303,7 +301,6 @@ mod tests {
             stored_len: 5,
             record_len: RecordHeader::aligned_len(3, 5).unwrap(),
             region_incarnation: 9,
-            epoch: 2,
             seqno: 101,
             key_hash: 0xfedc_ba98_7654_3210,
             expires_at: 1234,
@@ -334,7 +331,6 @@ mod tests {
             stored_len: 1,
             record_len: RecordHeader::aligned_len(8, 1).unwrap(),
             region_incarnation: 1,
-            epoch: 1,
             seqno: 2,
             key_hash: 3,
             expires_at: 0,
