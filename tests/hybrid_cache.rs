@@ -113,6 +113,44 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
     }
 }
 
+#[test]
+fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
+    let files = TestCache::new("explicit-tokio-handle");
+    let cache_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+        .unwrap();
+    let caller_runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let cache_handle = cache_runtime.handle().clone();
+
+    caller_runtime.block_on(async {
+        let cache = files
+            .config(1)
+            .with_tokio_handle(cache_handle.clone())
+            .open()
+            .await
+            .unwrap();
+        cache.put("key", "value").unwrap();
+        cache.drain().await.unwrap();
+        cache.close_warm().await.unwrap();
+
+        let reopened = files
+            .config(1)
+            .with_tokio_handle(cache_handle)
+            .open()
+            .await
+            .unwrap();
+        let value = reopened.get("key").await.unwrap().unwrap();
+        assert_eq!(value.tier(), CacheTier::L2);
+        assert_eq!(value.as_ref(), b"value");
+        drop(value);
+        reopened.close_fast().await.unwrap();
+    });
+}
+
 #[tokio::test]
 async fn fast_close_always_reopens_empty() {
     let files = TestCache::new("fast-close");

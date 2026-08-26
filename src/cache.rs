@@ -282,6 +282,7 @@ pub struct HybridCacheConfig {
     path: PathBuf,
     static_config: StaticConfig,
     runtime_config: RuntimeConfig,
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl HybridCacheConfig {
@@ -295,6 +296,7 @@ impl HybridCacheConfig {
             path: path.as_ref().to_path_buf(),
             static_config,
             runtime_config: RuntimeConfig::default(),
+            tokio_handle: None,
         }
     }
 
@@ -303,15 +305,31 @@ impl HybridCacheConfig {
         self
     }
 
+    /// Uses a specific Tokio runtime for blocking lifecycle work and L2 read
+    /// deadlines. The runtime must have time enabled and outlive the cache.
+    pub fn with_tokio_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.tokio_handle = Some(handle);
+        self
+    }
+
     /// Opens the cache on Tokio's blocking pool because recovery and file setup
-    /// use blocking filesystem operations.
+    /// use blocking filesystem operations. Without an explicit handle, this
+    /// captures the current Tokio runtime when the future is first polled.
     pub async fn open(self) -> Result<HybridCache> {
-        tokio::task::spawn_blocking(move || self.open_blocking())
+        let tokio_handle = match self.tokio_handle.clone() {
+            Some(handle) => handle,
+            None => tokio::runtime::Handle::try_current().map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?,
+        };
+        let cache_handle = tokio_handle.clone();
+        tokio_handle
+            .spawn_blocking(move || self.open_blocking(cache_handle))
             .await
             .map_err(|error| blocking_task_error("cache open", error))?
     }
 
-    fn open_blocking(self) -> Result<HybridCache> {
+    fn open_blocking(self, tokio_handle: tokio::runtime::Handle) -> Result<HybridCache> {
         let geometry = self.static_config.geometry()?;
         let region_layout = self.static_config.region_layout(geometry)?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
@@ -345,6 +363,7 @@ impl HybridCacheConfig {
         Ok(HybridCache {
             store,
             logical_disk_peak_bytes,
+            tokio_handle,
         })
     }
 }
@@ -389,6 +408,7 @@ impl Value {
 pub struct HybridCache {
     store: RegionStore<FileRegionBackend<SystemRegionFileSystem>>,
     logical_disk_peak_bytes: u64,
+    tokio_handle: tokio::runtime::Handle,
 }
 
 impl fmt::Debug for HybridCache {
@@ -457,7 +477,7 @@ impl HybridCache {
         key: impl AsRef<[u8]> + Send,
     ) -> Result<Option<Value>> {
         self.store
-            .get_value_async(namespace, key.as_ref())
+            .get_value_async(namespace, key.as_ref(), &self.tokio_handle)
             .await
             .map(|value| value.map(|inner| Value { inner }))
     }
@@ -484,7 +504,8 @@ impl HybridCache {
     /// Stops without publishing a recovery image on Tokio's blocking pool.
     /// Once called, the close continues even if the returned future is dropped.
     pub fn close_fast(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
-        let close = tokio::task::spawn_blocking(move || self.store.close_fast());
+        let tokio_handle = self.tokio_handle.clone();
+        let close = tokio_handle.spawn_blocking(move || self.store.close_fast());
         async move {
             close
                 .await
@@ -495,7 +516,8 @@ impl HybridCache {
     /// Publishes a clean recovery image on Tokio's blocking pool. Once called,
     /// the close continues even if the returned future is dropped.
     pub fn close_warm(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
-        let close = tokio::task::spawn_blocking(move || self.store.close_warm());
+        let tokio_handle = self.tokio_handle.clone();
+        let close = tokio_handle.spawn_blocking(move || self.store.close_warm());
         async move {
             close
                 .await

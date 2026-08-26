@@ -694,16 +694,27 @@ impl BoundedIoRequest {
     pub(crate) async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
         let deadline = tokio::time::Instant::from_std(self.deadline);
-        if let Ok(completion) = tokio::time::timeout_at(deadline, request.request_mut()).await {
+        let completion = {
+            let _entered = tokio_handle.enter();
+            tokio::time::timeout_at(deadline, request.request_mut())
+        }
+        .await;
+        if let Ok(completion) = completion {
             request.disarm();
             return Ok(completion);
         }
 
         let cancel_error = request.cancel().err();
-        match tokio::time::timeout(self.cancel_grace, request.request_mut()).await {
+        let completion = {
+            let _entered = tokio_handle.enter();
+            tokio::time::timeout(self.cancel_grace, request.request_mut())
+        }
+        .await;
+        match completion {
             Ok(completion) => {
                 request.disarm();
                 Err(IoDeadlineExceeded::new(cancel_error, Some(completion)))
@@ -3424,7 +3435,10 @@ mod tests {
         )
         .unwrap();
 
-        let completion = request.wait_async(Arc::clone(&engine)).await.unwrap();
+        let completion = request
+            .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+            .await
+            .unwrap();
 
         assert!(matches!(completion.status, CompletionStatus::Completed));
         assert_eq!(completion.bytes_transferred, 4096);
@@ -3442,7 +3456,11 @@ mod tests {
         )
         .unwrap();
         let waiter_engine = Arc::clone(&engine);
-        let waiter = tokio::spawn(async move { request.wait_async(waiter_engine).await });
+        let waiter = tokio::spawn(async move {
+            request
+                .wait_async(waiter_engine, &tokio::runtime::Handle::current())
+                .await
+        });
         tokio::task::yield_now().await;
         assert!(backend.wait_for_entered(1));
 
@@ -3469,7 +3487,10 @@ mod tests {
         .unwrap();
         assert!(backend.wait_for_entered(1));
 
-        let timeout = request.wait_async(Arc::clone(&engine)).await.unwrap_err();
+        let timeout = request
+            .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+            .await
+            .unwrap_err();
         let (error, buffer) = timeout.into_buffer();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(buffer.is_none());

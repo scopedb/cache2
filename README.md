@@ -55,6 +55,26 @@ cache.close_warm().await?;
 # }
 ```
 
+`open()` captures the current Tokio runtime by default. An embedding service
+can instead bind cache lifecycle work and L2 read deadlines to a specific
+runtime by passing its cloned handle:
+
+```rust,no_run
+# use cache_rs::HybridCacheConfig;
+# async fn open_cache(handle: tokio::runtime::Handle) -> std::io::Result<()> {
+let cache = HybridCacheConfig::new("/mnt/nvme/chunks.cache", 64 * 1024 * 1024 * 1024)
+    .with_tokio_handle(handle)
+    .open()
+    .await?;
+# cache.close_fast().await?;
+# Ok(())
+# }
+```
+
+The supplied runtime must have Tokio time enabled and remain alive until the
+cache is closed. Pass `runtime.handle().clone()` when the caller owns a
+`tokio::runtime::Runtime`; the cache does not take ownership of the runtime.
+
 The default path uses namespace zero. Namespaces are an explicit extension:
 
 ```rust

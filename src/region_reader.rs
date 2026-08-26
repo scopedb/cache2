@@ -67,13 +67,17 @@ impl PendingRead {
         Self::finish(plan, request_id, completion)
     }
 
-    pub(crate) async fn wait_async(self, engine: std::sync::Arc<dyn IoEngine>) -> ReadCompletion {
+    pub(crate) async fn wait_async(
+        self,
+        engine: std::sync::Arc<dyn IoEngine>,
+        tokio_handle: &tokio::runtime::Handle,
+    ) -> ReadCompletion {
         let Self {
             plan,
             request_id,
             request,
         } = self;
-        let completion = request.wait_async(engine).await;
+        let completion = request.wait_async(engine, tokio_handle).await;
         Self::finish(plan, request_id, completion)
     }
 

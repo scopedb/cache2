@@ -405,10 +405,11 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         &self,
         namespace_id: u32,
         key: &[u8],
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?
             .data_plane()?
-            .get_async(namespace_id, key)
+            .get_async(namespace_id, key, tokio_handle)
             .await
     }
 

@@ -573,7 +573,7 @@ impl PendingGet {
         }
     }
 
-    async fn wait_async(self) -> CompletedGet {
+    async fn wait_async(self, tokio_handle: &tokio::runtime::Handle) -> CompletedGet {
         let Self {
             engine,
             read,
@@ -581,7 +581,7 @@ impl PendingGet {
             hash,
         } = self;
         CompletedGet {
-            read: read.wait_async(engine).await,
+            read: read.wait_async(engine, tokio_handle).await,
             read_token,
             hash,
         }
@@ -923,11 +923,12 @@ impl RegionDataPlane {
         &self,
         namespace_id: u32,
         key: &[u8],
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
         match self.prepare_get(namespace_id, key)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => {
-                self.finish_get(pending.wait_async().await, namespace_id, key)
+                self.finish_get(pending.wait_async(tokio_handle).await, namespace_id, key)
             }
         }
     }

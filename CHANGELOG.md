@@ -33,6 +33,8 @@ version number documented in `MILESTONES.md`.
 - sequenced point deletion through the existing bounded mutation path, with
   best-effort exact-key L1 cleanup and warm-recoverable 24-byte index
   tombstones.
+- optional explicit Tokio runtime-handle binding for cache lifecycle work and
+  L2 read deadlines.
 
 ### Changed
 
