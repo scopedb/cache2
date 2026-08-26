@@ -1,6 +1,6 @@
 use std::io;
 
-const MAX_REGION_SETS: usize = 64;
+pub(crate) const MAX_REGION_SETS: usize = 64;
 const MAX_NAMESPACE_ROUTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -57,7 +57,10 @@ impl RegionSetConfig {
     /// Namespaces not listed by any set use RegionSet zero. A namespace may be
     /// listed by only one set.
     pub fn with_namespaces(mut self, namespaces: impl IntoIterator<Item = u32>) -> Self {
-        self.namespaces = namespaces.into_iter().collect();
+        self.namespaces = namespaces
+            .into_iter()
+            .take(MAX_NAMESPACE_ROUTES + 1)
+            .collect();
         self
     }
 
@@ -458,5 +461,15 @@ mod tests {
             let error = RegionLayout::build(8, 2, &configs).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn namespace_builder_stops_after_the_invalid_sentinel() {
+        let config = RegionSetConfig::new(0)
+            .with_namespaces(0..u32::try_from(MAX_NAMESPACE_ROUTES + 2).unwrap());
+
+        assert_eq!(config.namespaces().len(), MAX_NAMESPACE_ROUTES + 1);
+        let error = RegionLayout::build(8, 2, &[config]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

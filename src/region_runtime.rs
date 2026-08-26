@@ -557,7 +557,10 @@ impl ShardControl {
     }
 
     fn request_drain(&self, stop: bool) -> io::Result<u64> {
-        let mut state = self.lock()?;
+        let (mut state, poisoned) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
         state.drain_requested = state
             .drain_requested
             .checked_add(1)
@@ -565,7 +568,11 @@ impl ShardControl {
         state.stop |= stop;
         let generation = state.drain_requested;
         self.changed.notify_one();
-        Ok(generation)
+        if poisoned {
+            Err(poisoned_runtime_error())
+        } else {
+            Ok(generation)
+        }
     }
 
     fn wait_for_drain(&self, generation: u64) -> io::Result<()> {
@@ -1033,6 +1040,21 @@ impl RegionDataPlane {
         }));
         assert!(result.is_err());
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_shard_for_test(&self, shard_id: usize) {
+        let shard = self
+            .running
+            .shared
+            .shards
+            .get(shard_id)
+            .expect("test shard exists");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = shard.state.lock().unwrap();
+            panic!("poison shard gate");
+        }));
+        assert!(result.is_err());
+    }
 }
 
 pub(crate) fn flush_data_inode(engines: &[Arc<dyn IoEngine>]) -> io::Result<()> {
@@ -1455,12 +1477,20 @@ fn drain_shards(shared: &RunningShared, stop: bool) -> io::Result<()> {
     generations
         .try_reserve_exact(shared.shards.len())
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate drain fence"))?;
-    for shard in &shared.shards {
-        generations.push(shard.request_drain(stop)?);
-    }
     let mut first_error = None;
+    for shard in &shared.shards {
+        match shard.request_drain(stop) {
+            Ok(generation) => generations.push(Some(generation)),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                generations.push(None);
+            }
+        }
+    }
     for (shard, generation) in shared.shards.iter().zip(generations) {
-        if let Err(error) = shard.wait_for_drain(generation) {
+        if let Some(generation) = generation
+            && let Err(error) = shard.wait_for_drain(generation)
+        {
             first_error.get_or_insert(error);
         }
     }

@@ -19,7 +19,7 @@ use crate::recovery::{
     RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE, recovery_image_index_len,
 };
 use crate::region::{FileRegionBackend, RegionFiles, SystemRegionFileSystem};
-use crate::region_layout::{RegionLayout, RegionSetAllocation, RegionSetConfig};
+use crate::region_layout::{MAX_REGION_SETS, RegionLayout, RegionSetAllocation, RegionSetConfig};
 use crate::region_metadata::{
     REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE,
@@ -107,7 +107,7 @@ impl StaticConfig {
     /// Every set needs one active Region per assigned shard plus one spare.
     /// The complete layout is static recovery identity.
     pub fn with_region_sets(mut self, sets: impl IntoIterator<Item = RegionSetConfig>) -> Self {
-        self.region_sets = sets.into_iter().collect();
+        self.region_sets = sets.into_iter().take(MAX_REGION_SETS + 1).collect();
         self
     }
 
@@ -642,5 +642,17 @@ mod tests {
         assert_eq!(allocations[1].id.get(), 2);
         assert_eq!(allocations[1].region_count, 7);
         assert_eq!(allocations[1].append_shard_count, 2);
+    }
+
+    #[test]
+    fn region_set_builder_stops_after_the_invalid_sentinel() {
+        let config = StaticConfig::new(5 * DEFAULT_REGION_SIZE)
+            .with_region_sets((0..MAX_REGION_SETS + 2).map(|id| RegionSetConfig::new(id as u16)));
+
+        assert_eq!(config.region_sets().len(), MAX_REGION_SETS + 1);
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }
