@@ -202,8 +202,11 @@ may change on every open without invalidating a clean image:
 - POSIX positioned-I/O by default, with io_uring available only through an
   explicit crate feature and engine selection;
 - buffered/automatic/direct I/O mode;
-- any positive I/O worker count; POSIX exposes one execution slot per worker,
-  while optional io_uring uses a fixed 64-slot lane depth;
+- a bounded positive I/O worker count; POSIX workers share one bounded engine
+  with one execution slot per worker, while optional io_uring uses a fixed
+  64-slot lane depth;
+- a write-occupancy reserve for reads, defaulting to one slot when an engine
+  has multiple slots; reads may use the complete engine capacity;
 - L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
   batch capacity, and opt-in operational counters.
 
@@ -263,10 +266,11 @@ subsets of `l2_misses` without changing the fail-open `get` result.
 Fixed per-shard write buffers bound write admission. A true L2 miss does not allocate a
 buffer. An L2 candidate first reserves an engine execution slot and then
 allocates only its actual aligned read range against the aggregate memory
-limit. A full primary lane permits one non-waiting, hash-derived alternate-lane
-probe; there is no pool scan or retry loop. Allocation or I/O-engine pressure
-is an observable cache miss. Write
-occupancy cannot consume the final slot of a multi-entry I/O engine.
+limit. POSIX admission uses its shared engine directly. A full primary io_uring
+lane permits one non-waiting, hash-derived alternate-lane probe; there is no
+pool scan or retry loop. Allocation or I/O-engine pressure is an observable
+cache miss. `RuntimeConfig::with_read_io_reserve()` controls how many execution
+slots write occupancy cannot consume.
 Promoted hits release the temporary allocation before return;
 unpromoted zero-copy Region values retain it. Writes return `WouldBlock`
 immediately on shard-buffer or mutation-path pressure.

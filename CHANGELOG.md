@@ -49,9 +49,9 @@ version number documented in `MILESTONES.md`.
 - made `open`, `drain`, and explicit close Tokio-friendly: drain uses native
   shard notifications and blocking recovery/filesystem work stays off runtime
   workers;
-- added one bounded alternate-lane probe for L2 reads when their primary I/O
-  worker is full, preserving the existing aggregate concurrency bound without
-  a new shared hot-path counter;
+- pooled POSIX workers behind one bounded execution budget and added a runtime
+  read-slot reserve that caps write occupancy; optional multi-ring io_uring
+  reads retain one bounded alternate-lane probe;
 - stopped requiring the unused io_uring `fsync` opcode after the public data-sync
   operation was removed;
 - replaced FNV-1a key hashing with seeded XXH3-64 and bound the algorithm

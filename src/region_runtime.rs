@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
-use crate::io_engine::{IoEngine, ReadSlot, build_file_engine};
+use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_ENGINE, ReadSlot, build_file_engine};
 use crate::memory::{
     MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
 };
@@ -388,6 +388,22 @@ impl RuntimeConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "I/O worker count must be non-zero",
+            ));
+        }
+        if self.io_engine == crate::runtime_config::IoEngine::Posix
+            && self.io_workers > MAX_IO_REQUESTS_PER_ENGINE
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("POSIX I/O workers must be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"),
+            ));
+        }
+        let engine_depth = self.io_depth_per_engine();
+        let read_io_reserve = self.read_io_reserve();
+        if read_io_reserve >= engine_depth || (engine_depth > 1 && read_io_reserve == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read I/O reserve must be in 1..capacity for a multi-slot engine",
             ));
         }
         if self.memory_limit_bytes == 0 {
@@ -1334,16 +1350,18 @@ fn start_running(
 }
 
 fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> Option<usize> {
-    // Each I/O engine owns one normal worker. Reserve one additional stack per
-    // engine for the bounded shutdown reaper path.
-    let stack_count = config.io_workers.checked_mul(2)?.checked_add(shard_count)?;
+    // Reserve one stack per configured worker, one possible shutdown reaper per
+    // engine, and one worker per append shard.
+    let engine_count = config.io_engine_count();
+    let stack_count = config
+        .io_workers
+        .checked_add(engine_count)?
+        .checked_add(shard_count)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let queue = config
-        .io_workers
-        .checked_mul(config.io_depth_per_worker())?
+    let queue = engine_count
+        .checked_mul(config.io_depth_per_engine())?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
-    let controls = config
-        .io_workers
+    let controls = engine_count
         .checked_add(shard_count)?
         .checked_add(config.l1_shards)?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
@@ -1359,20 +1377,28 @@ fn build_engine_pool(
     config: &RuntimeConfig,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
+    let engine_count = config.io_engine_count();
     let mut engines = Vec::new();
     engines
-        .try_reserve_exact(config.io_workers)
+        .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let worker_depth = config.io_depth_per_worker();
-    for worker in 0..config.io_workers {
-        let worker_files = if worker + 1 == config.io_workers {
+    let engine_depth = config.io_depth_per_engine();
+    let posix_workers = if config.io_engine() == crate::runtime_config::IoEngine::Posix {
+        config.io_workers
+    } else {
+        1
+    };
+    for engine in 0..engine_count {
+        let worker_files = if engine + 1 == engine_count {
             source.take().expect("last I/O worker owns file set")
         } else {
             source.as_ref().expect("I/O file set exists").try_clone()?
         };
         engines.push(build_file_engine(
             worker_files,
-            worker_depth,
+            engine_depth,
+            posix_workers,
+            config.read_io_reserve(),
             config.io_engine(),
             config.statistics,
         )?);

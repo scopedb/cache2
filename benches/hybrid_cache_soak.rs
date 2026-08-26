@@ -27,6 +27,7 @@ struct SoakConfig {
     key_count: usize,
     shards: u32,
     io_workers: usize,
+    read_io_reserve: usize,
     writers: usize,
     readers: usize,
     warm_reopen: bool,
@@ -59,6 +60,7 @@ impl SoakConfig {
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
         let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
         let io_workers = env_usize("CACHE_SOAK_IO_WORKERS", 4)?;
+        let read_io_reserve = env_usize("CACHE_SOAK_READ_IO_RESERVE", usize::from(io_workers > 1))?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
         let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
@@ -95,6 +97,7 @@ impl SoakConfig {
             key_count,
             shards,
             io_workers,
+            read_io_reserve,
             writers,
             readers,
             warm_reopen,
@@ -116,6 +119,7 @@ impl SoakConfig {
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
+            .with_read_io_reserve(self.read_io_reserve)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(true)
@@ -281,7 +285,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} io_workers={} read_io_reserve={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -295,6 +299,7 @@ fn main() -> io::Result<()> {
         config.key_count,
         config.shards,
         config.io_workers,
+        config.read_io_reserve,
         config.writers,
         config.readers,
         config.warm_reopen,

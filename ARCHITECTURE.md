@@ -95,19 +95,20 @@ bypasses L1 insertion.
 
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
 L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
-read range, and reads one record. If the hash-selected lane is full, admission
-may probe one hash-derived alternate lane; it never scans or waits across the
-pool. Local validation checks the planned location, sequence, hash, namespace,
-complete key, lengths, and checksums.
+read range, and reads one record. POSIX uses one shared bounded engine, so one
+reservation observes the complete worker capacity. If an io_uring hash-selected
+lane is full, admission may probe one hash-derived alternate lane; it never
+scans or waits across the pool. Local validation checks the planned location,
+sequence, hash, namespace, complete key, lengths, and checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
 The I/O pool contains the requested number of workers. The default engine uses
-one POSIX positioned-I/O worker and one execution slot per lane. Explicit
-io_uring builds use one ring with a fixed 64-slot depth per lane. The sum of
-these fixed lane depths is the aggregate in-flight bound.
-Two-choice read routing reduces idle-lane fragmentation without adding a shared
-admission counter to every I/O.
+one shared bounded POSIX engine with one positioned-I/O worker and execution
+slot per configured worker. Explicit io_uring builds use one ring with a fixed
+64-slot depth per lane. The sum of these fixed depths is the aggregate in-flight
+bound. A runtime-configurable read reserve caps write occupancy without
+restricting reads or adding a read wait.
 
 ## Recovery path
 
@@ -153,8 +154,9 @@ layout are canonicalized to the implicit default, avoiding cold starts for
 configurations with identical physical behavior.
 
 Runtime configuration is not persisted and may change between opens. It
-includes I/O engine and mode, worker count, L1 capacity and shard count, one
-write-batch capacity, aggregate memory limit, and optional statistics.
+includes I/O engine and mode, worker count, read I/O reserve, L1 capacity and
+shard count, one write-batch capacity, aggregate memory limit, and optional
+statistics.
 Foreground L2 reads
 reserve one immediately available engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public

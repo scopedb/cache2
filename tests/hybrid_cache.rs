@@ -337,6 +337,7 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     let retuned = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(7)
+        .with_read_io_reserve(2)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
@@ -609,8 +610,12 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 6] = [
+    let cases: [RuntimeConfigCase; 8] = [
         ("zero-workers", |config| config.with_io_workers(0)),
+        ("zero-read-reserve", |config| config.with_read_io_reserve(0)),
+        ("read-reserve-exhausts-pool", |config| {
+            config.with_io_workers(2).with_read_io_reserve(2)
+        }),
         ("l1-exceeds-budget", |config| {
             config
                 .with_l1_capacity(64 * 1024 * 1024)

@@ -379,8 +379,11 @@ cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 `CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`,
 `CACHE_SOAK_MEMORY_LIMIT_MIB`, comma-separated `CACHE_SOAK_VALUE_BYTES`,
 `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
-`CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and
-`CACHE_SOAK_READERS` control the workload. `CACHE_SOAK_WARM_REOPEN=true`
+`CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`,
+`CACHE_SOAK_READ_IO_RESERVE`, `CACHE_SOAK_WRITERS`, and `CACHE_SOAK_READERS`
+control the workload. The read reserve must be smaller than the POSIX worker
+count and defaults to one, except for a single-worker pool where it is zero.
+`CACHE_SOAK_WARM_REOPEN=true`
 populates one complete pass at every configured value size, publishes a clean
 image, reopens it, and runs the measured turnover against the recovered private
 index mapping.

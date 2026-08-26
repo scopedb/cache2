@@ -50,7 +50,7 @@ use crate::runtime_config::IoEngine as ConfiguredIoEngine;
 use crate::snapshot::CacheIoSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
-pub(crate) const MAX_IO_REQUESTS_PER_WORKER: usize = 4096;
+pub(crate) const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
 /// than a durability knob: cache contents are disposable.
@@ -965,6 +965,7 @@ const fn waiting_writes(state: u64) -> usize {
 
 struct RuntimeShared {
     max_in_flight: usize,
+    max_write_in_flight: usize,
     statistics_enabled: bool,
     accepting: AtomicBool,
     /// Packed total, write, and waiting-write counts. A single CAS is the slot
@@ -991,9 +992,11 @@ enum SlotWaitError {
 }
 
 impl RuntimeShared {
-    fn new(max_in_flight: usize, statistics_enabled: bool) -> Self {
+    fn new(max_in_flight: usize, read_io_reserve: usize, statistics_enabled: bool) -> Self {
+        debug_assert!(read_io_reserve < max_in_flight);
         Self {
             max_in_flight,
+            max_write_in_flight: max_in_flight - read_io_reserve,
             statistics_enabled,
             accepting: AtomicBool::new(true),
             slot_state: AtomicU64::new(0),
@@ -1027,11 +1030,6 @@ impl RuntimeShared {
 
     fn try_reserve_slot(self: &Arc<Self>, write: bool) -> Option<IoSlot> {
         const MAX_SLOT_CAS_ATTEMPTS: usize = 8;
-        let write_limit = if self.max_in_flight > 1 {
-            self.max_in_flight - 1
-        } else {
-            self.max_in_flight
-        };
         // Reads may use the complete engine depth. Once a write is waiting,
         // keep one total slot available for its handoff so a read stream cannot
         // starve accepted write-back or an explicit drain barrier.
@@ -1039,11 +1037,11 @@ impl RuntimeShared {
         for _ in 0..MAX_SLOT_CAS_ATTEMPTS {
             let total = active_slots(current);
             let writes = active_write_slots(current);
-            if write && writes >= write_limit {
+            if write && writes >= self.max_write_in_flight {
                 return None;
             }
             let reserve_for_waiting_write =
-                !write && waiting_writes(current) != 0 && writes < write_limit;
+                !write && waiting_writes(current) != 0 && writes < self.max_write_in_flight;
             let slot_limit = if reserve_for_waiting_write {
                 self.max_in_flight.saturating_sub(1)
             } else {
@@ -1371,11 +1369,17 @@ enum SlotMode<'a> {
 }
 
 impl RuntimeInner {
-    fn validate_max_in_flight(max_in_flight: usize) -> io::Result<()> {
-        if !(1..=MAX_IO_REQUESTS_PER_WORKER).contains(&max_in_flight) {
+    fn validate_limits(max_in_flight: usize, read_io_reserve: usize) -> io::Result<()> {
+        if !(1..=MAX_IO_REQUESTS_PER_ENGINE).contains(&max_in_flight) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("I/O requests per worker must be in 1..={MAX_IO_REQUESTS_PER_WORKER}"),
+                format!("I/O requests per engine must be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"),
+            ));
+        }
+        if read_io_reserve >= max_in_flight || (max_in_flight > 1 && read_io_reserve == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read I/O reserve must be in 1..capacity for a multi-slot engine",
             ));
         }
         Ok(())
@@ -1747,6 +1751,7 @@ impl BackendIoEngine {
         files: RuntimeFileSet,
         max_in_flight: usize,
         worker_count: usize,
+        read_io_reserve: usize,
         statistics_enabled: bool,
     ) -> io::Result<Self> {
         files.set_statistics_enabled(statistics_enabled);
@@ -1755,6 +1760,7 @@ impl BackendIoEngine {
             backend,
             max_in_flight,
             worker_count,
+            read_io_reserve,
             statistics_enabled,
         )
     }
@@ -1770,23 +1776,34 @@ impl BackendIoEngine {
         max_in_flight: usize,
         worker_count: usize,
     ) -> io::Result<Self> {
-        Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true)
+        Self::new_with_workers_and_statistics(
+            backend,
+            max_in_flight,
+            worker_count,
+            usize::from(max_in_flight > 1),
+            true,
+        )
     }
 
     fn new_with_workers_and_statistics(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
+        read_io_reserve: usize,
         statistics_enabled: bool,
     ) -> io::Result<Self> {
-        RuntimeInner::validate_max_in_flight(max_in_flight)?;
+        RuntimeInner::validate_limits(max_in_flight, read_io_reserve)?;
         if worker_count == 0 || worker_count > max_in_flight {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "POSIX I/O worker count must not exceed the request limit",
             ));
         }
-        let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
+        let shared = Arc::new(RuntimeShared::new(
+            max_in_flight,
+            read_io_reserve,
+            statistics_enabled,
+        ));
         let command_capacity = max_in_flight
             .checked_mul(2)
             .and_then(|depth| depth.checked_add(1))
@@ -2063,9 +2080,10 @@ mod uring {
         pub(crate) fn new_with_files(
             files: RuntimeFileSet,
             max_in_flight: usize,
+            read_io_reserve: usize,
             statistics_enabled: bool,
         ) -> io::Result<Self> {
-            RuntimeInner::validate_max_in_flight(max_in_flight)?;
+            RuntimeInner::validate_limits(max_in_flight, read_io_reserve)?;
             files.set_statistics_enabled(statistics_enabled);
             let io_stats = files.stats_handle();
             let ring_entries = max_in_flight
@@ -2112,7 +2130,11 @@ mod uring {
             let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
                 sender: wake_sender,
             });
-            let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
+            let shared = Arc::new(RuntimeShared::new(
+                max_in_flight,
+                read_io_reserve,
+                statistics_enabled,
+            ));
             let command_capacity = max_in_flight
                 .checked_mul(2)
                 .and_then(|depth| depth.checked_add(1))
@@ -2974,16 +2996,22 @@ pub(crate) use uring::UringIoEngine;
 pub(crate) fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
+    posix_workers: usize,
+    read_io_reserve: usize,
     kind: ConfiguredIoEngine,
     statistics_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        ConfiguredIoEngine::Posix => {
-            let _ = max_in_flight;
-            BackendIoEngine::new_with_files_and_workers(files, 1, 1, statistics_enabled)
-                .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
-        }
+        ConfiguredIoEngine::Posix => BackendIoEngine::new_with_files_and_workers(
+            files,
+            max_in_flight,
+            posix_workers,
+            read_io_reserve,
+            statistics_enabled,
+        )
+        .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
         ConfiguredIoEngine::IoUring => {
+            let _ = posix_workers;
             #[cfg(all(
                 feature = "io-uring",
                 target_os = "linux",
@@ -2996,8 +3024,13 @@ pub(crate) fn build_file_engine(
                 )
             ))]
             {
-                UringIoEngine::new_with_files(files, max_in_flight, statistics_enabled)
-                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+                UringIoEngine::new_with_files(
+                    files,
+                    max_in_flight,
+                    read_io_reserve,
+                    statistics_enabled,
+                )
+                .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             #[cfg(not(all(
                 feature = "io-uring",
@@ -3571,19 +3604,19 @@ mod tests {
     fn engine_request_capacity_is_hard_bounded() {
         let file = TestFile::new();
         assert!(matches!(
-            BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_WORKER + 1),
+            BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_ENGINE + 1),
             Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
     }
 
     #[cfg(unix)]
     #[test]
-    fn configured_posix_engine_exposes_only_its_executable_slot() {
+    fn configured_posix_engine_shares_its_worker_capacity() {
         let file = TestFile::new();
         let files = RuntimeFileSet::new(file.file(), None);
-        let engine = build_file_engine(files, 32, ConfiguredIoEngine::Posix, false).unwrap();
+        let engine = build_file_engine(files, 4, 4, 1, ConfiguredIoEngine::Posix, false).unwrap();
 
-        let reserved = engine.try_reserve_read().unwrap();
+        let reserved: Vec<_> = (0..4).map(|_| engine.try_reserve_read().unwrap()).collect();
         assert_eq!(
             engine.try_reserve_read().err().unwrap().kind(),
             io::ErrorKind::WouldBlock
@@ -3597,7 +3630,8 @@ mod tests {
     fn disabled_io_statistics_skip_cumulative_engine_counters() {
         let file = TestFile::new();
         let engine =
-            BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false).unwrap();
+            BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, 0, false)
+                .unwrap();
         let resources = resources(1);
         let completion = engine
             .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x5a]), 0)
@@ -3610,7 +3644,7 @@ mod tests {
 
     #[test]
     fn writes_reserve_the_final_engine_slot_for_reads() {
-        let shared = Arc::new(RuntimeShared::new(2, true));
+        let shared = Arc::new(RuntimeShared::new(2, 1, true));
         let write = shared.try_reserve_slot(true).unwrap();
         assert!(shared.try_reserve_slot(true).is_none());
         let read = shared.try_reserve_slot(false).unwrap();
@@ -3623,13 +3657,25 @@ mod tests {
         assert_eq!(shared.writes_in_flight(), 1);
         drop((read, write));
 
-        let depth_one = Arc::new(RuntimeShared::new(1, true));
+        let depth_one = Arc::new(RuntimeShared::new(1, 0, true));
         assert!(depth_one.try_reserve_slot(true).is_some());
     }
 
     #[test]
+    fn configurable_read_reserve_caps_write_occupancy() {
+        let shared = Arc::new(RuntimeShared::new(4, 2, true));
+        let first_write = shared.try_reserve_slot(true).unwrap();
+        let second_write = shared.try_reserve_slot(true).unwrap();
+        assert!(shared.try_reserve_slot(true).is_none());
+        let first_read = shared.try_reserve_slot(false).unwrap();
+        let second_read = shared.try_reserve_slot(false).unwrap();
+        assert_eq!(shared.total_in_flight(), 4);
+        drop((first_write, second_write, first_read, second_read));
+    }
+
+    #[test]
     fn waiting_write_gets_the_next_slot_under_read_pressure() {
-        let shared = Arc::new(RuntimeShared::new(2, true));
+        let shared = Arc::new(RuntimeShared::new(2, 1, true));
         let first = shared.try_reserve_slot(false).unwrap();
         let second = shared.try_reserve_slot(false).unwrap();
         let waiting = Arc::clone(&shared);
@@ -3657,7 +3703,7 @@ mod tests {
 
     #[test]
     fn write_waiter_does_not_consume_the_read_reserved_slot() {
-        let shared = Arc::new(RuntimeShared::new(2, true));
+        let shared = Arc::new(RuntimeShared::new(2, 1, true));
         let first_write = shared.try_reserve_slot(true).unwrap();
         let waiting = Arc::clone(&shared);
         let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
@@ -3858,7 +3904,7 @@ mod tests {
 
     #[test]
     fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
-        let shared = Arc::new(RuntimeShared::new(1, true));
+        let shared = Arc::new(RuntimeShared::new(1, 0, true));
         let slot = shared.try_reserve_slot(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
