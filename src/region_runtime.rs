@@ -736,20 +736,6 @@ impl RegionDataPlane {
                         operation,
                     )?;
                 }
-                RegionStageValue::ManagerBusy => {
-                    // Region authority contention is unrelated to this shard's
-                    // capacity. Waiting on or urgently waking this shard cannot
-                    // make it progress, and can force an unrelated partial
-                    // batch to flush. Fail fast so the caller can retry.
-                    drop(operation);
-                    drop(permit);
-                    let reason = WriteOverloadReason::WriteBufferBusy;
-                    if running.statistics {
-                        RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
-                        running.metrics.record_write_rejection();
-                    }
-                    return Err(overload_runtime_error(reason));
-                }
             }
         }
     }
