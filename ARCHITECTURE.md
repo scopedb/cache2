@@ -7,7 +7,7 @@ copy of every value must live elsewhere.
 
 ```text
 HybridCache
-├── shared bounded RAM L1 + visibility fences
+├── shared bounded RAM L1
 ├── fixed-capacity partitioned mmap index
 ├── namespace → RegionSet router
 │ ├── RegionSet 0: append shards + private Region range + free/sealed FIFO
@@ -18,10 +18,11 @@ HybridCache
 
 RAM is a process-local L1 and the Region file is L2. Both tiers use the same key
 hash. The hash is seeded XXH3-64; L1 disambiguates a hash
-bucket with the namespace and complete key, while L2 validates the complete
-encoded key after reading a hash-selected record. A collision may therefore
-become a conservative miss but can never return another key's value. There is
-one SSD format and no Bucket engine, journal, or separate write-back executor.
+bucket with the namespace and complete key, while L2 validates the header
+namespace and complete raw key after reading a hash-selected record. A
+collision may therefore become a conservative miss but can never return
+another key's value. There is one SSD format and no Bucket engine, journal, or
+separate write-back executor.
 
 A RegionSet is an L2 retention boundary. Static capacity weights assign each
 set a contiguous Region range; append shards are assigned contiguous ranges
@@ -53,21 +54,19 @@ A `put` follows a direct bounded path:
 2. route the namespace to a RegionSet, then select one of its append shards;
 3. reserve bytes and sequence authority from the Region manager;
 4. encode directly into that shard's aligned staging buffer;
-5. publish the same sequence as a pending RAM entry when it fits, before
-   returning;
+5. publish the same sequence to RAM when it fits, before returning;
 6. seal a batch on size, age, or Region rotation;
 7. submit the owned buffer to one configured I/O engine;
-8. publish the index entry and mark the RAM entry clean only from successful
-   completion.
+8. publish the index entry only after successful completion.
 
 Each shard has exactly two staging buffers, allowing one submitted batch and one
 fill batch without allocating per request. RAM entries are byte-bounded per
-shard; pending entries stay resident until their matching completion, while
-clean victim order is selected at runtime from CLOCK, LRU, TinyLFU admission
-over LRU, SIEVE, FIFO, or S3-FIFO. The policy owns only slot-order metadata:
-capacity charging, pending eligibility, TTL, and full-key validation remain one
-common mechanism. Values that do not fit L1 continue through L2 without an
-additional queue. FIFO Region reuse remains the only SSD replacement policy.
+shard and immediately eligible for eviction. Victim order is selected at
+runtime from CLOCK, LRU, TinyLFU admission over LRU, SIEVE, FIFO, or S3-FIFO.
+The policy owns only slot-order metadata; capacity charging, TTL, and full-key
+validation remain one common mechanism. Values that do not fit L1 continue
+through L2 without an additional queue. FIFO Region reuse remains the only SSD
+replacement policy.
 L1 capacity remains charged through the last returned value handle, so eviction
 cannot hide memory retained by a slow caller.
 
@@ -77,12 +76,12 @@ targets and bounds its non-resident hash-only ghost queue by the corresponding
 maximum entry count. Policy metadata is covered by the fixed per-entry L1
 overhead estimate; it cannot increase the configured payload/entry charge.
 
-A `get` first checks the shared RAM tier. On an L1 miss it snapshots the relevant
-revision, looks up the fixed-size L2 index, reserves one bounded engine slot,
-allocates the exact aligned read range, reads and validates the record, then
-revalidates Region, index, append-shard authority, and that the Region belongs
-to the namespace's configured set before promoting a clean RAM copy. A
-concurrent newer `put` prevents an older L2 result from being promoted.
+A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
+L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
+read range, and reads one record. Local validation checks the planned location,
+sequence, hash, namespace, complete key, lengths, expiration, and checksums.
+There is no retry or second freshness check; a concurrently superseded but
+otherwise valid value may be returned or promoted.
 Expiration is lazy: the wall clock is sampled only after a matching entry with
 a nonzero expiration is found, so namespace-only and default hits do not pay
 for timekeeping.
@@ -171,7 +170,8 @@ remain observable when counters are disabled.
 
 ## Safety boundary
 
-HybridCache loss is acceptable; returning unchecked or stale physical data is not.
+HybridCache loss and stale valid values are acceptable; unchecked, wrong-key,
+out-of-bounds, or corrupt values are not.
 All sizes and offsets are checked, persistent structures are field-encoded and
 checksummed, reads verify full keys, Region reuse uses incarnation authority,
 and bounded buffers retain ownership through I/O completion. Device or

@@ -2,8 +2,8 @@
 //!
 //! This layer owns the sharded storage but deliberately does not own Region
 //! visibility or logical accounting. A lookup returns only the raw typed point
-//! state and releases its canonical partition before the caller consults Region
-//! authority. Mutations receive one authority object after the caller has
+//! state and releases its canonical partition before record I/O. Mutations
+//! receive one authority object after the caller has
 //! acquired stable Region-manager authority. No slot is modified until the
 //! probe has selected its final target. The same object supplies visibility
 //! during the probe and consumes the exact committed transition before the
@@ -79,9 +79,8 @@ impl RegionIndex {
 
     /// Looks up the raw typed state for one same-hash identity.
     ///
-    /// Region generation and clear-floor visibility deliberately do not run
-    /// here: the partition guard is released when this method returns, before the
-    /// runtime consults its Region manager.
+    /// Region-generation visibility deliberately does not run here. The read
+    /// path validates the selected physical record locally after I/O.
     pub(crate) fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let start = start_slot(hash, partition.slot_count());

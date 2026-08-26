@@ -23,7 +23,8 @@ version number documented in `MILESTONES.md`.
 - a bounded recovery-scale benchmark covering fresh/warm open, initial and
   recovered warm close, sentinel validation, file bounds, and fast close.
 - runtime-selectable CLOCK, LRU, TinyLFU, SIEVE, FIFO, and S3-FIFO RAM eviction
-  with shared byte bounds, pending-write pinning, and collision-safe lookup.
+  with shared byte bounds, immediate eviction eligibility, and collision-safe
+  lookup.
 - static namespace-to-RegionSet routing with weighted physical Region ranges,
   independent FIFO rotation, deterministic append-shard assignment, and warm
   recovery without a second disk format.

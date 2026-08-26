@@ -87,8 +87,8 @@ Exit criteria:
 2. no workload causes managed memory, queues, or logical files to exceed their
    documented limits;
 3. each supported I/O mode has a published reproducible benchmark result;
-4. a multi-hour turnover soak has no stale read, hang, or monotonic resource
-   growth.
+4. a multi-hour turnover soak has no unchecked or wrong-key read, hang, or
+   monotonic resource growth.
 
 ## M3 — Operable release candidate
 
