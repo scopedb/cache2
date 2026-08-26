@@ -372,28 +372,29 @@ fn concurrent_reads(
                     let mut attempts = 1;
                     let mut retry_deadline = None;
                     let value = loop {
-                        match cache.get(black_box(key))? {
-                            Some(value) => break value,
-                            None => {
-                                let deadline = retry_deadline
-                                    .get_or_insert_with(|| Instant::now() + READ_RETRY_TIMEOUT);
-                                if Instant::now() >= *deadline {
-                                    return Err(io::Error::other(format!(
-                                        "benchmark key {key_ordinal} missed on client {client} after {attempts} attempts",
-                                    )));
-                                }
-                                attempts += 1;
-                                thread::sleep(READ_RETRY_DELAY);
+                        if let Some(value) = cache.get(black_box(key))? {
+                            verify_value(key_ordinal, &value)?;
+                            if value.tier() == expected_tier {
+                                break value;
                             }
+                            if expected_tier != CacheTier::L1 {
+                                return Err(io::Error::other(format!(
+                                    "expected {expected_tier:?} hit, observed {:?}",
+                                    value.tier()
+                                )));
+                            }
+                            black_box(value.as_ref());
                         }
+                        let deadline = retry_deadline
+                            .get_or_insert_with(|| Instant::now() + READ_RETRY_TIMEOUT);
+                        if Instant::now() >= *deadline {
+                            return Err(io::Error::other(format!(
+                                "benchmark key {key_ordinal} did not produce an {expected_tier:?} hit on client {client} after {attempts} attempts",
+                            )));
+                        }
+                        attempts += 1;
+                        thread::sleep(READ_RETRY_DELAY);
                     };
-                    if value.tier() != expected_tier {
-                        return Err(io::Error::other(format!(
-                            "expected {expected_tier:?} hit, observed {:?}",
-                            value.tier()
-                        )));
-                    }
-                    verify_value(key_ordinal, &value)?;
                     bytes += value.len() as u128;
                     checksum = checksum.wrapping_add(
                         (ordinal as u64).rotate_left(17) ^ u64::from(value[ordinal % value.len()]),

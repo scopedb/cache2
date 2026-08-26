@@ -4,10 +4,11 @@ This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
 
 The current harness gives its fixed index extra headroom for the complete L2
-working set and retries rejected writes. Its concurrent post-reopen L2 phase
-also permits at most 16 immediate attempts for an allowed warm-page validation
-contention miss; exhausting that fixed budget is a hard failure. Rerun the
-baseline before treating historical thresholds as release gates.
+working set and retries rejected writes. Every measured read retries pressure
+misses for at most one second with a short delay. The L1 phases also retry a
+valid L2 fallback caused by best-effort shard-lock contention; that extra work
+remains inside the measured latency. Rerun the baseline before treating
+historical thresholds as release gates.
 
 ## M1 local baseline — 2026-08-24
 
