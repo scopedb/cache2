@@ -244,7 +244,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     );
     println!("file={}", files.data.display());
 
-    let cache = Arc::new(files.config(&config).open()?);
+    let cache = Arc::new(files.config(&config).open().await?);
     let started = Instant::now();
     let mut write_checksum = 0_u64;
     let mut write_attempts = 0_usize;
@@ -257,7 +257,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         throttled_writes = throttled_writes.saturating_add(usize::from(attempts > 1));
         write_checksum = write_checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
     }
-    cache.drain()?;
+    cache.drain().await?;
     let put = Measurement {
         elapsed: started.elapsed(),
         operations: config.entries,
@@ -293,11 +293,12 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let started = Instant::now();
     Arc::try_unwrap(cache)
         .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
-        .close_warm()?;
+        .close_warm()
+        .await?;
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
-    let cache = Arc::new(files.config(&config).open()?);
+    let cache = Arc::new(files.config(&config).open().await?);
     if cache.startup_mode() != StartupMode::Warm {
         return Err(io::Error::other(
             "benchmark did not reopen from a clean image",
@@ -346,7 +347,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     }
     Arc::try_unwrap(cache)
         .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
-        .close_fast()?;
+        .close_fast()
+        .await?;
 
     enforce_thresholds(&put, &l1, warm_close, &promotion, &promoted_l1)?;
 

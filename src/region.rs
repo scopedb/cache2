@@ -416,8 +416,13 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.delete(namespace_id, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn drain(&self) -> io::Result<()> {
         self.runtime()?.data_plane()?.drain()
+    }
+
+    pub(crate) async fn drain_async(&self) -> io::Result<()> {
+        self.runtime()?.data_plane()?.drain_async().await
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
@@ -2811,7 +2816,7 @@ mod tests {
 
     #[test]
     fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
-        for case in ["operation", "shard", "index"] {
+        for case in ["shard", "index"] {
             let directory = TestDirectory::new();
             let data = production_data_superblock(512 * 1024);
             let runtime_config = RuntimeConfig::default()
@@ -2834,7 +2839,6 @@ mod tests {
 
             let runtime = store.runtime().unwrap();
             match case {
-                "operation" => runtime.data_plane().unwrap().poison_operations_for_test(),
                 "shard" => runtime.data_plane().unwrap().poison_shard_for_test(0),
                 "index" => runtime
                     .core

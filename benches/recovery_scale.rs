@@ -170,7 +170,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     );
 
     let opened = Instant::now();
-    let cache = files.config(&config).open()?;
+    let cache = files.config(&config).open().await?;
     emit("fresh_open", opened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Cold)?;
     let resources = cache.snapshot()?;
@@ -188,33 +188,33 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
         put_eventually(&cache, key, &value)?;
     }
-    cache.drain()?;
+    cache.drain().await?;
     emit("populate_and_drain", populated.elapsed());
 
     let closed = Instant::now();
-    cache.close_warm()?;
+    cache.close_warm().await?;
     emit("initial_close_warm", closed.elapsed());
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = files.config(&config).open()?;
+    let cache = files.config(&config).open().await?;
     emit("warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys).await?;
 
     let closed = Instant::now();
-    cache.close_warm()?;
+    cache.close_warm().await?;
     emit("recovered_close_warm", closed.elapsed());
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = files.config(&config).open()?;
+    let cache = files.config(&config).open().await?;
     emit("second_warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys).await?;
 
     let closed = Instant::now();
-    cache.close_fast()?;
+    cache.close_fast().await?;
     emit("close_fast", closed.elapsed());
     println!("complete status=pass");
     Ok(())

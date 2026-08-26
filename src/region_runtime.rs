@@ -7,8 +7,8 @@
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
 use std::io;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, TryLockError};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,9 @@ const PLANNED_MIN_L1_ENTRY_BYTES: usize = 4 * 1024;
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
+const MUTATION_DRAINING: usize = 1_usize << (usize::BITS - 1);
+const MUTATION_COUNT_MASK: usize = !MUTATION_DRAINING;
+const MUTATION_ENTER_ATTEMPTS: usize = 8;
 
 const fn const_align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
@@ -95,6 +98,131 @@ impl Drop for LifecycleDrainingGuard<'_> {
                 Ordering::Acquire,
             );
         }
+    }
+}
+
+struct MutationGate {
+    state: AtomicUsize,
+    quiescent: Mutex<()>,
+    quiescent_changed: Condvar,
+    async_changed: tokio::sync::Notify,
+}
+
+impl MutationGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            quiescent: Mutex::new(()),
+            quiescent_changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_enter(&self) -> Option<MutationGuard<'_>> {
+        let mut state = self.state.load(Ordering::Acquire);
+        for _ in 0..MUTATION_ENTER_ATTEMPTS {
+            if state & MUTATION_DRAINING != 0 || state & MUTATION_COUNT_MASK == MUTATION_COUNT_MASK
+            {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(MutationGuard { gate: self }),
+                Err(observed) => state = observed,
+            }
+        }
+        None
+    }
+
+    fn begin_drain(&self) -> io::Result<MutationDrainGuard<'_>> {
+        let previous = self.state.fetch_or(MUTATION_DRAINING, Ordering::AcqRel);
+        if previous & MUTATION_DRAINING != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cache drain is already in progress",
+            ));
+        }
+        Ok(MutationDrainGuard { gate: self })
+    }
+
+    fn active_mutations(&self) -> usize {
+        self.state.load(Ordering::Acquire) & MUTATION_COUNT_MASK
+    }
+
+    fn wait_quiescent(&self) -> io::Result<()> {
+        let mut quiescent = self
+            .quiescent
+            .lock()
+            .map_err(|_| poisoned_runtime_error())?;
+        while self.active_mutations() != 0 {
+            quiescent = self
+                .quiescent_changed
+                .wait(quiescent)
+                .map_err(|_| poisoned_runtime_error())?;
+        }
+        Ok(())
+    }
+
+    async fn wait_quiescent_async(&self) {
+        while self.active_mutations() != 0 {
+            let notified = self.async_changed.notified();
+            if self.active_mutations() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn mutation_finished(&self) {
+        let previous = self.state.fetch_sub(1, Ordering::Release);
+        debug_assert_ne!(previous & MUTATION_COUNT_MASK, 0);
+        if previous == (MUTATION_DRAINING | 1) {
+            let quiescent = self
+                .quiescent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.quiescent_changed.notify_all();
+            drop(quiescent);
+            self.async_changed.notify_one();
+        }
+    }
+}
+
+struct MutationGuard<'a> {
+    gate: &'a MutationGate,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.mutation_finished();
+    }
+}
+
+struct MutationDrainGuard<'a> {
+    gate: &'a MutationGate,
+}
+
+impl MutationDrainGuard<'_> {
+    fn wait(&self) -> io::Result<()> {
+        self.gate.wait_quiescent()
+    }
+
+    async fn wait_async(&self) {
+        self.gate.wait_quiescent_async().await;
+    }
+}
+
+impl Drop for MutationDrainGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self
+            .gate
+            .state
+            .fetch_and(MUTATION_COUNT_MASK, Ordering::Release);
+        debug_assert_ne!(previous & MUTATION_DRAINING, 0);
     }
 }
 
@@ -487,7 +615,7 @@ pub(crate) struct RegionDataPlane {
     running: RunningOwner,
     // Fences write admission for drain, flush, and shutdown. Reads do not
     // participate because they cannot extend the set of records being fenced.
-    operations: RwLock<()>,
+    operations: MutationGate,
 }
 
 struct RunningOwner {
@@ -544,6 +672,7 @@ struct ShardControlState {
 struct ShardControl {
     state: Mutex<ShardControlState>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
 }
 
 impl ShardControl {
@@ -551,6 +680,7 @@ impl ShardControl {
         Self {
             state: Mutex::new(ShardControlState::default()),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -600,6 +730,22 @@ impl ShardControl {
         Ok(())
     }
 
+    async fn wait_for_drain_async(&self, generation: u64) -> io::Result<()> {
+        loop {
+            let notified = self.async_changed.notified();
+            {
+                let state = self.lock()?;
+                if let Some(failure) = &state.failure {
+                    return Err(failure.to_error());
+                }
+                if state.drain_completed >= generation {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn fail(&self, error: &io::Error) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -609,6 +755,7 @@ impl ShardControl {
             .failure
             .get_or_insert_with(|| ShardFailure::from_error(error));
         self.changed.notify_all();
+        self.async_changed.notify_one();
     }
 
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, ShardControlState>> {
@@ -638,7 +785,7 @@ impl RegionDataPlane {
             config,
             metrics,
             running,
-            operations: RwLock::new(()),
+            operations: MutationGate::new(),
         })
     }
 
@@ -675,15 +822,14 @@ impl RegionDataPlane {
         let activity = running
             .statistics
             .then(|| running.metrics.activity_for_hash(hash));
-        let operation = match self.operations.try_read() {
-            Ok(operation) => operation,
-            Err(TryLockError::WouldBlock) => {
+        let operation = match self.operations.try_enter() {
+            Some(operation) => operation,
+            None => {
                 if running.statistics {
                     running.metrics.record_write_rejection();
                 }
                 return Err(write_overload_error());
             }
-            Err(TryLockError::Poisoned(_)) => return Err(poisoned_runtime_error()),
         };
         let staged = match mutation {
             RuntimeMutation::Put(value) => self.core.try_stage_value(
@@ -953,14 +1099,21 @@ impl RegionDataPlane {
 
     /// Completes and publishes every record admitted before this call. This is
     /// an I/O completion barrier, not an fdatasync durability boundary.
+    #[cfg(test)]
     pub(crate) fn drain(&self) -> io::Result<()> {
-        let _exclusive = self
-            .operations
-            .write()
-            .map_err(|_| poisoned_runtime_error())?;
+        let operations = self.operations.begin_drain()?;
+        operations.wait()?;
         let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
         let running = &self.running.shared;
         drain_shards(running, false)
+    }
+
+    pub(crate) async fn drain_async(&self) -> io::Result<()> {
+        let operations = self.operations.begin_drain()?;
+        operations.wait_async().await;
+        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
+        let running = &self.running.shared;
+        drain_shards_async(running, false).await
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
@@ -1008,27 +1161,10 @@ impl RegionDataPlane {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let (_exclusive, poisoned) = match operations.write() {
-            Ok(exclusive) => (exclusive, false),
-            Err(error) => (error.into_inner(), true),
-        };
+        let operations = operations.begin_drain()?;
+        operations.wait()?;
         let retain_lock = stop_running(running)?;
-        if retain_lock {
-            Ok(true)
-        } else if poisoned {
-            Err(poisoned_runtime_error())
-        } else {
-            Ok(false)
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poison_operations_for_test(&self) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _exclusive = self.operations.write().unwrap();
-            panic!("poison operation gate");
-        }));
-        assert!(result.is_err());
+        Ok(retain_lock)
     }
 
     #[cfg(test)]
@@ -1383,6 +1519,8 @@ fn complete_shard_drain(control: &ShardControl, generation: u64) -> io::Result<(
     let mut state = control.lock()?;
     state.drain_completed = state.drain_completed.max(generation);
     control.changed.notify_all();
+    drop(state);
+    control.async_changed.notify_one();
     Ok(())
 }
 
@@ -1404,6 +1542,31 @@ fn drain_shards(shared: &RunningShared, stop: bool) -> io::Result<()> {
     for (shard, generation) in shared.shards.iter().zip(generations) {
         if let Some(generation) = generation
             && let Err(error) = shard.wait_for_drain(generation)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn drain_shards_async(shared: &RunningShared, stop: bool) -> io::Result<()> {
+    let mut generations = Vec::new();
+    generations
+        .try_reserve_exact(shared.shards.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate drain fence"))?;
+    let mut first_error = None;
+    for shard in &shared.shards {
+        match shard.request_drain(stop) {
+            Ok(generation) => generations.push(Some(generation)),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                generations.push(None);
+            }
+        }
+    }
+    for (shard, generation) in shared.shards.iter().zip(generations) {
+        if let Some(generation) = generation
+            && let Err(error) = shard.wait_for_drain_async(generation).await
         {
             first_error.get_or_insert(error);
         }
@@ -1550,6 +1713,56 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_gate_fences_existing_and_new_mutations() {
+        let gate = MutationGate::new();
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+
+        assert!(gate.try_enter().is_none());
+        drop(mutation);
+        drain.wait().unwrap();
+        assert!(gate.try_enter().is_none());
+
+        drop(drain);
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn mutation_gate_wakes_async_drain_without_blocking() {
+        let gate = Arc::new(MutationGate::new());
+        let mutation = gate.try_enter().unwrap();
+        let drain_gate = Arc::clone(&gate);
+        let drain = tokio::spawn(async move {
+            let drain = drain_gate.begin_drain().unwrap();
+            drain.wait_async().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.try_enter().is_none());
+
+        drop(mutation);
+        drain.await.unwrap();
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_async_drain_reopens_mutation_admission() {
+        let gate = Arc::new(MutationGate::new());
+        let mutation = gate.try_enter().unwrap();
+        let drain_gate = Arc::clone(&gate);
+        let drain = tokio::spawn(async move {
+            let drain = drain_gate.begin_drain().unwrap();
+            drain.wait_async().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.try_enter().is_none());
+
+        drain.abort();
+        assert!(drain.await.unwrap_err().is_cancelled());
+        assert!(gate.try_enter().is_some());
+        drop(mutation);
+    }
 
     #[test]
     fn urgent_empty_shard_wake_is_consumed() {

@@ -116,17 +116,17 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
 #[tokio::test]
 async fn fast_close_always_reopens_empty() {
     let files = TestCache::new("fast-close");
-    let cache = files.config(1).open().unwrap();
+    let cache = files.config(1).open().await.unwrap();
     assert_eq!(cache.startup_mode(), StartupMode::Cold);
     cache.put("key", "value").unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), b"value");
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 
-    let reopened = files.config(7).open().unwrap();
+    let reopened = files.config(7).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -137,7 +137,12 @@ async fn immediate_l1_publication_is_best_effort() {
         .with_io_workers(2)
         .with_io_concurrency(8)
         .with_statistics(true);
-    let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
+    let cache = files
+        .config(2)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
     let mut visible = 0;
     let mut last_sequence = 0;
     for version in 0_u8..64 {
@@ -158,7 +163,7 @@ async fn immediate_l1_publication_is_best_effort() {
         }
     }
     assert!(visible > 0);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -173,7 +178,12 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
         .with_l1_shards(1)
         .with_write_batch_size(256 * 1024)
         .with_statistics(true);
-    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let cache = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
     let first = vec![1_u8; 200 * 1024];
     let second = vec![2_u8; 200 * 1024];
 
@@ -190,10 +200,10 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
         1
     );
 
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     eventually_admitted(|| cache.put("key", &second));
     assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), second);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -208,10 +218,15 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
         .with_l1_shards(1)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
-    let cache = files.config(2).with_runtime_config(runtime).open().unwrap();
+    let cache = files
+        .config(2)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
 
     cache.put("key", "old").unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     let replacement = vec![9_u8; 1024];
     cache.put("key", &replacement).unwrap();
     assert_eq!(cache.snapshot().unwrap().l1_bypasses, 1);
@@ -219,11 +234,11 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
     assert_eq!(stale.as_ref(), b"old");
     drop(stale);
 
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     let value = cache.get("key").await.unwrap().unwrap();
     assert!(value.as_ref() == b"old" || value.as_ref() == replacement);
     drop(value);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[cfg(not(all(
@@ -237,8 +252,8 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
         target_arch = "powerpc64"
     )
 )))]
-#[test]
-fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
+#[tokio::test]
+async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::IoUring)
@@ -252,38 +267,39 @@ fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
         .config(1)
         .with_runtime_config(runtime)
         .open()
+        .await
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 
-    let reopened = files.config(1).open().unwrap();
+    let reopened = files.config(1).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn latest_put_survives_warm_recovery() {
     let files = TestCache::new("latest-warm-recovery");
-    let cache = files.config(3).open().unwrap();
+    let cache = files.config(3).open().await.unwrap();
     for version in 0_u8..64 {
         eventually_admitted(|| cache.put("key", [version; 1024]));
     }
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
-    let reopened = files.config(5).open().unwrap();
+    let reopened = files.config(5).open().await.unwrap();
     let value = reopened.get("key").await.unwrap().unwrap();
     assert_eq!(value.tier(), CacheTier::L2);
     assert_eq!(value.as_ref(), &[63; 1024]);
     drop(value);
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     let files = TestCache::new("warm-close");
-    let cache = files.config(1).open().unwrap();
+    let cache = files.config(1).open().await.unwrap();
     cache.put("key", vec![7_u8; 16 * 1024]).unwrap();
-    cache.drain().unwrap();
-    cache.close_warm().unwrap();
+    cache.drain().await.unwrap();
+    cache.close_warm().await.unwrap();
 
     let retuned = RuntimeConfig::default()
         .with_io_engine(IoEngine::Sync)
@@ -293,7 +309,12 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
         .with_write_batch_size(64 * 1024);
-    let reopened = files.config(7).with_runtime_config(retuned).open().unwrap();
+    let reopened = files
+        .config(7)
+        .with_runtime_config(retuned)
+        .open()
+        .await
+        .unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     let first = reopened.get("key").await.unwrap().unwrap();
     assert_eq!(first.tier(), CacheTier::L2);
@@ -308,16 +329,16 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     assert!(!snapshot.statistics_enabled);
     assert_eq!(snapshot.l1_hits, 0);
     assert!(snapshot.managed_memory_bytes <= snapshot.managed_memory_limit_bytes);
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn namespaces_are_independent() {
     let files = TestCache::new("namespaces");
-    let cache = files.config(3).open().unwrap();
+    let cache = files.config(3).open().await.unwrap();
     cache.put_in(1, "key", "one").unwrap();
     cache.put_in(2, "key", "two").unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     assert_eq!(
         cache.get_in(1, "key").await.unwrap().unwrap().as_ref(),
         b"one"
@@ -326,20 +347,20 @@ async fn namespaces_are_independent() {
         cache.get_in(2, "key").await.unwrap().unwrap().as_ref(),
         b"two"
     );
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn delete_is_namespaced_sequenced_and_warm_recoverable() {
     let files = TestCache::new("delete-warm-recovery");
-    let cache = files.config(3).open().unwrap();
+    let cache = files.config(3).open().await.unwrap();
     let put_sequence = cache.put_in(1, "key", "one").unwrap();
     cache.put_in(2, "key", "two").unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     let delete_sequence = cache.delete_in(1, "key").unwrap();
     assert!(delete_sequence > put_sequence);
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     assert!(cache.get_in(1, "key").await.unwrap().is_none());
     assert_eq!(
         cache.get_in(2, "key").await.unwrap().unwrap().as_ref(),
@@ -348,9 +369,9 @@ async fn delete_is_namespaced_sequenced_and_warm_recoverable() {
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.puts, 2);
     assert_eq!(snapshot.deletes, 1);
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
-    let reopened = files.config(5).open().unwrap();
+    let reopened = files.config(5).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     assert!(reopened.get_in(1, "key").await.unwrap().is_none());
     assert_eq!(
@@ -360,12 +381,12 @@ async fn delete_is_namespaced_sequenced_and_warm_recoverable() {
 
     let replacement_sequence = reopened.put_in(1, "key", "new").unwrap();
     assert!(replacement_sequence > delete_sequence);
-    reopened.drain().unwrap();
+    reopened.drain().await.unwrap();
     assert_eq!(
         reopened.get_in(1, "key").await.unwrap().unwrap().as_ref(),
         b"new"
     );
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -378,7 +399,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     const HEADER_BYTES: usize = 16;
 
     let files = TestCache::new("concurrent-mixed");
-    let cache = files.config(4).open().unwrap();
+    let cache = files.config(4).open().await.unwrap();
     let keys: Vec<_> = (0..KEY_COUNT)
         .map(|key| {
             format!("mixed-key-{key:04}")
@@ -461,7 +482,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
         start.store(true, Ordering::Release);
     });
 
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.health, CacheHealth::Running);
     assert_eq!(snapshot.puts, (WRITERS * WRITES_PER_CLIENT) as u64);
@@ -471,7 +492,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     );
     assert_eq!(snapshot.io_failures, 0);
     assert!(hits.load(Ordering::Relaxed) > 0);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -495,6 +516,7 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
     let cache = files
         .config_with_static(2, static_config.clone())
         .open()
+        .await
         .unwrap();
     let value = vec![0x5a; 240 * 1024];
 
@@ -503,11 +525,11 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
     eventually_admitted(|| cache.put_in(BULK, "bulk-survivor", &value));
     eventually_admitted(|| cache.put_in(BULK, "bulk-fill-1", &value));
     eventually_admitted(|| cache.put_in(BULK, "bulk-fill-2", &value));
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     for ordinal in 0..12 {
         eventually_admitted(|| cache.put_in(HOT, format!("hot-{ordinal}"), &value));
-        cache.drain().unwrap();
+        cache.drain().await.unwrap();
     }
 
     let detailed = cache.detailed_snapshot().unwrap();
@@ -534,9 +556,13 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
     );
     assert!(bulk.rotations > 0);
     assert!(hot.rotations > bulk.rotations);
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
-    let reopened = files.config_with_static(2, static_config).open().unwrap();
+    let reopened = files
+        .config_with_static(2, static_config)
+        .open()
+        .await
+        .unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     let survivor = reopened
         .get_in(BULK, "bulk-survivor")
@@ -546,11 +572,11 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
     assert_eq!(survivor.tier(), CacheTier::L2);
     assert_eq!(survivor.as_ref(), value);
     drop(survivor);
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
-#[test]
-fn invalid_runtime_config_is_rejected_before_file_creation() {
+#[tokio::test]
+async fn invalid_runtime_config_is_rejected_before_file_creation() {
     let cases: [RuntimeConfigCase; 6] = [
         ("workers-exceed-queue", |config| {
             config
@@ -587,6 +613,7 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
             .config(2)
             .with_runtime_config(configure(RuntimeConfig::default()))
             .open()
+            .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{case}");
         files.assert_absent();
@@ -596,7 +623,7 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
 #[tokio::test]
 async fn public_entry_size_limits_are_explicit() {
     let files = TestCache::new("entry-size-limits");
-    let cache = files.config(1).open().unwrap();
+    let cache = files.config(1).open().await.unwrap();
     let oversized_key = vec![0_u8; 4 * 1024 + 1];
     let oversized_value = vec![0_u8; 256 * 1024 + 1];
 
@@ -616,21 +643,21 @@ async fn public_entry_size_limits_are_explicit() {
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.puts, 0);
     assert_eq!(snapshot.deletes, 0);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
-#[test]
-fn cold_start_removes_stale_recovery_files() {
+#[tokio::test]
+async fn cold_start_removes_stale_recovery_files() {
     let files = TestCache::new("stale-recovery-files");
     let image = files.sidecar(".image");
     let temporary = files.sidecar(".image.next");
     std::fs::write(&image, b"stale image").unwrap();
     std::fs::write(&temporary, b"stale temporary image").unwrap();
 
-    let cache = files.config(2).open().unwrap();
+    let cache = files.config(2).open().await.unwrap();
     assert!(!image.exists());
     assert!(!temporary.exists());
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -645,21 +672,26 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let cache = files
         .config_with_static(1, static_config.clone())
         .open()
+        .await
         .unwrap();
     cache.put("first", &value).unwrap();
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
-    let recovered = files.config_with_static(1, static_config).open().unwrap();
+    let recovered = files
+        .config_with_static(1, static_config)
+        .open()
+        .await
+        .unwrap();
     assert_eq!(recovered.startup_mode(), StartupMode::Warm);
     assert_eq!(
         recovered.get("first").await.unwrap().unwrap().as_ref(),
         value
     );
-    recovered.close_fast().unwrap();
+    recovered.close_fast().await.unwrap();
 }
 
-#[test]
-fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
+#[tokio::test]
+async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
     let static_config = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
@@ -667,9 +699,13 @@ fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
         .with_write_shards(2);
     let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
 
-    let cache = files.config_with_static(2, static_config).open().unwrap();
+    let cache = files
+        .config_with_static(2, static_config)
+        .open()
+        .await
+        .unwrap();
     cache.put("key", vec![7_u8; 16 * 1024]).unwrap();
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
     let image = files.sidecar(".image");
     let temporary = files.sidecar(".image.next");
@@ -687,8 +723,8 @@ fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     assert_eq!(logical_bytes, peak_disk_bytes);
 }
 
-#[test]
-fn cache_snapshot_stays_within_the_configured_bounds() {
+#[tokio::test]
+async fn cache_snapshot_stays_within_the_configured_bounds() {
     let files = TestCache::new("resource-snapshot");
     let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
@@ -696,12 +732,12 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
         .with_write_shards(2)
         .peak_disk_bytes()
         .unwrap();
-    let cache = files.config(4).open().unwrap();
+    let cache = files.config(4).open().await.unwrap();
 
     for ordinal in 0_u64..128 {
         eventually_admitted(|| cache.put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024]));
     }
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     let resources = cache.snapshot().unwrap();
     assert_eq!(resources.health, CacheHealth::Running);
@@ -748,20 +784,20 @@ fn cache_snapshot_stays_within_the_configured_bounds() {
             + region_set.sealed_region_count,
         3
     );
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     let files = TestCache::new("activity-snapshot");
-    let cache = files.config(2).open().unwrap();
+    let cache = files.config(2).open().await.unwrap();
     cache.put("key", "value").unwrap();
     assert_eq!(
         cache.get("key").await.unwrap().unwrap().tier(),
         CacheTier::L1
     );
     assert!(cache.get("missing").await.unwrap().is_none());
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     let before_close = cache.snapshot().unwrap();
     assert_eq!(before_close.health, CacheHealth::Running);
@@ -777,9 +813,9 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(before_close.served_bytes, 5);
     assert_eq!(before_close.l1_promotions, 0);
     assert_eq!(before_close.io_failures, 0);
-    cache.close_warm().unwrap();
+    cache.close_warm().await.unwrap();
 
-    let reopened = files.config(3).open().unwrap();
+    let reopened = files.config(3).open().await.unwrap();
     let fresh = reopened.snapshot().unwrap();
     assert_eq!(fresh.puts, 0);
     assert_eq!(fresh.deletes, 0);
@@ -803,7 +839,7 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(warmed.l2_read_busy_misses, 0);
     assert_eq!(warmed.served_bytes, 10);
     assert_eq!(warmed.l1_promotions, 1);
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -817,9 +853,14 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
-    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let cache = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
     cache.put("key", vec![9_u8; 16 * 1024]).unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     std::fs::OpenOptions::new()
         .write(true)
@@ -833,7 +874,7 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
     assert_eq!(snapshot.l1_misses, 1);
     assert_eq!(snapshot.l2_misses, 1);
     assert_eq!(snapshot.io_failures, 1);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -852,13 +893,19 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
         .config(1)
         .with_runtime_config(runtime.clone())
         .open()
+        .await
         .unwrap();
     cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
     cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
-    cache.drain().unwrap();
-    cache.close_warm().unwrap();
+    cache.drain().await.unwrap();
+    cache.close_warm().await.unwrap();
 
-    let reopened = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let reopened = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
     let baseline = reopened.snapshot().unwrap().managed_memory_bytes;
     let first = reopened.get("key-1").await.unwrap().unwrap();
     assert_eq!(first.tier(), CacheTier::L2);
@@ -872,7 +919,7 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
     assert_eq!(snapshot.summary.managed_memory_bytes, baseline);
     assert_eq!(snapshot.summary.l1_promotions, 2);
     drop((first, second));
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -886,10 +933,15 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
         .with_statistics(true);
-    let cache = files.config(1).with_runtime_config(runtime).open().unwrap();
+    let cache = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap();
     cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
     cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
-    cache.drain().unwrap();
+    cache.drain().await.unwrap();
 
     let baseline = cache.snapshot().unwrap().managed_memory_bytes;
     let first = cache.get("key-1").await.unwrap().unwrap();
@@ -907,25 +959,25 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
     assert_eq!(snapshot.write_rejections, 0);
     drop((first, second));
     assert_eq!(cache.snapshot().unwrap().managed_memory_bytes, baseline);
-    cache.close_fast().unwrap();
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
 async fn static_config_change_discards_the_old_image() {
     let files = TestCache::new("static-change");
-    let cache = files.config(2).open().unwrap();
+    let cache = files.config(2).open().await.unwrap();
     cache.put("key", "old").unwrap();
-    cache.drain().unwrap();
-    cache.close_warm().unwrap();
+    cache.drain().await.unwrap();
+    cache.close_warm().await.unwrap();
 
     let changed = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
         .with_expected_entries(6553)
         .with_write_shards(2);
-    let reopened = files.config_with_static(5, changed).open().unwrap();
+    let reopened = files.config_with_static(5, changed).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
-    reopened.close_fast().unwrap();
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -936,9 +988,9 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
         ("image", StartupMode::Cold),
     ] {
         let files = TestCache::new(&format!("unsupported-{target}"));
-        let cache = files.config(2).open().unwrap();
+        let cache = files.config(2).open().await.unwrap();
         cache.put("key", "old").unwrap();
-        cache.close_warm().unwrap();
+        cache.close_warm().await.unwrap();
 
         match target {
             "data" => rewrite_page_version(&files.data, 0, 99),
@@ -950,9 +1002,9 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
             _ => unreachable!(),
         }
 
-        let reopened = files.config(3).open().unwrap();
+        let reopened = files.config(3).open().await.unwrap();
         assert_eq!(reopened.startup_mode(), expected_startup, "{target}");
         assert!(reopened.get("key").await.unwrap().is_none(), "{target}");
-        reopened.close_fast().unwrap();
+        reopened.close_fast().await.unwrap();
     }
 }

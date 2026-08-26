@@ -222,9 +222,12 @@ fn main() -> io::Result<()> {
     let files = SoakFiles::new(&config.directory);
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
-    let cache = HybridCacheConfig::from_static(&files.data, static_config)
-        .with_runtime_config(config.runtime_config())
-        .open()?;
+    let cache = runtime.block_on(async {
+        HybridCacheConfig::from_static(&files.data, static_config)
+            .with_runtime_config(config.runtime_config())
+            .open()
+            .await
+    })?;
     let keys: Vec<Box<[u8]>> = (0..config.key_count)
         .map(|ordinal| {
             format!("soak-key-{ordinal:016x}")
@@ -341,6 +344,7 @@ fn main() -> io::Result<()> {
                     peak_disk_bytes,
                     config.rss_slack_bytes,
                     true,
+                    runtime.handle(),
                 ) {
                     Ok(sample) => {
                         max_managed_memory = max_managed_memory
@@ -381,16 +385,17 @@ fn main() -> io::Result<()> {
         }
     })?;
 
-    cache.drain()?;
+    runtime.block_on(cache.drain())?;
     let sample = resource_sample(
         &cache,
         &files,
         peak_disk_bytes,
         config.rss_slack_bytes,
         false,
+        runtime.handle(),
     )?;
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
-    cache.close_fast()?;
+    runtime.block_on(async { cache.close_fast().await })?;
     report_sample(
         true,
         started.elapsed(),
@@ -568,9 +573,10 @@ fn resource_sample(
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,
     drain: bool,
+    runtime: &tokio::runtime::Handle,
 ) -> io::Result<ResourceSample> {
     if drain {
-        cache.drain()?;
+        runtime.block_on(cache.drain())?;
     }
     let logical_bytes = files.logical_bytes()?;
     if logical_bytes > peak_disk_bytes {

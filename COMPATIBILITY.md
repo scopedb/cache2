@@ -8,10 +8,10 @@ only when M4 is complete.
 
 The intended 1.0 surface is deliberately small:
 
-- `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and open a
-  cache;
+- `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and
+  asynchronously open a cache;
 - `HybridCache` provides synchronous point and namespace mutations plus native
-  Tokio-async `get` operations,
+  Tokio-async reads and lifecycle operations,
   a completion fence, snapshots, and explicit fast or warm close;
 - `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
 - `IoEngine` and `IoMode` select runtime I/O behavior.

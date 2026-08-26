@@ -36,7 +36,8 @@ let runtime_config = RuntimeConfig::default()
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
     .with_runtime_config(runtime_config)
-    .open()?;
+    .open()
+    .await?;
 
 cache.put("chunk-key", b"chunk bytes")?;
 let value = cache.get("chunk-key").await?.expect("cache hit");
@@ -46,10 +47,10 @@ assert_eq!(value.as_ref(), b"chunk bytes");
 cache.delete("chunk-key")?;
 
 // Waits for the async Region write and index publication.
-cache.drain()?;
+cache.drain().await?;
 
 // Publishes the only state that a later process is allowed to recover.
-cache.close_warm()?;
+cache.close_warm().await?;
 # Ok::<(), std::io::Error>(())
 # }
 ```
@@ -115,10 +116,12 @@ buffer is saturated or its short mutation path is contended; there is no
 global write-admission gate, wait policy, deadline, or foreground retry loop.
 Neither path holds a lock across device I/O.
 
-`get` and `get_in` are native Tokio futures. L1 hits and L2 index misses finish
-on their first poll; an admitted L2 candidate suspends the task until its one
-record read completes. Dropping the future requests best-effort cancellation,
-while the I/O engine retains the aligned buffer until the device completion so
+The public lifecycle and read API is Tokio-async. L1 hits and L2 index misses
+finish on their first poll; an admitted L2 candidate suspends the task until
+its one record read completes. `drain` waits natively on shard completion, while
+blocking filesystem and recovery work in `open` and close runs on Tokio's
+blocking pool. Dropping a read future requests best-effort cancellation, while
+the I/O engine retains the aligned buffer until the device completion so
 callers cannot outlive in-flight storage.
 
 `delete` uses the same shard routing, monotonic sequence, fixed staging, and

@@ -6,6 +6,7 @@
 //! state that a later process may recover.
 
 use std::fmt;
+use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,7 +303,15 @@ impl HybridCacheConfig {
         self
     }
 
-    pub fn open(self) -> Result<HybridCache> {
+    /// Opens the cache on Tokio's blocking pool because recovery and file setup
+    /// use blocking filesystem operations.
+    pub async fn open(self) -> Result<HybridCache> {
+        tokio::task::spawn_blocking(move || self.open_blocking())
+            .await
+            .map_err(|error| blocking_task_error("cache open", error))?
+    }
+
+    fn open_blocking(self) -> Result<HybridCache> {
         let geometry = self.static_config.geometry()?;
         let region_layout = self.static_config.region_layout(geometry)?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
@@ -453,8 +462,8 @@ impl HybridCache {
             .map(|value| value.map(|inner| Value { inner }))
     }
 
-    pub fn drain(&self) -> Result<()> {
-        self.store.drain()
+    pub async fn drain(&self) -> Result<()> {
+        self.store.drain_async().await
     }
 
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
@@ -472,13 +481,31 @@ impl HybridCache {
         Ok(snapshot)
     }
 
-    pub fn close_fast(mut self) -> Result<()> {
-        self.store.close_fast()
+    /// Stops without publishing a recovery image on Tokio's blocking pool.
+    /// Once called, the close continues even if the returned future is dropped.
+    pub fn close_fast(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
+        let close = tokio::task::spawn_blocking(move || self.store.close_fast());
+        async move {
+            close
+                .await
+                .map_err(|error| blocking_task_error("fast close", error))?
+        }
     }
 
-    pub fn close_warm(mut self) -> Result<()> {
-        self.store.close_warm()
+    /// Publishes a clean recovery image on Tokio's blocking pool. Once called,
+    /// the close continues even if the returned future is dropped.
+    pub fn close_warm(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
+        let close = tokio::task::spawn_blocking(move || self.store.close_warm());
+        async move {
+            close
+                .await
+                .map_err(|error| blocking_task_error("warm close", error))?
+        }
     }
+}
+
+fn blocking_task_error(operation: &'static str, error: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::other(format!("{operation} task failed: {error}"))
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
