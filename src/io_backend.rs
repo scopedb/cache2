@@ -232,10 +232,10 @@ impl RuntimeFileSet {
 
 pub(crate) fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -> bool {
     !buffer.is_null()
-        && buffer as usize % DIRECT_IO_ALIGNMENT == 0
+        && (buffer as usize).is_multiple_of(DIRECT_IO_ALIGNMENT)
         && length != 0
-        && length % DIRECT_IO_ALIGNMENT == 0
-        && offset % DIRECT_IO_ALIGNMENT as u64 == 0
+        && length.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        && offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -627,18 +627,18 @@ impl IoBackend for RuntimeFileBackend {
                     .files
                     .file_for(RuntimeIoPath::Buffered)
                     .read_at(buffer, offset);
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(RuntimeIoPath::Buffered, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(RuntimeIoPath::Buffered, bytes);
                 }
                 result
             }
             result => {
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(path, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(path, bytes);
                 }
                 result
             }
@@ -670,18 +670,18 @@ impl IoBackend for RuntimeFileBackend {
                         offset,
                     )
                 };
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(RuntimeIoPath::Buffered, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(RuntimeIoPath::Buffered, bytes);
                 }
                 result
             }
             result => {
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(path, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(path, bytes);
                 }
                 result
             }
@@ -701,18 +701,18 @@ impl IoBackend for RuntimeFileBackend {
                     .files
                     .file_for(RuntimeIoPath::Buffered)
                     .write_at(buffer, offset);
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(RuntimeIoPath::Buffered, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(RuntimeIoPath::Buffered, bytes);
                 }
                 result
             }
             result => {
-                if let Ok(bytes) = result {
-                    if bytes != 0 {
-                        self.files.record(path, bytes);
-                    }
+                if let Ok(bytes) = result
+                    && bytes != 0
+                {
+                    self.files.record(path, bytes);
                 }
                 result
             }

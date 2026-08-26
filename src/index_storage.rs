@@ -64,7 +64,7 @@ const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
         == INDEX_IMAGE_PAGE_SIZE
 );
-const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES % INDEX_IMAGE_PAGE_SIZE == 0);
+const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES.is_multiple_of(INDEX_IMAGE_PAGE_SIZE));
 
 /// One canonical, page-aligned partition of Index Image .
 ///
@@ -619,7 +619,7 @@ impl IndexStorage {
         if !physical_stats.is_valid_for(slot_count) {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
-        if file_offset % INDEX_IMAGE_PAGE_SIZE as u64 != 0 {
+        if !file_offset.is_multiple_of(INDEX_IMAGE_PAGE_SIZE as u64) {
             return Err(IndexStorageError::InvalidArgument(
                 "index image file offset must be 4 KiB aligned",
             ));

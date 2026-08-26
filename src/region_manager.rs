@@ -480,7 +480,7 @@ impl RegionManager {
         shard_id: usize,
         record_bytes: u32,
     ) -> Result<RegionAppendReservation, RegionMutationError> {
-        if record_bytes == 0 || record_bytes % RECORD_ALIGNMENT != 0 {
+        if record_bytes == 0 || !record_bytes.is_multiple_of(RECORD_ALIGNMENT) {
             return Err(RegionMutationError::InvalidRecordLength);
         }
         let shard = self
@@ -663,7 +663,7 @@ impl RegionManager {
             .checked_add(padding)
             .ok_or(RegionMutationError::ArithmeticOverflow)?;
         if padding >= alignment
-            || padding % u64::from(RECORD_ALIGNMENT) != 0
+            || !padding.is_multiple_of(u64::from(RECORD_ALIGNMENT))
             || padded_end_offset % alignment != 0
             || padded_end_offset > self.region_size
         {
@@ -778,7 +778,9 @@ impl RegionManager {
             || padding
                 .padding_bytes()
                 .is_none_or(|bytes| bytes == 0 || bytes as usize >= DIRECT_IO_ALIGNMENT)
-            || padding.padded_end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+            || !padding
+                .padded_end_offset
+                .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
         {
             return Err(RegionMutationError::StaleReceipt);
         }
@@ -812,7 +814,7 @@ impl RegionManager {
             "data shard has no staged records",
         ))?;
         if open.start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
-            || end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+            || !end_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
             || end_offset <= open.start_offset
         {
             return Err(RegionMutationError::Invariant(

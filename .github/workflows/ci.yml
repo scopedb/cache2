@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.85
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
-      - name: Select Rust 1.85
-        run: rustup default 1.85.0
+      - name: Install Rust 1.98
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Select Rust 1.98
+        run: rustup default 1.98.0
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check fuzz-target formatting
@@ -34,10 +34,10 @@ jobs:
         features: [default, no-default-features]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.85
-        run: rustup toolchain install 1.85.0 --profile minimal
-      - name: Select Rust 1.85
-        run: rustup default 1.85.0
+      - name: Install Rust 1.98
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Select Rust 1.98
+        run: rustup default 1.98.0
       - name: Check all targets
         if: matrix.features == 'default'
         run: cargo check --all-targets

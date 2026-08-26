@@ -123,7 +123,7 @@ impl DataGeometry {
             && self.region_count <= MAX_PACKED_REGION_COUNT
             && self.region_size >= RECOVERY_PAGE_SIZE as u64
             && self.region_size <= MAX_PACKED_REGION_SIZE
-            && self.region_size % RECOVERY_PAGE_SIZE as u64 == 0
+            && self.region_size.is_multiple_of(RECOVERY_PAGE_SIZE as u64)
             && Self::expected_file_len(self.region_size, self.region_count)
                 == Some(self.data_file_len)
     }
@@ -472,7 +472,9 @@ impl RecoveryImageHeader {
             return false;
         };
         let expected_file_len = (self.region_table_offset == index_end
-            && self.region_table_len % RECOVERY_PAGE_SIZE as u64 == 0
+            && self
+                .region_table_len
+                .is_multiple_of(RECOVERY_PAGE_SIZE as u64)
             && self.region_table_len != 0)
             .then(|| self.region_table_offset.checked_add(self.region_table_len))
             .flatten();
@@ -492,7 +494,7 @@ pub(crate) fn recovery_image_index_len(index_slots: u64) -> Option<u64> {
         return None;
     }
     let complete_pages = index_slots / RECOVERY_IMAGE_SLOTS_PER_PAGE;
-    let partial_page = u64::from(index_slots % RECOVERY_IMAGE_SLOTS_PER_PAGE != 0);
+    let partial_page = u64::from(!index_slots.is_multiple_of(RECOVERY_IMAGE_SLOTS_PER_PAGE));
     complete_pages
         .checked_add(partial_page)?
         .checked_mul(RECOVERY_PAGE_SIZE as u64)
@@ -968,7 +970,9 @@ mod tests {
             assert_eq!(encoded.len() % 2, 0);
             let bytes = encoded
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect::<Vec<_>>();
             let output = output.as_mut().expect("golden length must come first");

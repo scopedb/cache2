@@ -42,7 +42,7 @@ impl PackedLocation {
         if region_id > MAX_REGION_ID {
             return Err(PackedLocationError::RegionOutOfRange);
         }
-        if offset % OFFSET_ALIGNMENT != 0 {
+        if !offset.is_multiple_of(OFFSET_ALIGNMENT) {
             return Err(PackedLocationError::OffsetUnaligned);
         }
         if offset > MAX_REGION_OFFSET {
@@ -51,7 +51,7 @@ impl PackedLocation {
         if record_len == 0 {
             return Err(PackedLocationError::RecordLengthZero);
         }
-        if record_len % RECORD_LEN_ALIGNMENT != 0 {
+        if !record_len.is_multiple_of(RECORD_LEN_ALIGNMENT) {
             return Err(PackedLocationError::RecordLengthUnaligned);
         }
         if record_len > MAX_RECORD_LEN {

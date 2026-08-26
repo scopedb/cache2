@@ -39,7 +39,9 @@ impl RegionReadSnapshot {
             && self.incarnation != u32::MAX
             && self.created_seqno != 0
             && self.completed_used <= region_size
-            && self.completed_used % u64::from(RECORD_ALIGNMENT) == 0
+            && self
+                .completed_used
+                .is_multiple_of(u64::from(RECORD_ALIGNMENT))
             && (empty == (self.max_seqno == 0))
             && (empty || self.max_seqno >= self.created_seqno)
     }
@@ -183,7 +185,7 @@ impl RegionReadDirectory {
     pub(crate) fn try_new(region_count: u32, region_size: u64) -> Result<Self, RegionReadError> {
         if region_count == 0
             || region_size < RECOVERY_PAGE_SIZE as u64
-            || region_size % RECOVERY_PAGE_SIZE as u64 != 0
+            || !region_size.is_multiple_of(RECOVERY_PAGE_SIZE as u64)
         {
             return Err(RegionReadError::InvalidGeometry);
         }

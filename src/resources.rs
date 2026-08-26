@@ -295,7 +295,7 @@ enum BufferOwner {
 
 impl BufferLease {
     pub(crate) fn try_fixed(length: usize) -> Result<Self, ResourceBuildError> {
-        if length == 0 || length % BUFFER_ALIGNMENT != 0 || length > isize::MAX as usize {
+        if length == 0 || !length.is_multiple_of(BUFFER_ALIGNMENT) || length > isize::MAX as usize {
             return Err(ResourceBuildError::Invalid(
                 "fixed buffer size must be a non-zero 4096-byte multiple",
             ));

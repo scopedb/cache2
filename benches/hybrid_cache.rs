@@ -502,12 +502,12 @@ fn enforce_thresholds(
     require_minimum_rate("CACHE_BENCH_MIN_RESIDENT_L1_OPS", resident_l1)?;
     require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", l2_promote)?;
     require_minimum_rate("CACHE_BENCH_MIN_PROMOTED_L1_OPS", promoted_l1)?;
-    if let Some(maximum_ms) = env_optional_f64("CACHE_BENCH_MAX_WARM_CLOSE_MS")? {
-        if warm_close.as_secs_f64() * 1_000.0 > maximum_ms {
-            return Err(io::Error::other(format!(
-                "warm close exceeded CACHE_BENCH_MAX_WARM_CLOSE_MS={maximum_ms}"
-            )));
-        }
+    if let Some(maximum_ms) = env_optional_f64("CACHE_BENCH_MAX_WARM_CLOSE_MS")?
+        && warm_close.as_secs_f64() * 1_000.0 > maximum_ms
+    {
+        return Err(io::Error::other(format!(
+            "warm close exceeded CACHE_BENCH_MAX_WARM_CLOSE_MS={maximum_ms}"
+        )));
     }
     Ok(())
 }

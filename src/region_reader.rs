@@ -258,7 +258,7 @@ pub(crate) fn plan_read(geometry: DataGeometry, entry: IndexEntry) -> io::Result
             "aligned Region read is shorter than its record",
         )
     })?;
-    if absolute % alignment != 0
+    if !absolute.is_multiple_of(alignment)
         || record_range.end > aligned_len
         || overhead >= _MAX_READ_ALIGNMENT_OVERHEAD
         || io_end > geometry.data_file_len

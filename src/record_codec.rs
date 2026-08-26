@@ -157,7 +157,7 @@ pub(crate) fn encode_value_into_hashed(
         || reservation.region_incarnation == 0
         || reservation.region_incarnation == u32::MAX
         || reservation.seqno == 0
-        || reservation.offset % RECORD_ALIGNMENT != 0
+        || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT)
     {
         return Err(RecordEncodeError::InvalidReservation);
     }

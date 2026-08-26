@@ -299,14 +299,16 @@ impl RegionStaging {
         }
         if chunk_bytes == 0
             || chunk_bytes > MAX_WRITE_BATCH_BYTES
-            || chunk_bytes % BUFFER_ALIGNMENT != 0
-            || chunk_bytes % RECORD_ALIGNMENT as usize != 0
+            || !chunk_bytes.is_multiple_of(BUFFER_ALIGNMENT)
+            || !chunk_bytes.is_multiple_of(RECORD_ALIGNMENT as usize)
         {
             return Err(ResourceBuildError::Invalid(
                 "Region staging chunk must be a bounded aligned size",
             ));
         }
-        if region_size < RECOVERY_PAGE_SIZE as u64 || region_size % BUFFER_ALIGNMENT as u64 != 0 {
+        if region_size < RECOVERY_PAGE_SIZE as u64
+            || !region_size.is_multiple_of(BUFFER_ALIGNMENT as u64)
+        {
             return Err(ResourceBuildError::Invalid(
                 "Region staging Region size is invalid",
             ));
@@ -617,9 +619,15 @@ impl RegionStaging {
             if receipt.cache_epoch == 0
                 || receipt.region_incarnation == 0
                 || receipt.span_start_offset >= receipt.unpadded_end_offset
-                || receipt.span_start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
-                || receipt.unpadded_end_offset % u64::from(RECORD_ALIGNMENT) != 0
-                || receipt.padded_end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+                || !receipt
+                    .span_start_offset
+                    .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+                || !receipt
+                    .unpadded_end_offset
+                    .is_multiple_of(u64::from(RECORD_ALIGNMENT))
+                || !receipt
+                    .padded_end_offset
+                    .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
                 || receipt.padded_end_offset > self.region_size
                 || fill.is_empty()
                 || fill.cache_epoch != receipt.cache_epoch
@@ -892,8 +900,8 @@ impl RegionStaging {
             || receipt.region_incarnation == 0
             || receipt.seqno == 0
             || receipt.record_bytes == 0
-            || receipt.record_bytes % RECORD_ALIGNMENT != 0
-            || receipt.offset % RECORD_ALIGNMENT != 0
+            || !receipt.record_bytes.is_multiple_of(RECORD_ALIGNMENT)
+            || !receipt.offset.is_multiple_of(RECORD_ALIGNMENT)
             || end > self.region_size
         {
             return Err(StagingError::StaleReceipt);

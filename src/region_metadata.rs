@@ -352,7 +352,9 @@ impl RegionMetadata {
     }
 
     fn decode_pages(input: &[u8]) -> Result<Self> {
-        if input.len() < REGION_METADATA_PAGE_SIZE || input.len() % REGION_METADATA_PAGE_SIZE != 0 {
+        if input.len() < REGION_METADATA_PAGE_SIZE
+            || !input.len().is_multiple_of(REGION_METADATA_PAGE_SIZE)
+        {
             return Err(RegionMetadataError::InvalidLength);
         }
         let first = page(input, 0)?;
@@ -522,7 +524,7 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
         || root.index_page_count != u64::from(expected_index_pages)
         || root.region_size < RECOVERY_PAGE_SIZE as u64
         || root.region_size > MAX_PACKED_REGION_SIZE
-        || root.region_size % RECOVERY_PAGE_SIZE as u64 != 0
+        || !root.region_size.is_multiple_of(RECOVERY_PAGE_SIZE as u64)
         || root.region_count == 0
         || root.region_count > MAX_PACKED_REGION_COUNT
         || root.partition_count == 0
@@ -538,7 +540,7 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
         || root.max_seqno == u64::MAX
         || (root.live_record_count == 0) != (root.live_record_bytes == 0)
         || root.live_record_count > root.physical_value_slots
-        || root.live_record_bytes % 32 != 0
+        || !root.live_record_bytes.is_multiple_of(32)
         || root.active_region_count != root.shard_count
         || root
             .free_region_count

@@ -585,18 +585,16 @@ where
         .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
         let prefer_main = state.main.weight > state.main_target_bytes || state.small.len == 0;
-        if !prefer_main {
-            if let Some(index) = state.small.oldest_evictable(slots) {
-                if slots[index].frequency() >= 2 {
-                    let weight = weight_of(index);
-                    state.small.remove(slots, index, QueueId::Small, weight);
-                    slots[index].set_frequency(0);
-                    state.main.push_front(slots, index, QueueId::Main, weight);
-                    continue;
-                }
-                state.ghost.insert(slots[index].hash());
-                return VictimSelection::Victim(index);
+        if !prefer_main && let Some(index) = state.small.oldest_evictable(slots) {
+            if slots[index].frequency() >= 2 {
+                let weight = weight_of(index);
+                state.small.remove(slots, index, QueueId::Small, weight);
+                slots[index].set_frequency(0);
+                state.main.push_front(slots, index, QueueId::Main, weight);
+                continue;
             }
+            state.ghost.insert(slots[index].hash());
+            return VictimSelection::Victim(index);
         }
 
         if let Some(index) = state.main.oldest_evictable(slots) {
@@ -609,18 +607,16 @@ where
             return VictimSelection::Victim(index);
         }
 
-        if prefer_main {
-            if let Some(index) = state.small.oldest_evictable(slots) {
-                if slots[index].frequency() >= 2 {
-                    let weight = weight_of(index);
-                    state.small.remove(slots, index, QueueId::Small, weight);
-                    slots[index].set_frequency(0);
-                    state.main.push_front(slots, index, QueueId::Main, weight);
-                    continue;
-                }
-                state.ghost.insert(slots[index].hash());
-                return VictimSelection::Victim(index);
+        if prefer_main && let Some(index) = state.small.oldest_evictable(slots) {
+            if slots[index].frequency() >= 2 {
+                let weight = weight_of(index);
+                state.small.remove(slots, index, QueueId::Small, weight);
+                slots[index].set_frequency(0);
+                state.main.push_front(slots, index, QueueId::Main, weight);
+                continue;
             }
+            state.ghost.insert(slots[index].hash());
+            return VictimSelection::Victim(index);
         }
         return VictimSelection::None;
     }

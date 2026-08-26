@@ -201,12 +201,12 @@ fn main() -> io::Result<()> {
         expected[key_index] = Some(writes);
         writes = writes.saturating_add(1);
 
-        if writes % 256 == 0 {
+        if writes.is_multiple_of(256) {
             cache.drain()?;
         }
-        if writes % 4 == 0 {
+        if writes.is_multiple_of(4) {
             let read_ordinal = writes / 4;
-            let distance = if read_ordinal % 2 == 0 {
+            let distance = if read_ordinal.is_multiple_of(2) {
                 17
             } else {
                 u64::try_from(keys.len() / 4).unwrap_or(u64::MAX)

@@ -318,7 +318,9 @@ impl RuntimeConfig {
         }
         if self.write_buffer_bytes == 0
             || self.write_buffer_bytes > MAX_WRITE_BATCH_BYTES
-            || self.write_buffer_bytes % crate::resources::BUFFER_ALIGNMENT != 0
+            || !self
+                .write_buffer_bytes
+                .is_multiple_of(crate::resources::BUFFER_ALIGNMENT)
             || self.write_batch_bytes == 0
             || self.write_batch_bytes > self.write_buffer_bytes
         {
@@ -1530,10 +1532,10 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     } else {
         let mut result = Ok(());
         for engine in &owner.shared.engines {
-            if let Err(error) = engine.shutdown() {
-                if result.is_ok() {
-                    result = Err(error);
-                }
+            if let Err(error) = engine.shutdown()
+                && result.is_ok()
+            {
+                result = Err(error);
             }
         }
         result

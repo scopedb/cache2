@@ -250,7 +250,9 @@ mod tests {
             assert_eq!(encoded.len() % 2, 0);
             let bytes = encoded
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect::<Vec<_>>();
             let output = output.as_mut().expect("golden length must come first");

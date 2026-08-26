@@ -140,7 +140,7 @@ pub(crate) fn submit_span(
         });
     }
     let buffer_is_direct_aligned = buffer.as_slice().is_ok_and(|bytes| {
-        (bytes.as_ptr() as usize) % DIRECT_IO_ALIGNMENT == 0
+        (bytes.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGNMENT)
             && bytes.len() % DIRECT_IO_ALIGNMENT == 0
     });
     if !buffer_is_direct_aligned {
@@ -178,8 +178,8 @@ pub(crate) fn submit_span(
 fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(usize, u64)> {
     if !geometry.is_valid()
         || span.region_id >= geometry.region_count
-        || span.start_offset % DIRECT_IO_ALIGNMENT as u64 != 0
-        || span.end_offset % DIRECT_IO_ALIGNMENT as u64 != 0
+        || !span.start_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+        || !span.end_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
         || span.end_offset <= span.start_offset
         || span.end_offset > geometry.region_size
         || span.record_count == 0

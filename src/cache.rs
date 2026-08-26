@@ -183,9 +183,9 @@ impl StaticConfig {
     fn geometry(&self) -> Result<DataGeometry> {
         if self.region_size == 0
             || self.region_size > MAX_PACKED_REGION_SIZE
-            || self.region_size % 4096 != 0
+            || !self.region_size.is_multiple_of(4096)
             || self.capacity_bytes == 0
-            || self.capacity_bytes % self.region_size != 0
+            || !self.capacity_bytes.is_multiple_of(self.region_size)
         {
             return Err(invalid_config(
                 "capacity must be a non-zero multiple of an aligned representable Region size",

@@ -2747,14 +2747,14 @@ mod uring {
                     self.wake_active = false;
                 } else if user_data == WAKE_CANCEL_ID || user_data & CANCEL_CQE_BIT != 0 {
                     // A cancel CQE is not a target lifetime fence.
-                } else if user_data & INTERNAL_CQE_BIT == 0 {
-                    if let Some(flight) = self.flights.remove(&RequestId(user_data)) {
-                        self.shared.finish(
-                            flight.task,
-                            CompletionStatus::Failed(copy_io_error(error, message)),
-                            flight.transferred,
-                        );
-                    }
+                } else if user_data & INTERNAL_CQE_BIT == 0
+                    && let Some(flight) = self.flights.remove(&RequestId(user_data))
+                {
+                    self.shared.finish(
+                        flight.task,
+                        CompletionStatus::Failed(copy_io_error(error, message)),
+                        flight.transferred,
+                    );
                 }
             }
         }

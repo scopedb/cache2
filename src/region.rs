@@ -243,11 +243,11 @@ impl IndexMutationAuthority for RegionIndexMutationAuthority<'_> {
     }
 
     fn commit(&mut self, transition: IndexTransition) {
-        if self.accounting_error.is_none() {
-            if let Err(error) = self.manager.apply_index_transition(transition) {
-                self.health.enter_miss_only();
-                self.accounting_error = Some(error);
-            }
+        if self.accounting_error.is_none()
+            && let Err(error) = self.manager.apply_index_transition(transition)
+        {
+            self.health.enter_miss_only();
+            self.accounting_error = Some(error);
         }
     }
 }
