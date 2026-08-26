@@ -309,7 +309,6 @@ mod tests {
         IndexEntry {
             location,
             seqno: 11,
-            namespace_id: 0,
         }
     }
 

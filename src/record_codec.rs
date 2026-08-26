@@ -206,7 +206,6 @@ pub(crate) fn encode_value_into_hashed(
     Ok(IndexEntry {
         location,
         seqno: reservation.seqno,
-        namespace_id,
     })
 }
 
@@ -289,7 +288,6 @@ mod tests {
         assert_eq!(entry.location.offset(), 0);
         assert_eq!(entry.location.record_len(), required);
         assert_eq!(entry.seqno, 17);
-        assert_eq!(entry.namespace_id, namespace_id);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(header.namespace_id, namespace_id);

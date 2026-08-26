@@ -23,7 +23,7 @@ use std::os::fd::AsRawFd;
 
 pub(crate) const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub(crate) const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
-pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 32;
+pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 24;
 pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
     (INDEX_IMAGE_PAGE_SIZE - INDEX_IMAGE_PAGE_HEADER_SIZE) / INDEX_IMAGE_SLOT_SIZE;
 
@@ -35,7 +35,7 @@ pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
 pub(crate) const WARM_IMAGE_WRITE_BATCH_BYTES: usize = 1024 * 1024;
 
 const PAGE_MAGIC: [u8; 8] = *b"CRSIDX1\0";
-const PAGE_FORMAT_VERSION: u16 = 1;
+const PAGE_FORMAT_VERSION: u16 = 2;
 
 const PAGE_VERSION_OFFSET: usize = 8;
 const PAGE_HEADER_SIZE_OFFSET: usize = 10;
@@ -59,7 +59,7 @@ const PAGE_STATE_REJECTED: u8 = 4;
 const IMAGE_STATE_USABLE: u8 = 0;
 const IMAGE_STATE_REJECTED: u8 = 1;
 
-const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 126);
+const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 168);
 const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
         == INDEX_IMAGE_PAGE_SIZE
@@ -179,15 +179,13 @@ fn final_partition_slots(
 /// Logical fields in one Index Image slot.
 ///
 /// This type is intentionally not `repr(C)` and is never copied directly to
-/// or from an image. Its stable representation is exactly 32 bytes encoded by
+/// or from an image. Its stable representation is exactly 24 bytes encoded by
 /// [`Self::encode`] and [`Self::decode`]. A zeroed slot is the empty state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexSlot {
     pub(crate) hash: u64,
     pub(crate) location_raw: u64,
     pub(crate) seqno: u64,
-    pub(crate) namespace_id: u32,
-    pub(crate) reserved: u32,
 }
 
 /// Typed runtime meaning of one canonical Index Image slot.
@@ -204,7 +202,6 @@ pub(crate) enum IndexSlotState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexSlotSemanticError {
     NonCanonicalMarker,
-    ReservedNonZero,
     InvalidLocation(PackedLocationError),
 }
 
@@ -214,7 +211,6 @@ impl fmt::Display for IndexSlotSemanticError {
             Self::NonCanonicalMarker => {
                 formatter.write_str("zero-sequence slot is not Empty or Deleted")
             }
-            Self::ReservedNonZero => formatter.write_str("index slot reserved bytes are non-zero"),
             Self::InvalidLocation(error) => write!(formatter, "invalid packed location: {error}"),
         }
     }
@@ -225,16 +221,12 @@ impl IndexSlot {
         hash: 0,
         location_raw: 0,
         seqno: 0,
-        namespace_id: 0,
-        reserved: 0,
     };
 
     pub(crate) const DELETED: Self = Self {
         hash: 0,
         location_raw: u64::MAX,
         seqno: 0,
-        namespace_id: 0,
-        reserved: 0,
     };
 
     pub(crate) const fn from_state(state: IndexSlotState) -> Self {
@@ -245,8 +237,6 @@ impl IndexSlot {
                 hash,
                 location_raw: entry.location.raw(),
                 seqno: entry.seqno,
-                namespace_id: entry.namespace_id,
-                reserved: 0,
             },
         }
     }
@@ -255,8 +245,6 @@ impl IndexSlot {
         output[0..8].copy_from_slice(&self.hash.to_le_bytes());
         output[8..16].copy_from_slice(&self.location_raw.to_le_bytes());
         output[16..24].copy_from_slice(&self.seqno.to_le_bytes());
-        output[24..28].copy_from_slice(&self.namespace_id.to_le_bytes());
-        output[28..32].copy_from_slice(&self.reserved.to_le_bytes());
     }
 
     pub(crate) fn decode(input: &[u8; INDEX_IMAGE_SLOT_SIZE]) -> Self {
@@ -264,8 +252,6 @@ impl IndexSlot {
             hash: read_u64(input, 0),
             location_raw: read_u64(input, 8),
             seqno: read_u64(input, 16),
-            namespace_id: read_u32(input, 24),
-            reserved: read_u32(input, 28),
         }
     }
 
@@ -275,9 +261,6 @@ impl IndexSlot {
         }
         if self == Self::DELETED {
             return Ok(IndexSlotState::Deleted);
-        }
-        if self.reserved != 0 {
-            return Err(IndexSlotSemanticError::ReservedNonZero);
         }
         if self.seqno == 0 {
             return Err(IndexSlotSemanticError::NonCanonicalMarker);
@@ -289,7 +272,6 @@ impl IndexSlot {
             entry: IndexEntry {
                 location,
                 seqno: self.seqno,
-                namespace_id: self.namespace_id,
             },
         })
     }
@@ -2036,8 +2018,6 @@ mod tests {
             hash: 0x0102_0304_0506_0708 ^ seed,
             location_raw: location.raw(),
             seqno: seed + 1,
-            namespace_id: 0x3132_3334 ^ seed as u32,
-            reserved: 0,
         }
     }
 
@@ -2046,12 +2026,12 @@ mod tests {
         type RangeShape = (usize, usize, usize, usize);
         let cases: &[(usize, &[RangeShape])] = &[
             (8, &[(0, 1, 0, 8)]),
-            (126, &[(0, 1, 0, 126)]),
-            (127, &[(0, 2, 0, 127)]),
-            (133, &[(0, 2, 0, 133)]),
-            (134, &[(0, 1, 0, 126), (1, 1, 126, 8)]),
-            (252, &[(0, 1, 0, 126), (1, 1, 126, 126)]),
-            (253, &[(0, 1, 0, 126), (1, 2, 126, 127)]),
+            (168, &[(0, 1, 0, 168)]),
+            (169, &[(0, 2, 0, 169)]),
+            (175, &[(0, 2, 0, 175)]),
+            (176, &[(0, 1, 0, 168), (1, 1, 168, 8)]),
+            (336, &[(0, 1, 0, 168), (1, 1, 168, 168)]),
+            (337, &[(0, 1, 0, 168), (1, 2, 168, 169)]),
         ];
 
         for &(slot_count, expected) in cases {
@@ -2080,7 +2060,7 @@ mod tests {
 
     #[test]
     fn partitioned_storage_mutates_adjacent_ranges_and_roundtrips_stats() {
-        const SLOT_COUNT: usize = 253;
+        const SLOT_COUNT: usize = 337;
         const GENERATION: u64 = 113;
         const FIRST_RANGE_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
         const SECOND_RANGE_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
@@ -2365,10 +2345,8 @@ mod tests {
         assert_eq!(&encoded[0..8], &value.hash.to_le_bytes());
         assert_eq!(&encoded[8..16], &value.location_raw.to_le_bytes());
         assert_eq!(&encoded[16..24], &value.seqno.to_le_bytes());
-        assert_eq!(&encoded[24..28], &value.namespace_id.to_le_bytes());
-        assert_eq!(&encoded[28..32], &[0; 4]);
         assert_eq!(IndexSlot::decode(&encoded), value);
-        assert_eq!(IndexSlot::decode(&[0_u8; 32]), IndexSlot::EMPTY);
+        assert_eq!(IndexSlot::decode(&[0_u8; 24]), IndexSlot::EMPTY);
     }
 
     #[test]

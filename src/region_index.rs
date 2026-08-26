@@ -361,7 +361,6 @@ mod tests {
         IndexEntry {
             location: PackedLocation::new(region_id, offset, 32).unwrap(),
             seqno,
-            namespace_id: region_id + 100,
         }
     }
 
@@ -558,17 +557,17 @@ mod tests {
 
     #[test]
     fn a_probe_crossing_a_corrupt_page_returns_the_fault_without_mutation() {
-        const SLOT_COUNT: usize = 133;
-        const HASH: u64 = 124;
+        const SLOT_COUNT: usize = 175;
+        const HASH: u64 = 166;
 
         let source = PartitionedIndexStorage::anonymous(SLOT_COUNT).unwrap();
         {
             let mut partition = source.write_hash_partition(HASH).unwrap();
             partition
-                .replace_observed(124, IndexSlotState::Empty, IndexSlotState::Deleted)
+                .replace_observed(166, IndexSlotState::Empty, IndexSlotState::Deleted)
                 .unwrap();
             partition
-                .replace_observed(125, IndexSlotState::Empty, IndexSlotState::Deleted)
+                .replace_observed(167, IndexSlotState::Empty, IndexSlotState::Deleted)
                 .unwrap();
         }
         let partition_stats = source.partition_stats().unwrap();
@@ -601,7 +600,7 @@ mod tests {
 
     #[test]
     fn recovered_two_partition_image_serves_hash_lookup_without_rebuild() {
-        const SLOT_COUNT: usize = 134;
+        const SLOT_COUNT: usize = 176;
         const HASH_IN_SECOND_SHARD: u64 = 1;
 
         let source = anonymous(SLOT_COUNT);

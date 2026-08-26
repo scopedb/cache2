@@ -862,7 +862,6 @@ mod tests {
             entry: IndexEntry {
                 location: PackedLocation::new(1, offset, record_bytes).unwrap(),
                 seqno,
-                namespace_id: 9,
             },
         };
         (receipt, record)
@@ -1068,8 +1067,7 @@ mod tests {
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         let first_len = RecordHeader::aligned_len(0, 0).unwrap();
         assert_eq!(first_len as usize, RECORD_HEADER_SIZE);
-        let (first, mut first_record) = reservation(4096, first_len, 11);
-        first_record.entry.namespace_id = 0;
+        let (first, first_record) = reservation(4096, first_len, 11);
         let mut pointer = 0_usize;
         staging
             .encode_reserved(first, |target| {
@@ -1079,8 +1077,7 @@ mod tests {
             .unwrap();
 
         let second_offset = first.offset + first.record_bytes;
-        let (second, mut second_record) = reservation(second_offset, 128, 12);
-        second_record.entry.namespace_id = 0;
+        let (second, second_record) = reservation(second_offset, 128, 12);
         staging
             .encode_reserved(second, |target| {
                 encode_test_value(target, second, second_record)

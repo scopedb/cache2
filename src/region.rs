@@ -537,10 +537,8 @@ impl FileRegionCore {
     /// owner on a hit, avoiding a second payload copy.
     pub(crate) fn begin_value_read(&self, hash: u64, namespace_id: u32) -> Option<IndexEntry> {
         self.begin_point_read(hash).filter(|entry| {
-            entry.namespace_id == namespace_id
-                && self
-                    .layout
-                    .region_belongs_to_namespace(namespace_id, entry.location.region_id())
+            self.layout
+                .region_belongs_to_namespace(namespace_id, entry.location.region_id())
         })
     }
 
@@ -2319,7 +2317,7 @@ fn guarded_index_result<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_storage::IndexSlot;
+    use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, IndexSlot};
     use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
     use crate::io_engine::BackendIoEngine;
     use crate::recovery::{DataGeometry, PersistentId};
@@ -2927,7 +2925,6 @@ mod tests {
             entry: IndexEntry {
                 location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
                 seqno: 1,
-                namespace_id: 9,
             },
         };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -2948,9 +2945,10 @@ mod tests {
     #[test]
     fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         let data = data_path_superblock();
+        let index_slots = INDEX_IMAGE_SLOTS_PER_PAGE * 4;
         let runtime = FileRegionRuntime::install(
-            PartitionedIndexStorage::anonymous(512).unwrap(),
-            empty_region_metadata(data, 512, REGION_SHARDS).unwrap(),
+            PartitionedIndexStorage::anonymous(index_slots).unwrap(),
+            empty_region_metadata(data, index_slots, REGION_SHARDS).unwrap(),
         )
         .unwrap();
         let resources = data_path_resources();
@@ -3165,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn same_hash_candidate_is_a_miss_when_the_full_key_differs() {
+    fn same_hash_candidate_requires_full_key_and_namespace() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntime::install(
             PartitionedIndexStorage::anonymous(64).unwrap(),
@@ -3233,6 +3231,32 @@ mod tests {
                     plan,
                     namespace_id,
                     foreign_key,
+                    ExpiryClock::Fixed(1),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(runtime.health.is_healthy());
+        assert_eq!(
+            resources.managed_memory_snapshot().current_bytes,
+            memory_before_read
+        );
+
+        let foreign_namespace = namespace_id + 1;
+        let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
+        let entry = runtime
+            .begin_value_read(owner_hash, foreign_namespace)
+            .expect("a same-hash namespace collision must reach record validation");
+        let plan = plan_read(data.geometry, owner_hash, entry).unwrap();
+        assert!(
+            runtime
+                .read_value_from_plan(
+                    &engine,
+                    engine.try_reserve_read().unwrap(),
+                    read_buffer,
+                    plan,
+                    foreign_namespace,
+                    owner_key,
                     ExpiryClock::Fixed(1),
                 )
                 .unwrap()
@@ -3360,7 +3384,6 @@ mod tests {
         let old = IndexEntry {
             location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
             seqno: u64::from(REGION_SHARDS),
-            namespace_id: 0,
         };
         assert!(runtime.index.upsert(hash, old).unwrap());
 
@@ -3386,7 +3409,6 @@ mod tests {
         let stale = IndexEntry {
             location: crate::index::PackedLocation::new(1, 0, 32).unwrap(),
             seqno: 1,
-            namespace_id: 0,
         };
         {
             let mut partition = index.write_hash_partition(hash).unwrap();
@@ -3643,7 +3665,7 @@ mod tests {
     #[test]
     fn complete_warm_image_maps_without_rebuilding_index_slots() {
         let directory = TestDirectory::new();
-        let config = 134;
+        let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
         let value = IndexSlot::DELETED;
 
@@ -3654,7 +3676,11 @@ mod tests {
         .unwrap();
         let runtime = first.runtime_mut().unwrap();
         assert_eq!(runtime.index.storage().partition_count(), 2);
-        runtime.index.storage().write_slot(133, value).unwrap();
+        runtime
+            .index
+            .storage()
+            .write_slot(config - 1, value)
+            .unwrap();
         first.close_warm().unwrap();
         assert!(directory.files.image.exists());
 
@@ -3667,7 +3693,11 @@ mod tests {
         let recovered_runtime = recovered.runtime().unwrap();
         assert_eq!(recovered_runtime.index.storage().partition_count(), 2);
         assert_eq!(
-            recovered_runtime.index.storage().read_slot(133).unwrap(),
+            recovered_runtime
+                .index
+                .storage()
+                .read_slot(config - 1)
+                .unwrap(),
             value
         );
         recovered.close_fast().unwrap();
@@ -3718,7 +3748,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         let directory = TestDirectory::new();
-        let config = 134;
+        let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
         let mut first = RegionStore::open(
             config,

@@ -1694,7 +1694,6 @@ mod tests {
                     location: crate::index::PackedLocation::new(0, offset as u32, candidate_len)
                         .unwrap(),
                     seqno: 1,
-                    namespace_id: 1,
                 };
                 let plan = plan_read(geometry, 1, entry).unwrap();
                 observed_max = observed_max.max(plan.aligned_len);
@@ -1774,7 +1773,11 @@ mod tests {
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 8, 0)
             .unwrap();
-        let too_small = base.clone().with_memory_limit(20 * GIB);
+        base.clone()
+            .with_memory_limit(18 * GIB)
+            .validate_memory_plan(geometry, index_slots, 8, 0)
+            .unwrap();
+        let too_small = base.clone().with_memory_limit(17 * GIB);
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 8, 0)

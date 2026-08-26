@@ -23,7 +23,7 @@ pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMEN
 pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32) * RECORD_LEN_ALIGNMENT;
 pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
 pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
-/// 512M slots is a 16 GiB index at the stable 32-byte slot size and covers a
+/// 512M slots is a 12 GiB index at the stable 24-byte slot size and covers a
 /// 1 TiB cache containing 4 KiB records at the recommended 1.25x load factor.
 pub(crate) const MAX_INDEX_SLOTS: usize = 512 * 1024 * 1024;
 pub(crate) const MAX_INDEX_PROBES: usize = 64;
@@ -143,14 +143,11 @@ impl std::error::Error for PackedLocationError {}
 pub(crate) struct IndexEntry {
     pub(crate) location: PackedLocation,
     pub(crate) seqno: u64,
-    pub(crate) namespace_id: u32,
 }
 
 impl IndexEntry {
     pub(crate) const fn same_record_identity(self, other: Self) -> bool {
-        self.location.raw() == other.location.raw()
-            && self.seqno == other.seqno
-            && self.namespace_id == other.namespace_id
+        self.location.raw() == other.location.raw() && self.seqno == other.seqno
     }
 }
 

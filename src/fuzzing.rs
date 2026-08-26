@@ -3,7 +3,7 @@
 
 use crate::format::RecordHeader;
 use crate::index::{IndexEntry, PackedLocation};
-use crate::index_storage::{IndexSlot, PartitionedIndexStorage};
+use crate::index_storage::{INDEX_IMAGE_SLOT_SIZE, IndexSlot, PartitionedIndexStorage};
 use crate::recovery::{DataSuperblock, RecoveryImageHeader, StateRecord};
 use crate::region_index::RegionIndex;
 use crate::region_metadata::RegionMetadata;
@@ -19,8 +19,8 @@ pub fn persistent_decoders_and_index_probe(input: &[u8]) {
     let _ = RegionMetadata::decode(input);
 
     if let Some(encoded) = input
-        .get(..32)
-        .and_then(|bytes| <&[u8; 32]>::try_from(bytes).ok())
+        .get(..INDEX_IMAGE_SLOT_SIZE)
+        .and_then(|bytes| <&[u8; INDEX_IMAGE_SLOT_SIZE]>::try_from(bytes).ok())
     {
         let _ = IndexSlot::decode(encoded).runtime_state();
     }
@@ -46,11 +46,7 @@ fn fuzz_index_probe(input: &[u8]) {
         let offset = ((raw >> 32) as u32 & 0xffff) * 8;
         let location = PackedLocation::new(region_id, offset, 32)
             .expect("bounded aligned fuzz location is representable");
-        let entry = IndexEntry {
-            location,
-            seqno,
-            namespace_id: (raw >> 16) as u32,
-        };
+        let entry = IndexEntry { location, seqno };
         let _ = index.upsert(hash, entry);
         let _ = index.lookup_raw(hash);
     }

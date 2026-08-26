@@ -256,9 +256,10 @@ device to data-sync, but neither makes the cache recoverable.
    rule independently to every weighted assignment: each set needs one active
    Region per assigned shard plus one spare. More Regions reduce turnover.
 2. Set expected entries from the intended live key count; the fixed mmap index
-   uses approximately 1.25 slots per entry and 32 bytes per slot. Up to
-   512 million slots (16 GiB) supports a 1 TiB cache planned near 4 KiB per
-   entry with the normal probe headroom.
+   uses approximately 1.25 slots per entry and 24 bytes per slot, plus one
+   64-byte header per 4 KiB page. Up to 512 million slots (about 12.2 GiB
+   including page headers) supports a 1 TiB cache planned near 4 KiB per entry
+   with the normal probe headroom.
 3. Choose L1 capacity from the useful resident payload. The aggregate managed
    limit must additionally hold the fixed L1 directory/policy plan, index/Region
    metadata, two write buffers per shard, at least one maximum aligned record
@@ -266,9 +267,9 @@ device to data-sync, but neither makes the cache recoverable.
    stacks. Concurrent reads consume only their actual aligned read sizes.
    Invalid plans fail before creating files; inspect `detailed_snapshot().l1`
    and `.index` to confirm the resulting entry and slot pressure. As a concrete
-   upper-density plan, 1 TiB at 4 KiB per entry needs a 10 GiB index; paired
-   with a 10 GiB L1, the checked configuration uses a 24 GiB aggregate limit
-   rather than treating the L1 byte setting as the complete process budget.
+   upper-density plan, 1 TiB at 4 KiB per entry needs about a 7.62 GiB index;
+   paired with a 10 GiB L1, the checked configuration uses an 18 GiB aggregate
+   limit rather than treating the L1 byte setting as the complete process budget.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.

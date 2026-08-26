@@ -62,7 +62,7 @@ const STATE_IMAGE_FILE_LEN_OFFSET: usize = 112;
 
 const STATE_FLAG_HAS_IMAGE: u8 = 1;
 
-const IMAGE_FORMAT_VERSION: u16 = 1;
+const IMAGE_FORMAT_VERSION: u16 = 2;
 const IMAGE_HEADER_SIZE: u16 = 144;
 const IMAGE_VERSION_OFFSET: usize = 8;
 const IMAGE_HEADER_SIZE_OFFSET: usize = 10;
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn format_1_recovery_control_pages_match_committed_golden_bytes() {
+    fn recovery_control_pages_match_committed_golden_bytes() {
         let data = data_superblock();
         let clean = record(19, RecoveryState::Clean);
         let image = image_header();
@@ -1045,6 +1045,9 @@ mod tests {
             "../tests/fixtures/format_v1/clean_state.golden"
         ));
         let image_golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v2/recovery_image_header.golden"
+        ));
+        let legacy_image_golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/recovery_image_header.golden"
         ));
 
@@ -1054,6 +1057,10 @@ mod tests {
         assert_eq!(DataSuperblock::decode(&data_golden), Some(data));
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
         assert_eq!(RecoveryImageHeader::decode(&image_golden), Some(image));
+        assert_eq!(
+            RecoveryImageHeader::probe(&legacy_image_golden),
+            RecoveryImageHeaderProbe::Unsupported(1)
+        );
     }
 
     #[test]
@@ -1199,8 +1206,8 @@ mod tests {
     fn recovery_image_length_is_exact_and_checked() {
         assert_eq!(recovery_image_index_len(0), None);
         assert_eq!(recovery_image_index_len(1), Some(4096));
-        assert_eq!(recovery_image_index_len(126), Some(4096));
-        assert_eq!(recovery_image_index_len(127), Some(8192));
+        assert_eq!(recovery_image_index_len(168), Some(4096));
+        assert_eq!(recovery_image_index_len(169), Some(8192));
         assert_eq!(recovery_image_index_len(u64::MAX), None);
     }
 
