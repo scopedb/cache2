@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use crate::index::IndexEntry;
 use crate::io_engine::{
-    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, ReadSlot, RequestId,
-    submit_cache_read,
+    BoundedIoRequest, IoBuffer, IoCompletion, IoDeadlineExceeded, IoEngine, IoOperation,
+    OperationKind, ReadSlot, RequestId, submit_cache_read,
 };
 use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT};
 use crate::resources::BufferLease;
@@ -56,20 +56,45 @@ impl ReadCompletion {
 }
 
 impl PendingRead {
+    #[cfg(test)]
     pub(crate) fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
-        let completion = match self.request.wait(engine) {
+        let Self {
+            plan,
+            request_id,
+            request,
+        } = self;
+        let completion = request.wait(engine);
+        Self::finish(plan, request_id, completion)
+    }
+
+    pub(crate) async fn wait_async(self, engine: std::sync::Arc<dyn IoEngine>) -> ReadCompletion {
+        let Self {
+            plan,
+            request_id,
+            request,
+        } = self;
+        let completion = request.wait_async(engine).await;
+        Self::finish(plan, request_id, completion)
+    }
+
+    fn finish(
+        plan: ReadPlan,
+        request_id: RequestId,
+        completion: Result<IoCompletion, IoDeadlineExceeded>,
+    ) -> ReadCompletion {
+        let completion = match completion {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_lease();
                 return ReadCompletion {
-                    plan: self.plan,
+                    plan,
                     result: Err(error),
                     buffer,
                 };
             }
         };
         let identity_valid =
-            completion.request_id == self.request_id && completion.kind == OperationKind::Read;
+            completion.request_id == request_id && completion.kind == OperationKind::Read;
         let bytes_transferred = completion.bytes_transferred;
         let (io_result, buffer) = completion.into_lease();
 
@@ -85,7 +110,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(self.plan.aligned_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(plan.aligned_len).is_err())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -98,8 +123,7 @@ impl PendingRead {
         let result = match protocol_error {
             Some(error) => Err(error),
             None => io_result.and_then(|completed| {
-                if completed != self.plan.aligned_len || bytes_transferred != self.plan.aligned_len
-                {
+                if completed != plan.aligned_len || bytes_transferred != plan.aligned_len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Region record read completed with the wrong byte count",
@@ -109,7 +133,7 @@ impl PendingRead {
             }),
         };
         ReadCompletion {
-            plan: self.plan,
+            plan,
             result,
             buffer,
         }

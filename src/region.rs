@@ -45,7 +45,7 @@ use crate::region_metadata::{
 };
 #[cfg(test)]
 use crate::region_reader::plan_read;
-use crate::region_reader::{ReadPlan, submit_read};
+use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, submit_read};
 use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_staging::{
     RegionStaging, StageAppend, StagedRecord, StagedRecordKind, StagedWrite, StagingEncodeError,
@@ -392,12 +392,24 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.put(namespace_id, key, value)
     }
 
+    #[cfg(test)]
     pub(crate) fn get_value(
         &self,
         namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?.data_plane()?.get(namespace_id, key)
+    }
+
+    pub(crate) async fn get_value_async(
+        &self,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<Option<HybridValueRead>> {
+        self.runtime()?
+            .data_plane()?
+            .get_async(namespace_id, key)
+            .await
     }
 
     pub(crate) fn delete_value(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
@@ -547,6 +559,7 @@ impl FileRegionCore {
         self.read_value_from_plan(engine, slot, buffer, plan, namespace_id, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_value_from_plan(
         &self,
         engine: &dyn IoEngine,
@@ -556,10 +569,20 @@ impl FileRegionCore {
         namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let hash = plan.hash;
-        let entry = plan.entry;
-        let pending = match submit_read(engine, slot, plan, buffer) {
-            Ok(pending) => pending,
+        let pending = self.submit_value_read_from_plan(engine, slot, buffer, plan)?;
+        let completion = pending.wait(engine);
+        self.finish_value_read(completion, namespace_id, key)
+    }
+
+    pub(crate) fn submit_value_read_from_plan(
+        &self,
+        engine: &dyn IoEngine,
+        slot: ReadSlot,
+        buffer: BufferLease,
+        plan: ReadPlan,
+    ) -> io::Result<PendingRead> {
+        match submit_read(engine, slot, plan, buffer) {
+            Ok(pending) => Ok(pending),
             Err(error) => {
                 if !matches!(
                     error.kind(),
@@ -570,10 +593,19 @@ impl FileRegionCore {
                 ) {
                     self.health.enter_miss_only();
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        let completion = pending.wait(engine);
+        }
+    }
+
+    pub(crate) fn finish_value_read(
+        &self,
+        completion: ReadCompletion,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<Option<RegionValueRead>> {
+        let hash = completion.plan.hash;
+        let entry = completion.plan.entry;
         if let Err(error) = completion.result {
             self.health.enter_miss_only();
             return Err(error);

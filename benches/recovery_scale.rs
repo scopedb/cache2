@@ -146,6 +146,13 @@ impl Drop for ScaleFiles {
 
 fn main() -> io::Result<()> {
     let config = ScaleConfig::from_env()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(run(config))
+}
+
+async fn run(config: ScaleConfig) -> io::Result<()> {
     let files = ScaleFiles::new(&config.directory);
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
@@ -193,7 +200,7 @@ fn main() -> io::Result<()> {
     let cache = files.config(&config).open()?;
     emit("warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
-    verify_sentinels(&cache, &keys)?;
+    verify_sentinels(&cache, &keys).await?;
 
     let closed = Instant::now();
     cache.close_warm()?;
@@ -204,7 +211,7 @@ fn main() -> io::Result<()> {
     let cache = files.config(&config).open()?;
     emit("second_warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
-    verify_sentinels(&cache, &keys)?;
+    verify_sentinels(&cache, &keys).await?;
 
     let closed = Instant::now();
     cache.close_fast()?;
@@ -213,11 +220,12 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn verify_sentinels(cache: &cache_rs::HybridCache, keys: &[[u8; 16]]) -> io::Result<()> {
+async fn verify_sentinels(cache: &cache_rs::HybridCache, keys: &[[u8; 16]]) -> io::Result<()> {
     let started = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         let observed = cache
-            .get(key)?
+            .get(key)
+            .await?
             .ok_or_else(|| io::Error::other("recovered sentinel is missing"))?;
         if observed.len() < 8 || observed[..8] != (ordinal as u64).to_le_bytes() {
             return Err(io::Error::other("recovered sentinel value is incorrect"));

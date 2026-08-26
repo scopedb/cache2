@@ -437,14 +437,19 @@ impl HybridCache {
     /// buffer, performs one record read, and validates it locally. Internal
     /// allocation or I/O pressure fails open as a cache miss.
     /// A key longer than 4 KiB is also a miss.
-    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
-        self.get_in(0, key)
+    pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
+        self.get_in(0, key).await
     }
 
     /// Looks up a value in a logical namespace.
-    pub fn get_in(&self, namespace: u32, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
+    pub async fn get_in(
+        &self,
+        namespace: u32,
+        key: impl AsRef<[u8]> + Send,
+    ) -> Result<Option<Value>> {
         self.store
-            .get_value(namespace, key.as_ref())
+            .get_value_async(namespace, key.as_ref())
+            .await
             .map(|value| value.map(|inner| Value { inner }))
     }
 

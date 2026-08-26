@@ -5,10 +5,13 @@
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
 use std::fmt;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
+use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -482,6 +485,7 @@ impl SubmitError {
 struct CompletionCell {
     completion: Option<IoCompletion>,
     consumer_alive: bool,
+    waker: Option<Waker>,
 }
 
 pub(crate) struct CompletionState {
@@ -497,6 +501,7 @@ impl CompletionState {
             cell: Mutex::new(CompletionCell {
                 completion: None,
                 consumer_alive: true,
+                waker: None,
             }),
             ready: Condvar::new(),
             cancel_requested: AtomicBool::new(false),
@@ -505,15 +510,21 @@ impl CompletionState {
     }
 
     fn complete(&self, completion: IoCompletion) {
-        let mut cell = lock_unpoisoned(&self.cell);
-        if !cell.consumer_alive {
-            drop(cell);
-            drop(completion);
-            return;
-        }
-        debug_assert!(cell.completion.is_none());
-        cell.completion = Some(completion);
+        let waker = {
+            let mut cell = lock_unpoisoned(&self.cell);
+            if !cell.consumer_alive {
+                drop(cell);
+                drop(completion);
+                return;
+            }
+            debug_assert!(cell.completion.is_none());
+            cell.completion = Some(completion);
+            cell.waker.take()
+        };
         self.ready.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     #[cfg(test)]
@@ -552,9 +563,26 @@ impl CompletionState {
         let completion = {
             let mut cell = lock_unpoisoned(&self.cell);
             cell.consumer_alive = false;
+            cell.waker = None;
             cell.completion.take()
         };
         drop(completion);
+    }
+
+    fn poll(&self, context: &mut Context<'_>) -> Poll<IoCompletion> {
+        let mut cell = lock_unpoisoned(&self.cell);
+        if let Some(completion) = cell.completion.take() {
+            return Poll::Ready(completion);
+        }
+        debug_assert!(cell.consumer_alive);
+        if cell
+            .waker
+            .as_ref()
+            .is_none_or(|waker| !waker.will_wake(context.waker()))
+        {
+            cell.waker = Some(context.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
@@ -602,6 +630,21 @@ impl IoRequest {
     }
 }
 
+impl Future for IoRequest {
+    type Output = IoCompletion;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let request = self.get_mut();
+        match request.completion.poll(context) {
+            Poll::Ready(completion) => {
+                request.finished = true;
+                Poll::Ready(completion)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl Drop for IoRequest {
     fn drop(&mut self) {
         if !self.finished {
@@ -645,6 +688,80 @@ impl BoundedIoRequest {
                 drop(request);
                 Err(IoDeadlineExceeded::new(cancel_error, None))
             }
+        }
+    }
+
+    pub(crate) async fn wait_async(
+        self,
+        engine: Arc<dyn IoEngine>,
+    ) -> Result<IoCompletion, IoDeadlineExceeded> {
+        let mut request = AsyncRequestGuard::new(self.request, engine);
+        let deadline = tokio::time::Instant::from_std(self.deadline);
+        let timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(timer);
+        tokio::select! {
+            completion = request.request_mut() => {
+                request.disarm();
+                return Ok(completion);
+            }
+            () = &mut timer => {}
+        }
+
+        let cancel_error = request.cancel().err();
+        let grace = tokio::time::sleep(self.cancel_grace);
+        tokio::pin!(grace);
+        tokio::select! {
+            completion = request.request_mut() => {
+                request.disarm();
+                Err(IoDeadlineExceeded::new(cancel_error, Some(completion)))
+            }
+            () = &mut grace => {
+                request.stop_and_detach();
+                Err(IoDeadlineExceeded::new(cancel_error, None))
+            }
+        }
+    }
+}
+
+struct AsyncRequestGuard {
+    request: Option<IoRequest>,
+    engine: Arc<dyn IoEngine>,
+}
+
+impl AsyncRequestGuard {
+    fn new(request: IoRequest, engine: Arc<dyn IoEngine>) -> Self {
+        Self {
+            request: Some(request),
+            engine,
+        }
+    }
+
+    fn request_mut(&mut self) -> &mut IoRequest {
+        self.request.as_mut().expect("async request is armed")
+    }
+
+    fn cancel(&self) -> io::Result<bool> {
+        let request = self.request.as_ref().expect("async request is armed");
+        self.engine
+            .cancel(request.id(), request.completion.as_ref())
+    }
+
+    fn disarm(&mut self) {
+        let request = self.request.take().expect("async request is armed");
+        debug_assert!(request.finished);
+        drop(request);
+    }
+
+    fn stop_and_detach(&mut self) {
+        self.engine.stop_accepting_requests();
+        drop(self.request.take());
+    }
+}
+
+impl Drop for AsyncRequestGuard {
+    fn drop(&mut self) {
+        if self.request.is_some() {
+            let _ = self.cancel();
         }
     }
 }
@@ -3301,6 +3418,49 @@ mod tests {
         assert!(matches!(write.status, CompletionStatus::Failed(_)));
         assert_eq!(write.bytes_transferred, 3);
         engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_request_is_woken_by_driver_completion() {
+        let file = TestFile::new();
+        file.file().set_len(4096).unwrap();
+        let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
+        let resources = resources(4096);
+        let request = submit_cache_io(
+            engine.as_ref(),
+            IoOperation::read(read_buffer(&resources, 4096), 0),
+        )
+        .unwrap();
+
+        let completion = request.wait_async(Arc::clone(&engine)).await.unwrap();
+
+        assert!(matches!(completion.status, CompletionStatus::Completed));
+        assert_eq!(completion.bytes_transferred, 4096);
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_async_wait_requests_bounded_cancellation() {
+        let backend = Arc::new(BlockingBackend::default());
+        let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+        let resources = resources(4096);
+        let request = submit_cache_io(
+            engine.as_ref(),
+            IoOperation::read(read_buffer(&resources, 4096), 0),
+        )
+        .unwrap();
+        let waiter_engine = Arc::clone(&engine);
+        let waiter = tokio::spawn(async move { request.wait_async(waiter_engine).await });
+        tokio::task::yield_now().await;
+        assert!(backend.wait_for_entered(1));
+
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.stats().cancel_requested, 1);
+
+        backend.release();
+        engine.shutdown().unwrap();
+        assert_eq!(engine.in_flight(), 0);
     }
 
     #[cfg(unix)]

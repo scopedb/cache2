@@ -16,11 +16,13 @@ use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
 use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_WORKER, build_file_engine};
-use crate::memory::{MemoryLookup, MemoryMetricsSnapshot, MemoryStore, MemoryValue};
+use crate::memory::{
+    MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
+};
 use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
-use crate::region_reader::{_READ_ALIGNMENT, plan_read};
+use crate::region_reader::{_READ_ALIGNMENT, PendingRead, ReadCompletion, plan_read};
 use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
@@ -409,6 +411,55 @@ pub(crate) enum HybridValueRead {
     PromotedL2(MemoryValue),
 }
 
+enum PreparedGet {
+    Complete(Option<HybridValueRead>),
+    Pending(PendingGet),
+}
+
+struct PendingGet {
+    engine: Arc<dyn IoEngine>,
+    read: PendingRead,
+    read_token: MemoryReadToken,
+    hash: u64,
+}
+
+struct CompletedGet {
+    read: ReadCompletion,
+    read_token: MemoryReadToken,
+    hash: u64,
+}
+
+impl PendingGet {
+    #[cfg(test)]
+    fn wait(self) -> CompletedGet {
+        let Self {
+            engine,
+            read,
+            read_token,
+            hash,
+        } = self;
+        CompletedGet {
+            read: read.wait(engine.as_ref()),
+            read_token,
+            hash,
+        }
+    }
+
+    async fn wait_async(self) -> CompletedGet {
+        let Self {
+            engine,
+            read,
+            read_token,
+            hash,
+        } = self;
+        CompletedGet {
+            read: read.wait_async(engine).await,
+            read_token,
+            hash,
+        }
+    }
+}
+
 impl HybridValueRead {
     pub(crate) fn value(&self) -> &[u8] {
         match self {
@@ -689,14 +740,35 @@ impl RegionDataPlane {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, namespace_id: u32, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+        match self.prepare_get(namespace_id, key)? {
+            PreparedGet::Complete(value) => Ok(value),
+            PreparedGet::Pending(pending) => self.finish_get(pending.wait(), namespace_id, key),
+        }
+    }
+
+    pub(crate) async fn get_async(
+        &self,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<Option<HybridValueRead>> {
+        match self.prepare_get(namespace_id, key)? {
+            PreparedGet::Complete(value) => Ok(value),
+            PreparedGet::Pending(pending) => {
+                self.finish_get(pending.wait_async().await, namespace_id, key)
+            }
+        }
+    }
+
+    fn prepare_get(&self, namespace_id: u32, key: &[u8]) -> io::Result<PreparedGet> {
         if key.len() > _MAX_KEY_BYTES {
             if self.config.statistics {
                 let activity = self.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
-            return Ok(None);
+            return Ok(PreparedGet::Complete(None));
         }
         let running = &self.running.shared;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
@@ -708,7 +780,7 @@ impl RegionDataPlane {
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
-            return Ok(None);
+            return Ok(PreparedGet::Complete(None));
         }
         // This health observation is the read's availability linearization
         // point. A later one-way transition to miss-only does not invalidate a
@@ -719,7 +791,7 @@ impl RegionDataPlane {
                     RuntimeMetrics::increment(&activity.l1_hits);
                     RuntimeMetrics::add(&activity.served_bytes, value.len());
                 }
-                return Ok(Some(HybridValueRead::L1(value)));
+                return Ok(PreparedGet::Complete(Some(HybridValueRead::L1(value))));
             }
             MemoryLookup::Miss(token) => {
                 if let Some(activity) = activity {
@@ -732,7 +804,7 @@ impl RegionDataPlane {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
-            return Ok(None);
+            return Ok(PreparedGet::Complete(None));
         };
         let plan = match plan_read(self.data.geometry, hash, entry) {
             Ok(plan) if plan.aligned_len <= MAX_READ_BUFFER_BYTES => plan,
@@ -744,10 +816,10 @@ impl RegionDataPlane {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                 }
-                return Ok(None);
+                return Ok(PreparedGet::Complete(None));
             }
         };
-        let engine = running.engine_for(hash);
+        let engine = Arc::clone(running.engine_for(hash));
         let slot = match engine.try_reserve_read() {
             Ok(slot) => slot,
             Err(error) if is_read_pressure(error.kind()) => {
@@ -755,7 +827,7 @@ impl RegionDataPlane {
                     RuntimeMetrics::increment(&activity.l2_misses);
                     RuntimeMetrics::increment(&activity.l2_read_busy_misses);
                 }
-                return Ok(None);
+                return Ok(PreparedGet::Complete(None));
             }
             Err(_) => {
                 self.core.enter_miss_only();
@@ -765,7 +837,7 @@ impl RegionDataPlane {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                 }
-                return Ok(None);
+                return Ok(PreparedGet::Complete(None));
             }
         };
         let Some(buffer) = running.resources.try_read_buffer(plan.aligned_len) else {
@@ -773,16 +845,62 @@ impl RegionDataPlane {
                 RuntimeMetrics::increment(&activity.l2_misses);
                 RuntimeMetrics::increment(&activity.l2_read_memory_misses);
             }
-            return Ok(None);
+            return Ok(PreparedGet::Complete(None));
         };
-        let result =
-            self.core
-                .read_value_from_plan(engine.as_ref(), slot, buffer, plan, namespace_id, key);
-        match result {
+        match self
+            .core
+            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+        {
+            Ok(read) => Ok(PreparedGet::Pending(PendingGet {
+                engine,
+                read,
+                read_token,
+                hash,
+            })),
             // MissOnly is a cache availability state, not an application data
             // error. The operation that trips the one-way health latch and all
             // later reads therefore fail open as cache misses. Resource
             // overload remains explicit while the core is still healthy.
+            Err(_) if !self.core.is_healthy() => {
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&running.metrics.io_failures);
+                    RuntimeMetrics::increment(&activity.l2_misses);
+                }
+                Ok(PreparedGet::Complete(None))
+            }
+            Err(error) if is_read_pressure(error.kind()) => {
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_misses);
+                    RuntimeMetrics::increment(&activity.l2_read_busy_misses);
+                }
+                Ok(PreparedGet::Complete(None))
+            }
+            Err(error) => {
+                if running.statistics {
+                    RuntimeMetrics::increment(&running.metrics.io_failures);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_get(
+        &self,
+        completed: CompletedGet,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<Option<HybridValueRead>> {
+        let running = &self.running.shared;
+        let CompletedGet {
+            read,
+            read_token,
+            hash,
+        } = completed;
+        let activity = running
+            .statistics
+            .then(|| running.metrics.activity_for_hash(hash));
+        let result = self.core.finish_value_read(read, namespace_id, key);
+        match result {
             Err(_) if !self.core.is_healthy() => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&running.metrics.io_failures);

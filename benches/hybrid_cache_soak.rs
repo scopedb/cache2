@@ -214,6 +214,11 @@ struct ResourceSample {
 
 fn main() -> io::Result<()> {
     let config = SoakConfig::from_env()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.readers.max(2))
+        .thread_name("cache-rs-soak")
+        .enable_time()
+        .build()?;
     let files = SoakFiles::new(&config.directory);
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
@@ -297,6 +302,7 @@ fn main() -> io::Result<()> {
             let next_read = &next_read;
             let stop = &stop;
             let counters = &counters;
+            let runtime = runtime.handle().clone();
             workers.push(scope.spawn(move || {
                 let result = run_reader(
                     cache,
@@ -309,6 +315,7 @@ fn main() -> io::Result<()> {
                     next_read,
                     stop,
                     counters,
+                    &runtime,
                 );
                 if result.is_err() {
                     stop.store(true, Ordering::Release);
@@ -473,6 +480,7 @@ fn run_reader(
     next_read: &AtomicU64,
     stop: &AtomicBool,
     counters: &SoakCounters,
+    runtime: &tokio::runtime::Handle,
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
     while !stop.load(Ordering::Acquire) {
@@ -480,7 +488,7 @@ fn run_reader(
         let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
             .map_err(|_| invalid("soak sampled key exceeds usize"))?;
         let get_started = Instant::now();
-        match cache.get(&keys[sampled])? {
+        match runtime.block_on(cache.get(&keys[sampled]))? {
             Some(observed) => {
                 record_latency(&counters.max_get_ns, get_started.elapsed());
                 let latest = expected[sampled].load(Ordering::SeqCst);

@@ -36,6 +36,8 @@ version number documented in `MILESTONES.md`.
 
 ### Changed
 
+- made `get` and `get_in` native Tokio async operations; L1/index-miss paths
+  remain immediate, while an admitted L2 read wakes the caller task directly;
 - replaced FNV-1a key hashing with seeded XXH3-64 and bound the algorithm
   identity into static recovery compatibility;
 - reset the green-field disk layout to format 1 and removed legacy engines,

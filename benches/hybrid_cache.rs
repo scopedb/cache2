@@ -2,7 +2,7 @@ use std::env;
 use std::hint::black_box;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Barrier;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -214,6 +214,15 @@ struct Measurement {
 
 fn main() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.clients.max(2))
+        .thread_name("cache-rs-benchmark")
+        .enable_time()
+        .build()?;
+    runtime.block_on(run(config))
+}
+
+async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
     let mut value = vec![0xa5; config.value_bytes];
 
@@ -235,7 +244,7 @@ fn main() -> io::Result<()> {
     );
     println!("file={}", files.data.display());
 
-    let cache = files.config(&config).open()?;
+    let cache = Arc::new(files.config(&config).open()?);
     let started = Instant::now();
     let mut write_checksum = 0_u64;
     let mut write_attempts = 0_usize;
@@ -265,57 +274,64 @@ fn main() -> io::Result<()> {
     for ordinal in resident_start..config.entries {
         let key = benchmark_key(ordinal);
         let observed = cache
-            .get(black_box(key))?
+            .get(black_box(key))
+            .await?
             .ok_or_else(|| io::Error::other("resident L1 preparation missed"))?;
         verify_value(ordinal, &observed)?;
     }
     let l1 = concurrent_reads(
-        &cache,
+        Arc::clone(&cache),
         resident_start,
         config.resident_entries,
         config.read_ops,
         config.clients,
         CacheTier::L1,
-    )?;
+    )
+    .await?;
     report("resident_l1", "resident L1 get", &l1);
 
     let started = Instant::now();
-    cache.close_warm()?;
+    Arc::try_unwrap(cache)
+        .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
+        .close_warm()?;
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
-    let cache = files.config(&config).open()?;
+    let cache = Arc::new(files.config(&config).open()?);
     if cache.startup_mode() != StartupMode::Warm {
         return Err(io::Error::other(
             "benchmark did not reopen from a clean image",
         ));
     }
     let promotion = concurrent_reads(
-        &cache,
+        Arc::clone(&cache),
         0,
         config.entries,
         config.entries,
         config.clients,
         CacheTier::L2,
-    )?;
+    )
+    .await?;
     report("l2_promote", "L2 get + promote", &promotion);
 
     for ordinal in resident_start..config.entries {
         let key = benchmark_key(ordinal);
         let observed = cache
-            .get(black_box(key))?
+            .get(black_box(key))
+            .await?
             .ok_or_else(|| io::Error::other("promoted L1 preparation missed"))?;
         verify_value(ordinal, &observed)?;
     }
 
     let promoted_l1 = concurrent_reads(
-        &cache,
+        Arc::clone(&cache),
         resident_start,
         config.resident_entries,
         config.read_ops,
         config.clients,
         CacheTier::L1,
-    )?;
+    )
+    .await?;
     report("promoted_l1", "promoted L1 get", &promoted_l1);
     if config.statistics_enabled {
         let snapshot = cache.snapshot()?;
@@ -328,28 +344,30 @@ fn main() -> io::Result<()> {
             snapshot.l1_misses,
         );
     }
-    cache.close_fast()?;
+    Arc::try_unwrap(cache)
+        .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
+        .close_fast()?;
 
     enforce_thresholds(&put, &l1, warm_close, &promotion, &promoted_l1)?;
 
     Ok(())
 }
 
-fn concurrent_reads(
-    cache: &HybridCache,
+async fn concurrent_reads(
+    cache: Arc<HybridCache>,
     first_key: usize,
     key_count: usize,
     operations: usize,
     clients: usize,
     expected_tier: CacheTier,
 ) -> io::Result<Measurement> {
-    let barrier = Barrier::new(clients + 1);
-    thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(clients);
-        for client in 0..clients {
-            let barrier = &barrier;
-            handles.push(scope.spawn(move || -> io::Result<(u128, u64)> {
-                barrier.wait();
+    let barrier = Arc::new(tokio::sync::Barrier::new(clients + 1));
+    let mut handles = Vec::with_capacity(clients);
+    for client in 0..clients {
+        let cache = Arc::clone(&cache);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+                barrier.wait().await;
                 let mut bytes = 0_u128;
                 let mut checksum = 0_u64;
                 for ordinal in (client..operations).step_by(clients) {
@@ -358,7 +376,7 @@ fn concurrent_reads(
                     let mut attempts = 1;
                     let mut retry_deadline = None;
                     let value = loop {
-                        if let Some(value) = cache.get(black_box(key))? {
+                        if let Some(value) = cache.get(black_box(key)).await? {
                             verify_value(key_ordinal, &value)?;
                             if value.tier() == expected_tier {
                                 break value;
@@ -379,7 +397,7 @@ fn concurrent_reads(
                             )));
                         }
                         attempts += 1;
-                        thread::sleep(RETRY_DELAY);
+                        tokio::time::sleep(RETRY_DELAY).await;
                     };
                     bytes += value.len() as u128;
                     checksum = checksum.wrapping_add(
@@ -389,24 +407,23 @@ fn concurrent_reads(
                 }
                 Ok((bytes, checksum))
             }));
-        }
-        barrier.wait();
-        let started = Instant::now();
-        let mut bytes = 0_u128;
-        let mut checksum = 0_u64;
-        for handle in handles {
-            let (thread_bytes, thread_checksum) = handle
-                .join()
-                .map_err(|_| io::Error::other("benchmark reader panicked"))??;
-            bytes += thread_bytes;
-            checksum = checksum.wrapping_add(thread_checksum);
-        }
-        Ok(Measurement {
-            elapsed: started.elapsed(),
-            operations,
-            bytes,
-            checksum,
-        })
+    }
+    barrier.wait().await;
+    let started = Instant::now();
+    let mut bytes = 0_u128;
+    let mut checksum = 0_u64;
+    for handle in handles {
+        let (task_bytes, task_checksum) = handle
+            .await
+            .map_err(|_| io::Error::other("benchmark reader panicked"))??;
+        bytes += task_bytes;
+        checksum = checksum.wrapping_add(task_checksum);
+    }
+    Ok(Measurement {
+        elapsed: started.elapsed(),
+        operations,
+        bytes,
+        checksum,
     })
 }
 

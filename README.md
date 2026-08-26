@@ -17,6 +17,7 @@ The persistence contract is intentionally narrow:
 
 ```rust
 use cache_rs::{HybridCacheConfig, IoEngine, RuntimeConfig, StaticConfig};
+# async fn run() -> Result<(), std::io::Error> {
 
 let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
     .with_region_size(32 * 1024 * 1024)
@@ -38,7 +39,7 @@ let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_conf
     .open()?;
 
 cache.put("chunk-key", b"chunk bytes")?;
-let value = cache.get("chunk-key")?.expect("cache hit");
+let value = cache.get("chunk-key").await?.expect("cache hit");
 assert_eq!(value.as_ref(), b"chunk bytes");
 
 // Deletes use the same bounded mutation path and return a sequence number.
@@ -50,17 +51,22 @@ cache.drain()?;
 // Publishes the only state that a later process is allowed to recover.
 cache.close_warm()?;
 # Ok::<(), std::io::Error>(())
+# }
 ```
 
 The default path uses namespace zero. Namespaces are an explicit extension:
 
 ```rust
+# use cache_rs::HybridCache;
+# async fn read_namespace(cache: &HybridCache) -> Result<(), std::io::Error> {
 let namespace = 42;
 cache.put_in(namespace, "stable-key", b"namespaced value")?;
 cache.delete_in(namespace, "obsolete-key")?;
 
-let stable = cache.get_in(namespace, "stable-key")?;
+let stable = cache.get_in(namespace, "stable-key").await?;
+# let _ = stable;
 # Ok::<(), std::io::Error>(())
+# }
 ```
 
 Namespaces may also be assigned to physical RegionSets when workloads need
@@ -108,6 +114,12 @@ write admission rejects immediately with `WouldBlock` when the fixed shard
 buffer is saturated or its short mutation path is contended; there is no
 global write-admission gate, wait policy, deadline, or foreground retry loop.
 Neither path holds a lock across device I/O.
+
+`get` and `get_in` are native Tokio futures. L1 hits and L2 index misses finish
+on their first poll; an admitted L2 candidate suspends the task until its one
+record read completes. Dropping the future requests best-effort cancellation,
+while the I/O engine retains the aligned buffer until the device completion so
+callers cannot outlive in-flight storage.
 
 `delete` uses the same shard routing, monotonic sequence, fixed staging, and
 write admission as `put`. It performs one best-effort exact-key L1 cleanup

@@ -29,6 +29,7 @@ harness = false
 
 [dependencies]
 crc32c = "=0.6.8"
+tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 xxhash-rust = { version = "=0.8.18", default-features = false, features = ["xxh3"] }
 
 [features]
