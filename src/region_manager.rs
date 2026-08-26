@@ -2,8 +2,8 @@
 //!
 //! The manager deliberately does not retain the recovered index partition
 //! directory or its physical counters. A clean freeze accepts the current
-//! canonical shard records from the index owner and derives every Region,
-//! queue, and root accounting field from live manager state.
+//! canonical shard records from the index owner and derives every Region and
+//! queue field from live manager state.
 
 use crate::index::IndexEntry;
 use crate::index_storage::IndexSlotState;
