@@ -784,13 +784,13 @@ impl RegionDataPlane {
                 token
             }
         };
-        let Some(initial_point) = self.core.begin_value_read(hash, namespace_id)? else {
+        let Some(entry) = self.core.begin_value_read(hash, namespace_id)? else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
             return Ok(None);
         };
-        let plan = match plan_read(self.data.geometry, initial_point.entry) {
+        let plan = match plan_read(self.data.geometry, hash, entry) {
             Ok(plan) if plan.aligned_len <= MAX_READ_BUFFER_BYTES => plan,
             Ok(_) | Err(_) => {
                 self.core.enter_miss_only();
@@ -831,12 +831,11 @@ impl RegionDataPlane {
             }
             return Ok(None);
         };
-        let result = self.core.read_value_from_point(
+        let result = self.core.read_value_from_plan(
             engine.as_ref(),
             slot,
             buffer,
             plan,
-            initial_point,
             namespace_id,
             key,
             clock,
@@ -1645,7 +1644,7 @@ mod tests {
                     seqno: 1,
                     namespace_id: 1,
                 };
-                let plan = plan_read(geometry, entry).unwrap();
+                let plan = plan_read(geometry, 1, entry).unwrap();
                 observed_max = observed_max.max(plan.aligned_len);
                 assert!(plan.aligned_len <= MAX_READ_BUFFER_BYTES);
             }

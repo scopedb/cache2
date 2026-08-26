@@ -280,12 +280,6 @@ struct RegionShard {
     mutation: Mutex<()>,
 }
 
-/// Exact point identity used for one bounded physical record read.
-pub(crate) struct RegionPointRead {
-    pub(crate) hash: u64,
-    pub(crate) entry: IndexEntry,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionStageValue {
     Staged(u64),
@@ -561,7 +555,7 @@ impl FileRegionCore {
     }
 
     /// Begins one physical read with a single bounded index lookup.
-    fn begin_point_read(&self, hash: u64) -> io::Result<Option<RegionPointRead>> {
+    fn begin_point_read(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
         if !self.health.is_healthy() {
             return Ok(None);
         }
@@ -576,7 +570,7 @@ impl FileRegionCore {
                 return Ok(None);
             }
         };
-        Ok(Some(RegionPointRead { hash, entry }))
+        Ok(Some(entry))
     }
 
     /// Begins one durable value read. The aligned read buffer becomes the value
@@ -585,13 +579,13 @@ impl FileRegionCore {
         &self,
         hash: u64,
         namespace_id: u32,
-    ) -> io::Result<Option<RegionPointRead>> {
-        let point = self.begin_point_read(hash)?;
-        Ok(point.filter(|point| {
-            point.entry.namespace_id == namespace_id
+    ) -> io::Result<Option<IndexEntry>> {
+        let entry = self.begin_point_read(hash)?;
+        Ok(entry.filter(|entry| {
+            entry.namespace_id == namespace_id
                 && self
                     .layout
-                    .region_belongs_to_namespace(namespace_id, point.entry.location.region_id())
+                    .region_belongs_to_namespace(namespace_id, entry.location.region_id())
         }))
     }
 
@@ -608,38 +602,32 @@ impl FileRegionCore {
         clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = hash_namespaced_key(hash_seed, namespace_id, key);
-        let Some(point) = self.begin_value_read(hash, namespace_id)? else {
+        let Some(entry) = self.begin_value_read(hash, namespace_id)? else {
             return Ok(None);
         };
-        let plan = plan_read(geometry, point.entry)?;
+        let plan = plan_read(geometry, hash, entry)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_point(engine, slot, buffer, plan, point, namespace_id, key, clock)
+        self.read_value_from_plan(engine, slot, buffer, plan, namespace_id, key, clock)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn read_value_from_point(
+    pub(crate) fn read_value_from_plan(
         &self,
         engine: &dyn IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
         plan: ReadPlan,
-        point: RegionPointRead,
         namespace_id: u32,
         key: &[u8],
         clock: ExpiryClock,
     ) -> io::Result<Option<RegionValueRead>> {
-        let hash = point.hash;
-        if plan.entry != point.entry {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Region read plan does not match the index entry",
-            ));
-        }
+        let hash = plan.hash;
+        let entry = plan.entry;
         let pending = match submit_read(engine, slot, plan, buffer) {
             Ok(pending) => pending,
             Err(error) => {
                 if !matches!(
-                    error.error.kind(),
+                    error.kind(),
                     io::ErrorKind::OutOfMemory
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
@@ -647,7 +635,7 @@ impl FileRegionCore {
                 ) {
                     self.health.enter_miss_only();
                 }
-                return Err(error.error);
+                return Err(error);
             }
         };
         let completion = pending.wait(engine);
@@ -668,14 +656,14 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.record_len != point.entry.location.record_len()
-            || header.seqno != point.entry.seqno
+        if header.record_len != entry.location.record_len()
+            || header.seqno != entry.seqno
             || header.key_hash != hash
         {
             return Ok(None);
         }
         if clock.is_expired(header.expires_at) {
-            self.try_remove_expired(hash, point.entry);
+            self.try_remove_expired(hash, entry);
             return Ok(None);
         }
         let key_len = header.key_len as usize;
@@ -3114,7 +3102,7 @@ mod tests {
             .begin_point_read(first_hash)
             .unwrap()
             .expect("completed entry must plan a Region read");
-        assert_eq!(read.entry, entry);
+        assert_eq!(read, entry);
 
         let read_buffer_bytes = (last_entry.location.record_len() as usize)
             .div_ceil(RECOVERY_PAGE_SIZE)
@@ -3295,22 +3283,21 @@ mod tests {
             * RECOVERY_PAGE_SIZE;
         let memory_before_read = resources.managed_memory_snapshot().current_bytes;
         let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
-        let point = runtime
+        let entry = runtime
             .begin_point_read(owner_hash)
             .unwrap()
             .expect("hash lookup must return the collision candidate");
-        let plan = plan_read(data.geometry, point.entry).unwrap();
+        let plan = plan_read(data.geometry, owner_hash, entry).unwrap();
 
         // Supplying a different key after the hash lookup precisely models a
         // 64-bit collision at the L2 record-validation boundary.
         assert!(
             runtime
-                .read_value_from_point(
+                .read_value_from_plan(
                     &engine,
                     engine.try_reserve_read().unwrap(),
                     read_buffer,
                     plan,
-                    point,
                     namespace_id,
                     foreign_key,
                     ExpiryClock::Fixed(1),

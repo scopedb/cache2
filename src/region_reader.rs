@@ -5,7 +5,6 @@
 //! range and reports the exact record slice inside the returned buffer.
 //! Region generation and record contents are validated by the layers above.
 
-use std::fmt;
 use std::io;
 use std::ops::Range;
 
@@ -22,39 +21,11 @@ pub(crate) const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadPlan {
+    pub(crate) hash: u64,
     pub(crate) entry: IndexEntry,
     pub(crate) absolute: u64,
     pub(crate) aligned_len: usize,
     pub(crate) record_range: Range<usize>,
-}
-
-pub(crate) struct ReadSubmitError {
-    pub(crate) error: io::Error,
-    pub(crate) entry: IndexEntry,
-    pub(crate) buffer: Option<BufferLease>,
-}
-
-impl fmt::Debug for ReadSubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ReadSubmitError")
-            .field("error", &self.error)
-            .field("entry", &self.entry)
-            .field("buffer_returned", &self.buffer.is_some())
-            .finish()
-    }
-}
-
-impl fmt::Display for ReadSubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl std::error::Error for ReadSubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
 }
 
 pub(crate) struct PendingRead {
@@ -147,37 +118,17 @@ impl PendingRead {
 
 /// Submits one planned positioned read using an exact-size owned buffer.
 ///
-/// Validation happens before the lease is prepared or submitted. Every local
-/// failure returns that lease; engine failures preserve whatever buffer the
-/// engine returned with the rejected operation.
+/// Validation happens before the lease is prepared or submitted. Any rejected
+/// operation drops its lease immediately.
 pub(crate) fn submit_read(
     engine: &dyn IoEngine,
     slot: ReadSlot,
     plan: ReadPlan,
     buffer: BufferLease,
-) -> Result<PendingRead, ReadSubmitError> {
-    let entry = plan.entry;
-    let buffer = match IoBuffer::for_read(buffer, plan.aligned_len) {
-        Ok(buffer) => buffer,
-        Err(error) => {
-            return Err(ReadSubmitError {
-                error: error.error,
-                entry,
-                buffer: Some(error.lease),
-            });
-        }
-    };
-    let request = match submit_cache_read(engine, slot, IoOperation::read(buffer, plan.absolute)) {
-        Ok(request) => request,
-        Err(error) => {
-            let (error, buffer) = error.into_lease();
-            return Err(ReadSubmitError {
-                error,
-                entry,
-                buffer,
-            });
-        }
-    };
+) -> io::Result<PendingRead> {
+    let buffer = IoBuffer::for_read(buffer, plan.aligned_len).map_err(|error| error.error)?;
+    let request = submit_cache_read(engine, slot, IoOperation::read(buffer, plan.absolute))
+        .map_err(|error| error.into_lease().0)?;
     Ok(PendingRead {
         plan,
         request_id: request.id(),
@@ -185,7 +136,11 @@ pub(crate) fn submit_read(
     })
 }
 
-pub(crate) fn plan_read(geometry: DataGeometry, entry: IndexEntry) -> io::Result<ReadPlan> {
+pub(crate) fn plan_read(
+    geometry: DataGeometry,
+    hash: u64,
+    entry: IndexEntry,
+) -> io::Result<ReadPlan> {
     let location = entry.location;
     let offset = u64::from(location.offset());
     let record_len = usize::try_from(location.record_len()).map_err(|_| {
@@ -270,6 +225,7 @@ pub(crate) fn plan_read(geometry: DataGeometry, entry: IndexEntry) -> io::Result
     }
 
     Ok(ReadPlan {
+        hash,
         entry,
         absolute,
         aligned_len,
@@ -369,7 +325,7 @@ mod tests {
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
-        let plan = plan_read(geometry(), entry).unwrap();
+        let plan = plan_read(geometry(), 7, entry).unwrap();
 
         let slot = engine.try_reserve_read().unwrap();
         let completion = submit_read(
@@ -406,7 +362,7 @@ mod tests {
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::from_raw(0));
 
-        let error = plan_read(geometry(), invalid).unwrap_err();
+        let error = plan_read(geometry(), 7, invalid).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend
