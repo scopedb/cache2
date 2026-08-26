@@ -53,7 +53,6 @@ fn fuzz_index_probe(input: &[u8]) {
         };
         let _ = index.upsert_with_authority(hash, entry, &mut authority);
         let _ = index.lookup_raw(hash);
-        let _ = index.revalidate_exact(hash, entry);
     }
 }
 

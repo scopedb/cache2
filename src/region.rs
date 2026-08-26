@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
@@ -38,14 +38,11 @@ use crate::recovery::{
 use crate::region_appender::submit_span;
 use crate::region_index::{IndexMutationAuthority, IndexTransition, RegionIndex};
 use crate::region_layout::RegionLayout;
-use crate::region_manager::{RegionManager, RegionMutationError, RegionRuntime};
+use crate::region_manager::{RegionManager, RegionMutationError};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
     RegionMetadataRoot, RegionMetadataState,
-};
-use crate::region_read::{
-    RegionReadDirectory, RegionReadError, RegionReadGuard, RegionReadSnapshot,
 };
 #[cfg(test)]
 use crate::region_reader::plan_read;
@@ -257,9 +254,6 @@ pub(crate) struct FileRegionCore {
     layout: Arc<RegionLayout>,
     shards: Box<[RegionShard]>,
     rotation: Box<[Mutex<()>]>,
-    read_directory: RegionReadDirectory,
-    read_epoch: AtomicU32,
-    read_clear_floor: AtomicU64,
     health: RegionHealthLatch,
 }
 
@@ -286,13 +280,10 @@ struct RegionShard {
     mutation: Mutex<()>,
 }
 
-/// Exact point identity pinned to one Region generation across record I/O.
-pub(crate) struct RegionPointRead<'a> {
+/// Exact point identity used for one bounded physical record read.
+pub(crate) struct RegionPointRead {
     pub(crate) hash: u64,
     pub(crate) entry: IndexEntry,
-    region: RegionReadGuard<'a>,
-    cache_epoch: u32,
-    clear_floor_seqno: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,16 +292,6 @@ pub(crate) enum RegionStageValue {
     NeedsProgress,
     NeedsRotation,
     ManagerBusy,
-}
-
-impl RegionPointRead<'_> {
-    pub(crate) fn region_snapshot(&self) -> RegionReadSnapshot {
-        self.region.snapshot()
-    }
-
-    pub(crate) fn record_generation_matches(&self, epoch: u32, incarnation: u32) -> bool {
-        self.region.validate_snapshot(epoch, incarnation)
-    }
 }
 
 pub(crate) struct RegionValueRead {
@@ -387,20 +368,6 @@ impl FileRegionRuntime {
         }
         let manager = RegionManager::from_metadata_with_layout(metadata, Arc::clone(&layout))
             .map_err(region_metadata_io_error)?;
-        let read_directory = RegionReadDirectory::try_new(
-            u32::try_from(manager.regions().len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "Region count is too large")
-            })?,
-            manager.region_size(),
-        )
-        .map_err(region_read_io_error)?;
-        for region in manager.regions().iter().copied() {
-            if region.state != RegionMetadataState::Free {
-                read_directory
-                    .install(region_read_snapshot(&manager, region))
-                    .map_err(region_read_io_error)?;
-            }
-        }
         let mut shards = Vec::new();
         shards
             .try_reserve_exact(manager.active_regions().len())
@@ -425,13 +392,10 @@ impl FileRegionRuntime {
         Ok(Self {
             core: Arc::new(FileRegionCore {
                 index: RegionIndex::from_storage(index),
-                read_epoch: AtomicU32::new(manager.cache_epoch()),
-                read_clear_floor: AtomicU64::new(manager.clear_floor_seqno()),
                 manager: RegionManagerAuthority::new(manager, health.clone()),
                 layout,
                 shards: shards.into_boxed_slice(),
                 rotation: rotation.into_boxed_slice(),
-                read_directory,
                 health,
             }),
             data_plane: None,
@@ -607,13 +571,7 @@ impl FileRegionCore {
             return Ok(None);
         }
         match self.index.lookup_raw(hash) {
-            Ok(Some(entry)) if self.health.is_healthy() => {
-                Ok(if self.acquire_region_read(entry)?.is_some() {
-                    Some(entry)
-                } else {
-                    None
-                })
-            }
+            Ok(Some(entry)) if self.health.is_healthy() => Ok(Some(entry)),
             Ok(result) if self.health.is_healthy() => Ok(result),
             Ok(_) => Ok(None),
             Err(_) => {
@@ -623,10 +581,8 @@ impl FileRegionCore {
         }
     }
 
-    /// Begins a physical read without touching the global Region-manager
-    /// mutex. The returned per-Region guard must live through I/O, record
-    /// validation, and exact index revalidation.
-    fn begin_point_read(&self, hash: u64) -> io::Result<Option<RegionPointRead<'_>>> {
+    /// Begins one physical read with a single bounded index lookup.
+    fn begin_point_read(&self, hash: u64) -> io::Result<Option<RegionPointRead>> {
         if !self.health.is_healthy() {
             return Ok(None);
         }
@@ -641,42 +597,16 @@ impl FileRegionCore {
                 return Ok(None);
             }
         };
-        let Some((region, cache_epoch, clear_floor_seqno)) = self.acquire_region_read(entry)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(RegionPointRead {
-            hash,
-            entry,
-            region,
-            cache_epoch,
-            clear_floor_seqno,
-        }))
+        Ok(Some(RegionPointRead { hash, entry }))
     }
 
-    /// Finishes a physical read while its Region generation is still pinned.
-    /// A same-key overwrite/remove, clear fence, or health transition turns
-    /// the result into a miss.
-    fn revalidate_point_read(&self, read: &RegionPointRead<'_>) -> io::Result<bool> {
-        if read.region_snapshot().cache_epoch != read.cache_epoch
-            || self.read_epoch.load(Ordering::Acquire) != read.cache_epoch
-            || self.read_clear_floor.load(Ordering::Acquire) != read.clear_floor_seqno
-            || read.entry.seqno < read.clear_floor_seqno
-            || !self.revalidate_exact(read.hash, read.entry)?
-        {
-            return Ok(false);
-        }
-        Ok(self.health.is_healthy())
-    }
-
-    /// Performs one durable value read under a per-Region generation pin.
-    /// The aligned read buffer is returned as the value owner, avoiding a
-    /// second payload copy on the disk-hit path.
+    /// Begins one durable value read. The aligned read buffer becomes the value
+    /// owner on a hit, avoiding a second payload copy.
     pub(crate) fn begin_value_read(
         &self,
         hash: u64,
         namespace_id: u32,
-    ) -> io::Result<Option<RegionPointRead<'_>>> {
+    ) -> io::Result<Option<RegionPointRead>> {
         let point = self.begin_point_read(hash)?;
         Ok(point.filter(|point| {
             point.entry.namespace_id == namespace_id
@@ -714,7 +644,7 @@ impl FileRegionCore {
         slot: ReadSlot,
         buffer: BufferLease,
         plan: ReadPlan,
-        point: RegionPointRead<'_>,
+        point: RegionPointRead,
         namespace_id: u32,
         key: &[u8],
         clock: ExpiryClock,
@@ -723,7 +653,7 @@ impl FileRegionCore {
         if plan.entry != point.entry {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Region read plan does not match the pinned index entry",
+                "Region read plan does not match the index entry",
             ));
         }
         let pending = match submit_read(engine, slot, plan, buffer) {
@@ -753,19 +683,17 @@ impl FileRegionCore {
                 "record completion lost its exact record slice",
             )
         })?;
-        let header = RecordHeader::decode(
-            record
-                .get(..RECORD_HEADER_SIZE)
-                .ok_or_else(|| corrupt_record(&self.health))?,
-        )
-        .ok_or_else(|| corrupt_record(&self.health))?;
+        let Some(header) = record
+            .get(..RECORD_HEADER_SIZE)
+            .and_then(RecordHeader::decode)
+        else {
+            return Ok(None);
+        };
         if header.record_len != point.entry.location.record_len()
             || header.seqno != point.entry.seqno
             || header.key_hash != hash
-            || !point.record_generation_matches(header.epoch, header.region_incarnation)
         {
-            self.health.enter_miss_only();
-            return Err(corrupt_record(&self.health));
+            return Ok(None);
         }
         if clock.is_expired(header.expires_at) {
             self.try_remove_expired(hash, point.entry);
@@ -773,29 +701,30 @@ impl FileRegionCore {
         }
         let key_len = header.key_len as usize;
         let value_len = header.stored_len as usize;
-        let payload_end = RECORD_HEADER_SIZE
+        let Some(payload_end) = RECORD_HEADER_SIZE
             .checked_add(key_len)
             .and_then(|end| end.checked_add(value_len))
             .filter(|end| *end <= record.len())
-            .ok_or_else(|| corrupt_record(&self.health))?;
+        else {
+            return Ok(None);
+        };
         let encoded_key = &record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + key_len];
         if !record_key_matches(header.codec, encoded_key, namespace_id, key) {
             return Ok(None);
         }
         if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
-            self.health.enter_miss_only();
-            return Err(corrupt_record(&self.health));
-        }
-        if !self.revalidate_point_read(&point)? {
             return Ok(None);
         }
         let value_start = completion.plan.record_range.start + RECORD_HEADER_SIZE + key_len;
-        let value_end = value_start
-            .checked_add(value_len)
-            .ok_or_else(|| corrupt_record(&self.health))?;
+        let Some(value_end) = value_start.checked_add(value_len) else {
+            return Ok(None);
+        };
         let Some(buffer) = completion.buffer else {
             self.health.enter_miss_only();
-            return Err(corrupt_record(&self.health));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "validated Region read lost its owned buffer",
+            ));
         };
         Ok(Some(RegionValueRead {
             buffer,
@@ -804,28 +733,6 @@ impl FileRegionCore {
             expires_at_unix_ms: header.expires_at,
             seqno: header.seqno,
         }))
-    }
-
-    fn acquire_region_read(
-        &self,
-        entry: IndexEntry,
-    ) -> io::Result<Option<(RegionReadGuard<'_>, u32, u64)>> {
-        let cache_epoch = self.read_epoch.load(Ordering::Acquire);
-        let clear_floor_seqno = self.read_clear_floor.load(Ordering::Acquire);
-        let guard = self
-            .read_directory
-            .acquire_visible(entry, cache_epoch, clear_floor_seqno)
-            .map_err(|error| {
-                self.health.enter_miss_only();
-                region_read_io_error(error)
-            })?;
-        if !self.health.is_healthy()
-            || self.read_epoch.load(Ordering::Acquire) != cache_epoch
-            || self.read_clear_floor.load(Ordering::Acquire) != clear_floor_seqno
-        {
-            return Ok(None);
-        }
-        Ok(guard.map(|guard| (guard, cache_epoch, clear_floor_seqno)))
     }
 
     /// Preflights, reserves, and encodes one value directly into a shard's
@@ -1071,7 +978,7 @@ impl FileRegionCore {
             ));
         };
 
-        let snapshot = {
+        {
             let mut manager = match self.manager.lock() {
                 Ok(manager) => manager,
                 Err(error) => {
@@ -1085,21 +992,6 @@ impl FileRegionCore {
                 self.fail_staged_span(staging, span, Some(buffer), records);
                 return Err(region_mutation_io_error(error));
             }
-            let Some(region) = manager.regions().get(span.region_id as usize).copied() else {
-                self.health.enter_miss_only();
-                drop(manager);
-                self.fail_staged_span(staging, span, Some(buffer), records);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "completed span has no Region authority",
-                ));
-            };
-            region_read_snapshot(&manager, region)
-        };
-        if let Err(error) = self.read_directory.update_active(snapshot) {
-            self.health.enter_miss_only();
-            self.fail_staged_span(staging, span, Some(buffer), records);
-            return Err(region_read_io_error(error));
         }
 
         if let Err(error) = self.publish_completed_records(records.as_slice()) {
@@ -1113,9 +1005,8 @@ impl FileRegionCore {
         Ok(Some(span))
     }
 
-    /// Rotates one empty data shard through the exact read-drain boundary. The
-    /// RegionSet-local gate protects its FIFO plan while no manager mutex is held
-    /// waiting for readers of a reused victim.
+    /// Rotates one empty data shard. Concurrent reads validate the returned
+    /// record identity and may observe either valid generation.
     pub(crate) fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
         self.health.require_healthy()?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
@@ -1138,59 +1029,20 @@ impl FileRegionCore {
             Err(error) => return Err(region_mutation_context("rotation planning", error)),
         };
 
-        let mut victim = if plan.reused {
-            Some(
-                self.read_directory
-                    .acquire_rotation_write(
-                        plan.victim_region_id,
-                        plan.cache_epoch,
-                        plan.victim_incarnation,
-                    )
-                    .map_err(region_read_io_error)?,
-            )
-        } else {
-            None
-        };
-
         let receipt = self
             .manager
             .lock()?
             .begin_rotation(plan)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
-        if let Some(victim) = victim.as_mut() {
-            victim.mark_unreadable().map_err(region_read_io_error)?;
-        }
         // Manager authority now carries the exact in-progress rotation
         // receipt, so foreground staging fails fast on this shard. Release the
         // shard gates before publishing the completed in-memory rotation.
         drop(rotation);
         drop(shard_mutation);
 
-        let activated = {
-            let mut manager = self.manager.lock()?;
-            manager.finish_rotation(receipt).map_err(|error| {
-                self.health.enter_miss_only();
-                region_mutation_context("rotation completion", error)
-            })?;
-            let region = manager
-                .regions()
-                .get(receipt.activated_region_id as usize)
-                .copied()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "activated Region is outside manager authority",
-                    )
-                })?;
-            region_read_snapshot(&manager, region)
-        };
-        let projection = match victim.as_mut() {
-            Some(victim) => victim.install(activated),
-            None => self.read_directory.install(activated),
-        };
-        if let Err(error) = projection {
+        if let Err(error) = self.manager.lock()?.finish_rotation(receipt) {
             self.health.enter_miss_only();
-            return Err(region_read_io_error(error));
+            return Err(region_mutation_context("rotation completion", error));
         }
         Ok(true)
     }
@@ -1233,25 +1085,6 @@ impl FileRegionCore {
     ) {
         self.health.enter_miss_only();
         let _ = staging.finish_failure(span, buffer, records);
-    }
-
-    /// Revalidate only the exact index identity. Region visibility is checked
-    /// separately by the read snapshot owner after the index partition is free.
-    fn revalidate_exact(&self, hash: u64, expected: crate::index::IndexEntry) -> io::Result<bool> {
-        if !self.health.is_healthy() {
-            return Ok(false);
-        }
-        match self.index.revalidate_exact(hash, expected) {
-            Ok(matches) if self.health.is_healthy() => Ok(matches),
-            Ok(_) => Ok(false),
-            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
-                Ok(false)
-            }
-            Err(_) => {
-                self.health.enter_miss_only();
-                Ok(false)
-            }
-        }
     }
 
     fn try_remove_expired(&self, hash: u64, expected: IndexEntry) {
@@ -1932,9 +1765,6 @@ where
             layout: _,
             shards,
             rotation,
-            read_directory,
-            read_epoch,
-            read_clear_floor,
             health,
         } = runtime.into_core()?;
         if shards.iter().any(|shard| shard.mutation.is_poisoned())
@@ -1947,34 +1777,6 @@ where
             ));
         }
         let manager = manager.into_inner()?;
-        if read_epoch.into_inner() != manager.cache_epoch()
-            || read_clear_floor.into_inner() != manager.clear_floor_seqno()
-        {
-            health.enter_miss_only();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "read fence and Region authority disagree",
-            ));
-        }
-        for region in manager.regions().iter().copied() {
-            let valid = if region.state == RegionMetadataState::Free {
-                read_directory
-                    .snapshot(region.region_id)
-                    .map_err(region_read_io_error)?
-                    .is_none()
-            } else {
-                read_directory
-                    .validate_snapshot(region_read_snapshot(&manager, region))
-                    .map_err(region_read_io_error)?
-            };
-            if !valid {
-                health.enter_miss_only();
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "read projection and Region authority disagree",
-                ));
-            }
-        }
         let partitions = index_partition_metadata(index.storage(), &health)?;
         let metadata = manager
             .freeze_metadata(partitions)
@@ -2623,26 +2425,6 @@ fn region_mutation_context(context: &'static str, error: RegionMutationError) ->
     )
 }
 
-fn region_read_snapshot(manager: &RegionManager, region: RegionRuntime) -> RegionReadSnapshot {
-    RegionReadSnapshot {
-        region_id: region.region_id,
-        cache_epoch: manager.cache_epoch(),
-        incarnation: region.incarnation,
-        created_seqno: region.created_seqno,
-        completed_used: region.completed_used,
-        max_seqno: region.max_seqno,
-    }
-}
-
-fn region_read_io_error(error: RegionReadError) -> io::Error {
-    let kind = match error {
-        RegionReadError::Allocation => io::ErrorKind::OutOfMemory,
-        RegionReadError::InvalidGeometry => io::ErrorKind::InvalidInput,
-        _ => io::ErrorKind::InvalidData,
-    };
-    io::Error::new(kind, error.to_string())
-}
-
 fn record_encode_io_error(error: RecordEncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
@@ -2662,14 +2444,6 @@ fn record_key_matches(
                 && encoded_key.get(size_of::<u32>()..) == Some(expected_key)
         }
     }
-}
-
-fn corrupt_record(health: &RegionHealthLatch) -> io::Error {
-    health.enter_miss_only();
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "Region record failed identity or checksum validation",
-    )
 }
 
 fn staging_io_error(error: StagingError) -> io::Error {
@@ -3387,13 +3161,8 @@ mod tests {
         let read = runtime
             .begin_point_read(first_hash)
             .unwrap()
-            .expect("completed entry must acquire its Region read pin");
-        assert!(read.record_generation_matches(
-            read.region_snapshot().cache_epoch,
-            read.region_snapshot().incarnation
-        ));
-        assert!(runtime.revalidate_point_read(&read).unwrap());
-        drop(read);
+            .expect("completed entry must plan a Region read");
+        assert_eq!(read.entry, entry);
 
         let read_buffer_bytes = (last_entry.location.record_len() as usize)
             .div_ceil(RECOVERY_PAGE_SIZE)
@@ -4118,18 +3887,7 @@ mod tests {
         let runtime = recovered.runtime().unwrap();
         assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);
         assert!(runtime.health.is_healthy());
-        assert!(
-            !runtime
-                .revalidate_exact(
-                    1,
-                    IndexEntry {
-                        location: PackedLocation::new(0, 4096, 32).unwrap(),
-                        seqno: 1,
-                        namespace_id: 0,
-                    },
-                )
-                .unwrap()
-        );
+        assert_eq!(runtime.lookup_snapshot(1).unwrap(), None);
         assert!(!runtime.health.is_healthy());
         assert_eq!(runtime.lookup_snapshot(1).unwrap(), None);
         assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);

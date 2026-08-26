@@ -102,22 +102,6 @@ impl RegionIndex {
         Ok(None)
     }
 
-    /// Revalidates the exact immutable record identity observed by a prior
-    /// lookup without consulting Region visibility.
-    ///
-    /// The caller separately revalidates its Region generation/epoch snapshot
-    /// after this partition guard is released.
-    pub(crate) fn revalidate_exact(
-        &self,
-        hash: u64,
-        expected: IndexEntry,
-    ) -> Result<bool, IndexStorageError> {
-        Ok(matches!(
-            self.lookup_raw(hash)?,
-            Some(current) if current.same_record_identity(expected)
-        ))
-    }
-
     /// Installs a live value using the existing bounded replacement policy.
     ///
     /// Deleted slots and the first invisible foreign value are reusable. If
@@ -600,16 +584,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_lookup_and_exact_revalidate_need_no_visibility_callback() {
+    fn raw_lookup_needs_no_visibility_callback() {
         let index = anonymous(8);
         let hash = 5;
         let current = entry(2, 16, 9);
         assert!(index.upsert(hash, current, |_| true).unwrap());
 
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(current));
-        assert!(index.revalidate_exact(hash, current).unwrap());
-        assert!(!index.revalidate_exact(hash, entry(3, 24, 9)).unwrap());
-        assert!(!index.revalidate_exact(hash, entry(2, 16, 10)).unwrap());
     }
 
     #[test]

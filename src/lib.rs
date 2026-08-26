@@ -25,7 +25,6 @@ mod region_index;
 mod region_layout;
 mod region_manager;
 mod region_metadata;
-mod region_read;
 mod region_reader;
 mod region_runtime;
 mod region_staging;
