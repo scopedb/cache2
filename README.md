@@ -31,7 +31,6 @@ let runtime_config = RuntimeConfig::default()
     .with_l1_shards(64)
     .with_io_engine(IoEngine::Posix)
     .with_io_workers(16)
-    .with_io_concurrency(16)
     .with_write_batch_size(4 * 1024 * 1024);
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
@@ -203,8 +202,8 @@ may change on every open without invalidating a clean image:
 - POSIX positioned-I/O by default, with io_uring available only through an
   explicit crate feature and engine selection;
 - buffered/automatic/direct I/O mode;
-- any positive I/O worker count within the configured total I/O concurrency;
-- total I/O concurrency;
+- any positive I/O worker count; POSIX exposes one execution slot per worker,
+  while optional io_uring uses a fixed 64-slot lane depth;
 - L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
   batch capacity, and opt-in operational counters.
 
@@ -311,8 +310,8 @@ recoverable.
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
 5. Start with four workers and measure 1/2/4/8/16 on the target device. Worker
-   count, I/O concurrency, memory, and write-batch capacity are runtime settings
-   and may change across a warm restart.
+   count, memory, and write-batch capacity are runtime settings and may change
+   across a warm restart.
 
 The reproducible baseline, Linux NVMe matrix, regression thresholds, and soak
 procedure are in `BENCHMARK.md`.

@@ -52,9 +52,9 @@ Static configuration defines disk identity: capacity, Region geometry, index
 slots, shard count, RegionSet capacity layout and namespace ownership, seeded
 XXH3-64 algorithm identity, and hash seed. A change intentionally cold-starts
 empty.
-Runtime configuration—including workers, I/O concurrency, write-batch
-capacity, L1 capacity, and statistics—may change across a successful warm restart
-without invalidating the clean image.
+Runtime configuration—including workers, write-batch capacity, L1 capacity,
+and statistics—may change across a successful warm restart without invalidating
+the clean image.
 
 Only `close_warm` publishes recoverable state. Fast close, process failure, and
 every unclean boundary reopen empty. This recovery contract is part of format 1

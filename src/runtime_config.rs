@@ -1,6 +1,7 @@
 pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
 pub(crate) const MAX_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+const IO_URING_DEPTH_PER_WORKER: usize = 64;
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,7 +27,6 @@ pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
     pub(crate) io_mode: IoMode,
     pub(crate) io_workers: usize,
-    pub(crate) io_concurrency: usize,
     pub(crate) l1_capacity_bytes: usize,
     pub(crate) memory_limit_bytes: usize,
     pub(crate) l1_shards: usize,
@@ -40,7 +40,6 @@ impl Default for RuntimeConfig {
             io_engine: IoEngine::Posix,
             io_mode: IoMode::Auto,
             io_workers: 4,
-            io_concurrency: 4,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
@@ -63,13 +62,6 @@ impl RuntimeConfig {
 
     pub fn with_io_workers(mut self, workers: usize) -> Self {
         self.io_workers = workers;
-        self
-    }
-
-    /// Sets aggregate asynchronous I/O admission. The POSIX engine has
-    /// one executable slot per `io_worker` and does not queue cache reads.
-    pub fn with_io_concurrency(mut self, requests: usize) -> Self {
-        self.io_concurrency = requests;
         self
     }
 
@@ -110,10 +102,6 @@ impl RuntimeConfig {
         self.io_workers
     }
 
-    pub const fn io_concurrency(&self) -> usize {
-        self.io_concurrency
-    }
-
     pub const fn l1_capacity_bytes(&self) -> usize {
         self.l1_capacity_bytes
     }
@@ -133,6 +121,13 @@ impl RuntimeConfig {
     pub const fn statistics_enabled(&self) -> bool {
         self.statistics
     }
+
+    pub(crate) const fn io_depth_per_worker(&self) -> usize {
+        match self.io_engine {
+            IoEngine::Posix => 1,
+            IoEngine::IoUring => IO_URING_DEPTH_PER_WORKER,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +138,12 @@ mod tests {
     fn runtime_defaults_to_posix_io() {
         let config = RuntimeConfig::default();
         assert_eq!(config.io_engine(), IoEngine::Posix);
-        assert_eq!(config.io_concurrency(), config.io_workers());
+        assert_eq!(config.io_depth_per_worker(), 1);
+        assert_eq!(
+            config
+                .with_io_engine(IoEngine::IoUring)
+                .io_depth_per_worker(),
+            64
+        );
     }
 }

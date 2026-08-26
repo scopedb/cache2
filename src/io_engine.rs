@@ -3568,7 +3568,7 @@ mod tests {
     }
 
     #[test]
-    fn io_concurrency_is_hard_bounded() {
+    fn engine_request_capacity_is_hard_bounded() {
         let file = TestFile::new();
         assert!(matches!(
             BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_WORKER + 1),
@@ -3736,7 +3736,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_wait_blocks_at_the_io_concurrency_limit_and_resumes() {
+    fn submit_wait_blocks_at_engine_capacity_and_resumes() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(1);

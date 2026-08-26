@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
-use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_WORKER, ReadSlot, build_file_engine};
+use crate::io_engine::{IoEngine, ReadSlot, build_file_engine};
 use crate::memory::{
     MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
 };
@@ -52,7 +52,7 @@ const _RETRY_AGE: Duration = Duration::from_micros(50);
 // ResourceController separately.
 const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 // Covers worker/shard controls and handles whose size does not scale with the
-// payload or configured concurrency.
+// payload or engine depth.
 const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
 // Keep the fixed L1 directory useful when the configured L2 has deliberate
 // headroom. Smaller entries may still bypass before the byte budget fills;
@@ -384,16 +384,10 @@ impl RuntimeMetrics {
 
 impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.io_workers == 0 || self.io_workers > self.io_concurrency {
+        if self.io_workers == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "I/O workers must be in 1..=I/O concurrency",
-            ));
-        }
-        if self.io_concurrency.div_ceil(self.io_workers) > MAX_IO_REQUESTS_PER_WORKER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "I/O concurrency per worker exceeds 4096",
+                "I/O worker count must be non-zero",
             ));
         }
         if self.memory_limit_bytes == 0 {
@@ -1345,7 +1339,8 @@ fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> 
     let stack_count = config.io_workers.checked_mul(2)?.checked_add(shard_count)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
     let queue = config
-        .io_concurrency
+        .io_workers
+        .checked_mul(config.io_depth_per_worker())?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let controls = config
         .io_workers
@@ -1368,18 +1363,16 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(config.io_workers)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let base_depth = config.io_concurrency / config.io_workers;
-    let remainder = config.io_concurrency % config.io_workers;
+    let worker_depth = config.io_depth_per_worker();
     for worker in 0..config.io_workers {
         let worker_files = if worker + 1 == config.io_workers {
             source.take().expect("last I/O worker owns file set")
         } else {
             source.as_ref().expect("I/O file set exists").try_clone()?
         };
-        let worker_concurrency = base_depth + usize::from(worker < remainder);
         engines.push(build_file_engine(
             worker_files,
-            worker_concurrency,
+            worker_depth,
             config.io_engine(),
             config.statistics,
         )?);

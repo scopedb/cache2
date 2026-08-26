@@ -100,16 +100,10 @@ impl SoakConfig {
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
-        let io_concurrency = if self.io_engine == IoEngine::Posix {
-            self.io_workers
-        } else {
-            self.io_workers.saturating_mul(64)
-        };
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
             .with_io_workers(self.io_workers)
-            .with_io_concurrency(io_concurrency)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_bytes.saturating_add(256 * MIB))
             .with_statistics(true)

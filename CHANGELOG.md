@@ -42,6 +42,8 @@ version number documented in `MILESTONES.md`.
 - made POSIX positioned I/O the only default engine, renamed `IoEngine::Sync`
   to `IoEngine::Posix`, removed implicit `IoEngine::Auto` selection, and made
   io_uring an explicit opt-in crate feature;
+- removed the public `io_concurrency` setting; POSIX capacity now equals worker
+  count and optional io_uring uses a fixed 64-request depth per worker;
 - made `get` and `get_in` native Tokio async operations; L1/index-miss paths
   remain immediate, while an admitted L2 read wakes the caller task directly;
 - made `open`, `drain`, and explicit close Tokio-friendly: drain uses native
@@ -89,7 +91,7 @@ version number documented in `MILESTONES.md`.
   derive the maximum range from the runtime record limits, and expose
   `l2_read_memory_misses` and `l2_read_busy_misses` counters.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
-  aggregate memory limit, I/O concurrency, and one per-shard write-batch capacity.
+  aggregate memory limit, I/O workers, and one per-shard write-batch capacity.
 - made `put` and `put_in` return their mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
 - replaced runtime-growing L1 maps and slot vectors with fixed startup

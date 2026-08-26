@@ -29,7 +29,7 @@ set a contiguous Region range; append shards are assigned contiguous ranges
 evenly across sets. Every append shard has one Active Region, two fixed write
 buffers, and one ordered worker. Free and sealed FIFOs are private to their set,
 and Region rotation never borrows across sets. L1, the global index, I/O pool,
-I/O concurrency, memory limit, and statistics stay shared. Runtime-only L1 shards are
+memory limit, and statistics stay shared. Runtime-only L1 shards are
 independent of static append shards, so RAM concurrency can be retuned without
 changing Region assignment or recovery identity.
 
@@ -103,9 +103,9 @@ There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
 The I/O pool contains the requested number of workers. The default engine uses
-one POSIX positioned-I/O worker per lane. Explicit io_uring builds use one ring
-per lane. The sum of fixed lane depths never exceeds the configured global
-in-flight bound.
+one POSIX positioned-I/O worker and one execution slot per lane. Explicit
+io_uring builds use one ring with a fixed 64-slot depth per lane. The sum of
+these fixed lane depths is the aggregate in-flight bound.
 Two-choice read routing reduces idle-lane fragmentation without adding a shared
 admission counter to every I/O.
 
@@ -153,9 +153,9 @@ layout are canonicalized to the implicit default, avoiding cold starts for
 configurations with identical physical behavior.
 
 Runtime configuration is not persisted and may change between opens. It
-includes I/O engine and mode, worker count, total I/O concurrency,
-L1 capacity and shard count, one write-batch capacity, aggregate memory limit,
-and optional statistics. Foreground L2 reads
+includes I/O engine and mode, worker count, L1 capacity and shard count, one
+write-batch capacity, aggregate memory limit, and optional statistics.
+Foreground L2 reads
 reserve one immediately available engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public
 admission policy. Write occupancy leaves the final slot of a multi-entry I/O

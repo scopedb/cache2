@@ -36,7 +36,6 @@ impl TestCache {
         let runtime_config = RuntimeConfig::default()
             .with_io_engine(IoEngine::Posix)
             .with_io_workers(workers)
-            .with_io_concurrency(workers)
             .with_l1_capacity(4 * 1024 * 1024)
             .with_memory_limit(32 * 1024 * 1024)
             .with_write_batch_size(256 * 1024)
@@ -173,7 +172,6 @@ async fn immediate_l1_publication_is_best_effort() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(2)
-        .with_io_concurrency(2)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -210,7 +208,6 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(1)
         .with_l1_capacity(1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -250,7 +247,6 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(2)
-        .with_io_concurrency(2)
         .with_l1_capacity(512)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -296,7 +292,6 @@ async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::IoUring)
         .with_io_workers(1)
-        .with_io_concurrency(4)
         .with_l1_capacity(4 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024);
@@ -342,7 +337,6 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     let retuned = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(7)
-        .with_io_concurrency(7)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
@@ -616,12 +610,7 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
     let cases: [RuntimeConfigCase; 6] = [
-        ("workers-exceed-queue", |config| {
-            config
-                .with_io_engine(IoEngine::Posix)
-                .with_io_workers(8)
-                .with_io_concurrency(4)
-        }),
+        ("zero-workers", |config| config.with_io_workers(0)),
         ("l1-exceeds-budget", |config| {
             config
                 .with_l1_capacity(64 * 1024 * 1024)
@@ -631,7 +620,6 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             config
                 .with_io_engine(IoEngine::Posix)
                 .with_io_workers(2)
-                .with_io_concurrency(8)
                 .with_l1_capacity(0)
                 .with_memory_limit(2 * 1024 * 1024)
                 .with_write_batch_size(128 * 1024)
@@ -886,7 +874,6 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
@@ -921,7 +908,6 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(1)
         .with_l1_capacity(64 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -966,7 +952,6 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_io_workers(1)
-        .with_io_concurrency(1)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
