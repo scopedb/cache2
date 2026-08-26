@@ -408,6 +408,8 @@ impl HybridCache {
     }
 
     /// Stores a value and returns its monotonic mutation sequence.
+    ///
+    /// Keys are limited to 4 KiB and values to 256 KiB.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.put_in(0, key, value)
     }
@@ -426,6 +428,7 @@ impl HybridCache {
     /// sequence.
     ///
     /// An expiration of zero means that the value does not expire.
+    /// Keys are limited to 4 KiB and values to 256 KiB.
     pub fn put_until(
         &self,
         namespace: u32,
@@ -437,12 +440,29 @@ impl HybridCache {
             .put_value(namespace, key.as_ref(), value.as_ref(), expires_at_unix_ms)
     }
 
+    /// Deletes a key and returns its monotonic mutation sequence.
+    ///
+    /// The accepted delete is staged through the same bounded write path as a
+    /// put. L1 cleanup is immediate and best effort; the L2 delete is applied
+    /// after its containing Region batch completes.
+    /// Keys are limited to 4 KiB.
+    pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
+        self.delete_in(0, key)
+    }
+
+    /// Deletes a key from a logical namespace and returns its mutation
+    /// sequence.
+    pub fn delete_in(&self, namespace: u32, key: impl AsRef<[u8]>) -> Result<u64> {
+        self.store.delete_value(namespace, key.as_ref())
+    }
+
     /// Looks up a value in L1 and then L2.
     ///
     /// An L2 index miss returns directly. An L2 candidate reserves one
     /// immediately available engine slot, allocates one exact-size aligned
     /// buffer, performs one record read, and validates it locally. Internal
     /// allocation or I/O pressure fails open as a cache miss.
+    /// A key longer than 4 KiB is also a miss.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
         self.get_in(0, key)
     }

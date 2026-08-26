@@ -105,13 +105,15 @@ on internal implementation details.
   request path;
 - [x] expose a compact lifecycle/health state for running, draining, miss-only,
   and terminal failure;
+- [x] expose sequenced point deletes through the bounded mutation path with
+  best-effort L1 cleanup and warm-recoverable L2 tombstones;
 - [x] document overload behavior, shutdown choices, capacity planning, and
   benchmark reproduction;
 - [x] validate configuration changes and graceful restart in an embedding-service
   integration test;
 - [x] define a predeclared workload-canary evidence and pass/fail contract;
-- [x] keep invalidation, batching, and async wrappers out until an integration
-  or benchmark demonstrates that the core API is insufficient;
+- [x] keep batching and async wrappers out until an integration or benchmark
+  demonstrates that the core API is insufficient;
 - [ ] complete a real workload canary with agreed latency and hit-rate targets.
 
 Exit criteria:

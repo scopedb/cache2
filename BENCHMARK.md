@@ -352,11 +352,13 @@ scheduling/page-cache contention or a device-path limit.
 
 ## Turnover soak
 
-The soak workload continuously overwrites a key ring larger than L1 and cycles
-256 B, 4 KiB, 16 KiB, and 256 KiB entries by default. It drains in bounded
-batches, validates the embedded version, key, length, and payload of every hit,
-and reports an older valid version as `stale_hits` because freshness is best
-effort. A future version, wrong key, or malformed record is fatal. Samples
+The soak workload runs four writers and four readers by default while
+continuously overwriting a key ring larger than L1. Every 64th announced write
+also attempts a delete, and values cycle through 256 B, 4 KiB, 16 KiB, and
+256 KiB sizes. Periodic samples flush accepted batches, validate the embedded
+version, key, length, and payload of every hit, and report an older valid
+version as `stale_hits` because freshness is best effort. A future version,
+wrong key, or malformed record is fatal. Samples
 cover managed-memory current/peak/budget, L1 and index pressure, current and
 peak RSS, logical disk use, and latency. The Linux run fails when current RSS
 exceeds the managed-memory limit plus a fixed slack, or when a cache-owned bound
@@ -376,7 +378,8 @@ cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 
 `CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`, comma-separated
 `CACHE_SOAK_VALUE_BYTES`, `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
-`CACHE_SOAK_RSS_SLACK_MIB`, and `CACHE_SOAK_IO_WORKERS` control the workload.
+`CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and
+`CACHE_SOAK_READERS` control the workload.
 `CACHE_SOAK_IO_ENGINE` and
 `CACHE_SOAK_IO_MODE` select the device path. `CACHE_SOAK_EVICTION` selects
 `clock`, `lru`, `tinylfu`, `sieve`, `fifo`, or `s3fifo`; the main benchmark uses

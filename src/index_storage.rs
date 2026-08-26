@@ -190,12 +190,14 @@ pub(crate) struct IndexSlot {
 
 /// Typed runtime meaning of one canonical Index Image slot.
 ///
-/// `Deleted` is the open-addressing probe marker. Every `Value` has a non-zero
-/// sequence and a valid [`PackedLocation`].
+/// `Deleted` is the open-addressing probe marker. A `Tombstone` is a sequenced
+/// logical delete encoded with the otherwise invalid all-ones location. Every
+/// `Value` has a non-zero sequence and a valid [`PackedLocation`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexSlotState {
     Empty,
     Deleted,
+    Tombstone { hash: u64, seqno: u64 },
     Value { hash: u64, entry: IndexEntry },
 }
 
@@ -233,6 +235,11 @@ impl IndexSlot {
         match state {
             IndexSlotState::Empty => Self::EMPTY,
             IndexSlotState::Deleted => Self::DELETED,
+            IndexSlotState::Tombstone { hash, seqno } => Self {
+                hash,
+                location_raw: u64::MAX,
+                seqno,
+            },
             IndexSlotState::Value { hash, entry } => Self {
                 hash,
                 location_raw: entry.location.raw(),
@@ -265,6 +272,12 @@ impl IndexSlot {
         if self.seqno == 0 {
             return Err(IndexSlotSemanticError::NonCanonicalMarker);
         }
+        if self.location_raw == u64::MAX {
+            return Ok(IndexSlotState::Tombstone {
+                hash: self.hash,
+                seqno: self.seqno,
+            });
+        }
         let location = PackedLocation::try_from_raw(self.location_raw)
             .map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
@@ -279,6 +292,8 @@ impl IndexSlot {
     fn physical_kind(self) -> SlotPhysicalKind {
         if self == Self::EMPTY {
             SlotPhysicalKind::Empty
+        } else if self.location_raw == u64::MAX {
+            SlotPhysicalKind::Deleted
         } else if self.seqno != 0 {
             SlotPhysicalKind::Value
         } else {
@@ -2347,6 +2362,18 @@ mod tests {
         assert_eq!(&encoded[16..24], &value.seqno.to_le_bytes());
         assert_eq!(IndexSlot::decode(&encoded), value);
         assert_eq!(IndexSlot::decode(&[0_u8; 24]), IndexSlot::EMPTY);
+
+        let tombstone_state = IndexSlotState::Tombstone {
+            hash: 0x8877_6655_4433_2211,
+            seqno: 19,
+        };
+        let tombstone = IndexSlot::from_state(tombstone_state);
+        tombstone.encode(&mut encoded);
+        assert_eq!(&encoded[0..8], &0x8877_6655_4433_2211_u64.to_le_bytes());
+        assert_eq!(&encoded[8..16], &u64::MAX.to_le_bytes());
+        assert_eq!(&encoded[16..24], &19_u64.to_le_bytes());
+        assert_eq!(IndexSlot::decode(&encoded), tombstone);
+        assert_eq!(tombstone.runtime_state(), Ok(tombstone_state));
     }
 
     #[test]
@@ -2360,6 +2387,20 @@ mod tests {
             IndexPhysicalStats {
                 value: 1,
                 deleted: 0,
+            }
+        );
+
+        storage
+            .write_slot(
+                0,
+                IndexSlot::from_state(IndexSlotState::Tombstone { hash: 1, seqno: 2 }),
+            )
+            .unwrap();
+        assert_eq!(
+            storage.physical_stats(),
+            IndexPhysicalStats {
+                value: 0,
+                deleted: 1,
             }
         );
 

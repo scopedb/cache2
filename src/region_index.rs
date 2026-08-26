@@ -117,6 +117,9 @@ impl RegionIndex {
             |_, state| match state {
                 IndexSlotState::Empty => true,
                 IndexSlotState::Deleted => false,
+                IndexSlotState::Tombstone {
+                    hash: current_hash, ..
+                } => current_hash == hash,
                 IndexSlotState::Value {
                     hash: current_hash,
                     entry,
@@ -154,7 +157,25 @@ impl RegionIndex {
             hash,
             entry: supplied,
         };
-        self.install_if_newer(hash, supplied.seqno, installed)
+        self.install_if_newer(hash, supplied.seqno, installed, true)
+    }
+
+    /// Replaces a matching entry with a sequenced logical delete. An already
+    /// missing hash consumes no slot and never evicts an unrelated live value.
+    pub(crate) fn upsert_tombstone(
+        &self,
+        hash: u64,
+        seqno: u64,
+    ) -> Result<bool, IndexStorageError> {
+        if seqno == 0 {
+            return Ok(false);
+        }
+        self.install_if_newer(
+            hash,
+            seqno,
+            IndexSlotState::Tombstone { hash, seqno },
+            false,
+        )
     }
 
     fn install_if_newer(
@@ -162,6 +183,7 @@ impl RegionIndex {
         hash: u64,
         supplied_seqno: u64,
         installed: IndexSlotState,
+        install_missing: bool,
     ) -> Result<bool, IndexStorageError> {
         let mut partition = self.storage.write_hash_partition(hash)?;
         let slot_count = partition.slot_count();
@@ -177,16 +199,34 @@ impl RegionIndex {
             probe_limit(slot_count),
             |local_slot, state| match state {
                 IndexSlotState::Empty => {
-                    apply = Some(deleted.or(stale).unwrap_or((
-                        local_slot,
-                        state,
-                        InstallKind::Empty,
-                    )));
+                    if install_missing {
+                        apply = Some(deleted.or(stale).unwrap_or((
+                            local_slot,
+                            state,
+                            InstallKind::Empty,
+                        )));
+                    }
                     true
                 }
                 IndexSlotState::Deleted => {
                     deleted.get_or_insert((local_slot, state, InstallKind::Deleted));
                     false
+                }
+                IndexSlotState::Tombstone {
+                    hash: current_hash,
+                    seqno: current_seqno,
+                } => {
+                    if current_hash == hash {
+                        if supplied_seqno <= current_seqno {
+                            rejected = true;
+                        } else {
+                            apply = Some((local_slot, state, InstallKind::Existing));
+                        }
+                        true
+                    } else {
+                        deleted.get_or_insert((local_slot, state, InstallKind::Deleted));
+                        false
+                    }
                 }
                 IndexSlotState::Value {
                     hash: current_hash,
@@ -202,7 +242,7 @@ impl RegionIndex {
                     } else {
                         if self.is_stale(current) {
                             stale.get_or_insert((local_slot, state, InstallKind::Stale));
-                        } else if victim.is_none() {
+                        } else if install_missing && victim.is_none() {
                             victim = Some((local_slot, state, InstallKind::LiveVictim));
                         }
                         false
@@ -214,7 +254,12 @@ impl RegionIndex {
             return Ok(false);
         }
 
-        let Some((local_slot, previous, kind)) = apply.or(deleted).or(stale).or(victim) else {
+        let fallback = if install_missing {
+            deleted.or(stale).or(victim)
+        } else {
+            None
+        };
+        let Some((local_slot, previous, kind)) = apply.or(fallback) else {
             return Ok(false);
         };
         partition.replace_observed(local_slot, previous, installed)?;
@@ -273,6 +318,9 @@ impl RegionIndex {
             |local_slot, state| match state {
                 IndexSlotState::Empty => true,
                 IndexSlotState::Deleted => false,
+                IndexSlotState::Tombstone {
+                    hash: current_hash, ..
+                } => current_hash == hash,
                 IndexSlotState::Value {
                     hash: current_hash,
                     entry,
@@ -419,6 +467,60 @@ mod tests {
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
         assert!(index.upsert(15, entry(4, 32, 12)).unwrap());
         assert_eq!(index.snapshot().unwrap().deleted_slot_reuses, 1);
+    }
+
+    #[test]
+    fn tombstones_order_puts_and_deletes_by_sequence() {
+        let index = anonymous(8);
+        let hash = 7;
+        let first = entry(1, 8, 10);
+        let newer = entry(2, 16, 12);
+
+        assert!(index.upsert(hash, first).unwrap());
+        assert!(!index.upsert_tombstone(hash, 9).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(first));
+
+        assert!(index.upsert_tombstone(hash, 11).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), None);
+        assert!(!index.upsert(hash, first).unwrap());
+
+        assert!(index.upsert(hash, newer).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(newer));
+        assert_eq!(
+            index.storage().physical_stats().unwrap(),
+            IndexPhysicalStats {
+                value: 1,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_delete_does_not_replace_a_live_foreign_value() {
+        let empty = anonymous(8);
+        assert!(!empty.upsert_tombstone(8, 20).unwrap());
+        assert_eq!(
+            empty.storage().physical_stats().unwrap(),
+            IndexPhysicalStats::default()
+        );
+
+        let index = anonymous(8);
+        for hash in 0..8 {
+            assert!(
+                index
+                    .upsert(hash, entry(0, hash as u32 * 32, hash + 1))
+                    .unwrap()
+            );
+        }
+
+        assert!(!index.upsert_tombstone(8, 20).unwrap());
+        for hash in 0..8 {
+            assert_eq!(
+                index.lookup_raw(hash).unwrap(),
+                Some(entry(0, hash as u32 * 32, hash + 1))
+            );
+        }
+        assert_eq!(index.snapshot().unwrap().live_slot_replacements, 0);
     }
 
     #[test]

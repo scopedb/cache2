@@ -35,9 +35,60 @@ pub(crate) struct ShardFillSnapshot {
 /// completion path; staging never calls into the index while holding a shard
 /// lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StagedRecordKind {
+    Value,
+    Tombstone,
+}
+
+const STAGED_TOMBSTONE_BIT: u64 = 1_u64 << 63;
+
+/// Compact transient completion descriptor. The packed location's reserved
+/// high bit carries the publication kind while the descriptor is in memory;
+/// it is masked before reconstructing an [`IndexEntry`] and is never persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StagedRecord {
-    pub(crate) hash: u64,
-    pub(crate) entry: IndexEntry,
+    hash: u64,
+    location_and_kind: u64,
+    seqno: u64,
+}
+
+impl StagedRecord {
+    pub(crate) fn new(hash: u64, entry: IndexEntry, kind: StagedRecordKind) -> Self {
+        debug_assert_eq!(entry.location.raw() & STAGED_TOMBSTONE_BIT, 0);
+        let kind_bit = match kind {
+            StagedRecordKind::Value => 0,
+            StagedRecordKind::Tombstone => STAGED_TOMBSTONE_BIT,
+        };
+        Self {
+            hash,
+            location_and_kind: entry.location.raw() | kind_bit,
+            seqno: entry.seqno,
+        }
+    }
+
+    pub(crate) const fn hash(self) -> u64 {
+        self.hash
+    }
+
+    pub(crate) const fn entry(self) -> IndexEntry {
+        IndexEntry {
+            location: PackedLocation::from_raw(self.location_and_kind & !STAGED_TOMBSTONE_BIT),
+            seqno: self.seqno,
+        }
+    }
+
+    pub(crate) const fn kind(self) -> StagedRecordKind {
+        if self.location_and_kind & STAGED_TOMBSTONE_BIT == 0 {
+            StagedRecordKind::Value
+        } else {
+            StagedRecordKind::Tombstone
+        }
+    }
+
+    fn set_location(&mut self, location: PackedLocation) {
+        let kind = self.location_and_kind & STAGED_TOMBSTONE_BIT;
+        self.location_and_kind = location.raw() | kind;
+    }
 }
 
 /// A zero-copy write job. `buffer` is the shard's former fill lease and is
@@ -519,7 +570,8 @@ impl RegionStaging {
             }
 
             let last = *fill.records.last().ok_or(StagingError::StaleReceipt)?;
-            let location = last.entry.location;
+            let last_entry = last.entry();
+            let location = last_entry.location;
             let old_record_len = location.record_len();
             let new_record_len = old_record_len
                 .checked_add(padding)
@@ -531,7 +583,7 @@ impl RegionStaging {
                 .checked_add(u64::from(old_record_len))
                 .ok_or(StagingError::StaleReceipt)?;
             if location.region_id() != receipt.region_id
-                || last.entry.seqno != receipt.max_seqno
+                || last_entry.seqno != receipt.max_seqno
                 || record_end != receipt.unpadded_end_offset
             {
                 return Err(StagingError::StaleReceipt);
@@ -555,8 +607,8 @@ impl RegionStaging {
                 StagingError::Invariant("staging final record header is corrupt"),
             )?;
             if header.record_len != old_record_len
-                || header.seqno != last.entry.seqno
-                || header.key_hash != last.hash
+                || header.seqno != last_entry.seqno
+                || header.key_hash != last.hash()
             {
                 return Err(StagingError::StaleReceipt);
             }
@@ -570,8 +622,7 @@ impl RegionStaging {
             fill.records
                 .last_mut()
                 .expect("validated non-empty staging records")
-                .entry
-                .location = padded_location;
+                .set_location(padded_location);
             fill.end_offset = receipt.padded_end_offset;
             Ok(())
         })();
@@ -734,11 +785,12 @@ impl RegionStaging {
         record: StagedRecord,
     ) -> Result<(), StagingError> {
         self.validate_reservation(receipt)?;
-        let location = record.entry.location;
+        let entry = record.entry();
+        let location = entry.location;
         if location.region_id() != receipt.region_id
             || location.offset() != receipt.offset
             || location.record_len() != receipt.record_bytes
-            || record.entry.seqno != receipt.seqno
+            || entry.seqno != receipt.seqno
         {
             return Err(StagingError::StaleReceipt);
         }
@@ -803,7 +855,7 @@ fn span_matches_records(span: RegionWriteSpan, records: &[StagedRecord]) -> bool
     let mut offset = span.start_offset;
     let mut max_seqno = 0_u64;
     for record in records {
-        let entry = record.entry;
+        let entry = record.entry();
         if entry.location.region_id() != span.region_id
             || u64::from(entry.location.offset()) != offset
             || entry.seqno == 0
@@ -857,13 +909,14 @@ mod tests {
             record_bytes,
             seqno,
         };
-        let record = StagedRecord {
-            hash: seqno.wrapping_mul(17),
-            entry: IndexEntry {
+        let record = StagedRecord::new(
+            seqno.wrapping_mul(17),
+            IndexEntry {
                 location: PackedLocation::new(1, offset, record_bytes).unwrap(),
                 seqno,
             },
-        };
+            StagedRecordKind::Value,
+        );
         (receipt, record)
     }
 
@@ -898,7 +951,7 @@ mod tests {
             namespace_id: 0,
             record_len: receipt.record_bytes,
             seqno: receipt.seqno,
-            key_hash: record.hash,
+            key_hash: record.hash(),
             expires_at: 0,
             payload_crc: 0,
         };
@@ -908,6 +961,7 @@ mod tests {
 
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
+        assert_eq!(std::mem::size_of::<StagedRecord>(), 24);
         let resources = resources(4 * 1024 * 1024);
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
@@ -1078,6 +1132,11 @@ mod tests {
 
         let second_offset = first.offset + first.record_bytes;
         let (second, second_record) = reservation(second_offset, 128, 12);
+        let second_record = StagedRecord::new(
+            second_record.hash(),
+            second_record.entry(),
+            StagedRecordKind::Tombstone,
+        );
         staging
             .encode_reserved(second, |target| {
                 encode_test_value(target, second, second_record)
@@ -1110,11 +1169,12 @@ mod tests {
         assert_eq!(first_header.record_len, first_len);
         let padded_second_len = second.record_bytes + padding_bytes;
         assert_eq!(second_header.record_len, padded_second_len);
-        assert_eq!(job.records[0].entry.location.record_len(), first_len);
+        assert_eq!(job.records[0].entry().location.record_len(), first_len);
         assert_eq!(
-            job.records[1].entry.location.record_len(),
+            job.records[1].entry().location.record_len(),
             padded_second_len
         );
+        assert_eq!(job.records[1].kind(), StagedRecordKind::Tombstone);
         assert!(
             bytes[unpadded_end as usize - 4096..]
                 .iter()
@@ -1197,8 +1257,15 @@ mod tests {
         let resources = resources(8 * 1024 * 1024);
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         let (receipt, record) = reservation(4096, 64, 11);
-        let mut mismatched = record;
-        mismatched.entry.seqno += 1;
+        let entry = record.entry();
+        let mismatched = StagedRecord::new(
+            record.hash(),
+            IndexEntry {
+                location: entry.location,
+                seqno: entry.seqno + 1,
+            },
+            record.kind(),
+        );
         assert_eq!(
             staging.encode_reserved(receipt, |target| {
                 target.fill(0x22);

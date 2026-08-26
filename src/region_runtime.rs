@@ -113,6 +113,7 @@ struct RuntimeMetrics {
 #[repr(align(64))]
 struct ActivityMetrics {
     puts: AtomicU64,
+    deletes: AtomicU64,
     written_bytes: AtomicU64,
     l1_hits: AtomicU64,
     l1_misses: AtomicU64,
@@ -128,6 +129,7 @@ impl ActivityMetrics {
     fn new() -> Self {
         Self {
             puts: AtomicU64::new(0),
+            deletes: AtomicU64::new(0),
             written_bytes: AtomicU64::new(0),
             l1_hits: AtomicU64::new(0),
             l1_misses: AtomicU64::new(0),
@@ -209,6 +211,7 @@ impl RuntimeMetrics {
             CacheHealth::Running
         };
         let mut puts = 0_u64;
+        let mut deletes = 0_u64;
         let mut written_bytes = 0_u64;
         let mut l1_hits = 0_u64;
         let mut l1_misses = 0_u64;
@@ -220,6 +223,7 @@ impl RuntimeMetrics {
         let mut l1_promotions = 0_u64;
         for activity in &self.activity {
             puts = puts.saturating_add(activity.puts.load(Ordering::Relaxed));
+            deletes = deletes.saturating_add(activity.deletes.load(Ordering::Relaxed));
             written_bytes =
                 written_bytes.saturating_add(activity.written_bytes.load(Ordering::Relaxed));
             l1_hits = l1_hits.saturating_add(activity.l1_hits.load(Ordering::Relaxed));
@@ -239,6 +243,7 @@ impl RuntimeMetrics {
             health,
             statistics_enabled,
             puts,
+            deletes,
             written_bytes,
             l1_hits,
             l1_misses,
@@ -462,6 +467,12 @@ impl HybridValueRead {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeMutation<'a> {
+    Put { value: &'a [u8], expires_at: u64 },
+    Delete,
+}
+
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
@@ -676,13 +687,34 @@ impl RegionDataPlane {
         value: &[u8],
         expires_at: u64,
     ) -> io::Result<u64> {
-        if key.len() > _MAX_KEY_BYTES || value.len() > _MAX_VALUE_BYTES {
+        self.mutate(
+            namespace_id,
+            key,
+            RuntimeMutation::Put { value, expires_at },
+        )
+    }
+
+    pub(crate) fn delete(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
+        self.mutate(namespace_id, key, RuntimeMutation::Delete)
+    }
+
+    fn mutate(
+        &self,
+        namespace_id: u32,
+        key: &[u8],
+        mutation: RuntimeMutation<'_>,
+    ) -> io::Result<u64> {
+        let value_len = match mutation {
+            RuntimeMutation::Put { value, .. } => value.len(),
+            RuntimeMutation::Delete => 0,
+        };
+        if key.len() > _MAX_KEY_BYTES || value_len > _MAX_VALUE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-chunk entry exceeds the 4 KiB key or 256 KiB value limit",
             ));
         }
-        let record_bytes = required_record_bytes(key.len(), value.len())
+        let record_bytes = required_record_bytes(key.len(), value_len)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let running = &self.running.shared;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
@@ -731,25 +763,54 @@ impl RegionDataPlane {
                 }
                 Err(TryLockError::Poisoned(_)) => return Err(poisoned_runtime_error()),
             };
-            match self.core.try_stage_value(
-                &running.staging,
-                shard_id,
-                hash,
-                record_bytes,
-                namespace_id,
-                key,
-                value,
-                expires_at,
-            )? {
+            let staged = match mutation {
+                RuntimeMutation::Put { value, expires_at } => self.core.try_stage_value(
+                    &running.staging,
+                    shard_id,
+                    hash,
+                    record_bytes,
+                    namespace_id,
+                    key,
+                    value,
+                    expires_at,
+                ),
+                RuntimeMutation::Delete => self.core.try_stage_delete(
+                    &running.staging,
+                    shard_id,
+                    hash,
+                    record_bytes,
+                    namespace_id,
+                    key,
+                ),
+            }?;
+            match staged {
                 RegionStageValue::Staged(seqno) => {
-                    let _published =
-                        running
-                            .memory
-                            .publish(hash, namespace_id, key, value, expires_at, seqno);
+                    match mutation {
+                        RuntimeMutation::Put { value, expires_at } => {
+                            let _published = running.memory.publish(
+                                hash,
+                                namespace_id,
+                                key,
+                                value,
+                                expires_at,
+                                seqno,
+                            );
+                        }
+                        RuntimeMutation::Delete => {
+                            let _removed = running.memory.delete(hash, namespace_id, key, seqno);
+                        }
+                    }
                     control.notify(WAKE_DATA)?;
                     if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.puts);
-                        RuntimeMetrics::add(&activity.written_bytes, value.len());
+                        match mutation {
+                            RuntimeMutation::Put { value, .. } => {
+                                RuntimeMetrics::increment(&activity.puts);
+                                RuntimeMetrics::add(&activity.written_bytes, value.len());
+                            }
+                            RuntimeMutation::Delete => {
+                                RuntimeMetrics::increment(&activity.deletes);
+                            }
+                        }
                     }
                     return Ok(seqno);
                 }

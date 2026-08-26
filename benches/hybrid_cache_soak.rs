@@ -1,12 +1,19 @@
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache_rs::{EvictionPolicy, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StaticConfig};
+use cache_rs::{
+    CacheHealth, DetailedCacheSnapshot, EvictionPolicy, HybridCache, HybridCacheConfig, IoEngine,
+    IoMode, RuntimeConfig, StaticConfig,
+};
 
 const MIB: usize = 1024 * 1024;
 const VALUE_HEADER_BYTES: usize = 16;
+const DELETE_INTERVAL: u64 = 64;
+const OVERLOAD_DELAY: Duration = Duration::from_micros(50);
 const DEFAULT_VALUE_BYTES: [usize; 4] = [256, 4 * 1024, 16 * 1024, 256 * 1024];
 
 struct SoakConfig {
@@ -19,6 +26,8 @@ struct SoakConfig {
     key_count: usize,
     shards: u32,
     io_workers: usize,
+    writers: usize,
+    readers: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
     eviction_policy: EvictionPolicy,
@@ -42,6 +51,8 @@ impl SoakConfig {
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
         let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
         let io_workers = env_usize("CACHE_SOAK_IO_WORKERS", 4)?;
+        let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
+        let readers = env_usize("CACHE_SOAK_READERS", 4)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let eviction_policy = parse_eviction_policy("CACHE_SOAK_EVICTION")?;
@@ -57,6 +68,8 @@ impl SoakConfig {
             || key_count == 0
             || shards == 0
             || io_workers == 0
+            || writers == 0
+            || readers == 0
             || !directory.is_dir()
         {
             return Err(invalid(
@@ -73,6 +86,8 @@ impl SoakConfig {
             key_count,
             shards,
             io_workers,
+            writers,
+            readers,
             io_engine,
             io_mode,
             eviction_policy,
@@ -150,6 +165,58 @@ impl Drop for SoakFiles {
     }
 }
 
+#[derive(Default)]
+struct SoakCounters {
+    writes: AtomicU64,
+    deletes: AtomicU64,
+    write_rejections: AtomicU64,
+    delete_rejections: AtomicU64,
+    hits: AtomicU64,
+    stale_hits: AtomicU64,
+    misses: AtomicU64,
+    max_put_ns: AtomicU64,
+    max_delete_ns: AtomicU64,
+    max_get_ns: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct CounterSnapshot {
+    writes: u64,
+    deletes: u64,
+    write_rejections: u64,
+    delete_rejections: u64,
+    hits: u64,
+    stale_hits: u64,
+    misses: u64,
+    max_put_ns: u64,
+    max_delete_ns: u64,
+    max_get_ns: u64,
+}
+
+impl SoakCounters {
+    fn snapshot(&self) -> CounterSnapshot {
+        CounterSnapshot {
+            writes: self.writes.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
+            write_rejections: self.write_rejections.load(Ordering::Relaxed),
+            delete_rejections: self.delete_rejections.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            stale_hits: self.stale_hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            max_put_ns: self.max_put_ns.load(Ordering::Relaxed),
+            max_delete_ns: self.max_delete_ns.load(Ordering::Relaxed),
+            max_get_ns: self.max_get_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct ResourceSample {
+    detailed: DetailedCacheSnapshot,
+    logical_bytes: u64,
+    current_rss: u64,
+    rss_limit: u64,
+}
+
 fn main() -> io::Result<()> {
     let config = SoakConfig::from_env()?;
     let files = SoakFiles::new(&config.directory);
@@ -168,23 +235,23 @@ fn main() -> io::Result<()> {
     let key_count = u64::try_from(keys.len()).map_err(|_| invalid("soak key count exceeds u64"))?;
     let value_size_count = u64::try_from(config.value_bytes.len())
         .map_err(|_| invalid("soak value-size count exceeds u64"))?;
-    let mut expected = vec![None; config.key_count];
-    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
-    let mut value = vec![0_u8; maximum_value_bytes];
+    let expected: Vec<_> = (0..config.key_count).map(|_| AtomicU64::new(0)).collect();
+    let next_write = AtomicU64::new(0);
+    let next_read = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let client_count = config
+        .writers
+        .checked_add(config.readers)
+        .ok_or_else(|| invalid("soak client count is too large"))?;
+    let counters = SoakCounters::default();
     let started = Instant::now();
-    let deadline = started + config.duration;
-    let mut next_sample = started + config.sample_period;
-    let mut writes = 0_u64;
-    let mut write_rejections = 0_u64;
-    let mut hits = 0_u64;
-    let mut stale_hits = 0_u64;
-    let mut misses = 0_u64;
-    let mut max_put = Duration::ZERO;
-    let mut max_get = Duration::ZERO;
+    let deadline = started
+        .checked_add(config.duration)
+        .ok_or_else(|| invalid("soak deadline is too far in the future"))?;
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} workers={} engine={:?} mode={:?} eviction={:?} peak_disk={} rss_slack={}",
+        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB values={} keys={} shards={} io_workers={} writers={} readers={} delete_interval={} engine={:?} mode={:?} eviction={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -197,6 +264,9 @@ fn main() -> io::Result<()> {
         config.key_count,
         config.shards,
         config.io_workers,
+        config.writers,
+        config.readers,
+        DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
         config.eviction_policy,
@@ -204,162 +274,302 @@ fn main() -> io::Result<()> {
         config.rss_slack_bytes,
     );
 
-    while Instant::now() < deadline {
-        let key_index = usize::try_from(writes % key_count)
+    thread::scope(|scope| -> io::Result<()> {
+        let mut workers = Vec::with_capacity(client_count);
+        for _ in 0..config.writers {
+            workers.push(scope.spawn(|| {
+                let result = run_writer(
+                    &cache,
+                    &config,
+                    &keys,
+                    &expected,
+                    key_count,
+                    value_size_count,
+                    &next_write,
+                    &stop,
+                    &counters,
+                );
+                if result.is_err() {
+                    stop.store(true, Ordering::Release);
+                }
+                result
+            }));
+        }
+        for reader_id in 0..config.readers {
+            let cache = &cache;
+            let config = &config;
+            let keys = &keys;
+            let expected = &expected;
+            let next_read = &next_read;
+            let stop = &stop;
+            let counters = &counters;
+            workers.push(scope.spawn(move || {
+                let result = run_reader(
+                    cache,
+                    config,
+                    keys,
+                    expected,
+                    key_count,
+                    value_size_count,
+                    reader_id,
+                    next_read,
+                    stop,
+                    counters,
+                );
+                if result.is_err() {
+                    stop.store(true, Ordering::Release);
+                }
+                result
+            }));
+        }
+
+        let mut next_sample = started
+            .checked_add(config.sample_period)
+            .ok_or_else(|| invalid("soak sample deadline is too far in the future"))?;
+        let mut sample_error = None;
+        while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
+            let wake_at = std::cmp::min(next_sample, deadline);
+            if let Some(remaining) = wake_at.checked_duration_since(Instant::now()) {
+                thread::sleep(remaining);
+            }
+            let now = Instant::now();
+            if now >= next_sample && now < deadline {
+                match resource_sample(
+                    &cache,
+                    &files,
+                    peak_disk_bytes,
+                    config.rss_slack_bytes,
+                    true,
+                ) {
+                    Ok(sample) => {
+                        max_managed_memory = max_managed_memory
+                            .max(sample.detailed.summary.managed_memory_peak_bytes);
+                        report_sample(
+                            false,
+                            started.elapsed(),
+                            counters.snapshot(),
+                            &sample,
+                            max_managed_memory,
+                        );
+                    }
+                    Err(error) => {
+                        sample_error = Some(error);
+                        stop.store(true, Ordering::Release);
+                    }
+                }
+                next_sample = now.checked_add(config.sample_period).unwrap_or(deadline);
+            }
+        }
+        stop.store(true, Ordering::Release);
+
+        let mut worker_error = None;
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
+                Ok(Err(_)) => {}
+                Err(_) if worker_error.is_none() => {
+                    worker_error = Some(io::Error::other("soak worker panicked"));
+                }
+                Err(_) => {}
+            }
+        }
+        match sample_error.or(worker_error) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })?;
+
+    cache.drain()?;
+    let sample = resource_sample(
+        &cache,
+        &files,
+        peak_disk_bytes,
+        config.rss_slack_bytes,
+        false,
+    )?;
+    max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
+    cache.close_fast()?;
+    report_sample(
+        true,
+        started.elapsed(),
+        counters.snapshot(),
+        &sample,
+        max_managed_memory,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_writer(
+    cache: &HybridCache,
+    config: &SoakConfig,
+    keys: &[Box<[u8]>],
+    expected: &[AtomicU64],
+    key_count: u64,
+    value_size_count: u64,
+    next_write: &AtomicU64,
+    stop: &AtomicBool,
+    counters: &SoakCounters,
+) -> io::Result<()> {
+    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
+    let mut value = vec![0_u8; maximum_value_bytes];
+    while !stop.load(Ordering::Acquire) {
+        let ordinal = next_write.fetch_add(1, Ordering::Relaxed);
+        let announced = ordinal
+            .checked_add(1)
+            .ok_or_else(|| invalid("soak write ordinal exhausted"))?;
+        let key_index = usize::try_from(ordinal % key_count)
             .map_err(|_| invalid("soak key index exceeds usize"))?;
-        let value_index = usize::try_from(writes / key_count % value_size_count)
+        let value_index = usize::try_from(ordinal / key_count % value_size_count)
             .map_err(|_| invalid("soak value-size index exceeds usize"))?;
         let value_bytes = config.value_bytes[value_index];
-        let pattern = (writes ^ key_index as u64) as u8;
+        let pattern = (ordinal ^ key_index as u64) as u8;
         value[..value_bytes].fill(pattern);
-        value[..8].copy_from_slice(&writes.to_le_bytes());
+        value[..8].copy_from_slice(&ordinal.to_le_bytes());
         value[8..VALUE_HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
+
+        // Announce before publication so a reader can never classify a newly
+        // visible value as future. Rejected attempts only make validation more
+        // conservative; stale and missing values are permitted.
+        expected[key_index].fetch_max(announced, Ordering::SeqCst);
         let put_started = Instant::now();
         match cache.put(&keys[key_index], &value[..value_bytes]) {
-            Ok(_) => {}
+            Ok(_) => {
+                record_latency(&counters.max_put_ns, put_started.elapsed());
+                counters.writes.fetch_add(1, Ordering::Relaxed);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                max_put = max_put.max(put_started.elapsed());
-                write_rejections = write_rejections.saturating_add(1);
-                std::thread::sleep(Duration::from_micros(50));
+                record_latency(&counters.max_put_ns, put_started.elapsed());
+                counters.write_rejections.fetch_add(1, Ordering::Relaxed);
+                thread::sleep(OVERLOAD_DELAY);
                 continue;
             }
             Err(error) => return Err(error),
         }
-        max_put = max_put.max(put_started.elapsed());
-        expected[key_index] = Some(writes);
-        writes = writes.saturating_add(1);
 
-        if writes.is_multiple_of(256) {
-            cache.drain()?;
-        }
-        if writes.is_multiple_of(4) {
-            let read_ordinal = writes / 4;
-            let distance = if read_ordinal.is_multiple_of(2) {
-                17
-            } else {
-                u64::try_from(keys.len() / 4).unwrap_or(u64::MAX)
-            };
-            let sampled = usize::try_from(writes.saturating_sub(distance) % key_count)
-                .map_err(|_| invalid("soak sampled key exceeds usize"))?;
-            let get_started = Instant::now();
-            match cache.get(&keys[sampled])? {
-                Some(observed) => {
-                    max_get = max_get.max(get_started.elapsed());
-                    if observed.len() < VALUE_HEADER_BYTES {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "soak read returned a truncated value",
-                        ));
-                    }
-                    let sequence = u64::from_le_bytes(observed[..8].try_into().unwrap());
-                    let observed_key =
-                        u64::from_le_bytes(observed[8..VALUE_HEADER_BYTES].try_into().unwrap());
-                    let Some(latest) = expected[sampled] else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "soak read returned a value for an unwritten key",
-                        ));
-                    };
-                    if observed_key != sampled as u64 || sequence > latest {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "soak read returned a wrong-key or future value",
-                        ));
-                    }
-                    let observed_value_index =
-                        usize::try_from(sequence / key_count % value_size_count)
-                            .map_err(|_| invalid("observed value-size index exceeds usize"))?;
-                    let expected_length = config.value_bytes[observed_value_index];
-                    let expected_pattern = (sequence ^ sampled as u64) as u8;
-                    if observed.len() != expected_length
-                        || observed[VALUE_HEADER_BYTES..]
-                            .iter()
-                            .any(|byte| *byte != expected_pattern)
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "soak read returned a malformed value",
-                        ));
-                    }
-                    if sequence < latest {
-                        stale_hits = stale_hits.saturating_add(1);
-                    }
-                    hits = hits.saturating_add(1);
+        if announced.is_multiple_of(DELETE_INTERVAL) {
+            let delete_started = Instant::now();
+            match cache.delete(&keys[key_index]) {
+                Ok(_) => {
+                    record_latency(&counters.max_delete_ns, delete_started.elapsed());
+                    counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
-                None => {
-                    max_get = max_get.max(get_started.elapsed());
-                    misses = misses.saturating_add(1);
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    record_latency(&counters.max_delete_ns, delete_started.elapsed());
+                    counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
+                    thread::sleep(OVERLOAD_DELAY);
                 }
+                Err(error) => return Err(error),
             }
-        }
-
-        let now = Instant::now();
-        if now >= next_sample {
-            cache.flush()?;
-            let logical_bytes = files.logical_bytes()?;
-            if logical_bytes > peak_disk_bytes {
-                return Err(io::Error::other("soak exceeded the logical disk bound"));
-            }
-            let detailed = cache.detailed_snapshot()?;
-            let resources = detailed.summary;
-            if resources.managed_memory_bytes > resources.managed_memory_limit_bytes
-                || resources.managed_memory_peak_bytes > resources.managed_memory_limit_bytes
-            {
-                return Err(io::Error::other("soak exceeded the managed memory bound"));
-            }
-            if resources.io_failures != 0 {
-                return Err(io::Error::other("soak observed a cache runtime failure"));
-            }
-            let current_rss = current_rss_bytes()?;
-            let rss_limit = (resources.managed_memory_limit_bytes as u64)
-                .saturating_add(config.rss_slack_bytes as u64);
-            if current_rss != 0 && current_rss > rss_limit {
-                return Err(io::Error::other("soak exceeded the process RSS bound"));
-            }
-            max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
-            println!(
-                "elapsed={:.1}s writes={} write_rejections={} hits={} stale_hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_get_us={}",
-                started.elapsed().as_secs_f64(),
-                writes,
-                write_rejections,
-                hits,
-                stale_hits,
-                misses,
-                0,
-                resources.l1_hits,
-                resources.l2_hits,
-                resources.l2_misses,
-                resources.l1_promotions,
-                resources.l1_evictions,
-                resources.l1_bypasses,
-                resources.l1_admission_rejections,
-                resources.write_rejections,
-                resources.region_rotations,
-                detailed.l1.resident_entries,
-                detailed.l1.entry_capacity,
-                detailed.l1.resident_bytes,
-                detailed.l1.retained_bytes,
-                detailed.l1.metadata_bytes,
-                detailed.index.physical_value_slots,
-                detailed.index.deleted_slots,
-                detailed.index.deleted_slot_reuses,
-                detailed.index.stale_slot_reuses,
-                detailed.index.live_slot_replacements,
-                resources.managed_memory_bytes,
-                max_managed_memory,
-                resources.managed_memory_limit_bytes,
-                logical_bytes,
-                current_rss,
-                rss_limit,
-                peak_rss_bytes(),
-                max_put.as_micros(),
-                max_get.as_micros(),
-            );
-            next_sample = now + config.sample_period;
         }
     }
+    Ok(())
+}
 
-    cache.drain()?;
+#[allow(clippy::too_many_arguments)]
+fn run_reader(
+    cache: &HybridCache,
+    config: &SoakConfig,
+    keys: &[Box<[u8]>],
+    expected: &[AtomicU64],
+    key_count: u64,
+    value_size_count: u64,
+    reader_id: usize,
+    next_read: &AtomicU64,
+    stop: &AtomicBool,
+    counters: &SoakCounters,
+) -> io::Result<()> {
+    let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
+    while !stop.load(Ordering::Acquire) {
+        let ordinal = next_read.fetch_add(1, Ordering::Relaxed);
+        let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
+            .map_err(|_| invalid("soak sampled key exceeds usize"))?;
+        let get_started = Instant::now();
+        match cache.get(&keys[sampled])? {
+            Some(observed) => {
+                record_latency(&counters.max_get_ns, get_started.elapsed());
+                let latest = expected[sampled].load(Ordering::SeqCst);
+                let stale = validate_observed(
+                    sampled,
+                    &observed,
+                    latest,
+                    key_count,
+                    value_size_count,
+                    &config.value_bytes,
+                )?;
+                counters.hits.fetch_add(1, Ordering::Relaxed);
+                if stale {
+                    counters.stale_hits.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None => {
+                record_latency(&counters.max_get_ns, get_started.elapsed());
+                counters.misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_observed(
+    sampled: usize,
+    observed: &[u8],
+    latest: u64,
+    key_count: u64,
+    value_size_count: u64,
+    value_bytes: &[usize],
+) -> io::Result<bool> {
+    if observed.len() < VALUE_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "soak read returned a truncated value",
+        ));
+    }
+    let sequence = u64::from_le_bytes(observed[..8].try_into().unwrap());
+    let observed_key = u64::from_le_bytes(observed[8..VALUE_HEADER_BYTES].try_into().unwrap());
+    let observed_version = sequence
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "soak value version overflow"))?;
+    if latest == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "soak read returned a value for an unwritten key",
+        ));
+    }
+    if observed_key != sampled as u64 || observed_version > latest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "soak read returned a wrong-key or future value",
+        ));
+    }
+    let value_index = usize::try_from(sequence / key_count % value_size_count)
+        .map_err(|_| invalid("observed value-size index exceeds usize"))?;
+    let expected_length = value_bytes[value_index];
+    let expected_pattern = (sequence ^ sampled as u64) as u8;
+    if observed.len() != expected_length
+        || observed[VALUE_HEADER_BYTES..]
+            .iter()
+            .any(|byte| *byte != expected_pattern)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "soak read returned a malformed value",
+        ));
+    }
+    Ok(observed_version < latest)
+}
+
+fn resource_sample(
+    cache: &HybridCache,
+    files: &SoakFiles,
+    peak_disk_bytes: u64,
+    rss_slack_bytes: usize,
+    flush: bool,
+) -> io::Result<ResourceSample> {
+    if flush {
+        cache.flush()?;
+    }
     let logical_bytes = files.logical_bytes()?;
     if logical_bytes > peak_disk_bytes {
         return Err(io::Error::other("soak exceeded the logical disk bound"));
@@ -371,26 +581,46 @@ fn main() -> io::Result<()> {
     {
         return Err(io::Error::other("soak exceeded the managed memory bound"));
     }
-    if resources.io_failures != 0 {
+    if resources.health != CacheHealth::Running || resources.io_failures != 0 {
         return Err(io::Error::other("soak observed a cache runtime failure"));
     }
     let current_rss = current_rss_bytes()?;
     let rss_limit =
-        (resources.managed_memory_limit_bytes as u64).saturating_add(config.rss_slack_bytes as u64);
+        (resources.managed_memory_limit_bytes as u64).saturating_add(rss_slack_bytes as u64);
     if current_rss != 0 && current_rss > rss_limit {
         return Err(io::Error::other("soak exceeded the process RSS bound"));
     }
-    max_managed_memory = max_managed_memory.max(resources.managed_memory_peak_bytes);
-    cache.close_fast()?;
+    Ok(ResourceSample {
+        detailed,
+        logical_bytes,
+        current_rss,
+        rss_limit,
+    })
+}
+
+fn report_sample(
+    complete: bool,
+    elapsed: Duration,
+    counters: CounterSnapshot,
+    sample: &ResourceSample,
+    max_managed_memory: usize,
+) {
+    let prefix = if complete { "complete " } else { "" };
+    let detailed = &sample.detailed;
+    let resources = detailed.summary;
     println!(
-        "complete elapsed={:.1}s writes={} write_rejections={} hits={} stale_hits={} misses={} errors={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_get_us={}",
-        started.elapsed().as_secs_f64(),
-        writes,
-        write_rejections,
-        hits,
-        stale_hits,
-        misses,
+        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} promotions={} l1_evictions={} l1_bypasses={} admission_rejections={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
+        elapsed.as_secs_f64(),
+        counters.writes,
+        counters.deletes,
+        counters.write_rejections,
+        counters.delete_rejections,
+        counters.hits,
+        counters.stale_hits,
+        counters.misses,
         0,
+        resources.puts,
+        resources.deletes,
         resources.l1_hits,
         resources.l2_hits,
         resources.l2_misses,
@@ -410,16 +640,22 @@ fn main() -> io::Result<()> {
         detailed.index.deleted_slot_reuses,
         detailed.index.stale_slot_reuses,
         detailed.index.live_slot_replacements,
+        resources.managed_memory_bytes,
         max_managed_memory,
         resources.managed_memory_limit_bytes,
-        logical_bytes,
-        current_rss,
-        rss_limit,
+        sample.logical_bytes,
+        sample.current_rss,
+        sample.rss_limit,
         peak_rss_bytes(),
-        max_put.as_micros(),
-        max_get.as_micros(),
+        counters.max_put_ns / 1_000,
+        counters.max_delete_ns / 1_000,
+        counters.max_get_ns / 1_000,
     );
-    Ok(())
+}
+
+fn record_latency(counter: &AtomicU64, elapsed: Duration) {
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    counter.fetch_max(nanos, Ordering::Relaxed);
 }
 
 #[cfg(unix)]

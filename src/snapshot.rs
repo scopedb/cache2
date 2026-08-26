@@ -26,6 +26,7 @@ pub struct CacheSnapshot {
     pub health: CacheHealth,
     pub statistics_enabled: bool,
     pub puts: u64,
+    pub deletes: u64,
     pub written_bytes: u64,
     pub l1_hits: u64,
     pub l1_misses: u64,

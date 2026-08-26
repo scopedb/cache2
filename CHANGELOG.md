@@ -31,6 +31,9 @@ version number documented in `MILESTONES.md`.
 - on-demand detailed snapshots for queue and buffer pressure, aggregate worker
   I/O, fixed/resident/retained L1 memory, index occupancy/replacement pressure,
   and per-RegionSet capacity, occupancy, and process-local rotations.
+- sequenced point deletion through the existing bounded mutation path, with
+  best-effort exact-key L1 cleanup and warm-recoverable 24-byte index
+  tombstones.
 
 ### Changed
 
@@ -83,6 +86,8 @@ version number documented in `MILESTONES.md`.
   stale hits, reject future/wrong-key/malformed values, and gate Linux current
   RSS; production qualification now requires exact Rust 1.98.0 and all five
   performance thresholds.
+- made the turnover soak concurrently exercise multiple writers and readers,
+  including periodic deletes and independent mutation/read latency reporting.
 
 ### Compatibility
 

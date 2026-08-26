@@ -71,6 +71,15 @@ replacement policy.
 L1 capacity remains charged through the last returned value handle, so eviction
 cannot hide memory retained by a slow caller.
 
+A `delete` follows the same append shard, sequence allocation, fixed staging,
+batch completion, and backpressure path. Its foreground work adds only one
+best-effort exact-key L1 removal. Completion replaces an older same-hash index
+value with a sequenced tombstone encoded in the existing 24-byte slot; a newer
+put may replace it, and an already missing delete consumes no index slot. Reads
+stop at a matching tombstone as an index miss. They do not retry or validate
+freshness a second time, so stale L1 values remain permitted by the cache
+contract.
+
 Each L1 shard receives fixed entry slots, policy slots, a free list, and an
 open-addressed directory during open. The directory routes the already seeded
 XXH3 hash directly and has a fixed 64-probe ceiling; pressure bypasses optional
@@ -155,6 +164,9 @@ then allocate one actual-size aligned range; they have no separate public
 admission policy. Write occupancy leaves the final slot of a multi-entry I/O
 engine available to reads, while a waiting write receives a bounded handoff.
 Runtime configuration is validated before filesystem mutation.
+Keys are bounded at 4 KiB and values at 256 KiB. Device operations use a fixed
+five-second completion guardrail so a stalled cache device cannot retain a
+frontend or shutdown barrier indefinitely.
 
 The managed logical disk peak is deterministic: the fixed data file and 8 KiB
 state file plus two fixed-size recovery images. The second image is the bounded
@@ -172,8 +184,8 @@ slot replacement. The replacement counters follow the optional statistics
 switch; occupancy remains always available. Optional activity statistics
 separately classify read-memory and busy-engine misses.
 
-`HybridCache::snapshot()` also reads relaxed process-local counters for L1/L2
-hits and misses, read-memory and busy-engine misses, L1 promotions,
+`HybridCache::snapshot()` also reads relaxed process-local counters for puts,
+deletes, L1/L2 hits and misses, read-memory and busy-engine misses, L1 promotions,
 evictions/bypasses/admission rejections, logical bytes, write rejections, failures,
 and Region rotations. Health is `Running`,
 transiently `Draining`, one-way `MissOnly` for

@@ -49,7 +49,8 @@ use crate::region_reader::plan_read;
 use crate::region_reader::{ReadPlan, submit_read};
 use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_staging::{
-    RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
+    RegionStaging, StageAppend, StagedRecord, StagedRecordKind, StagedWrite, StagingEncodeError,
+    StagingError,
 };
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
 use crate::resources::BufferLease;
@@ -414,6 +415,10 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.get(namespace_id, key, clock)
     }
 
+    pub(crate) fn delete_value(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.delete(namespace_id, key)
+    }
+
     pub(crate) fn drain(&self) -> io::Result<()> {
         self.runtime()?.data_plane()?.drain()
     }
@@ -672,6 +677,54 @@ impl FileRegionCore {
         value: &[u8],
         expires_at: u64,
     ) -> io::Result<RegionStageValue> {
+        self.try_stage_record(
+            staging,
+            shard_id,
+            hash,
+            record_bytes,
+            namespace_id,
+            key,
+            value,
+            expires_at,
+            StagedRecordKind::Value,
+        )
+    }
+
+    pub(crate) fn try_stage_delete(
+        &self,
+        staging: &RegionStaging,
+        shard_id: usize,
+        hash: u64,
+        record_bytes: u32,
+        namespace_id: u32,
+        key: &[u8],
+    ) -> io::Result<RegionStageValue> {
+        self.try_stage_record(
+            staging,
+            shard_id,
+            hash,
+            record_bytes,
+            namespace_id,
+            key,
+            &[],
+            0,
+            StagedRecordKind::Tombstone,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_stage_record(
+        &self,
+        staging: &RegionStaging,
+        shard_id: usize,
+        hash: u64,
+        record_bytes: u32,
+        namespace_id: u32,
+        key: &[u8],
+        value: &[u8],
+        expires_at: u64,
+        kind: StagedRecordKind,
+    ) -> io::Result<RegionStageValue> {
         self.health.require_healthy()?;
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
@@ -731,7 +784,7 @@ impl FileRegionCore {
                 value,
                 expires_at,
             )?;
-            Ok::<StagedRecord, RecordEncodeError>(StagedRecord { hash, entry })
+            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, kind))
         });
         match staged {
             Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
@@ -979,7 +1032,14 @@ impl FileRegionCore {
     /// A delayed older completion cannot replace a newer same-hash sequence.
     fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for record in records.iter().copied() {
-            if let Err(error) = self.index.upsert(record.hash, record.entry) {
+            let entry = record.entry();
+            let published = match record.kind() {
+                StagedRecordKind::Value => self.index.upsert(record.hash(), entry),
+                StagedRecordKind::Tombstone => {
+                    self.index.upsert_tombstone(record.hash(), entry.seqno)
+                }
+            };
+            if let Err(error) = published {
                 self.health.enter_miss_only();
                 return Err(index_storage_io_error(error));
             }
@@ -2920,13 +2980,14 @@ mod tests {
         .unwrap();
         let core = Arc::clone(&runtime.core);
         let manager = core.manager.inner.lock().unwrap();
-        let record = StagedRecord {
-            hash: 7,
-            entry: IndexEntry {
+        let record = StagedRecord::new(
+            7,
+            IndexEntry {
                 location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
                 seqno: 1,
             },
-        };
+            StagedRecordKind::Value,
+        );
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let publisher_core = Arc::clone(&core);
         let publisher = std::thread::spawn(move || {
@@ -2939,7 +3000,7 @@ mod tests {
         drop(manager);
         publisher.join().unwrap();
         published.unwrap().unwrap();
-        assert_eq!(runtime.lookup_snapshot(7).unwrap(), Some(record.entry));
+        assert_eq!(runtime.lookup_snapshot(7).unwrap(), Some(record.entry()));
     }
 
     #[test]

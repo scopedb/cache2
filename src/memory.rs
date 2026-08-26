@@ -965,6 +965,27 @@ impl MemoryStore {
         result.inserted
     }
 
+    /// Best-effort exact-key cleanup for a sequenced delete. Contention
+    /// bypasses L1, and a newer resident value is never removed.
+    pub(crate) fn delete(&self, hash: u64, namespace_id: u32, key: &[u8], seqno: u64) -> bool {
+        let shard_id = self.route(hash);
+        let Some(mut shard) = self.try_lock_shard(shard_id) else {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return false;
+        };
+        let Some(index) = shard.find(hash, namespace_id, key) else {
+            return true;
+        };
+        if shard.slots[index]
+            .as_ref()
+            .is_some_and(|entry| entry.seqno > seqno)
+        {
+            return true;
+        }
+        shard.remove_slot(index);
+        true
+    }
+
     pub(crate) fn lookup(
         &self,
         hash: u64,
@@ -1173,6 +1194,42 @@ mod tests {
             store.lookup(8, 0, b"b", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.len() == 300
         ));
+    }
+
+    #[test]
+    fn delete_is_exact_and_does_not_remove_a_newer_value() {
+        let store = store(4096, 1);
+        assert!(store.publish(7, 1, b"a", b"value-a", 0, 10));
+        assert!(store.publish(7, 1, b"b", b"value-b", 0, 11));
+
+        assert!(store.delete(7, 1, b"a", 12));
+        assert!(matches!(
+            store.lookup(7, 1, b"a", ExpiryClock::Fixed(1)),
+            MemoryLookup::Miss(_)
+        ));
+        assert!(matches!(
+            store.lookup(7, 1, b"b", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hit(value) if value.as_ref() == b"value-b"
+        ));
+
+        assert!(store.publish(7, 1, b"a", b"newer", 0, 20));
+        assert!(store.delete(7, 1, b"a", 19));
+        assert!(matches!(
+            store.lookup(7, 1, b"a", ExpiryClock::Fixed(1)),
+            MemoryLookup::Hit(value) if value.as_ref() == b"newer"
+        ));
+    }
+
+    #[test]
+    fn delete_bypasses_a_contended_l1_shard() {
+        let store = store(4096, 1);
+        assert!(store.publish(7, 0, b"a", b"value", 0, 10));
+        let shard = store.shards[0].lock().unwrap();
+        assert!(!store.delete(7, 0, b"a", 11));
+        drop(shard);
+
+        assert_hit(&store, 7, b"a");
+        assert_eq!(store.metrics_snapshot().bypasses, 1);
     }
 
     #[test]

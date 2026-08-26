@@ -1,6 +1,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use cache_rs::{
@@ -353,6 +354,140 @@ fn namespaces_are_independent() {
 }
 
 #[test]
+fn delete_is_namespaced_sequenced_and_warm_recoverable() {
+    let files = TestCache::new("delete-warm-recovery");
+    let cache = files.config(3).open().unwrap();
+    let put_sequence = cache.put_in(1, "key", "one").unwrap();
+    cache.put_in(2, "key", "two").unwrap();
+    cache.drain().unwrap();
+
+    let delete_sequence = cache.delete_in(1, "key").unwrap();
+    assert!(delete_sequence > put_sequence);
+    cache.drain().unwrap();
+    assert!(cache.get_in(1, "key").unwrap().is_none());
+    assert_eq!(cache.get_in(2, "key").unwrap().unwrap().as_ref(), b"two");
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.puts, 2);
+    assert_eq!(snapshot.deletes, 1);
+    cache.close_warm().unwrap();
+
+    let reopened = files.config(5).open().unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    assert!(reopened.get_in(1, "key").unwrap().is_none());
+    assert_eq!(reopened.get_in(2, "key").unwrap().unwrap().as_ref(), b"two");
+
+    let replacement_sequence = reopened.put_in(1, "key", "new").unwrap();
+    assert!(replacement_sequence > delete_sequence);
+    reopened.drain().unwrap();
+    assert_eq!(reopened.get_in(1, "key").unwrap().unwrap().as_ref(), b"new");
+    reopened.close_fast().unwrap();
+}
+
+#[test]
+fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
+    const WRITERS: usize = 4;
+    const READERS: usize = 4;
+    const KEY_COUNT: usize = 64;
+    const WRITES_PER_CLIENT: usize = 256;
+    const VALUE_SIZES: [usize; 3] = [256, 4 * 1024, 16 * 1024];
+    const HEADER_BYTES: usize = 16;
+
+    let files = TestCache::new("concurrent-mixed");
+    let cache = files.config(4).open().unwrap();
+    let keys: Vec<_> = (0..KEY_COUNT)
+        .map(|key| {
+            format!("mixed-key-{key:04}")
+                .into_bytes()
+                .into_boxed_slice()
+        })
+        .collect();
+    let announced: Vec<_> = (0..KEY_COUNT).map(|_| AtomicU64::new(0)).collect();
+    let writers_left = AtomicUsize::new(WRITERS);
+    let start = AtomicBool::new(false);
+    let hits = AtomicU64::new(0);
+
+    thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let cache = &cache;
+            let keys = &keys;
+            let announced = &announced;
+            let writers_left = &writers_left;
+            let start = &start;
+            scope.spawn(move || {
+                while !start.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                let mut value = vec![0_u8; *VALUE_SIZES.iter().max().unwrap()];
+                for ordinal in 0..WRITES_PER_CLIENT {
+                    let key_index = writer + (ordinal % (KEY_COUNT / WRITERS)) * WRITERS;
+                    let version = u64::try_from(ordinal + 1).unwrap();
+                    let value_len = VALUE_SIZES[(ordinal + key_index) % VALUE_SIZES.len()];
+                    let pattern = (version ^ key_index as u64) as u8;
+                    value[..value_len].fill(pattern);
+                    value[..8].copy_from_slice(&version.to_le_bytes());
+                    value[8..HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
+                    announced[key_index].store(version, Ordering::SeqCst);
+                    eventually_admitted(|| cache.put(&keys[key_index], &value[..value_len]));
+                    if ordinal % 11 == 10 {
+                        eventually_admitted(|| cache.delete(&keys[key_index]));
+                    }
+                }
+                writers_left.fetch_sub(1, Ordering::Release);
+            });
+        }
+
+        for reader in 0..READERS {
+            let cache = &cache;
+            let keys = &keys;
+            let announced = &announced;
+            let writers_left = &writers_left;
+            let start = &start;
+            let hits = &hits;
+            scope.spawn(move || {
+                while !start.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                let mut ordinal = reader;
+                while writers_left.load(Ordering::Acquire) != 0 {
+                    let key_index = ordinal % KEY_COUNT;
+                    ordinal = ordinal.wrapping_add(READERS);
+                    let Some(value) = cache.get(&keys[key_index]).unwrap() else {
+                        continue;
+                    };
+                    assert!(value.len() >= HEADER_BYTES);
+                    let version = u64::from_le_bytes(value[..8].try_into().unwrap());
+                    let observed_key =
+                        u64::from_le_bytes(value[8..HEADER_BYTES].try_into().unwrap());
+                    let latest = announced[key_index].load(Ordering::SeqCst);
+                    assert_eq!(observed_key, key_index as u64);
+                    assert!(version != 0 && version <= latest);
+                    let writer_ordinal = usize::try_from(version - 1).unwrap();
+                    let expected_len =
+                        VALUE_SIZES[(writer_ordinal + key_index) % VALUE_SIZES.len()];
+                    let pattern = (version ^ key_index as u64) as u8;
+                    assert_eq!(value.len(), expected_len);
+                    assert!(value[HEADER_BYTES..].iter().all(|byte| *byte == pattern));
+                    hits.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        start.store(true, Ordering::Release);
+    });
+
+    cache.drain().unwrap();
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.health, CacheHealth::Running);
+    assert_eq!(snapshot.puts, (WRITERS * WRITES_PER_CLIENT) as u64);
+    assert_eq!(
+        snapshot.deletes,
+        (WRITERS * (WRITES_PER_CLIENT / 11)) as u64
+    );
+    assert_eq!(snapshot.io_failures, 0);
+    assert!(hits.load(Ordering::Relaxed) > 0);
+    cache.close_fast().unwrap();
+}
+
+#[test]
 fn namespace_region_sets_rotate_and_recover_independently() {
     const HOT: u32 = 7;
     const BULK: u32 = 9;
@@ -469,6 +604,32 @@ fn invalid_runtime_config_is_rejected_before_file_creation() {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{case}");
         files.assert_absent();
     }
+}
+
+#[test]
+fn public_entry_size_limits_are_explicit() {
+    let files = TestCache::new("entry-size-limits");
+    let cache = files.config(1).open().unwrap();
+    let oversized_key = vec![0_u8; 4 * 1024 + 1];
+    let oversized_value = vec![0_u8; 256 * 1024 + 1];
+
+    assert_eq!(
+        cache.put(&oversized_key, b"value").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        cache.put(b"key", &oversized_value).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        cache.delete(&oversized_key).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(cache.get(&oversized_key).unwrap().is_none());
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.puts, 0);
+    assert_eq!(snapshot.deletes, 0);
+    cache.close_fast().unwrap();
 }
 
 #[test]
@@ -616,6 +777,7 @@ fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     let before_close = cache.snapshot().unwrap();
     assert_eq!(before_close.health, CacheHealth::Running);
     assert_eq!(before_close.puts, 1);
+    assert_eq!(before_close.deletes, 0);
     assert_eq!(before_close.written_bytes, 5);
     assert_eq!(before_close.l1_hits, 1);
     assert_eq!(before_close.l1_misses, 1);
@@ -631,6 +793,7 @@ fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     let reopened = files.config(3).open().unwrap();
     let fresh = reopened.snapshot().unwrap();
     assert_eq!(fresh.puts, 0);
+    assert_eq!(fresh.deletes, 0);
     assert_eq!(fresh.l1_hits, 0);
     assert_eq!(fresh.l2_hits, 0);
     assert_eq!(reopened.get("key").unwrap().unwrap().tier(), CacheTier::L2);

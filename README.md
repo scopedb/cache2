@@ -5,7 +5,7 @@ chunks. It is disposable acceleration, not durable storage.
 
 The persistence contract is intentionally narrow:
 
-- ordinary `put` operations do not publish recoverable state;
+- ordinary `put` and `delete` operations do not publish recoverable state;
 - `close_fast` and process crashes reopen as an empty cache;
 - only a successful `close_warm` publishes a clean recovery image;
 - open never scans the data extent or replays dirty records;
@@ -44,6 +44,9 @@ cache.put("chunk-key", b"chunk bytes")?;
 let value = cache.get("chunk-key")?.expect("cache hit");
 assert_eq!(value.as_ref(), b"chunk bytes");
 
+// Deletes use the same bounded mutation path and return a sequence number.
+cache.delete("chunk-key")?;
+
 // Waits for the async Region write and index publication.
 cache.drain()?;
 
@@ -59,6 +62,7 @@ the system clock. Namespaces and expiration are explicit extensions:
 let namespace = 42;
 cache.put_in(namespace, "stable-key", b"no expiration")?;
 cache.put_until(namespace, "leased-key", b"expires", expires_at_unix_ms)?;
+cache.delete_in(namespace, "obsolete-key")?;
 
 let stable = cache.get_in(namespace, "stable-key")?;
 let leased = cache.get_in(namespace, "leased-key")?;
@@ -121,6 +125,16 @@ capacity. Any write may briefly wait for the shard mutation gate. Region
 manager contention follows the selected backpressure policy after one
 non-waiting probe. Neither path holds a lock across device I/O.
 
+`delete` uses the same shard routing, monotonic sequence, fixed staging, and
+write backpressure as `put`. It performs one best-effort exact-key L1 cleanup
+before returning, then replaces a matching L2 index candidate with a sequenced
+tombstone only after the containing Region batch completes. The tombstone uses
+the existing 24-byte slot and prevents an older same-hash index publication
+from replacing it; a newer `put` may replace it. An already missing key consumes
+no index slot. Deletes do not add a read retry, fence, or second validation
+pass. A stale L1 value or an older value observed before tombstone publication
+remains an accepted best-effort cache result.
+
 After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate
 plans one exact aligned read range, reserves an immediately available engine
@@ -147,6 +161,13 @@ one 64-bit hash so collision work remains constant-bounded.
 Use `drain` when the caller needs all accepted Region writes completed, and
 `flush` when completed data should also be issued through the device data-sync
 primitive. Neither operation creates a recovery image.
+
+Keys are limited to 4 KiB and values to 256 KiB. Oversized mutations return
+`InvalidInput`; an oversized lookup is a miss. Each admitted device operation
+also has a fixed five-second completion guardrail. It is an internal
+device-stall safety boundary, not a durability or configurable request-timeout
+setting; a persistent stall takes the cache runtime out of service and later
+reads fail open as misses.
 
 ## Configuration boundary
 
@@ -204,8 +225,8 @@ including the data/state files and both recovery images that may coexist during
 atomic warm publication.
 
 Invalid runtime topology is rejected before cache files are opened or created.
-`HybridCache::snapshot()` reports tier hits/misses, promotions, L1 evictions,
-bypasses and TinyLFU admission rejections, served and written bytes,
+`HybridCache::snapshot()` reports puts, deletes, tier hits/misses, promotions,
+L1 evictions, bypasses and TinyLFU admission rejections, served and written bytes,
 overload/failure/rotation counters, lifecycle health, current and peak managed
 memory against its configured limit, and the configured logical-disk peak.
 Managed figures deliberately exclude allocator metadata, buffered-I/O page
@@ -269,7 +290,8 @@ device to data-sync, but neither makes the cache recoverable.
    stacks. Concurrent reads consume only their actual aligned read sizes.
    Invalid plans fail before creating files; inspect `detailed_snapshot().l1`
    and `.index` to confirm the resulting entry and slot pressure. As a concrete
-   upper-density plan, 1 TiB at 4 KiB per entry needs about a 7.62 GiB index;
+   upper-density plan, 1 TiB at 4 KiB per entry—or 4 TiB at 16 KiB per
+   entry—needs about a 7.62 GiB index;
    paired with a 10 GiB L1, the checked configuration uses an 18 GiB aggregate
    limit rather than treating the L1 byte setting as the complete process budget.
 4. Reserve at least `StaticConfig::peak_disk_bytes()` logical bytes on the cache
@@ -312,7 +334,9 @@ The configurable turnover soak is available through
 `cargo bench --bench hybrid_cache_soak`; use the multi-hour device command in
 `BENCHMARK.md` for M2 validation. Its engine and mode are independently
 selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`. By default it
-cycles 256 B, 4 KiB, 16 KiB, and 256 KiB values. A validated older version is
+uses four writers and four readers, periodically deletes keys, and cycles 256 B,
+4 KiB, 16 KiB, and 256 KiB values. `CACHE_SOAK_WRITERS` and
+`CACHE_SOAK_READERS` control the client mix. A validated older version is
 counted as `stale_hits`; a future version, wrong key, malformed value, resource
 bound violation, or runtime failure terminates the run.
 
