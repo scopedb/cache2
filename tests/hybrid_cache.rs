@@ -1,6 +1,5 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -236,26 +235,44 @@ fn l1_bypass_fences_the_old_region_value_without_waiting() {
     cache.close_fast().unwrap();
 }
 
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
 #[test]
-fn concurrent_first_operations_share_one_runtime() {
-    let files = TestCache::new("concurrent-first-operations");
-    let cache = Arc::new(files.config(2).open().unwrap());
+fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
+    let files = TestCache::new("unavailable-io-engine");
+    let runtime = RuntimeConfig::default()
+        .with_io_engine(IoEngine::IoUring)
+        .with_io_workers(1)
+        .with_io_concurrency(4)
+        .with_waiting_write_limit(16)
+        .with_l1_capacity(4 * 1024 * 1024)
+        .with_memory_limit(32 * 1024 * 1024)
+        .with_write_buffer_size(256 * 1024)
+        .with_write_batch_size(128 * 1024)
+        .with_write_flush_delay(Duration::from_millis(2));
 
-    std::thread::scope(|scope| {
-        for ordinal in 0_u64..8 {
-            let cache = Arc::clone(&cache);
-            scope.spawn(move || {
-                let key = ordinal.to_le_bytes();
-                let value = [ordinal as u8; 1024];
-                eventually_admitted(|| cache.put(key, value));
-                assert_eq!(cache.get(key).unwrap().unwrap().as_ref(), &value);
-            });
-        }
-    });
+    let error = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 
-    let cache = Arc::try_unwrap(cache).expect("worker cache references were released");
-    cache.drain().unwrap();
-    cache.close_fast().unwrap();
+    let reopened = files.config(1).open().unwrap();
+    assert_eq!(
+        reopened.startup_mode(),
+        StartupMode::ColdAfterUncleanShutdown
+    );
+    reopened.close_fast().unwrap();
 }
 
 #[test]

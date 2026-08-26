@@ -3184,6 +3184,53 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_operation_gate_stops_runtime_and_rejects_warm_close() {
+        let directory = TestDirectory::new();
+        let data = production_data_superblock(512 * 1024);
+        let runtime_config = RuntimeConfig::default()
+            .with_io_engine(crate::runtime_config::IoEngine::Sync)
+            .with_io_workers(1)
+            .with_io_concurrency(4)
+            .with_waiting_write_limit(4)
+            .with_l1_capacity(0)
+            .with_memory_limit(32 * 1024 * 1024)
+            .with_write_buffer_size(256 * 1024)
+            .with_write_batch_size(128 * 1024);
+        let mut store = RegionStore::open(
+            4096,
+            FileRegionBackend::new_with_configs(
+                directory.files.clone(),
+                data,
+                REGION_SHARDS,
+                runtime_config.clone(),
+            ),
+        )
+        .unwrap();
+
+        store
+            .runtime()
+            .unwrap()
+            .data_plane()
+            .unwrap()
+            .poison_operations_for_test();
+        let error = store.close_warm().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut reopened = RegionStore::open(
+            4096,
+            FileRegionBackend::new_with_configs(
+                directory.files.clone(),
+                data,
+                REGION_SHARDS,
+                runtime_config,
+            ),
+        )
+        .unwrap();
+        assert_eq!(reopened.startup(), StartupMode::ColdAfterUncleanShutdown);
+        reopened.close_fast().unwrap();
+    }
+
+    #[test]
     fn fresh_metadata_assigns_four_active_shards_and_a_free_victim() {
         let data = test_data_superblock();
         let metadata = empty_region_metadata(data, 64, REGION_SHARDS).unwrap();

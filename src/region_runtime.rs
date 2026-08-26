@@ -8,7 +8,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, RwLock, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -429,19 +429,10 @@ pub(crate) struct RegionDataPlane {
     data: DataSuperblock,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
-    // Published once after lazy startup; steady-state operations borrow it
-    // without taking the lifecycle mutex or cloning an Arc.
-    running: OnceLock<Arc<RunningShared>>,
-    lifecycle: Mutex<DataPlaneLifecycle>,
+    running: RunningOwner,
     // Fences write admission for drain, flush, and shutdown. Reads do not
     // participate because they cannot extend the set of records being fenced.
     operations: RwLock<()>,
-}
-
-enum DataPlaneLifecycle {
-    Dormant(RuntimeFileSet),
-    Running(RunningOwner),
-    Stopped,
 }
 
 struct RunningOwner {
@@ -615,13 +606,19 @@ impl RegionDataPlane {
         config: RuntimeConfig,
     ) -> io::Result<Self> {
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
+        let running = start_running(
+            Arc::clone(&core),
+            data,
+            files,
+            config.clone(),
+            Arc::clone(&metrics),
+        )?;
         Ok(Self {
             core,
             data,
             config,
             metrics,
-            running: OnceLock::new(),
-            lifecycle: Mutex::new(DataPlaneLifecycle::Dormant(files)),
+            running,
             operations: RwLock::new(()),
         })
     }
@@ -641,7 +638,7 @@ impl RegionDataPlane {
         }
         let record_bytes = required_record_bytes(namespace_id, key.len(), value.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let running = self.running()?;
+        let running = &self.running.shared;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
         let shard_id = self.core.append_shard(namespace_id, hash);
         let control = &running.shards[shard_id];
@@ -769,7 +766,7 @@ impl RegionDataPlane {
             }
             return Ok(None);
         }
-        let running = self.running()?;
+        let running = &self.running.shared;
         let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
         let activity = running
             .statistics
@@ -943,7 +940,7 @@ impl RegionDataPlane {
             .write()
             .map_err(|_| poisoned_runtime_error())?;
         let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
-        let running = self.running()?;
+        let running = &self.running.shared;
         drain_shards(running, false)
     }
 
@@ -956,7 +953,7 @@ impl RegionDataPlane {
                 .write()
                 .map_err(|_| poisoned_runtime_error())?;
             let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
-            let running = self.running()?;
+            let running = &self.running.shared;
             drain_shards(running, false)?;
             flush_data_inode(&running.engines)?;
             Ok(())
@@ -968,12 +965,12 @@ impl RegionDataPlane {
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
-        let running = self.running()?;
+        let running = &self.running.shared;
         Ok(self.snapshot_running(running))
     }
 
     pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
-        let running = self.running()?;
+        let running = &self.running.shared;
         let writes = running.resources.runtime_snapshot(
             running
                 .metrics
@@ -1002,66 +999,39 @@ impl RegionDataPlane {
     /// The return value asks the backend to retain flock for process lifetime
     /// because an issued write or flush could not be fenced.
     pub(crate) fn shutdown(self) -> io::Result<bool> {
-        let _ = self.metrics.lifecycle.compare_exchange(
+        let Self {
+            metrics,
+            running,
+            operations,
+            ..
+        } = self;
+        let _ = metrics.lifecycle.compare_exchange(
             LIFECYCLE_RUNNING,
             LIFECYCLE_DRAINING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let _exclusive = self
-            .operations
-            .write()
-            .map_err(|_| poisoned_runtime_error())?;
-        let owner = {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|_| poisoned_runtime_error())?;
-            match std::mem::replace(&mut *lifecycle, DataPlaneLifecycle::Stopped) {
-                DataPlaneLifecycle::Dormant(_) | DataPlaneLifecycle::Stopped => {
-                    return Ok(false);
-                }
-                DataPlaneLifecycle::Running(owner) => owner,
-            }
+        let (_exclusive, poisoned) = match operations.write() {
+            Ok(exclusive) => (exclusive, false),
+            Err(error) => (error.into_inner(), true),
         };
-        stop_running(owner)
+        let retain_lock = stop_running(running)?;
+        if retain_lock {
+            Ok(true)
+        } else if poisoned {
+            Err(poisoned_runtime_error())
+        } else {
+            Ok(false)
+        }
     }
 
-    fn running(&self) -> io::Result<&RunningShared> {
-        if let Some(running) = self.running.get() {
-            return Ok(running);
-        }
-
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|_| poisoned_runtime_error())?;
-        if let Some(running) = self.running.get() {
-            return Ok(running);
-        }
-        let files = match std::mem::replace(&mut *lifecycle, DataPlaneLifecycle::Stopped) {
-            DataPlaneLifecycle::Dormant(files) => files,
-            DataPlaneLifecycle::Stopped => return Err(closed_runtime_error()),
-            DataPlaneLifecycle::Running(_) => {
-                unreachable!("running owner is published with its shared state")
-            }
-        };
-        let owner = start_running(
-            Arc::clone(&self.core),
-            self.data,
-            files,
-            self.config.clone(),
-            Arc::clone(&self.metrics),
-        )?;
-        let shared = Arc::clone(&owner.shared);
-        *lifecycle = DataPlaneLifecycle::Running(owner);
-        self.running
-            .set(shared)
-            .map_err(|_| io::Error::other("runtime was initialized twice"))?;
-        Ok(self
-            .running
-            .get()
-            .expect("successful runtime publication is immediately visible"))
+    #[cfg(test)]
+    pub(crate) fn poison_operations_for_test(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _exclusive = self.operations.write().unwrap();
+            panic!("poison operation gate");
+        }));
+        assert!(result.is_err());
     }
 }
 
