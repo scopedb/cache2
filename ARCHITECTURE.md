@@ -95,14 +95,18 @@ bypasses L1 insertion.
 
 A `get` first checks the shared RAM tier. On an L1 miss it probes the fixed-size
 L2 index once, reserves one non-waiting engine slot, allocates the exact aligned
-read range, and reads one record. Local validation checks the planned location,
-sequence, hash, namespace, complete key, lengths, and checksums.
+read range, and reads one record. If the hash-selected lane is full, admission
+may probe one hash-derived alternate lane; it never scans or waits across the
+pool. Local validation checks the planned location, sequence, hash, namespace,
+complete key, lengths, and checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
 The I/O pool contains the requested number of workers. In sync mode these are
-positioned-I/O workers; with io_uring they are independent rings. Hash routing
-keeps work distributed while total in-flight I/O remains explicitly bounded.
+positioned-I/O workers; with io_uring they are independent rings. The sum of
+fixed lane depths never exceeds the configured global in-flight bound.
+Two-choice read routing reduces idle-lane fragmentation without adding a shared
+admission counter to every I/O.
 
 ## Recovery path
 

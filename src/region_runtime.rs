@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
-use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_WORKER, build_file_engine};
+use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_WORKER, ReadSlot, build_file_engine};
 use crate::memory::{
     MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
 };
@@ -639,6 +639,31 @@ impl RunningShared {
     fn engine_for(&self, route: u64) -> &Arc<dyn IoEngine> {
         &self.engines[route_hash(route, self.engines.len())]
     }
+
+    fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+        try_reserve_read_lane(&self.engines, route)
+    }
+}
+
+fn try_reserve_read_lane(
+    engines: &[Arc<dyn IoEngine>],
+    route: u64,
+) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+    debug_assert!(!engines.is_empty());
+    let primary = route_hash(route, engines.len());
+    match engines[primary].try_reserve_read() {
+        Ok(slot) => Ok((Arc::clone(&engines[primary]), slot)),
+        Err(error) if engines.len() == 1 || !is_read_pressure(error.kind()) => Err(error),
+        Err(primary_error) => {
+            let offset = 1 + route_hash(route.rotate_right(32), engines.len() - 1);
+            let alternate = (primary + offset) % engines.len();
+            match engines[alternate].try_reserve_read() {
+                Ok(slot) => Ok((Arc::clone(&engines[alternate]), slot)),
+                Err(error) if !is_read_pressure(error.kind()) => Err(error),
+                Err(_) => Err(primary_error),
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -965,9 +990,8 @@ impl RegionDataPlane {
                 return Ok(PreparedGet::Complete(None));
             }
         };
-        let engine = Arc::clone(running.engine_for(hash));
-        let slot = match engine.try_reserve_read() {
-            Ok(slot) => slot,
+        let (engine, slot) = match running.try_reserve_read(hash) {
+            Ok(reservation) => reservation,
             Err(error) if is_read_pressure(error.kind()) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
@@ -1713,6 +1737,44 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io_backend::{FileBackend, IoBackend};
+    use crate::io_engine::BackendIoEngine;
+
+    static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
+        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cache-rs-read-lane-{}-{id}.cache",
+            std::process::id()
+        ));
+        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
+        let engines: Box<[Arc<dyn IoEngine>]> = vec![
+            Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
+            Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
+        ]
+        .into_boxed_slice();
+        let primary = engines[0].try_reserve_read().unwrap();
+
+        let (selected, alternate) = try_reserve_read_lane(&engines, 0).unwrap();
+        assert!(Arc::ptr_eq(&selected, &engines[1]));
+        let error = match try_reserve_read_lane(&engines, 0) {
+            Ok(_) => panic!("both read lanes are already reserved"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(alternate);
+        drop(primary);
+        drop(selected);
+        for engine in &engines {
+            engine.shutdown().unwrap();
+        }
+        drop(engines);
+        drop(backend);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn mutation_gate_fences_existing_and_new_mutations() {

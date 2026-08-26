@@ -243,7 +243,9 @@ subsets of `l2_misses` without changing the fail-open `get` result.
 Fixed per-shard write buffers bound write admission. A true L2 miss does not allocate a
 buffer. An L2 candidate first reserves an engine execution slot and then
 allocates only its actual aligned read range against the aggregate memory
-limit; allocation or I/O-engine pressure is an observable cache miss. Write
+limit. A full primary lane permits one non-waiting, hash-derived alternate-lane
+probe; there is no pool scan or retry loop. Allocation or I/O-engine pressure
+is an observable cache miss. Write
 occupancy cannot consume the final slot of a multi-entry I/O engine.
 Promoted hits release the temporary allocation before return;
 unpromoted zero-copy Region values retain it. Writes return `WouldBlock`

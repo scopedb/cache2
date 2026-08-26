@@ -697,25 +697,18 @@ impl BoundedIoRequest {
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
         let deadline = tokio::time::Instant::from_std(self.deadline);
-        let timer = tokio::time::sleep_until(deadline);
-        tokio::pin!(timer);
-        tokio::select! {
-            completion = request.request_mut() => {
-                request.disarm();
-                return Ok(completion);
-            }
-            () = &mut timer => {}
+        if let Ok(completion) = tokio::time::timeout_at(deadline, request.request_mut()).await {
+            request.disarm();
+            return Ok(completion);
         }
 
         let cancel_error = request.cancel().err();
-        let grace = tokio::time::sleep(self.cancel_grace);
-        tokio::pin!(grace);
-        tokio::select! {
-            completion = request.request_mut() => {
+        match tokio::time::timeout(self.cancel_grace, request.request_mut()).await {
+            Ok(completion) => {
                 request.disarm();
                 Err(IoDeadlineExceeded::new(cancel_error, Some(completion)))
             }
-            () = &mut grace => {
+            Err(_) => {
                 request.stop_and_detach();
                 Err(IoDeadlineExceeded::new(cancel_error, None))
             }
@@ -2093,7 +2086,6 @@ mod uring {
             let required = [
                 opcode::Read::CODE,
                 opcode::Write::CODE,
-                opcode::Fsync::CODE,
                 opcode::AsyncCancel::CODE,
                 opcode::PollAdd::CODE,
             ];
@@ -3461,6 +3453,30 @@ mod tests {
         backend.release();
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn async_completion_deadline_stops_a_stalled_engine() {
+        let backend = Arc::new(BlockingBackend::default());
+        let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+        let resources = resources(4096);
+        let request = submit_cache_io_until(
+            engine.as_ref(),
+            IoOperation::read(read_buffer(&resources, 4096), 0),
+            Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(backend.wait_for_entered(1));
+
+        let timeout = request.wait_async(Arc::clone(&engine)).await.unwrap_err();
+        let (error, buffer) = timeout.into_buffer();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(buffer.is_none());
+        assert_eq!(engine.in_flight(), 1);
+
+        backend.release();
+        engine.shutdown().unwrap();
     }
 
     #[cfg(unix)]
