@@ -217,9 +217,7 @@ pub(crate) fn encode_value_into_hashed(
         codec,
         key_len,
         value_len,
-        stored_len: value_len,
         record_len: reservation.record_bytes,
-        region_incarnation: reservation.region_incarnation,
         seqno: reservation.seqno,
         key_hash: hash,
         expires_at,
@@ -332,9 +330,7 @@ mod tests {
             (NAMESPACE_KEY_PREFIX_SIZE + key.len()) as u32
         );
         assert_eq!(header.value_len, value.len() as u32);
-        assert_eq!(header.stored_len, value.len() as u32);
         assert_eq!(header.record_len, required);
-        assert_eq!(header.region_incarnation, 3);
         assert_eq!(header.seqno, 17);
         assert_eq!(header.key_hash, hash);
         assert_eq!(header.expires_at, 123_456);

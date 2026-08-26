@@ -22,10 +22,10 @@ const RECORD_KIND_OFFSET: usize = 6;
 const RECORD_CODEC_OFFSET: usize = 7;
 const RECORD_KEY_LEN_OFFSET: usize = 8;
 const RECORD_VALUE_LEN_OFFSET: usize = 12;
-const RECORD_STORED_LEN_OFFSET: usize = 16;
+const RECORD_RESERVED_LENGTH_OFFSET: usize = 16;
 const RECORD_LEN_OFFSET: usize = 20;
-const RECORD_REGION_INCARNATION_OFFSET: usize = 24;
-const RECORD_RESERVED_OFFSET: usize = 28;
+const RECORD_RESERVED_GENERATION_OFFSET: usize = 24;
+const RECORD_RESERVED_EPOCH_OFFSET: usize = 28;
 const RECORD_SEQNO_OFFSET: usize = 32;
 const RECORD_KEY_HASH_OFFSET: usize = 40;
 const RECORD_EXPIRES_AT_OFFSET: usize = 48;
@@ -58,9 +58,7 @@ pub(crate) struct RecordHeader {
     pub(crate) codec: RecordCodec,
     pub(crate) key_len: u32,
     pub(crate) value_len: u32,
-    pub(crate) stored_len: u32,
     pub(crate) record_len: u32,
-    pub(crate) region_incarnation: u32,
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
     pub(crate) expires_at: u64,
@@ -69,10 +67,10 @@ pub(crate) struct RecordHeader {
 
 impl RecordHeader {
     /// Returns the smallest 32-byte-aligned record length for this payload.
-    pub(crate) fn aligned_len(key_len: usize, stored_len: usize) -> Option<u32> {
+    pub(crate) fn aligned_len(key_len: usize, value_len: usize) -> Option<u32> {
         let unaligned = RECORD_HEADER_SIZE
             .checked_add(key_len)?
-            .checked_add(stored_len)?;
+            .checked_add(value_len)?;
         let aligned = checked_align_up(unaligned, RECORD_ALIGNMENT)?;
         u32::try_from(aligned).ok()
     }
@@ -85,14 +83,7 @@ impl RecordHeader {
         output[RECORD_CODEC_OFFSET] = self.codec as u8;
         put_u32(&mut output, RECORD_KEY_LEN_OFFSET, self.key_len);
         put_u32(&mut output, RECORD_VALUE_LEN_OFFSET, self.value_len);
-        put_u32(&mut output, RECORD_STORED_LEN_OFFSET, self.stored_len);
         put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
-        put_u32(
-            &mut output,
-            RECORD_REGION_INCARNATION_OFFSET,
-            self.region_incarnation,
-        );
-        put_u32(&mut output, RECORD_RESERVED_OFFSET, 0);
         put_u64(&mut output, RECORD_SEQNO_OFFSET, self.seqno);
         put_u64(&mut output, RECORD_KEY_HASH_OFFSET, self.key_hash);
         put_u64(&mut output, RECORD_EXPIRES_AT_OFFSET, self.expires_at);
@@ -108,7 +99,9 @@ impl RecordHeader {
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != FORMAT_VERSION
             || *input.get(RECORD_KIND_OFFSET)? != RECORD_KIND_VALUE
-            || get_u32(input, RECORD_RESERVED_OFFSET)? != 0
+            || get_u32(input, RECORD_RESERVED_LENGTH_OFFSET)? != 0
+            || get_u32(input, RECORD_RESERVED_GENERATION_OFFSET)? != 0
+            || get_u32(input, RECORD_RESERVED_EPOCH_OFFSET)? != 0
             || !checksum_matches(input, RECORD_HEADER_CRC_OFFSET)
         {
             return None;
@@ -118,9 +111,7 @@ impl RecordHeader {
             codec: RecordCodec::decode(*input.get(RECORD_CODEC_OFFSET)?)?,
             key_len: get_u32(input, RECORD_KEY_LEN_OFFSET)?,
             value_len: get_u32(input, RECORD_VALUE_LEN_OFFSET)?,
-            stored_len: get_u32(input, RECORD_STORED_LEN_OFFSET)?,
             record_len: get_u32(input, RECORD_LEN_OFFSET)?,
-            region_incarnation: get_u32(input, RECORD_REGION_INCARNATION_OFFSET)?,
             seqno: get_u64(input, RECORD_SEQNO_OFFSET)?,
             key_hash: get_u64(input, RECORD_KEY_HASH_OFFSET)?,
             expires_at: get_u64(input, RECORD_EXPIRES_AT_OFFSET)?,
@@ -140,25 +131,18 @@ impl RecordHeader {
         let Ok(value_len) = usize::try_from(self.value_len) else {
             return false;
         };
-        let Ok(stored_len) = usize::try_from(self.stored_len) else {
-            return false;
-        };
         let Ok(record_len) = usize::try_from(self.record_len) else {
             return false;
         };
 
         if key_len > MAX_KEY_SIZE
             || value_len > MAX_VALUE_SIZE
-            || stored_len > MAX_VALUE_SIZE
             || record_len % RECORD_ALIGNMENT != 0
         {
             return false;
         }
-        if value_len != stored_len {
-            return false;
-        }
 
-        Self::aligned_len(key_len, stored_len).is_some_and(|minimum| self.record_len >= minimum)
+        Self::aligned_len(key_len, value_len).is_some_and(|minimum| self.record_len >= minimum)
     }
 }
 
@@ -271,9 +255,7 @@ mod tests {
             codec: RecordCodec::PlainKey,
             key_len: key.len() as u32,
             value_len: value.len() as u32,
-            stored_len: value.len() as u32,
             record_len: 96,
-            region_incarnation: 9,
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
             expires_at: 0x0102_0304_0506_0708,
@@ -298,9 +280,7 @@ mod tests {
             codec: RecordCodec::PlainKey,
             key_len: 3,
             value_len: 5,
-            stored_len: 5,
             record_len: RecordHeader::aligned_len(3, 5).unwrap(),
-            region_incarnation: 9,
             seqno: 101,
             key_hash: 0xfedc_ba98_7654_3210,
             expires_at: 1234,
@@ -328,9 +308,7 @@ mod tests {
             codec: RecordCodec::PlainKey,
             key_len: 8,
             value_len: 1,
-            stored_len: 1,
             record_len: RecordHeader::aligned_len(8, 1).unwrap(),
-            region_incarnation: 1,
             seqno: 2,
             key_hash: 3,
             expires_at: 0,
@@ -344,9 +322,16 @@ mod tests {
         too_short.record_len = RECORD_HEADER_SIZE as u32;
         assert_eq!(RecordHeader::decode(&too_short.encode()), None);
 
-        let mut mismatched_value = header;
-        mismatched_value.value_len = 2;
-        assert_eq!(RecordHeader::decode(&mismatched_value.encode()), None);
+        let mut oversized_value = header;
+        oversized_value.value_len = MAX_VALUE_SIZE as u32 + 1;
+        assert_eq!(RecordHeader::decode(&oversized_value.encode()), None);
+
+        let mut reserved = header.encode();
+        put_u32(&mut reserved, RECORD_RESERVED_LENGTH_OFFSET, 1);
+        put_u32(&mut reserved, RECORD_HEADER_CRC_OFFSET, 0);
+        let checksum = crc32c(&reserved);
+        put_u32(&mut reserved, RECORD_HEADER_CRC_OFFSET, checksum);
+        assert_eq!(RecordHeader::decode(&reserved), None);
 
         assert_eq!(RecordHeader::aligned_len(usize::MAX, 1), None);
     }

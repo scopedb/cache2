@@ -700,7 +700,7 @@ impl FileRegionCore {
             return Ok(None);
         }
         let key_len = header.key_len as usize;
-        let value_len = header.stored_len as usize;
+        let value_len = header.value_len as usize;
         let Some(payload_end) = RECORD_HEADER_SIZE
             .checked_add(key_len)
             .and_then(|end| end.checked_add(value_len))

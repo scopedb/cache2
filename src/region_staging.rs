@@ -555,7 +555,6 @@ impl RegionStaging {
                 StagingError::Invariant("staging final record header is corrupt"),
             )?;
             if header.record_len != old_record_len
-                || header.region_incarnation != receipt.region_incarnation
                 || header.seqno != last.entry.seqno
                 || header.key_hash != last.hash
             {
@@ -899,9 +898,7 @@ mod tests {
             codec: RecordCodec::PlainKey,
             key_len: 0,
             value_len: 0,
-            stored_len: 0,
             record_len: receipt.record_bytes,
-            region_incarnation: receipt.region_incarnation,
             seqno: receipt.seqno,
             key_hash: record.hash,
             expires_at: 0,
