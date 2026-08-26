@@ -24,7 +24,7 @@ use crate::record_codec::{hash_namespaced_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_reader::{_READ_ALIGNMENT, plan_read};
-use crate::region_staging::{PendingFenceLookup, RegionStaging, StagingError};
+use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_BACKPRESSURE_TIMEOUT, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
     ResourceBuildError, ResourceController, ResourceLimits, WriteBackpressure, WriteOverloadReason,
@@ -703,15 +703,10 @@ impl RegionDataPlane {
                 expires_at,
             )? {
                 RegionStageValue::Staged(seqno) => {
-                    let _published = running.memory.publish_pending(
-                        shard_id,
-                        hash,
-                        namespace_id,
-                        key,
-                        value,
-                        expires_at,
-                        seqno,
-                    );
+                    let _published =
+                        running
+                            .memory
+                            .publish(hash, namespace_id, key, value, expires_at, seqno);
                     control.notify(WAKE_DATA)?;
                     if let Some(activity) = activity {
                         RuntimeMetrics::increment(&activity.puts);
@@ -788,44 +783,21 @@ impl RegionDataPlane {
         // This health observation is the read's availability linearization
         // point. A later one-way transition to miss-only does not invalidate a
         // value that was already resident here.
-        let shard_id = self.core.append_shard(namespace_id, hash);
-        let minimum_seqno = match running.staging.pending_fence(shard_id, hash) {
-            PendingFenceLookup::Unfenced => None,
-            PendingFenceLookup::Fenced(seqno) => Some(seqno),
-            PendingFenceLookup::Contended => {
+        let read_token = match running.memory.lookup(hash, namespace_id, key, clock) {
+            MemoryLookup::Hit(value) => {
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l1_hits);
+                    RuntimeMetrics::add(&activity.served_bytes, value.len());
+                }
+                return Ok(Some(HybridValueRead::L1(value)));
+            }
+            MemoryLookup::Miss(token) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l1_misses);
-                    RuntimeMetrics::increment(&activity.l2_misses);
                 }
-                return Ok(None);
+                token
             }
         };
-        let read_token =
-            match running
-                .memory
-                .lookup_with_fence(hash, namespace_id, key, clock, minimum_seqno)
-            {
-                MemoryLookup::Hit(value) => {
-                    if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.l1_hits);
-                        RuntimeMetrics::add(&activity.served_bytes, value.len());
-                    }
-                    return Ok(Some(HybridValueRead::L1(value)));
-                }
-                MemoryLookup::Hidden => {
-                    if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.l1_misses);
-                        RuntimeMetrics::increment(&activity.l2_misses);
-                    }
-                    return Ok(None);
-                }
-                MemoryLookup::Miss(token) => {
-                    if let Some(activity) = activity {
-                        RuntimeMetrics::increment(&activity.l1_misses);
-                    }
-                    token
-                }
-            };
         let Some(initial_point) = self.core.begin_value_read(hash, namespace_id)? else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
@@ -900,7 +872,7 @@ impl RegionDataPlane {
                     RuntimeMetrics::increment(&activity.l2_hits);
                     RuntimeMetrics::add(&activity.served_bytes, value.value().len());
                 }
-                let promoted = running.memory.promote_clean(
+                let promoted = running.memory.promote(
                     read_token,
                     hash,
                     namespace_id,
@@ -1155,7 +1127,6 @@ fn start_running(
     let memory = Arc::new(MemoryStore::new(
         config.l1_capacity_bytes,
         config.l1_shards,
-        shard_count,
         config.eviction_policy,
         config.statistics,
     )?);
@@ -1313,12 +1284,9 @@ fn shard_worker_result(
                 }
                 if force_flush || fill.bytes >= shared.write_batch_bytes {
                     let engine = shared.engine_for(shard_id as u64);
-                    shared.core.flush_staging_shard(
-                        &shared.staging,
-                        engine.as_ref(),
-                        shard_id,
-                        Some(shared.memory.as_ref()),
-                    )?;
+                    shared
+                        .core
+                        .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
                     deadline = None;
                     advance_shard_progress(control)?;
                 }
@@ -1353,12 +1321,9 @@ fn shard_worker_result(
                 .is_some()
             {
                 let engine = shared.engine_for(shard_id as u64);
-                shared.core.flush_staging_shard(
-                    &shared.staging,
-                    engine.as_ref(),
-                    shard_id,
-                    Some(shared.memory.as_ref()),
-                )?;
+                shared
+                    .core
+                    .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
                 advance_shard_progress(control)?;
             }
             complete_shard_drain(control, drain_generation)?;

@@ -25,7 +25,6 @@ use crate::io_backend::{
     read_at_bounded, read_exact_at, write_all_at,
 };
 use crate::io_engine::{IoEngine, ReadSlot};
-use crate::memory::MemoryStore;
 use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
 use crate::record_codec::{hash_namespaced_key, required_record_bytes};
@@ -868,15 +867,6 @@ impl FileRegionCore {
                 return Err(staging_io_error(error));
             }
         }
-        match staging.preflight_pending_fence(shard_id, hash) {
-            Ok(()) => {}
-            Err(StagingError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
-            Err(error) => {
-                self.health.enter_miss_only();
-                staging.close();
-                return Err(staging_io_error(error));
-            }
-        }
         let receipt = {
             let Some(mut manager) = self.manager.try_lock()? else {
                 return Ok(RegionStageValue::ManagerBusy);
@@ -959,7 +949,6 @@ impl FileRegionCore {
         staging: &RegionStaging,
         engine: &dyn IoEngine,
         shard_id: usize,
-        memory: Option<&MemoryStore>,
     ) -> io::Result<Option<crate::region_manager::RegionWriteSpan>> {
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
@@ -1113,7 +1102,7 @@ impl FileRegionCore {
             return Err(region_read_io_error(error));
         }
 
-        if let Err(error) = self.publish_completed_records(shard_id, records.as_slice(), memory) {
+        if let Err(error) = self.publish_completed_records(records.as_slice()) {
             self.fail_staged_span(staging, span, Some(buffer), records);
             return Err(error);
         }
@@ -1209,12 +1198,7 @@ impl FileRegionCore {
     /// Publishes a completed batch in small fixed chunks. The worker keeps
     /// batching index work, but never monopolizes global Region authority for
     /// all records in a maximum-size staging span.
-    fn publish_completed_records(
-        &self,
-        shard_id: usize,
-        records: &[StagedRecord],
-        memory: Option<&MemoryStore>,
-    ) -> io::Result<()> {
+    fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for chunk in records.chunks(INDEX_PUBLICATION_CHUNK_RECORDS) {
             let mut authority = self.manager.begin_index_mutation()?;
             let mut index_error = None;
@@ -1236,13 +1220,6 @@ impl FileRegionCore {
                 return Err(index_storage_io_error(error));
             }
             accounting?;
-            if let Some(memory) = memory {
-                let mut completions = [(0_u64, 0_u64); INDEX_PUBLICATION_CHUNK_RECORDS];
-                for (completion, record) in completions.iter_mut().zip(chunk) {
-                    *completion = (record.hash, record.entry.seqno);
-                }
-                memory.complete_batch(shard_id, &completions[..chunk.len()]);
-            }
         }
         Ok(())
     }
@@ -3379,7 +3356,7 @@ mod tests {
         assert_eq!(runtime.lookup_snapshot(first_hash).unwrap(), None);
 
         let published = runtime
-            .flush_staging_shard(&staging, &engine, 0, None)
+            .flush_staging_shard(&staging, &engine, 0)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3491,7 +3468,7 @@ mod tests {
             panic!("expired value must stage");
         };
         runtime
-            .flush_staging_shard(&staging, &engine, 0, None)
+            .flush_staging_shard(&staging, &engine, 0)
             .unwrap()
             .expect("expired value must publish before its deadline");
 
@@ -3587,7 +3564,7 @@ mod tests {
             panic!("collision owner must stage");
         };
         runtime
-            .flush_staging_shard(&staging, &engine, 0, None)
+            .flush_staging_shard(&staging, &engine, 0)
             .unwrap()
             .expect("collision owner must publish");
 
@@ -3693,7 +3670,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .flush_staging_shard(&staging, &engine, 0, None)
+                .flush_staging_shard(&staging, &engine, 0)
                 .unwrap_err()
                 .raw_os_error(),
             Some(5)

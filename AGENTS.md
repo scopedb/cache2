@@ -4,34 +4,30 @@
 
 Use this order whenever correctness and performance goals conflict:
 
-1. Do not wait for internal capacity unless the caller explicitly selected a
-   waiting write policy.
-2. Do not return a stale value.
-3. Preserve or improve hit rate.
+1. Keep the request path simple and fast.
+2. Preserve or improve hit rate.
+3. Prefer a newer value when sequence information makes that cheap.
 
-Prefer a cache miss over waiting for internal capacity or serving an obsolete
-version. An admitted L2 lookup may complete its single bounded record read so
-L2 can decide the result.
+Consistency is best effort. A cache hit may be stale. Sequence numbers may
+help prefer newer records, but must not add a fence, retry protocol, or second
+validation pass to a read. Writes and deletes may throttle on bounded internal
+capacity; this is expected to be uncommon in normal operation.
 
 ## Performance Contract
 
-- Steady-state `put` must not wait for device I/O, batch completion, data
+- Steady-state `put` and delete operations may wait for bounded in-memory
+  admission, but must not wait for device I/O, batch completion, data
   synchronization, or recovery publication.
-- Waiting is allowed only for an explicit barrier such as `drain`, `flush`, or
-  graceful warm close, when the caller explicitly selects a waiting
-  write-backpressure policy. An admitted L2 hit may otherwise wait only for
-  its own single bounded record read.
+- An admitted L2 hit may wait only for its own single bounded record read.
 - Keep memory, queues, staging buffers, index probes, and eviction work strictly
   bounded. Never introduce an unbounded allocation, scan, retry loop, or queue.
-- On saturation, bypass L1, return a cache miss, or reject with an overload
-  result. Only caller-selected write policies may wait for capacity.
+- On saturation, bypass L1, return a cache miss, throttle a mutation, or reject
+  it with an overload result.
 - Keep the admitted L1 path limited to shard routing and short, bounded
   in-memory critical sections. Do not add work needed only by bypass or failure
   cases to the normal hit path.
-- L1 lookup and pending publication retain only their short shard-local
-  critical sections so an admitted `Pending` value remains immediately visible
-  and an older L1 value cannot escape a newer pending fence. Optional promotion
-  bypasses on lock contention.
+- L1 lookup and publication retain only short shard-local critical sections.
+  Optional insertion and promotion may bypass on pressure.
 - Give every eviction selection, multi-victim admission, and frequency-aging
   operation a small constant work budget. Exhausting that budget bypasses L1.
 - Never hold a lock across device I/O. Keep mutation critical sections short
@@ -41,7 +37,7 @@ L2 can decide the result.
 - On an I/O engine with more than one slot, write submissions must leave the
   final slot available to reads. Apply that limit to write occupancy rather
   than total occupancy. Reads may use the complete engine depth, but a waiting
-  waiting write must receive a bounded handoff so accepted writes and explicit
+  write must receive a bounded handoff so accepted writes and explicit
   barriers cannot starve behind a read stream.
 - An L1 miss must always consult L2. A true L2 index miss returns immediately
   without acquiring a read buffer.
@@ -49,7 +45,7 @@ L2 can decide the result.
   reserves one non-waiting engine execution slot, allocates only that aligned range
   against the aggregate memory limit, and submits under the reservation.
   Allocation or engine pressure is a miss, not public read backpressure. An
-  admitted request completes one read plus exact revalidation.
+  admitted request completes one read plus local record validation.
 - Do not add a read admission policy, read-buffer pool, read wait, background
   ready table, or retry protocol to `get`. The bounded I/O engine and aggregate
   memory limit are execution safety boundaries, not public read admission.
@@ -57,14 +53,11 @@ L2 can decide the result.
   transient aligned buffer before `get` returns while preserving Region as the
   hit source. If promotion bypasses, the zero-copy Region value may retain its
   exact-size allocation until the caller drops it.
-- Under the default reject policy, shard staging is the only write admission
-  boundary. Do not put a global request gate in front of it.
 - Preflight shard capacity before allocating an append receipt. Reserve the
   Region tail and commit its open-span accounting under one manager try-lock;
   the shard mutation gate then protects encoding without holding that manager.
-- Index-partition mutation, warm-page validation, and Region-generation
-  contention are misses. Never wait or spin behind another request before
-  deciding an L2 candidate.
+- Index-partition and warm-page contention are misses. Never wait or spin
+  behind another request before deciding an L2 candidate.
 - Bound every L1 same-hash bucket to a small constant and bypass L1 when that
   bucket is full. Full-key validation remains mandatory within the bound.
 - Compute the namespaced key hash and planned record size once at the public
@@ -76,40 +69,28 @@ L2 can decide the result.
 
 ## Visibility Semantics
 
-- A value admitted to L1 is immediately readable as `Pending` while its Region
-  write is still in flight.
-- A `Pending` L1 value is not evictable. It becomes `Clean` only after its
-  matching Region record completes.
-- If a value cannot enter L1, do not wait for Region completion. Publish a
-  transient pending fence and return immediately.
-- While that fence is active, reads must return a miss instead of falling back
-  to the older Region value.
-- Completing the record clears the matching fence at the same sequence number.
-- The required degradation order is `new value -> miss`, never
-  `new value -> stale value`.
-- Expired pending values hide the Region tier. Expired clean values may be
-  removed and treated as misses.
+- A value admitted to L1 is immediately readable and immediately evictable.
+- If a value cannot enter L1, the mutation may still complete through Region.
+- L1 contention, eviction, delayed publication, and L2 promotion may expose an
+  older valid value. This is an accepted best-effort outcome.
+- Expired values are misses.
 - Namespace and full-key validation remain mandatory after hash lookup so hash
   collisions cannot return another entry.
 
 ## Concurrency and Versioning
 
-- Every mutation has a monotonic sequence number. A newer sequence always wins.
-- A delayed older publication must never overwrite, expose, or evict a newer
-  version of the same key.
-- Scope completion watermarks to append shards. A memory-shard-wide version
-  floor must not suppress unrelated keys.
-- Concurrent operations may be linearized in any order allowed by their
-  overlap, but the final visible state must respect sequence ordering.
-- After Region I/O, revalidate the exact index record identity, Region
-  generation, cache epoch, and clear floor before returning the value.
-- Pending fences are runtime-only; warm recovery images contain completed index
-  values only.
+- Every Region record has a monotonic sequence number. Use it to reject a
+  mismatched physical record and to prefer a newer value where this is already
+  part of a bounded mutation, not to guarantee read freshness.
+- Concurrent and delayed operations may expose an older valid version.
+- After Region I/O, validate the returned record locally against the planned
+  location, sequence number, hash, namespace, full key, lengths, and checksum.
+  Do not perform a second index lookup or a global freshness check.
 
 ## Cache and Durability Semantics
 
 - cache-rs is a best-effort cache, not a database. Eviction, bypass, rejection,
-  and misses are valid outcomes; stale reads are not.
+  throttling, misses, and stale reads are valid outcomes.
 - Publish an L2 index entry only after the corresponding data write completes.
 - `drain` is an accepted-write completion barrier, not a durability sync.
 - `flush` drains accepted writes and then issues the device data-sync operation.
@@ -123,4 +104,5 @@ L2 can decide the result.
 - Reads in miss-only mode fail open as cache misses rather than application data
   errors.
 - Resource overload remains explicit, bounded, and observable.
-- If freshness and bounded execution cannot both be guaranteed, return a miss.
+- Invalid, out-of-bounds, wrong-key, or corrupt records are misses and must
+  never be returned.

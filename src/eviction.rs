@@ -1,7 +1,7 @@
 //! Shard-local eviction policies for the volatile RAM tier.
 //!
-//! Capacity accounting, pending-write pinning, TTL, and key correctness stay
-//! in `memory`; policies only maintain access metadata and choose a clean slot.
+//! Capacity accounting, TTL, and key correctness stay in `memory`; policies
+//! only maintain access metadata and choose a resident slot.
 
 use std::collections::HashMap;
 use std::io;
@@ -68,11 +68,10 @@ enum QueueId {
 }
 
 const RESIDENT_BIT: u8 = 1 << 0;
-const EVICTABLE_BIT: u8 = 1 << 1;
-const QUEUE_SHIFT: u8 = 2;
+const QUEUE_SHIFT: u8 = 1;
 const QUEUE_MASK: u8 = 0b11 << QUEUE_SHIFT;
-const VISITED_BIT: u8 = 1 << 4;
-const FREQUENCY_SHIFT: u8 = 5;
+const VISITED_BIT: u8 = 1 << 3;
+const FREQUENCY_SHIFT: u8 = 4;
 const FREQUENCY_MASK: u8 = 0b11 << FREQUENCY_SHIFT;
 const LINK_INDEX_BITS: u32 = 25;
 const LINK_INDEX_MASK: u32 = (1 << LINK_INDEX_BITS) - 1;
@@ -87,13 +86,12 @@ pub(crate) struct PolicySlot {
 }
 
 impl PolicySlot {
-    fn new(hash: u64, evictable: bool) -> Self {
+    fn new(hash: u64) -> Self {
         let mut slot = Self {
             hash,
             ..Self::default()
         };
         slot.set_flags(RESIDENT_BIT);
-        slot.set_evictable(evictable);
         slot
     }
 
@@ -101,16 +99,8 @@ impl PolicySlot {
         self.hash
     }
 
-    pub(crate) fn is_evictable(&self) -> bool {
-        self.flags() & EVICTABLE_BIT != 0
-    }
-
     fn is_resident(&self) -> bool {
         self.flags() & RESIDENT_BIT != 0
-    }
-
-    fn set_evictable(&mut self, evictable: bool) {
-        self.set_flags((self.flags() & !EVICTABLE_BIT) | (u8::from(evictable) * EVICTABLE_BIT));
     }
 
     fn queue(&self) -> QueueId {
@@ -250,17 +240,8 @@ impl SlotList {
         self.push_front(slots, index, queue, 0);
     }
 
-    fn oldest_evictable(&self, slots: &[PolicySlot]) -> Option<usize> {
-        let mut candidate = self.tail;
-        for _ in 0..self.len.min(MAX_POLICY_SCAN_STEPS) {
-            let index = candidate?;
-            let slot = &slots[index];
-            if slot.is_resident() && slot.is_evictable() {
-                return Some(index);
-            }
-            candidate = slot.previous();
-        }
-        None
+    fn oldest(&self, slots: &[PolicySlot]) -> Option<usize> {
+        self.tail.filter(|index| slots[*index].is_resident())
     }
 }
 
@@ -367,11 +348,10 @@ impl EvictionState {
         index: usize,
         hash: u64,
         weight: usize,
-        evictable: bool,
         hint: AdmissionHint,
     ) {
         debug_assert!(!slots[index].is_resident());
-        slots[index] = PolicySlot::new(hash, evictable);
+        slots[index] = PolicySlot::new(hash);
         match &mut self.state {
             PolicyState::Clock(_) => slots[index].set_visited(true),
             PolicyState::Lru(state) => {
@@ -427,12 +407,6 @@ impl EvictionState {
         }
     }
 
-    pub(crate) fn set_evictable(&mut self, slots: &mut [PolicySlot], index: usize) {
-        if slots.get(index).is_some_and(PolicySlot::is_resident) {
-            slots[index].set_evictable(true);
-        }
-    }
-
     pub(crate) fn remove(&mut self, slots: &mut [PolicySlot], index: usize, weight: usize) {
         if !slots.get(index).is_some_and(PolicySlot::is_resident) {
             return;
@@ -482,10 +456,10 @@ impl EvictionState {
             PolicyState::Clock(state) => select_clock(state, slots),
             PolicyState::Lru(state) => state
                 .entries
-                .oldest_evictable(slots)
+                .oldest(slots)
                 .map_or(VictimSelection::None, VictimSelection::Victim),
             PolicyState::TinyLfu(state) => {
-                let Some(victim) = state.entries.oldest_evictable(slots) else {
+                let Some(victim) = state.entries.oldest(slots) else {
                     return VictimSelection::None;
                 };
                 if apply_admission
@@ -500,7 +474,7 @@ impl EvictionState {
             PolicyState::Sieve(state) => select_sieve(state, slots),
             PolicyState::Fifo(state) => state
                 .entries
-                .oldest_evictable(slots)
+                .oldest(slots)
                 .map_or(VictimSelection::None, VictimSelection::Victim),
             PolicyState::S3Fifo(state) => select_s3fifo(state, slots, weight_of),
         }
@@ -520,7 +494,7 @@ fn select_clock(state: &mut ClockState, slots: &mut [PolicySlot]) -> VictimSelec
         let index = state.hand % slots.len();
         state.hand = (index + 1) % slots.len();
         let slot = &mut slots[index];
-        if !slot.is_resident() || !slot.is_evictable() {
+        if !slot.is_resident() {
             continue;
         }
         if slot.is_visited() {
@@ -556,13 +530,11 @@ fn select_sieve(state: &mut SieveState, slots: &mut [PolicySlot]) -> VictimSelec
             break;
         };
         let next = slots[index].previous().or(state.entries.tail);
-        if slots[index].is_evictable() {
-            if slots[index].is_visited() {
-                slots[index].set_visited(false);
-            } else {
-                state.hand = next_sieve_candidate(&state.entries, slots, index);
-                return VictimSelection::Victim(index);
-            }
+        if slots[index].is_visited() {
+            slots[index].set_visited(false);
+        } else {
+            state.hand = next_sieve_candidate(&state.entries, slots, index);
+            return VictimSelection::Victim(index);
         }
         candidate = next;
     }
@@ -585,7 +557,7 @@ where
         .min(MAX_POLICY_SCAN_STEPS);
     for _ in 0..maximum_steps {
         let prefer_main = state.main.weight > state.main_target_bytes || state.small.len == 0;
-        if !prefer_main && let Some(index) = state.small.oldest_evictable(slots) {
+        if !prefer_main && let Some(index) = state.small.oldest(slots) {
             if slots[index].frequency() >= 2 {
                 let weight = weight_of(index);
                 state.small.remove(slots, index, QueueId::Small, weight);
@@ -597,7 +569,7 @@ where
             return VictimSelection::Victim(index);
         }
 
-        if let Some(index) = state.main.oldest_evictable(slots) {
+        if let Some(index) = state.main.oldest(slots) {
             let frequency = slots[index].frequency();
             if frequency > 0 {
                 slots[index].set_frequency(frequency - 1);
@@ -607,7 +579,7 @@ where
             return VictimSelection::Victim(index);
         }
 
-        if prefer_main && let Some(index) = state.small.oldest_evictable(slots) {
+        if prefer_main && let Some(index) = state.small.oldest(slots) {
             if slots[index].frequency() >= 2 {
                 let weight = weight_of(index);
                 state.small.remove(slots, index, QueueId::Small, weight);
@@ -800,7 +772,7 @@ mod tests {
         let index = slots.len();
         slots.push(PolicySlot::default());
         let hint = policy.prepare_insert(hash);
-        policy.insert(slots, index, hash, 100, true, hint);
+        policy.insert(slots, index, hash, 100, hint);
         index
     }
 
@@ -830,7 +802,7 @@ mod tests {
         policy.remove(&mut slots, first, 100);
 
         let hint = policy.record_miss(1);
-        policy.insert(&mut slots, first, 1, 100, true, hint);
+        policy.insert(&mut slots, first, 1, 100, hint);
         assert_eq!(slots[first].queue(), QueueId::Main);
     }
 

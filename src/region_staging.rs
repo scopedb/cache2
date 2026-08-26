@@ -3,7 +3,6 @@
 //! Region manager receipts are the only span authority.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
@@ -18,16 +17,6 @@ use crate::resources::{
 use crate::runtime_config::MAX_WRITE_BATCH_BYTES;
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
-const MAX_PENDING_FENCES_PER_SHARD: usize = 2 * MAX_STAGING_RECORDS;
-const PENDING_FENCE_SLOTS_PER_SHARD: usize = 2 * MAX_PENDING_FENCES_PER_SHARD;
-const MAX_PENDING_FENCE_PROBES: usize = 16;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PendingFenceLookup {
-    Unfenced,
-    Fenced(u64),
-    Contended,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StageAppend {
@@ -154,85 +143,6 @@ struct ShardState {
 
 struct ShardStaging {
     state: Mutex<ShardState>,
-    pending_fences: PendingFenceTable,
-}
-
-#[derive(Default)]
-struct PendingFenceSlot {
-    hash: AtomicU64,
-    seqno: AtomicU64,
-}
-
-/// A fixed open-addressed visibility table. Exhausting its small probe budget
-/// rejects the new write at staging admission instead of allocating, scanning
-/// without a bound, or making foreground reads acquire bookkeeping locks.
-struct PendingFenceTable {
-    slots: Box<[PendingFenceSlot]>,
-}
-
-impl PendingFenceTable {
-    fn slot(&self, hash: u64, probe: usize) -> &PendingFenceSlot {
-        let start = (hash % self.slots.len() as u64) as usize;
-        &self.slots[(start + probe) % self.slots.len()]
-    }
-
-    fn preflight(&self, hash: u64) -> bool {
-        let mut has_empty = false;
-        for probe in 0..MAX_PENDING_FENCE_PROBES {
-            let slot = self.slot(hash, probe);
-            let seqno = slot.seqno.load(Ordering::Acquire);
-            if seqno == 0 {
-                has_empty = true;
-            } else if slot.hash.load(Ordering::Relaxed) == hash {
-                return true;
-            }
-        }
-        has_empty
-    }
-
-    fn publish(&self, hash: u64, seqno: u64) -> bool {
-        let mut empty = None;
-        for probe in 0..MAX_PENDING_FENCE_PROBES {
-            let slot = self.slot(hash, probe);
-            let current_seqno = slot.seqno.load(Ordering::Relaxed);
-            if current_seqno == 0 {
-                empty.get_or_insert(slot);
-            } else if slot.hash.load(Ordering::Relaxed) == hash {
-                if seqno > current_seqno {
-                    slot.seqno.store(seqno, Ordering::Release);
-                }
-                return true;
-            }
-        }
-        let Some(slot) = empty else {
-            return false;
-        };
-        slot.hash.store(hash, Ordering::Relaxed);
-        slot.seqno.store(seqno, Ordering::Release);
-        true
-    }
-
-    fn lookup(&self, hash: u64) -> PendingFenceLookup {
-        for probe in 0..MAX_PENDING_FENCE_PROBES {
-            let slot = self.slot(hash, probe);
-            let seqno = slot.seqno.load(Ordering::Acquire);
-            if seqno != 0 && slot.hash.load(Ordering::Relaxed) == hash {
-                return PendingFenceLookup::Fenced(seqno);
-            }
-        }
-        PendingFenceLookup::Unfenced
-    }
-
-    fn clear_through(&self, hash: u64, completed_seqno: u64) {
-        for probe in 0..MAX_PENDING_FENCE_PROBES {
-            let slot = self.slot(hash, probe);
-            if slot.hash.load(Ordering::Relaxed) == hash
-                && slot.seqno.load(Ordering::Relaxed) <= completed_seqno
-            {
-                slot.seqno.store(0, Ordering::Release);
-            }
-        }
-    }
 }
 
 /// Restores a fill lease if an encoder returns an error or unwinds. The
@@ -278,11 +188,8 @@ impl RegionStaging {
         let records_per_shard = MAX_STAGING_RECORDS
             .checked_mul(std::mem::size_of::<StagedRecord>())?
             .checked_mul(2)?;
-        let fences_per_shard =
-            PENDING_FENCE_SLOTS_PER_SHARD.checked_mul(std::mem::size_of::<PendingFenceSlot>())?;
         buffers_per_shard
             .checked_add(records_per_shard)?
-            .checked_add(fences_per_shard)?
             .checked_mul(shard_count)
     }
 
@@ -316,8 +223,8 @@ impl RegionStaging {
 
         let reserved = Self::reservation_bytes(shard_count, chunk_bytes)
             .ok_or(ResourceBuildError::Allocation)?;
-        // Keep the aggregate reservation alive so eager buffers, record
-        // vectors, and pending fences participate in the hard memory limit.
+        // Keep the aggregate reservation alive so eager buffers and record
+        // vectors participate in the hard memory limit.
         let memory = resources.reserve_runtime_memory(reserved)?;
 
         let mut shards = Vec::new();
@@ -329,7 +236,6 @@ impl RegionStaging {
             let spare_buffer = BufferLease::try_fixed(chunk_bytes)?;
             let fill_records = try_staged_records()?;
             let spare_records = try_staged_records()?;
-            let pending_fences = try_pending_fences()?;
             shards.push(ShardStaging {
                 state: Mutex::new(ShardState {
                     fill: FillChunk::new(fill_buffer, fill_records),
@@ -340,7 +246,6 @@ impl RegionStaging {
                     failed: false,
                     closed: false,
                 }),
-                pending_fences,
             });
         }
 
@@ -397,36 +302,6 @@ impl RegionStaging {
             return Ok(StageAppend::NeedsSeal);
         }
         Ok(StageAppend::Appended)
-    }
-
-    /// Preflights the runtime visibility fence before Region authority assigns
-    /// a sequence number. The caller holds the append-shard mutation gate, so
-    /// another producer cannot consume the remaining logical slot; completion
-    /// may only make more room.
-    pub(crate) fn preflight_pending_fence(
-        &self,
-        shard_id: usize,
-        hash: u64,
-    ) -> Result<(), StagingError> {
-        let shard = self
-            .shards
-            .get(shard_id)
-            .ok_or(StagingError::InvalidShard)?;
-        let state = lock_unpoisoned(&shard.state);
-        ensure_open(&state)?;
-        if !shard.pending_fences.preflight(hash) {
-            return Err(StagingError::WouldBlock);
-        }
-        Ok(())
-    }
-
-    /// Reads the newest in-flight sequence for one hash without waiting for
-    /// staging bookkeeping. Contention hides both tiers for this lookup.
-    pub(crate) fn pending_fence(&self, shard_id: usize, hash: u64) -> PendingFenceLookup {
-        let Some(shard) = self.shards.get(shard_id) else {
-            return PendingFenceLookup::Contended;
-        };
-        shard.pending_fences.lookup(hash)
     }
 
     /// Returns the currently sealable fill prefix without waiting for an
@@ -572,15 +447,6 @@ impl RegionStaging {
             StagingError::Invariant("staging reservation end overflow"),
         ))?;
         state.fill.max_seqno = state.fill.max_seqno.max(receipt.seqno);
-        if !shard
-            .pending_fences
-            .publish(record.hash, record.entry.seqno)
-        {
-            state.failed = true;
-            return Err(StagingEncodeError::Staging(StagingError::Invariant(
-                "pending fence capacity changed after successful preflight",
-            )));
-        }
         state.fill.records.push(record);
         state.fill.buffer = Some(buffer);
         state.encoding = None;
@@ -849,11 +715,6 @@ impl RegionStaging {
                 "staging completion found occupied spare resources",
             ));
         }
-        for record in &records {
-            shard
-                .pending_fences
-                .clear_through(record.hash, record.entry.seqno);
-        }
         records.clear();
         state.spare_buffer = buffer;
         state.spare_records = Some(records);
@@ -930,19 +791,6 @@ fn try_staged_records() -> Result<Vec<StagedRecord>, ResourceBuildError> {
         .try_reserve_exact(MAX_STAGING_RECORDS)
         .map_err(|_| ResourceBuildError::Allocation)?;
     Ok(records)
-}
-
-fn try_pending_fences() -> Result<PendingFenceTable, ResourceBuildError> {
-    let mut slots = Vec::new();
-    slots
-        .try_reserve_exact(PENDING_FENCE_SLOTS_PER_SHARD)
-        .map_err(|_| ResourceBuildError::Allocation)?;
-    slots.resize_with(PENDING_FENCE_SLOTS_PER_SHARD, PendingFenceSlot::default);
-    let slots = slots.into_boxed_slice();
-    if slots.len() != PENDING_FENCE_SLOTS_PER_SHARD {
-        return Err(ResourceBuildError::Allocation);
-    }
-    Ok(PendingFenceTable { slots })
 }
 
 fn ensure_open(state: &ShardState) -> Result<(), StagingError> {
@@ -1083,9 +931,7 @@ mod tests {
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
             resources.managed_memory_snapshot().current_bytes,
-            (2 * 4096
-                + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()
-                + PENDING_FENCE_SLOTS_PER_SHARD * std::mem::size_of::<PendingFenceSlot>())
+            2 * 4096 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()
         );
 
         let (first, first_record) = reservation(0, 64, 11);
@@ -1101,11 +947,6 @@ mod tests {
             StageAppend::Appended
         );
         assert_eq!(first_pointer % BUFFER_ALIGNMENT, 0);
-        assert_eq!(
-            staging.pending_fence(0, first_record.hash),
-            PendingFenceLookup::Fenced(first_record.entry.seqno)
-        );
-
         let first_span = span(0, 64, 1, 11, 1);
         let first_job = staging.take_sealed(first_span).unwrap().unwrap();
         assert_eq!(first_job.span, first_span);
@@ -1137,14 +978,6 @@ mod tests {
             buffer, records, ..
         } = first_job;
         staging.finish_success(first_span, buffer, records).unwrap();
-        assert_eq!(
-            staging.pending_fence(0, first_record.hash),
-            PendingFenceLookup::Unfenced
-        );
-        assert_eq!(
-            staging.pending_fence(0, second_record.hash),
-            PendingFenceLookup::Fenced(second_record.entry.seqno)
-        );
         let second_job = staging.take_sealed(second_span).unwrap().unwrap();
         assert_eq!(
             second_job.buffer.as_slice().unwrap().as_ptr() as usize,
@@ -1156,42 +989,6 @@ mod tests {
         staging
             .finish_success(second_span, buffer, records)
             .unwrap();
-        assert_eq!(
-            staging.pending_fence(0, second_record.hash),
-            PendingFenceLookup::Unfenced
-        );
-    }
-
-    #[test]
-    fn pending_fence_lookup_never_waits_for_staging_bookkeeping() {
-        let resources = resources(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
-        let _state = staging.shards[0].state.lock().unwrap();
-
-        assert_eq!(staging.pending_fence(0, 17), PendingFenceLookup::Unfenced);
-    }
-
-    #[test]
-    fn exhausted_fence_probe_budget_rejects_staging_admission() {
-        let resources = resources(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
-        for probe in 0..MAX_PENDING_FENCE_PROBES {
-            let offset = u32::try_from(probe * 64).unwrap();
-            let seqno = probe as u64 + 1;
-            let (receipt, mut record) = reservation(offset, 64, seqno);
-            record.hash = 7 + probe as u64 * PENDING_FENCE_SLOTS_PER_SHARD as u64;
-            staging
-                .encode_reserved(receipt, |target| encode_test_value(target, receipt, record))
-                .unwrap();
-        }
-
-        assert_eq!(
-            staging.preflight_pending_fence(
-                0,
-                7 + MAX_PENDING_FENCE_PROBES as u64 * PENDING_FENCE_SLOTS_PER_SHARD as u64,
-            ),
-            Err(StagingError::WouldBlock)
-        );
     }
 
     #[test]

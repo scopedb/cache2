@@ -1,9 +1,8 @@
 //! Bounded shard-local RAM tier for the HybridCache data path.
 //!
-//! L1 is process-local and never participates in recovery. Pending entries are
-//! visible immediately but cannot be evicted until their matching Region write
-//! completes; clean entries use a small CLOCK policy and may be discarded at
-//! any time.
+//! L1 is process-local and never participates in recovery. Entries are visible
+//! immediately, may be discarded at any time, and use a small bounded eviction
+//! policy.
 
 use std::collections::HashMap;
 use std::io;
@@ -32,7 +31,6 @@ const NO_SLOT_INDEX: u32 = u32::MAX;
 /// with shard occupancy.
 const MAX_EVICTIONS_PER_INSERT: usize = 16;
 const MAX_BUDGET_CAS_ATTEMPTS: usize = 8;
-const MAX_COMPLETIONS_PER_LOCK_BATCH: usize = 32;
 
 pub(crate) struct MemoryBudget {
     pub(crate) capacity_bytes: usize,
@@ -165,7 +163,6 @@ struct MemoryEntry {
 struct MemoryShard {
     budget: Arc<MemoryBudget>,
     eviction: EvictionState,
-    revision: u64,
     directory: HashMap<u64, u32>,
     slots: Vec<Option<MemoryEntry>>,
     policy_slots: Vec<PolicySlot>,
@@ -181,17 +178,11 @@ impl MemoryShard {
         Ok(Self {
             budget,
             eviction: EvictionState::new(policy, capacity_bytes, maximum_entries)?,
-            revision: 0,
             directory,
             slots: Vec::new(),
             policy_slots: Vec::new(),
             free_slots: Vec::new(),
         })
-    }
-
-    fn next_revision(&mut self) -> Option<u64> {
-        self.revision = self.revision.checked_add(1)?;
-        Some(self.revision)
     }
 
     fn directory_head(&self, hash: u64) -> Option<u32> {
@@ -224,40 +215,6 @@ impl MemoryShard {
             cursor = entry.hash_next;
         }
         None
-    }
-
-    /// Resolves one completed Region record. Any older same-hash L1 entries
-    /// must disappear before the staging fence is cleared, otherwise a put
-    /// that bypassed L1 under contention could expose an obsolete value.
-    fn resolve_completion(&mut self, hash: u64, seqno: u64) {
-        let Some(mut cursor) = self.directory_head(hash) else {
-            return;
-        };
-        let mut obsolete = [usize::MAX; MAX_SAME_HASH_ENTRIES];
-        let mut obsolete_len = 0;
-        for _ in 0..MAX_SAME_HASH_ENTRIES {
-            let Ok(index) = usize::try_from(cursor) else {
-                break;
-            };
-            let Some(entry) = self.slots.get(index).and_then(Option::as_ref) else {
-                break;
-            };
-            let entry_seqno = entry.seqno;
-            let next = entry.hash_next;
-            if entry.seqno == seqno {
-                self.eviction.set_evictable(&mut self.policy_slots, index);
-            } else if entry_seqno < seqno {
-                obsolete[obsolete_len] = index;
-                obsolete_len += 1;
-            }
-            if next == NO_SLOT_INDEX {
-                break;
-            }
-            cursor = next;
-        }
-        for index in obsolete[..obsolete_len].iter().copied() {
-            self.remove_slot(index);
-        }
     }
 
     fn hash_chain_is_full(&self, hash: u64) -> bool {
@@ -421,7 +378,6 @@ impl MemoryShard {
         value: &[u8],
         expires_at_unix_ms: u64,
         seqno: u64,
-        evictable: bool,
         hint: AdmissionHint,
     ) -> MemoryInsertResult {
         if self.hash_chain_is_full(hash) || !self.directory_can_upsert(hash) {
@@ -489,14 +445,8 @@ impl MemoryShard {
                 self.policy_slots.push(PolicySlot::default());
             }
         }
-        self.eviction.insert(
-            &mut self.policy_slots,
-            index,
-            hash,
-            charged_bytes,
-            evictable,
-            hint,
-        );
+        self.eviction
+            .insert(&mut self.policy_slots, index, hash, charged_bytes, hint);
         let previous = self.directory_upsert(hash, packed_index);
         debug_assert_eq!(previous, previous_head);
         MemoryInsertResult {
@@ -546,19 +496,16 @@ impl MemoryInsertResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryReadToken {
     shard_id: usize,
-    revision: u64,
     admission: AdmissionHint,
 }
 
 pub(crate) enum MemoryLookup {
     Hit(MemoryValue),
-    Hidden,
     Miss(MemoryReadToken),
 }
 
 pub(crate) struct MemoryStore {
     shards: Box<[MemoryShardLock]>,
-    completed_seqnos: Box<[AtomicU64]>,
     metrics: MemoryMetrics,
 }
 
@@ -591,14 +538,13 @@ impl MemoryStore {
     pub(crate) fn new(
         capacity_bytes: usize,
         shard_count: usize,
-        completion_shard_count: usize,
         policy: EvictionPolicy,
         statistics_enabled: bool,
     ) -> io::Result<Self> {
-        if shard_count == 0 || completion_shard_count == 0 {
+        if shard_count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "memory tier and completion tracking require at least one shard",
+                "memory tier requires at least one shard",
             ));
         }
         let base = capacity_bytes / shard_count;
@@ -616,19 +562,8 @@ impl MemoryStore {
                 policy,
             )?)));
         }
-        let mut completed_seqnos = Vec::new();
-        completed_seqnos
-            .try_reserve_exact(completion_shard_count)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "cannot allocate memory-tier completion tracking",
-                )
-            })?;
-        completed_seqnos.resize_with(completion_shard_count, || AtomicU64::new(0));
         Ok(Self {
             shards: shards.into_boxed_slice(),
-            completed_seqnos: completed_seqnos.into_boxed_slice(),
             metrics: MemoryMetrics {
                 enabled: statistics_enabled,
                 evictions: AtomicU64::new(0),
@@ -639,9 +574,8 @@ impl MemoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn publish_pending(
+    pub(crate) fn publish(
         &self,
-        completion_shard_id: usize,
         hash: u64,
         namespace_id: u32,
         key: &[u8],
@@ -649,18 +583,11 @@ impl MemoryStore {
         expires_at_unix_ms: u64,
         seqno: u64,
     ) -> bool {
-        let Some(completed_seqno) = self.completed_seqnos.get(completion_shard_id) else {
-            return false;
-        };
         let shard_id = self.route(hash);
         let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
         };
-        let completed_seqno = completed_seqno.load(Ordering::Acquire);
-        if completed_seqno > seqno {
-            return true;
-        }
         let existing = shard.find(hash, namespace_id, key);
         if existing.is_some_and(|index| {
             shard.slots[index]
@@ -668,9 +595,6 @@ impl MemoryStore {
                 .is_some_and(|entry| entry.seqno >= seqno)
         }) {
             return true;
-        }
-        if shard.next_revision().is_none() {
-            return false;
         }
         let admission = shard.eviction.prepare_insert(hash);
         if let Some(index) = existing {
@@ -683,7 +607,6 @@ impl MemoryStore {
             value,
             expires_at_unix_ms,
             seqno,
-            seqno == completed_seqno,
             admission,
         );
         drop(shard);
@@ -691,97 +614,35 @@ impl MemoryStore {
         result.inserted
     }
 
-    #[cfg(test)]
-    pub(crate) fn complete(&self, completion_shard_id: usize, hash: u64, seqno: u64) {
-        self.complete_batch(completion_shard_id, &[(hash, seqno)]);
-    }
-
-    /// Advances one append-shard completion watermark and marks exact L1
-    /// entries clean while acquiring each affected memory shard only once per
-    /// small fixed batch.
-    pub(crate) fn complete_batch(&self, completion_shard_id: usize, records: &[(u64, u64)]) {
-        let Some(completed_seqno) = self.completed_seqnos.get(completion_shard_id) else {
-            return;
-        };
-        let Some(max_seqno) = records.iter().map(|record| record.1).max() else {
-            return;
-        };
-        completed_seqno.fetch_max(max_seqno, Ordering::AcqRel);
-
-        for batch in records.chunks(MAX_COMPLETIONS_PER_LOCK_BATCH) {
-            let mut routes = [0_usize; MAX_COMPLETIONS_PER_LOCK_BATCH];
-            for (route, (hash, _)) in routes.iter_mut().zip(batch) {
-                *route = self.route(*hash);
-            }
-            for (record_index, memory_shard_id) in routes[..batch.len()].iter().copied().enumerate()
-            {
-                if routes[..record_index].contains(&memory_shard_id) {
-                    continue;
-                }
-                let Ok(mut shard) = self.lock_shard(memory_shard_id) else {
-                    continue;
-                };
-                for ((hash, seqno), route) in batch.iter().copied().zip(routes) {
-                    if route == memory_shard_id {
-                        shard.resolve_completion(hash, seqno);
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn lookup(&self, hash: u64, namespace_id: u32, key: &[u8], clock: ExpiryClock) -> MemoryLookup {
-        self.lookup_with_fence(hash, namespace_id, key, clock, None)
-    }
-
-    pub(crate) fn lookup_with_fence(
+    pub(crate) fn lookup(
         &self,
         hash: u64,
         namespace_id: u32,
         key: &[u8],
         clock: ExpiryClock,
-        minimum_seqno: Option<u64>,
     ) -> MemoryLookup {
         let shard_id = self.route(hash);
         let Ok(Some(mut shard)) = self.try_lock_shard(shard_id) else {
-            return MemoryLookup::Hidden;
+            return MemoryLookup::Miss(MemoryReadToken {
+                shard_id,
+                admission: AdmissionHint::default(),
+            });
         };
         let Some(index) = shard.find(hash, namespace_id, key) else {
-            if minimum_seqno.is_some() {
-                return MemoryLookup::Hidden;
-            }
             let admission = shard.eviction.record_miss(hash);
             return MemoryLookup::Miss(MemoryReadToken {
                 shard_id,
-                revision: shard.revision,
                 admission,
             });
         };
-        if minimum_seqno.is_some_and(|minimum| {
-            shard.slots[index]
-                .as_ref()
-                .is_none_or(|entry| entry.seqno < minimum)
-        }) {
-            return MemoryLookup::Hidden;
-        }
         let expired = shard.slots[index]
             .as_ref()
             .is_some_and(|entry| clock.is_expired(entry.expires_at_unix_ms));
         if expired {
-            if !shard.policy_slots[index].is_evictable() {
-                let shard = &mut *shard;
-                shard.eviction.record_hit(&mut shard.policy_slots, index);
-                return MemoryLookup::Hidden;
-            }
             shard.remove_slot(index);
-            if minimum_seqno.is_some() {
-                return MemoryLookup::Hidden;
-            }
             let admission = shard.eviction.record_miss(hash);
             return MemoryLookup::Miss(MemoryReadToken {
                 shard_id,
-                revision: shard.revision,
                 admission,
             });
         }
@@ -794,7 +655,7 @@ impl MemoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn promote_clean(
+    pub(crate) fn promote(
         &self,
         token: MemoryReadToken,
         hash: u64,
@@ -810,7 +671,7 @@ impl MemoryStore {
         let Ok(Some(mut shard)) = self.try_lock_shard(token.shard_id) else {
             return None;
         };
-        if shard.revision != token.revision || shard.find(hash, namespace_id, key).is_some() {
+        if shard.find(hash, namespace_id, key).is_some() {
             return None;
         }
         let result = shard.insert(
@@ -820,7 +681,6 @@ impl MemoryStore {
             value,
             expires_at_unix_ms,
             seqno,
-            true,
             token.admission,
         );
         let promoted = result.inserted.then(|| {
@@ -868,12 +728,6 @@ impl MemoryStore {
         (hash % self.shards.len() as u64) as usize
     }
 
-    fn lock_shard(&self, shard_id: usize) -> io::Result<MutexGuard<'_, MemoryShard>> {
-        self.shards[shard_id]
-            .lock()
-            .map_err(|_| io::Error::other("memory-tier shard is poisoned"))
-    }
-
     fn try_lock_shard(&self, shard_id: usize) -> io::Result<Option<MutexGuard<'_, MemoryShard>>> {
         match self.shards[shard_id].try_lock() {
             Ok(shard) => Ok(Some(shard)),
@@ -898,12 +752,11 @@ mod tests {
         shard_count: usize,
         policy: EvictionPolicy,
     ) -> MemoryStore {
-        MemoryStore::new(capacity_bytes, shard_count, 1, policy, true).unwrap()
+        MemoryStore::new(capacity_bytes, shard_count, policy, true).unwrap()
     }
 
     fn publish_clean(store: &MemoryStore, hash: u64, key: &[u8], seqno: u64) {
-        assert!(store.publish_pending(0, hash, 0, key, &[hash as u8], 0, seqno));
-        store.complete(0, hash, seqno);
+        assert!(store.publish(hash, 0, key, &[hash as u8], 0, seqno));
     }
 
     fn assert_hit(store: &MemoryStore, hash: u64, key: &[u8]) {
@@ -921,16 +774,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_value_is_visible_and_matching_completion_makes_it_evictable() {
+    fn published_value_is_visible_and_immediately_evictable() {
         let store = store(512, 1);
-        assert!(store.publish_pending(0, 7, 0, b"a", b"value-a", 0, 1));
+        assert!(store.publish(7, 0, b"a", b"value-a", 0, 1));
         assert!(matches!(
             store.lookup(7, 0, b"a", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.as_ref() == b"value-a"
         ));
 
-        store.complete(0, 7, 1);
-        assert!(store.publish_pending(0, 8, 0, b"b", &[2; 300], 0, 2));
+        assert!(store.publish(8, 0, b"b", &[2; 300], 0, 2));
         assert!(matches!(
             store.lookup(8, 0, b"b", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.len() == 300
@@ -938,46 +790,22 @@ mod tests {
     }
 
     #[test]
-    fn l1_contention_bypasses_without_exposing_an_older_value() {
+    fn l1_contention_bypasses_and_allows_l2_fallback() {
         let store = store(1024, 1);
-        assert!(store.publish_pending(0, 7, 0, b"key", b"old", 0, 1));
-        store.complete(0, 7, 1);
+        assert!(store.publish(7, 0, b"key", b"old", 0, 1));
 
         let shard = store.shards[0].lock().unwrap();
         assert!(matches!(
             store.lookup(7, 0, b"key", ExpiryClock::Fixed(1)),
-            MemoryLookup::Hidden
+            MemoryLookup::Miss(_)
         ));
-        assert!(!store.publish_pending(0, 7, 0, b"key", b"new", 0, 2));
+        assert!(!store.publish(7, 0, b"key", b"new", 0, 2));
         drop(shard);
 
         assert!(matches!(
-            store.lookup_with_fence(7, 0, b"key", ExpiryClock::Fixed(1), Some(2)),
-            MemoryLookup::Hidden
-        ));
-        store.complete(0, 7, 2);
-        assert!(matches!(
             store.lookup(7, 0, b"key", ExpiryClock::Fixed(1)),
-            MemoryLookup::Miss(_)
+            MemoryLookup::Hit(value) if value.as_ref() == b"old"
         ));
-    }
-
-    #[test]
-    fn every_policy_pins_pending_entries_until_completion() {
-        for policy in EvictionPolicy::ALL {
-            let store = store_with_policy(2 * MEMORY_ENTRY_OVERHEAD_BYTES + 10, 1, policy);
-            assert!(store.publish_pending(0, 1, 0, b"a", b"a", 0, 1));
-            assert!(store.publish_pending(0, 2, 0, b"b", b"b", 0, 2));
-            assert!(!store.publish_pending(0, 3, 0, b"c", b"c", 0, 3));
-            assert_hit(&store, 1, b"a");
-            assert_hit(&store, 2, b"b");
-
-            store.complete(0, 1, 1);
-            let inserted = store.publish_pending(0, 3, 0, b"c", b"c", 0, 4)
-                || store.publish_pending(0, 3, 0, b"c", b"c", 0, 5);
-            assert!(inserted);
-            assert_hit(&store, 3, b"c");
-        }
     }
 
     #[test]
@@ -985,34 +813,10 @@ mod tests {
         for policy in EvictionPolicy::ALL {
             let store = store_with_policy(2048, 1, policy);
             let collision_hash = 42;
-            assert!(store.publish_pending(
-                0,
-                collision_hash,
-                7,
-                b"alpha",
-                b"value-alpha-ns7",
-                0,
-                1,
-            ));
-            assert!(store.publish_pending(0, collision_hash, 7, b"beta", b"value-beta-ns7", 0, 2,));
-            assert!(store.publish_pending(
-                0,
-                collision_hash,
-                8,
-                b"alpha",
-                b"value-alpha-ns8",
-                0,
-                3,
-            ));
-            assert!(store.publish_pending(
-                0,
-                collision_hash,
-                7,
-                b"beta",
-                b"replacement-beta-ns7",
-                0,
-                4,
-            ));
+            assert!(store.publish(collision_hash, 7, b"alpha", b"value-alpha-ns7", 0, 1,));
+            assert!(store.publish(collision_hash, 7, b"beta", b"value-beta-ns7", 0, 2,));
+            assert!(store.publish(collision_hash, 8, b"alpha", b"value-alpha-ns8", 0, 3,));
+            assert!(store.publish(collision_hash, 7, b"beta", b"replacement-beta-ns7", 0, 4,));
 
             for (namespace, key, expected) in [
                 (7, b"alpha".as_slice(), b"value-alpha-ns7".as_slice()),
@@ -1040,8 +844,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for (ordinal, key) in keys.iter().take(MAX_SAME_HASH_ENTRIES).enumerate() {
-            assert!(store.publish_pending(
-                0,
+            assert!(store.publish(
                 collision_hash,
                 0,
                 key.as_bytes(),
@@ -1050,8 +853,7 @@ mod tests {
                 ordinal as u64 + 1,
             ));
         }
-        assert!(!store.publish_pending(
-            0,
+        assert!(!store.publish(
             collision_hash,
             0,
             keys[MAX_SAME_HASH_ENTRIES].as_bytes(),
@@ -1070,17 +872,13 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_put_revision_blocks_stale_disk_promotion() {
+    fn existing_exact_key_blocks_disk_promotion() {
         let store = store(1024, 1);
         let MemoryLookup::Miss(token) = store.lookup(9, 0, b"key", ExpiryClock::Fixed(1)) else {
             panic!("empty memory tier must miss");
         };
-        assert!(store.publish_pending(0, 9, 0, b"key", b"new", 0, 2));
-        assert!(
-            store
-                .promote_clean(token, 9, 0, b"key", b"old", 0, 1)
-                .is_none()
-        );
+        assert!(store.publish(9, 0, b"key", b"new", 0, 2));
+        assert!(store.promote(token, 9, 0, b"key", b"old", 0, 1).is_none());
         assert!(matches!(
             store.lookup(9, 0, b"key", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.as_ref() == b"new"
@@ -1090,8 +888,8 @@ mod tests {
     #[test]
     fn newer_exact_key_publication_suppresses_a_delayed_older_put() {
         let store = store(1024, 1);
-        assert!(store.publish_pending(0, 11, 0, b"key", b"new", 0, 2));
-        assert!(store.publish_pending(0, 11, 0, b"key", b"old", 0, 1));
+        assert!(store.publish(11, 0, b"key", b"new", 0, 2));
+        assert!(store.publish(11, 0, b"key", b"old", 0, 1));
         assert!(matches!(
             store.lookup(11, 0, b"key", ExpiryClock::Fixed(1)),
             MemoryLookup::Hit(value) if value.as_ref() == b"new"
@@ -1101,67 +899,21 @@ mod tests {
     #[test]
     fn newer_unrelated_publication_does_not_suppress_an_older_key() {
         let store = store(1024, 1);
-        assert!(store.publish_pending(0, 12, 0, b"newer", b"newer", 0, 2));
-        assert!(store.publish_pending(0, 11, 0, b"older", b"older", 0, 1));
+        assert!(store.publish(12, 0, b"newer", b"newer", 0, 2));
+        assert!(store.publish(11, 0, b"older", b"older", 0, 1));
         assert_hit(&store, 12, b"newer");
         assert_hit(&store, 11, b"older");
     }
 
     #[test]
-    fn later_append_completion_suppresses_a_delayed_older_l1_publication() {
-        let store = store(1024, 1);
-        store.complete(0, 12, 2);
-        assert!(store.publish_pending(0, 11, 0, b"older", b"older", 0, 1));
-        assert_miss(&store, 11, b"older");
-    }
-
-    #[test]
-    fn completion_before_publication_installs_a_clean_entry() {
-        let store = store(512, 1);
-        store.complete(0, 12, 3);
-        assert!(store.publish_pending(0, 12, 0, b"a", b"value-a", 0, 3));
-        assert!(store.publish_pending(0, 13, 0, b"b", &[4; 300], 0, 4));
-    }
-
-    #[test]
-    fn completion_watermarks_are_scoped_to_append_shards() {
-        let store = MemoryStore::new(400, 1, 2, EvictionPolicy::Clock, true).unwrap();
-        store.complete(1, 12, 3);
-        assert!(store.publish_pending(0, 12, 0, b"a", b"value-a", 0, 3));
-        assert!(!store.publish_pending(0, 13, 0, b"b", &[4; 300], 0, 4));
-
-        store.complete(0, 12, 3);
-        assert!(store.publish_pending(0, 13, 0, b"b", &[4; 300], 0, 5));
-    }
-
-    #[test]
-    fn batch_completion_cleans_entries_across_l1_shards() {
-        let store = MemoryStore::new(2048, 2, 1, EvictionPolicy::Clock, true).unwrap();
-        for (hash, key, seqno) in [(0, b"a".as_slice(), 1), (2, b"b", 2), (1, b"c", 3)] {
-            assert!(store.publish_pending(0, hash, 0, key, b"value", 0, seqno));
-        }
-
-        store.complete_batch(0, &[(0, 1), (2, 2), (1, 3)]);
-
-        for (hash, key) in [(0, b"a".as_slice()), (2, b"b"), (1, b"c")] {
-            let shard = store.shards[store.route(hash)].lock().unwrap();
-            let index = shard.find(hash, 0, key).unwrap();
-            assert!(shard.policy_slots[index].is_evictable());
-        }
-        assert!(store.publish_pending(0, 3, 0, b"late", b"old", 0, 2));
-        assert_miss(&store, 3, b"late");
-    }
-
-    #[test]
     fn retained_value_keeps_its_capacity_charge_after_eviction() {
         let store = store(512, 1);
-        assert!(store.publish_pending(0, 21, 0, b"a", &[1; 300], 0, 1));
-        store.complete(0, 21, 1);
+        assert!(store.publish(21, 0, b"a", &[1; 300], 0, 1));
         let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)) else {
             panic!("published value must be visible");
         };
 
-        assert!(!store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 2));
+        assert!(!store.publish(22, 0, b"b", &[2; 300], 0, 2));
         assert_eq!(
             store.shards[0].lock().unwrap().budget.used_bytes(),
             MEMORY_ENTRY_OVERHEAD_BYTES + 301
@@ -1169,20 +921,19 @@ mod tests {
 
         drop(retained);
         assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), 0);
-        assert!(store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 3));
+        assert!(store.publish(22, 0, b"b", &[2; 300], 0, 3));
     }
 
     #[test]
     fn concurrent_retained_value_drops_release_the_charge_once() {
         let store = store(512, 1);
-        assert!(store.publish_pending(0, 21, 0, b"a", &[1; 300], 0, 1));
-        store.complete(0, 21, 1);
+        assert!(store.publish(21, 0, b"a", &[1; 300], 0, 1));
         let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a", ExpiryClock::Fixed(1)) else {
             panic!("published value must be visible");
         };
         let clones = (0..8).map(|_| retained.clone()).collect::<Vec<_>>();
 
-        assert!(!store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 2));
+        assert!(!store.publish(22, 0, b"b", &[2; 300], 0, 2));
         let barrier = Arc::new(std::sync::Barrier::new(clones.len() + 1));
         std::thread::scope(|scope| {
             for value in clones {
@@ -1197,15 +948,17 @@ mod tests {
         });
 
         assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), 0);
-        assert!(store.publish_pending(0, 22, 0, b"b", &[2; 300], 0, 3));
+        assert!(store.publish(22, 0, b"b", &[2; 300], 0, 3));
     }
 
     #[test]
     fn skewed_shard_admission_cannot_consume_another_shards_budget() {
         let store = store(1024, 2);
-        assert!(store.publish_pending(0, 2, 0, b"even-a", &[1; 300], 0, 1));
-        assert!(!store.publish_pending(0, 4, 0, b"even-b", &[2; 300], 0, 2));
-        assert!(store.publish_pending(0, 3, 0, b"odd", &[3; 300], 0, 3));
+        assert!(store.publish(2, 0, b"even-a", &[1; 300], 0, 1));
+        assert!(store.publish(4, 0, b"even-b", &[2; 300], 0, 2));
+        assert!(store.publish(3, 0, b"odd", &[3; 300], 0, 3));
+        assert_miss(&store, 2, b"even-a");
+        assert_hit(&store, 4, b"even-b");
 
         assert!(
             store
@@ -1249,8 +1002,8 @@ mod tests {
         publish_clean(&store, 2, b"cold", 2);
         assert_hit(&store, 1, b"hot");
 
-        assert!(!store.publish_pending(0, 3, 0, b"cand", b"c", 0, 3));
-        assert!(store.publish_pending(0, 3, 0, b"cand", b"c", 0, 4));
+        assert!(!store.publish(3, 0, b"cand", b"c", 0, 3));
+        assert!(store.publish(3, 0, b"cand", b"c", 0, 4));
         assert_miss(&store, 2, b"cold");
         assert_hit(&store, 3, b"cand");
 
