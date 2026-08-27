@@ -88,11 +88,12 @@ returning the record.
 
 The fixed index stores 8-byte slots with 20-bit Region and offset fields, an
 8-bit record-size upper class, a 14-bit fingerprint, and a 2-bit displacement.
-It uses four deterministic candidates, at most one relocation, and no
-tombstones or generation table. Point work is therefore capped at four primary
-probes plus the bounded one-hop relocation work on mutation. The exact record
-envelope is recovered and validated from the one bounded read. Index-partition
-contention is a miss or mutation overload, never a wait.
+It uses four deterministic candidates, a fixed relocation search of depth two,
+and no tombstones or generation table. Point work is therefore capped at four
+primary probes; mutations may additionally move at most two occupants before a
+bounded eviction. The exact record envelope is recovered and validated from
+the one bounded read. Index-partition contention is a miss or mutation
+overload, never a wait.
 
 L1 uses fixed startup allocations for entries, CLOCK metadata, free lists, and
 its prehashed directory. Each same-hash chain is capped at eight full keys.

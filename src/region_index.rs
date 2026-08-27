@@ -247,7 +247,7 @@ impl RegionIndex {
         Ok(None)
     }
 
-    /// Installs a value with one bounded relocation and one bounded eviction.
+    /// Installs a value with up to two bounded relocations and one bounded eviction.
     pub(crate) fn upsert(
         &self,
         hash: u64,
@@ -351,6 +351,92 @@ impl RegionIndex {
                     self.relocations.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(true);
+            }
+        }
+
+        // A second bounded hop recovers the remaining common collisions while
+        // leaving the four-probe lookup path unchanged. This path runs only
+        // after every direct candidate and one-hop alternate is occupied.
+        for source_displacement in 0..INDEX_CANDIDATES {
+            let source_slot = candidates[source_displacement];
+            if candidates[..source_displacement].contains(&source_slot) {
+                continue;
+            }
+            let source = observed[source_displacement];
+            let IndexSlotState::Value {
+                fingerprint: source_fingerprint,
+                displacement: source_current_displacement,
+                entry: source_entry,
+            } = source
+            else {
+                continue;
+            };
+            let source_current_displacement = usize::from(source_current_displacement);
+            if source_current_displacement >= INDEX_CANDIDATES {
+                return Err(IndexStorageError::InvalidArgument(
+                    "index bucket displacement is out of range",
+                ));
+            }
+            let source_home = home_from_slot(source_slot, source_current_displacement, slot_count);
+            for middle_displacement in 0..INDEX_CANDIDATES {
+                if middle_displacement == source_current_displacement {
+                    continue;
+                }
+                let middle_slot = slot_from_home(source_home, middle_displacement, slot_count);
+                if middle_slot == source_slot {
+                    continue;
+                }
+                let middle = partition.slot_state(middle_slot)?;
+                let IndexSlotState::Value {
+                    fingerprint: middle_fingerprint,
+                    displacement: middle_current_displacement,
+                    entry: middle_entry,
+                } = middle
+                else {
+                    continue;
+                };
+                let middle_current_displacement = usize::from(middle_current_displacement);
+                if middle_current_displacement >= INDEX_CANDIDATES {
+                    return Err(IndexStorageError::InvalidArgument(
+                        "index bucket displacement is out of range",
+                    ));
+                }
+                let middle_home =
+                    home_from_slot(middle_slot, middle_current_displacement, slot_count);
+                for target_displacement in 0..INDEX_CANDIDATES {
+                    if target_displacement == middle_current_displacement {
+                        continue;
+                    }
+                    let target_slot = slot_from_home(middle_home, target_displacement, slot_count);
+                    if target_slot == source_slot
+                        || target_slot == middle_slot
+                        || !matches!(partition.slot_state(target_slot)?, IndexSlotState::Empty)
+                    {
+                        continue;
+                    }
+                    self.replace_slot(
+                        &mut partition,
+                        target_slot,
+                        IndexSlotState::Empty,
+                        value_state(middle_fingerprint, target_displacement, middle_entry),
+                    )?;
+                    self.replace_slot(
+                        &mut partition,
+                        middle_slot,
+                        middle,
+                        value_state(source_fingerprint, middle_displacement, source_entry),
+                    )?;
+                    self.replace_slot(
+                        &mut partition,
+                        source_slot,
+                        source,
+                        value_state(fingerprint, source_displacement, supplied),
+                    )?;
+                    if self.statistics_enabled.load(Ordering::Relaxed) {
+                        self.relocations.fetch_add(2, Ordering::Relaxed);
+                    }
+                    return Ok(true);
+                }
             }
         }
 
@@ -595,6 +681,7 @@ fn candidate_offset(displacement: usize, slot_count: usize) -> usize {
 mod tests {
     use super::*;
     use crate::index_storage::IndexPhysicalStats;
+    use crate::record_codec::hash_key;
 
     fn entry(region_id: u32, offset: u32) -> IndexEntry {
         IndexEntry {
@@ -634,6 +721,30 @@ mod tests {
                 value: 0,
                 deleted: 0,
             }
+        );
+    }
+
+    #[test]
+    fn full_candidate_window_uses_the_bounded_second_relocation_hop() {
+        let index = anonymous(128);
+        index.set_statistics_enabled(true);
+        let mut exercised = false;
+        for ordinal in 0..10_000_u64 {
+            let hash = hash_key(7, &ordinal.to_le_bytes());
+            let supplied = entry(1, (ordinal as u32) * 32);
+            let before = index.snapshot().unwrap();
+            index.upsert(hash, supplied).unwrap();
+            let after = index.snapshot().unwrap();
+            if after.relocations == before.relocations + 2 {
+                assert_eq!(after.overflow_evictions, before.overflow_evictions);
+                assert_eq!(index.lookup_raw(hash).unwrap(), Some(supplied));
+                exercised = true;
+                break;
+            }
+        }
+        assert!(
+            exercised,
+            "test hash stream never exercised a two-hop relocation"
         );
     }
 
