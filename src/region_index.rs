@@ -372,12 +372,33 @@ fn candidate_slots(hash: u64, slot_count: usize) -> [usize; INDEX_CANDIDATES] {
 
 fn slot_from_home(home: usize, displacement: usize, slot_count: usize) -> usize {
     debug_assert!(displacement < INDEX_CANDIDATES);
-    (home + CANDIDATE_OFFSETS[displacement] % slot_count) % slot_count
+    debug_assert!(home < slot_count);
+    let offset = candidate_offset(displacement, slot_count);
+    let slot = home + offset;
+    if slot >= slot_count {
+        slot - slot_count
+    } else {
+        slot
+    }
 }
 
 fn home_from_slot(slot: usize, displacement: usize, slot_count: usize) -> usize {
-    let offset = CANDIDATE_OFFSETS[displacement] % slot_count;
-    (slot + slot_count - offset) % slot_count
+    debug_assert!(slot < slot_count);
+    let offset = candidate_offset(displacement, slot_count);
+    if slot >= offset {
+        slot - offset
+    } else {
+        slot_count - (offset - slot)
+    }
+}
+
+fn candidate_offset(displacement: usize, slot_count: usize) -> usize {
+    let offset = CANDIDATE_OFFSETS[displacement];
+    if offset < slot_count {
+        offset
+    } else {
+        offset % slot_count
+    }
 }
 
 #[cfg(test)]
