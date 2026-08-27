@@ -872,11 +872,10 @@ fn parse_io_engine(name: &str) -> io::Result<IoEngine> {
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {
     match env::var(name)
-        .unwrap_or_else(|_| "prefer-direct".to_owned())
+        .unwrap_or_else(|_| "buffered".to_owned())
         .as_str()
     {
         "buffered" => Ok(IoMode::Buffered),
-        "prefer-direct" => Ok(IoMode::PreferDirect),
         "direct" => Ok(IoMode::Direct),
         value => Err(invalid(format!("unsupported I/O mode: {value}"))),
     }

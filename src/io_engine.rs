@@ -2187,7 +2187,6 @@ mod uring {
         transferred: usize,
         active: bool,
         active_path: Option<RuntimeIoPath>,
-        force_buffered: bool,
         cancel_submitted: bool,
     }
 
@@ -2311,7 +2310,6 @@ mod uring {
                                     transferred: 0,
                                     active: false,
                                     active_path: None,
-                                    force_buffered: false,
                                     cancel_submitted: false,
                                 },
                             );
@@ -2442,16 +2440,12 @@ mod uring {
                             .flights
                             .get(&request_id)
                             .expect("pending target has a flight");
-                        if flight.force_buffered {
-                            RuntimeIoPath::Buffered
-                        } else {
-                            flight.task.operation.runtime_io_path(
-                                self.files
-                                    .as_ref()
-                                    .expect("runtime files exist while driver runs"),
-                                flight.transferred,
-                            )?
-                        }
+                        flight.task.operation.runtime_io_path(
+                            self.files
+                                .as_ref()
+                                .expect("runtime files exist while driver runs"),
+                            flight.transferred,
+                        )?
                     };
                     let file_fd = self
                         .files
@@ -2573,22 +2567,6 @@ mod uring {
             if result < 0 {
                 let raw_error = result.saturating_neg();
                 let error = io::Error::from_raw_os_error(raw_error);
-                if !flight
-                    .task
-                    .completion
-                    .cancel_requested
-                    .load(Ordering::Acquire)
-                    && self
-                        .files
-                        .as_ref()
-                        .is_some_and(|files| files.should_fallback(active_path, &error))
-                {
-                    flight.force_buffered = true;
-                    flight.cancel_submitted = false;
-                    self.flights.insert(request_id, flight);
-                    self.pending_targets.push_back(request_id);
-                    return;
-                }
                 let cancelled = flight
                     .task
                     .completion

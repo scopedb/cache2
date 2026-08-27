@@ -24,10 +24,8 @@ pub enum IoEngine {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IoMode {
     /// Always use buffered positioned I/O.
-    Buffered,
-    /// Prefer Linux `O_DIRECT`, falling back to buffered I/O when unavailable.
     #[default]
-    PreferDirect,
+    Buffered,
     /// Require Linux `O_DIRECT` support for aligned record I/O.
     ///
     /// Aligned direct-I/O errors are returned instead of falling back. A
@@ -58,7 +56,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             io_engine: IoEngine::Posix,
-            io_mode: IoMode::PreferDirect,
+            io_mode: IoMode::Buffered,
             read_io_workers: 4,
             write_io_workers: 4,
             append_shards: DEFAULT_APPEND_SHARDS,
@@ -82,6 +80,9 @@ impl RuntimeConfig {
     }
 
     /// Selects the buffered/direct policy for runtime record I/O.
+    ///
+    /// Buffered I/O is the default. `Direct` requires Linux `O_DIRECT` support
+    /// and returns direct-I/O errors without retrying through buffered I/O.
     pub fn with_io_mode(mut self, mode: IoMode) -> Self {
         self.io_mode = mode;
         self
@@ -238,12 +239,13 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoEngine, RuntimeConfig};
+    use super::{IoEngine, IoMode, RuntimeConfig};
 
     #[test]
-    fn runtime_defaults_to_posix_io() {
+    fn runtime_defaults_to_posix_buffered_io() {
         let config = RuntimeConfig::default();
         assert_eq!(config.io_engine(), IoEngine::Posix);
+        assert_eq!(config.io_mode(), IoMode::Buffered);
         assert_eq!(config.read_io_workers(), 4);
         assert_eq!(config.write_io_workers(), 4);
         assert_eq!(config.append_shards(), 4);

@@ -63,11 +63,10 @@ impl BenchConfig {
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_BENCH_IO_MODE")
-            .unwrap_or_else(|_| "prefer-direct".to_owned())
+            .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
         {
             "buffered" => IoMode::Buffered,
-            "prefer-direct" => IoMode::PreferDirect,
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };

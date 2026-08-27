@@ -69,11 +69,11 @@ threshold, and optional statistics. Runtime tuning may change across opens,
 except that an append-shard count different from the clean image cold-starts
 empty.
 
-POSIX positioned I/O is the default production path. `IoMode::PreferDirect`
-prefers Linux `O_DIRECT` for aligned runtime record I/O and falls back to
-buffered I/O when unavailable; `Buffered` and strict `Direct` modes are also
-available. Control and recovery I/O remain buffered. Linux io_uring is an
-explicit `io-uring` crate feature and runtime selection.
+POSIX positioned I/O with `IoMode::Buffered` is the default production path.
+`IoMode::Direct` explicitly enables Linux `O_DIRECT` for aligned runtime record
+I/O and reports direct-I/O errors without retrying through buffered I/O. Control,
+recovery, and necessarily unaligned remainder I/O stay buffered. Linux io_uring
+is an explicit `io-uring` crate feature and runtime selection.
 
 Each append shard owns one Active Region, two Region-sized staging buffers, and
 one ordered append worker. Read and write I/O workers bound separate execution
