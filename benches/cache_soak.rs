@@ -68,6 +68,9 @@ impl SoakConfig {
             .checked_mul(2 * REGION_BYTES)
             .and_then(|bytes| bytes.checked_add(read_reservation_bytes))
             .and_then(|bytes| bytes.checked_add(memory_bytes))
+            // Cover the fixed index/L1 metadata and recovery scratch for the
+            // default harness. Large custom plans should set an explicit limit.
+            .and_then(|bytes| bytes.checked_add(REGION_BYTES))
             .ok_or_else(|| invalid("soak default managed memory limit is too large"))?
             .div_ceil(MIB);
         let managed_memory_limit_bytes = env_usize(
