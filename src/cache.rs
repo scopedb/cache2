@@ -1,9 +1,10 @@
 //! Public performance-first RAM + Region SSD hybrid cache.
 //!
 //! Static configuration defines the on-disk identity and clean recovery image.
-//! Runtime configuration may change on every open without invalidating that
-//! image. Ordinary mutations are never made durable; only `close_warm` publishes
-//! state that a later process may recover.
+//! Runtime configuration is selected on every open; changing the append-shard
+//! topology discards an incompatible clean image. Ordinary mutations are never
+//! made durable; only `close_warm` publishes state that a later process may
+//! recover.
 
 use std::fmt;
 use std::future::Future;
@@ -34,9 +35,7 @@ use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
-const DEFAULT_SHARDS: u32 = 4;
 const MIN_INDEX_SLOTS: usize = 8;
-const MAX_SHARDS: u32 = 256;
 
 pub type Result<T> = std::io::Result<T>;
 
@@ -45,7 +44,6 @@ pub struct StaticConfig {
     capacity_bytes: u64,
     region_size: u64,
     index_slots: usize,
-    write_shards: u32,
     hash_seed: u64,
     region_sets: Vec<RegionSetConfig>,
 }
@@ -64,7 +62,6 @@ impl StaticConfig {
             capacity_bytes,
             region_size: DEFAULT_REGION_SIZE,
             index_slots,
-            write_shards: DEFAULT_SHARDS,
             hash_seed: DEFAULT_HASH_SEED,
             region_sets: Vec::new(),
         }
@@ -84,24 +81,15 @@ impl StaticConfig {
         self
     }
 
-    /// Sets the number of independent append/staging paths in the on-disk layout.
-    ///
-    /// Each path owns one Active Region, two fixed write buffers, and one
-    /// ordered worker. This is static recovery identity and is independent of
-    /// the runtime read and write I/O worker counts.
-    pub fn with_write_shards(mut self, shards: u32) -> Self {
-        self.write_shards = shards;
-        self
-    }
-
     /// Replaces the physical RegionSet layout.
     ///
-    /// Capacity weights divide the fixed Region count. Append shards are
-    /// distributed evenly and deterministically across the configured sets.
+    /// Capacity weights divide the fixed Region count. Runtime append shards
+    /// are distributed evenly and deterministically across the configured sets.
     /// RegionSet zero is required and receives every namespace not explicitly
     /// listed by another set.
     /// Every set needs one active Region per assigned shard plus one spare.
-    /// The complete layout is static recovery identity.
+    /// Physical Region allocation and namespace ownership are static recovery
+    /// identity.
     pub fn with_region_sets(mut self, sets: impl IntoIterator<Item = RegionSetConfig>) -> Self {
         self.region_sets = sets.into_iter().take(MAX_REGION_SETS + 1).collect();
         self
@@ -119,24 +107,21 @@ impl StaticConfig {
         self.index_slots
     }
 
-    pub const fn write_shards(&self) -> u32 {
-        self.write_shards
-    }
-
     pub fn region_sets(&self) -> &[RegionSetConfig] {
         &self.region_sets
     }
 
-    /// Validates the complete static geometry without opening cache files.
+    /// Validates the static physical geometry without opening cache files.
     pub fn validate(&self) -> Result<()> {
         self.geometry().map(|_| ())
     }
 
-    /// Resolves capacity weights and append-shard assignment without opening
-    /// cache files. Results are ordered by RegionSet id.
-    pub fn region_set_allocations(&self) -> Result<Vec<RegionSetAllocation>> {
+    /// Resolves capacity weights and the requested runtime append-shard
+    /// assignment without opening cache files. Results are ordered by
+    /// RegionSet id.
+    pub fn region_set_allocations(&self, write_shards: u32) -> Result<Vec<RegionSetAllocation>> {
         let geometry = self.geometry()?;
-        self.region_layout(geometry)?
+        self.region_layout(geometry, write_shards)?
             .allocations(geometry.region_size)
     }
 
@@ -191,14 +176,6 @@ impl StaticConfig {
             .ok()
             .filter(|count| *count <= MAX_PACKED_REGION_COUNT)
             .ok_or_else(|| invalid_config("cache Region count is not representable"))?;
-        if self.write_shards == 0
-            || self.write_shards > MAX_SHARDS
-            || region_count <= self.write_shards
-        {
-            return Err(invalid_config(
-                "write shards must be in 1..=256 with one additional Region for rotation",
-            ));
-        }
         if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
             return Err(invalid_config("index slots must be in 8..=536870912"));
         }
@@ -212,12 +189,18 @@ impl StaticConfig {
         if !geometry.is_valid() {
             return Err(invalid_config("cache data geometry is not representable"));
         }
-        self.region_layout(geometry)?;
+        self.minimum_region_layout(geometry)?;
         Ok(geometry)
     }
 
-    fn region_layout(&self, geometry: DataGeometry) -> Result<RegionLayout> {
-        RegionLayout::build(geometry.region_count, self.write_shards, &self.region_sets)
+    fn minimum_region_layout(&self, geometry: DataGeometry) -> Result<RegionLayout> {
+        let minimum_shards = u32::try_from(self.region_sets.len().max(1))
+            .map_err(|_| invalid_config("RegionSet count does not fit u32"))?;
+        self.region_layout(geometry, minimum_shards)
+    }
+
+    fn region_layout(&self, geometry: DataGeometry, write_shards: u32) -> Result<RegionLayout> {
+        RegionLayout::build(geometry.region_count, write_shards, &self.region_sets)
     }
 
     fn fingerprint(&self, geometry: DataGeometry, layout: &RegionLayout) -> u64 {
@@ -240,7 +223,6 @@ impl StaticConfig {
             geometry.region_size,
             u64::from(geometry.region_count),
             self.index_slots as u64,
-            u64::from(self.write_shards),
             self.hash_seed,
             hash_algorithm_id,
         ] {
@@ -258,8 +240,6 @@ impl StaticConfig {
                     u64::from(set.id.get()),
                     u64::from(set.first_region),
                     u64::from(set.region_count),
-                    u64::from(set.first_shard),
-                    u64::from(set.shard_count),
                 ] {
                     hash_identity_word(&mut hash, value);
                 }
@@ -335,13 +315,16 @@ impl HybridCacheConfig {
 
     fn open_blocking(self, tokio_handle: tokio::runtime::Handle) -> Result<HybridCache> {
         let geometry = self.static_config.geometry()?;
-        let region_layout = self.static_config.region_layout(geometry)?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
         let runtime_config = self.runtime_config;
+        runtime_config.validate()?;
+        let region_layout = self
+            .static_config
+            .region_layout(geometry, runtime_config.write_shards)?;
         runtime_config.validate_memory_plan(
             geometry,
             self.static_config.index_slots,
-            self.static_config.write_shards as usize,
+            runtime_config.write_shards as usize,
             region_layout.memory_bytes(),
         )?;
         let format_data = DataSuperblock {
@@ -577,7 +560,7 @@ mod tests {
     fn static_fingerprint_binds_the_hash_algorithm() {
         let config = StaticConfig::new(5 * DEFAULT_REGION_SIZE);
         let geometry = config.geometry().unwrap();
-        let layout = config.region_layout(geometry).unwrap();
+        let layout = config.region_layout(geometry, 4).unwrap();
         let algorithm = u64::from(KEY_HASH_ALGORITHM_XXH3_64);
         assert_eq!(
             config.fingerprint(geometry, &layout),
@@ -591,12 +574,10 @@ mod tests {
 
     #[test]
     fn minimum_static_region_geometry_is_encodable() {
-        let config = StaticConfig::new(5 * 4096)
-            .with_region_size(4096)
-            .with_write_shards(4);
+        let config = StaticConfig::new(5 * 4096).with_region_size(4096);
         config.validate().unwrap();
         let geometry = config.geometry().unwrap();
-        let layout = config.region_layout(geometry).unwrap();
+        let layout = config.region_layout(geometry, 4).unwrap();
         let data = DataSuperblock {
             generation: 1,
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -629,8 +610,8 @@ mod tests {
                 .with_namespaces([7, 9]),
         ]);
         let geometry = base.geometry().unwrap();
-        let base_layout = base.region_layout(geometry).unwrap();
-        let changed_layout = changed.region_layout(geometry).unwrap();
+        let base_layout = base.region_layout(geometry, 4).unwrap();
+        let changed_layout = changed.region_layout(geometry, 4).unwrap();
 
         assert_ne!(
             base.fingerprint(geometry, &base_layout),
@@ -645,8 +626,8 @@ mod tests {
             .clone()
             .with_region_sets([RegionSetConfig::new(0).with_weight(99).with_namespaces([7])]);
         let geometry = implicit.geometry().unwrap();
-        let implicit_layout = implicit.region_layout(geometry).unwrap();
-        let explicit_layout = explicit.region_layout(geometry).unwrap();
+        let implicit_layout = implicit.region_layout(geometry, 4).unwrap();
+        let explicit_layout = explicit.region_layout(geometry, 4).unwrap();
 
         assert!(explicit_layout.routes().is_empty());
         assert_eq!(
@@ -657,14 +638,12 @@ mod tests {
 
     #[test]
     fn resolved_region_set_allocations_expose_rounding_and_shards() {
-        let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE)
-            .with_write_shards(4)
-            .with_region_sets([
-                RegionSetConfig::new(0).with_weight(1),
-                RegionSetConfig::new(2).with_weight(3),
-            ]);
+        let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE).with_region_sets([
+            RegionSetConfig::new(0).with_weight(1),
+            RegionSetConfig::new(2).with_weight(3),
+        ]);
 
-        let allocations = config.region_set_allocations().unwrap();
+        let allocations = config.region_set_allocations(4).unwrap();
         assert_eq!(allocations.len(), 2);
         assert_eq!(allocations[0].id.get(), 0);
         assert_eq!(allocations[0].region_count, 3);
@@ -673,6 +652,22 @@ mod tests {
         assert_eq!(allocations[1].id.get(), 2);
         assert_eq!(allocations[1].region_count, 7);
         assert_eq!(allocations[1].append_shard_count, 2);
+    }
+
+    #[test]
+    fn runtime_write_shards_do_not_change_static_fingerprint() {
+        let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE).with_region_sets([
+            RegionSetConfig::new(0).with_weight(1),
+            RegionSetConfig::new(2).with_weight(1).with_namespaces([7]),
+        ]);
+        let geometry = config.geometry().unwrap();
+        let two_shards = config.region_layout(geometry, 2).unwrap();
+        let four_shards = config.region_layout(geometry, 4).unwrap();
+
+        assert_eq!(
+            config.fingerprint(geometry, &two_shards),
+            config.fingerprint(geometry, &four_shards)
+        );
     }
 
     #[test]

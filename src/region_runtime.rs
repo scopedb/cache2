@@ -28,7 +28,7 @@ use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
     ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, RuntimeConfig};
+use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, MAX_WRITE_SHARDS, RuntimeConfig};
 use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
 
 const _MAX_KEY_BYTES: usize = 4 * 1024;
@@ -384,6 +384,12 @@ impl RuntimeMetrics {
 
 impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if self.write_shards == 0 || self.write_shards > MAX_WRITE_SHARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write shards must be in 1..=256",
+            ));
+        }
         if self.read_io_workers == 0 || self.write_io_workers == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

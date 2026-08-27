@@ -49,12 +49,13 @@ not imply recovering or preserving the previous cache contents.
 ## Configuration and restart
 
 Static configuration defines disk identity: capacity, Region geometry, index
-slots, shard count, RegionSet capacity layout and namespace ownership, seeded
-XXH3-64 algorithm identity, and hash seed. A change intentionally cold-starts
-empty.
-Runtime configuration—including workers, write-batch capacity, L1 capacity,
-and statistics—may change across a successful warm restart without invalidating
-the clean image.
+slots, RegionSet capacity layout and namespace ownership, seeded XXH3-64
+algorithm identity, and hash seed. A change intentionally cold-starts empty.
+Runtime configuration includes append-shard count, workers, write-batch
+capacity, L1 capacity, and statistics. Append-shard count is selected at open
+but must match a clean image for warm recovery; a mismatch safely opens empty.
+Other runtime settings may change across a successful warm restart without
+invalidating the clean image.
 
 Only `close_warm` publishes recoverable state. Fast close, process failure, and
 every unclean boundary reopen empty. This recovery contract is part of format 1

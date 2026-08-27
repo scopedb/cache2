@@ -56,7 +56,6 @@ impl ScaleConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size(32 * MIB as u64)
             .with_expected_entries(self.expected_entries)
-            .with_write_shards(4)
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
@@ -65,6 +64,7 @@ impl ScaleConfig {
             .with_io_mode(IoMode::Buffered)
             .with_read_io_workers(1)
             .with_write_io_workers(1)
+            .with_write_shards(4)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(false)

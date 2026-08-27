@@ -26,13 +26,14 @@ another key's value. There is one SSD format and no Bucket engine, journal, or
 separate write-back executor.
 
 A RegionSet is an L2 retention boundary. Static capacity weights assign each
-set a contiguous Region range; append shards are assigned contiguous ranges
-evenly across sets. Every append shard has one Active Region, two fixed write
-buffers, and one ordered worker. Free and sealed FIFOs are private to their set,
-and Region rotation never borrows across sets. L1, the global index, I/O pools,
-memory limit, and statistics stay shared. Runtime-only L1 shards are
-independent of static append shards, so RAM concurrency can be retuned without
-changing Region assignment or recovery identity.
+set a contiguous Region range. At open, runtime append shards are assigned
+contiguous ranges evenly across sets. Every append shard has one Active Region,
+two fixed write buffers, and one ordered worker. Free and sealed FIFOs are
+private to their set, and Region rotation never borrows across sets. L1, the
+global index, I/O pools, memory limit, and statistics stay shared. Runtime L1
+shards and append shards are independent. Changing the append-shard count does
+not change physical Region assignment, but it discards a clean image whose
+active-Region topology has a different shard count.
 
 ## Internal boundaries
 
@@ -138,11 +139,10 @@ reads; it is never serialized into the clean image.
 ## Configuration identity
 
 Static configuration is included in the data superblock fingerprint and clean
-image binding. It consists of capacity, Region size/count, index slots, data
-shards, RegionSet ranges, namespace ownership, hash-algorithm
-identity, and hash seed. A mismatch reformats disposable cache state rather
-than trying to migrate it. The single implicit set preserves the original
-single-pool layout identity.
+image binding. It consists of capacity, Region size/count, index slots,
+RegionSet ranges, namespace ownership, hash-algorithm identity, and hash seed.
+A mismatch reformats disposable cache state rather than trying to migrate it.
+The single implicit set preserves the original single-pool layout identity.
 
 RegionSet weights are resolved once at open by largest remainder at whole-Region
 granularity, with stable RegionSet ID as the tie breaker. Append shards are
@@ -156,10 +156,12 @@ Routes that explicitly name RegionSet zero and an explicit single-set-zero
 layout are canonicalized to the implicit default, avoiding cold starts for
 configurations with identical physical behavior.
 
-Runtime configuration is not persisted and may change between opens. It
-includes I/O engine and mode, independent read and write worker counts, L1
-capacity and shard count, one write-batch capacity, aggregate memory limit, and
-optional statistics.
+Runtime configuration is not part of the data-superblock identity and is
+selected on each open. It includes I/O engine and mode, independent read and
+write worker counts, append-shard count, L1 capacity and shard count, one
+write-batch capacity, aggregate memory limit, and optional statistics. The
+clean image records its append-shard topology; a count mismatch cold-starts
+empty instead of migrating it. Other runtime tuning can retain the image.
 Foreground L2 reads
 reserve one immediately available read-engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public

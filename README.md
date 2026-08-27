@@ -21,8 +21,7 @@ use cache_rs::{HybridCacheConfig, IoEngine, RuntimeConfig, StaticConfig};
 
 let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
     .with_region_size(32 * 1024 * 1024)
-    .with_expected_entries(1_000_000)
-    .with_write_shards(8);
+    .with_expected_entries(1_000_000);
 let peak_disk_bytes = static_config.peak_disk_bytes()?;
 
 let runtime_config = RuntimeConfig::default()
@@ -32,6 +31,7 @@ let runtime_config = RuntimeConfig::default()
     .with_io_engine(IoEngine::Posix)
     .with_read_io_workers(16)
     .with_write_io_workers(4)
+    .with_write_shards(8)
     .with_write_batch_size(4 * 1024 * 1024);
 
 let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
@@ -93,23 +93,23 @@ let stable = cache.get_in(namespace, "stable-key").await?;
 Namespaces may also be assigned to physical RegionSets when workloads need
 different SSD retention. Capacity weights divide the fixed Region count; each
 set owns its active Regions and its own free/sealed FIFO, so rotation in one set
-cannot reclaim another set. The append-shard count remains the global
-`with_write_shards` value and is distributed evenly across sets in deterministic ID
-order:
+cannot reclaim another set. The append-shard count remains the global runtime
+`with_write_shards` value and is distributed evenly across sets in
+deterministic ID order:
 
 ```rust
 use cache_rs::{RegionSetConfig, StaticConfig};
 
+let write_shards = 8;
 let static_config = StaticConfig::new(96 * 1024 * 1024 * 1024)
     .with_region_size(32 * 1024 * 1024)
-    .with_write_shards(8)
     .with_region_sets([
         RegionSetConfig::new(0).with_weight(3), // default, larger cold set
         RegionSetConfig::new(1)
             .with_weight(1)
             .with_namespaces([7]), // compact hot set
     ]);
-let allocations = static_config.region_set_allocations()?;
+let allocations = static_config.region_set_allocations(write_shards)?;
 # let _ = allocations;
 # Ok::<(), std::io::Error>(())
 ```
@@ -122,9 +122,10 @@ append shard plus at least one spare Region; invalid layouts fail before files
 are created. RegionSet zero is required and receives every namespace not listed
 by another set. Layout and namespace ownership are static identity, so changing
 either intentionally cold-starts empty.
-`StaticConfig::validate()` checks the layout without touching cache files, and
-`region_set_allocations()` reports the resolved Region count, capacity bytes,
-and append-shard count for capacity planning.
+`StaticConfig::validate()` checks that the physical layout can support at least
+one shard per set without touching cache files.
+`region_set_allocations(write_shards)` validates the requested runtime topology
+and reports its resolved Region count, capacity bytes, and append-shard count.
 
 `put` publishes an admitted RAM value immediately and encodes the same sequence
 into the bounded per-shard write buffer before returning. The value is readable
@@ -193,12 +194,11 @@ reads fail open as misses.
 
 - capacity and Region size;
 - expected-entry-derived index slot count;
-- write-shard count;
 - RegionSet capacity layout and namespace ownership;
 - seeded XXH3-64 key hashing with a fixed internal seed.
 
 Changing one of these values safely formats an empty cache. `RuntimeConfig`
-may change on every open without invalidating a clean image:
+is selected on every open:
 
 - POSIX positioned-I/O by default, with io_uring available only through an
   explicit crate feature and engine selection;
@@ -206,13 +206,17 @@ may change on every open without invalidating a clean image:
 - bounded positive read and write I/O worker counts; POSIX uses one dedicated
   bounded engine per direction with one execution slot per worker, while
   optional io_uring uses one fixed 64-slot lane per configured worker;
+- bounded append-shard count;
 - L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
   batch capacity, and opt-in operational counters.
 
 `with_write_shards` is separate from `with_write_io_workers`. A write shard is
-a static append/staging path with one Active Region, two fixed write buffers,
-and one ordered worker. The write I/O worker count is runtime-only device
-parallelism; concurrent batch submissions are bounded by the smaller of the
+a runtime append/staging path with one Active Region, two fixed write buffers,
+and one ordered worker. Its count can change between opens, but not while a
+cache is running. A count that differs from a clean image safely opens empty
+instead of migrating the old active-Region topology; the static data layout is
+not reformatted. The write I/O worker count independently bounds device
+parallelism, so concurrent batch submissions are limited by the smaller of the
 write-shard and write-worker counts.
 
 The RAM tier uses shard-local CLOCK. Victim search and multi-entry eviction use
@@ -318,9 +322,9 @@ recoverable.
    device. Provision extra filesystem space for allocation granularity and
    metadata, which are outside the logical bound.
 5. Start with four read workers and four write workers, then measure each count
-   independently on the target device. Both worker counts, memory, and
-   write-batch capacity are runtime settings and may change across a warm
-   restart. Write shards remain static layout identity.
+   independently on the target device. Worker counts, memory, and write-batch
+   capacity may change while retaining a clean image. Write shards are also
+   selected at open, but changing their count intentionally cold-starts empty.
 
 The reproducible baseline, Linux NVMe matrix, regression thresholds, and soak
 procedure are in `BENCHMARK.md`.

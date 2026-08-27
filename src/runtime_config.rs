@@ -1,6 +1,8 @@
 pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
+pub(crate) const MAX_WRITE_SHARDS: u32 = 256;
 pub(crate) const MAX_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_WRITE_SHARDS: u32 = 4;
 const IO_URING_DEPTH_PER_WORKER: usize = 64;
 
 #[non_exhaustive]
@@ -28,6 +30,7 @@ pub struct RuntimeConfig {
     pub(crate) io_mode: IoMode,
     pub(crate) read_io_workers: usize,
     pub(crate) write_io_workers: usize,
+    pub(crate) write_shards: u32,
     pub(crate) l1_capacity_bytes: usize,
     pub(crate) memory_limit_bytes: usize,
     pub(crate) l1_shards: usize,
@@ -42,6 +45,7 @@ impl Default for RuntimeConfig {
             io_mode: IoMode::Auto,
             read_io_workers: 4,
             write_io_workers: 4,
+            write_shards: DEFAULT_WRITE_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
@@ -69,6 +73,17 @@ impl RuntimeConfig {
 
     pub fn with_write_io_workers(mut self, workers: usize) -> Self {
         self.write_io_workers = workers;
+        self
+    }
+
+    /// Sets the number of independent append/staging paths created at open.
+    ///
+    /// Each path owns one Active Region, two fixed write buffers, and one
+    /// ordered worker. The valid range is 1..=256. Changing this value across
+    /// opens safely cold-starts the disposable cache instead of migrating
+    /// recovered shard state; it does not change the static disk identity.
+    pub fn with_write_shards(mut self, shards: u32) -> Self {
+        self.write_shards = shards;
         self
     }
 
@@ -111,6 +126,10 @@ impl RuntimeConfig {
 
     pub const fn write_io_workers(&self) -> usize {
         self.write_io_workers
+    }
+
+    pub const fn write_shards(&self) -> u32 {
+        self.write_shards
     }
 
     pub const fn l1_capacity_bytes(&self) -> usize {
@@ -158,6 +177,7 @@ mod tests {
         assert_eq!(config.io_engine(), IoEngine::Posix);
         assert_eq!(config.read_io_workers(), 4);
         assert_eq!(config.write_io_workers(), 4);
+        assert_eq!(config.write_shards(), 4);
         assert_eq!(config.io_engine_count(config.read_io_workers()), 1);
         assert_eq!(config.io_depth_per_engine(config.read_io_workers()), 4);
         assert_eq!(

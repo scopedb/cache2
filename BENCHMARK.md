@@ -71,7 +71,7 @@ all runs stayed within the 128 MiB managed-memory limit. This validates pool
 isolation without adding read waiting or a shared-slot handoff protocol.
 
 The same three-second profile held both I/O pools at four workers and varied
-only the static write-shard count:
+only the runtime write-shard count:
 
 | Write shards | Accepted writes | Approx. writes/s | Rotations | Managed peak | Read busy misses |
 |---:|---:|---:|---:|---:|---:|

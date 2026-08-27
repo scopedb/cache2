@@ -160,7 +160,6 @@ impl BenchConfig {
             // Keep the benchmark's complete L2 working set comfortably below
             // every page-aligned index partition's bounded-probe capacity.
             .with_expected_entries(self.entries.saturating_mul(4))
-            .with_write_shards(self.shards)
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
@@ -169,6 +168,7 @@ impl BenchConfig {
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
             .with_write_io_workers(self.write_io_workers)
+            .with_write_shards(self.shards)
             .with_l1_capacity(self.memory_bytes)
             .with_memory_limit(self.memory_limit_bytes)
             .with_statistics(self.statistics_enabled)

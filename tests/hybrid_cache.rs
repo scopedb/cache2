@@ -27,16 +27,25 @@ impl TestCache {
     fn config(&self, workers: usize) -> HybridCacheConfig {
         let static_config = StaticConfig::new(3 * 512 * 1024)
             .with_region_size(512 * 1024)
-            .with_expected_entries(3277)
-            .with_write_shards(2);
+            .with_expected_entries(3277);
         self.config_with_static(workers, static_config)
     }
 
     fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> HybridCacheConfig {
+        self.config_with_static_and_shards(workers, static_config, 2)
+    }
+
+    fn config_with_static_and_shards(
+        &self,
+        workers: usize,
+        static_config: StaticConfig,
+        write_shards: u32,
+    ) -> HybridCacheConfig {
         let runtime_config = RuntimeConfig::default()
             .with_io_engine(IoEngine::Posix)
             .with_read_io_workers(workers)
             .with_write_io_workers(workers)
+            .with_write_shards(write_shards)
             .with_l1_capacity(4 * 1024 * 1024)
             .with_memory_limit(32 * 1024 * 1024)
             .with_write_batch_size(256 * 1024)
@@ -174,6 +183,7 @@ async fn immediate_l1_publication_is_best_effort() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(2)
         .with_write_io_workers(2)
+        .with_write_shards(2)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -211,6 +221,7 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
+        .with_write_shards(2)
         .with_l1_capacity(1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -251,6 +262,7 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(2)
         .with_write_io_workers(2)
+        .with_write_shards(2)
         .with_l1_capacity(512)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -297,6 +309,7 @@ async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
         .with_io_engine(IoEngine::IoUring)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
+        .with_write_shards(2)
         .with_l1_capacity(4 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024);
@@ -343,6 +356,7 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(7)
         .with_write_io_workers(2)
+        .with_write_shards(2)
         .with_l1_capacity(2 * 1024 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(7)
@@ -368,6 +382,44 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     assert_eq!(snapshot.l1_hits, 0);
     assert!(snapshot.managed_memory_bytes <= snapshot.managed_memory_limit_bytes);
     reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn changing_runtime_write_shards_discards_the_clean_image() {
+    let files = TestCache::new("runtime-write-shards");
+    let static_config = StaticConfig::new(3 * 512 * 1024)
+        .with_region_size(512 * 1024)
+        .with_expected_entries(3277);
+
+    let cache = files
+        .config_with_static_and_shards(1, static_config.clone(), 1)
+        .open()
+        .await
+        .unwrap();
+    cache.put("old-key", [7_u8; 1024]).unwrap();
+    cache.close_warm().await.unwrap();
+
+    let reopened = files
+        .config_with_static_and_shards(2, static_config.clone(), 2)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
+    assert!(reopened.get("old-key").await.unwrap().is_none());
+    reopened.put("new-key", [9_u8; 1024]).unwrap();
+    reopened.close_warm().await.unwrap();
+
+    let recovered = files
+        .config_with_static_and_shards(2, static_config, 2)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(recovered.startup_mode(), StartupMode::Warm);
+    assert_eq!(
+        recovered.get("new-key").await.unwrap().unwrap().as_ref(),
+        &[9_u8; 1024]
+    );
+    recovered.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -543,7 +595,6 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
     let static_config = StaticConfig::new(6 * REGION_BYTES)
         .with_region_size(REGION_BYTES)
         .with_expected_entries(3277)
-        .with_write_shards(2)
         .with_region_sets([
             RegionSetConfig::new(0).with_weight(2),
             RegionSetConfig::new(1)
@@ -615,7 +666,11 @@ async fn namespace_region_sets_rotate_and_recover_independently() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 9] = [
+    let cases: [RuntimeConfigCase; 11] = [
+        ("zero-write-shards", |config| config.with_write_shards(0)),
+        ("too-many-write-shards", |config| {
+            config.with_write_shards(257)
+        }),
         ("zero-read-workers", |config| config.with_read_io_workers(0)),
         ("zero-write-workers", |config| {
             config.with_write_io_workers(0)
@@ -653,7 +708,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         let files = TestCache::new(case);
         let error = files
             .config(2)
-            .with_runtime_config(configure(RuntimeConfig::default()))
+            .with_runtime_config(configure(RuntimeConfig::default().with_write_shards(2)))
             .open()
             .await
             .unwrap_err();
@@ -707,12 +762,11 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
     let static_config = StaticConfig::new(2 * 4096)
         .with_region_size(4096)
-        .with_expected_entries(51)
-        .with_write_shards(1);
+        .with_expected_entries(51);
     let value = vec![0x5a; 128];
 
     let cache = files
-        .config_with_static(1, static_config.clone())
+        .config_with_static_and_shards(1, static_config.clone(), 1)
         .open()
         .await
         .unwrap();
@@ -720,7 +774,7 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     cache.close_warm().await.unwrap();
 
     let recovered = files
-        .config_with_static(1, static_config)
+        .config_with_static_and_shards(1, static_config, 1)
         .open()
         .await
         .unwrap();
@@ -737,8 +791,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
     let static_config = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
-        .with_expected_entries(3277)
-        .with_write_shards(2);
+        .with_expected_entries(3277);
     let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
 
     let cache = files
@@ -771,7 +824,6 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
         .with_expected_entries(3277)
-        .with_write_shards(2)
         .peak_disk_bytes()
         .unwrap();
     let cache = files.config(4).open().await.unwrap();
@@ -891,6 +943,7 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
+        .with_write_shards(2)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
@@ -926,6 +979,7 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
+        .with_write_shards(2)
         .with_l1_capacity(64 * 1024)
         .with_memory_limit(32 * 1024 * 1024)
         .with_l1_shards(1)
@@ -971,6 +1025,7 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
+        .with_write_shards(2)
         .with_l1_capacity(0)
         .with_memory_limit(32 * 1024 * 1024)
         .with_write_batch_size(128 * 1024)
@@ -1014,8 +1069,7 @@ async fn static_config_change_discards_the_old_image() {
 
     let changed = StaticConfig::new(3 * 512 * 1024)
         .with_region_size(512 * 1024)
-        .with_expected_entries(6553)
-        .with_write_shards(2);
+        .with_expected_entries(6553);
     let reopened = files.config_with_static(5, changed).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());

@@ -53,6 +53,9 @@ version number documented in `MILESTONES.md`.
 - separated read and write submissions into dedicated bounded worker pools so
   write pressure cannot consume read slots; optional multi-ring io_uring reads
   retain one bounded alternate-lane probe;
+- moved write-shard count from static disk identity to reopen-time runtime
+  topology; changing it discards an incompatible clean image and cold-starts
+  empty without migrating or reformatting the physical Region layout;
 - stopped requiring the unused io_uring `fsync` opcode after the public data-sync
   operation was removed;
 - replaced FNV-1a key hashing with seeded XXH3-64 and bound the algorithm
@@ -114,6 +117,6 @@ version number documented in `MILESTONES.md`.
 
 - no public Rust API or disk-format compatibility promise is made before the
   M4/1.0 freeze;
-- runtime configuration may change across a clean warm restart without
-  invalidating the image;
+- runtime configuration other than append-shard count may change across a clean
+  warm restart without invalidating the image;
 - static layout changes and unsupported formats intentionally start empty.

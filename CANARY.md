@@ -42,7 +42,8 @@ observed result.
 4. Exercise the configured overload policy and verify the service remains
    correct when cache operations reject, time out, or miss.
 5. Stop admission, execute `close_warm`, restart with a permitted runtime-only
-   configuration change, and verify warm recovery plus continued correctness.
+   configuration change other than append-shard count, and verify warm recovery
+   plus continued correctness.
 6. Execute one fast/unclean restart and verify cold-empty recovery without stale
    values or an origin failure storm outside the declared service gate.
 
