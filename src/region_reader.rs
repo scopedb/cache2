@@ -20,10 +20,17 @@ use crate::resources::BufferLease;
 pub(crate) const _READ_ALIGNMENT: usize = 4096;
 pub(crate) const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadCandidate {
+    pub(crate) entry: IndexEntry,
+    pub(crate) region_generation: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadPlan {
     pub(crate) hash: u64,
     pub(crate) entry: IndexEntry,
+    pub(crate) region_generation: u64,
     pub(crate) absolute: u64,
     pub(crate) read_len: usize,
     pub(crate) record_range: Range<usize>,
@@ -168,9 +175,13 @@ pub(crate) fn submit_read(
 pub(crate) fn plan_read(
     geometry: DataGeometry,
     hash: u64,
-    entry: IndexEntry,
+    candidate: ReadCandidate,
     align_for_direct_io: bool,
 ) -> io::Result<ReadPlan> {
+    let ReadCandidate {
+        entry,
+        region_generation,
+    } = candidate;
     let location = entry.location;
     let offset = u64::from(location.offset());
     let record_len = usize::try_from(location.record_len()).map_err(|_| {
@@ -187,7 +198,7 @@ pub(crate) fn plan_read(
     })?;
     let record_end = offset.checked_add(record_len_u64);
     if !geometry.is_valid()
-        || entry.seqno == 0
+        || region_generation == 0
         || location.region_id() >= geometry.region_count
         || offset % u64::from(RECORD_ALIGNMENT) != 0
         || record_len == 0
@@ -259,6 +270,7 @@ pub(crate) fn plan_read(
     Ok(ReadPlan {
         hash,
         entry,
+        region_generation,
         absolute,
         read_len,
         record_range,
@@ -334,9 +346,13 @@ mod tests {
     }
 
     fn entry(location: crate::index::PackedLocation) -> IndexEntry {
-        IndexEntry {
-            location,
-            seqno: 11,
+        IndexEntry { location }
+    }
+
+    fn candidate(entry: IndexEntry) -> ReadCandidate {
+        ReadCandidate {
+            entry,
+            region_generation: 1,
         }
     }
 
@@ -351,7 +367,7 @@ mod tests {
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
-        let plan = plan_read(geometry(), 7, entry, true).unwrap();
+        let plan = plan_read(geometry(), 7, candidate(entry), true).unwrap();
 
         let slot = engine.try_reserve_read().unwrap();
         let completion = submit_read(
@@ -392,7 +408,7 @@ mod tests {
         })
         .unwrap();
         let entry = entry(PackedLocation::new(1, 32, 64).unwrap());
-        let plan = plan_read(geometry(), 7, entry, false).unwrap();
+        let plan = plan_read(geometry(), 7, candidate(entry), false).unwrap();
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
 
         let completion = submit_read(
@@ -425,7 +441,7 @@ mod tests {
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
-        let error = plan_read(geometry(), 7, invalid, true).unwrap_err();
+        let error = plan_read(geometry(), 7, candidate(invalid), true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend
@@ -433,6 +449,17 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
+        );
+
+        let generation_zero = ReadCandidate {
+            entry: entry(PackedLocation::new(0, 0, 32).unwrap()),
+            region_generation: 0,
+        };
+        assert_eq!(
+            plan_read(geometry(), 7, generation_zero, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
         );
         engine.shutdown().unwrap();
     }

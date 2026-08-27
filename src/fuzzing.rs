@@ -33,20 +33,17 @@ fn fuzz_index_probe(input: &[u8]) {
     let Ok(storage) = PartitionedIndexStorage::anonymous(slot_count) else {
         return;
     };
-    let Ok(index) = RegionIndex::try_from_storage(storage, (0..1024).map(|_| 0)) else {
-        return;
-    };
+    let index = RegionIndex::from_storage(storage);
     for chunk in input.get(1..).unwrap_or_default().chunks(24).take(128) {
         let mut bytes = [0_u8; 24];
         bytes[..chunk.len()].copy_from_slice(chunk);
         let hash = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let seqno = u64::from_le_bytes(bytes[8..16].try_into().unwrap()).max(1);
         let raw = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let region_id = (raw as u32) & 0x3ff;
         let offset = ((raw >> 32) as u32 & 0xffff) * 8;
         let location = PackedLocation::new(region_id, offset, 32)
             .expect("bounded aligned fuzz location is representable");
-        let entry = IndexEntry { location, seqno };
+        let entry = IndexEntry { location };
         let _ = index.upsert(hash, entry);
         let _ = index.lookup_raw(hash);
     }

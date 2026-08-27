@@ -763,6 +763,10 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     assert_eq!(resources.puts, 128);
     assert_eq!(resources.written_bytes, 128 * 8 * 1024);
     assert!(resources.region_rotations > 0);
+    assert!(resources.reclaim.regions > 0);
+    assert!(resources.reclaim.bytes_read > 0);
+    assert!(resources.reclaim.records_scanned > 0);
+    assert!(resources.reclaim.index_entries_removed <= resources.reclaim.records_scanned);
     assert_eq!(resources.managed_memory_limit_bytes, 32 * 1024 * 1024);
     assert!(resources.managed_memory_bytes <= resources.managed_memory_limit_bytes);
     assert!(resources.managed_memory_peak_bytes >= resources.managed_memory_bytes);
@@ -772,11 +776,19 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     let detailed = cache.detailed_snapshot().unwrap();
     assert_eq!(detailed.summary, resources);
     assert_eq!(detailed.write_buffer_rejections, resources.write_rejections);
-    assert_eq!(resources.io.read.requests_in_flight, 0);
+    // Drain fences accepted writes, not the independent one-deep reclaim
+    // reader. A final Region cleanup may still be in flight.
+    assert!(resources.io.read.requests_in_flight <= 1);
     assert_eq!(resources.io.write.requests_in_flight, 0);
     assert_eq!(
-        resources.io.read.requests_succeeded,
-        resources.io.read.requests_submitted
+        resources.io.read.requests_submitted,
+        resources
+            .io
+            .read
+            .requests_succeeded
+            .saturating_add(resources.io.read.requests_cancelled)
+            .saturating_add(resources.io.read.requests_failed)
+            .saturating_add(resources.io.read.requests_in_flight)
     );
     assert_eq!(
         resources.io.write.requests_succeeded,
@@ -798,18 +810,17 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     assert!(detailed.l1.resident_bytes <= 4 * 1024 * 1024);
     assert_eq!(detailed.l1.retained_bytes, 0);
     assert!(detailed.l1.metadata_bytes > 0);
-    assert_eq!(detailed.index.slot_capacity, 4097);
+    assert_eq!(detailed.index.slot_capacity, 6554);
     assert_eq!(
-        detailed.index.physical_value_slots
-            + detailed.index.deleted_slots
-            + detailed.index.empty_slots,
+        detailed.index.physical_value_slots + detailed.index.empty_slots,
         detailed.index.slot_capacity
     );
     assert_eq!(detailed.region.capacity_bytes, 3 * 512 * 1024);
     assert_eq!(
         detailed.region.active_region_count
             + detailed.region.free_region_count
-            + detailed.region.sealed_region_count,
+            + detailed.region.sealed_region_count
+            + detailed.region.reclaiming_region_count,
         3
     );
     cache.close_fast().await.unwrap();

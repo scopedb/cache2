@@ -34,7 +34,7 @@ impl Default for RegionIndexTurnoverConfig {
     fn default() -> Self {
         Self {
             // One 4 TiB / 16 KiB production partition contains 65,536 live
-            // entries in 81,920 physical slots at the default 80% load.
+            // entries in 131,072 physical slots at the default 50% load.
             region_count: 128,
             entries_per_region: 512,
             turns: 100,
@@ -170,9 +170,7 @@ impl TurnoverPlan {
             .checked_mul(config.entries_per_region)
             .ok_or_else(|| invalid("turnover physical entry count overflow"))?;
         let index_slots = physical_entries
-            .checked_mul(5)
-            .and_then(|slots| slots.checked_add(3))
-            .map(|slots| slots / 4)
+            .checked_mul(2)
             .ok_or_else(|| invalid("turnover index slot count overflow"))?
             .max(8);
         if index_slots > MAX_INDEX_SLOTS {
@@ -204,9 +202,8 @@ struct TurnoverWorkload {
     hashes: Vec<u64>,
     missing_hashes: Vec<u64>,
     locations: Vec<PackedLocation>,
+    location_owners: Vec<Option<usize>>,
     expected_entries: Vec<Option<IndexEntry>>,
-    region_generations: Vec<u64>,
-    next_seqno: u64,
     total_writes: usize,
 }
 
@@ -214,8 +211,7 @@ impl TurnoverWorkload {
     fn new(plan: TurnoverPlan) -> io::Result<Self> {
         let storage = PartitionedIndexStorage::anonymous_single_partition(plan.index_slots)
             .map_err(index_error)?;
-        let index =
-            RegionIndex::try_from_storage(storage, (0..plan.config.region_count).map(|_| 0_u64))?;
+        let index = RegionIndex::from_storage(storage);
         index.set_statistics_enabled(true);
 
         let mut hashes = Vec::new();
@@ -257,11 +253,11 @@ impl TurnoverWorkload {
             .map_err(|_| out_of_memory("turnover correctness oracle"))?;
         expected_entries.resize(plan.key_space_entries, None);
 
-        let mut region_generations = Vec::new();
-        region_generations
-            .try_reserve_exact(plan.config.region_count)
-            .map_err(|_| out_of_memory("turnover Region generations"))?;
-        region_generations.resize(plan.config.region_count, 0);
+        let mut location_owners = Vec::new();
+        location_owners
+            .try_reserve_exact(plan.physical_entries)
+            .map_err(|_| out_of_memory("turnover Region owners"))?;
+        location_owners.resize(plan.physical_entries, None);
 
         Ok(Self {
             plan,
@@ -269,9 +265,8 @@ impl TurnoverWorkload {
             hashes,
             missing_hashes,
             locations,
+            location_owners,
             expected_entries,
-            region_generations,
-            next_seqno: 1,
             total_writes: 0,
         })
     }
@@ -282,22 +277,25 @@ impl TurnoverWorkload {
         let mut checksum = 0_u64;
         let mut installed = 0_usize;
         for region_id in 0..self.plan.config.region_count {
-            let generation = self.next_seqno;
-            if !self
-                .index
-                .publish_region_generation(region_id as u32, generation)
-            {
-                return Err(io::Error::other(
-                    "turnover generation publication was rejected",
-                ));
-            }
-            self.region_generations[region_id] = generation;
             let location_start = region_id * self.plan.config.entries_per_region;
+            for physical in location_start..location_start + self.plan.config.entries_per_region {
+                let Some(key_ordinal) = self.location_owners[physical].take() else {
+                    continue;
+                };
+                let old = IndexEntry {
+                    location: self.locations[physical],
+                };
+                self.index
+                    .remove_if_match(self.hashes[key_ordinal], old.location)
+                    .map_err(index_error)?;
+                if self.expected_entries[key_ordinal] == Some(old) {
+                    self.expected_entries[key_ordinal] = None;
+                }
+            }
             for slot in 0..self.plan.config.entries_per_region {
                 let key_ordinal = self.total_writes % self.plan.key_space_entries;
                 let entry = IndexEntry {
                     location: self.locations[location_start + slot],
-                    seqno: self.next_seqno,
                 };
                 let accepted = self
                     .index
@@ -307,16 +305,14 @@ impl TurnoverWorkload {
                     return Err(io::Error::other("turnover index publication was rejected"));
                 }
                 self.expected_entries[key_ordinal] = Some(entry);
-                self.next_seqno = self
-                    .next_seqno
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("turnover sequence overflow"))?;
+                self.location_owners[location_start + slot] = Some(key_ordinal);
                 self.total_writes = self
                     .total_writes
                     .checked_add(1)
                     .ok_or_else(|| invalid("turnover write ordinal overflow"))?;
                 installed = installed.saturating_add(1);
-                checksum = checksum.wrapping_add(entry.seqno.rotate_left((slot % 64) as u32));
+                checksum =
+                    checksum.wrapping_add(entry.location.raw().rotate_left((slot % 64) as u32));
             }
         }
         finish_phase(
@@ -345,9 +341,6 @@ impl TurnoverWorkload {
                     % self.plan.key_space_entries;
                 let expected = self.expected_entries[key_ordinal]
                     .ok_or_else(|| io::Error::other("recent turnover key has no oracle entry"))?;
-                if !self.is_live(expected) {
-                    return Err(io::Error::other("recent turnover key is already stale"));
-                }
                 Ok((self.hashes[key_ordinal], LookupExpectation::Live(expected)))
             },
         )?;
@@ -360,15 +353,12 @@ impl TurnoverWorkload {
                 |operation| {
                     let key_ordinal = (stale_start + operation % self.plan.physical_entries)
                         % self.plan.key_space_entries;
-                    let expected = self.expected_entries[key_ordinal].ok_or_else(|| {
-                        io::Error::other("stale turnover key has no oracle entry")
-                    })?;
-                    if self.is_live(expected) {
-                        return Err(io::Error::other(
-                            "stale turnover key remains logically live",
-                        ));
-                    }
-                    Ok((self.hashes[key_ordinal], LookupExpectation::Miss))
+                    Ok(match self.expected_entries[key_ordinal] {
+                        Some(expected) => {
+                            (self.hashes[key_ordinal], LookupExpectation::Live(expected))
+                        }
+                        None => (self.hashes[key_ordinal], LookupExpectation::Miss),
+                    })
                 },
             )?)
         } else {
@@ -383,24 +373,13 @@ impl TurnoverWorkload {
 
         Ok(RegionIndexTurnoverCheckpoint {
             turn,
-            logical_live_keys: self
-                .expected_entries
-                .iter()
-                .flatten()
-                .filter(|entry| self.is_live(**entry))
-                .count(),
+            logical_live_keys: self.expected_entries.iter().flatten().count(),
             index: self.index.snapshot().map_err(index_error)?,
             publish,
             recent_lookup,
             stale_lookup,
             missing_lookup,
         })
-    }
-
-    fn is_live(&self, entry: IndexEntry) -> bool {
-        self.region_generations
-            .get(entry.location.region_id() as usize)
-            .is_some_and(|generation| entry.seqno >= *generation)
     }
 }
 
@@ -419,6 +398,7 @@ fn measure_lookups(
     let started = Instant::now();
     let mut hits = 0_usize;
     let mut misses = 0_usize;
+    let mut false_candidates = 0_u64;
     let mut checksum = 0_u64;
     for operation in 0..operations {
         let (hash, expected) = request(operation)?;
@@ -426,26 +406,25 @@ fn measure_lookups(
         match (expected, observed) {
             (LookupExpectation::Live(expected), Some(observed)) if observed == expected => {
                 hits = hits.saturating_add(1);
-                checksum =
-                    checksum.wrapping_add(observed.seqno.rotate_left((operation % 64) as u32));
+                checksum = checksum
+                    .wrapping_add(observed.location.raw().rotate_left((operation % 64) as u32));
             }
             (LookupExpectation::Live(_), None) | (LookupExpectation::Miss, None) => {
                 misses = misses.saturating_add(1);
             }
-            (LookupExpectation::Live(_), Some(_)) => {
-                return Err(io::Error::other(
-                    "turnover lookup returned the wrong or future entry",
-                ));
-            }
-            (LookupExpectation::Miss, Some(_)) => {
-                return Err(io::Error::other(
-                    "turnover lookup returned a stale or foreign entry",
-                ));
+            (LookupExpectation::Live(_), Some(_)) | (LookupExpectation::Miss, Some(_)) => {
+                // The compact index stores a fingerprint rather than the full
+                // hash. A false candidate is a production miss after the one
+                // record read validates generation, hash, and full key.
+                misses = misses.saturating_add(1);
+                false_candidates = false_candidates.saturating_add(1);
             }
         }
         black_box(observed);
     }
-    finish_phase(started.elapsed(), operations, hits, misses, checksum)
+    let mut phase = finish_phase(started.elapsed(), operations, hits, misses, checksum)?;
+    phase.stale_slots = false_candidates;
+    Ok(phase)
 }
 
 fn finish_phase(
@@ -525,7 +504,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accelerated_turnover_stays_bounded_and_rejects_stale_entries() {
+    fn accelerated_turnover_stays_bounded_and_classifies_false_candidates_as_misses() {
         let report = run_region_index_turnover(RegionIndexTurnoverConfig {
             region_count: 8,
             entries_per_region: 8,

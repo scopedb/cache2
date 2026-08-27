@@ -41,18 +41,19 @@ fn main() -> io::Result<()> {
         report.config.sample_operations,
     );
     println!(
-        "production_projection capacity=4TiB average_entry=16KiB partitions=4096 physical_entries_per_partition=65536 index_slots_per_partition=81920"
+        "production_projection capacity=4TiB average_entry=16KiB partitions=4096 physical_entries_per_partition=65536 index_slots_per_partition=131072"
     );
 
     for checkpoint in report.checkpoints {
         println!(
-            "checkpoint turn={} logical_live={} physical_values={} empty={} stale_reuses={} live_replacements={}",
+            "checkpoint turn={} logical_live={} physical_values={} empty={} relocations={} overflow_evictions={} conditional_remove_misses={}",
             checkpoint.turn,
             checkpoint.logical_live_keys,
             checkpoint.index.physical_value_slots,
             checkpoint.index.empty_slots,
-            checkpoint.index.stale_slot_reuses,
-            checkpoint.index.live_slot_replacements,
+            checkpoint.index.relocations,
+            checkpoint.index.overflow_evictions,
+            checkpoint.index.conditional_remove_misses,
         );
         report_phase(checkpoint.turn, "publish", checkpoint.publish);
         report_phase(checkpoint.turn, "recent_lookup", checkpoint.recent_lookup);

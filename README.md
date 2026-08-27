@@ -11,8 +11,8 @@ chunks. It is disposable acceleration, not durable storage.
   `WouldBlock`. They never wait for device I/O.
 - An L1 miss consults L2. An admitted L2 lookup performs one bounded record
   read; memory or I/O pressure fails open as a miss.
-- Full keys, lengths, sequence numbers, locations, and checksums are validated
-  before an L2 value is returned.
+- Full keys, exact record lengths, Region generations, hashes, locations, and
+  checksums are validated before an L2 value is returned.
 - There is one raw byte-key space and no TTL. Encode any logical namespace into
   the key.
 - `drain` waits for accepted writes to complete but is not a durability sync.
@@ -83,11 +83,12 @@ fixed-memory cost.
 Keys are limited to 4 KiB. A complete encoded record must fit in one Region.
 Entries charged above 256 KiB bypass L1 but remain valid in L2.
 
-The fixed L2 index uses roughly 1.25 slots per expected entry and 24 bytes per
+The fixed L2 index uses roughly two slots per expected entry and 10 bytes per
 slot, plus page headers. A 4 TiB cache averaging 16 KiB per entry therefore
-needs about 7.62 GiB for the index. The aggregate managed-memory limit must also
-cover L1, two staging buffers per append shard, metadata, transient reads, and
-cache thread stacks. Invalid plans fail before cache files are created.
+needs about 5.08 GiB for the index. The aggregate managed-memory limit must also
+cover L1, two staging buffers per append shard, one Region reclaim buffer,
+metadata, transient reads, and cache thread stacks. Invalid plans fail before
+cache files are created.
 `StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound.
 
 ## Operations
@@ -116,6 +117,8 @@ Prometheus names:
 | Request time | `cache2.io.request.time`, unit `s` | `cache2_io_request_time_seconds_total` |
 | Slot-wait time | `cache2.io.slot.wait`, unit `s` | `cache2_io_slot_wait_seconds_total` |
 | Requests in flight | `cache2.io.request.in_flight`, unit `{request}` | `cache2_io_requests_in_flight` |
+| Region reclaim | `cache2.reclaim`, unit `{operation}` | `cache2_reclaim_total` |
+| Reclaim bytes | `cache2.reclaim.io`, unit `By` | `cache2_reclaim_io_bytes_total` |
 | Managed memory | `cache2.memory.usage`, unit `By` | `cache2_memory_usage_bytes` |
 
 Use fixed `direction=read|write`, `path=buffered|direct`, and
@@ -123,6 +126,10 @@ Use fixed `direction=read|write`, `path=buffered|direct`, and
 shards, and workers must not become labels. `metrics_epoch` is a reset marker
 for the adapter, not a label: when it changes, use the current cumulative value
 as the first delta for the new open.
+
+The read direction includes the dedicated reclaim lane so request and runtime
+file counters remain additive. `reclaim` separately exposes Regions completed,
+second chances, sequential bytes, records scanned, and index entries removed.
 
 For get outcomes, export `l1_hits`, `l2_hits`, and `l2_misses` as the disjoint
 `result=l1_hit|l2_hit|miss` series; `l1_misses` overlaps the latter two and must

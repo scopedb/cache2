@@ -42,6 +42,7 @@ pub struct CacheSnapshot {
     pub write_rejections: u64,
     pub io_failures: u64,
     pub region_rotations: u64,
+    pub reclaim: CacheReclaimSnapshot,
     pub managed_memory_bytes: usize,
     pub managed_memory_peak_bytes: usize,
     pub managed_memory_limit_bytes: usize,
@@ -91,6 +92,16 @@ pub struct CacheIoPathSnapshot {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheReclaimSnapshot {
+    pub regions: u64,
+    pub region_second_chances: u64,
+    pub bytes_read: u64,
+    pub records_scanned: u64,
+    pub index_entries_removed: u64,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheL1Snapshot {
     pub entry_capacity: usize,
     pub resident_entries: usize,
@@ -104,11 +115,10 @@ pub struct CacheL1Snapshot {
 pub struct CacheIndexSnapshot {
     pub slot_capacity: u64,
     pub physical_value_slots: u64,
-    pub deleted_slots: u64,
     pub empty_slots: u64,
-    pub deleted_slot_reuses: u64,
-    pub stale_slot_reuses: u64,
-    pub live_slot_replacements: u64,
+    pub relocations: u64,
+    pub overflow_evictions: u64,
+    pub conditional_remove_misses: u64,
 }
 
 #[non_exhaustive]
@@ -119,6 +129,7 @@ pub struct RegionSnapshot {
     pub active_region_count: u32,
     pub free_region_count: u32,
     pub sealed_region_count: u32,
+    pub reclaiming_region_count: u32,
     pub physical_record_count: u64,
     pub physical_bytes: u64,
     pub rotations: u64,

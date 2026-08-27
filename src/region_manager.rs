@@ -48,6 +48,7 @@ pub(crate) enum RegionMutationError {
 pub(crate) struct RegionAppendReservation {
     pub(crate) shard_id: usize,
     pub(crate) region_id: u32,
+    pub(crate) region_created_seqno: u64,
     pub(crate) offset: u32,
     pub(crate) record_bytes: u32,
     pub(crate) seqno: u64,
@@ -104,8 +105,20 @@ pub(crate) struct RegionRotationReceipt {
     pub(crate) sealed_region_id: u32,
     pub(crate) activated_region_id: u32,
     pub(crate) activated_created_seqno: u64,
-    pub(crate) reused: bool,
 }
+
+/// Exclusive ownership of one sealed Region while its records are scanned
+/// and conditionally removed from the index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionReclaimReceipt {
+    pub(crate) region_id: u32,
+    pub(crate) created_seqno: u64,
+    pub(crate) used_offset: u64,
+    pub(crate) physical_record_count: u64,
+    pub(crate) second_chances: u32,
+}
+
+const MAX_RECLAIM_SECOND_CHANCES: usize = 8;
 
 /// Read-only selection of the next FIFO rotation victim.
 ///
@@ -118,7 +131,6 @@ pub(crate) struct RegionRotationPlan {
     pub(crate) shard_id: usize,
     pub(crate) victim_region_id: u32,
     pub(crate) victim_created_seqno: u64,
-    pub(crate) reused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,6 +192,7 @@ pub(crate) struct RegionManager {
     shard_mutations: Vec<ShardMutation>,
     free_regions: VecDeque<u32>,
     sealed_regions: VecDeque<u32>,
+    reclaiming: Option<RegionReclaimReceipt>,
     queue_capacity: usize,
     rotations: u64,
 }
@@ -266,6 +279,7 @@ impl RegionManager {
             shard_mutations,
             free_regions,
             sealed_regions,
+            reclaiming: None,
             queue_capacity: sealed_capacity,
             rotations: 0,
         })
@@ -302,6 +316,7 @@ impl RegionManager {
                 .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
             sealed_region_count: u32::try_from(self.sealed_regions.len())
                 .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
+            reclaiming_region_count: u32::from(self.reclaiming.is_some()),
             rotations: self.rotations,
             ..RegionSnapshot::default()
         };
@@ -324,6 +339,12 @@ impl RegionManager {
     #[cfg(test)]
     pub(crate) fn sealed_regions(&self) -> &VecDeque<u32> {
         &self.sealed_regions
+    }
+
+    pub(crate) fn reclaim_needed(&self) -> bool {
+        self.reclaiming.is_none()
+            && !self.sealed_regions.is_empty()
+            && self.free_regions.len() < self.active_regions.len().max(1)
     }
 
     /// Allocates one process-local ordering version. Sequence exhaustion is a
@@ -397,6 +418,7 @@ impl RegionManager {
         let receipt = RegionAppendReservation {
             shard_id,
             region_id,
+            region_created_seqno: region.created_seqno,
             offset,
             record_bytes,
             seqno,
@@ -758,9 +780,9 @@ impl RegionManager {
     }
 
     /// Starts one previously planned FIFO rotation without performing I/O.
-    /// Free Regions are used first; once exhausted, the oldest sealed Region
-    /// generation is reused. The outgoing Active Region is withheld from the
-    /// FIFO until [`Self::finish_rotation`] commits the in-memory rotation.
+    /// Only a Region already cleaned into the Free queue may be activated. The
+    /// outgoing Active Region is withheld from the FIFO until
+    /// [`Self::finish_rotation`] commits the in-memory rotation.
     ///
     /// This remains the only rotation mutation authority. A stale plan is
     /// rejected before a sequence number or queue entry is consumed.
@@ -779,13 +801,8 @@ impl RegionManager {
         } = selection;
         let shard_id = plan.shard_id;
         let victim_region_id = plan.victim_region_id;
-        let reused = plan.reused;
         let created_seqno = self.allocate_seqno()?;
-        let removed = if reused {
-            self.sealed_regions.pop_front()
-        } else {
-            self.free_regions.pop_front()
-        };
+        let removed = self.free_regions.pop_front();
         if removed != Some(victim_region_id) {
             return Err(RegionMutationError::Invariant(
                 "rotation victim changed during selection",
@@ -807,7 +824,6 @@ impl RegionManager {
                 .map_err(|_| RegionMutationError::ArithmeticOverflow)?,
             activated_region_id: victim_region_id,
             activated_created_seqno: created_seqno,
-            reused,
         };
         self.shard_mutations[shard_id].rotation_requested = false;
         self.shard_mutations[shard_id].rotation = Some(receipt);
@@ -848,17 +864,11 @@ impl RegionManager {
             return Err(RegionMutationError::WouldBlock);
         }
 
-        let free = self.free_regions.front().copied();
-        let (victim_region_id, reused) = match free {
-            Some(region_id) => (region_id, false),
-            None => (
-                self.sealed_regions
-                    .front()
-                    .copied()
-                    .ok_or(RegionMutationError::WouldBlock)?,
-                true,
-            ),
-        };
+        let victim_region_id = self
+            .free_regions
+            .front()
+            .copied()
+            .ok_or(RegionMutationError::WouldBlock)?;
         let victim_index = usize::try_from(victim_region_id)
             .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
         let victim =
@@ -868,12 +878,7 @@ impl RegionManager {
                 .ok_or(RegionMutationError::Invariant(
                     "rotation victim id is out of bounds",
                 ))?;
-        let expected_victim_state = if reused {
-            RegionMetadataState::Sealed
-        } else {
-            RegionMetadataState::Free
-        };
-        if victim.state != expected_victim_state || victim_region_id == old_region_id {
+        if victim.state != RegionMetadataState::Free || victim_region_id == old_region_id {
             return Err(RegionMutationError::Invariant(
                 "rotation victim queue is inconsistent",
             ));
@@ -883,7 +888,6 @@ impl RegionManager {
                 shard_id,
                 victim_region_id,
                 victim_created_seqno: victim.created_seqno,
-                reused,
             },
             old_index,
             victim_index,
@@ -939,6 +943,119 @@ impl RegionManager {
         Ok(())
     }
 
+    /// Removes the oldest sealed Region from the reusable queues while a
+    /// background owner scans it. Reclaim starts only when the clean reserve
+    /// has fallen below one Region per append shard.
+    pub(crate) fn begin_reclaim(
+        &mut self,
+        mut referenced: impl FnMut(u32) -> bool,
+    ) -> Result<Option<RegionReclaimReceipt>, RegionMutationError> {
+        if !self.reclaim_needed() {
+            return Ok(None);
+        }
+        let alternatives = self
+            .sealed_regions
+            .len()
+            .saturating_sub(1)
+            .min(MAX_RECLAIM_SECOND_CHANCES);
+        let mut second_chances = 0_u32;
+        for _ in 0..alternatives {
+            let region_id = *self
+                .sealed_regions
+                .front()
+                .ok_or(RegionMutationError::Invariant(
+                    "reclaim selection lost its sealed Region",
+                ))?;
+            if !referenced(region_id) {
+                break;
+            }
+            let moved = self.sealed_regions.pop_front();
+            if moved != Some(region_id) {
+                return Err(RegionMutationError::Invariant(
+                    "reclaim victim changed during second chance",
+                ));
+            }
+            self.sealed_regions.push_back(region_id);
+            second_chances = second_chances.saturating_add(1);
+        }
+        let region_id = self
+            .sealed_regions
+            .pop_front()
+            .ok_or(RegionMutationError::Invariant(
+                "reclaim selection lost its sealed Region",
+            ))?;
+        let index =
+            usize::try_from(region_id).map_err(|_| RegionMutationError::ArithmeticOverflow)?;
+        let region = self
+            .regions
+            .get(index)
+            .copied()
+            .ok_or(RegionMutationError::Invariant(
+                "reclaim Region id is out of bounds",
+            ))?;
+        if region.state != RegionMetadataState::Sealed
+            || region.completed_used != region.reserved_used
+        {
+            return Err(RegionMutationError::Invariant(
+                "reclaim victim is not a completed sealed Region",
+            ));
+        }
+        let receipt = RegionReclaimReceipt {
+            region_id,
+            created_seqno: region.created_seqno,
+            used_offset: region.completed_used,
+            physical_record_count: region.physical_record_count,
+            second_chances,
+        };
+        self.reclaiming = Some(receipt);
+        Ok(Some(receipt))
+    }
+
+    /// Makes a scanned Region reusable. Index cleanup must complete before
+    /// this transition because an Active owner may overwrite the bytes as soon
+    /// as the Region enters the Free queue.
+    pub(crate) fn finish_reclaim(
+        &mut self,
+        receipt: RegionReclaimReceipt,
+    ) -> Result<(), RegionMutationError> {
+        if self.reclaiming != Some(receipt) {
+            return Err(RegionMutationError::StaleReceipt);
+        }
+        let index = usize::try_from(receipt.region_id)
+            .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
+        let region = self
+            .regions
+            .get_mut(index)
+            .ok_or(RegionMutationError::StaleReceipt)?;
+        if region.state != RegionMetadataState::Sealed
+            || region.created_seqno != receipt.created_seqno
+            || region.completed_used != receipt.used_offset
+            || region.physical_record_count != receipt.physical_record_count
+        {
+            return Err(RegionMutationError::StaleReceipt);
+        }
+        if self
+            .free_regions
+            .len()
+            .saturating_add(self.sealed_regions.len())
+            >= self.queue_capacity
+        {
+            return Err(RegionMutationError::Invariant(
+                "free Region queue exceeded its reserved capacity",
+            ));
+        }
+        *region = RegionRuntime {
+            state: RegionMetadataState::Free,
+            created_seqno: 0,
+            completed_used: 0,
+            reserved_used: 0,
+            physical_record_count: 0,
+        };
+        self.free_regions.push_back(receipt.region_id);
+        self.reclaiming = None;
+        Ok(())
+    }
+
     /// Freezes the complete Region metadata table against the current
     /// canonical index partition directory and physical counters supplied by the
     /// index owner.
@@ -946,10 +1063,11 @@ impl RegionManager {
         &self,
         partitions: Box<[PartitionMetadataRecord]>,
     ) -> Result<RegionMetadata, RegionMetadataError> {
-        if self
-            .shard_mutations
-            .iter()
-            .any(|shard| !shard.is_quiescent())
+        if self.reclaiming.is_some()
+            || self
+                .shard_mutations
+                .iter()
+                .any(|shard| !shard.is_quiescent())
         {
             return Err(RegionMetadataError::InvalidField("live_region_authority"));
         }
@@ -1153,7 +1271,7 @@ mod tests {
     }
 
     fn sample() -> RegionMetadata {
-        let ranges = canonical_index_partition_ranges(200).unwrap();
+        let ranges = canonical_index_partition_ranges(407).unwrap();
         let mut shards = ranges
             .iter()
             .map(|range| PartitionMetadataRecord {
@@ -1166,9 +1284,8 @@ mod tests {
                 physical_deleted_slots: 0,
             })
             .collect::<Vec<_>>();
-        shards[0].physical_value_slots = 1;
-        shards[0].physical_deleted_slots = 1;
-        shards[1].physical_deleted_slots = 1;
+        shards[0].physical_value_slots = 2;
+        shards[1].physical_value_slots = 1;
 
         RegionMetadata {
             root: RegionMetadataRoot {
@@ -1178,7 +1295,7 @@ mod tests {
                 image_identity: id(4),
                 image_generation: 5,
                 config_fingerprint: 6,
-                index_slots: 200,
+                index_slots: 407,
                 index_page_count: 2,
                 region_size: 32 * 1024 * 1024,
                 region_count: 6,
@@ -1283,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_accounting_overflow_is_rejected_during_freeze() {
+    fn shard_accounting_outside_partition_capacity_is_rejected_during_freeze() {
         let metadata = sample();
         let mut shards = metadata.partitions.clone();
         let manager = RegionManager::from_metadata(metadata).unwrap();
@@ -1291,7 +1408,7 @@ mod tests {
         shards[1].physical_value_slots = 1;
         assert_eq!(
             manager.freeze_metadata(shards).unwrap_err(),
-            RegionMetadataError::ArithmeticOverflow
+            RegionMetadataError::InvalidField("partition")
         );
     }
 
@@ -1317,6 +1434,7 @@ mod tests {
             RegionAppendReservation {
                 shard_id: 0,
                 region_id: 3,
+                region_created_seqno: 1,
                 offset: 0,
                 record_bytes: 64,
                 seqno: 8,
@@ -1457,11 +1575,9 @@ mod tests {
                 shard_id: 0,
                 victim_region_id: 5,
                 victim_created_seqno: 0,
-                reused: false,
             }
         );
         let rotation = manager.begin_rotation(plan).unwrap();
-        assert!(!rotation.reused);
         assert_eq!(rotation.sealed_region_id, 3);
         assert_eq!(rotation.activated_region_id, 5);
         assert_eq!(rotation.activated_created_seqno, 8);
@@ -1501,23 +1617,28 @@ mod tests {
     }
 
     #[test]
-    fn fifo_reuse_bumps_generation_and_resets_physical_state() {
+    fn sealed_region_must_be_reclaimed_before_rotation_reuses_it() {
         let metadata = sample_without_free_regions();
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
         request_rotation(&mut manager, 0);
+        assert_eq!(
+            manager.plan_rotation(0),
+            Err(RegionMutationError::WouldBlock)
+        );
+        let reclaim = manager.begin_reclaim(|_| false).unwrap().unwrap();
+        assert_eq!(reclaim.region_id, 4);
+        manager.finish_reclaim(reclaim).unwrap();
         let plan = manager.plan_rotation(0).unwrap();
         assert_eq!(
             plan,
             RegionRotationPlan {
                 shard_id: 0,
                 victim_region_id: 4,
-                victim_created_seqno: 3,
-                reused: true,
+                victim_created_seqno: 0,
             }
         );
         let rotation = manager.begin_rotation(plan).unwrap();
-        assert!(rotation.reused);
         assert_eq!(rotation.activated_region_id, 4);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.regions[4].physical_record_count, 0);
@@ -1529,6 +1650,21 @@ mod tests {
         );
         let frozen = manager.freeze_metadata(shards).unwrap();
         assert_eq!(frozen.regions[4].physical_record_count, 0);
+    }
+
+    #[test]
+    fn reclaim_gives_a_referenced_fifo_region_one_bounded_second_chance() {
+        let mut manager = RegionManager::from_metadata(sample_without_free_regions()).unwrap();
+        let reclaim = manager
+            .begin_reclaim(|region_id| region_id == 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaim.region_id, 1);
+        assert_eq!(reclaim.second_chances, 1);
+        assert_eq!(
+            manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
+            [5, 2, 4]
+        );
     }
 
     #[test]

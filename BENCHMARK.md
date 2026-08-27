@@ -18,7 +18,7 @@ Values contain their key ordinal, so a wrong-key result is fatal. Writes retry
 
 The request-path workload uses 20% physical index load so every planned L2
 operation remains a storage hit. Use `region_index_turnover` below for the
-production 80% index load factor, bounded-probe cost, and replacement rate.
+production 50% index load factor, bounded-candidate cost, and replacement rate.
 
 The main controls are:
 
@@ -95,8 +95,9 @@ cargo +1.98.0 bench --locked --features benchmarking \
 ```
 
 The default models one production-sized partition from a 4 TiB cache averaging
-16 KiB entries: 65,536 logical live entries in 81,920 slots. This preserves the
-80% load and probe shape without allocating the complete 7.62 GiB index.
+16 KiB entries: 65,536 logical live entries in 131,072 slots. This preserves
+the 50% load and candidate shape without allocating the complete 5.08 GiB
+index.
 
 Measure fresh/warm open and close costs at a configurable index scale:
 

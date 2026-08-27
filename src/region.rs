@@ -9,13 +9,15 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
 use crate::hashing::route_hash;
-use crate::index::{IndexEntry, MAX_INDEX_PARTITIONS};
+#[cfg(test)]
+use crate::index::IndexEntry;
+use crate::index::{MAX_INDEX_PARTITIONS, PackedLocation};
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, IndexStorageError,
     PartitionedIndexStorage, WARM_IMAGE_WRITE_BATCH_BYTES, canonical_index_partition_ranges,
@@ -29,15 +31,15 @@ use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
 use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{
-    DataSuperblock, DataSuperblockProbe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET,
-    RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe, RecoveryState,
-    STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedState, StateBinding, StatePageWrite, StateRecord,
-    StateSelectionError, clean_image_matches, latest_state, prepare_next_state,
+    DATA_REGION_AREA_OFFSET, DataSuperblock, DataSuperblockProbe, PersistentId,
+    RECOVERY_IMAGE_INDEX_OFFSET, RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe,
+    RecoveryState, STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedState, StateBinding, StatePageWrite,
+    StateRecord, StateSelectionError, clean_image_matches, latest_state, prepare_next_state,
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
 use crate::region_index::RegionIndex;
-use crate::region_manager::{RegionManager, RegionMutationError};
+use crate::region_manager::{RegionManager, RegionMutationError, RegionReclaimReceipt};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
@@ -45,7 +47,7 @@ use crate::region_metadata::{
 };
 #[cfg(test)]
 use crate::region_reader::plan_read;
-use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, submit_read};
+use crate::region_reader::{PendingRead, ReadCandidate, ReadCompletion, ReadPlan, submit_read};
 use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_staging::{
     RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
@@ -149,8 +151,8 @@ impl RegionHealthLatch {
 }
 
 /// The steady-state owner of Region allocation, FIFO rotation, and write-span
-/// accounting. Index publication is deliberately independent: sequence order
-/// selects newer entries, and reads validate the physical record locally.
+/// accounting. Index publication is deliberately independent; reads validate
+/// the physical record locally and may observe an older valid completion.
 struct RegionManagerAuthority {
     inner: Mutex<RegionManager>,
     health: RegionHealthLatch,
@@ -223,8 +225,22 @@ pub(crate) struct FileRegionCore {
     index: RegionIndex,
     manager: RegionManagerAuthority,
     shards: Box<[RegionShard]>,
+    region_access: Box<[RegionAccessState]>,
     rotation: Mutex<()>,
     health: RegionHealthLatch,
+}
+
+struct RegionAccessState {
+    generation: AtomicU64,
+    referenced: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RegionReclaimStats {
+    pub(crate) records_scanned: u64,
+    pub(crate) records_removed: u64,
+    pub(crate) bytes_read: u64,
+    pub(crate) second_chances: u64,
 }
 
 /// Unique steady-state owner. Workers share only `core`; runtime resources and
@@ -322,16 +338,29 @@ impl FileRegionRuntime {
                 )
             })?;
         shards.resize_with(manager.active_regions().len(), RegionShard::default);
+        let mut region_access = Vec::new();
+        region_access
+            .try_reserve_exact(manager.regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate Region access state",
+                )
+            })?;
+        for region in manager.regions() {
+            region_access.push(RegionAccessState {
+                generation: AtomicU64::new(region.created_seqno),
+                referenced: AtomicBool::new(false),
+            });
+        }
         let health = RegionHealthLatch::healthy();
-        let index = RegionIndex::try_from_storage(
-            index,
-            manager.regions().iter().map(|region| region.created_seqno),
-        )?;
+        let index = RegionIndex::from_storage(index);
         Ok(Self {
             core: Arc::new(FileRegionCore {
                 index,
                 manager: RegionManagerAuthority::new(manager, health.clone()),
                 shards: shards.into_boxed_slice(),
+                region_access: region_access.into_boxed_slice(),
                 rotation: Mutex::new(()),
                 health,
             }),
@@ -466,6 +495,142 @@ impl FileRegionCore {
         self.index.set_statistics_enabled(enabled);
     }
 
+    pub(crate) fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {
+        self.health.require_healthy()?;
+        self.manager
+            .lock()?
+            .begin_reclaim(|region_id| {
+                self.region_access
+                    .get(region_id as usize)
+                    .is_some_and(|access| access.referenced.swap(false, Ordering::Relaxed))
+            })
+            .map_err(|error| region_mutation_context("reclaim begin", error))
+    }
+
+    pub(crate) fn reclaim_needed(&self) -> io::Result<bool> {
+        Ok(self.manager.lock()?.reclaim_needed())
+    }
+
+    pub(crate) fn reclaim_absolute(&self, receipt: RegionReclaimReceipt) -> io::Result<u64> {
+        DATA_REGION_AREA_OFFSET
+            .checked_add(
+                u64::from(receipt.region_id)
+                    .checked_mul(self.manager.lock()?.region_size())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "reclaim offset overflow")
+                    })?,
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reclaim offset overflow"))
+    }
+
+    /// Scans one exact sealed prefix and clears only mappings that still point
+    /// at those physical records. No manager lock is held during index work.
+    pub(crate) fn finish_reclaim(
+        &self,
+        receipt: RegionReclaimReceipt,
+        bytes: &[u8],
+    ) -> io::Result<RegionReclaimStats> {
+        if bytes.len() as u64 != receipt.used_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reclaim read does not match the sealed Region prefix",
+            ));
+        }
+        let mut offset = 0_usize;
+        let mut stats = RegionReclaimStats {
+            bytes_read: receipt.used_offset,
+            second_chances: u64::from(receipt.second_chances),
+            ..RegionReclaimStats::default()
+        };
+        while offset < bytes.len() {
+            let header_end = offset.checked_add(RECORD_HEADER_SIZE).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "reclaim header offset overflow")
+            })?;
+            let header = bytes
+                .get(offset..header_end)
+                .and_then(RecordHeader::decode)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reclaim found an invalid record header",
+                    )
+                })?;
+            let record_len = usize::try_from(header.record_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reclaim record length is too large",
+                )
+            })?;
+            let record_end = offset
+                .checked_add(record_len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reclaim record crosses the sealed prefix",
+                    )
+                })?;
+            let payload_end = header_end
+                .checked_add(usize::from(header.key_len))
+                .and_then(|end| end.checked_add(header.value_len as usize))
+                .filter(|end| *end <= record_end)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reclaim record payload is out of bounds",
+                    )
+                })?;
+            if header.region_generation != receipt.created_seqno || payload_end > record_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reclaim record belongs to another Region generation",
+                ));
+            }
+            let location = PackedLocation::new(
+                receipt.region_id,
+                u32::try_from(offset).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reclaim record offset is too large",
+                    )
+                })?,
+                header.record_len,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if self
+                .index
+                .remove_if_match(header.key_hash, location)
+                .map_err(index_storage_io_error)?
+            {
+                stats.records_removed = stats.records_removed.saturating_add(1);
+            }
+            stats.records_scanned = stats.records_scanned.saturating_add(1);
+            offset = record_end;
+        }
+        if stats.records_scanned != receipt.physical_record_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reclaim record count does not match Region metadata",
+            ));
+        }
+        let access = self
+            .region_access
+            .get(receipt.region_id as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reclaim Region id is out of bounds",
+                )
+            })?;
+        access.referenced.store(false, Ordering::Relaxed);
+        access.generation.store(0, Ordering::Release);
+        self.manager
+            .lock()?
+            .finish_reclaim(receipt)
+            .map_err(|error| region_mutation_context("reclaim completion", error))?;
+        Ok(stats)
+    }
+
     pub(crate) fn enter_miss_only(&self) {
         self.health.enter_miss_only();
     }
@@ -514,7 +679,7 @@ impl FileRegionCore {
     }
 
     /// Begins one physical read with a single bounded index lookup.
-    fn begin_point_read(&self, hash: u64) -> Option<IndexEntry> {
+    fn begin_point_read(&self, hash: u64) -> Option<ReadCandidate> {
         if !self.health.is_healthy() {
             return None;
         }
@@ -530,12 +695,26 @@ impl FileRegionCore {
                 return None;
             }
         };
-        Some(entry)
+        // This best-effort touch intentionally happens on the one index pass.
+        // A fingerprint false positive may protect one Region once; avoiding a
+        // post-I/O index validation keeps the admitted read path unchanged.
+        let access = self
+            .region_access
+            .get(entry.location.region_id() as usize)?;
+        let region_generation = access.generation.load(Ordering::Acquire);
+        if region_generation == 0 {
+            return None;
+        }
+        access.referenced.store(true, Ordering::Relaxed);
+        Some(ReadCandidate {
+            entry,
+            region_generation,
+        })
     }
 
     /// Begins one durable value read. The owned read buffer becomes the value
     /// owner on a hit, avoiding a second payload copy.
-    pub(crate) fn begin_value_read(&self, hash: u64) -> Option<IndexEntry> {
+    pub(crate) fn begin_value_read(&self, hash: u64) -> Option<ReadCandidate> {
         self.begin_point_read(hash)
     }
 
@@ -549,10 +728,10 @@ impl FileRegionCore {
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = hash_key(hash_seed, key);
-        let Some(entry) = self.begin_value_read(hash) else {
+        let Some(candidate) = self.begin_value_read(hash) else {
             return Ok(None);
         };
-        let plan = plan_read(geometry, hash, entry, true)?;
+        let plan = plan_read(geometry, hash, candidate, true)?;
         let slot = engine.try_reserve_read()?;
         self.read_value_from_plan(engine, slot, buffer, plan, key)
     }
@@ -601,7 +780,6 @@ impl FileRegionCore {
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.plan.hash;
-        let entry = completion.plan.entry;
         if let Err(error) = completion.result {
             self.health.enter_miss_only();
             return Err(error);
@@ -619,7 +797,10 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.seqno != entry.seqno || header.key_hash != hash {
+        if header.region_generation != completion.plan.region_generation
+            || header.record_len != completion.plan.entry.location.record_len()
+            || header.key_hash != hash
+        {
             return Ok(None);
         }
         let key_len = usize::from(header.key_len);
@@ -722,7 +903,7 @@ impl FileRegionCore {
         let staged = staging.encode_reserved(receipt, |destination| {
             let entry =
                 encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?;
-            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry))
+            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, receipt.seqno))
         });
         match staged {
             Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
@@ -763,7 +944,7 @@ impl FileRegionCore {
                 }
             }
         };
-        match self.index.try_delete(hash, seqno) {
+        match self.index.try_delete(hash) {
             Ok(_) => Ok(Some(seqno)),
             Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
                 Ok(None)
@@ -966,16 +1147,20 @@ impl FileRegionCore {
             .lock()?
             .begin_rotation(plan)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
-        if !self
-            .index
-            .publish_region_generation(receipt.activated_region_id, receipt.activated_created_seqno)
-        {
-            self.health.enter_miss_only();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "rotation activated an untracked Region generation",
-            ));
-        }
+        let access = self
+            .region_access
+            .get(receipt.activated_region_id as usize)
+            .ok_or_else(|| {
+                self.health.enter_miss_only();
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rotation activated an untracked Region",
+                )
+            })?;
+        access.referenced.store(false, Ordering::Relaxed);
+        access
+            .generation
+            .store(receipt.activated_created_seqno, Ordering::Release);
         // Manager authority now carries the exact in-progress rotation
         // receipt, so foreground staging fails fast on this shard. Release the
         // shard gates before publishing the completed in-memory rotation.
@@ -990,7 +1175,8 @@ impl FileRegionCore {
     }
 
     /// Publishes a completed batch without entering global Region authority.
-    /// A delayed older completion cannot replace a newer same-hash sequence.
+    /// A delayed older completion may replace a newer candidate; stale values
+    /// are accepted and exact physical identity is checked after the read.
     fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for record in records.iter().copied() {
             let entry = record.entry();
@@ -1643,6 +1829,7 @@ where
             index,
             manager,
             shards,
+            region_access: _,
             rotation,
             health,
         } = runtime.into_core()?;
@@ -2535,7 +2722,7 @@ mod tests {
             let mut initial =
                 RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data))
                     .unwrap();
-            initial.put_value(b"survivor", b"old").unwrap();
+            eventually_admitted(|| initial.put_value(b"survivor", b"old"));
             initial.drain().unwrap();
             initial.close_warm().unwrap();
 
@@ -2583,7 +2770,7 @@ mod tests {
             }
             "write" | "drain" => {
                 let store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
-                store.put_value(b"replacement", b"new").unwrap();
+                eventually_admitted(|| store.put_value(b"replacement", b"new"));
                 if case == "drain" {
                     store.drain().unwrap();
                 }
@@ -2664,13 +2851,26 @@ mod tests {
             expected.push((key, value));
         }
         store.drain().unwrap();
+        let first_hash = hash_key(data.hash_seed, &expected[0].0);
+        let first_entry = store
+            .runtime()
+            .unwrap()
+            .core
+            .lookup_snapshot(first_hash)
+            .unwrap()
+            .unwrap();
+        let first_access =
+            &store.runtime().unwrap().core.region_access[first_entry.location.region_id() as usize];
+        assert!(!first_access.referenced.load(Ordering::Relaxed));
         for (key, value) in &expected {
             assert_eq!(store.get_value(key).unwrap().unwrap().value(), value);
         }
+        assert!(first_access.referenced.load(Ordering::Relaxed));
 
         // A 256 KiB record leaves insufficient room for another same-shard
         // record in this test geometry. Repeated writes therefore consume the
-        // free Region and then exercise sealed FIFO reuse.
+        // free Region and then exercise reclaim-before-reuse. With one spare
+        // Region, only the newest same-shard record is guaranteed to survive.
         let rotation_value = vec![0xa5; 256 * 1024];
         let mut recent = Vec::new();
         let rotations_before = store.detailed_snapshot().unwrap().region.rotations;
@@ -2685,7 +2885,7 @@ mod tests {
             31,
             "one full-Region signal must cause exactly one rotation"
         );
-        for key in recent.iter().rev().take(2) {
+        for key in recent.iter().rev().take(1) {
             assert_eq!(
                 store.get_value(key).unwrap().unwrap().value(),
                 rotation_value
@@ -2848,8 +3048,8 @@ mod tests {
             7,
             IndexEntry {
                 location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
-                seqno: 1,
             },
+            1,
         );
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let publisher_core = Arc::clone(&core);
@@ -2910,7 +3110,7 @@ mod tests {
                 outcome => panic!("unexpected staging outcome: {outcome:?}"),
             }
         }
-        let (first_key, first_hash, first_seqno) =
+        let (first_key, first_hash, _first_seqno) =
             first.expect("4 MiB span must contain target-size records");
         let (last_key, last_hash, last_seqno) =
             last.expect("4 MiB span must retain its final record");
@@ -2928,7 +3128,6 @@ mod tests {
         let Some(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
             panic!("completed first record must be published");
         };
-        assert_eq!(entry.seqno, first_seqno);
         assert_eq!(
             entry.location.record_len(),
             required_record_bytes(first_key.len(), value.len()).unwrap()
@@ -2937,7 +3136,6 @@ mod tests {
         let Some(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
             panic!("completed final record must be published");
         };
-        assert_eq!(last_entry.seqno, last_seqno);
         assert!(
             last_entry.location.record_len()
                 > required_record_bytes(last_key.len(), value.len()).unwrap()
@@ -2949,7 +3147,7 @@ mod tests {
         let read = runtime
             .begin_point_read(first_hash)
             .expect("completed entry must plan a Region read");
-        assert_eq!(read, entry);
+        assert_eq!(read.entry, entry);
 
         let read_buffer_bytes = (last_entry.location.record_len() as usize)
             .div_ceil(RECOVERY_PAGE_SIZE)
@@ -2966,6 +3164,7 @@ mod tests {
             .unwrap()
             .expect("completed record must validate as a disk hit");
         assert_eq!(hit.value(), value);
+        assert_eq!(hit.seqno(), last_seqno);
         drop(hit);
         assert_eq!(
             resources.managed_memory_snapshot().current_bytes,
@@ -3054,6 +3253,54 @@ mod tests {
         assert_eq!(
             resources.managed_memory_snapshot().current_bytes,
             memory_before_read
+        );
+
+        let current = runtime
+            .begin_point_read(owner_hash)
+            .expect("owner remains indexed");
+        let stale_generation = ReadCandidate {
+            region_generation: current.region_generation + 1,
+            ..current
+        };
+        let stale_plan = plan_read(data.geometry, owner_hash, stale_generation, true).unwrap();
+        assert!(
+            runtime
+                .read_value_from_plan(
+                    &engine,
+                    engine.try_reserve_read().unwrap(),
+                    resources.try_read_buffer(read_buffer_bytes).unwrap(),
+                    stale_plan,
+                    owner_key,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let wrong_length_location = PackedLocation::new(
+            current.entry.location.region_id(),
+            current.entry.location.offset(),
+            current.entry.location.record_len() + crate::format::RECORD_ALIGNMENT,
+        )
+        .unwrap();
+        let wrong_length = ReadCandidate {
+            entry: IndexEntry {
+                location: wrong_length_location,
+            },
+            ..current
+        };
+        let wrong_length_plan = plan_read(data.geometry, owner_hash, wrong_length, true).unwrap();
+        let wrong_length_read_bytes = wrong_length_plan.read_len;
+        assert!(
+            runtime
+                .read_value_from_plan(
+                    &engine,
+                    engine.try_reserve_read().unwrap(),
+                    resources.try_read_buffer(wrong_length_read_bytes).unwrap(),
+                    wrong_length_plan,
+                    owner_key,
+                )
+                .unwrap()
+                .is_none()
         );
 
         let hit = runtime
@@ -3147,70 +3394,6 @@ mod tests {
         let manager = runtime.manager.lock().unwrap();
         assert_eq!(manager.active_regions()[0], REGION_SHARDS);
         assert_eq!(manager.sealed_regions().back(), Some(&0));
-    }
-
-    #[test]
-    fn reclaim_hides_the_victim_regions_old_index_slots() {
-        let data = data_path_superblock();
-        let runtime = FileRegionRuntime::install(
-            PartitionedIndexStorage::anonymous(64).unwrap(),
-            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
-        )
-        .unwrap();
-        let hash = 19;
-        let old = IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
-            seqno: u64::from(REGION_SHARDS),
-        };
-        assert!(runtime.index.upsert(hash, old).unwrap());
-
-        for expected_hit in [Some(old), None] {
-            runtime
-                .manager
-                .inner
-                .lock()
-                .unwrap()
-                .request_rotation_for_test(0)
-                .unwrap();
-            assert!(runtime.rotate_shard(0).unwrap());
-            assert_eq!(runtime.index.lookup_raw(hash).unwrap(), expected_hit);
-        }
-        assert_eq!(runtime.manager.lock().unwrap().active_regions()[0], 0);
-    }
-
-    #[test]
-    fn recovery_watermarks_hide_stale_slots_without_rebuilding_the_index() {
-        let data = data_path_superblock();
-        let index = PartitionedIndexStorage::anonymous(64).unwrap();
-        let hash = 19;
-        let stale = IndexEntry {
-            location: crate::index::PackedLocation::new(1, 0, 32).unwrap(),
-            seqno: 1,
-        };
-        {
-            let mut partition = index.write_hash_partition(hash).unwrap();
-            let local_slot = crate::hashing::route_hash(hash, partition.slot_count());
-            partition
-                .replace_observed(
-                    local_slot,
-                    crate::index_storage::IndexSlotState::Empty,
-                    crate::index_storage::IndexSlotState::Value { hash, entry: stale },
-                )
-                .unwrap();
-        }
-        let mut metadata = empty_region_metadata(data, 64, REGION_SHARDS).unwrap();
-        metadata.partitions[0].physical_value_slots = 1;
-
-        let runtime = FileRegionRuntime::install(index, metadata).unwrap();
-
-        assert_eq!(runtime.index.lookup_raw(hash).unwrap(), None);
-        assert_eq!(
-            runtime.index.storage().physical_stats().unwrap(),
-            IndexPhysicalStats {
-                value: 1,
-                deleted: 0,
-            }
-        );
     }
 
     fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {
@@ -3374,7 +3557,13 @@ mod tests {
         let directory = TestDirectory::new();
         let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
-        let value = IndexSlot::DELETED;
+        let value = IndexSlot::from_state(crate::index_storage::IndexSlotState::Value {
+            fingerprint: 7,
+            displacement: 0,
+            entry: IndexEntry {
+                location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
+            },
+        });
 
         let mut first = RegionStore::open(
             config,

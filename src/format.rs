@@ -7,7 +7,7 @@ use crate::checksum::{Crc32c, crc32c};
 
 pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
 
-pub(crate) const RECORD_HEADER_SIZE: usize = 36;
+pub(crate) const RECORD_HEADER_SIZE: usize = 48;
 pub(crate) const RECORD_ALIGNMENT: u32 = 32;
 
 pub(crate) const MAX_KEY_SIZE: usize = 4 * 1024;
@@ -22,6 +22,8 @@ const RECORD_VALUE_LEN_OFFSET: usize = 8;
 const RECORD_SEQNO_OFFSET: usize = 12;
 const RECORD_KEY_HASH_OFFSET: usize = 20;
 const RECORD_PAYLOAD_CRC_OFFSET: usize = 28;
+const RECORD_REGION_GENERATION_OFFSET: usize = 32;
+const RECORD_LEN_OFFSET: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecordHeader {
@@ -30,6 +32,8 @@ pub(crate) struct RecordHeader {
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
     pub(crate) payload_crc: u32,
+    pub(crate) region_generation: u64,
+    pub(crate) record_len: u32,
 }
 
 impl RecordHeader {
@@ -51,6 +55,12 @@ impl RecordHeader {
         put_u64(&mut output, RECORD_SEQNO_OFFSET, self.seqno);
         put_u64(&mut output, RECORD_KEY_HASH_OFFSET, self.key_hash);
         put_u32(&mut output, RECORD_PAYLOAD_CRC_OFFSET, self.payload_crc);
+        put_u64(
+            &mut output,
+            RECORD_REGION_GENERATION_OFFSET,
+            self.region_generation,
+        );
+        put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
 
         let checksum = crc32c(&output);
         put_u32(&mut output, RECORD_HEADER_CRC_OFFSET, checksum);
@@ -72,6 +82,8 @@ impl RecordHeader {
             seqno: get_u64(input, RECORD_SEQNO_OFFSET)?,
             key_hash: get_u64(input, RECORD_KEY_HASH_OFFSET)?,
             payload_crc: get_u32(input, RECORD_PAYLOAD_CRC_OFFSET)?,
+            region_generation: get_u64(input, RECORD_REGION_GENERATION_OFFSET)?,
+            record_len: get_u32(input, RECORD_LEN_OFFSET)?,
         };
 
         if !header.has_valid_lengths() {
@@ -85,10 +97,17 @@ impl RecordHeader {
         let Ok(value_len) = usize::try_from(self.value_len) else {
             return false;
         };
-        if key_len > MAX_KEY_SIZE {
+        if key_len > MAX_KEY_SIZE
+            || self.region_generation == 0
+            || self.seqno < self.region_generation
+        {
             return false;
         }
-        Self::aligned_len(key_len, value_len).is_some()
+        Self::aligned_len(key_len, value_len).is_some_and(|minimum| {
+            self.record_len >= minimum
+                && self.record_len != 0
+                && self.record_len.is_multiple_of(RECORD_ALIGNMENT)
+        })
     }
 }
 
@@ -203,6 +222,8 @@ mod tests {
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
             payload_crc: crc32c(&payload),
+            region_generation: 17,
+            record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
         };
         let record_len = RecordHeader::aligned_len(key.len(), value.len()).unwrap();
         let mut encoded = vec![0_u8; record_len as usize];
@@ -226,6 +247,8 @@ mod tests {
             seqno: 101,
             key_hash: 0xfedc_ba98_7654_3210,
             payload_crc: 77,
+            region_generation: 99,
+            record_len: 64,
         };
 
         assert_eq!(RecordHeader::aligned_len(3, 5), Some(64));
@@ -240,6 +263,8 @@ mod tests {
             seqno: 2,
             key_hash: 3,
             payload_crc: 4,
+            region_generation: 1,
+            record_len: 64,
         };
         let mut encoded = header.encode();
         encoded[RECORD_SEQNO_OFFSET] ^= 0x80;

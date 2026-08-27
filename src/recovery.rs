@@ -1198,8 +1198,8 @@ mod tests {
     fn recovery_image_length_is_exact_and_checked() {
         assert_eq!(recovery_image_index_len(0), None);
         assert_eq!(recovery_image_index_len(1), Some(4096));
-        assert_eq!(recovery_image_index_len(168), Some(4096));
-        assert_eq!(recovery_image_index_len(169), Some(8192));
+        assert_eq!(recovery_image_index_len(403), Some(4096));
+        assert_eq!(recovery_image_index_len(404), Some(8192));
         assert_eq!(recovery_image_index_len(u64::MAX), None);
     }
 

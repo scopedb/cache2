@@ -10,6 +10,7 @@ Cache
 ├── append shards + global Region FIFO
 ├── bounded read I/O pool
 ├── bounded write I/O pool
+├── one-depth background reclaim I/O lane
 └── data, state, and clean-image files
 ```
 
@@ -40,8 +41,8 @@ there is no foreground retry protocol or global admission queue.
 2. On miss, probe one L2 index partition without waiting for contention.
 3. For a candidate, reserve one immediately available read-engine slot and
    allocate its exact aligned range against the managed-memory limit.
-4. Perform one record read and validate location, sequence, hash, full key,
-   lengths, and checksum locally.
+4. Perform one record read and validate location, Region generation, hash,
+   full key, exact length, and checksum locally.
 5. Promote to L1 when bounded admission succeeds; otherwise return the
    exact-size Region-backed value.
 
@@ -59,14 +60,24 @@ the cache contract.
 ## Reclamation and bounds
 
 Every append shard owns one Active Region. All other Regions share one global
-free/sealed FIFO, allowing any shard to consume free capacity and reclaim the
-oldest sealed Region.
+free/sealed FIFO, allowing any shard to consume clean capacity. A sealed Region
+is never reused directly. When the free reserve falls below one Region per
+append shard, the background worker reads one sealed prefix sequentially,
+walks its self-sized records, and removes each index mapping only if it still
+points at that exact address. Only then does the Region enter the free FIFO.
 
-Reclaim advances the Region generation and its index watermark. It does not
-scan the index: old physical slots become invalid immediately and are reused
-lazily by later bounded probes. The fixed index stores 24-byte slots and caps
-point work at 64 probes. Index-partition contention is a miss or mutation
-overload, never a wait.
+An L2 candidate marks its Region with one relaxed reference bit during the
+existing index pass. Reclaim gives referenced FIFO heads one bounded second
+chance, inspecting at most eight alternatives; this adds no request-path lock
+or I/O. Every record also carries its exact Region generation. The read plan
+captures that generation from a per-Region atomic, and completion compares it
+locally before returning the record.
+
+The fixed index stores 10-byte slots with four deterministic candidates, at
+most one relocation, and no tombstones or generation table. Point work is
+therefore capped at four primary probes plus the bounded one-hop relocation
+work on mutation. Index-partition contention is a miss or mutation overload,
+never a wait.
 
 L1 uses fixed startup allocations for entries, CLOCK metadata, free lists, and
 its prehashed directory. Each same-hash chain is capped at eight full keys.

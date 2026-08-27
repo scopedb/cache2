@@ -728,7 +728,7 @@ fn report_sample(
         .saturating_add(io.write.requests_cancelled)
         .saturating_add(io.write.requests_failed);
     println!(
-        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} io_submitted={} io_completed={} io_errors={} io_in_flight_peak={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
+        "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} reclaimed_regions={} reclaim_second_chances={} reclaim_bytes={} reclaim_records={} reclaim_index_removed={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_relocations={} index_overflow_evictions={} index_conditional_remove_misses={} io_submitted={} io_completed={} io_errors={} io_in_flight_peak={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
         elapsed.as_secs_f64(),
         counters.writes,
         counters.deletes,
@@ -750,16 +750,20 @@ fn report_sample(
         resources.l1_bypasses,
         resources.write_rejections,
         resources.region_rotations,
+        resources.reclaim.regions,
+        resources.reclaim.region_second_chances,
+        resources.reclaim.bytes_read,
+        resources.reclaim.records_scanned,
+        resources.reclaim.index_entries_removed,
         detailed.l1.resident_entries,
         detailed.l1.entry_capacity,
         detailed.l1.resident_bytes,
         detailed.l1.retained_bytes,
         detailed.l1.metadata_bytes,
         detailed.index.physical_value_slots,
-        detailed.index.deleted_slots,
-        detailed.index.deleted_slot_reuses,
-        detailed.index.stale_slot_reuses,
-        detailed.index.live_slot_replacements,
+        detailed.index.relocations,
+        detailed.index.overflow_evictions,
+        detailed.index.conditional_remove_misses,
         io_submitted,
         io_completed,
         io.read

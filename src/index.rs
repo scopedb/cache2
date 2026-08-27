@@ -23,10 +23,12 @@ pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMEN
 pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32 + 1) * RECORD_LEN_ALIGNMENT;
 pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
 pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
-/// 512M slots is a 12 GiB index at the stable 24-byte slot size and covers a
-/// 1 TiB cache containing 4 KiB records at the recommended 1.25x load factor.
+/// 512M buckets is a 5 GiB index at the stable 10-byte bucket size and covers
+/// a 4 TiB cache containing 16 KiB records at the recommended 2x capacity.
 pub(crate) const MAX_INDEX_SLOTS: usize = 512 * 1024 * 1024;
-pub(crate) const MAX_INDEX_PROBES: usize = 64;
+pub(crate) const INDEX_CANDIDATES: usize = 4;
+#[cfg(feature = "benchmarking")]
+pub(crate) const MAX_INDEX_PROBES: usize = INDEX_CANDIDATES;
 pub(crate) const MAX_INDEX_PARTITIONS: usize = 4096;
 
 /// A record location packed into one machine word.
@@ -142,7 +144,6 @@ impl std::error::Error for PackedLocationError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IndexEntry {
     pub(crate) location: PackedLocation,
-    pub(crate) seqno: u64,
 }
 
 /// Stable power-of-two partition routing for persisted index layouts.

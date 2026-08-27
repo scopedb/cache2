@@ -126,7 +126,10 @@ pub(crate) fn encode_value_into_hashed(
             reserved: reservation.record_bytes,
         });
     }
-    if reservation.seqno == 0 || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT) {
+    if reservation.region_created_seqno == 0
+        || reservation.seqno < reservation.region_created_seqno
+        || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT)
+    {
         return Err(RecordEncodeError::InvalidReservation);
     }
 
@@ -169,13 +172,12 @@ pub(crate) fn encode_value_into_hashed(
         seqno: reservation.seqno,
         key_hash: hash,
         payload_crc: payload_crc.finish(),
+        region_generation: reservation.region_created_seqno,
+        record_len: reservation.record_bytes,
     };
     destination[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
 
-    Ok(IndexEntry {
-        location,
-        seqno: reservation.seqno,
-    })
+    Ok(IndexEntry { location })
 }
 
 pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
@@ -209,6 +211,7 @@ mod tests {
         let reservation = RegionAppendReservation {
             shard_id: 0,
             region_id: 7,
+            region_created_seqno: 11,
             offset: 0,
             record_bytes: required,
             seqno: 17,
@@ -228,8 +231,6 @@ mod tests {
         assert_eq!(entry.location.region_id(), 7);
         assert_eq!(entry.location.offset(), 0);
         assert_eq!(entry.location.record_len(), required);
-        assert_eq!(entry.seqno, 17);
-
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(usize::from(header.key_len), key.len());
         assert_eq!(header.value_len, value.len() as u32);
@@ -279,6 +280,7 @@ mod tests {
         let reservation = RegionAppendReservation {
             shard_id: 0,
             region_id: 0,
+            region_created_seqno: 1,
             offset: 0,
             record_bytes: required,
             seqno: 1,
@@ -289,5 +291,22 @@ mod tests {
             Err(RecordEncodeError::DestinationLengthMismatch { .. })
         ));
         assert!(wrong_destination.iter().all(|byte| *byte == 0xa5));
+
+        let invalid_generation = RegionAppendReservation {
+            region_created_seqno: 0,
+            ..reservation
+        };
+        let mut exact_destination = vec![0xa5; required as usize];
+        assert_eq!(
+            encode_value_into(
+                &mut exact_destination,
+                invalid_generation,
+                0,
+                b"key",
+                &[7; 16],
+            ),
+            Err(RecordEncodeError::InvalidReservation)
+        );
+        assert!(exact_destination.iter().all(|byte| *byte == 0xa5));
     }
 }

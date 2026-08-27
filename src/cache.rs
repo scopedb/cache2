@@ -35,7 +35,7 @@ const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
-const STATIC_FINGERPRINT_SCHEMA: u64 = 2;
+const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
 
 pub type Result<T> = std::io::Result<T>;
 
@@ -62,9 +62,7 @@ impl StaticConfig {
     pub fn new(capacity_bytes: u64) -> Self {
         let expected_entries = capacity_bytes / DEFAULT_EXPECTED_ENTRY_BYTES;
         let index_slots = expected_entries
-            .saturating_mul(5)
-            .saturating_add(3)
-            .saturating_div(4)
+            .saturating_mul(2)
             .clamp(MIN_INDEX_SLOTS as u64, MAX_INDEX_SLOTS as u64)
             as usize;
         Self {
@@ -90,14 +88,10 @@ impl StaticConfig {
     /// keys.
     ///
     /// This is not a lifetime-write count. The resulting index uses roughly
-    /// 1.25 physical slots per expected live key and is part of the static disk
+    /// two physical buckets per expected live key and is part of the static disk
     /// identity.
     pub fn with_expected_entries(mut self, entries: usize) -> Self {
-        self.index_slots = entries
-            .saturating_mul(5)
-            .saturating_add(3)
-            .saturating_div(4)
-            .max(MIN_INDEX_SLOTS);
+        self.index_slots = entries.saturating_mul(2).max(MIN_INDEX_SLOTS);
         self
     }
 
@@ -625,7 +619,7 @@ mod tests {
     fn four_tib_default_index_matches_sixteen_kib_entries() {
         let config = StaticConfig::new(4_u64 << 40);
 
-        assert_eq!(config.index_slots(), 335_544_320);
+        assert_eq!(config.index_slots(), 536_870_912);
         config.validate().unwrap();
     }
 }

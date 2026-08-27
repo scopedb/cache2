@@ -8,7 +8,8 @@
 
 use crate::checksum::Crc32c;
 use crate::index::{
-    IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation, PackedLocationError, index_partition_for,
+    INDEX_CANDIDATES, IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation, PackedLocationError,
+    index_partition_for,
 };
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -23,7 +24,7 @@ use std::os::fd::AsRawFd;
 
 pub(crate) const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub(crate) const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
-pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 24;
+pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 10;
 pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
     (INDEX_IMAGE_PAGE_SIZE - INDEX_IMAGE_PAGE_HEADER_SIZE) / INDEX_IMAGE_SLOT_SIZE;
 
@@ -34,7 +35,7 @@ pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
 /// does not issue one positioned syscall per page.
 pub(crate) const WARM_IMAGE_WRITE_BATCH_BYTES: usize = 1024 * 1024;
 
-const PAGE_MAGIC: [u8; 8] = *b"CRSIDX1\0";
+const PAGE_MAGIC: [u8; 8] = *b"C2SIDX1\0";
 const PAGE_FORMAT_VERSION: u16 = 1;
 
 const PAGE_VERSION_OFFSET: usize = 8;
@@ -59,10 +60,10 @@ const PAGE_STATE_REJECTED: u8 = 4;
 const IMAGE_STATE_USABLE: u8 = 0;
 const IMAGE_STATE_REJECTED: u8 = 1;
 
-const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 168);
+const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 403);
 const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
-        == INDEX_IMAGE_PAGE_SIZE
+        <= INDEX_IMAGE_PAGE_SIZE
 );
 const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES.is_multiple_of(INDEX_IMAGE_PAGE_SIZE));
 
@@ -85,21 +86,21 @@ pub(crate) struct IndexPartitionRange {
 /// The partition count is the greatest usable power of two bounded by the physical
 /// page count and [`MAX_INDEX_PARTITIONS`]. Extra pages are assigned to the final
 /// partitions so the partially filled final image page stays with a larger range.
-/// If that range would still contain fewer than eight slots, the partition count is
+/// If that range would still contain fewer than four buckets, the partition count is
 /// halved until every range is a valid bounded-probe table.
 pub(crate) fn canonical_index_partition_ranges(
     slot_count: usize,
 ) -> Result<Box<[IndexPartitionRange]>, IndexStorageError> {
-    if slot_count < 8 {
+    if slot_count < INDEX_CANDIDATES {
         return Err(IndexStorageError::InvalidArgument(
-            "partitioned index storage requires at least 8 slots",
+            "partitioned index storage requires at least 4 buckets",
         ));
     }
     let layout = ImageLayout::new(slot_count)?;
     let maximum = layout.page_count.min(MAX_INDEX_PARTITIONS);
     let mut partition_count = greatest_power_of_two(maximum);
     while partition_count > 1
-        && final_partition_slots(slot_count, layout.page_count, partition_count)? < 8
+        && final_partition_slots(slot_count, layout.page_count, partition_count)? < INDEX_CANDIDATES
     {
         partition_count /= 2;
     }
@@ -126,9 +127,9 @@ pub(crate) fn canonical_index_partition_ranges(
             .checked_sub(first_slot)
             .ok_or(IndexStorageError::SizeOverflow)?;
         let range_slot_count = slots_remaining.min(range_capacity);
-        if page_count == 0 || range_slot_count < 8 {
+        if page_count == 0 || range_slot_count < INDEX_CANDIDATES {
             return Err(IndexStorageError::InvalidArgument(
-                "canonical index partition contains fewer than 8 slots",
+                "canonical index partition contains fewer than 4 buckets",
             ));
         }
         ranges.push(IndexPartitionRange {
@@ -176,27 +177,26 @@ fn final_partition_slots(
         .ok_or(IndexStorageError::SizeOverflow)
 }
 
-/// Logical fields in one Index Image slot.
+/// Logical fields in one Index Image bucket.
 ///
 /// This type is intentionally not `repr(C)` and is never copied directly to
-/// or from an image. Its stable representation is exactly 24 bytes encoded by
-/// [`Self::encode`] and [`Self::decode`]. A zeroed slot is the empty state.
+/// or from an image. Its stable representation is exactly 10 bytes encoded by
+/// [`Self::encode`] and [`Self::decode`]. A zeroed bucket is the empty state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexSlot {
-    pub(crate) hash: u64,
-    pub(crate) location_raw: u64,
-    pub(crate) seqno: u64,
+    pub(crate) encoded_location: u64,
+    pub(crate) control: u16,
 }
 
-/// Typed runtime meaning of one canonical Index Image slot.
-///
-/// `Deleted` is the open-addressing probe marker. Every `Value` has a non-zero
-/// sequence and a valid [`PackedLocation`].
+/// Typed runtime meaning of one canonical Index Image bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexSlotState {
     Empty,
-    Deleted,
-    Value { hash: u64, entry: IndexEntry },
+    Value {
+        fingerprint: u16,
+        displacement: u8,
+        entry: IndexEntry,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,7 +209,7 @@ impl fmt::Display for IndexSlotSemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NonCanonicalMarker => {
-                formatter.write_str("slot is neither Empty, Deleted, nor a valid value")
+                formatter.write_str("bucket is neither Empty nor a valid value")
             }
             Self::InvalidLocation(error) => write!(formatter, "invalid packed location: {error}"),
         }
@@ -218,76 +218,62 @@ impl fmt::Display for IndexSlotSemanticError {
 
 impl IndexSlot {
     pub(crate) const EMPTY: Self = Self {
-        hash: 0,
-        location_raw: 0,
-        seqno: 0,
-    };
-
-    pub(crate) const DELETED: Self = Self {
-        hash: 0,
-        location_raw: u64::MAX,
-        seqno: 0,
+        encoded_location: 0,
+        control: 0,
     };
 
     pub(crate) const fn from_state(state: IndexSlotState) -> Self {
         match state {
             IndexSlotState::Empty => Self::EMPTY,
-            IndexSlotState::Deleted => Self::DELETED,
-            IndexSlotState::Value { hash, entry } => Self {
-                hash,
-                location_raw: entry.location.raw(),
-                seqno: entry.seqno,
+            IndexSlotState::Value {
+                fingerprint,
+                displacement,
+                entry,
+            } => Self {
+                encoded_location: entry.location.raw() + 1,
+                control: fingerprint | ((displacement as u16) << 14),
             },
         }
     }
 
     pub(crate) fn encode(self, output: &mut [u8; INDEX_IMAGE_SLOT_SIZE]) {
-        output[0..8].copy_from_slice(&self.hash.to_le_bytes());
-        output[8..16].copy_from_slice(&self.location_raw.to_le_bytes());
-        output[16..24].copy_from_slice(&self.seqno.to_le_bytes());
+        output[0..8].copy_from_slice(&self.encoded_location.to_le_bytes());
+        output[8..10].copy_from_slice(&self.control.to_le_bytes());
     }
 
     pub(crate) fn decode(input: &[u8; INDEX_IMAGE_SLOT_SIZE]) -> Self {
         Self {
-            hash: read_u64(input, 0),
-            location_raw: read_u64(input, 8),
-            seqno: read_u64(input, 16),
+            encoded_location: read_u64(input, 0),
+            control: read_u16(input, 8),
         }
     }
 
     pub(crate) fn runtime_state(self) -> Result<IndexSlotState, IndexSlotSemanticError> {
-        if self == Self::EMPTY {
-            return Ok(IndexSlotState::Empty);
+        if self.encoded_location == 0 {
+            return if self.control == 0 {
+                Ok(IndexSlotState::Empty)
+            } else {
+                Err(IndexSlotSemanticError::NonCanonicalMarker)
+            };
         }
-        if self == Self::DELETED {
-            return Ok(IndexSlotState::Deleted);
-        }
-        if self.seqno == 0 {
+        let raw = self.encoded_location - 1;
+        if raw >> 63 != 0 {
             return Err(IndexSlotSemanticError::NonCanonicalMarker);
         }
-        if self.location_raw == u64::MAX {
-            return Err(IndexSlotSemanticError::NonCanonicalMarker);
-        }
-        let location = PackedLocation::try_from_raw(self.location_raw)
-            .map_err(IndexSlotSemanticError::InvalidLocation)?;
+        let location =
+            PackedLocation::try_from_raw(raw).map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
-            hash: self.hash,
-            entry: IndexEntry {
-                location,
-                seqno: self.seqno,
-            },
+            fingerprint: self.control & 0x3fff,
+            displacement: (self.control >> 14) as u8,
+            entry: IndexEntry { location },
         })
     }
 
     fn physical_kind(self) -> SlotPhysicalKind {
-        if self == Self::EMPTY {
+        if self.encoded_location == 0 {
             SlotPhysicalKind::Empty
-        } else if self.location_raw == u64::MAX {
-            SlotPhysicalKind::Deleted
-        } else if self.seqno != 0 {
-            SlotPhysicalKind::Value
         } else {
-            SlotPhysicalKind::Deleted
+            SlotPhysicalKind::Value
         }
     }
 }
@@ -309,7 +295,7 @@ impl IndexImageBinding {
     }
 }
 
-/// Counts of the two non-empty physical slot states.
+/// Counts carried by clean metadata. Deleted buckets are forbidden by v1.
 ///
 /// Clean recovery metadata validates these counts before passing them to
 /// [`IndexStorage::map_private`], avoiding an O(slot-count) startup scan.
@@ -328,7 +314,7 @@ impl IndexPhysicalStats {
         let Ok(slot_count) = u64::try_from(slot_count) else {
             return false;
         };
-        self.total().is_some_and(|total| total <= slot_count)
+        self.deleted == 0 && self.total().is_some_and(|total| total <= slot_count)
     }
 
     fn transitioned(
@@ -347,7 +333,6 @@ impl IndexPhysicalStats {
         let counter = match kind {
             SlotPhysicalKind::Empty => return Some(()),
             SlotPhysicalKind::Value => &mut self.value,
-            SlotPhysicalKind::Deleted => &mut self.deleted,
         };
         *counter = counter.checked_sub(1)?;
         Some(())
@@ -357,7 +342,6 @@ impl IndexPhysicalStats {
         let counter = match kind {
             SlotPhysicalKind::Empty => return Some(()),
             SlotPhysicalKind::Value => &mut self.value,
-            SlotPhysicalKind::Deleted => &mut self.deleted,
         };
         *counter = counter.checked_add(1)?;
         Some(())
@@ -368,7 +352,6 @@ impl IndexPhysicalStats {
 enum SlotPhysicalKind {
     Empty,
     Value,
-    Deleted,
 }
 
 /// The lazy validation state of one physical image page.
@@ -674,51 +657,23 @@ impl IndexStorage {
         self.core.read_slot(self.global_slot(slot)?)
     }
 
-    fn probe_states(
-        &self,
-        start: usize,
-        limit: usize,
-        mut visit: impl FnMut(usize, IndexSlotState) -> bool,
-    ) -> Result<(), IndexStorageError> {
-        if start >= self.range.slot_count || limit > self.range.slot_count {
-            return Err(IndexStorageError::InvalidArgument(
-                "index probe exceeds its partition",
-            ));
-        }
-        // Validate only on page changes, then recheck the shared image latch
-        // once after decoding so a concurrent rejection cannot authorize a
-        // result.
-        let mut validated_page = None;
-        for step in 0..limit {
-            let index = start + step;
-            let local_slot = if index >= self.range.slot_count {
-                index - self.range.slot_count
-            } else {
-                index
-            };
-            let global_slot = self.global_slot(local_slot)?;
-            let (page, offset) = self.core.slot_address(global_slot)?;
-            if validated_page != Some(page) {
-                self.core.ensure_page_valid(page)?;
-                validated_page = Some(page);
-            }
-            let state = self
-                .core
-                .decode_at(offset)
-                .runtime_state()
-                .map_err(|reason| {
-                    self.core.reject_image();
-                    IndexStorageError::CorruptSlot {
-                        slot_index: global_slot,
-                        reason,
-                    }
-                })?;
-            if visit(local_slot, state) {
-                break;
-            }
-        }
-        self.core
-            .ensure_image_usable(validated_page.unwrap_or(self.range.first_page))
+    fn state_at(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
+        let global_slot = self.global_slot(slot)?;
+        let (page, offset) = self.core.slot_address(global_slot)?;
+        self.core.ensure_page_valid(page)?;
+        let state = self
+            .core
+            .decode_at(offset)
+            .runtime_state()
+            .map_err(|reason| {
+                self.core.reject_image();
+                IndexStorageError::CorruptSlot {
+                    slot_index: global_slot,
+                    reason,
+                }
+            })?;
+        self.core.ensure_image_usable(page)?;
+        Ok(state)
     }
 
     fn replace_observed_state(
@@ -1190,13 +1145,8 @@ impl IndexPartitionReadGuard<'_> {
         self.range.slot_count
     }
 
-    pub(crate) fn probe(
-        &self,
-        start: usize,
-        limit: usize,
-        visit: impl FnMut(usize, IndexSlotState) -> bool,
-    ) -> Result<(), IndexStorageError> {
-        self.guard.probe_states(start, limit, visit)
+    pub(crate) fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
+        self.guard.state_at(slot)
     }
 }
 
@@ -1210,13 +1160,8 @@ impl IndexPartitionWriteGuard<'_> {
         self.range.slot_count
     }
 
-    pub(crate) fn probe(
-        &self,
-        start: usize,
-        limit: usize,
-        visit: impl FnMut(usize, IndexSlotState) -> bool,
-    ) -> Result<(), IndexStorageError> {
-        self.guard.probe_states(start, limit, visit)
+    pub(crate) fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
+        self.guard.state_at(slot)
     }
 
     pub(crate) fn replace_observed(
@@ -2041,9 +1986,8 @@ mod tests {
         let location =
             PackedLocation::new((seed % 64) as u32, ((seed % 128) * 8) as u32, 32).unwrap();
         IndexSlot {
-            hash: 0x0102_0304_0506_0708 ^ seed,
-            location_raw: location.raw(),
-            seqno: seed + 1,
+            encoded_location: location.raw() + 1,
+            control: ((seed as u16 & 3) << 14) | (seed as u16 & 0x3fff),
         }
     }
 
@@ -2052,12 +1996,12 @@ mod tests {
         type RangeShape = (usize, usize, usize, usize);
         let cases: &[(usize, &[RangeShape])] = &[
             (8, &[(0, 1, 0, 8)]),
-            (168, &[(0, 1, 0, 168)]),
-            (169, &[(0, 2, 0, 169)]),
-            (175, &[(0, 2, 0, 175)]),
-            (176, &[(0, 1, 0, 168), (1, 1, 168, 8)]),
-            (336, &[(0, 1, 0, 168), (1, 1, 168, 168)]),
-            (337, &[(0, 1, 0, 168), (1, 2, 168, 169)]),
+            (403, &[(0, 1, 0, 403)]),
+            (404, &[(0, 2, 0, 404)]),
+            (406, &[(0, 2, 0, 406)]),
+            (407, &[(0, 1, 0, 403), (1, 1, 403, 4)]),
+            (806, &[(0, 1, 0, 403), (1, 1, 403, 403)]),
+            (807, &[(0, 1, 0, 403), (1, 2, 403, 404)]),
         ];
 
         for &(slot_count, expected) in cases {
@@ -2080,13 +2024,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, expected, "slot_count={slot_count}");
-            assert!(actual.iter().all(|range| range.3 >= 8));
+            assert!(actual.iter().all(|range| range.3 >= INDEX_CANDIDATES));
         }
     }
 
     #[test]
     fn partitioned_storage_mutates_adjacent_ranges_and_roundtrips_stats() {
-        const SLOT_COUNT: usize = 337;
+        const SLOT_COUNT: usize = 807;
         const GENERATION: u64 = 113;
         const FIRST_RANGE_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
         const SECOND_RANGE_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
@@ -2102,13 +2046,13 @@ mod tests {
         );
 
         let first_value = sample_slot(1);
-        let second_deleted = IndexSlot::DELETED;
+        let second_value = sample_slot(2);
         let tail_value = sample_slot(3);
         source
             .write_slot(FIRST_RANGE_LAST_SLOT, first_value)
             .unwrap();
         source
-            .write_slot(SECOND_RANGE_FIRST_SLOT, second_deleted)
+            .write_slot(SECOND_RANGE_FIRST_SLOT, second_value)
             .unwrap();
         source.write_slot(SLOT_COUNT - 1, tail_value).unwrap();
         assert_eq!(
@@ -2117,7 +2061,7 @@ mod tests {
         );
         assert_eq!(
             source.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
-            second_deleted
+            second_value
         );
 
         let expected_partition_stats: Box<[IndexPhysicalStats]> = Box::new([
@@ -2126,16 +2070,16 @@ mod tests {
                 deleted: 0,
             },
             IndexPhysicalStats {
-                value: 1,
-                deleted: 1,
+                value: 2,
+                deleted: 0,
             },
         ]);
         assert_eq!(source.partition_stats().unwrap(), expected_partition_stats);
         assert_eq!(
             source.physical_stats().unwrap(),
             IndexPhysicalStats {
-                value: 2,
-                deleted: 1,
+                value: 3,
+                deleted: 0,
             }
         );
 
@@ -2167,7 +2111,7 @@ mod tests {
         );
         assert_eq!(
             recovered.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
-            second_deleted
+            second_value
         );
         assert_eq!(recovered.read_slot(SLOT_COUNT - 1).unwrap(), tail_value);
 
@@ -2327,7 +2271,7 @@ mod tests {
             .write_warm_image(&mut image, binding(GENERATION))
             .unwrap();
         let page: &mut [u8; INDEX_IMAGE_PAGE_SIZE] = image.as_mut_slice().try_into().unwrap();
-        put_u64(page, INDEX_IMAGE_PAGE_HEADER_SIZE, 1);
+        put_u64(page, INDEX_IMAGE_PAGE_HEADER_SIZE, u64::MAX);
         let checksum = page_checksum(page);
         put_u32(page, PAGE_CHECKSUM_OFFSET, checksum);
 
@@ -2364,21 +2308,18 @@ mod tests {
         let value = sample_slot(0);
         let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
         value.encode(&mut encoded);
-        assert_eq!(&encoded[0..8], &value.hash.to_le_bytes());
-        assert_eq!(&encoded[8..16], &value.location_raw.to_le_bytes());
-        assert_eq!(&encoded[16..24], &value.seqno.to_le_bytes());
+        assert_eq!(&encoded[0..8], &value.encoded_location.to_le_bytes());
+        assert_eq!(&encoded[8..10], &value.control.to_le_bytes());
         assert_eq!(IndexSlot::decode(&encoded), value);
-        assert_eq!(IndexSlot::decode(&[0_u8; 24]), IndexSlot::EMPTY);
+        assert_eq!(IndexSlot::decode(&[0_u8; 10]), IndexSlot::EMPTY);
 
         let noncanonical = IndexSlot {
-            hash: 0x8877_6655_4433_2211,
-            location_raw: u64::MAX,
-            seqno: 19,
+            encoded_location: 0,
+            control: 19,
         };
         noncanonical.encode(&mut encoded);
-        assert_eq!(&encoded[0..8], &0x8877_6655_4433_2211_u64.to_le_bytes());
-        assert_eq!(&encoded[8..16], &u64::MAX.to_le_bytes());
-        assert_eq!(&encoded[16..24], &19_u64.to_le_bytes());
+        assert_eq!(&encoded[0..8], &0_u64.to_le_bytes());
+        assert_eq!(&encoded[8..10], &19_u16.to_le_bytes());
         assert_eq!(IndexSlot::decode(&encoded), noncanonical);
         assert_eq!(
             noncanonical.runtime_state(),
@@ -2400,14 +2341,6 @@ mod tests {
             }
         );
 
-        storage.write_slot(0, IndexSlot::DELETED).unwrap();
-        assert_eq!(
-            storage.physical_stats(),
-            IndexPhysicalStats {
-                value: 0,
-                deleted: 1,
-            }
-        );
         storage.write_slot(0, IndexSlot::EMPTY).unwrap();
         assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
     }

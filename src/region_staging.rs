@@ -6,7 +6,6 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::format::RECORD_ALIGNMENT;
-#[cfg(test)]
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation};
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
@@ -40,11 +39,12 @@ pub(crate) struct ShardFillSnapshot {
 pub(crate) struct StagedRecord {
     hash: u64,
     entry: IndexEntry,
+    seqno: u64,
 }
 
 impl StagedRecord {
-    pub(crate) const fn new(hash: u64, entry: IndexEntry) -> Self {
-        Self { hash, entry }
+    pub(crate) const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
+        Self { hash, entry, seqno }
     }
 
     pub(crate) const fn hash(self) -> u64 {
@@ -53,6 +53,10 @@ impl StagedRecord {
 
     pub(crate) const fn entry(self) -> IndexEntry {
         self.entry
+    }
+
+    pub(crate) const fn seqno(self) -> u64 {
+        self.seqno
     }
 
     fn set_location(&mut self, location: PackedLocation) {
@@ -548,7 +552,7 @@ impl RegionStaging {
                 .checked_add(u64::from(old_record_len))
                 .ok_or(StagingError::StaleReceipt)?;
             if location.region_id() != receipt.region_id
-                || last_entry.seqno != receipt.max_seqno
+                || last.seqno() != receipt.max_seqno
                 || record_end != receipt.unpadded_end_offset
             {
                 return Err(StagingError::StaleReceipt);
@@ -565,6 +569,22 @@ impl RegionStaging {
                     .map_err(|_| StagingError::Invariant("padded location is invalid"))?;
 
             bytes[used..padded_used].fill(0);
+            let record_start = used
+                .checked_sub(old_record_len as usize)
+                .ok_or(StagingError::Invariant("staging record start underflow"))?;
+            let header_end = record_start
+                .checked_add(RECORD_HEADER_SIZE)
+                .ok_or(StagingError::Invariant("staging header range overflow"))?;
+            let mut header = RecordHeader::decode(
+                bytes
+                    .get(record_start..header_end)
+                    .ok_or(StagingError::Invariant("staging header is out of bounds"))?,
+            )
+            .ok_or(StagingError::Invariant(
+                "staging final record header is invalid",
+            ))?;
+            header.record_len = new_record_len;
+            bytes[record_start..header_end].copy_from_slice(&header.encode());
             fill.records
                 .last_mut()
                 .expect("validated non-empty staging records")
@@ -735,7 +755,7 @@ impl RegionStaging {
         if location.region_id() != receipt.region_id
             || location.offset() != receipt.offset
             || location.record_len() != receipt.record_bytes
-            || entry.seqno != receipt.seqno
+            || record.seqno() != receipt.seqno
         {
             return Err(StagingError::StaleReceipt);
         }
@@ -802,8 +822,8 @@ fn span_matches_records(span: RegionWriteSpan, records: &[StagedRecord]) -> bool
         let entry = record.entry();
         if entry.location.region_id() != span.region_id
             || u64::from(entry.location.offset()) != offset
-            || entry.seqno == 0
-            || entry.seqno <= max_seqno
+            || record.seqno() == 0
+            || record.seqno() <= max_seqno
         {
             return false;
         }
@@ -811,7 +831,7 @@ fn span_matches_records(span: RegionWriteSpan, records: &[StagedRecord]) -> bool
             return false;
         };
         offset = end;
-        max_seqno = entry.seqno;
+        max_seqno = record.seqno();
     }
     offset == span.end_offset && max_seqno == span.max_seqno
 }
@@ -847,6 +867,7 @@ mod tests {
         let receipt = RegionAppendReservation {
             shard_id: 0,
             region_id: 1,
+            region_created_seqno: 1,
             offset,
             record_bytes,
             seqno,
@@ -855,8 +876,8 @@ mod tests {
             seqno.wrapping_mul(17),
             IndexEntry {
                 location: PackedLocation::new(1, offset, record_bytes).unwrap(),
-                seqno,
             },
+            seqno,
         );
         (receipt, record)
     }
@@ -889,6 +910,8 @@ mod tests {
             seqno: receipt.seqno,
             key_hash: record.hash(),
             payload_crc: 0,
+            region_generation: receipt.region_created_seqno,
+            record_len: receipt.record_bytes,
         };
         target[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
         Ok(record)
@@ -1189,8 +1212,8 @@ mod tests {
             record.hash(),
             IndexEntry {
                 location: entry.location,
-                seqno: entry.seqno + 1,
             },
+            record.seqno() + 1,
         );
         assert_eq!(
             staging.encode_reserved(receipt, |target| {
