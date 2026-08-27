@@ -84,7 +84,9 @@ two-access signal rather than a hit count: a reinserted entry needs two later L2
 candidate accesses to become eligible for another reclaim cycle. Every record
 also carries its exact Region generation. The read plan captures that
 generation from a per-Region atomic, and completion compares it locally before
-returning the record.
+returning the record. The logical sequence remains in the record and L1, where
+it orders bounded publication and promotion; the compact L2 read token does not
+carry it or use it as a freshness fence.
 
 The fixed index stores 8-byte slots with 20-bit Region and offset fields, an
 8-bit record-size upper class, a 14-bit fingerprint, and a 2-bit displacement.

@@ -82,13 +82,16 @@ capacity; this is expected to be uncommon in normal operation.
 
 ## Concurrency and Versioning
 
-- Every Region record has a monotonic sequence number. Use it to reject a
-  mismatched physical record and to prefer a newer value where this is already
-  part of a bounded mutation, not to guarantee read freshness.
+- Every Region record has a logical sequence number. Preserve it across
+  reinsertion and use it to prefer a newer value where this is already part of
+  a bounded L1 mutation. The compact L2 index does not retain it, so it is not
+  a read token and does not guarantee freshness.
 - Concurrent and delayed operations may expose an older valid version.
 - After Region I/O, validate the returned record locally against the planned
-  location, sequence number, hash, full key, lengths, and checksum.
-  Do not perform a second index lookup or a global freshness check.
+  physical address, Region generation, size class, hash, full key, lengths,
+  and header and payload checksums. Require a structurally valid logical
+  sequence for L1 promotion, but do not perform a second index lookup or a
+  global freshness check.
 
 ## Cache and Durability Semantics
 
