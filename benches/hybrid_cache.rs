@@ -12,7 +12,10 @@ use cache_rs::{
 };
 
 const MIB: usize = 1024 * 1024;
-const MAX_VALUE_BYTES: usize = 256 * 1024;
+const REGION_BYTES: usize = 32 * MIB;
+// The benchmark uses a fixed 16-byte key. Leave one 64-byte format envelope so
+// every accepted benchmark value fits its configured Region.
+const MAX_VALUE_BYTES: usize = REGION_BYTES - 64;
 const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_micros(50);
@@ -81,7 +84,9 @@ impl BenchConfig {
             ));
         }
         if !(8..=MAX_VALUE_BYTES).contains(&value_bytes) {
-            return Err(invalid("value size must be in 8..=262144 bytes"));
+            return Err(invalid(format!(
+                "value size must be in 8..={MAX_VALUE_BYTES} bytes"
+            )));
         }
         if !directory.is_dir() {
             return Err(invalid(format!(
@@ -156,7 +161,7 @@ impl BenchConfig {
 
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
-            .with_region_size(32 * MIB as u64)
+            .with_region_size(REGION_BYTES as u64)
             // Keep the benchmark's complete L2 working set comfortably below
             // every page-aligned index partition's bounded-probe capacity.
             .with_expected_entries(self.entries.saturating_mul(4))
