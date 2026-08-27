@@ -88,6 +88,11 @@ The soak continuously mixes writes, reads, deletes, Region rotation, and 256 B,
 managed memory, RSS, logical disk use, and latency. Valid older values count as
 `stale_hits`; future, wrong-key, or malformed values fail the run.
 
+Reclaim samples also report reinsert rewrite records and bytes, skipped hot
+records, and conditional replacement misses. A turnover run with L2 hits should
+exercise reinsertion without allowing cumulative rewritten bytes to exceed the
+bounded reclaim budget.
+
 Value sizes are deterministically mixed on every write instead of running in
 size phases. Repeat a size in `CACHE_SOAK_VALUE_BYTES` to give it proportionally
 more weight in a production-shaped distribution.

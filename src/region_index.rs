@@ -4,8 +4,9 @@
 //! bucket stores only a 14-bit fingerprint, its two-bit displacement, and the
 //! exact packed record location. Full-key and checksum validation remain the
 //! authority after the single record read. There are no probe chains,
-//! tombstones, generation tables, retries, or dynamic allocations.
+//! tombstones, generation tables, retries, or request-time allocations.
 
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(feature = "benchmarking")]
@@ -13,18 +14,87 @@ use std::cell::Cell;
 
 use crate::hashing::route_hash;
 use crate::index::{INDEX_CANDIDATES, IndexEntry, PackedLocation};
-use crate::index_storage::{IndexSlotState, IndexStorageError, PartitionedIndexStorage};
+use crate::index_storage::{
+    IndexPartitionWriteGuard, IndexSlotState, IndexStorageError, PartitionedIndexStorage,
+};
 use crate::snapshot::CacheIndexSnapshot;
 
 const CANDIDATE_OFFSETS: [usize; INDEX_CANDIDATES] = [0, 23, 61, 97];
 const FINGERPRINT_MASK: u16 = (1 << 14) - 1;
+const REFERENCE_WORD_BITS: usize = u64::BITS as usize;
+
+pub(crate) fn reference_memory_bytes(slot_count: usize) -> Option<usize> {
+    slot_count
+        .div_ceil(REFERENCE_WORD_BITS)
+        .checked_mul(std::mem::size_of::<AtomicU64>())
+}
+
+struct SlotReferences {
+    words: Box<[AtomicU64]>,
+}
+
+impl SlotReferences {
+    fn try_new(slot_count: usize) -> Result<Self, IndexStorageError> {
+        let word_count = slot_count.div_ceil(REFERENCE_WORD_BITS);
+        let mut words = Vec::new();
+        words.try_reserve_exact(word_count).map_err(|_| {
+            IndexStorageError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "unable to allocate index reference bitmap",
+            ))
+        })?;
+        words.resize_with(word_count, || AtomicU64::new(0));
+        Ok(Self {
+            words: words.into_boxed_slice(),
+        })
+    }
+
+    fn mark(&self, slot: usize) {
+        let word = slot / REFERENCE_WORD_BITS;
+        let mask = 1_u64 << (slot % REFERENCE_WORD_BITS);
+        if let Some(current) = self.words.get(word) {
+            // The caller retains this slot's partition guard. Writers cannot
+            // clear the same bit between the load and RMW; atomics are still
+            // required because concurrent readers and adjacent partitions can
+            // share one bitmap word.
+            if current.load(Ordering::Relaxed) & mask == 0 {
+                current.fetch_or(mask, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn take(&self, slot: usize) -> bool {
+        let word = slot / REFERENCE_WORD_BITS;
+        let mask = 1_u64 << (slot % REFERENCE_WORD_BITS);
+        self.words.get(word).is_some_and(|current| {
+            if current.load(Ordering::Relaxed) & mask == 0 {
+                false
+            } else {
+                current.fetch_and(!mask, Ordering::Relaxed) & mask != 0
+            }
+        })
+    }
+
+    fn clear(&self, slot: usize) {
+        let _ = self.take(slot);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReclaimIndexAction {
+    Missing,
+    Removed,
+    Reinsert,
+}
 
 pub(crate) struct RegionIndex {
     storage: PartitionedIndexStorage,
+    references: SlotReferences,
     statistics_enabled: AtomicBool,
     relocations: AtomicU64,
     overflow_evictions: AtomicU64,
     conditional_remove_misses: AtomicU64,
+    conditional_replace_misses: AtomicU64,
 }
 
 #[cfg(feature = "benchmarking")]
@@ -81,14 +151,19 @@ fn record_benchmark_probe(probes: usize) {
 }
 
 impl RegionIndex {
-    pub(crate) fn from_storage(storage: PartitionedIndexStorage) -> Self {
-        Self {
+    pub(crate) fn from_storage(
+        storage: PartitionedIndexStorage,
+    ) -> Result<Self, IndexStorageError> {
+        let references = SlotReferences::try_new(storage.slot_count())?;
+        Ok(Self {
             storage,
+            references,
             statistics_enabled: AtomicBool::new(false),
             relocations: AtomicU64::new(0),
             overflow_evictions: AtomicU64::new(0),
             conditional_remove_misses: AtomicU64::new(0),
-        }
+            conditional_replace_misses: AtomicU64::new(0),
+        })
     }
 
     pub(crate) const fn storage(&self) -> &PartitionedIndexStorage {
@@ -113,6 +188,7 @@ impl RegionIndex {
             relocations: self.relocations.load(Ordering::Relaxed),
             overflow_evictions: self.overflow_evictions.load(Ordering::Relaxed),
             conditional_remove_misses: self.conditional_remove_misses.load(Ordering::Relaxed),
+            conditional_replace_misses: self.conditional_replace_misses.load(Ordering::Relaxed),
         })
     }
 
@@ -141,6 +217,7 @@ impl RegionIndex {
                 && current == fingerprint
                 && usize::from(current_displacement) == displacement
             {
+                self.references.mark(partition.global_slot(slot)?);
                 #[cfg(feature = "benchmarking")]
                 record_benchmark_probe(probes);
                 return Ok(Some(entry));
@@ -184,7 +261,8 @@ impl RegionIndex {
                 } if current == fingerprint
                     && usize::from(current_displacement) == displacement =>
                 {
-                    partition.replace_observed(
+                    self.replace_slot(
+                        &mut partition,
                         slot,
                         state,
                         value_state(fingerprint, displacement, supplied),
@@ -196,7 +274,8 @@ impl RegionIndex {
         }
 
         if let Some(displacement) = first_empty {
-            partition.replace_observed(
+            self.replace_slot(
+                &mut partition,
                 candidates[displacement],
                 IndexSlotState::Empty,
                 value_state(fingerprint, displacement, supplied),
@@ -237,12 +316,14 @@ impl RegionIndex {
                 {
                     continue;
                 }
-                partition.replace_observed(
+                self.replace_slot(
+                    &mut partition,
                     target_slot,
                     IndexSlotState::Empty,
                     value_state(occupant_fingerprint, target_displacement, occupant_entry),
                 )?;
-                partition.replace_observed(
+                self.replace_slot(
+                    &mut partition,
                     source_slot,
                     source,
                     value_state(fingerprint, source_displacement, supplied),
@@ -260,7 +341,8 @@ impl RegionIndex {
             .find(|&displacement| !candidates[..displacement].contains(&candidates[displacement]))
             .expect("every non-empty index partition has one distinct candidate");
         let victim_slot = candidates[victim_displacement];
-        partition.replace_observed(
+        self.replace_slot(
+            &mut partition,
             victim_slot,
             observed[victim_displacement],
             value_state(fingerprint, victim_displacement, supplied),
@@ -282,6 +364,74 @@ impl RegionIndex {
         old_location: PackedLocation,
     ) -> Result<bool, IndexStorageError> {
         self.remove_matching(hash, Some(old_location), false)
+    }
+
+    /// Atomically classifies one reclaim candidate under its index partition.
+    /// A referenced exact mapping is retained for a later conditional rewrite;
+    /// every other exact mapping is removed before the source Region is freed.
+    pub(crate) fn prepare_reclaim(
+        &self,
+        hash: u64,
+        old_location: PackedLocation,
+    ) -> Result<ReclaimIndexAction, IndexStorageError> {
+        let mut partition = self.storage.write_hash_partition(hash)?;
+        let slot_count = partition.slot_count();
+        let fingerprint = fingerprint(hash);
+        let candidates = candidate_slots(hash, slot_count);
+        for displacement in 0..INDEX_CANDIDATES {
+            let slot = candidates[displacement];
+            if candidates[..displacement].contains(&slot) {
+                continue;
+            }
+            let state = partition.slot_state(slot)?;
+            if !token_location_matches(state, fingerprint, displacement, old_location) {
+                continue;
+            }
+            let global_slot = partition.global_slot(slot)?;
+            if self.references.take(global_slot) {
+                return Ok(ReclaimIndexAction::Reinsert);
+            }
+            self.replace_slot(&mut partition, slot, state, IndexSlotState::Empty)?;
+            return Ok(ReclaimIndexAction::Removed);
+        }
+        self.record_conditional_remove_miss();
+        Ok(ReclaimIndexAction::Missing)
+    }
+
+    /// Repoints one still-current source mapping after the replacement bytes
+    /// have completed. Concurrent puts and deletes win by changing or removing
+    /// the expected old address first.
+    pub(crate) fn replace_if_match(
+        &self,
+        hash: u64,
+        old_location: PackedLocation,
+        replacement: IndexEntry,
+    ) -> Result<bool, IndexStorageError> {
+        let mut partition = self.storage.write_hash_partition(hash)?;
+        let slot_count = partition.slot_count();
+        let fingerprint = fingerprint(hash);
+        let candidates = candidate_slots(hash, slot_count);
+        for displacement in 0..INDEX_CANDIDATES {
+            let slot = candidates[displacement];
+            if candidates[..displacement].contains(&slot) {
+                continue;
+            }
+            let state = partition.slot_state(slot)?;
+            if token_location_matches(state, fingerprint, displacement, old_location) {
+                self.replace_slot(
+                    &mut partition,
+                    slot,
+                    state,
+                    value_state(fingerprint, displacement, replacement),
+                )?;
+                return Ok(true);
+            }
+        }
+        if self.statistics_enabled.load(Ordering::Relaxed) {
+            self.conditional_replace_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false)
     }
 
     fn remove_matching(
@@ -311,15 +461,34 @@ impl RegionIndex {
                 None => token_matches(state, fingerprint, displacement),
             };
             if matches {
-                partition.replace_observed(slot, state, IndexSlotState::Empty)?;
+                self.replace_slot(&mut partition, slot, state, IndexSlotState::Empty)?;
                 return Ok(true);
             }
         }
-        if expected_location.is_some() && self.statistics_enabled.load(Ordering::Relaxed) {
+        if expected_location.is_some() {
+            self.record_conditional_remove_miss();
+        }
+        Ok(false)
+    }
+
+    fn record_conditional_remove_miss(&self) {
+        if self.statistics_enabled.load(Ordering::Relaxed) {
             self.conditional_remove_misses
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Ok(false)
+    }
+
+    fn replace_slot(
+        &self,
+        partition: &mut IndexPartitionWriteGuard<'_>,
+        slot: usize,
+        previous: IndexSlotState,
+        next: IndexSlotState,
+    ) -> Result<(), IndexStorageError> {
+        let global_slot = partition.global_slot(slot)?;
+        partition.replace_observed(slot, previous, next)?;
+        self.references.clear(global_slot);
+        Ok(())
     }
 }
 
@@ -413,7 +582,15 @@ mod tests {
     }
 
     fn anonymous(slot_count: usize) -> RegionIndex {
-        RegionIndex::from_storage(PartitionedIndexStorage::anonymous(slot_count).unwrap())
+        RegionIndex::from_storage(PartitionedIndexStorage::anonymous(slot_count).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn production_reference_bitmap_is_exactly_one_bit_per_slot() {
+        assert_eq!(
+            reference_memory_bytes(crate::index::MAX_INDEX_SLOTS),
+            Some(64 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -451,6 +628,82 @@ mod tests {
         assert!(!index.remove_if_match(hash, old.location).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(new));
         assert!(index.remove_if_match(hash, new.location).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), None);
+    }
+
+    #[test]
+    fn reclaim_reinserts_only_a_referenced_exact_mapping() {
+        let index = anonymous(128);
+        let hash = 17;
+        let old = entry(1, 0);
+        let replacement = entry(2, 0);
+
+        index.upsert(hash, old).unwrap();
+        assert_eq!(
+            index.prepare_reclaim(hash, old.location).unwrap(),
+            ReclaimIndexAction::Removed
+        );
+
+        index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+        assert_eq!(
+            index.prepare_reclaim(hash, old.location).unwrap(),
+            ReclaimIndexAction::Reinsert
+        );
+        assert!(
+            index
+                .replace_if_match(hash, old.location, replacement)
+                .unwrap()
+        );
+        assert_eq!(
+            index.prepare_reclaim(hash, replacement.location).unwrap(),
+            ReclaimIndexAction::Removed,
+            "conditional publication must reset the reference bit"
+        );
+    }
+
+    #[test]
+    fn newer_index_publication_wins_a_delayed_reinsert() {
+        let index = anonymous(128);
+        let hash = 23;
+        let old = entry(1, 0);
+        let replacement = entry(2, 0);
+        let newer = entry(3, 0);
+
+        index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+        assert_eq!(
+            index.prepare_reclaim(hash, old.location).unwrap(),
+            ReclaimIndexAction::Reinsert
+        );
+        index.upsert(hash, newer).unwrap();
+        assert!(
+            !index
+                .replace_if_match(hash, old.location, replacement)
+                .unwrap()
+        );
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn delete_wins_a_delayed_reinsert() {
+        let index = anonymous(128);
+        let hash = 29;
+        let old = entry(1, 0);
+        let replacement = entry(2, 0);
+
+        index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+        assert_eq!(
+            index.prepare_reclaim(hash, old.location).unwrap(),
+            ReclaimIndexAction::Reinsert
+        );
+        assert!(index.try_delete(hash).unwrap());
+        assert!(
+            !index
+                .replace_if_match(hash, old.location, replacement)
+                .unwrap()
+        );
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
     }
 

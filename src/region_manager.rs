@@ -115,10 +115,7 @@ pub(crate) struct RegionReclaimReceipt {
     pub(crate) created_seqno: u64,
     pub(crate) used_offset: u64,
     pub(crate) physical_record_count: u64,
-    pub(crate) second_chances: u32,
 }
-
-const MAX_RECLAIM_SECOND_CHANCES: usize = 8;
 
 /// Read-only selection of the next FIFO rotation victim.
 ///
@@ -972,35 +969,9 @@ impl RegionManager {
     /// has fallen below one Region per append shard.
     pub(crate) fn begin_reclaim(
         &mut self,
-        mut referenced: impl FnMut(u32) -> bool,
     ) -> Result<Option<RegionReclaimReceipt>, RegionMutationError> {
         if !self.reclaim_needed() {
             return Ok(None);
-        }
-        let alternatives = self
-            .sealed_regions
-            .len()
-            .saturating_sub(1)
-            .min(MAX_RECLAIM_SECOND_CHANCES);
-        let mut second_chances = 0_u32;
-        for _ in 0..alternatives {
-            let region_id = *self
-                .sealed_regions
-                .front()
-                .ok_or(RegionMutationError::Invariant(
-                    "reclaim selection lost its sealed Region",
-                ))?;
-            if !referenced(region_id) {
-                break;
-            }
-            let moved = self.sealed_regions.pop_front();
-            if moved != Some(region_id) {
-                return Err(RegionMutationError::Invariant(
-                    "reclaim victim changed during second chance",
-                ));
-            }
-            self.sealed_regions.push_back(region_id);
-            second_chances = second_chances.saturating_add(1);
         }
         let region_id = self
             .sealed_regions
@@ -1029,7 +1000,6 @@ impl RegionManager {
             created_seqno: region.created_seqno,
             used_offset: region.completed_used,
             physical_record_count: region.physical_record_count,
-            second_chances,
         };
         debug_assert!(self.reclaiming.len() < self.reclaim_limit);
         debug_assert!(self.reclaiming.len() < self.reclaiming.capacity());
@@ -1654,7 +1624,7 @@ mod tests {
             manager.plan_rotation(0),
             Err(RegionMutationError::WouldBlock)
         );
-        let reclaim = manager.begin_reclaim(|_| false).unwrap().unwrap();
+        let reclaim = manager.begin_reclaim().unwrap().unwrap();
         assert_eq!(reclaim.region_id, 4);
         manager.finish_reclaim(reclaim).unwrap();
         let plan = manager.plan_rotation(0).unwrap();
@@ -1695,17 +1665,17 @@ mod tests {
         );
         manager.configure_reclaim_workers(2).unwrap();
 
-        let first = manager.begin_reclaim(|_| false).unwrap().unwrap();
-        let second = manager.begin_reclaim(|_| false).unwrap().unwrap();
+        let first = manager.begin_reclaim().unwrap().unwrap();
+        let second = manager.begin_reclaim().unwrap().unwrap();
         assert_eq!((first.region_id, second.region_id), (4, 1));
-        assert_eq!(manager.begin_reclaim(|_| false).unwrap(), None);
+        assert_eq!(manager.begin_reclaim().unwrap(), None);
         assert_eq!(
             manager.region_snapshot().unwrap().reclaiming_region_count,
             2
         );
 
         manager.finish_reclaim(second).unwrap();
-        assert_eq!(manager.begin_reclaim(|_| false).unwrap(), None);
+        assert_eq!(manager.begin_reclaim().unwrap(), None);
         assert_eq!(
             manager.region_snapshot().unwrap().reclaiming_region_count,
             1
@@ -1719,17 +1689,13 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_gives_a_referenced_fifo_region_one_bounded_second_chance() {
+    fn reclaim_always_selects_the_fifo_head() {
         let mut manager = RegionManager::from_metadata(sample_without_free_regions()).unwrap();
-        let reclaim = manager
-            .begin_reclaim(|region_id| region_id == 4)
-            .unwrap()
-            .unwrap();
-        assert_eq!(reclaim.region_id, 1);
-        assert_eq!(reclaim.second_chances, 1);
+        let reclaim = manager.begin_reclaim().unwrap().unwrap();
+        assert_eq!(reclaim.region_id, 4);
         assert_eq!(
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
-            [5, 2, 4]
+            [1, 5, 2]
         );
     }
 

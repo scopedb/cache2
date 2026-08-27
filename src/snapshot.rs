@@ -94,10 +94,15 @@ pub struct CacheIoPathSnapshot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheReclaimSnapshot {
     pub regions: u64,
-    pub region_second_chances: u64,
     pub bytes_read: u64,
     pub records_scanned: u64,
     pub index_entries_removed: u64,
+    /// Referenced records physically rewritten during reclaim.
+    pub reinsert_records: u64,
+    /// Encoded record bytes rewritten, excluding batch padding.
+    pub reinsert_bytes: u64,
+    /// Referenced records dropped after validation failure or budget/staging pressure.
+    pub reinsert_skipped: u64,
 }
 
 #[non_exhaustive]
@@ -119,6 +124,8 @@ pub struct CacheIndexSnapshot {
     pub relocations: u64,
     pub overflow_evictions: u64,
     pub conditional_remove_misses: u64,
+    /// Completed reinsert writes whose old index address had already changed.
+    pub conditional_replace_misses: u64,
 }
 
 #[non_exhaustive]

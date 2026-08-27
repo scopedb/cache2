@@ -10,7 +10,7 @@ Cache
 ├── append shards + global Region FIFO
 ├── bounded read I/O pool
 ├── bounded write I/O pool
-├── one-depth background reclaim I/O lane
+├── bounded one-depth background reclaim I/O lanes
 └── data, state, and clean-image files
 ```
 
@@ -62,22 +62,28 @@ the cache contract.
 Every append shard owns one Active Region. All other Regions share one global
 free/sealed FIFO, allowing any shard to consume clean capacity. A sealed Region
 is never reused directly. When the free reserve falls below one Region per
-append shard, the background worker reads one sealed prefix sequentially,
-walks its self-sized records, and removes each index mapping only if it still
-points at that exact address. Only then does the Region enter the free FIFO.
+append shard, a background worker reads the oldest sealed prefix sequentially
+and walks its self-sized records.
 
-An L2 candidate marks its Region with one relaxed reference bit during the
-existing index pass. Reclaim gives referenced FIFO heads one bounded second
-chance, inspecting at most eight alternatives; this adds no request-path lock
-or I/O. Every record also carries its exact Region generation. The read plan
-captures that generation from a per-Region atomic, and completion compares it
-locally before returning the record.
+An L2 candidate marks its exact index slot in a volatile one-bit reference
+bitmap during the existing index pass. Reclaim consumes that bit and offers the
+still-current record for reinsertion; cold records are removed only when the
+index still points at their exact old address. Reinsertion preserves the
+record's logical sequence number, writes through an existing append shard, and
+conditionally replaces the old address only after the batch completes.
 
-Per-record hit counters and reclaim-time reinsertion are intentionally absent.
-They would turn L2 hits into random index or shadow-table mutations and require
-conditional publication after an asynchronous rewrite. Region second chance
-keeps the heat signal bounded and off the index write path; entry reinsertion
-should be added only if production-shaped traces show a material hit-rate gap.
+The source Region stays pinned until accepted replacement batches finish. A
+reclaim rewrites at most roughly one eighth of its used bytes; staging pressure
+skips the remaining hot records instead of waiting. Only then does the source
+Region enter the free FIFO. This keeps victim selection strict FIFO and adds no
+foreground queue, retry, lock, or I/O.
+
+The reference bitmap costs one bit per index slot and resets on restart. It is
+a one-shot heat signal rather than a hit count: another L2 hit after reinsertion
+must mark the new slot to preserve the entry through another reclaim cycle.
+Every record also carries its exact Region generation. The read plan captures
+that generation from a per-Region atomic, and completion compares it locally
+before returning the record.
 
 The fixed index stores 10-byte slots with four deterministic candidates, at
 most one relocation, and no tombstones or generation table. Point work is

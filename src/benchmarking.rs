@@ -211,7 +211,7 @@ impl TurnoverWorkload {
     fn new(plan: TurnoverPlan) -> io::Result<Self> {
         let storage = PartitionedIndexStorage::anonymous_single_partition(plan.index_slots)
             .map_err(index_error)?;
-        let index = RegionIndex::from_storage(storage);
+        let index = RegionIndex::from_storage(storage).map_err(index_error)?;
         index.set_statistics_enabled(true);
 
         let mut hashes = Vec::new();

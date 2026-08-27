@@ -85,9 +85,10 @@ Keys are limited to 4 KiB. A complete encoded record must fit in one Region.
 Entries charged above 256 KiB bypass L1 but remain valid in L2.
 
 The fixed L2 index uses roughly two slots per expected entry and 10 bytes per
-slot, plus page headers. A 4 TiB cache averaging 16 KiB per entry therefore
-needs about 5.08 GiB for the index. The aggregate managed-memory limit must also
-cover L1, two staging buffers per append shard, one Region reclaim buffer,
+slot, plus page headers and one volatile reference bit per slot. A 4 TiB cache
+averaging 16 KiB per entry therefore needs about 5.08 GiB for the index plus
+64 MiB for reference bits. The aggregate managed-memory limit must also cover
+L1, two staging buffers per append shard, one Region reclaim buffer per worker,
 metadata, transient reads, and cache thread stacks. Invalid plans fail before
 cache files are created.
 `StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound.
@@ -128,9 +129,12 @@ shards, and workers must not become labels. `metrics_epoch` is a reset marker
 for the adapter, not a label: when it changes, use the current cumulative value
 as the first delta for the new open.
 
-The read direction includes the dedicated reclaim lane so request and runtime
+The read direction includes the dedicated reclaim lanes so request and runtime
 file counters remain additive. `reclaim` separately exposes Regions completed,
-second chances, sequential bytes, records scanned, and index entries removed.
+sequential bytes, records scanned, index entries removed, reinsert rewrite
+records and bytes, and skipped hot records. Conditional index-replacement
+misses expose races in which a newer foreground mutation won over delayed
+reinsertion.
 
 For get outcomes, export `l1_hits`, `l2_hits`, and `l2_misses` as the disjoint
 `result=l1_hit|l2_hit|miss` series; `l1_misses` overlaps the latter two and must

@@ -226,10 +226,12 @@ struct RuntimeMetrics {
     io_failures: AtomicU64,
     region_rotations: AtomicU64,
     reclaimed_regions: AtomicU64,
-    reclaim_region_second_chances: AtomicU64,
     reclaimed_bytes: AtomicU64,
     reclaim_records_scanned: AtomicU64,
     reclaim_index_entries_removed: AtomicU64,
+    reclaim_reinsert_records: AtomicU64,
+    reclaim_reinsert_bytes: AtomicU64,
+    reclaim_reinsert_skipped: AtomicU64,
 }
 
 #[repr(align(64))]
@@ -284,10 +286,12 @@ impl RuntimeMetrics {
             io_failures: AtomicU64::new(0),
             region_rotations: AtomicU64::new(0),
             reclaimed_regions: AtomicU64::new(0),
-            reclaim_region_second_chances: AtomicU64::new(0),
             reclaimed_bytes: AtomicU64::new(0),
             reclaim_records_scanned: AtomicU64::new(0),
             reclaim_index_entries_removed: AtomicU64::new(0),
+            reclaim_reinsert_records: AtomicU64::new(0),
+            reclaim_reinsert_bytes: AtomicU64::new(0),
+            reclaim_reinsert_skipped: AtomicU64::new(0),
         })
     }
 
@@ -314,14 +318,18 @@ impl RuntimeMetrics {
 
     fn record_reclaim(&self, stats: crate::region::RegionReclaimStats) {
         Self::increment(&self.reclaimed_regions);
-        self.reclaim_region_second_chances
-            .fetch_add(stats.second_chances, Ordering::Relaxed);
         self.reclaimed_bytes
             .fetch_add(stats.bytes_read, Ordering::Relaxed);
         self.reclaim_records_scanned
             .fetch_add(stats.records_scanned, Ordering::Relaxed);
         self.reclaim_index_entries_removed
             .fetch_add(stats.records_removed, Ordering::Relaxed);
+        self.reclaim_reinsert_records
+            .fetch_add(stats.reinsert_records, Ordering::Relaxed);
+        self.reclaim_reinsert_bytes
+            .fetch_add(stats.reinsert_bytes, Ordering::Relaxed);
+        self.reclaim_reinsert_skipped
+            .fetch_add(stats.reinsert_skipped, Ordering::Relaxed);
     }
 
     fn snapshot(
@@ -392,10 +400,12 @@ impl RuntimeMetrics {
             region_rotations: self.region_rotations.load(Ordering::Relaxed),
             reclaim: CacheReclaimSnapshot {
                 regions: self.reclaimed_regions.load(Ordering::Relaxed),
-                region_second_chances: self.reclaim_region_second_chances.load(Ordering::Relaxed),
                 bytes_read: self.reclaimed_bytes.load(Ordering::Relaxed),
                 records_scanned: self.reclaim_records_scanned.load(Ordering::Relaxed),
                 index_entries_removed: self.reclaim_index_entries_removed.load(Ordering::Relaxed),
+                reinsert_records: self.reclaim_reinsert_records.load(Ordering::Relaxed),
+                reinsert_bytes: self.reclaim_reinsert_bytes.load(Ordering::Relaxed),
+                reinsert_skipped: self.reclaim_reinsert_skipped.load(Ordering::Relaxed),
             },
             managed_memory_bytes: memory.current_bytes,
             managed_memory_peak_bytes: memory.peak_bytes,
@@ -650,7 +660,7 @@ pub(crate) struct RegionDataPlane {
     running: RunningOwner,
     // Fences write admission for drain, flush, and shutdown. Reads do not
     // participate because they cannot extend the set of records being fenced.
-    operations: MutationGate,
+    operations: Arc<MutationGate>,
 }
 
 struct RunningOwner {
@@ -669,6 +679,7 @@ struct RunningShared {
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
     staging: Arc<RegionStaging>,
+    operations: Arc<MutationGate>,
     shards: Box<[Arc<ShardControl>]>,
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
@@ -915,12 +926,14 @@ impl RegionDataPlane {
         core.configure_reclaim_workers(config.reclaim_workers)?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
+        let operations = Arc::new(MutationGate::new());
         let running = start_running(
             Arc::clone(&core),
             data,
             files,
             config.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&operations),
         )?;
         Ok(Self {
             core,
@@ -928,7 +941,7 @@ impl RegionDataPlane {
             config,
             metrics,
             running,
-            operations: MutationGate::new(),
+            operations,
         })
     }
 
@@ -1387,6 +1400,7 @@ fn start_running(
     files: RuntimeFileSet,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
+    operations: Arc<MutationGate>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
     let l1_entry_capacity = config.l1_entry_capacity(data.geometry, core.index_slot_count())?;
@@ -1464,6 +1478,7 @@ fn start_running(
         metrics,
         memory,
         staging,
+        operations,
         shards: shards.into_boxed_slice(),
         write_flush_threshold_bytes: config.write_flush_threshold_bytes,
         align_reads_for_direct_io: config.io_mode == IoMode::Direct,
@@ -1766,7 +1781,35 @@ fn reclaim_worker_result(
                         "reclaim buffer is not initialized",
                     )
                 })?;
-            let stats = shared.core.finish_reclaim(receipt, bytes)?;
+            let reinsert_shard = worker_id % shared.shards.len();
+            let reinsert_operation = shared.operations.try_enter();
+            let mut accepting_reinserts = reinsert_operation.is_some();
+            let mut staged_reinsert = false;
+            let stats = shared.core.scan_reclaim(receipt, bytes, |record| {
+                if !accepting_reinserts {
+                    return Ok(false);
+                }
+                match shared
+                    .core
+                    .try_stage_reinsert(&shared.staging, reinsert_shard, record)?
+                {
+                    crate::region::RegionStageValue::Staged(_) => {
+                        staged_reinsert = true;
+                        Ok(true)
+                    }
+                    crate::region::RegionStageValue::NeedsProgress
+                    | crate::region::RegionStageValue::NeedsRotation => {
+                        accepting_reinserts = false;
+                        Ok(false)
+                    }
+                }
+            })?;
+            if staged_reinsert {
+                let generation = shared.shards[reinsert_shard].request_drain(false)?;
+                shared.shards[reinsert_shard].wait_for_drain(generation)?;
+            }
+            shared.core.complete_reclaim(receipt)?;
+            drop(reinsert_operation);
             if shared.statistics {
                 shared.metrics.record_reclaim(stats);
             }
@@ -1778,7 +1821,9 @@ fn reclaim_worker_result(
                 bytes = stats.bytes_read,
                 records_scanned = stats.records_scanned,
                 records_removed = stats.records_removed,
-                second_chances = stats.second_chances;
+                reinsert_records = stats.reinsert_records,
+                reinsert_bytes = stats.reinsert_bytes,
+                reinsert_skipped = stats.reinsert_skipped;
                 "cache Region reclaimed"
             );
             for shard in &shared.shards {
@@ -1835,18 +1880,23 @@ fn shard_worker_result(
         }
 
         if draining {
-            // Producers are fenced by the owner's write barrier. One forced
-            // pass therefore empties the shard completely.
-            if shared
-                .staging
-                .shard_fill_snapshot(shard_id)
-                .map_err(staging_runtime_error)?
-                .is_some()
-            {
-                let engine = shared.write_engine_for(shard_id as u64);
-                shared
-                    .core
-                    .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
+            // Owner drains fence producers. A reclaimer requests the same
+            // completion boundary without fencing foreground mutations, so a
+            // short in-progress encode must be retried rather than treated as
+            // structural staging failure.
+            match shared.staging.shard_fill_snapshot(shard_id) {
+                Ok(Some(_)) => {
+                    let engine = shared.write_engine_for(shard_id as u64);
+                    shared
+                        .core
+                        .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
+                }
+                Ok(None) => {}
+                Err(StagingError::WouldBlock) => {
+                    deadline = Some(Instant::now() + _RETRY_AGE);
+                    continue;
+                }
+                Err(error) => return Err(staging_runtime_error(error)),
             }
             complete_shard_drain(control, drain_generation)?;
             if stop {
@@ -2343,10 +2393,10 @@ mod tests {
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 8).unwrap();
         base.clone()
-            .with_managed_memory_limit_bytes(14 * GIB)
+            .with_managed_memory_limit_bytes(15 * GIB)
             .validate_memory_plan(geometry, index_slots, 8)
             .unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(13 * GIB);
+        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 8)

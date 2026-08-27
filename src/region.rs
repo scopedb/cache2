@@ -9,11 +9,11 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
-use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
+use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
 use crate::hashing::route_hash;
 #[cfg(test)]
 use crate::index::IndexEntry;
@@ -27,7 +27,9 @@ use crate::io_backend::{
     read_at_bounded, read_exact_at, write_all_at,
 };
 use crate::io_engine::{IoEngine, ReadSlot};
-use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
+use crate::record_codec::{
+    RecordEncodeError, encode_reinsert_into_hashed, encode_value_into_hashed,
+};
 #[cfg(test)]
 use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{
@@ -38,7 +40,7 @@ use crate::recovery::{
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
-use crate::region_index::RegionIndex;
+use crate::region_index::{ReclaimIndexAction, RegionIndex, reference_memory_bytes};
 use crate::region_manager::{RegionManager, RegionMutationError, RegionReclaimReceipt};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
@@ -232,7 +234,6 @@ pub(crate) struct FileRegionCore {
 
 struct RegionAccessState {
     generation: AtomicU64,
-    referenced: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -240,7 +241,18 @@ pub(crate) struct RegionReclaimStats {
     pub(crate) records_scanned: u64,
     pub(crate) records_removed: u64,
     pub(crate) bytes_read: u64,
-    pub(crate) second_chances: u64,
+    pub(crate) reinsert_records: u64,
+    pub(crate) reinsert_bytes: u64,
+    pub(crate) reinsert_skipped: u64,
+}
+
+pub(crate) struct RegionReinsertRecord<'a> {
+    pub(crate) hash: u64,
+    pub(crate) previous_location: PackedLocation,
+    pub(crate) logical_seqno: u64,
+    pub(crate) record_bytes: u32,
+    pub(crate) key: &'a [u8],
+    pub(crate) value: &'a [u8],
 }
 
 /// Unique steady-state owner. Workers share only `core`; runtime resources and
@@ -350,11 +362,10 @@ impl FileRegionRuntime {
         for region in manager.regions() {
             region_access.push(RegionAccessState {
                 generation: AtomicU64::new(region.created_seqno),
-                referenced: AtomicBool::new(false),
             });
         }
         let health = RegionHealthLatch::healthy();
-        let index = RegionIndex::from_storage(index);
+        let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
         Ok(Self {
             core: Arc::new(FileRegionCore {
                 index,
@@ -506,11 +517,7 @@ impl FileRegionCore {
         self.health.require_healthy()?;
         self.manager
             .lock()?
-            .begin_reclaim(|region_id| {
-                self.region_access
-                    .get(region_id as usize)
-                    .is_some_and(|access| access.referenced.swap(false, Ordering::Relaxed))
-            })
+            .begin_reclaim()
             .map_err(|error| region_mutation_context("reclaim begin", error))
     }
 
@@ -530,12 +537,14 @@ impl FileRegionCore {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reclaim offset overflow"))
     }
 
-    /// Scans one exact sealed prefix and clears only mappings that still point
-    /// at those physical records. No manager lock is held during index work.
-    pub(crate) fn finish_reclaim(
+    /// Scans one exact sealed prefix, removes cold mappings, and offers each
+    /// referenced current record once to a bounded reinsertion sink. The
+    /// source Region remains exclusively pinned until [`Self::complete_reclaim`].
+    pub(crate) fn scan_reclaim(
         &self,
         receipt: RegionReclaimReceipt,
         bytes: &[u8],
+        mut try_reinsert: impl FnMut(RegionReinsertRecord<'_>) -> io::Result<bool>,
     ) -> io::Result<RegionReclaimStats> {
         if bytes.len() as u64 != receipt.used_offset {
             return Err(io::Error::new(
@@ -546,9 +555,12 @@ impl FileRegionCore {
         let mut offset = 0_usize;
         let mut stats = RegionReclaimStats {
             bytes_read: receipt.used_offset,
-            second_chances: u64::from(receipt.second_chances),
             ..RegionReclaimStats::default()
         };
+        let alignment = u64::from(RECORD_ALIGNMENT);
+        let raw_budget =
+            (receipt.used_offset / 8).saturating_sub(crate::io_backend::DIRECT_IO_ALIGNMENT as u64);
+        let mut reinsert_budget = raw_budget - raw_budget % alignment;
         while offset < bytes.len() {
             let header_end = offset.checked_add(RECORD_HEADER_SIZE).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "reclaim header offset overflow")
@@ -604,12 +616,61 @@ impl FileRegionCore {
                 header.record_len,
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            if self
+            let action = self
                 .index
-                .remove_if_match(header.key_hash, location)
-                .map_err(index_storage_io_error)?
-            {
-                stats.records_removed = stats.records_removed.saturating_add(1);
+                .prepare_reclaim(header.key_hash, location)
+                .map_err(index_storage_io_error)?;
+            match action {
+                ReclaimIndexAction::Missing => {}
+                ReclaimIndexAction::Removed => {
+                    stats.records_removed = stats.records_removed.saturating_add(1);
+                }
+                ReclaimIndexAction::Reinsert => {
+                    let key_start = header_end;
+                    let key_end = key_start
+                        .checked_add(usize::from(header.key_len))
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "reclaim key range overflow")
+                        })?;
+                    let key = &bytes[key_start..key_end];
+                    let value = &bytes[key_end..payload_end];
+                    let rewrite_bytes = RecordHeader::aligned_len(key.len(), value.len())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "reclaim replacement record is too large",
+                            )
+                        })?;
+                    let payload_valid =
+                        crc32c(&bytes[header_end..payload_end]) == header.payload_crc;
+                    let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
+                    let reinserted = payload_valid
+                        && within_budget
+                        && try_reinsert(RegionReinsertRecord {
+                            hash: header.key_hash,
+                            previous_location: location,
+                            logical_seqno: header.seqno,
+                            record_bytes: rewrite_bytes,
+                            key,
+                            value,
+                        })?;
+                    if reinserted {
+                        reinsert_budget = reinsert_budget.saturating_sub(u64::from(rewrite_bytes));
+                        stats.reinsert_records = stats.reinsert_records.saturating_add(1);
+                        stats.reinsert_bytes = stats
+                            .reinsert_bytes
+                            .saturating_add(u64::from(rewrite_bytes));
+                    } else {
+                        if self
+                            .index
+                            .remove_if_match(header.key_hash, location)
+                            .map_err(index_storage_io_error)?
+                        {
+                            stats.records_removed = stats.records_removed.saturating_add(1);
+                        }
+                        stats.reinsert_skipped = stats.reinsert_skipped.saturating_add(1);
+                    }
+                }
             }
             stats.records_scanned = stats.records_scanned.saturating_add(1);
             offset = record_end;
@@ -620,6 +681,12 @@ impl FileRegionCore {
                 "reclaim record count does not match Region metadata",
             ));
         }
+        Ok(stats)
+    }
+
+    /// Releases one fully scanned source only after every accepted replacement
+    /// batch has completed and conditionally published.
+    pub(crate) fn complete_reclaim(&self, receipt: RegionReclaimReceipt) -> io::Result<()> {
         let access = self
             .region_access
             .get(receipt.region_id as usize)
@@ -629,13 +696,12 @@ impl FileRegionCore {
                     "reclaim Region id is out of bounds",
                 )
             })?;
-        access.referenced.store(false, Ordering::Relaxed);
         access.generation.store(0, Ordering::Release);
         self.manager
             .lock()?
             .finish_reclaim(receipt)
             .map_err(|error| region_mutation_context("reclaim completion", error))?;
-        Ok(stats)
+        Ok(())
     }
 
     pub(crate) fn enter_miss_only(&self) {
@@ -710,9 +776,6 @@ impl FileRegionCore {
                 return None;
             }
         };
-        // This best-effort touch intentionally happens on the one index pass.
-        // A fingerprint false positive may protect one Region once; avoiding a
-        // post-I/O index validation keeps the admitted read path unchanged.
         let access = self
             .region_access
             .get(entry.location.region_id() as usize)?;
@@ -720,7 +783,6 @@ impl FileRegionCore {
         if region_generation == 0 {
             return None;
         }
-        access.referenced.store(true, Ordering::Relaxed);
         Some(ReadCandidate {
             entry,
             region_generation,
@@ -873,6 +935,37 @@ impl FileRegionCore {
         key: &[u8],
         value: &[u8],
     ) -> io::Result<RegionStageValue> {
+        self.try_stage_record(staging, shard_id, hash, record_bytes, key, value, None)
+    }
+
+    pub(crate) fn try_stage_reinsert(
+        &self,
+        staging: &RegionStaging,
+        shard_id: usize,
+        record: RegionReinsertRecord<'_>,
+    ) -> io::Result<RegionStageValue> {
+        self.try_stage_record(
+            staging,
+            shard_id,
+            record.hash,
+            record.record_bytes,
+            record.key,
+            record.value,
+            Some((record.logical_seqno, record.previous_location)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_stage_record(
+        &self,
+        staging: &RegionStaging,
+        shard_id: usize,
+        hash: u64,
+        record_bytes: u32,
+        key: &[u8],
+        value: &[u8],
+        reinsert: Option<(u64, PackedLocation)>,
+    ) -> io::Result<RegionStageValue> {
         self.health.require_healthy()?;
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
@@ -922,9 +1015,26 @@ impl FileRegionCore {
         };
 
         let staged = staging.encode_reserved(receipt, |destination| {
-            let entry =
-                encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?;
-            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, receipt.seqno))
+            let entry = match reinsert {
+                Some((logical_seqno, _)) => encode_reinsert_into_hashed(
+                    destination,
+                    receipt,
+                    hash,
+                    record_bytes,
+                    key,
+                    value,
+                    logical_seqno,
+                )?,
+                None => {
+                    encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?
+                }
+            };
+            Ok::<StagedRecord, RecordEncodeError>(match reinsert {
+                Some((_, previous_location)) => {
+                    StagedRecord::reinsert(hash, entry, receipt.seqno, previous_location)
+                }
+                None => StagedRecord::new(hash, entry, receipt.seqno),
+            })
         });
         match staged {
             Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
@@ -1178,7 +1288,6 @@ impl FileRegionCore {
                     "rotation activated an untracked Region",
                 )
             })?;
-        access.referenced.store(false, Ordering::Relaxed);
         access
             .generation
             .store(receipt.activated_created_seqno, Ordering::Release);
@@ -1201,7 +1310,10 @@ impl FileRegionCore {
     fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for record in records.iter().copied() {
             let entry = record.entry();
-            let published = self.index.upsert(record.hash(), entry);
+            let published = match record.previous_location() {
+                Some(previous) => self.index.replace_if_match(record.hash(), previous, entry),
+                None => self.index.upsert(record.hash(), entry),
+            };
             if let Err(error) = published {
                 self.health.enter_miss_only();
                 return Err(index_storage_io_error(error));
@@ -1264,8 +1376,15 @@ pub(crate) fn runtime_fixed_memory_bytes(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(WARM_IMAGE_WRITE_BATCH_BYTES))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recovery memory overflow"))?;
+    let reference_bytes = reference_memory_bytes(index_slots).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "index reference memory does not fit the platform",
+        )
+    })?;
     index_bytes
-        .checked_add(region_bytes)
+        .checked_add(reference_bytes)
+        .and_then(|bytes| bytes.checked_add(region_bytes))
         .and_then(|bytes| bytes.checked_add(recovery_scratch))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))
 }
@@ -2850,6 +2969,7 @@ mod tests {
         let data = production_data_superblock(512 * 1024);
         let runtime_config = RuntimeConfig {
             l1_capacity_bytes: 0,
+            statistics: true,
             ..RuntimeConfig::default()
         };
         let mut store = RegionStore::open(
@@ -2872,21 +2992,9 @@ mod tests {
             expected.push((key, value));
         }
         store.drain().unwrap();
-        let first_hash = hash_key(data.hash_seed, &expected[0].0);
-        let first_entry = store
-            .runtime()
-            .unwrap()
-            .core
-            .lookup_snapshot(first_hash)
-            .unwrap()
-            .unwrap();
-        let first_access =
-            &store.runtime().unwrap().core.region_access[first_entry.location.region_id() as usize];
-        assert!(!first_access.referenced.load(Ordering::Relaxed));
         for (key, value) in &expected {
             assert_eq!(store.get_value(key).unwrap().unwrap().value(), value);
         }
-        assert!(first_access.referenced.load(Ordering::Relaxed));
 
         // A 256 KiB record leaves insufficient room for another same-shard
         // record in this test geometry. Repeated writes therefore consume the
@@ -2906,6 +3014,10 @@ mod tests {
             31,
             "one full-Region signal must cause exactly one rotation"
         );
+        let reclaim = store.detailed_snapshot().unwrap().summary.reclaim;
+        assert!(reclaim.reinsert_records > 0, "{reclaim:?}");
+        assert!(reclaim.reinsert_bytes > 0);
+        assert!(reclaim.reinsert_bytes.saturating_mul(8) <= reclaim.bytes_read);
         for key in recent.iter().rev().take(1) {
             assert_eq!(
                 store.get_value(key).unwrap().unwrap().value(),

@@ -33,7 +33,9 @@ fn fuzz_index_probe(input: &[u8]) {
     let Ok(storage) = PartitionedIndexStorage::anonymous(slot_count) else {
         return;
     };
-    let index = RegionIndex::from_storage(storage);
+    let Ok(index) = RegionIndex::from_storage(storage) else {
+        return;
+    };
     for chunk in input.get(1..).unwrap_or_default().chunks(24).take(128) {
         let mut bytes = [0_u8; 24];
         bytes[..chunk.len()].copy_from_slice(chunk);

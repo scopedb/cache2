@@ -29,9 +29,11 @@ const RECORD_LEN_OFFSET: usize = 40;
 pub(crate) struct RecordHeader {
     pub(crate) key_len: u16,
     pub(crate) value_len: u32,
+    /// Logical mutation order, preserved when reclaim rewrites a value.
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
     pub(crate) payload_crc: u32,
+    /// Physical Region incarnation containing this encoded record.
     pub(crate) region_generation: u64,
     pub(crate) record_len: u32,
 }
@@ -97,10 +99,7 @@ impl RecordHeader {
         let Ok(value_len) = usize::try_from(self.value_len) else {
             return false;
         };
-        if key_len > MAX_KEY_SIZE
-            || self.region_generation == 0
-            || self.seqno < self.region_generation
-        {
+        if key_len > MAX_KEY_SIZE || self.region_generation == 0 || self.seqno == 0 {
             return false;
         }
         Self::aligned_len(key_len, value_len).is_some_and(|minimum| {

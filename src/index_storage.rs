@@ -1148,6 +1148,19 @@ impl IndexPartitionReadGuard<'_> {
     pub(crate) fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
         self.guard.state_at(slot)
     }
+
+    pub(crate) fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
+        if slot >= self.range.slot_count {
+            return Err(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.range.slot_count,
+            });
+        }
+        self.range
+            .first_slot
+            .checked_add(slot)
+            .ok_or(IndexStorageError::SizeOverflow)
+    }
 }
 
 pub(crate) struct IndexPartitionWriteGuard<'a> {
@@ -1162,6 +1175,19 @@ impl IndexPartitionWriteGuard<'_> {
 
     pub(crate) fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
         self.guard.state_at(slot)
+    }
+
+    pub(crate) fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
+        if slot >= self.range.slot_count {
+            return Err(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.range.slot_count,
+            });
+        }
+        self.range
+            .first_slot
+            .checked_add(slot)
+            .ok_or(IndexStorageError::SizeOverflow)
     }
 
     pub(crate) fn replace_observed(

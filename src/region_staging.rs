@@ -17,6 +17,7 @@ use crate::resources::{
 };
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
+const UPSERT_PUBLICATION: u64 = 1_u64 << (u64::BITS - 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StageAppend {
@@ -40,11 +41,31 @@ pub(crate) struct StagedRecord {
     hash: u64,
     entry: IndexEntry,
     seqno: u64,
+    previous_location: u64,
 }
 
 impl StagedRecord {
     pub(crate) const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
-        Self { hash, entry, seqno }
+        Self {
+            hash,
+            entry,
+            seqno,
+            previous_location: UPSERT_PUBLICATION,
+        }
+    }
+
+    pub(crate) const fn reinsert(
+        hash: u64,
+        entry: IndexEntry,
+        seqno: u64,
+        previous_location: PackedLocation,
+    ) -> Self {
+        Self {
+            hash,
+            entry,
+            seqno,
+            previous_location: previous_location.raw(),
+        }
     }
 
     pub(crate) const fn hash(self) -> u64 {
@@ -57,6 +78,14 @@ impl StagedRecord {
 
     pub(crate) const fn seqno(self) -> u64 {
         self.seqno
+    }
+
+    pub(crate) const fn previous_location(self) -> Option<PackedLocation> {
+        if self.previous_location == UPSERT_PUBLICATION {
+            None
+        } else {
+            Some(PackedLocation::from_raw(self.previous_location))
+        }
     }
 
     fn set_location(&mut self, location: PackedLocation) {
@@ -919,7 +948,7 @@ mod tests {
 
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
-        assert_eq!(std::mem::size_of::<StagedRecord>(), 24);
+        assert_eq!(std::mem::size_of::<StagedRecord>(), 32);
         let resources = resources(4 * 1024 * 1024);
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
@@ -1089,6 +1118,13 @@ mod tests {
 
         let second_offset = first.offset + first.record_bytes;
         let (second, second_record) = reservation(second_offset, 128, 12);
+        let previous_location = PackedLocation::new(2, 0, 128).unwrap();
+        let second_record = StagedRecord::reinsert(
+            second_record.hash(),
+            second_record.entry(),
+            second_record.seqno(),
+            previous_location,
+        );
         staging
             .encode_reserved(second, |target| {
                 encode_test_value(target, second, second_record)
@@ -1124,6 +1160,11 @@ mod tests {
         assert_eq!(
             job.records[1].entry().location.record_len(),
             padded_second_len
+        );
+        assert_eq!(
+            job.records[1].previous_location(),
+            Some(previous_location),
+            "direct-I/O padding must not lose conditional publication identity"
         );
         assert!(
             bytes[unpadded_end as usize - 4096..]

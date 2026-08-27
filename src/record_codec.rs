@@ -111,6 +111,51 @@ pub(crate) fn encode_value_into_hashed(
     key: &[u8],
     value: &[u8],
 ) -> Result<IndexEntry, RecordEncodeError> {
+    encode_value_into_hashed_with_seqno(
+        destination,
+        reservation,
+        hash,
+        required,
+        key,
+        value,
+        reservation.seqno,
+    )
+}
+
+/// Re-encodes one retained cache value at a new physical reservation while
+/// preserving the logical mutation sequence used by L1 publication.
+pub(crate) fn encode_reinsert_into_hashed(
+    destination: &mut [u8],
+    reservation: RegionAppendReservation,
+    hash: u64,
+    required: u32,
+    key: &[u8],
+    value: &[u8],
+    logical_seqno: u64,
+) -> Result<IndexEntry, RecordEncodeError> {
+    if logical_seqno == 0 {
+        return Err(RecordEncodeError::InvalidReservation);
+    }
+    encode_value_into_hashed_with_seqno(
+        destination,
+        reservation,
+        hash,
+        required,
+        key,
+        value,
+        logical_seqno,
+    )
+}
+
+fn encode_value_into_hashed_with_seqno(
+    destination: &mut [u8],
+    reservation: RegionAppendReservation,
+    hash: u64,
+    required: u32,
+    key: &[u8],
+    value: &[u8],
+    logical_seqno: u64,
+) -> Result<IndexEntry, RecordEncodeError> {
     let destination_len = destination.len();
     let reserved_len =
         usize::try_from(reservation.record_bytes).map_err(|_| RecordEncodeError::LengthOverflow)?;
@@ -169,7 +214,7 @@ pub(crate) fn encode_value_into_hashed(
     let header = RecordHeader {
         key_len,
         value_len,
-        seqno: reservation.seqno,
+        seqno: logical_seqno,
         key_hash: hash,
         payload_crc: payload_crc.finish(),
         region_generation: reservation.region_created_seqno,
@@ -263,6 +308,28 @@ mod tests {
             saw_non_direct_boundary |= cursor % crate::io_backend::DIRECT_IO_ALIGNMENT != 0;
         }
         assert!(saw_non_direct_boundary);
+    }
+
+    #[test]
+    fn reinsertion_preserves_logical_seqno_across_a_new_region_generation() {
+        let key = b"key";
+        let value = b"value";
+        let required = required_record_bytes(key.len(), value.len()).unwrap();
+        let reservation = RegionAppendReservation {
+            shard_id: 0,
+            region_id: 3,
+            region_created_seqno: 100,
+            offset: 0,
+            record_bytes: required,
+            seqno: 101,
+        };
+        let mut destination = vec![0_u8; required as usize];
+
+        encode_reinsert_into_hashed(&mut destination, reservation, 7, required, key, value, 11)
+            .unwrap();
+        let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
+        assert_eq!(header.seqno, 11);
+        assert_eq!(header.region_generation, 100);
     }
 
     #[test]
