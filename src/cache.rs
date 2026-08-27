@@ -11,7 +11,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::index::{MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::canonical_index_partition_ranges;
@@ -240,13 +240,52 @@ impl HybridCacheConfig {
             })?,
         };
         let cache_handle = tokio_handle.clone();
+        let started = Instant::now();
         tokio_handle
-            .spawn_blocking(move || self.open_blocking(cache_handle))
+            .spawn_blocking(move || self.open_blocking(cache_handle, started))
             .await
             .map_err(|error| blocking_task_error("cache open", error))?
     }
 
-    fn open_blocking(self, tokio_handle: tokio::runtime::Handle) -> Result<HybridCache> {
+    fn open_blocking(
+        self,
+        tokio_handle: tokio::runtime::Handle,
+        started: Instant,
+    ) -> Result<HybridCache> {
+        let path = self.path.clone();
+        let capacity_bytes = self.static_config.capacity_bytes;
+        let index_slots = self.static_config.index_slots;
+        let result = self.open_blocking_inner(tokio_handle);
+        match &result {
+            Ok(cache) => {
+                let startup = cache.startup_mode();
+                log::info!(
+                    target: "cache_rs::lifecycle",
+                    event = "cache_opened",
+                    path:% = path.display(),
+                    startup = startup_name(startup),
+                    index_backing = index_backing_name(startup),
+                    capacity_bytes,
+                    index_slots,
+                    elapsed_us = elapsed_micros(started.elapsed());
+                    "cache opened"
+                );
+            }
+            Err(error) => log::error!(
+                target: "cache_rs::lifecycle",
+                event = "cache_open_failed",
+                path:% = path.display(),
+                capacity_bytes,
+                index_slots,
+                elapsed_us = elapsed_micros(started.elapsed()),
+                error:% = error;
+                "cache open failed"
+            ),
+        }
+        result
+    }
+
+    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> Result<HybridCache> {
         let geometry = self.static_config.geometry()?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
         let runtime_config = self.runtime_config;
@@ -283,6 +322,7 @@ impl HybridCacheConfig {
         let store = RegionStore::open(self.static_config.index_slots, backend)?;
         Ok(HybridCache {
             store,
+            path: self.path,
             logical_disk_peak_bytes,
             tokio_handle,
         })
@@ -328,6 +368,7 @@ impl Value {
 
 pub struct HybridCache {
     store: RegionStore<FileRegionBackend<SystemRegionFileSystem>>,
+    path: PathBuf,
     logical_disk_peak_bytes: u64,
     tokio_handle: tokio::runtime::Handle,
 }
@@ -400,7 +441,12 @@ impl HybridCache {
     /// Once called, the close continues even if the returned future is dropped.
     pub fn close_fast(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
         let tokio_handle = self.tokio_handle.clone();
-        let close = tokio_handle.spawn_blocking(move || self.store.close_fast());
+        let started = Instant::now();
+        let close = tokio_handle.spawn_blocking(move || {
+            let result = self.store.close_fast();
+            log_cache_close(&self.path, "fast", started.elapsed(), &result);
+            result
+        });
         async move {
             close
                 .await
@@ -412,12 +458,57 @@ impl HybridCache {
     /// the close continues even if the returned future is dropped.
     pub fn close_warm(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
         let tokio_handle = self.tokio_handle.clone();
-        let close = tokio_handle.spawn_blocking(move || self.store.close_warm());
+        let started = Instant::now();
+        let close = tokio_handle.spawn_blocking(move || {
+            let result = self.store.close_warm();
+            log_cache_close(&self.path, "warm", started.elapsed(), &result);
+            result
+        });
         async move {
             close
                 .await
                 .map_err(|error| blocking_task_error("warm close", error))?
         }
+    }
+}
+
+fn startup_name(startup: StartupMode) -> &'static str {
+    match startup {
+        StartupMode::Cold => "cold",
+        StartupMode::Warm => "warm",
+    }
+}
+
+fn index_backing_name(startup: StartupMode) -> &'static str {
+    match startup {
+        StartupMode::Cold => "anonymous",
+        StartupMode::Warm => "file_private_mmap",
+    }
+}
+
+fn elapsed_micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &Result<()>) {
+    match result {
+        Ok(()) => log::info!(
+            target: "cache_rs::lifecycle",
+            event = "cache_closed",
+            path:% = path.display(),
+            mode,
+            elapsed_us = elapsed_micros(elapsed);
+            "cache closed"
+        ),
+        Err(error) => log::error!(
+            target: "cache_rs::lifecycle",
+            event = "cache_close_failed",
+            path:% = path.display(),
+            mode,
+            elapsed_us = elapsed_micros(elapsed),
+            error:% = error;
+            "cache close failed"
+        ),
     }
 }
 

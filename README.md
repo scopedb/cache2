@@ -75,6 +75,35 @@ The supplied runtime must have Tokio time enabled and remain alive until the
 cache is closed. Pass `runtime.handle().clone()` when the caller owns a
 `tokio::runtime::Runtime`; the cache does not take ownership of the runtime.
 
+## Logging
+
+`cache-rs` emits structured lifecycle records through the `log` facade and
+leaves the process-global logger under application control. Tokio applications
+can install logforth before opening the cache:
+
+```toml
+logforth = { version = "0.30.1", features = ["starter-log"] }
+```
+
+```rust
+logforth::starter_log::stderr()
+    .layout(logforth::layout::JsonLayout::default())
+    .apply();
+```
+
+Enable the records with `RUST_LOG=cache_rs=info`. The emitted events cover the
+cold-recovery reason, successful or failed open, fast or warm close, and the
+first transition into miss-only mode. Normal `get`, `put`, delete, contention,
+and cache-miss paths do not log. A successful open reports `index_backing` as
+`anonymous` or `file_private_mmap`. The library never logs keys or hashes.
+
+The checked-in example persists a small warm image so two runs demonstrate a
+cold open followed by a warm open:
+
+```sh
+RUST_LOG=cache_rs=info cargo run --example logforth -- /tmp/cache-rs-logforth.data
+```
+
 `HybridCache` has one raw byte-key space. If an application needs logical
 namespaces, encode the namespace into the key before calling the cache; it then
 participates naturally in hashing and full-key validation without a separate

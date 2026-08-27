@@ -105,7 +105,37 @@ impl RegionHealthLatch {
     }
 
     pub(crate) fn enter_miss_only(&self) {
-        self.state.store(REGION_MISS_ONLY, Ordering::Release);
+        if self.transition_to_miss_only() {
+            log::warn!(
+                target: "cache_rs::health",
+                event = "cache_miss_only",
+                reason = "internal_failure";
+                "cache entered miss-only mode"
+            );
+        }
+    }
+
+    fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl std::fmt::Display) {
+        if self.transition_to_miss_only() {
+            log::warn!(
+                target: "cache_rs::health",
+                event = "cache_miss_only",
+                reason,
+                error:% = error;
+                "cache entered miss-only mode"
+            );
+        }
+    }
+
+    fn transition_to_miss_only(&self) -> bool {
+        self.state
+            .compare_exchange(
+                REGION_HEALTHY,
+                REGION_MISS_ONLY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub(crate) fn require_healthy(&self) -> io::Result<()> {
@@ -475,8 +505,9 @@ impl FileRegionCore {
             Ok(Some(entry)) if self.health.is_healthy() => Ok(Some(entry)),
             Ok(result) if self.health.is_healthy() => Ok(result),
             Ok(_) => Ok(None),
-            Err(_) => {
-                self.health.enter_miss_only();
+            Err(error) => {
+                self.health
+                    .enter_miss_only_with_error("index_lookup_failed", &error);
                 Ok(None)
             }
         }
@@ -493,8 +524,9 @@ impl FileRegionCore {
             Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
                 return None;
             }
-            Err(_) => {
-                self.health.enter_miss_only();
+            Err(error) => {
+                self.health
+                    .enter_miss_only_with_error("index_lookup_failed", &error);
                 return None;
             }
         };
@@ -1205,6 +1237,24 @@ where
             )
         })
     }
+
+    fn log_cold_recovery(&self, reason: &'static str) {
+        log::info!(
+            target: "cache_rs::recovery",
+            event = "cache_recovery_cold",
+            path:% = self.files.data.display(),
+            reason;
+            "cache recovery selected cold start"
+        );
+    }
+
+    fn cold_recovery(
+        &self,
+        reason: &'static str,
+    ) -> io::Result<RecoveryPlan<CleanFileRegionImage>> {
+        self.log_cold_recovery(reason);
+        Ok(RecoveryPlan::Running)
+    }
 }
 
 impl<F> RegionBackend for FileRegionBackend<F>
@@ -1312,31 +1362,37 @@ where
         self.cold_reset_needed = !fresh;
 
         let pages = read_state_pages(self.state_file()?)?;
-        let recovery_state = match latest_state([&pages[0], &pages[1]]) {
-            Ok(selected) => selected,
-            Err(StateSelectionError::ConflictingGeneration(_)) => None,
-            Err(StateSelectionError::UnsupportedVersion { .. }) => None,
+        let (recovery_state, state_rejection) = match latest_state([&pages[0], &pages[1]]) {
+            Ok(Some(selected)) => (Some(selected), None),
+            Ok(None) => (None, Some("no_valid_state")),
+            Err(StateSelectionError::ConflictingGeneration(_)) => {
+                (None, Some("state_generation_conflict"))
+            }
+            Err(StateSelectionError::UnsupportedVersion { .. }) => {
+                (None, Some("state_version_unsupported"))
+            }
         };
         // A conflicting same-generation pair is disposable cache state. Keep
         // the greatest decodable record only so RUNNING advances beyond it.
         self.current_state = select_state_for_fence(&pages);
         if fresh {
+            self.log_cold_recovery("fresh_data_file");
             return Ok(RecoveryPlan::Fresh);
         }
         let Some(selected) = recovery_state else {
-            return Ok(RecoveryPlan::Running);
+            return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"));
         };
         if selected.record.state != RecoveryState::Clean {
-            return Ok(RecoveryPlan::Running);
+            return self.cold_recovery("unclean_shutdown");
         }
         if !selected.record.binding.matches_data(data) {
-            return Ok(RecoveryPlan::Running);
+            return self.cold_recovery("state_data_mismatch");
         }
 
         let image = match self.file_system.open(&self.files.image, false) {
             Ok(image) => image,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(RecoveryPlan::Running);
+                return self.cold_recovery("image_missing");
             }
             Err(error) => return Err(error),
         };
@@ -1357,23 +1413,26 @@ where
 
         let actual_file_len = image.len()?;
         if actual_file_len < RECOVERY_PAGE_SIZE as u64 {
-            return Ok(RecoveryPlan::Running);
+            return self.cold_recovery("image_truncated");
         }
         let mut header_page = [0_u8; RECOVERY_PAGE_SIZE];
         if let Err(error) = read_exact_at(&image, &mut header_page, 0) {
-            return if error.kind() == io::ErrorKind::UnexpectedEof {
-                Ok(RecoveryPlan::Running)
-            } else {
-                Err(error)
-            };
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return self.cold_recovery("image_truncated");
+            }
+            return Err(error);
         }
         let header = match RecoveryImageHeader::probe(&header_page) {
             RecoveryImageHeaderProbe::Valid(header) => header,
-            RecoveryImageHeaderProbe::Unsupported(_) => return Ok(RecoveryPlan::Running),
+            RecoveryImageHeaderProbe::Unsupported(_) => {
+                return self.cold_recovery("image_version_unsupported");
+            }
             RecoveryImageHeaderProbe::Empty
             | RecoveryImageHeaderProbe::Corrupt
             | RecoveryImageHeaderProbe::Unrecognized
-            | RecoveryImageHeaderProbe::Truncated => return Ok(RecoveryPlan::Running),
+            | RecoveryImageHeaderProbe::Truncated => {
+                return self.cold_recovery("image_header_invalid");
+            }
         };
         let expected_slots = u64::try_from(index_slots).map_err(|_| {
             io::Error::new(
@@ -1391,9 +1450,11 @@ where
             actual_file_len,
             expected_slots,
             expected_index_len,
-        ) || header.region_table_len > maximum_region_metadata_len(data.geometry.region_count)?
-        {
-            return Ok(RecoveryPlan::Running);
+        ) {
+            return self.cold_recovery("image_identity_or_layout_mismatch");
+        }
+        if header.region_table_len > maximum_region_metadata_len(data.geometry.region_count)? {
+            return self.cold_recovery("metadata_too_large");
         }
 
         let metadata_len = usize::try_from(header.region_table_len).map_err(|_| {
@@ -1413,16 +1474,15 @@ where
             })?;
         metadata_bytes.resize(metadata_len, 0);
         if let Err(error) = read_exact_at(&image, &mut metadata_bytes, header.region_table_offset) {
-            return if error.kind() == io::ErrorKind::UnexpectedEof {
-                Ok(RecoveryPlan::Running)
-            } else {
-                Err(error)
-            };
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return self.cold_recovery("metadata_truncated");
+            }
+            return Err(error);
         }
         let metadata = match RegionMetadata::decode_owned(metadata_bytes) {
             Ok(metadata) => metadata,
             Err(RegionMetadataError::UnsupportedVersion(_)) => {
-                return Ok(RecoveryPlan::Running);
+                return self.cold_recovery("metadata_version_unsupported");
             }
             Err(RegionMetadataError::Allocation) => {
                 return Err(io::Error::new(
@@ -1430,10 +1490,13 @@ where
                     "cannot decode Region metadata",
                 ));
             }
-            Err(_) => return Ok(RecoveryPlan::Running),
+            Err(_) => return self.cold_recovery("metadata_invalid"),
         };
-        if !metadata.matches_image(data, header) || metadata.root.shard_count != self.shard_count {
-            return Ok(RecoveryPlan::Running);
+        if !metadata.matches_image(data, header) {
+            return self.cold_recovery("metadata_identity_mismatch");
+        }
+        if metadata.root.shard_count != self.shard_count {
+            return self.cold_recovery("write_shards_mismatch");
         }
         let file = image.try_clone_control_file()?;
         self.cold_reset_needed = false;
@@ -1497,6 +1560,7 @@ where
             && clean.metadata.validate().is_ok();
         if !eligible {
             self.cold_reset_needed = true;
+            self.log_cold_recovery("image_became_ineligible");
             return Ok(None);
         }
         let partition_stats = metadata_partition_stats(&clean.metadata)?;
