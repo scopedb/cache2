@@ -50,6 +50,9 @@ jobs:
       - name: Run tests with optional io_uring
         if: matrix.features == 'io-uring'
         run: cargo test --features io-uring
+      - name: Run optimized tests with all features
+        if: matrix.os == 'ubuntu-latest' && matrix.features == 'io-uring'
+        run: cargo test --release --all-features
 
   safety-checks:
     name: persistent fuzz and mmap ASan
