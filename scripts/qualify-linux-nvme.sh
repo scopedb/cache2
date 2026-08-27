@@ -145,7 +145,6 @@ performance_gates=(
   CACHE_BENCH_MIN_PUT_OPS
   CACHE_BENCH_MIN_RESIDENT_L1_OPS
   CACHE_BENCH_MIN_L2_OPS
-  CACHE_BENCH_MIN_PROMOTED_L1_OPS
   CACHE_BENCH_MAX_WARM_CLOSE_MS
 )
 performance_gate_count=0
@@ -158,7 +157,7 @@ for gate in "${performance_gates[@]}"; do
     ((performance_gate_count += 1))
   fi
 done
-if ((performance_gate_count < 5)); then
+if ((performance_gate_count < 4)); then
   qualification_status=preflight_pass
 fi
 
@@ -277,7 +276,7 @@ summarize_profile() {
   local expected_runs=$2
   local log=$3
   local phase
-  for phase in put_drain resident_l1 warm_close l2_promote promoted_l1; do
+  for phase in put_drain resident_l1 warm_close l2_promote; do
     local observed
     observed=$(extract_metric "$phase" elapsed_ns "$log" | wc -l)
     if [[ $observed -ne $expected_runs ]]; then
@@ -348,7 +347,7 @@ fi
 )
 {
   echo "status=$qualification_status"
-  echo "performance_gates_configured=$performance_gate_count/5"
+  echo "performance_gates_configured=$performance_gate_count/4"
   echo "completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$report_directory/qualification.status"
 

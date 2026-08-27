@@ -11,10 +11,10 @@ revision instead.
 cargo +1.98.0 bench --locked --bench cache
 ```
 
-The benchmark covers bounded concurrent puts plus drain, resident L1 reads,
-warm close, L2 reads with promotion, and promoted L1 reads. Values contain their
-key ordinal, so a wrong-key result is fatal. Writes retry `WouldBlock` only in
-the harness; this is not library behavior.
+The benchmark covers bounded concurrent puts plus drain, warm close, L2 reads
+with best-effort promotion, and resident L1 reads populated in a fresh RAM tier.
+Values contain their key ordinal, so a wrong-key result is fatal. Writes retry
+`WouldBlock` only in the harness; this is not library behavior.
 
 The main controls are:
 

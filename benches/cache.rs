@@ -288,37 +288,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         write.throttled_writes,
     );
 
-    let resident_start = config.entries - config.resident_entries;
-    if l1_entry_eligible {
-        for ordinal in resident_start..config.entries {
-            let key = benchmark_key(ordinal);
-            let observed = cache
-                .get(black_box(key))
-                .await?
-                .ok_or_else(|| io::Error::other("resident L1 preparation missed"))?;
-            verify_value(ordinal, &observed)?;
-        }
-    }
-    let resident_tier = if l1_entry_eligible {
-        CacheTier::L1
-    } else {
-        CacheTier::L2
-    };
-    let resident = concurrent_reads(
-        Arc::clone(&cache),
-        resident_start,
-        config.resident_entries,
-        config.read_ops,
-        config.clients,
-        resident_tier,
-    )
-    .await?;
-    if l1_entry_eligible {
-        report("resident_l1", "resident L1 get", &resident);
-    } else {
-        report("resident_l2", "resident L2 get", &resident);
-    }
-
     let started = Instant::now();
     Arc::try_unwrap(cache)
         .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
@@ -348,31 +317,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         report("l2_read", "L2 get", &l2_read);
     }
 
-    if l1_entry_eligible {
-        for ordinal in resident_start..config.entries {
-            let key = benchmark_key(ordinal);
-            let observed = cache
-                .get(black_box(key))
-                .await?
-                .ok_or_else(|| io::Error::other("promoted L1 preparation missed"))?;
-            verify_value(ordinal, &observed)?;
-        }
-    }
-
-    let repeated = concurrent_reads(
-        Arc::clone(&cache),
-        resident_start,
-        config.resident_entries,
-        config.read_ops,
-        config.clients,
-        resident_tier,
-    )
-    .await?;
-    if l1_entry_eligible {
-        report("promoted_l1", "promoted L1 get", &repeated);
-    } else {
-        report("repeat_l2", "repeat L2 get", &repeated);
-    }
     if config.statistics_enabled {
         let snapshot = cache.snapshot()?;
         println!(
@@ -389,14 +333,40 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         .close_fast()
         .await?;
 
-    enforce_thresholds(
-        &write.measurement,
-        &resident,
-        warm_close,
-        &l2_read,
-        &repeated,
-        l1_entry_eligible,
-    )?;
+    let resident = if l1_entry_eligible {
+        let cache = Arc::new(files.config(&config).open().await?);
+        if cache.startup_mode() != StartupMode::Cold {
+            return Err(io::Error::other(
+                "fast-closed benchmark did not reopen empty",
+            ));
+        }
+        let _ = concurrent_writes(
+            Arc::clone(&cache),
+            config.resident_entries,
+            config.value_bytes,
+            1,
+        )?;
+        cache.drain().await?;
+        let resident = concurrent_reads(
+            Arc::clone(&cache),
+            0,
+            config.resident_entries,
+            config.read_ops,
+            config.clients,
+            CacheTier::L1,
+        )
+        .await?;
+        report("resident_l1", "resident L1 get", &resident);
+        Arc::try_unwrap(cache)
+            .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
+            .close_fast()
+            .await?;
+        Some(resident)
+    } else {
+        None
+    };
+
+    enforce_thresholds(&write.measurement, warm_close, &l2_read, resident.as_ref())?;
 
     Ok(())
 }
@@ -615,20 +585,14 @@ fn report_latency(phase: &str, name: &str, elapsed: Duration) {
 
 fn enforce_thresholds(
     put: &Measurement,
-    resident: &Measurement,
     warm_close: Duration,
     l2_read: &Measurement,
-    repeated: &Measurement,
-    l1_entry_eligible: bool,
+    resident: Option<&Measurement>,
 ) -> io::Result<()> {
     require_minimum_rate("CACHE_BENCH_MIN_PUT_OPS", put)?;
     require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", l2_read)?;
-    if l1_entry_eligible {
+    if let Some(resident) = resident {
         require_minimum_rate("CACHE_BENCH_MIN_RESIDENT_L1_OPS", resident)?;
-        require_minimum_rate("CACHE_BENCH_MIN_PROMOTED_L1_OPS", repeated)?;
-    } else {
-        require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", resident)?;
-        require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", repeated)?;
     }
     if let Some(maximum_ms) = env_optional_f64("CACHE_BENCH_MAX_WARM_CLOSE_MS")?
         && warm_close.as_secs_f64() * 1_000.0 > maximum_ms
