@@ -9,7 +9,7 @@ readme = "README.md"
 documentation = "https://docs.rs/cache2"
 keywords = ["cache", "nvme", "storage"]
 categories = ["caching", "data-structures"]
-exclude = ["fuzz/", ".github/"]
+exclude = ["fuzz/", ".github/", "AGENTS.md"]
 
 [lib]
 name = "cache2"
