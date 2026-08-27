@@ -1098,8 +1098,9 @@ impl RegionDataPlane {
             running.align_reads_for_direct_io,
         ) {
             Ok(plan) => plan,
-            Err(_) => {
-                self.core.enter_miss_only();
+            Err(error) => {
+                self.core
+                    .enter_miss_only_with_error("record_read_plan_invalid", &error);
                 if running.statistics {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
@@ -1118,8 +1119,9 @@ impl RegionDataPlane {
                 }
                 return Ok(PreparedGet::Complete(None));
             }
-            Err(_) => {
-                self.core.enter_miss_only();
+            Err(error) => {
+                self.core
+                    .enter_miss_only_with_error("read_engine_reservation_failed", &error);
                 if running.statistics {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }

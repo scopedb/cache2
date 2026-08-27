@@ -73,6 +73,12 @@ or I/O. Every record also carries its exact Region generation. The read plan
 captures that generation from a per-Region atomic, and completion compares it
 locally before returning the record.
 
+Per-record hit counters and reclaim-time reinsertion are intentionally absent.
+They would turn L2 hits into random index or shadow-table mutations and require
+conditional publication after an asynchronous rewrite. Region second chance
+keeps the heat signal bounded and off the index write path; entry reinsertion
+should be added only if production-shaped traces show a material hit-rate gap.
+
 The fixed index stores 10-byte slots with four deterministic candidates, at
 most one relocation, and no tombstones or generation table. Point work is
 therefore capped at four primary probes plus the bounded one-hop relocation

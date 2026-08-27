@@ -642,6 +642,14 @@ impl FileRegionCore {
         self.health.enter_miss_only();
     }
 
+    pub(crate) fn enter_miss_only_with_error(
+        &self,
+        reason: &'static str,
+        error: &impl std::fmt::Display,
+    ) {
+        self.health.enter_miss_only_with_error(reason, error);
+    }
+
     pub(crate) fn is_healthy(&self) -> bool {
         self.health.is_healthy()
     }
@@ -774,7 +782,8 @@ impl FileRegionCore {
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
                 ) {
-                    self.health.enter_miss_only();
+                    self.health
+                        .enter_miss_only_with_error("record_read_submit_failed", &error);
                 }
                 Err(error)
             }
@@ -788,16 +797,19 @@ impl FileRegionCore {
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.plan.hash;
         if let Err(error) = completion.result {
-            self.health.enter_miss_only();
+            self.health
+                .enter_miss_only_with_error("record_read_completion_failed", &error);
             return Err(error);
         }
-        let record = completion.record_bytes().ok_or_else(|| {
-            self.health.enter_miss_only();
-            io::Error::new(
+        let Some(record) = completion.record_bytes() else {
+            let error = io::Error::new(
                 io::ErrorKind::InvalidData,
                 "record completion lost its exact record slice",
-            )
-        })?;
+            );
+            self.health
+                .enter_miss_only_with_error("record_read_completion_invalid", &error);
+            return Err(error);
+        };
         let Some(header) = record
             .get(..RECORD_HEADER_SIZE)
             .and_then(RecordHeader::decode)
@@ -831,11 +843,13 @@ impl FileRegionCore {
             return Ok(None);
         };
         let Some(buffer) = completion.buffer else {
-            self.health.enter_miss_only();
-            return Err(io::Error::new(
+            let error = io::Error::new(
                 io::ErrorKind::InvalidData,
                 "validated Region read lost its owned buffer",
-            ));
+            );
+            self.health
+                .enter_miss_only_with_error("record_read_completion_invalid", &error);
+            return Err(error);
         };
         Ok(Some(RegionValueRead {
             buffer,
