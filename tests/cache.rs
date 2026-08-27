@@ -889,6 +889,38 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
 }
 
 #[tokio::test]
+async fn buffered_l2_read_submits_the_exact_record_range() {
+    let files = TestCache::new("buffered-exact-read");
+    let static_config = StaticConfig::new(3 * 512 * 1024)
+        .with_region_size_bytes(512 * 1024)
+        .with_expected_entries(3277);
+    let cache = files
+        .config_with_static_and_shards(1, static_config.clone(), 1)
+        .open()
+        .await
+        .unwrap();
+    cache.put("key-1", "value").unwrap();
+    cache.put("key-2", "value").unwrap();
+    cache.close_warm().await.unwrap();
+
+    let reopened = files
+        .config_with_static_and_shards(1, static_config, 1)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get("key-1").await.unwrap().unwrap().tier(),
+        CacheTier::L2
+    );
+    let snapshot = reopened.snapshot().unwrap();
+    assert_eq!(snapshot.io.read.requests_submitted, 1);
+    assert_eq!(snapshot.io.read.buffered.operations, 1);
+    assert_eq!(snapshot.io.read.buffered.bytes, 64);
+    assert_eq!(snapshot.io.read.direct.operations, 0);
+    reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
 async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
     let runtime = RuntimeConfig::default()

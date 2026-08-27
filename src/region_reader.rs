@@ -1,9 +1,9 @@
-//! Aligned owned-buffer record reads for the RegionStore data path.
+//! Owned-buffer record reads for the RegionStore data path.
 //!
 //! A packed record may start on a 32-byte boundary, while direct I/O requires
-//! a 4 KiB-aligned address, offset, and length. This seam reads one aligned
-//! range and reports the exact record slice inside the returned buffer.
-//! Region generation and record contents are validated by the layers above.
+//! a 4 KiB-aligned address, offset, and length. Buffered I/O reads the exact
+//! record; direct I/O reads one aligned range and reports the record slice
+//! inside it. Region generation and record contents are validated above.
 
 use std::io;
 use std::ops::Range;
@@ -25,7 +25,7 @@ pub(crate) struct ReadPlan {
     pub(crate) hash: u64,
     pub(crate) entry: IndexEntry,
     pub(crate) absolute: u64,
-    pub(crate) aligned_len: usize,
+    pub(crate) read_len: usize,
     pub(crate) record_range: Range<usize>,
 }
 
@@ -50,7 +50,7 @@ impl ReadCompletion {
         }
         self.buffer
             .as_ref()?
-            .prepared(self.plan.aligned_len)
+            .prepared(self.plan.read_len)
             .ok()?
             .get(self.plan.record_range.clone())
     }
@@ -115,7 +115,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(plan.aligned_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(plan.read_len).is_err())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -128,7 +128,7 @@ impl PendingRead {
         let result = match protocol_error {
             Some(error) => Err(error),
             None => io_result.and_then(|completed| {
-                if completed != plan.aligned_len || bytes_transferred != plan.aligned_len {
+                if completed != plan.read_len || bytes_transferred != plan.read_len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Region record read completed with the wrong byte count",
@@ -155,7 +155,7 @@ pub(crate) fn submit_read(
     plan: ReadPlan,
     buffer: BufferLease,
 ) -> io::Result<PendingRead> {
-    let buffer = IoBuffer::for_read(buffer, plan.aligned_len).map_err(|error| error.error)?;
+    let buffer = IoBuffer::for_read(buffer, plan.read_len).map_err(|error| error.error)?;
     let request = submit_cache_read(engine, slot, IoOperation::read(buffer, plan.absolute))
         .map_err(|error| error.into_lease().0)?;
     Ok(PendingRead {
@@ -169,6 +169,7 @@ pub(crate) fn plan_read(
     geometry: DataGeometry,
     hash: u64,
     entry: IndexEntry,
+    align_for_direct_io: bool,
 ) -> io::Result<ReadPlan> {
     let location = entry.location;
     let offset = u64::from(location.offset());
@@ -215,19 +216,21 @@ pub(crate) fn plan_read(
         })?;
 
     let alignment = _READ_ALIGNMENT as u64;
-    let absolute = record_absolute / alignment * alignment;
-    let io_end = align_up(record_absolute_end, alignment)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow"))?;
-    let aligned_len = io_end
+    let (absolute, io_end) = if align_for_direct_io {
+        (
+            record_absolute / alignment * alignment,
+            align_up(record_absolute_end, alignment).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow")
+            })?,
+        )
+    } else {
+        (record_absolute, record_absolute_end)
+    };
+    let read_len = io_end
         .checked_sub(absolute)
         .and_then(|length| usize::try_from(length).ok())
-        .filter(|length| *length != 0 && *length % _READ_ALIGNMENT == 0)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid aligned Region record read",
-            )
-        })?;
+        .filter(|length| *length != 0 && (!align_for_direct_io || *length % _READ_ALIGNMENT == 0))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Region record read"))?;
     let record_start = record_absolute
         .checked_sub(absolute)
         .and_then(|start| usize::try_from(start).ok())
@@ -236,20 +239,20 @@ pub(crate) fn plan_read(
         ..record_start.checked_add(record_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "record slice end overflow")
         })?;
-    let overhead = aligned_len.checked_sub(record_len).ok_or_else(|| {
+    let overhead = read_len.checked_sub(record_len).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "aligned Region read is shorter than its record",
+            "Region read is shorter than its record",
         )
     })?;
-    if !absolute.is_multiple_of(alignment)
-        || record_range.end > aligned_len
-        || overhead >= _MAX_READ_ALIGNMENT_OVERHEAD
+    if record_range.end > read_len
+        || (align_for_direct_io
+            && (!absolute.is_multiple_of(alignment) || overhead >= _MAX_READ_ALIGNMENT_OVERHEAD))
         || io_end > geometry.data_file_len
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "aligned Region read exceeds its bounds",
+            "Region read exceeds its bounds",
         ));
     }
 
@@ -257,7 +260,7 @@ pub(crate) fn plan_read(
         hash,
         entry,
         absolute,
-        aligned_len,
+        read_len,
         record_range,
     })
 }
@@ -348,7 +351,7 @@ mod tests {
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
-        let plan = plan_read(geometry(), 7, entry).unwrap();
+        let plan = plan_read(geometry(), 7, entry, true).unwrap();
 
         let slot = engine.try_reserve_read().unwrap();
         let completion = submit_read(
@@ -380,12 +383,49 @@ mod tests {
     }
 
     #[test]
+    fn buffered_record_uses_one_exact_read() {
+        let backend = Arc::new(RecordingBackend::default());
+        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let resources = ResourceController::try_new(ResourceLimits {
+            memory_limit_bytes: _READ_ALIGNMENT,
+            reserved_memory_bytes: 0,
+        })
+        .unwrap();
+        let entry = entry(PackedLocation::new(1, 32, 64).unwrap());
+        let plan = plan_read(geometry(), 7, entry, false).unwrap();
+        let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
+
+        let completion = submit_read(
+            &engine,
+            engine.try_reserve_read().unwrap(),
+            plan,
+            resources.try_read_buffer(64).unwrap(),
+        )
+        .unwrap()
+        .wait(&engine);
+        assert!(completion.result.is_ok());
+        assert_eq!(completion.plan.record_range, 0..64);
+        assert_eq!(completion.record_bytes().unwrap().len(), 64);
+        assert_eq!(
+            backend
+                .reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(record_absolute, 64)]
+        );
+        drop(completion.buffer);
+        engine.shutdown().unwrap();
+        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+    }
+
+    #[test]
     fn invalid_entry_is_rejected_before_allocating_or_issuing_io() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
-        let error = plan_read(geometry(), 7, invalid).unwrap_err();
+        let error = plan_read(geometry(), 7, invalid, true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend

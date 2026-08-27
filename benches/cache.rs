@@ -433,6 +433,14 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             snapshot.l1_hits,
             snapshot.l1_misses,
         );
+        println!(
+            "result phase=read_io requests={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={}",
+            snapshot.io.read.requests_succeeded,
+            snapshot.io.read.buffered.operations,
+            snapshot.io.read.buffered.bytes,
+            snapshot.io.read.direct.operations,
+            snapshot.io.read.direct.bytes,
+        );
     }
     Arc::try_unwrap(cache)
         .map_err(|_| io::Error::other("benchmark retained a cache reader"))?

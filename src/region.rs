@@ -533,7 +533,7 @@ impl FileRegionCore {
         Some(entry)
     }
 
-    /// Begins one durable value read. The aligned read buffer becomes the value
+    /// Begins one durable value read. The owned read buffer becomes the value
     /// owner on a hit, avoiding a second payload copy.
     pub(crate) fn begin_value_read(&self, hash: u64) -> Option<IndexEntry> {
         self.begin_point_read(hash)
@@ -552,7 +552,7 @@ impl FileRegionCore {
         let Some(entry) = self.begin_value_read(hash) else {
             return Ok(None);
         };
-        let plan = plan_read(geometry, hash, entry)?;
+        let plan = plan_read(geometry, hash, entry, true)?;
         let slot = engine.try_reserve_read()?;
         self.read_value_from_plan(engine, slot, buffer, plan, key)
     }
@@ -651,7 +651,7 @@ impl FileRegionCore {
         };
         Ok(Some(RegionValueRead {
             buffer,
-            buffer_len: completion.plan.aligned_len,
+            buffer_len: completion.plan.read_len,
             value_range: value_start..value_end,
             seqno: header.seqno,
         }))
@@ -3034,7 +3034,7 @@ mod tests {
         let entry = runtime
             .begin_point_read(owner_hash)
             .expect("hash lookup must return the collision candidate");
-        let plan = plan_read(data.geometry, owner_hash, entry).unwrap();
+        let plan = plan_read(data.geometry, owner_hash, entry, true).unwrap();
 
         // Supplying a different key after the hash lookup precisely models a
         // 64-bit collision at the L2 record-validation boundary.

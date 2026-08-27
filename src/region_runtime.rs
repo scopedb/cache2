@@ -28,7 +28,9 @@ use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
     ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{MAX_APPEND_SHARDS, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig};
+use crate::runtime_config::{
+    IoMode, MAX_APPEND_SHARDS, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig,
+};
 use crate::snapshot::{
     CacheHealth, CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
 };
@@ -624,6 +626,7 @@ struct RunningShared {
     staging: Arc<RegionStaging>,
     shards: Box<[Arc<ShardControl>]>,
     write_flush_threshold_bytes: usize,
+    align_reads_for_direct_io: bool,
     statistics: bool,
 }
 
@@ -969,7 +972,12 @@ impl RegionDataPlane {
             }
             return Ok(PreparedGet::Complete(None));
         };
-        let plan = match plan_read(self.data.geometry, hash, entry) {
+        let plan = match plan_read(
+            self.data.geometry,
+            hash,
+            entry,
+            running.align_reads_for_direct_io,
+        ) {
             Ok(plan) => plan,
             Err(_) => {
                 self.core.enter_miss_only();
@@ -1002,7 +1010,7 @@ impl RegionDataPlane {
                 return Ok(PreparedGet::Complete(None));
             }
         };
-        let Some(buffer) = running.resources.try_read_buffer(plan.aligned_len) else {
+        let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
                 RuntimeMetrics::increment(&activity.l2_read_memory_misses);
@@ -1308,6 +1316,7 @@ fn start_running(
         staging,
         shards: shards.into_boxed_slice(),
         write_flush_threshold_bytes: config.write_flush_threshold_bytes,
+        align_reads_for_direct_io: config.io_mode == IoMode::Direct,
         statistics: config.statistics,
     });
     let mut shard_workers = Vec::new();
@@ -1900,7 +1909,7 @@ mod tests {
             seqno: 1,
         };
         assert_eq!(
-            plan_read(geometry, 1, entry).unwrap().aligned_len,
+            plan_read(geometry, 1, entry, true).unwrap().read_len,
             geometry.region_size as usize
         );
     }
