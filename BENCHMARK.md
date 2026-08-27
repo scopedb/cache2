@@ -25,8 +25,15 @@ The main controls are:
 - `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, and
   `CACHE_BENCH_WRITE_IO_WORKERS` for topology;
 - `CACHE_BENCH_WRITE_CLIENTS` and `CACHE_BENCH_CLIENTS` for concurrency;
+- `CACHE_BENCH_HOT_ENTRIES` enables the focused hot-set/cold-scan workload;
+  `CACHE_BENCH_HOT_READ_INTERVAL` controls one hot read per N cold reads;
 - `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
   `CACHE_BENCH_DIR` for the execution path.
+
+The optional hot-scan mode rewrites a bounded hot set into L1 after warm open,
+then interleaves one-shot hot reads with a single pass over the remaining cold
+keys. It reports L1/L2/miss counts before, during, and after the scan without
+requiring best-effort admission to succeed.
 
 Use a data set larger than host RAM for L2 device measurements. Run each
 revision at least five times in alternating order, report medians, and retain
