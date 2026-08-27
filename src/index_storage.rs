@@ -1237,6 +1237,27 @@ impl PartitionedIndexStorage {
         Self::from_core(slot_count, ranges, core, None)
     }
 
+    #[cfg(feature = "benchmarking")]
+    pub(crate) fn anonymous_single_partition(slot_count: usize) -> Result<Self, IndexStorageError> {
+        let layout = ImageLayout::new(slot_count)?;
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(1).map_err(|_| {
+            IndexStorageError::Io(io::Error::other(
+                "unable to allocate benchmark index partition",
+            ))
+        })?;
+        ranges.push(IndexPartitionRange {
+            partition_id: 0,
+            first_page: 0,
+            page_count: layout.page_count,
+            first_slot: 0,
+            slot_count,
+        });
+        let whole = IndexStorage::anonymous(slot_count)?;
+        let IndexStorage { core, .. } = whole;
+        Self::from_core(slot_count, ranges.into_boxed_slice(), core, None)
+    }
+
     pub(crate) fn map_private(
         file: &File,
         file_offset: u64,

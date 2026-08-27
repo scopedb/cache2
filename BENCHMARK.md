@@ -94,6 +94,10 @@ cargo +1.98.0 bench --locked --features benchmarking \
   --bench region_index_turnover
 ```
 
+The default models one production-sized partition from a 4 TiB cache averaging
+16 KiB entries: 65,536 logical live entries in 81,920 slots. This preserves the
+80% load and probe shape without allocating the complete 7.62 GiB index.
+
 Measure fresh/warm open and close costs at a configurable index scale:
 
 ```sh

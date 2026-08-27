@@ -41,7 +41,7 @@ fn main() -> io::Result<()> {
         report.config.sample_operations,
     );
     println!(
-        "production_projection capacity=4TiB average_entry=16KiB physical_entries=268435456 index_slots=335544320"
+        "production_projection capacity=4TiB average_entry=16KiB partitions=4096 physical_entries_per_partition=65536 index_slots_per_partition=81920"
     );
 
     for checkpoint in report.checkpoints {

@@ -33,8 +33,10 @@ pub struct RegionIndexTurnoverConfig {
 impl Default for RegionIndexTurnoverConfig {
     fn default() -> Self {
         Self {
-            region_count: 100,
-            entries_per_region: 43,
+            // One 4 TiB / 16 KiB production partition contains 65,536 live
+            // entries in 81,920 physical slots at the default 80% load.
+            region_count: 128,
+            entries_per_region: 512,
             turns: 100,
             sample_operations: 262_144,
             key_space_multiplier: 4,
@@ -210,7 +212,8 @@ struct TurnoverWorkload {
 
 impl TurnoverWorkload {
     fn new(plan: TurnoverPlan) -> io::Result<Self> {
-        let storage = PartitionedIndexStorage::anonymous(plan.index_slots).map_err(index_error)?;
+        let storage = PartitionedIndexStorage::anonymous_single_partition(plan.index_slots)
+            .map_err(index_error)?;
         let index =
             RegionIndex::try_from_storage(storage, (0..plan.config.region_count).map(|_| 0_u64))?;
         index.set_statistics_enabled(true);
@@ -540,6 +543,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2]
         );
+        assert_eq!(report.partition_count, 1);
+        assert_eq!(report.minimum_partition_slots, report.index_slots);
+        assert_eq!(report.maximum_partition_slots, report.index_slots);
         for checkpoint in &report.checkpoints {
             assert_eq!(checkpoint.logical_live_keys, report.physical_entries);
             assert!(checkpoint.index.physical_value_slots <= report.index_slots as u64);
