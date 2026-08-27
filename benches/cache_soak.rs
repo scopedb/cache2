@@ -37,7 +37,9 @@ struct SoakConfig {
     reclaim_workers: usize,
     writers: usize,
     readers: usize,
+    operation_interval: Duration,
     warm_reopen: bool,
+    final_warm_verify: bool,
     io_engine: IoEngine,
     io_mode: IoMode,
     directory: PathBuf,
@@ -83,7 +85,10 @@ impl SoakConfig {
         let write_io_workers = env_usize("CACHE_SOAK_WRITE_IO_WORKERS", 4)?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
+        let operation_interval =
+            Duration::from_micros(env_u64("CACHE_SOAK_OPERATION_INTERVAL_US", 0)?);
         let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
+        let final_warm_verify = env_bool("CACHE_SOAK_FINAL_WARM_VERIFY", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -103,10 +108,11 @@ impl SoakConfig {
             || write_io_workers == 0
             || writers == 0
             || readers == 0
+            || operation_interval > Duration::from_secs(1)
             || !directory.is_dir()
         {
             return Err(invalid(
-                "invalid soak duration, topology, value, or directory",
+                "invalid soak duration, pacing, topology, value, or directory",
             ));
         }
         Ok(Self {
@@ -124,7 +130,9 @@ impl SoakConfig {
             reclaim_workers,
             writers,
             readers,
+            operation_interval,
             warm_reopen,
+            final_warm_verify,
             io_engine,
             io_mode,
             directory,
@@ -228,6 +236,13 @@ struct CounterSnapshot {
     max_get_ns: u64,
 }
 
+#[derive(Default)]
+struct WarmVerification {
+    hits: u64,
+    stale_hits: u64,
+    misses: u64,
+}
+
 impl SoakCounters {
     fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
@@ -311,7 +326,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -329,7 +344,9 @@ fn main() -> io::Result<()> {
         config.reclaim_workers,
         config.writers,
         config.readers,
+        config.operation_interval.as_micros(),
         config.warm_reopen,
+        config.final_warm_verify,
         DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
@@ -456,7 +473,48 @@ fn main() -> io::Result<()> {
         runtime.handle(),
     )?;
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
-    runtime.block_on(async { cache.close_fast().await })?;
+    if config.final_warm_verify {
+        runtime.block_on(cache.close_warm())?;
+        cache = open_cache(&runtime, &files, &config)?;
+        if cache.startup_mode() != StartupMode::Warm {
+            return Err(io::Error::other(
+                "soak final verification did not recover a clean image",
+            ));
+        }
+        let verification = verify_warm_reopen(
+            &runtime,
+            &cache,
+            &keys,
+            &expected,
+            value_size_count,
+            &config.value_bytes,
+        )?;
+        let verification_sample = resource_sample(
+            &cache,
+            &files,
+            peak_disk_bytes,
+            config.rss_slack_bytes,
+            false,
+            runtime.handle(),
+        )?;
+        let verification_resources = verification_sample.detailed.summary;
+        max_managed_memory =
+            max_managed_memory.max(verification_resources.managed_memory_peak_bytes);
+        runtime.block_on(cache.close_fast())?;
+        println!(
+            "warm_verification keys={} hits={} stale_hits={} misses={} l2_hits={} l2_misses={} managed={} managed_peak={} errors=0",
+            keys.len(),
+            verification.hits,
+            verification.stale_hits,
+            verification.misses,
+            verification_resources.l2_hits,
+            verification_resources.l2_misses,
+            verification_resources.managed_memory_bytes,
+            verification_resources.managed_memory_peak_bytes,
+        );
+    } else {
+        runtime.block_on(cache.close_fast())?;
+    }
     report_sample(
         true,
         started.elapsed(),
@@ -506,6 +564,7 @@ fn populate_for_warm_reopen(
     let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     for ordinal in 0..total {
+        pace(config.operation_interval);
         let announced = ordinal
             .checked_add(1)
             .ok_or_else(|| invalid("warm-reopen write ordinal exhausted"))?;
@@ -546,6 +605,10 @@ fn run_writer(
     let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     while !stop.load(Ordering::Acquire) {
+        pace(config.operation_interval);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let ordinal = next_write.fetch_add(1, Ordering::Relaxed);
         let announced = ordinal
             .checked_add(1)
@@ -613,6 +676,10 @@ fn run_reader(
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
     while !stop.load(Ordering::Acquire) {
+        pace(config.operation_interval);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let ordinal = next_read.fetch_add(1, Ordering::Relaxed);
         let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
             .map_err(|_| invalid("soak sampled key exceeds usize"))?;
@@ -640,6 +707,30 @@ fn run_reader(
         }
     }
     Ok(())
+}
+
+fn verify_warm_reopen(
+    runtime: &tokio::runtime::Runtime,
+    cache: &Cache,
+    keys: &[Box<[u8]>],
+    expected: &[AtomicU64],
+    value_size_count: u64,
+    value_bytes: &[usize],
+) -> io::Result<WarmVerification> {
+    let mut verification = WarmVerification::default();
+    for (sampled, key) in keys.iter().enumerate() {
+        match runtime.block_on(cache.get(key))? {
+            Some(observed) => {
+                let latest = expected[sampled].load(Ordering::SeqCst);
+                if validate_observed(sampled, &observed, latest, value_size_count, value_bytes)? {
+                    verification.stale_hits = verification.stale_hits.saturating_add(1);
+                }
+                verification.hits = verification.hits.saturating_add(1);
+            }
+            None => verification.misses = verification.misses.saturating_add(1),
+        }
+    }
+    Ok(verification)
 }
 
 fn validate_observed(
@@ -819,6 +910,12 @@ fn report_sample(
 fn record_latency(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
     counter.fetch_max(nanos, Ordering::Relaxed);
+}
+
+fn pace(interval: Duration) {
+    if !interval.is_zero() {
+        thread::sleep(interval);
+    }
 }
 
 #[cfg(unix)]

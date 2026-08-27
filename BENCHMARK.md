@@ -96,6 +96,49 @@ Use `CACHE_SOAK_WARM_REOPEN=true` to publish and reopen a clean image before the
 measured phase. `CACHE_SOAK_*` variables control capacity, managed memory, keys,
 append-shard and worker counts, clients, value sizes, and RSS slack.
 
+## Long correctness and stability run
+
+Use a per-client interval to keep a long run below saturation. The following
+configuration limits two writers to at most roughly 1,000 combined operations
+per second and four readers to at most roughly 2,000 reads per second. Actual
+rates are lower because operation time is not subtracted from the interval.
+
+```sh
+CACHE_SOAK_SECONDS=86400 \
+CACHE_SOAK_SAMPLE_SECONDS=60 \
+CACHE_SOAK_DIR=/mnt/nvme \
+CACHE_SOAK_CAPACITY_MIB=65536 \
+CACHE_SOAK_MEMORY_MIB=4096 \
+CACHE_SOAK_MANAGED_MEMORY_LIMIT_MIB=6144 \
+CACHE_SOAK_RSS_SLACK_MIB=256 \
+CACHE_SOAK_KEYS=1048576 \
+CACHE_SOAK_VALUE_BYTES=256,256,4096,4096,4096,4096,16384,16384,16384,16384,16384,16384,16384,16384,65536,262144 \
+CACHE_SOAK_APPEND_SHARDS=4 \
+CACHE_SOAK_RECLAIM_WORKERS=1 \
+CACHE_SOAK_READ_IO_WORKERS=4 \
+CACHE_SOAK_WRITE_IO_WORKERS=4 \
+CACHE_SOAK_WRITERS=2 \
+CACHE_SOAK_READERS=4 \
+CACHE_SOAK_OPERATION_INTERVAL_US=2000 \
+CACHE_SOAK_WARM_REOPEN=true \
+CACHE_SOAK_FINAL_WARM_VERIFY=true \
+CACHE_SOAK_IO_ENGINE=posix \
+CACHE_SOAK_IO_MODE=buffered \
+cargo +1.98.0 bench --locked --bench cache_soak
+```
+
+The operation interval applies to every foreground client and to the initial
+warm prefill; zero preserves the original unpaced behavior. Intervals above one
+second are rejected so shutdown remains responsive.
+
+Final warm verification publishes the churned state, reopens it, and scans the
+complete key space sequentially. Every recovered hit receives the same key,
+version, length, and payload validation as the measured readers. A successful
+run emits `warm_verification ... errors=0` followed by
+`complete ... errors=0 ... io_errors=0`. The configured measured duration does
+not include the paced prefill or final verification scan; the final reported
+elapsed time does include the verification work.
+
 ## Focused diagnostics
 
 Exercise long-turnover index behavior without storage I/O:
