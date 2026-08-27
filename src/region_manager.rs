@@ -5,8 +5,9 @@
 //! canonical shard records from the index owner and derives every Region and
 //! queue field from live manager state.
 
+use crate::format::RECORD_ALIGNMENT;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
-use crate::recovery::{PersistentId, RECORD_ALIGNMENT};
+use crate::recovery::PersistentId;
 use crate::region_metadata::{
     PartitionMetadataRecord, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
     RegionMetadataRoot, RegionMetadataState,
@@ -606,7 +607,7 @@ impl RegionManager {
 
     /// Atomically consumes one exact padding receipt and seals its open span.
     /// Keeping the receipt pending until this call prevents another append from
-    /// entering between staging's header rewrite and manager publication.
+    /// entering between staging's padding update and manager publication.
     pub(crate) fn seal_write_span_with_padding(
         &mut self,
         padding: RegionPaddingReceipt,

@@ -214,7 +214,7 @@ async fn immediate_l1_publication_is_best_effort() {
 }
 
 #[tokio::test]
-async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
+async fn write_batch_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
@@ -235,22 +235,16 @@ async fn reject_returns_when_the_fixed_write_buffer_needs_a_flush() {
     let first = vec![1_u8; 200 * 1024];
     let second = vec![2_u8; 200 * 1024];
 
-    cache.put("key", &first).unwrap();
-    let error = match cache.put("key", &second) {
-        Err(error) => error,
-        Ok(_) => panic!("fixed write buffer accepted a second oversized resident batch"),
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), first);
-    assert_eq!(cache.snapshot().unwrap().write_rejections, 1);
+    let first_seqno = cache.put("key", &first).unwrap();
+    let second_seqno = cache.put("key", &second).unwrap();
+    assert!(second_seqno > first_seqno);
+    assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), second);
+    assert_eq!(cache.snapshot().unwrap().write_rejections, 0);
     assert_eq!(
         cache.detailed_snapshot().unwrap().write_buffer_rejections,
-        1
+        0
     );
-
     cache.drain().await.unwrap();
-    eventually_admitted(|| cache.put("key", &second));
-    assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), second);
     cache.close_fast().await.unwrap();
 }
 
@@ -625,15 +619,25 @@ async fn public_entry_size_limits_are_explicit() {
     let files = TestCache::new("entry-size-limits");
     let cache = files.config(1).open().await.unwrap();
     let oversized_key = vec![0_u8; 4 * 1024 + 1];
-    let oversized_value = vec![0_u8; 256 * 1024 + 1];
+    let large_value = vec![7_u8; 512 * 1024 - 64];
+    let oversized_value = vec![0_u8; large_value.len() + 32];
 
     assert_eq!(
         cache.put(&oversized_key, b"value").unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
     assert_eq!(
-        cache.put(b"key", &oversized_value).unwrap_err().kind(),
+        cache
+            .put(b"too-large", &oversized_value)
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::InvalidInput
+    );
+    cache.put(b"large", &large_value).unwrap();
+    cache.drain().await.unwrap();
+    assert_eq!(
+        cache.get(b"large").await.unwrap().unwrap().as_ref(),
+        large_value
     );
     assert_eq!(
         cache.delete(&oversized_key).unwrap_err().kind(),
@@ -641,9 +645,17 @@ async fn public_entry_size_limits_are_explicit() {
     );
     assert!(cache.get(&oversized_key).await.unwrap().is_none());
     let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.puts, 0);
+    assert_eq!(snapshot.puts, 1);
     assert_eq!(snapshot.deletes, 0);
-    cache.close_fast().await.unwrap();
+    cache.close_warm().await.unwrap();
+
+    let reopened = files.config(1).open().await.unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    let value = reopened.get(b"large").await.unwrap().unwrap();
+    assert_eq!(value.tier(), CacheTier::L2);
+    assert_eq!(value.as_ref(), large_value);
+    drop(value);
+    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]

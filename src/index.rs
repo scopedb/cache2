@@ -20,7 +20,7 @@ const RECORD_LEN_ALIGNMENT: u32 = 32;
 
 pub(crate) const MAX_REGION_ID: u32 = REGION_MASK as u32;
 pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMENT;
-pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32) * RECORD_LEN_ALIGNMENT;
+pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32 + 1) * RECORD_LEN_ALIGNMENT;
 pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
 pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
 /// 512M slots is a 12 GiB index at the stable 24-byte slot size and covers a
@@ -60,7 +60,7 @@ impl PackedLocation {
         }
 
         let offset_units = u64::from(offset / OFFSET_ALIGNMENT);
-        let record_len_units = u64::from(record_len / RECORD_LEN_ALIGNMENT);
+        let record_len_units = u64::from(record_len / RECORD_LEN_ALIGNMENT - 1);
         Ok(Self(
             u64::from(region_id)
                 | (offset_units << OFFSET_SHIFT)
@@ -97,7 +97,7 @@ impl PackedLocation {
     }
 
     pub(crate) const fn record_len(self) -> u32 {
-        (((self.0 >> RECORD_LEN_SHIFT) & RECORD_LEN_MASK) as u32) * RECORD_LEN_ALIGNMENT
+        ((((self.0 >> RECORD_LEN_SHIFT) & RECORD_LEN_MASK) as u32) + 1) * RECORD_LEN_ALIGNMENT
     }
 }
 
@@ -179,10 +179,6 @@ mod tests {
             assert_eq!(location.offset(), offset);
             assert_eq!(location.record_len(), len);
         }
-        assert_eq!(
-            PackedLocation::try_from_raw(0),
-            Err(PackedLocationError::RecordLengthZero)
-        );
         assert_eq!(
             PackedLocation::try_from_raw(1_u64 << RESERVED_SHIFT),
             Err(PackedLocationError::ReservedBitSet)

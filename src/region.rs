@@ -587,13 +587,10 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.record_len != entry.location.record_len()
-            || header.seqno != entry.seqno
-            || header.key_hash != hash
-        {
+        if header.seqno != entry.seqno || header.key_hash != hash {
             return Ok(None);
         }
-        let key_len = header.key_len as usize;
+        let key_len = usize::from(header.key_len);
         let value_len = header.value_len as usize;
         let Some(payload_end) = RECORD_HEADER_SIZE
             .checked_add(key_len)
@@ -646,7 +643,7 @@ impl FileRegionCore {
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "value exceeds one fixed write buffer",
+                "value exceeds one Region staging buffer",
             ));
         }
         let _shard_mutation = self.lock_shard_mutation(shard_id)?;
@@ -788,7 +785,7 @@ impl FileRegionCore {
         };
 
         // An already aligned span is sealed under this first manager guard. A
-        // non-zero tail receipt remains a shard fence while staging rewrites its
+        // non-zero tail receipt remains a shard fence while staging extends its
         // last record outside the manager lock.
         let (padding, sealed) = {
             let mut manager = self.manager.lock()?;

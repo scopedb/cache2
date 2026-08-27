@@ -13,7 +13,6 @@ use crate::io_engine::{
 };
 use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
 use crate::region_manager::RegionWriteSpan;
-use crate::runtime_config::MAX_WRITE_BATCH_BYTES;
 
 pub(crate) struct RegionSpanSubmitError {
     pub(crate) error: io::Error,
@@ -193,13 +192,11 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
         .end_offset
         .checked_sub(span.start_offset)
         .and_then(|length| usize::try_from(length).ok())
-        .filter(|length| {
-            *length != 0 && *length <= MAX_WRITE_BATCH_BYTES && *length % DIRECT_IO_ALIGNMENT == 0
-        })
+        .filter(|length| *length != 0 && *length % DIRECT_IO_ALIGNMENT == 0)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Region write span exceeds the fixed batch size",
+                "Region write span length is invalid",
             )
         })?;
     let absolute = u64::from(span.region_id)

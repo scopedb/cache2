@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE};
+use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
 use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_ENGINE, ReadSlot, build_file_engine};
@@ -22,7 +22,7 @@ use crate::memory::{
 use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
-use crate::region_reader::{_READ_ALIGNMENT, PendingRead, ReadCompletion, plan_read};
+use crate::region_reader::{PendingRead, ReadCompletion, plan_read};
 use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
@@ -31,20 +31,6 @@ use crate::resources::{
 use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, MAX_WRITE_SHARDS, RuntimeConfig};
 use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
 
-const _MAX_KEY_BYTES: usize = 4 * 1024;
-const _MAX_VALUE_BYTES: usize = 256 * 1024;
-const MAX_RUNTIME_RECORD_BYTES: usize = const_align_up(
-    RECORD_HEADER_SIZE + _MAX_KEY_BYTES + _MAX_VALUE_BYTES,
-    RECORD_ALIGNMENT,
-);
-// A runtime record begins on a RECORD_ALIGNMENT boundary. Tail padding, when
-// present, moves the same record end to the next read boundary, so the largest
-// exact aligned read is the maximum record plus the largest possible start
-// skew, rounded once to the device-read alignment.
-const MAX_READ_BUFFER_BYTES: usize = const_align_up(
-    MAX_RUNTIME_RECORD_BYTES + (_READ_ALIGNMENT - RECORD_ALIGNMENT),
-    _READ_ALIGNMENT,
-);
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
 // Covers the bounded engine registry, command channel, and driver-side
@@ -64,10 +50,6 @@ const LIFECYCLE_FAILED: u8 = 2;
 const MUTATION_DRAINING: usize = 1_usize << (usize::BITS - 1);
 const MUTATION_COUNT_MASK: usize = !MUTATION_DRAINING;
 const MUTATION_ENTER_ATTEMPTS: usize = 8;
-
-const fn const_align_up(value: usize, alignment: usize) -> usize {
-    (value + alignment - 1) & !(alignment - 1)
-}
 
 struct LifecycleDrainingGuard<'a> {
     lifecycle: &'a AtomicU8,
@@ -515,8 +497,7 @@ impl RuntimeConfig {
             .ok_or_else(|| invalid_runtime_config("runtime topology memory plan overflow"))?;
         let usable_region = usize::try_from(geometry.region_size)
             .map_err(|_| invalid_runtime_config("Region size does not fit the memory plan"))?;
-        let chunk_bytes =
-            usable_region.min(self.write_batch_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+        let chunk_bytes = usable_region;
         let write_buffer_reservation =
             RegionStaging::reservation_bytes(shard_count, chunk_bytes)
                 .ok_or_else(|| invalid_runtime_config("write buffer memory plan overflow"))?;
@@ -529,7 +510,7 @@ impl RuntimeConfig {
             // Keep enough uncommitted budget for at least one maximum-size
             // exact read. Additional reads consume only their actual aligned
             // buffer size and fail open when the aggregate budget is full.
-            .and_then(|bytes| bytes.checked_add(MAX_READ_BUFFER_BYTES))
+            .and_then(|bytes| bytes.checked_add(usable_region))
             .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
         Ok((reserved_memory, minimum))
     }
@@ -823,14 +804,20 @@ impl RegionDataPlane {
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        if key.len() > _MAX_KEY_BYTES || value.len() > _MAX_VALUE_BYTES {
+        if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "file-chunk entry exceeds the 4 KiB key or 256 KiB value limit",
+                "file-chunk key exceeds the 4 KiB limit",
             ));
         }
         let record_bytes = required_record_bytes(key.len(), value.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        if u64::from(record_bytes) > self.data.geometry.region_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "encoded file-chunk entry exceeds one Region",
+            ));
+        }
         let running = &self.running.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let shard_id = self.core.append_shard(hash);
@@ -875,7 +862,7 @@ impl RegionDataPlane {
     }
 
     pub(crate) fn delete(&self, key: &[u8]) -> io::Result<u64> {
-        if key.len() > _MAX_KEY_BYTES {
+        if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-chunk key exceeds the 4 KiB limit",
@@ -931,7 +918,7 @@ impl RegionDataPlane {
     }
 
     fn prepare_get(&self, key: &[u8]) -> io::Result<PreparedGet> {
-        if key.len() > _MAX_KEY_BYTES {
+        if key.len() > MAX_KEY_SIZE {
             if self.config.statistics {
                 let activity = self.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
@@ -976,8 +963,8 @@ impl RegionDataPlane {
             return Ok(PreparedGet::Complete(None));
         };
         let plan = match plan_read(self.data.geometry, hash, entry) {
-            Ok(plan) if plan.aligned_len <= MAX_READ_BUFFER_BYTES => plan,
-            Ok(_) | Err(_) => {
+            Ok(plan) => plan,
+            Err(_) => {
                 self.core.enter_miss_only();
                 if running.statistics {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
@@ -1267,8 +1254,7 @@ fn start_running(
     );
     let usable_region = usize::try_from(data.geometry.region_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region size is too large"))?;
-    let chunk_bytes =
-        usable_region.min(config.write_batch_bytes) & !(crate::resources::BUFFER_ALIGNMENT - 1);
+    let chunk_bytes = usable_region;
     let staging = Arc::new(
         RegionStaging::try_new(
             shard_count,
@@ -1876,24 +1862,17 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let record_len = required_record_bytes(_MAX_KEY_BYTES, _MAX_VALUE_BYTES).unwrap();
-        assert_eq!(record_len as usize, MAX_RUNTIME_RECORD_BYTES);
-
-        let mut observed_max = 0;
-        for offset in (0.._READ_ALIGNMENT).step_by(RECORD_ALIGNMENT) {
-            let padded_end = const_align_up(offset + record_len as usize, _READ_ALIGNMENT);
-            for candidate_len in [record_len, (padded_end - offset) as u32] {
-                let entry = crate::index::IndexEntry {
-                    location: crate::index::PackedLocation::new(0, offset as u32, candidate_len)
-                        .unwrap(),
-                    seqno: 1,
-                };
-                let plan = plan_read(geometry, 1, entry).unwrap();
-                observed_max = observed_max.max(plan.aligned_len);
-                assert!(plan.aligned_len <= MAX_READ_BUFFER_BYTES);
-            }
-        }
-        assert_eq!(observed_max, MAX_READ_BUFFER_BYTES);
+        let value_len = geometry.region_size as usize - crate::format::RECORD_HEADER_SIZE;
+        let record_len = required_record_bytes(0, value_len).unwrap();
+        assert_eq!(u64::from(record_len), geometry.region_size);
+        let entry = crate::index::IndexEntry {
+            location: crate::index::PackedLocation::new(0, 0, record_len).unwrap(),
+            seqno: 1,
+        };
+        assert_eq!(
+            plan_read(geometry, 1, entry).unwrap().aligned_len,
+            geometry.region_size as usize
+        );
     }
 
     #[test]
@@ -1936,10 +1915,10 @@ mod tests {
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 8).unwrap();
         base.clone()
-            .with_memory_limit(18 * GIB)
+            .with_memory_limit(19 * GIB)
             .validate_memory_plan(geometry, index_slots, 8)
             .unwrap();
-        let too_small = base.clone().with_memory_limit(17 * GIB);
+        let too_small = base.clone().with_memory_limit(18 * GIB);
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 8)

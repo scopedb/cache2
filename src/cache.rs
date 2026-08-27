@@ -348,16 +348,16 @@ impl HybridCache {
 
     /// Stores a value and returns its monotonic mutation sequence.
     ///
-    /// Keys are limited to 4 KiB and values to 256 KiB.
+    /// Keys are limited to 4 KiB. The complete encoded record must fit in one
+    /// Region; values have no smaller independent limit.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.store.put_value(key.as_ref(), value.as_ref())
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
     ///
-    /// The accepted delete is staged through the same bounded write path as a
-    /// put. L1 cleanup is immediate and best effort; the L2 delete is applied
-    /// after its containing Region batch completes.
+    /// Delete performs a bounded in-memory index removal and best-effort L1
+    /// cleanup. It does not append a physical Region record.
     /// Keys are limited to 4 KiB.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
         self.store.delete_value(key.as_ref())

@@ -7,6 +7,7 @@
 //! to the selected slot and provide the required `fdatasync` barrier.
 
 use crate::checksum::{Crc32c, crc32c};
+use crate::format::{RECORD_ALIGNMENT, RECORD_FORMAT_VERSION};
 use crate::index::{MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
 
@@ -17,8 +18,6 @@ pub(crate) const STATE_FILE_SIZE: usize = STATE_SLOT_COUNT * RECOVERY_PAGE_SIZE;
 pub(crate) const DATA_REGION_AREA_OFFSET: u64 = RECOVERY_PAGE_SIZE as u64;
 pub(crate) const RECOVERY_IMAGE_INDEX_OFFSET: u64 = INDEX_IMAGE_PAGE_SIZE as u64;
 pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE as u64;
-pub(crate) const RECORD_ALIGNMENT: u32 = 32;
-pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
 pub(crate) const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
 
 const DATA_MAGIC: [u8; 8] = *b"CRDATA\0\0";

@@ -22,8 +22,8 @@ record. A collision may therefore become a conservative miss but can never
 return another key's value. Logical namespaces, when needed, are encoded by the
 caller into that raw key.
 
-Every append shard has one Active Region, two fixed write buffers, and one
-ordered worker. All remaining Regions share one global free/sealed FIFO, so any
+Every append shard has one Active Region, two Region-sized write buffers, and
+one ordered worker. All remaining Regions share one global free/sealed FIFO, so any
 shard can consume free capacity and reclaim the oldest sealed Region. Runtime
 L1 shards and append shards are independent. Changing the append-shard count
 does not change physical Region capacity, but it discards a clean image whose
@@ -57,10 +57,10 @@ A `put` follows a direct bounded path:
 8. publish the index entry directly to its index partition only after successful
    completion, without reacquiring the global Region manager.
 
-Each shard has exactly two staging buffers, allowing one submitted batch and one
-fill batch without allocating per request. RAM entries are byte-bounded per
-shard and immediately eligible for eviction. Victim order is selected at
-runtime by shard-local CLOCK with a fixed scan budget. Capacity charging and
+Each shard has exactly two Region-sized staging buffers, allowing one submitted
+batch and one fill batch without allocating per request. RAM entries are
+byte-bounded per shard and immediately eligible for eviction. Victim order is
+selected at runtime by shard-local CLOCK with a fixed scan budget. Capacity charging and
 full-key validation remain separate from its visited-bit metadata. Values that
 do not fit L1 continue through L2 without an additional queue. FIFO Region
 reuse remains the only SSD replacement policy.
@@ -140,7 +140,7 @@ state rather than trying to migrate it.
 Runtime configuration is not part of the data-superblock identity and is
 selected on each open. It includes I/O engine and mode, independent read and
 write worker counts, append-shard count, L1 capacity and shard count, one
-write-batch capacity, aggregate memory limit, and optional statistics. The
+write-batch flush target, aggregate memory limit, and optional statistics. The
 clean image records its append-shard topology; a count mismatch cold-starts
 empty instead of migrating it. Other runtime tuning can retain the image.
 Foreground L2 reads
@@ -148,8 +148,9 @@ reserve one immediately available read-engine execution slot after an index hit,
 then allocate one actual-size aligned range; they have no separate public
 admission policy. The dedicated write pool cannot affect read-slot availability.
 Runtime configuration is validated before filesystem mutation.
-Keys are bounded at 4 KiB and values at 256 KiB. Device operations use a fixed
-five-second completion guardrail so a stalled cache device cannot retain a
+Keys are bounded at 4 KiB. A value has no smaller independent bound; its complete
+encoded record must fit in one Region. Device operations use a fixed five-second
+completion guardrail so a stalled cache device cannot retain a
 frontend or shutdown barrier indefinitely.
 
 The managed logical disk peak is deterministic: the fixed data file and 8 KiB

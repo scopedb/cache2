@@ -131,8 +131,10 @@ one 64-bit hash so collision work remains constant-bounded.
 Use `drain` when the caller needs all accepted Region writes completed. It does
 not sync data or create a recovery image.
 
-Keys are limited to 4 KiB and values to 256 KiB. Oversized mutations return
-`InvalidInput`; an oversized lookup is a miss. Each admitted device operation
+Keys are limited to 4 KiB. A value has no smaller independent limit: its complete
+encoded record (36-byte header, key, value, and alignment padding) must fit in
+one Region. Oversized mutations return `InvalidInput`; an oversized-key lookup
+is a miss. Each admitted device operation
 also has a fixed five-second completion guardrail. It is an internal
 device-stall safety boundary, not a durability or configurable request-timeout
 setting; a persistent stall takes the cache runtime out of service and later
@@ -156,14 +158,14 @@ is selected on every open:
   bounded engine per direction with one execution slot per worker, while
   optional io_uring uses one fixed 64-slot lane per configured worker;
 - bounded append-shard count;
-- L1 capacity, L1 shard count, aggregate memory limit, one per-shard write
-  batch capacity, and opt-in operational counters.
+- L1 capacity, L1 shard count, aggregate memory limit, a write-batch flush
+  target, and opt-in operational counters.
 
 `with_write_shards` is separate from `with_write_io_workers`. A write shard is
-a runtime append/staging path with one Active Region, two fixed write buffers,
-and one ordered worker. Its count can change between opens, but not while a
-cache is running. A count that differs from a clean image safely opens empty
-instead of migrating the old active-Region topology; the static data layout is
+a runtime append/staging path with one Active Region, two Region-sized write
+buffers, and one ordered worker. Its count can change between opens, but not
+while a cache is running. A count that differs from a clean image safely opens
+empty instead of migrating the old active-Region topology; the static data layout is
 not reformatted. The write I/O worker count independently bounds device
 parallelism, so concurrent batch submissions are limited by the smaller of the
 write-shard and write-worker counts.

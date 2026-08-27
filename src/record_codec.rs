@@ -10,16 +10,14 @@ use std::fmt;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::checksum::Crc32c;
-use crate::format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordHeader};
+use crate::format::{MAX_KEY_SIZE, RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation, PackedLocationError};
-use crate::recovery::RECORD_ALIGNMENT;
 use crate::region_manager::RegionAppendReservation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecordEncodeError {
     LengthOverflow,
     KeyTooLarge,
-    ValueTooLarge,
     RecordTooLarge,
     DestinationLengthMismatch { reserved: u32, destination: usize },
     ReservationTooSmall { required: u32, reserved: u32 },
@@ -32,7 +30,6 @@ impl fmt::Display for RecordEncodeError {
         match self {
             Self::LengthOverflow => formatter.write_str("record length overflow"),
             Self::KeyTooLarge => formatter.write_str("record key exceeds the format limit"),
-            Self::ValueTooLarge => formatter.write_str("record value exceeds the format limit"),
             Self::RecordTooLarge => {
                 formatter.write_str("record length exceeds the packed-location limit")
             }
@@ -73,9 +70,6 @@ pub(crate) fn required_record_bytes(
 ) -> Result<u32, RecordEncodeError> {
     if key_len > MAX_KEY_SIZE {
         return Err(RecordEncodeError::KeyTooLarge);
-    }
-    if value_len > MAX_VALUE_SIZE {
-        return Err(RecordEncodeError::ValueTooLarge);
     }
     let record_bytes =
         RecordHeader::aligned_len(key_len, value_len).ok_or(RecordEncodeError::LengthOverflow)?;
@@ -142,8 +136,8 @@ pub(crate) fn encode_value_into_hashed(
         reservation.record_bytes,
     )
     .map_err(RecordEncodeError::InvalidLocation)?;
-    let value_len = u32::try_from(value.len()).map_err(|_| RecordEncodeError::ValueTooLarge)?;
-    let key_len = u32::try_from(key.len()).map_err(|_| RecordEncodeError::LengthOverflow)?;
+    let value_len = u32::try_from(value.len()).map_err(|_| RecordEncodeError::LengthOverflow)?;
+    let key_len = u16::try_from(key.len()).map_err(|_| RecordEncodeError::KeyTooLarge)?;
     let payload_end = RECORD_HEADER_SIZE
         .checked_add(key.len())
         .and_then(|end| end.checked_add(value.len()))
@@ -172,7 +166,6 @@ pub(crate) fn encode_value_into_hashed(
     let header = RecordHeader {
         key_len,
         value_len,
-        record_len: reservation.record_bytes,
         seqno: reservation.seqno,
         key_hash: hash,
         payload_crc: payload_crc.finish(),
@@ -238,9 +231,8 @@ mod tests {
         assert_eq!(entry.seqno, 17);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(header.key_len, key.len() as u32);
+        assert_eq!(usize::from(header.key_len), key.len());
         assert_eq!(header.value_len, value.len() as u32);
-        assert_eq!(header.record_len, required);
         assert_eq!(header.seqno, 17);
         assert_eq!(header.key_hash, hash);
 
@@ -279,8 +271,8 @@ mod tests {
             Err(RecordEncodeError::KeyTooLarge)
         );
         assert_eq!(
-            required_record_bytes(1, MAX_VALUE_SIZE + 1),
-            Err(RecordEncodeError::ValueTooLarge)
+            required_record_bytes(0, MAX_RECORD_LEN as usize - RECORD_HEADER_SIZE + 1),
+            Err(RecordEncodeError::RecordTooLarge)
         );
 
         let required = required_record_bytes(3, 16).unwrap();

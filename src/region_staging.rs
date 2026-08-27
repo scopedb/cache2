@@ -5,16 +5,17 @@
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::format::RECORD_ALIGNMENT;
+#[cfg(test)]
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation};
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::io_engine::IoBuffer;
-use crate::recovery::{DATA_REGION_AREA_OFFSET, RECORD_ALIGNMENT, RECOVERY_PAGE_SIZE};
+use crate::recovery::{DATA_REGION_AREA_OFFSET, RECOVERY_PAGE_SIZE};
 use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
 use crate::resources::{
     BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController, RuntimeMemoryReservation,
 };
-use crate::runtime_config::MAX_WRITE_BATCH_BYTES;
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
 
@@ -217,20 +218,23 @@ impl RegionStaging {
                 "Region staging requires at least one shard",
             ));
         }
-        if chunk_bytes == 0
-            || chunk_bytes > MAX_WRITE_BATCH_BYTES
-            || !chunk_bytes.is_multiple_of(BUFFER_ALIGNMENT)
-            || !chunk_bytes.is_multiple_of(RECORD_ALIGNMENT as usize)
-        {
-            return Err(ResourceBuildError::Invalid(
-                "Region staging chunk must be a bounded aligned size",
-            ));
-        }
         if region_size < RECOVERY_PAGE_SIZE as u64
             || !region_size.is_multiple_of(BUFFER_ALIGNMENT as u64)
         {
             return Err(ResourceBuildError::Invalid(
                 "Region staging Region size is invalid",
+            ));
+        }
+        let region_bytes = usize::try_from(region_size).map_err(|_| {
+            ResourceBuildError::Invalid("Region staging Region size does not fit usize")
+        })?;
+        if chunk_bytes == 0
+            || chunk_bytes > region_bytes
+            || !chunk_bytes.is_multiple_of(BUFFER_ALIGNMENT)
+            || !chunk_bytes.is_multiple_of(RECORD_ALIGNMENT as usize)
+        {
+            return Err(ResourceBuildError::Invalid(
+                "Region staging chunk must be a bounded aligned size",
             ));
         }
 
@@ -464,8 +468,8 @@ impl RegionStaging {
 
     /// Applies one exact manager-issued tail-padding receipt in place.
     ///
-    /// Only the last record grows: its header checksum and staged
-    /// index location are rewritten together, while the added bytes are zeroed.
+    /// Only the last record's staged index location grows; added bytes are
+    /// zeroed and the logical header remains unchanged.
     /// Any mismatch is terminal because the manager has already advanced its
     /// exclusive reservation cursor.
     pub(crate) fn apply_write_padding(
@@ -549,14 +553,6 @@ impl RegionStaging {
             {
                 return Err(StagingError::StaleReceipt);
             }
-            let record_start = u64::from(location.offset())
-                .checked_sub(receipt.span_start_offset)
-                .and_then(|offset| usize::try_from(offset).ok())
-                .ok_or(StagingError::StaleReceipt)?;
-            let header_end = record_start
-                .checked_add(RECORD_HEADER_SIZE)
-                .filter(|end| *end <= used)
-                .ok_or(StagingError::StaleReceipt)?;
             let buffer = fill
                 .buffer
                 .as_mut()
@@ -564,22 +560,11 @@ impl RegionStaging {
             let bytes = buffer
                 .prepared_mut(padded_used)
                 .map_err(|()| StagingError::Invariant("staging buffer is undersized"))?;
-            let mut header = RecordHeader::decode(&bytes[record_start..header_end]).ok_or(
-                StagingError::Invariant("staging final record header is corrupt"),
-            )?;
-            if header.record_len != old_record_len
-                || header.seqno != last_entry.seqno
-                || header.key_hash != last.hash()
-            {
-                return Err(StagingError::StaleReceipt);
-            }
             let padded_location =
                 PackedLocation::new(receipt.region_id, location.offset(), new_record_len)
                     .map_err(|_| StagingError::Invariant("padded location is invalid"))?;
 
             bytes[used..padded_used].fill(0);
-            header.record_len = new_record_len;
-            bytes[record_start..header_end].copy_from_slice(&header.encode());
             fill.records
                 .last_mut()
                 .expect("validated non-empty staging records")
@@ -901,7 +886,6 @@ mod tests {
         let header = RecordHeader {
             key_len: 0,
             value_len: 0,
-            record_len: receipt.record_bytes,
             seqno: receipt.seqno,
             key_hash: record.hash(),
             payload_crc: 0,
@@ -1110,9 +1094,9 @@ mod tests {
         let second_start = first_len as usize;
         let second_header =
             RecordHeader::decode(&bytes[second_start..second_start + RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(first_header.record_len, first_len);
         let padded_second_len = second.record_bytes + padding_bytes;
-        assert_eq!(second_header.record_len, padded_second_len);
+        assert_eq!(first_header.seqno, 11);
+        assert_eq!(second_header.seqno, 12);
         assert_eq!(job.records[0].entry().location.record_len(), first_len);
         assert_eq!(
             job.records[1].entry().location.record_len(),

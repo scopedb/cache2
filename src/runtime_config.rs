@@ -78,10 +78,11 @@ impl RuntimeConfig {
 
     /// Sets the number of independent append/staging paths created at open.
     ///
-    /// Each path owns one Active Region, two fixed write buffers, and one
-    /// ordered worker. The valid range is 1..=256. Changing this value across
-    /// opens safely cold-starts the disposable cache instead of migrating
-    /// recovered shard state; it does not change the static disk identity.
+    /// Each path owns one Active Region, two Region-sized write buffers, and
+    /// one ordered worker. The valid range is 1..=256. Changing this value
+    /// across opens safely cold-starts the disposable cache instead of
+    /// migrating recovered shard state; it does not change the static disk
+    /// identity.
     pub fn with_write_shards(mut self, shards: u32) -> Self {
         self.write_shards = shards;
         self
@@ -102,6 +103,8 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the byte threshold that asks a shard worker to flush its current
+    /// Region-sized staging buffer.
     pub fn with_write_batch_size(mut self, bytes: usize) -> Self {
         self.write_batch_bytes = bytes;
         self

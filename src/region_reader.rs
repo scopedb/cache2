@@ -8,12 +8,13 @@
 use std::io;
 use std::ops::Range;
 
+use crate::format::RECORD_ALIGNMENT;
 use crate::index::IndexEntry;
 use crate::io_engine::{
     BoundedIoRequest, IoBuffer, IoCompletion, IoDeadlineExceeded, IoEngine, IoOperation,
     OperationKind, ReadSlot, RequestId, submit_cache_read,
 };
-use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry, RECORD_ALIGNMENT};
+use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
 use crate::resources::BufferLease;
 
 pub(crate) const _READ_ALIGNMENT: usize = 4096;
@@ -386,7 +387,7 @@ mod tests {
     fn invalid_entry_is_rejected_before_allocating_or_issuing_io() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let invalid = entry(PackedLocation::from_raw(0));
+        let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
         let error = plan_read(geometry(), 7, invalid).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
