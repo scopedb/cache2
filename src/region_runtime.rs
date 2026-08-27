@@ -826,6 +826,19 @@ impl ShardControl {
         Ok(())
     }
 
+    fn notify_if_running(&self, flags: u8) -> io::Result<()> {
+        let mut state = self.lock()?;
+        if let Some(failure) = &state.failure {
+            return Err(failure.to_error());
+        }
+        if state.stop {
+            return Ok(());
+        }
+        state.wake_flags |= flags;
+        self.changed.notify_one();
+        Ok(())
+    }
+
     fn request_drain(&self, stop: bool) -> io::Result<u64> {
         let (mut state, poisoned) = match self.state.lock() {
             Ok(state) => (state, false),
@@ -1767,7 +1780,7 @@ fn reclaim_worker_result(
                 "cache Region reclaimed"
             );
             for shard in &shared.shards {
-                shard.notify(WAKE_ROTATE)?;
+                shard.notify_if_running(WAKE_ROTATE)?;
             }
         }
     }
@@ -2209,6 +2222,18 @@ mod tests {
         assert_eq!(drain_generation, 0);
         assert!(!stop);
         assert!(timed_out);
+    }
+
+    #[test]
+    fn reclaim_progress_does_not_fail_after_a_shard_stops() {
+        let control = ShardControl::new();
+        control.request_drain(true).unwrap();
+
+        control.notify_if_running(WAKE_ROTATE).unwrap();
+        assert_eq!(
+            control.notify(WAKE_ROTATE).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     #[test]
