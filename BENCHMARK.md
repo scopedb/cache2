@@ -163,8 +163,8 @@ cargo +1.98.0 bench --locked --features benchmarking \
 
 The default models one production-sized partition from a 4 TiB cache averaging
 16 KiB entries: 65,536 logical live entries in 131,072 slots. This preserves
-the 50% load and candidate shape without allocating the complete 5.08 GiB
-index.
+the 50% load and candidate shape without allocating the complete 4.06 GiB
+index or its 128 MiB volatile heat bitmaps.
 
 Measure fresh/warm open and close costs at a configurable index scale:
 

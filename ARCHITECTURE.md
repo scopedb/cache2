@@ -40,11 +40,11 @@ there is no foreground retry protocol or global admission queue.
 1. Probe one L1 shard under a short critical section.
 2. On miss, probe one L2 index partition without waiting for contention.
 3. For a candidate, reserve one immediately available read-engine slot and
-   allocate its exact aligned range against the managed-memory limit.
+   allocate its bounded size-class range against the managed-memory limit.
 4. Perform one record read and validate location, Region generation, hash,
    full key, exact length, and checksum locally.
 5. Promote to L1 when bounded admission succeeds; otherwise return the
-   exact-size Region-backed value.
+   zero-copy Region-backed value with its bounded read allocation.
 
 An index miss allocates nothing. Read-memory, index, or engine pressure is a
 miss. There is no read queue, retry, second index lookup, or freshness fence, so
@@ -65,11 +65,12 @@ is never reused directly. When the free reserve falls below one Region per
 append shard, a background worker reads the oldest sealed prefix sequentially
 and walks its self-sized records.
 
-An L2 candidate marks its exact index slot in a volatile one-bit reference
-bitmap during the existing index pass. Reclaim consumes that bit and offers the
-still-current record for reinsertion; cold records are removed only when the
-index still points at their exact old address. Reinsertion preserves the
-record's logical sequence number, writes through an existing append shard, and
+Two volatile bitmaps track `seen` and `hot` for each exact index slot during the
+existing index pass. The first L2 candidate access marks `seen`; a later access
+marks `hot`. Reclaim consumes both bits and offers only a hot, still-current
+record for reinsertion. Other current records are removed only when the index
+still points at their exact old address. Reinsertion preserves the record's
+logical sequence number, writes through an existing append shard, and
 conditionally replaces the old address only after the batch completes.
 
 The source Region stays pinned until accepted replacement batches finish. A
@@ -78,18 +79,20 @@ skips the remaining hot records instead of waiting. Only then does the source
 Region enter the free FIFO. This keeps victim selection strict FIFO and adds no
 foreground queue, retry, lock, or I/O.
 
-The reference bitmap costs one bit per index slot and resets on restart. It is
-a one-shot heat signal rather than a hit count: another L2 hit after reinsertion
-must mark the new slot to preserve the entry through another reclaim cycle.
-Every record also carries its exact Region generation. The read plan captures
-that generation from a per-Region atomic, and completion compares it locally
-before returning the record.
+The heat bitmaps cost two bits per index slot and reset on restart. They are a
+two-access signal rather than a hit count: a reinserted entry needs two later L2
+candidate accesses to become eligible for another reclaim cycle. Every record
+also carries its exact Region generation. The read plan captures that
+generation from a per-Region atomic, and completion compares it locally before
+returning the record.
 
-The fixed index stores 10-byte slots with four deterministic candidates, at
-most one relocation, and no tombstones or generation table. Point work is
-therefore capped at four primary probes plus the bounded one-hop relocation
-work on mutation. Index-partition contention is a miss or mutation overload,
-never a wait.
+The fixed index stores 8-byte slots with 20-bit Region and offset fields, an
+8-bit record-size upper class, a 14-bit fingerprint, and a 2-bit displacement.
+It uses four deterministic candidates, at most one relocation, and no
+tombstones or generation table. Point work is therefore capped at four primary
+probes plus the bounded one-hop relocation work on mutation. The exact record
+envelope is recovered and validated from the one bounded read. Index-partition
+contention is a miss or mutation overload, never a wait.
 
 L1 uses fixed startup allocations for entries, CLOCK metadata, free lists, and
 its prehashed directory. Each same-hash chain is capped at eight full keys.

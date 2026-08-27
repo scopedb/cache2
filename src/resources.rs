@@ -1,8 +1,8 @@
 //! Bounded write admission and aligned record buffers.
 //!
 //! Foreground reads allocate one alignment-rounded transient buffer for the
-//! exact planned range after an L2 index hit. Write waiting uses a separate
-//! request gate.
+//! size-class-bounded planned range after an L2 index hit. Write waiting uses
+//! a separate request gate.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::fmt;
