@@ -225,7 +225,7 @@ impl RegionManager {
         let mut active_regions = try_unassigned_vec(active_count)?;
         let mut shard_mutations = try_vec(active_count)?;
         shard_mutations.resize(active_count, ShardMutation::default());
-        let mut free_regions = try_unassigned_queue(free_count, free_count)?;
+        let mut free_regions = try_unassigned_queue(free_count, free_count.max(active_count))?;
         let mut sealed_regions = try_unassigned_queue(sealed_count, sealed_capacity)?;
         let reclaiming = try_vec(1)?;
 
@@ -1698,6 +1698,19 @@ mod tests {
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
             [1, 5, 2]
         );
+    }
+
+    #[test]
+    fn recovered_empty_free_queue_does_not_allocate_during_reclaim() {
+        let mut manager = RegionManager::from_metadata(sample_without_free_regions()).unwrap();
+        let free_capacity = manager.free_regions.capacity();
+        assert!(free_capacity >= manager.active_regions.len());
+
+        let reclaim = manager.begin_reclaim().unwrap().unwrap();
+        manager.finish_reclaim(reclaim).unwrap();
+
+        assert_eq!(manager.free_regions.capacity(), free_capacity);
+        assert_eq!(manager.free_regions(), &[4]);
     }
 
     #[test]
