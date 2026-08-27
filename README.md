@@ -43,7 +43,7 @@ cache.put("chunk-key", b"chunk bytes")?;
 let value = cache.get("chunk-key").await?.expect("cache hit");
 assert_eq!(value.as_ref(), b"chunk bytes");
 
-// Deletes use the same bounded mutation path and return a sequence number.
+// Deletes perform bounded in-memory cleanup and return a sequence number.
 cache.delete("chunk-key")?;
 
 // Waits for the async Region write and index publication.
@@ -98,15 +98,12 @@ blocking pool. Dropping a read future requests best-effort cancellation, while
 the I/O engine retains the aligned buffer until the device completion so
 callers cannot outlive in-flight storage.
 
-`delete` uses the same shard routing, monotonic sequence, fixed staging, and
-write admission as `put`. It performs one best-effort exact-key L1 cleanup
-before returning, then replaces a matching L2 index candidate with a sequenced
-tombstone only after the containing Region batch completes. The tombstone uses
-the existing 24-byte slot and prevents an older same-hash index publication
-from replacing it; a newer `put` may replace it. An already missing key consumes
-no index slot. Deletes do not add a read retry, fence, or second validation
-pass. A stale L1 value or an older value observed before tombstone publication
-remains an accepted best-effort cache result.
+`delete` allocates a monotonic sequence, then performs one non-waiting bounded
+L2 index probe and one best-effort exact-key L1 cleanup. It reserves no Region
+space, submits no I/O, and consumes no index slot for an already missing key.
+Manager or index contention rejects the delete as write overload. A delayed
+older `put` completion may republish a deleted value; this is an accepted stale
+cache result. Deletes do not add a read retry, fence, or second validation pass.
 
 After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate

@@ -610,12 +610,6 @@ impl HybridValueRead {
     }
 }
 
-#[derive(Clone, Copy)]
-enum RuntimeMutation<'a> {
-    Put(&'a [u8]),
-    Delete,
-}
-
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
@@ -829,25 +823,13 @@ impl RegionDataPlane {
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.mutate(key, RuntimeMutation::Put(value))
-    }
-
-    pub(crate) fn delete(&self, key: &[u8]) -> io::Result<u64> {
-        self.mutate(key, RuntimeMutation::Delete)
-    }
-
-    fn mutate(&self, key: &[u8], mutation: RuntimeMutation<'_>) -> io::Result<u64> {
-        let value_len = match mutation {
-            RuntimeMutation::Put(value) => value.len(),
-            RuntimeMutation::Delete => 0,
-        };
-        if key.len() > _MAX_KEY_BYTES || value_len > _MAX_VALUE_BYTES {
+        if key.len() > _MAX_KEY_BYTES || value.len() > _MAX_VALUE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file-chunk entry exceeds the 4 KiB key or 256 KiB value limit",
             ));
         }
-        let record_bytes = required_record_bytes(key.len(), value_len)
+        let record_bytes = required_record_bytes(key.len(), value.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let running = &self.running.shared;
         let hash = hash_key(self.data.hash_seed, key);
@@ -865,41 +847,21 @@ impl RegionDataPlane {
                 return Err(write_overload_error());
             }
         };
-        let staged = match mutation {
-            RuntimeMutation::Put(value) => self.core.try_stage_value(
-                &running.staging,
-                shard_id,
-                hash,
-                record_bytes,
-                key,
-                value,
-            ),
-            RuntimeMutation::Delete => {
-                self.core
-                    .try_stage_delete(&running.staging, shard_id, hash, record_bytes, key)
-            }
-        }?;
+        let staged = self.core.try_stage_value(
+            &running.staging,
+            shard_id,
+            hash,
+            record_bytes,
+            key,
+            value,
+        )?;
         match staged {
             RegionStageValue::Staged(seqno) => {
-                match mutation {
-                    RuntimeMutation::Put(value) => {
-                        let _published = running.memory.publish(hash, key, value, seqno);
-                    }
-                    RuntimeMutation::Delete => {
-                        let _removed = running.memory.delete(hash, key, seqno);
-                    }
-                }
+                let _published = running.memory.publish(hash, key, value, seqno);
                 control.notify(WAKE_DATA)?;
                 if let Some(activity) = activity {
-                    match mutation {
-                        RuntimeMutation::Put(value) => {
-                            RuntimeMetrics::increment(&activity.puts);
-                            RuntimeMetrics::add(&activity.written_bytes, value.len());
-                        }
-                        RuntimeMutation::Delete => {
-                            RuntimeMetrics::increment(&activity.deletes);
-                        }
-                    }
+                    RuntimeMetrics::increment(&activity.puts);
+                    RuntimeMetrics::add(&activity.written_bytes, value.len());
                 }
                 Ok(seqno)
             }
@@ -910,6 +872,41 @@ impl RegionDataPlane {
                 reject_staged_write(running, control, WAKE_ROTATE | WAKE_URGENT, operation)
             }
         }
+    }
+
+    pub(crate) fn delete(&self, key: &[u8]) -> io::Result<u64> {
+        if key.len() > _MAX_KEY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file-chunk key exceeds the 4 KiB limit",
+            ));
+        }
+        let running = &self.running.shared;
+        let hash = hash_key(self.data.hash_seed, key);
+        let activity = running
+            .statistics
+            .then(|| running.metrics.activity_for_hash(hash));
+        let operation = match self.operations.try_enter() {
+            Some(operation) => operation,
+            None => {
+                if running.statistics {
+                    running.metrics.record_write_rejection();
+                }
+                return Err(write_overload_error());
+            }
+        };
+        let Some(seqno) = self.core.try_delete_value(hash)? else {
+            drop(operation);
+            if running.statistics {
+                running.metrics.record_write_rejection();
+            }
+            return Err(write_overload_error());
+        };
+        let _removed = running.memory.delete(hash, key, seqno);
+        if let Some(activity) = activity {
+            RuntimeMetrics::increment(&activity.deletes);
+        }
+        Ok(seqno)
     }
 
     #[cfg(test)]

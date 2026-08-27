@@ -427,6 +427,11 @@ async fn delete_is_sequenced_and_warm_recoverable() {
     let cache = files.config(3).open().await.unwrap();
     let put_sequence = cache.put("key", "one").unwrap();
     cache.drain().await.unwrap();
+    let records_before_delete = cache
+        .detailed_snapshot()
+        .unwrap()
+        .region
+        .physical_record_count;
 
     let delete_sequence = cache.delete("key").unwrap();
     assert!(delete_sequence > put_sequence);
@@ -435,6 +440,14 @@ async fn delete_is_sequenced_and_warm_recoverable() {
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.puts, 1);
     assert_eq!(snapshot.deletes, 1);
+    assert_eq!(
+        cache
+            .detailed_snapshot()
+            .unwrap()
+            .region
+            .physical_record_count,
+        records_before_delete
+    );
     cache.close_warm().await.unwrap();
 
     let reopened = files.config(5).open().await.unwrap();

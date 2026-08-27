@@ -48,8 +48,7 @@ use crate::region_reader::plan_read;
 use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, submit_read};
 use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_staging::{
-    RegionStaging, StageAppend, StagedRecord, StagedRecordKind, StagedWrite, StagingEncodeError,
-    StagingError,
+    RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
 };
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
 use crate::resources::BufferLease;
@@ -643,47 +642,6 @@ impl FileRegionCore {
         key: &[u8],
         value: &[u8],
     ) -> io::Result<RegionStageValue> {
-        self.try_stage_record(
-            staging,
-            shard_id,
-            hash,
-            record_bytes,
-            key,
-            value,
-            StagedRecordKind::Value,
-        )
-    }
-
-    pub(crate) fn try_stage_delete(
-        &self,
-        staging: &RegionStaging,
-        shard_id: usize,
-        hash: u64,
-        record_bytes: u32,
-        key: &[u8],
-    ) -> io::Result<RegionStageValue> {
-        self.try_stage_record(
-            staging,
-            shard_id,
-            hash,
-            record_bytes,
-            key,
-            &[],
-            StagedRecordKind::Tombstone,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_stage_record(
-        &self,
-        staging: &RegionStaging,
-        shard_id: usize,
-        hash: u64,
-        record_bytes: u32,
-        key: &[u8],
-        value: &[u8],
-        kind: StagedRecordKind,
-    ) -> io::Result<RegionStageValue> {
         self.health.require_healthy()?;
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
@@ -735,7 +693,7 @@ impl FileRegionCore {
         let staged = staging.encode_reserved(receipt, |destination| {
             let entry =
                 encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?;
-            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, kind))
+            Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry))
         });
         match staged {
             Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
@@ -755,6 +713,35 @@ impl FileRegionCore {
                 self.health.enter_miss_only();
                 staging.close();
                 Err(staging_io_error(error))
+            }
+        }
+    }
+
+    /// Allocates one ordering sequence and removes the current L2 candidate
+    /// with a single non-waiting bounded index probe. No Region bytes are
+    /// reserved or written for a delete.
+    pub(crate) fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
+        self.health.require_healthy()?;
+        let seqno = {
+            let Some(mut manager) = self.manager.try_lock()? else {
+                return Ok(None);
+            };
+            match manager.allocate_seqno() {
+                Ok(seqno) => seqno,
+                Err(error) => {
+                    self.health.enter_miss_only();
+                    return Err(region_mutation_io_error(error));
+                }
+            }
+        };
+        match self.index.try_delete(hash, seqno) {
+            Ok(_) => Ok(Some(seqno)),
+            Err(IndexStorageError::PageBusy { .. } | IndexStorageError::PartitionBusy { .. }) => {
+                Ok(None)
+            }
+            Err(error) => {
+                self.health.enter_miss_only();
+                Err(index_storage_io_error(error))
             }
         }
     }
@@ -978,12 +965,7 @@ impl FileRegionCore {
     fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for record in records.iter().copied() {
             let entry = record.entry();
-            let published = match record.kind() {
-                StagedRecordKind::Value => self.index.upsert(record.hash(), entry),
-                StagedRecordKind::Tombstone => {
-                    self.index.upsert_tombstone(record.hash(), entry.seqno)
-                }
-            };
+            let published = self.index.upsert(record.hash(), entry);
             if let Err(error) = published {
                 self.health.enter_miss_only();
                 return Err(index_storage_io_error(error));
@@ -2810,7 +2792,6 @@ mod tests {
                 location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
                 seqno: 1,
             },
-            StagedRecordKind::Value,
         );
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let publisher_core = Arc::clone(&core);

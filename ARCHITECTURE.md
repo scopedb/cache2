@@ -67,14 +67,13 @@ reuse remains the only SSD replacement policy.
 L1 capacity remains charged through the last returned value handle, so eviction
 cannot hide memory retained by a slow caller.
 
-A `delete` follows the same append shard, sequence allocation, fixed staging,
-batch completion, and immediate-rejection admission path. Its foreground work adds only one
-best-effort exact-key L1 removal. Completion replaces an older same-hash index
-value with a sequenced tombstone encoded in the existing 24-byte slot; a newer
-put may replace it, and an already missing delete consumes no index slot. Reads
-stop at a matching tombstone as an index miss. They do not retry or validate
-freshness a second time, so stale L1 values remain permitted by the cache
-contract.
+A `delete` allocates one sequence and performs a non-waiting bounded L2 index
+probe plus a best-effort exact-key L1 removal. It does not enter append staging,
+reserve Region bytes, or submit I/O. Manager or index contention rejects it as
+write overload, and an already missing delete consumes no index slot. Because
+the open-addressing deleted marker carries no sequence, a delayed older put may
+reappear. This is permitted by the stale-cache contract; reads do not retry or
+validate freshness a second time.
 
 Each L1 shard receives fixed entry slots, policy slots, a free list, and an
 open-addressed directory during open. The directory routes the already seeded

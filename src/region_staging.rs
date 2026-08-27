@@ -34,36 +34,16 @@ pub(crate) struct ShardFillSnapshot {
 /// containing device span completes. The descriptor stays owned by the
 /// completion path; staging never calls into the index while holding a shard
 /// lock.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StagedRecordKind {
-    Value,
-    Tombstone,
-}
-
-const STAGED_TOMBSTONE_BIT: u64 = 1_u64 << 63;
-
-/// Compact transient completion descriptor. The packed location's reserved
-/// high bit carries the publication kind while the descriptor is in memory;
-/// it is masked before reconstructing an [`IndexEntry`] and is never persisted.
+/// Compact transient completion descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StagedRecord {
     hash: u64,
-    location_and_kind: u64,
-    seqno: u64,
+    entry: IndexEntry,
 }
 
 impl StagedRecord {
-    pub(crate) fn new(hash: u64, entry: IndexEntry, kind: StagedRecordKind) -> Self {
-        debug_assert_eq!(entry.location.raw() & STAGED_TOMBSTONE_BIT, 0);
-        let kind_bit = match kind {
-            StagedRecordKind::Value => 0,
-            StagedRecordKind::Tombstone => STAGED_TOMBSTONE_BIT,
-        };
-        Self {
-            hash,
-            location_and_kind: entry.location.raw() | kind_bit,
-            seqno: entry.seqno,
-        }
+    pub(crate) const fn new(hash: u64, entry: IndexEntry) -> Self {
+        Self { hash, entry }
     }
 
     pub(crate) const fn hash(self) -> u64 {
@@ -71,23 +51,11 @@ impl StagedRecord {
     }
 
     pub(crate) const fn entry(self) -> IndexEntry {
-        IndexEntry {
-            location: PackedLocation::from_raw(self.location_and_kind & !STAGED_TOMBSTONE_BIT),
-            seqno: self.seqno,
-        }
-    }
-
-    pub(crate) const fn kind(self) -> StagedRecordKind {
-        if self.location_and_kind & STAGED_TOMBSTONE_BIT == 0 {
-            StagedRecordKind::Value
-        } else {
-            StagedRecordKind::Tombstone
-        }
+        self.entry
     }
 
     fn set_location(&mut self, location: PackedLocation) {
-        let kind = self.location_and_kind & STAGED_TOMBSTONE_BIT;
-        self.location_and_kind = location.raw() | kind;
+        self.entry.location = location;
     }
 }
 
@@ -914,7 +882,6 @@ mod tests {
                 location: PackedLocation::new(1, offset, record_bytes).unwrap(),
                 seqno,
             },
-            StagedRecordKind::Value,
         );
         (receipt, record)
     }
@@ -1128,11 +1095,6 @@ mod tests {
 
         let second_offset = first.offset + first.record_bytes;
         let (second, second_record) = reservation(second_offset, 128, 12);
-        let second_record = StagedRecord::new(
-            second_record.hash(),
-            second_record.entry(),
-            StagedRecordKind::Tombstone,
-        );
         staging
             .encode_reserved(second, |target| {
                 encode_test_value(target, second, second_record)
@@ -1170,7 +1132,6 @@ mod tests {
             job.records[1].entry().location.record_len(),
             padded_second_len
         );
-        assert_eq!(job.records[1].kind(), StagedRecordKind::Tombstone);
         assert!(
             bytes[unpadded_end as usize - 4096..]
                 .iter()
@@ -1260,7 +1221,6 @@ mod tests {
                 location: entry.location,
                 seqno: entry.seqno + 1,
             },
-            record.kind(),
         );
         assert_eq!(
             staging.encode_reserved(receipt, |target| {

@@ -4,8 +4,8 @@
 //! watermark per Region. A lookup returns only the raw typed point state and
 //! releases its canonical partition before record I/O. Mutations use sequence
 //! order within one bounded partition probe. Region reuse advances one
-//! watermark so obsolete slots become logical tombstones without an index
-//! scan or Region-manager access on point operations.
+//! watermark so obsolete slots become logical misses without an index scan or
+//! Region-manager access on point operations.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -115,9 +115,6 @@ impl RegionIndex {
             |_, state| match state {
                 IndexSlotState::Empty => true,
                 IndexSlotState::Deleted => false,
-                IndexSlotState::Tombstone {
-                    hash: current_hash, ..
-                } => current_hash == hash,
                 IndexSlotState::Value {
                     hash: current_hash,
                     entry,
@@ -158,22 +155,45 @@ impl RegionIndex {
         self.install_if_newer(hash, supplied.seqno, installed, true)
     }
 
-    /// Replaces a matching entry with a sequenced logical delete. An already
-    /// missing hash consumes no slot and never evicts an unrelated live value.
-    pub(crate) fn upsert_tombstone(
-        &self,
-        hash: u64,
-        seqno: u64,
-    ) -> Result<bool, IndexStorageError> {
+    /// Removes an older matching entry with one non-waiting bounded probe.
+    ///
+    /// A missing key consumes no slot. Because the Deleted marker carries no
+    /// sequence, a delayed older publication may become visible again; that is
+    /// an accepted stale-cache outcome.
+    pub(crate) fn try_delete(&self, hash: u64, seqno: u64) -> Result<bool, IndexStorageError> {
         if seqno == 0 {
             return Ok(false);
         }
-        self.install_if_newer(
-            hash,
-            seqno,
-            IndexSlotState::Tombstone { hash, seqno },
-            false,
-        )
+        let mut partition = self.storage.try_write_hash_partition(hash)?;
+        let slot_count = partition.slot_count();
+        let start = start_slot(hash, slot_count);
+        let mut found = None;
+        partition.probe(
+            start,
+            probe_limit(slot_count),
+            |local_slot, state| match state {
+                IndexSlotState::Empty => true,
+                IndexSlotState::Deleted => false,
+                IndexSlotState::Value {
+                    hash: current_hash,
+                    entry,
+                } => {
+                    if current_hash == hash {
+                        if entry.seqno <= seqno {
+                            found = Some((local_slot, state));
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
+        )?;
+        let Some((local_slot, previous)) = found else {
+            return Ok(false);
+        };
+        partition.replace_observed(local_slot, previous, IndexSlotState::Deleted)?;
+        Ok(true)
     }
 
     fn install_if_newer(
@@ -209,22 +229,6 @@ impl RegionIndex {
                 IndexSlotState::Deleted => {
                     deleted.get_or_insert((local_slot, state, InstallKind::Deleted));
                     false
-                }
-                IndexSlotState::Tombstone {
-                    hash: current_hash,
-                    seqno: current_seqno,
-                } => {
-                    if current_hash == hash {
-                        if supplied_seqno <= current_seqno {
-                            rejected = true;
-                        } else {
-                            apply = Some((local_slot, state, InstallKind::Existing));
-                        }
-                        true
-                    } else {
-                        deleted.get_or_insert((local_slot, state, InstallKind::Deleted));
-                        false
-                    }
                 }
                 IndexSlotState::Value {
                     hash: current_hash,
@@ -362,13 +366,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_returns_busy_instead_of_waiting_for_partition_mutation() {
+    fn point_operations_return_busy_instead_of_waiting_for_partition_mutation() {
         let index = anonymous(8);
         let hash = 7;
         let _mutation = index.storage().write_hash_partition(hash).unwrap();
 
         assert!(matches!(
             index.lookup_raw(hash),
+            Err(IndexStorageError::PartitionBusy { .. })
+        ));
+        assert!(matches!(
+            index.try_delete(hash, 1),
             Err(IndexStorageError::PartitionBusy { .. })
         ));
     }
@@ -387,19 +395,20 @@ mod tests {
     }
 
     #[test]
-    fn tombstones_order_puts_and_deletes_by_sequence() {
+    fn delete_is_bounded_and_allows_a_delayed_stale_publication() {
         let index = anonymous(8);
         let hash = 7;
         let first = entry(1, 8, 10);
         let newer = entry(2, 16, 12);
 
         assert!(index.upsert(hash, first).unwrap());
-        assert!(!index.upsert_tombstone(hash, 9).unwrap());
+        assert!(!index.try_delete(hash, 9).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(first));
 
-        assert!(index.upsert_tombstone(hash, 11).unwrap());
+        assert!(index.try_delete(hash, 11).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
-        assert!(!index.upsert(hash, first).unwrap());
+        assert!(index.upsert(hash, first).unwrap());
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(first));
 
         assert!(index.upsert(hash, newer).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(newer));
@@ -415,7 +424,7 @@ mod tests {
     #[test]
     fn missing_delete_does_not_replace_a_live_foreign_value() {
         let empty = anonymous(8);
-        assert!(!empty.upsert_tombstone(8, 20).unwrap());
+        assert!(!empty.try_delete(8, 20).unwrap());
         assert_eq!(
             empty.storage().physical_stats().unwrap(),
             IndexPhysicalStats::default()
@@ -430,7 +439,7 @@ mod tests {
             );
         }
 
-        assert!(!index.upsert_tombstone(8, 20).unwrap());
+        assert!(!index.try_delete(8, 20).unwrap());
         for hash in 0..8 {
             assert_eq!(
                 index.lookup_raw(hash).unwrap(),
