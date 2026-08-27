@@ -1419,10 +1419,20 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     if shared.statistics {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
-    shared
+    let first_failure = shared
         .metrics
         .lifecycle
-        .store(LIFECYCLE_FAILED, Ordering::Release);
+        .swap(LIFECYCLE_FAILED, Ordering::AcqRel)
+        != LIFECYCLE_FAILED;
+    if first_failure {
+        log::error!(
+            target: "cache2::health",
+            event = "cache_shard_worker_failed",
+            shard_id,
+            error:% = error;
+            "cache shard worker failed"
+        );
+    }
     shared.core.enter_miss_only();
     control.fail(&error);
     // Wake engine admission in case another shard is blocked behind work that
