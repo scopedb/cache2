@@ -417,7 +417,9 @@ cargo +1.98.0 bench --locked --bench hybrid_cache_soak
 `CACHE_SOAK_KEYS`, `CACHE_SOAK_SHARDS`,
 `CACHE_SOAK_RSS_SLACK_MIB`, `CACHE_SOAK_READ_IO_WORKERS`,
 `CACHE_SOAK_WRITE_IO_WORKERS`, `CACHE_SOAK_WRITERS`, and `CACHE_SOAK_READERS`
-control the workload. Read and write I/O worker counts each default to four.
+control the workload. Configured values may use the complete 32 MiB Region
+envelope. The default managed-memory limit scales with the two Region-sized
+staging buffers per shard. Read and write I/O worker counts each default to four.
 `CACHE_SOAK_WARM_REOPEN=true`
 populates one complete pass at every configured value size, publishes a clean
 image, reopens it, and runs the measured turnover against the recovered private

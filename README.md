@@ -313,9 +313,11 @@ The configurable turnover soak is available through
 selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`; the engine
 defaults to `posix`. By default it uses four writers and four readers,
 periodically deletes keys, and cycles 256 B, 4 KiB, 16 KiB, and 256 KiB values.
-`CACHE_SOAK_WRITERS` and `CACHE_SOAK_READERS` control the client mix. A validated older version is
-counted as `stale_hits`; a future version, wrong key, malformed value, resource
-bound violation, or runtime failure terminates the run.
+Both benchmark runners accept configured values up to their 32 MiB Region
+envelope. `CACHE_SOAK_WRITERS` and `CACHE_SOAK_READERS` control the client mix.
+A validated older version is counted as `stale_hits`; a future version, wrong
+key, malformed value, resource bound violation, or runtime failure terminates
+the run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the data and recovery paths,
 [BENCHMARK.md](BENCHMARK.md) for the current reproducible baseline, and

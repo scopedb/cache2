@@ -11,7 +11,9 @@ use cache_rs::{
 };
 
 const MIB: usize = 1024 * 1024;
+const REGION_BYTES: usize = 32 * MIB;
 const VALUE_HEADER_BYTES: usize = 16;
+const MAX_VALUE_BYTES: usize = REGION_BYTES - 64;
 const DELETE_INTERVAL: u64 = 64;
 const OVERLOAD_DELAY: Duration = Duration::from_micros(50);
 const DEFAULT_VALUE_BYTES: [usize; 4] = [256, 4 * 1024, 16 * 1024, 256 * 1024];
@@ -47,18 +49,24 @@ impl SoakConfig {
         let memory_bytes = memory_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
-        let memory_limit_bytes = env_usize(
-            "CACHE_SOAK_MEMORY_LIMIT_MIB",
-            memory_mib.saturating_add(256),
-        )?
-        .checked_mul(MIB)
-        .ok_or_else(|| invalid("soak memory limit is too large"))?;
+        let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
+        let shard_count =
+            usize::try_from(shards).map_err(|_| invalid("soak shard count does not fit usize"))?;
+        let default_memory_limit_mib = shard_count
+            .checked_mul(2 * REGION_BYTES)
+            .and_then(|bytes| bytes.checked_add(2 * REGION_BYTES))
+            .and_then(|bytes| bytes.checked_add(memory_bytes))
+            .ok_or_else(|| invalid("soak default memory limit is too large"))?
+            .div_ceil(MIB);
+        let memory_limit_bytes =
+            env_usize("CACHE_SOAK_MEMORY_LIMIT_MIB", default_memory_limit_mib)?
+                .checked_mul(MIB)
+                .ok_or_else(|| invalid("soak memory limit is too large"))?;
         let value_bytes = env_usize_list("CACHE_SOAK_VALUE_BYTES", &DEFAULT_VALUE_BYTES)?;
         let rss_slack_bytes = env_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak RSS slack is too large"))?;
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
-        let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
         let read_io_workers = env_usize("CACHE_SOAK_READ_IO_WORKERS", 4)?;
         let write_io_workers = env_usize("CACHE_SOAK_WRITE_IO_WORKERS", 4)?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
@@ -74,7 +82,7 @@ impl SoakConfig {
             || value_bytes.is_empty()
             || value_bytes
                 .iter()
-                .any(|bytes| !(VALUE_HEADER_BYTES..=256 * 1024).contains(bytes))
+                .any(|bytes| !(VALUE_HEADER_BYTES..=MAX_VALUE_BYTES).contains(bytes))
             || key_count == 0
             || shards == 0
             || read_io_workers == 0
@@ -110,7 +118,7 @@ impl SoakConfig {
 
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
-            .with_region_size(32 * MIB as u64)
+            .with_region_size(REGION_BYTES as u64)
             .with_expected_entries(self.key_count)
     }
 
