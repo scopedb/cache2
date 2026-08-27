@@ -684,6 +684,7 @@ pub(crate) struct BoundedIoRequest {
     request: IoRequest,
     deadline: Instant,
     cancel_grace: Duration,
+    stop_engine_on_deadline: bool,
 }
 
 impl BoundedIoRequest {
@@ -706,10 +707,13 @@ impl BoundedIoRequest {
             Ok(completion) => Err(IoDeadlineExceeded::new(cancel_error, Some(completion))),
             Err(request) => {
                 // Dropping the consumer detaches it but deliberately leaves the
-                // operation and owned buffer in the driver. Stop all further
-                // requests; close will inspect the exact in-flight write
-                // count before deciding whether to retain flock.
-                engine.stop_accepting_requests();
+                // operation and owned buffer in the driver. A stuck read keeps
+                // only its own bounded slot; other read workers may continue.
+                // A write timeout stops its engine so close can retain the
+                // exact unfenced-write boundary.
+                if self.stop_engine_on_deadline {
+                    engine.stop_accepting_requests();
+                }
                 drop(request);
                 Err(IoDeadlineExceeded::new(cancel_error, None))
             }
@@ -745,7 +749,7 @@ impl BoundedIoRequest {
                 Err(IoDeadlineExceeded::new(cancel_error, Some(completion)))
             }
             Err(_) => {
-                request.stop_and_detach();
+                request.detach(self.stop_engine_on_deadline);
                 Err(IoDeadlineExceeded::new(cancel_error, None))
             }
         }
@@ -781,8 +785,10 @@ impl AsyncRequestGuard {
         drop(request);
     }
 
-    fn stop_and_detach(&mut self) {
-        self.engine.stop_accepting_requests();
+    fn detach(&mut self, stop_engine: bool) {
+        if stop_engine {
+            self.engine.stop_accepting_requests();
+        }
         drop(self.request.take());
     }
 }
@@ -851,6 +857,7 @@ pub(crate) fn submit_cache_read(
         request,
         deadline,
         cancel_grace: CACHE_IO_CANCEL_GRACE,
+        stop_engine_on_deadline: false,
     })
 }
 
@@ -861,11 +868,13 @@ fn submit_cache_io_until(
     cancel_grace: Duration,
 ) -> Result<BoundedIoRequest, SubmitError> {
     let cancelled = AtomicBool::new(false);
+    let stop_engine_on_deadline = operation.kind().uses_write_slot();
     let request = engine.submit_wait_controlled(operation, &cancelled, Some(deadline))?;
     Ok(BoundedIoRequest {
         request,
         deadline,
         cancel_grace,
+        stop_engine_on_deadline,
     })
 }
 
@@ -3364,9 +3373,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_completion_deadline_stops_a_stalled_engine() {
+    async fn async_read_deadline_keeps_other_slots_available() {
         let backend = Arc::new(BlockingBackend::default());
-        let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+        let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
         let resources = resources(4096);
         let request = submit_cache_io_until(
             engine.as_ref(),
@@ -3385,6 +3394,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(buffer.is_none());
         assert_eq!(engine.in_flight(), 1);
+        drop(engine.try_reserve_read().unwrap());
 
         backend.release();
         engine.shutdown().unwrap();
@@ -3451,7 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_deadline_stops_requests_without_releasing_an_unfenced_target() {
+    fn read_completion_deadline_retains_only_its_bounded_slot() {
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = resources(4096);
@@ -3478,7 +3488,7 @@ mod tests {
         let rejected = engine
             .submit(IoOperation::read(read_buffer(&resources, 1), 0))
             .unwrap_err();
-        assert_eq!(rejected.error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
 
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
@@ -3505,6 +3515,14 @@ mod tests {
         let timeout = request.wait(&engine).unwrap_err();
         let pending = engine.in_flight();
         let pending_writes = engine.writes_in_flight();
+        let rejected = engine
+            .submit(IoOperation::write(
+                WritePoint::Record,
+                write_buffer(&resources, &[0x33; 4096]),
+                4096,
+            ))
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::BrokenPipe);
         backend.release();
         let (error, buffer) = timeout.into_buffer();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
