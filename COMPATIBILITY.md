@@ -10,13 +10,11 @@ The intended 1.0 surface is deliberately small:
 
 - `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and
   asynchronously open a cache;
-- `HybridCache` provides synchronous point and namespace mutations plus native
-  Tokio-async reads and lifecycle operations,
+- `HybridCache` provides synchronous point mutations plus native Tokio-async
+  reads and lifecycle operations,
   a completion fence, snapshots, and explicit fast or warm close;
 - `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
 - `IoEngine` and `IoMode` select runtime I/O behavior.
-- `RegionSetConfig`, `RegionSetId`, and `RegionSetAllocation` define and inspect
-  optional physical namespace retention partitions.
 
 Before 1.0, source-breaking changes may occur in any `0.x` release and are
 recorded in `CHANGELOG.md`. After 1.0, backwards-compatible additions use a
@@ -49,8 +47,8 @@ not imply recovering or preserving the previous cache contents.
 ## Configuration and restart
 
 Static configuration defines disk identity: capacity, Region geometry, index
-slots, RegionSet capacity layout and namespace ownership, seeded XXH3-64
-algorithm identity, and hash seed. A change intentionally cold-starts empty.
+slots, seeded XXH3-64 algorithm identity, and hash seed. A change intentionally
+cold-starts empty.
 Runtime configuration includes append-shard count, workers, write-batch
 capacity, L1 capacity, and statistics. Append-shard count is selected at open
 but must match a clean image for warm recovery; a mismatch safely opens empty.

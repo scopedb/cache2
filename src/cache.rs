@@ -20,7 +20,6 @@ use crate::recovery::{
     RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE, recovery_image_index_len,
 };
 use crate::region::{FileRegionBackend, RegionFiles, SystemRegionFileSystem};
-use crate::region_layout::{MAX_REGION_SETS, RegionLayout, RegionSetAllocation, RegionSetConfig};
 use crate::region_metadata::{
     REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
     REGION_METADATA_REGIONS_PER_PAGE,
@@ -36,6 +35,7 @@ const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
+const STATIC_FINGERPRINT_SCHEMA: u64 = 2;
 
 pub type Result<T> = std::io::Result<T>;
 
@@ -45,7 +45,6 @@ pub struct StaticConfig {
     region_size: u64,
     index_slots: usize,
     hash_seed: u64,
-    region_sets: Vec<RegionSetConfig>,
 }
 
 impl StaticConfig {
@@ -63,7 +62,6 @@ impl StaticConfig {
             region_size: DEFAULT_REGION_SIZE,
             index_slots,
             hash_seed: DEFAULT_HASH_SEED,
-            region_sets: Vec::new(),
         }
     }
 
@@ -81,20 +79,6 @@ impl StaticConfig {
         self
     }
 
-    /// Replaces the physical RegionSet layout.
-    ///
-    /// Capacity weights divide the fixed Region count. Runtime append shards
-    /// are distributed evenly and deterministically across the configured sets.
-    /// RegionSet zero is required and receives every namespace not explicitly
-    /// listed by another set.
-    /// Every set needs one active Region per assigned shard plus one spare.
-    /// Physical Region allocation and namespace ownership are static recovery
-    /// identity.
-    pub fn with_region_sets(mut self, sets: impl IntoIterator<Item = RegionSetConfig>) -> Self {
-        self.region_sets = sets.into_iter().take(MAX_REGION_SETS + 1).collect();
-        self
-    }
-
     pub const fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
@@ -107,22 +91,9 @@ impl StaticConfig {
         self.index_slots
     }
 
-    pub fn region_sets(&self) -> &[RegionSetConfig] {
-        &self.region_sets
-    }
-
     /// Validates the static physical geometry without opening cache files.
     pub fn validate(&self) -> Result<()> {
         self.geometry().map(|_| ())
-    }
-
-    /// Resolves capacity weights and the requested runtime append-shard
-    /// assignment without opening cache files. Results are ordered by
-    /// RegionSet id.
-    pub fn region_set_allocations(&self, write_shards: u32) -> Result<Vec<RegionSetAllocation>> {
-        let geometry = self.geometry()?;
-        self.region_layout(geometry, write_shards)?
-            .allocations(geometry.region_size)
     }
 
     /// Maximum cache-owned logical disk bytes after a successful open.
@@ -176,6 +147,9 @@ impl StaticConfig {
             .ok()
             .filter(|count| *count <= MAX_PACKED_REGION_COUNT)
             .ok_or_else(|| invalid_config("cache Region count is not representable"))?;
+        if region_count < 2 {
+            return Err(invalid_config("cache requires at least two Regions"));
+        }
         if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
             return Err(invalid_config("index slots must be in 8..=536870912"));
         }
@@ -189,36 +163,21 @@ impl StaticConfig {
         if !geometry.is_valid() {
             return Err(invalid_config("cache data geometry is not representable"));
         }
-        self.minimum_region_layout(geometry)?;
         Ok(geometry)
     }
 
-    fn minimum_region_layout(&self, geometry: DataGeometry) -> Result<RegionLayout> {
-        let minimum_shards = u32::try_from(self.region_sets.len().max(1))
-            .map_err(|_| invalid_config("RegionSet count does not fit u32"))?;
-        self.region_layout(geometry, minimum_shards)
-    }
-
-    fn region_layout(&self, geometry: DataGeometry, write_shards: u32) -> Result<RegionLayout> {
-        RegionLayout::build(geometry.region_count, write_shards, &self.region_sets)
-    }
-
-    fn fingerprint(&self, geometry: DataGeometry, layout: &RegionLayout) -> u64 {
-        self.fingerprint_with_hash_algorithm(
-            geometry,
-            layout,
-            u64::from(KEY_HASH_ALGORITHM_XXH3_64),
-        )
+    fn fingerprint(&self, geometry: DataGeometry) -> u64 {
+        self.fingerprint_with_hash_algorithm(geometry, u64::from(KEY_HASH_ALGORITHM_XXH3_64))
     }
 
     fn fingerprint_with_hash_algorithm(
         &self,
         geometry: DataGeometry,
-        layout: &RegionLayout,
         hash_algorithm_id: u64,
     ) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for value in [
+            STATIC_FINGERPRINT_SCHEMA,
             geometry.data_file_len,
             geometry.region_size,
             u64::from(geometry.region_count),
@@ -231,33 +190,7 @@ impl StaticConfig {
                 hash = hash.wrapping_mul(0x100_0000_01b3);
             }
         }
-        if !layout.uses_default_single_set() {
-            hash_identity_word(&mut hash, 0x7265_6769_6f6e_7365);
-            hash_identity_word(&mut hash, layout.sets().len() as u64);
-            hash_identity_word(&mut hash, 0);
-            for set in layout.sets() {
-                for value in [
-                    u64::from(set.id.get()),
-                    u64::from(set.first_region),
-                    u64::from(set.region_count),
-                ] {
-                    hash_identity_word(&mut hash, value);
-                }
-            }
-            hash_identity_word(&mut hash, layout.routes().len() as u64);
-            for &(namespace_id, set_index) in layout.routes() {
-                hash_identity_word(&mut hash, u64::from(namespace_id));
-                hash_identity_word(&mut hash, u64::from(layout.sets()[set_index].id.get()));
-            }
-        }
         hash.max(1)
-    }
-}
-
-fn hash_identity_word(hash: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(0x100_0000_01b3);
     }
 }
 
@@ -318,14 +251,15 @@ impl HybridCacheConfig {
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
         let runtime_config = self.runtime_config;
         runtime_config.validate()?;
-        let region_layout = self
-            .static_config
-            .region_layout(geometry, runtime_config.write_shards)?;
+        if geometry.region_count <= runtime_config.write_shards {
+            return Err(invalid_config(
+                "write shards require one Active Region each plus one spare Region",
+            ));
+        }
         runtime_config.validate_memory_plan(
             geometry,
             self.static_config.index_slots,
             runtime_config.write_shards as usize,
-            region_layout.memory_bytes(),
         )?;
         let format_data = DataSuperblock {
             generation: 1,
@@ -333,17 +267,17 @@ impl HybridCacheConfig {
             data_identity: next_persistent_id(),
             geometry,
             hash_seed: self.static_config.hash_seed,
-            config_fingerprint: self.static_config.fingerprint(geometry, &region_layout),
+            config_fingerprint: self.static_config.fingerprint(geometry),
         };
         let files = RegionFiles::new(
             &self.path,
             sidecar_path(&self.path, ".state"),
             sidecar_path(&self.path, ".image"),
         );
-        let backend = FileRegionBackend::new_with_region_layout(
+        let backend = FileRegionBackend::new_with_configs(
             files,
             format_data,
-            region_layout,
+            runtime_config.write_shards,
             runtime_config,
         );
         let store = RegionStore::open(self.static_config.index_slots, backend)?;
@@ -416,18 +350,7 @@ impl HybridCache {
     ///
     /// Keys are limited to 4 KiB and values to 256 KiB.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
-        self.put_in(0, key, value)
-    }
-
-    /// Stores a value in a logical namespace and returns its mutation sequence.
-    pub fn put_in(
-        &self,
-        namespace: u32,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-    ) -> Result<u64> {
-        self.store
-            .put_value(namespace, key.as_ref(), value.as_ref())
+        self.store.put_value(key.as_ref(), value.as_ref())
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
@@ -437,13 +360,7 @@ impl HybridCache {
     /// after its containing Region batch completes.
     /// Keys are limited to 4 KiB.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
-        self.delete_in(0, key)
-    }
-
-    /// Deletes a key from a logical namespace and returns its mutation
-    /// sequence.
-    pub fn delete_in(&self, namespace: u32, key: impl AsRef<[u8]>) -> Result<u64> {
-        self.store.delete_value(namespace, key.as_ref())
+        self.store.delete_value(key.as_ref())
     }
 
     /// Looks up a value in L1 and then L2.
@@ -454,17 +371,8 @@ impl HybridCache {
     /// allocation or I/O pressure fails open as a cache miss.
     /// A key longer than 4 KiB is also a miss.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
-        self.get_in(0, key).await
-    }
-
-    /// Looks up a value in a logical namespace.
-    pub async fn get_in(
-        &self,
-        namespace: u32,
-        key: impl AsRef<[u8]> + Send,
-    ) -> Result<Option<Value>> {
         self.store
-            .get_value_async(namespace, key.as_ref(), &self.tokio_handle)
+            .get_value_async(key.as_ref(), &self.tokio_handle)
             .await
             .map(|value| value.map(|inner| Value { inner }))
     }
@@ -479,7 +387,7 @@ impl HybridCache {
         Ok(snapshot)
     }
 
-    /// Samples queue, I/O, and per-RegionSet state in addition to the regular
+    /// Samples queue, I/O, and Region state in addition to the regular
     /// cache summary. This is intended for periodic diagnostics rather than a
     /// request hot path because it briefly locks and scans Region metadata.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
@@ -560,15 +468,14 @@ mod tests {
     fn static_fingerprint_binds_the_hash_algorithm() {
         let config = StaticConfig::new(5 * DEFAULT_REGION_SIZE);
         let geometry = config.geometry().unwrap();
-        let layout = config.region_layout(geometry, 4).unwrap();
         let algorithm = u64::from(KEY_HASH_ALGORITHM_XXH3_64);
         assert_eq!(
-            config.fingerprint(geometry, &layout),
-            config.fingerprint_with_hash_algorithm(geometry, &layout, algorithm)
+            config.fingerprint(geometry),
+            config.fingerprint_with_hash_algorithm(geometry, algorithm)
         );
         assert_ne!(
-            config.fingerprint(geometry, &layout),
-            config.fingerprint_with_hash_algorithm(geometry, &layout, algorithm + 1)
+            config.fingerprint(geometry),
+            config.fingerprint_with_hash_algorithm(geometry, algorithm + 1)
         );
     }
 
@@ -577,14 +484,13 @@ mod tests {
         let config = StaticConfig::new(5 * 4096).with_region_size(4096);
         config.validate().unwrap();
         let geometry = config.geometry().unwrap();
-        let layout = config.region_layout(geometry, 4).unwrap();
         let data = DataSuperblock {
             generation: 1,
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
             data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
             geometry,
             hash_seed: config.hash_seed,
-            config_fingerprint: config.fingerprint(geometry, &layout),
+            config_fingerprint: config.fingerprint(geometry),
         };
         assert!(data.encode().is_ok());
     }
@@ -595,90 +501,5 @@ mod tests {
 
         assert_eq!(config.index_slots(), 335_544_320);
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn static_fingerprint_binds_region_assignment() {
-        let base = StaticConfig::new(10 * DEFAULT_REGION_SIZE).with_region_sets([
-            RegionSetConfig::new(0).with_weight(1),
-            RegionSetConfig::new(2).with_weight(1).with_namespaces([7]),
-        ]);
-        let changed = base.clone().with_region_sets([
-            RegionSetConfig::new(0).with_weight(1),
-            RegionSetConfig::new(2)
-                .with_weight(1)
-                .with_namespaces([7, 9]),
-        ]);
-        let geometry = base.geometry().unwrap();
-        let base_layout = base.region_layout(geometry, 4).unwrap();
-        let changed_layout = changed.region_layout(geometry, 4).unwrap();
-
-        assert_ne!(
-            base.fingerprint(geometry, &base_layout),
-            changed.fingerprint(geometry, &changed_layout)
-        );
-    }
-
-    #[test]
-    fn equivalent_default_region_layouts_share_fingerprint() {
-        let implicit = StaticConfig::new(5 * DEFAULT_REGION_SIZE);
-        let explicit = implicit
-            .clone()
-            .with_region_sets([RegionSetConfig::new(0).with_weight(99).with_namespaces([7])]);
-        let geometry = implicit.geometry().unwrap();
-        let implicit_layout = implicit.region_layout(geometry, 4).unwrap();
-        let explicit_layout = explicit.region_layout(geometry, 4).unwrap();
-
-        assert!(explicit_layout.routes().is_empty());
-        assert_eq!(
-            implicit.fingerprint(geometry, &implicit_layout),
-            explicit.fingerprint(geometry, &explicit_layout)
-        );
-    }
-
-    #[test]
-    fn resolved_region_set_allocations_expose_rounding_and_shards() {
-        let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE).with_region_sets([
-            RegionSetConfig::new(0).with_weight(1),
-            RegionSetConfig::new(2).with_weight(3),
-        ]);
-
-        let allocations = config.region_set_allocations(4).unwrap();
-        assert_eq!(allocations.len(), 2);
-        assert_eq!(allocations[0].id.get(), 0);
-        assert_eq!(allocations[0].region_count, 3);
-        assert_eq!(allocations[0].capacity_bytes, 3 * DEFAULT_REGION_SIZE);
-        assert_eq!(allocations[0].append_shard_count, 2);
-        assert_eq!(allocations[1].id.get(), 2);
-        assert_eq!(allocations[1].region_count, 7);
-        assert_eq!(allocations[1].append_shard_count, 2);
-    }
-
-    #[test]
-    fn runtime_write_shards_do_not_change_static_fingerprint() {
-        let config = StaticConfig::new(10 * DEFAULT_REGION_SIZE).with_region_sets([
-            RegionSetConfig::new(0).with_weight(1),
-            RegionSetConfig::new(2).with_weight(1).with_namespaces([7]),
-        ]);
-        let geometry = config.geometry().unwrap();
-        let two_shards = config.region_layout(geometry, 2).unwrap();
-        let four_shards = config.region_layout(geometry, 4).unwrap();
-
-        assert_eq!(
-            config.fingerprint(geometry, &two_shards),
-            config.fingerprint(geometry, &four_shards)
-        );
-    }
-
-    #[test]
-    fn region_set_builder_stops_after_the_invalid_sentinel() {
-        let config = StaticConfig::new(5 * DEFAULT_REGION_SIZE)
-            .with_region_sets((0..MAX_REGION_SETS + 2).map(|id| RegionSetConfig::new(id as u16)));
-
-        assert_eq!(config.region_sets().len(), MAX_REGION_SETS + 1);
-        assert_eq!(
-            config.validate().unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
     }
 }

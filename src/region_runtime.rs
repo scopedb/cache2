@@ -19,7 +19,7 @@ use crate::io_engine::{IoEngine, MAX_IO_REQUESTS_PER_ENGINE, ReadSlot, build_fil
 use crate::memory::{
     MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
 };
-use crate::record_codec::{hash_namespaced_key, required_record_bytes};
+use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_reader::{_READ_ALIGNMENT, PendingRead, ReadCompletion, plan_read};
@@ -444,7 +444,6 @@ impl RuntimeConfig {
         geometry: DataGeometry,
         index_slots: usize,
         shard_count: usize,
-        layout_memory_bytes: usize,
     ) -> io::Result<()> {
         let l1_entry_capacity = self.l1_entry_capacity(geometry, index_slots)?;
         let l1_metadata_bytes = MemoryStore::allocation_bytes(
@@ -454,8 +453,7 @@ impl RuntimeConfig {
         )?;
         let fixed_bytes =
             crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
-                .checked_add(layout_memory_bytes)
-                .and_then(|bytes| bytes.checked_add(l1_metadata_bytes))
+                .checked_add(l1_metadata_bytes)
                 .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
         self.validated_reserved_memory_bytes(geometry, shard_count, fixed_bytes)?;
         Ok(())
@@ -830,20 +828,15 @@ impl RegionDataPlane {
         })
     }
 
-    pub(crate) fn put(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.mutate(namespace_id, key, RuntimeMutation::Put(value))
+    pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.mutate(key, RuntimeMutation::Put(value))
     }
 
-    pub(crate) fn delete(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
-        self.mutate(namespace_id, key, RuntimeMutation::Delete)
+    pub(crate) fn delete(&self, key: &[u8]) -> io::Result<u64> {
+        self.mutate(key, RuntimeMutation::Delete)
     }
 
-    fn mutate(
-        &self,
-        namespace_id: u32,
-        key: &[u8],
-        mutation: RuntimeMutation<'_>,
-    ) -> io::Result<u64> {
+    fn mutate(&self, key: &[u8], mutation: RuntimeMutation<'_>) -> io::Result<u64> {
         let value_len = match mutation {
             RuntimeMutation::Put(value) => value.len(),
             RuntimeMutation::Delete => 0,
@@ -857,8 +850,8 @@ impl RegionDataPlane {
         let record_bytes = required_record_bytes(key.len(), value_len)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let running = &self.running.shared;
-        let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
-        let shard_id = self.core.append_shard(namespace_id, hash);
+        let hash = hash_key(self.data.hash_seed, key);
+        let shard_id = self.core.append_shard(hash);
         let control = &running.shards[shard_id];
         let activity = running
             .statistics
@@ -878,30 +871,22 @@ impl RegionDataPlane {
                 shard_id,
                 hash,
                 record_bytes,
-                namespace_id,
                 key,
                 value,
             ),
-            RuntimeMutation::Delete => self.core.try_stage_delete(
-                &running.staging,
-                shard_id,
-                hash,
-                record_bytes,
-                namespace_id,
-                key,
-            ),
+            RuntimeMutation::Delete => {
+                self.core
+                    .try_stage_delete(&running.staging, shard_id, hash, record_bytes, key)
+            }
         }?;
         match staged {
             RegionStageValue::Staged(seqno) => {
                 match mutation {
                     RuntimeMutation::Put(value) => {
-                        let _published =
-                            running
-                                .memory
-                                .publish(hash, namespace_id, key, value, seqno);
+                        let _published = running.memory.publish(hash, key, value, seqno);
                     }
                     RuntimeMutation::Delete => {
-                        let _removed = running.memory.delete(hash, namespace_id, key, seqno);
+                        let _removed = running.memory.delete(hash, key, seqno);
                     }
                 }
                 control.notify(WAKE_DATA)?;
@@ -928,28 +913,27 @@ impl RegionDataPlane {
     }
 
     #[cfg(test)]
-    pub(crate) fn get(&self, namespace_id: u32, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
-        match self.prepare_get(namespace_id, key)? {
+    pub(crate) fn get(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+        match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
-            PreparedGet::Pending(pending) => self.finish_get(pending.wait(), namespace_id, key),
+            PreparedGet::Pending(pending) => self.finish_get(pending.wait(), key),
         }
     }
 
     pub(crate) async fn get_async(
         &self,
-        namespace_id: u32,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
-        match self.prepare_get(namespace_id, key)? {
+        match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => {
-                self.finish_get(pending.wait_async(tokio_handle).await, namespace_id, key)
+                self.finish_get(pending.wait_async(tokio_handle).await, key)
             }
         }
     }
 
-    fn prepare_get(&self, namespace_id: u32, key: &[u8]) -> io::Result<PreparedGet> {
+    fn prepare_get(&self, key: &[u8]) -> io::Result<PreparedGet> {
         if key.len() > _MAX_KEY_BYTES {
             if self.config.statistics {
                 let activity = self.metrics.activity(0);
@@ -959,7 +943,7 @@ impl RegionDataPlane {
             return Ok(PreparedGet::Complete(None));
         }
         let running = &self.running.shared;
-        let hash = hash_namespaced_key(self.data.hash_seed, namespace_id, key);
+        let hash = hash_key(self.data.hash_seed, key);
         let activity = running
             .statistics
             .then(|| running.metrics.activity_for_hash(hash));
@@ -973,7 +957,7 @@ impl RegionDataPlane {
         // This health observation is the read's availability linearization
         // point. A later one-way transition to miss-only does not invalidate a
         // value that was already resident here.
-        let read_token = match running.memory.lookup(hash, namespace_id, key) {
+        let read_token = match running.memory.lookup(hash, key) {
             MemoryLookup::Hit(value) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l1_hits);
@@ -988,7 +972,7 @@ impl RegionDataPlane {
                 token
             }
         };
-        let Some(entry) = self.core.begin_value_read(hash, namespace_id) else {
+        let Some(entry) = self.core.begin_value_read(hash) else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
@@ -1074,7 +1058,6 @@ impl RegionDataPlane {
     fn finish_get(
         &self,
         completed: CompletedGet,
-        namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<HybridValueRead>> {
         let running = &self.running.shared;
@@ -1086,7 +1069,7 @@ impl RegionDataPlane {
         let activity = running
             .statistics
             .then(|| running.metrics.activity_for_hash(hash));
-        let result = self.core.finish_value_read(read, namespace_id, key);
+        let result = self.core.finish_value_read(read, key);
         match result {
             Err(_) if !self.core.is_healthy() => {
                 if let Some(activity) = activity {
@@ -1100,14 +1083,10 @@ impl RegionDataPlane {
                     RuntimeMetrics::increment(&activity.l2_hits);
                     RuntimeMetrics::add(&activity.served_bytes, value.value().len());
                 }
-                let promoted = running.memory.promote(
-                    read_token,
-                    hash,
-                    namespace_id,
-                    key,
-                    value.value(),
-                    value.seqno(),
-                );
+                let promoted =
+                    running
+                        .memory
+                        .promote(read_token, hash, key, value.value(), value.seqno());
                 if let Some(promoted) = promoted {
                     if let Some(activity) = activity {
                         RuntimeMetrics::increment(&activity.l1_promotions);
@@ -1173,7 +1152,7 @@ impl RegionDataPlane {
             io: aggregate_io_stats(&running.read_engines, &running.write_engines),
             l1: running.memory.detailed_snapshot()?,
             index: self.core.index_snapshot()?,
-            region_sets: self.core.region_set_snapshots()?,
+            region: self.core.region_snapshot()?,
         })
     }
 
@@ -1944,32 +1923,6 @@ mod tests {
     }
 
     #[test]
-    fn preopen_memory_plan_charges_region_layout() {
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
-            region_size: 512 * 1024,
-            region_count: 10,
-        };
-        let mut config = RuntimeConfig::default();
-        let l1_entries = config.l1_entry_capacity(geometry, 4096).unwrap();
-        let l1_metadata =
-            MemoryStore::allocation_bytes(config.l1_capacity_bytes, l1_entries, config.l1_shards)
-                .unwrap();
-        let fixed = crate::region::runtime_fixed_memory_bytes(4096, geometry.region_count)
-            .unwrap()
-            .checked_add(l1_metadata)
-            .unwrap();
-        let (_, without_layout) = config.memory_plan_bytes(geometry, 4, fixed).unwrap();
-        config.memory_limit_bytes = without_layout;
-
-        config.validate_memory_plan(geometry, 4096, 4, 0).unwrap();
-        let error = config
-            .validate_memory_plan(geometry, 4096, 4, 4096)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
     fn production_l1_entry_plan_scales_from_the_static_index() {
         const GIB: usize = 1024 * 1024 * 1024;
         let geometry = DataGeometry {
@@ -1984,16 +1937,15 @@ mod tests {
             .with_l1_shards(64);
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
-        base.validate_memory_plan(geometry, index_slots, 8, 0)
-            .unwrap();
+        base.validate_memory_plan(geometry, index_slots, 8).unwrap();
         base.clone()
             .with_memory_limit(18 * GIB)
-            .validate_memory_plan(geometry, index_slots, 8, 0)
+            .validate_memory_plan(geometry, index_slots, 8)
             .unwrap();
         let too_small = base.clone().with_memory_limit(17 * GIB);
         assert_eq!(
             too_small
-                .validate_memory_plan(geometry, index_slots, 8, 0)
+                .validate_memory_plan(geometry, index_slots, 8)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput

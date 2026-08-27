@@ -55,7 +55,7 @@ const ROOT_REGION_SIZE_OFFSET: usize = 88;
 const ROOT_REGION_COUNT_OFFSET: usize = 96;
 const ROOT_PARTITION_COUNT_OFFSET: usize = 100;
 const ROOT_SHARD_COUNT_OFFSET: usize = 104;
-const ROOT_NAMESPACE_COUNT_OFFSET: usize = 108;
+const ROOT_RESERVED32_OFFSET: usize = 108;
 const ROOT_RESERVED_EPOCH_OFFSET: usize = 112;
 const ROOT_RESERVED_CLEAR_FLOOR_OFFSET: usize = 120;
 const ROOT_MAX_SEQNO_OFFSET: usize = 128;
@@ -902,7 +902,7 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
     put_u32(output, ROOT_REGION_COUNT_OFFSET, root.region_count);
     put_u32(output, ROOT_PARTITION_COUNT_OFFSET, root.partition_count);
     put_u32(output, ROOT_SHARD_COUNT_OFFSET, root.shard_count);
-    put_u32(output, ROOT_NAMESPACE_COUNT_OFFSET, 1);
+    put_u32(output, ROOT_RESERVED32_OFFSET, 0);
     put_u64(output, ROOT_RESERVED_EPOCH_OFFSET, 0);
     put_u64(output, ROOT_RESERVED_CLEAR_FLOOR_OFFSET, 0);
     put_u64(output, ROOT_MAX_SEQNO_OFFSET, root.max_seqno);
@@ -948,7 +948,7 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
 
 fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
     if input.len() != REGION_METADATA_ROOT_SIZE
-        || get_u32(input, ROOT_NAMESPACE_COUNT_OFFSET)? != 1
+        || get_u32(input, ROOT_RESERVED32_OFFSET)? != 0
         || get_u64(input, ROOT_RESERVED_EPOCH_OFFSET)? != 0
         || get_u64(input, ROOT_RESERVED_CLEAR_FLOOR_OFFSET)? != 0
         || input[ROOT_RESERVED_ACCOUNTING_START..ROOT_RESERVED_ACCOUNTING_END]
@@ -1289,6 +1289,19 @@ mod tests {
 
     #[test]
     fn reserved_root_slots_are_rejected() {
+        let mut reserved32 = sample().encode().unwrap();
+        let root_page = page_mut(&mut reserved32, 0).unwrap();
+        put_u32(
+            page_payload_mut(root_page, 0, REGION_METADATA_ROOT_SIZE),
+            ROOT_RESERVED32_OFFSET,
+            1,
+        );
+        finish_page(root_page);
+        assert_eq!(
+            RegionMetadata::decode(&reserved32),
+            Err(RegionMetadataError::InvalidField("root_encoding"))
+        );
+
         let mut root_reserved = sample().encode().unwrap();
         let root_page = page_mut(&mut root_reserved, 0).unwrap();
         page_payload_mut(root_page, 0, REGION_METADATA_ROOT_SIZE)[ROOT_RESERVED_ACCOUNTING_START] =

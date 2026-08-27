@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::checksum::crc32c;
 use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
+use crate::hashing::route_hash;
 use crate::index::{IndexEntry, MAX_INDEX_PARTITIONS};
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, IndexStorageError,
@@ -26,7 +27,7 @@ use crate::io_backend::{
 use crate::io_engine::{IoEngine, ReadSlot};
 use crate::record_codec::{RecordEncodeError, encode_value_into_hashed};
 #[cfg(test)]
-use crate::record_codec::{hash_namespaced_key, required_record_bytes};
+use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{
     DataSuperblock, DataSuperblockProbe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET,
     RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe, RecoveryState,
@@ -36,7 +37,6 @@ use crate::recovery::{
 };
 use crate::region_appender::submit_span;
 use crate::region_index::RegionIndex;
-use crate::region_layout::RegionLayout;
 use crate::region_manager::{RegionManager, RegionMutationError};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
@@ -56,9 +56,7 @@ use crate::resources::BufferLease;
 use crate::runtime_config::{IoMode, RuntimeConfig};
 #[cfg(test)]
 use crate::snapshot::StartupMode;
-use crate::snapshot::{
-    CacheIndexSnapshot, CacheSnapshot, DetailedCacheSnapshot, RegionSetSnapshot,
-};
+use crate::snapshot::{CacheIndexSnapshot, CacheSnapshot, DetailedCacheSnapshot, RegionSnapshot};
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -195,9 +193,8 @@ impl RegionManagerAuthority {
 pub(crate) struct FileRegionCore {
     index: RegionIndex,
     manager: RegionManagerAuthority,
-    layout: Arc<RegionLayout>,
     shards: Box<[RegionShard]>,
-    rotation: Box<[Mutex<()>]>,
+    rotation: Mutex<()>,
     health: RegionHealthLatch,
 }
 
@@ -271,20 +268,7 @@ pub(crate) struct PreparedFileRegionClean {
 impl FileRegionRuntime {
     /// Installs one complete authority. Recovery metadata is consumed here so
     /// the live runtime cannot retain a stale second copy beside the manager.
-    #[cfg(test)]
     fn install(index: PartitionedIndexStorage, metadata: RegionMetadata) -> io::Result<Self> {
-        let layout = Arc::new(RegionLayout::single(
-            metadata.root.region_count,
-            metadata.root.shard_count,
-        )?);
-        Self::install_with_layout(index, metadata, layout)
-    }
-
-    fn install_with_layout(
-        index: PartitionedIndexStorage,
-        metadata: RegionMetadata,
-        layout: Arc<RegionLayout>,
-    ) -> io::Result<Self> {
         let physical_stats = index.partition_stats().map_err(index_storage_io_error)?;
         let slot_count = u64::try_from(index.slot_count()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
@@ -298,8 +282,7 @@ impl FileRegionRuntime {
                 "index and Region metadata do not describe one authority",
             ));
         }
-        let manager = RegionManager::from_metadata_with_layout(metadata, Arc::clone(&layout))
-            .map_err(region_metadata_io_error)?;
+        let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
         let mut shards = Vec::new();
         shards
             .try_reserve_exact(manager.active_regions().len())
@@ -310,16 +293,6 @@ impl FileRegionRuntime {
                 )
             })?;
         shards.resize_with(manager.active_regions().len(), RegionShard::default);
-        let mut rotation = Vec::new();
-        rotation
-            .try_reserve_exact(layout.sets().len())
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "cannot allocate RegionSet rotation gates",
-                )
-            })?;
-        rotation.resize_with(layout.sets().len(), || Mutex::new(()));
         let health = RegionHealthLatch::healthy();
         let index = RegionIndex::try_from_storage(
             index,
@@ -329,9 +302,8 @@ impl FileRegionRuntime {
             core: Arc::new(FileRegionCore {
                 index,
                 manager: RegionManagerAuthority::new(manager, health.clone()),
-                layout,
                 shards: shards.into_boxed_slice(),
-                rotation: rotation.into_boxed_slice(),
+                rotation: Mutex::new(()),
                 health,
             }),
             data_plane: None,
@@ -388,33 +360,28 @@ impl FileRegionRuntime {
 }
 
 impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
-    pub(crate) fn put_value(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.put(namespace_id, key, value)
+    pub(crate) fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.put(key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn get_value(
-        &self,
-        namespace_id: u32,
-        key: &[u8],
-    ) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?.data_plane()?.get(namespace_id, key)
+    pub(crate) fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+        self.runtime()?.data_plane()?.get(key)
     }
 
     pub(crate) async fn get_value_async(
         &self,
-        namespace_id: u32,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?
             .data_plane()?
-            .get_async(namespace_id, key, tokio_handle)
+            .get_async(key, tokio_handle)
             .await
     }
 
-    pub(crate) fn delete_value(&self, namespace_id: u32, key: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.delete(namespace_id, key)
+    pub(crate) fn delete_value(&self, key: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.delete(key)
     }
 
     #[cfg(test)]
@@ -448,19 +415,17 @@ impl FileRegionCore {
         let region_count = u32::try_from(self.manager.lock()?.regions().len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large")
         })?;
-        runtime_fixed_memory_bytes(self.index.storage().slot_count(), region_count)?
-            .checked_add(self.layout.memory_bytes())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory plan overflow"))
+        runtime_fixed_memory_bytes(self.index.storage().slot_count(), region_count)
     }
 
-    pub(crate) fn append_shard(&self, namespace_id: u32, hash: u64) -> usize {
-        self.layout.append_shard(namespace_id, hash)
+    pub(crate) fn append_shard(&self, hash: u64) -> usize {
+        route_hash(hash, self.shards.len())
     }
 
-    pub(crate) fn region_set_snapshots(&self) -> io::Result<Box<[RegionSetSnapshot]>> {
+    pub(crate) fn region_snapshot(&self) -> io::Result<RegionSnapshot> {
         self.manager
             .lock()?
-            .region_set_snapshots()
+            .region_snapshot()
             .map_err(region_metadata_io_error)
     }
 
@@ -539,11 +504,8 @@ impl FileRegionCore {
 
     /// Begins one durable value read. The aligned read buffer becomes the value
     /// owner on a hit, avoiding a second payload copy.
-    pub(crate) fn begin_value_read(&self, hash: u64, namespace_id: u32) -> Option<IndexEntry> {
-        self.begin_point_read(hash).filter(|entry| {
-            self.layout
-                .region_belongs_to_namespace(namespace_id, entry.location.region_id())
-        })
+    pub(crate) fn begin_value_read(&self, hash: u64) -> Option<IndexEntry> {
+        self.begin_point_read(hash)
     }
 
     #[cfg(test)]
@@ -553,16 +515,15 @@ impl FileRegionCore {
         geometry: crate::recovery::DataGeometry,
         buffer: BufferLease,
         hash_seed: u64,
-        namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let hash = hash_namespaced_key(hash_seed, namespace_id, key);
-        let Some(entry) = self.begin_value_read(hash, namespace_id) else {
+        let hash = hash_key(hash_seed, key);
+        let Some(entry) = self.begin_value_read(hash) else {
             return Ok(None);
         };
         let plan = plan_read(geometry, hash, entry)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_plan(engine, slot, buffer, plan, namespace_id, key)
+        self.read_value_from_plan(engine, slot, buffer, plan, key)
     }
 
     #[cfg(test)]
@@ -572,12 +533,11 @@ impl FileRegionCore {
         slot: ReadSlot,
         buffer: BufferLease,
         plan: ReadPlan,
-        namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
         let pending = self.submit_value_read_from_plan(engine, slot, buffer, plan)?;
         let completion = pending.wait(engine);
-        self.finish_value_read(completion, namespace_id, key)
+        self.finish_value_read(completion, key)
     }
 
     pub(crate) fn submit_value_read_from_plan(
@@ -607,7 +567,6 @@ impl FileRegionCore {
     pub(crate) fn finish_value_read(
         &self,
         completion: ReadCompletion,
-        namespace_id: u32,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.plan.hash;
@@ -645,7 +604,7 @@ impl FileRegionCore {
             return Ok(None);
         };
         let encoded_key = &record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + key_len];
-        if header.namespace_id != namespace_id || encoded_key != key {
+        if encoded_key != key {
             return Ok(None);
         }
         if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
@@ -675,14 +634,12 @@ impl FileRegionCore {
     /// one manager try-lock; the shard mutation gate then protects encoding
     /// without retaining global authority. This method performs no device I/O
     /// and never publishes an index entry.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_stage_value(
         &self,
         staging: &RegionStaging,
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
-        namespace_id: u32,
         key: &[u8],
         value: &[u8],
     ) -> io::Result<RegionStageValue> {
@@ -691,7 +648,6 @@ impl FileRegionCore {
             shard_id,
             hash,
             record_bytes,
-            namespace_id,
             key,
             value,
             StagedRecordKind::Value,
@@ -704,7 +660,6 @@ impl FileRegionCore {
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
-        namespace_id: u32,
         key: &[u8],
     ) -> io::Result<RegionStageValue> {
         self.try_stage_record(
@@ -712,7 +667,6 @@ impl FileRegionCore {
             shard_id,
             hash,
             record_bytes,
-            namespace_id,
             key,
             &[],
             StagedRecordKind::Tombstone,
@@ -726,7 +680,6 @@ impl FileRegionCore {
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
-        namespace_id: u32,
         key: &[u8],
         value: &[u8],
         kind: StagedRecordKind,
@@ -780,15 +733,8 @@ impl FileRegionCore {
         };
 
         let staged = staging.encode_reserved(receipt, |destination| {
-            let entry = encode_value_into_hashed(
-                destination,
-                receipt,
-                hash,
-                record_bytes,
-                namespace_id,
-                key,
-                value,
-            )?;
+            let entry =
+                encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?;
             Ok::<StagedRecord, RecordEncodeError>(StagedRecord::new(hash, entry, kind))
         });
         match staged {
@@ -986,17 +932,11 @@ impl FileRegionCore {
     pub(crate) fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
         self.health.require_healthy()?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
-        let set_index = self.layout.set_index_for_shard(shard_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "rotation shard is outside the RegionSet layout",
-            )
-        })?;
-        let rotation = self.rotation[set_index].lock().map_err(|_| {
+        let rotation = self.rotation.lock().map_err(|_| {
             self.health.enter_miss_only();
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionSet rotation gate is poisoned",
+                "Region rotation gate is poisoned",
             )
         })?;
         let plan = match self.manager.lock()?.plan_rotation(shard_id) {
@@ -1194,7 +1134,7 @@ where
     /// files retain their on-disk identities but must match this geometry and
     /// configuration fingerprint.
     format_data: DataSuperblock,
-    region_layout: Arc<RegionLayout>,
+    shard_count: u32,
     runtime_config: RuntimeConfig,
     file_system: F,
     data_file: Option<F::File>,
@@ -1213,29 +1153,17 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeConfig::default())
     }
 
-    #[cfg(test)]
     pub(crate) fn new_with_configs(
         files: RegionFiles,
         format_data: DataSuperblock,
         shards: u32,
         runtime_config: RuntimeConfig,
     ) -> Self {
-        let region_layout =
-            RegionLayout::single_unchecked(format_data.geometry.region_count, shards);
-        Self::new_with_region_layout(files, format_data, region_layout, runtime_config)
-    }
-
-    pub(crate) fn new_with_region_layout(
-        files: RegionFiles,
-        format_data: DataSuperblock,
-        region_layout: RegionLayout,
-        runtime_config: RuntimeConfig,
-    ) -> Self {
         Self::new_with_file_system_and_configs(
             files,
             format_data,
             SystemRegionFileSystem,
-            Arc::new(region_layout),
+            shards,
             runtime_config,
         )
     }
@@ -1255,10 +1183,7 @@ where
             files,
             format_data,
             file_system,
-            Arc::new(RegionLayout::single_unchecked(
-                format_data.geometry.region_count,
-                REGION_SHARDS,
-            )),
+            REGION_SHARDS,
             RuntimeConfig::default(),
         )
     }
@@ -1267,13 +1192,13 @@ where
         files: RegionFiles,
         format_data: DataSuperblock,
         file_system: F,
-        region_layout: Arc<RegionLayout>,
+        shard_count: u32,
         runtime_config: RuntimeConfig,
     ) -> Self {
         Self {
             files,
             format_data,
-            region_layout,
+            shard_count,
             runtime_config,
             file_system,
             data_file: None,
@@ -1320,10 +1245,7 @@ where
             ));
         }
         self.runtime_config.validate()?;
-        if self.region_layout.shard_count() == 0
-            || self.format_data.geometry.region_count != self.region_layout.region_count()
-            || self.format_data.geometry.region_count <= self.region_layout.shard_count()
-        {
+        if self.shard_count == 0 || self.format_data.geometry.region_count <= self.shard_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore requires at least one data shard and one additional Region",
@@ -1531,9 +1453,7 @@ where
             }
             Err(_) => return Ok(RecoveryPlan::Running),
         };
-        if !metadata.matches_image(data, header)
-            || metadata.root.shard_count != self.region_layout.shard_count()
-        {
+        if !metadata.matches_image(data, header) || metadata.root.shard_count != self.shard_count {
             return Ok(RecoveryPlan::Running);
         }
         let file = image.try_clone_control_file()?;
@@ -1561,14 +1481,10 @@ where
             self.current_state = None;
             self.cold_reset_needed = false;
         }
-        let metadata = empty_region_metadata_with_layout(data, index_slots, &self.region_layout)?;
+        let metadata = empty_region_metadata(data, index_slots, self.shard_count)?;
         let index =
             PartitionedIndexStorage::anonymous(index_slots).map_err(index_storage_io_error)?;
-        let runtime = FileRegionRuntime::install_with_layout(
-            index,
-            metadata,
-            Arc::clone(&self.region_layout),
-        )?;
+        let runtime = FileRegionRuntime::install(index, metadata)?;
         Ok(runtime)
     }
 
@@ -1598,7 +1514,7 @@ where
                 expected_index_len,
             )
         }) && clean.metadata.matches_image(data, clean.header)
-            && clean.metadata.root.shard_count == self.region_layout.shard_count()
+            && clean.metadata.root.shard_count == self.shard_count
             && clean.metadata.validate().is_ok();
         if !eligible {
             self.cold_reset_needed = true;
@@ -1614,11 +1530,7 @@ where
             &partition_stats,
         )
         .map_err(index_storage_io_error)?;
-        let runtime = FileRegionRuntime::install_with_layout(
-            index,
-            clean.metadata,
-            Arc::clone(&self.region_layout),
-        )?;
+        let runtime = FileRegionRuntime::install(index, clean.metadata)?;
         Ok(Some(runtime))
     }
 
@@ -1687,14 +1599,11 @@ where
         let FileRegionCore {
             index,
             manager,
-            layout: _,
             shards,
             rotation,
             health,
         } = runtime.into_core()?;
-        if shards.iter().any(|shard| shard.mutation.is_poisoned())
-            || rotation.iter().any(Mutex::is_poisoned)
-        {
+        if shards.iter().any(|shard| shard.mutation.is_poisoned()) || rotation.is_poisoned() {
             health.enter_miss_only();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2136,29 +2045,15 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
             })
 }
 
-#[cfg(test)]
 fn empty_region_metadata(
     data: DataSuperblock,
     index_slots: usize,
     shards: u32,
 ) -> io::Result<RegionMetadata> {
-    let layout = RegionLayout::single(data.geometry.region_count, shards)?;
-    empty_region_metadata_with_layout(data, index_slots, &layout)
-}
-
-fn empty_region_metadata_with_layout(
-    data: DataSuperblock,
-    index_slots: usize,
-    layout: &RegionLayout,
-) -> io::Result<RegionMetadata> {
-    let shards = layout.shard_count();
-    if shards == 0
-        || data.geometry.region_count <= shards
-        || data.geometry.region_count != layout.region_count()
-    {
+    if shards == 0 || data.geometry.region_count <= shards {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RegionStore layout does not match its Region geometry",
+            "RegionStore requires one Active Region per shard plus one spare",
         ));
     }
     let partition_ranges =
@@ -2176,18 +2071,9 @@ fn empty_region_metadata_with_layout(
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate Region table"))?;
     let mut free_ordinal = 0_u32;
     for region_id in 0..data.geometry.region_count {
-        let set_index = layout.set_index_for_region(region_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RegionSet ranges do not cover the data geometry",
-            )
-        })?;
-        let set = layout.sets()[set_index];
-        let local_region = region_id - set.first_region;
-        let active = local_region < set.shard_count;
-        let shard_id = set.first_shard + local_region;
+        let active = region_id < shards;
         let queue_ordinal = if active {
-            shard_id
+            region_id
         } else {
             let ordinal = free_ordinal;
             free_ordinal = free_ordinal
@@ -2204,7 +2090,7 @@ fn empty_region_metadata_with_layout(
                 RegionMetadataState::Free
             },
             queue_ordinal,
-            created_seqno: if active { u64::from(shard_id) + 1 } else { 0 },
+            created_seqno: if active { u64::from(region_id) + 1 } else { 0 },
             durable_used_offset: 0,
             max_seqno: 0,
             physical_record_count: 0,
@@ -2609,7 +2495,7 @@ mod tests {
             let mut initial =
                 RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data))
                     .unwrap();
-            initial.put_value(7, b"survivor", b"old").unwrap();
+            initial.put_value(b"survivor", b"old").unwrap();
             initial.drain().unwrap();
             initial.close_warm().unwrap();
 
@@ -2635,16 +2521,13 @@ mod tests {
             if expect_clean {
                 assert_eq!(reopened.startup(), StartupMode::Warm, "{case}");
                 assert_eq!(
-                    reopened.get_value(7, b"survivor").unwrap().unwrap().value(),
+                    reopened.get_value(b"survivor").unwrap().unwrap().value(),
                     b"old",
                     "{case}",
                 );
             } else {
                 assert_eq!(reopened.startup(), StartupMode::Cold, "{case}");
-                assert!(
-                    reopened.get_value(7, b"survivor").unwrap().is_none(),
-                    "{case}",
-                );
+                assert!(reopened.get_value(b"survivor").unwrap().is_none(), "{case}",);
             }
             reopened.close_fast().unwrap();
         }
@@ -2660,7 +2543,7 @@ mod tests {
             }
             "write" | "drain" => {
                 let store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
-                store.put_value(7, b"replacement", b"new").unwrap();
+                store.put_value(b"replacement", b"new").unwrap();
                 if case == "drain" {
                     store.drain().unwrap();
                 }
@@ -2703,12 +2586,10 @@ mod tests {
         }
     }
 
-    fn key_for_shard(data: DataSuperblock, namespace_id: u32, shard: u64, ordinal: u64) -> Vec<u8> {
+    fn key_for_shard(data: DataSuperblock, shard: u64, ordinal: u64) -> Vec<u8> {
         for attempt in 0_u64..10_000 {
             let key = format!("shard-{shard}-object-{ordinal}-{attempt}").into_bytes();
-            if hash_namespaced_key(data.hash_seed, namespace_id, &key) % u64::from(REGION_SHARDS)
-                == shard
-            {
+            if hash_key(data.hash_seed, &key) % u64::from(REGION_SHARDS) == shard {
                 return key;
             }
         }
@@ -2719,7 +2600,6 @@ mod tests {
     fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
-        let namespace_id = 7;
         let runtime_config = RuntimeConfig {
             l1_capacity_bytes: 0,
             ..RuntimeConfig::default()
@@ -2738,17 +2618,14 @@ mod tests {
         let mixed = [16 * 1024, 64 * 1024, 128 * 1024, 256 * 1024];
         let mut expected = Vec::new();
         for (ordinal, size) in mixed.into_iter().enumerate() {
-            let key = key_for_shard(data, namespace_id, ordinal as u64, ordinal as u64);
+            let key = key_for_shard(data, ordinal as u64, ordinal as u64);
             let value = vec![(ordinal as u8) + 1; size];
-            eventually_admitted(|| store.put_value(namespace_id, &key, &value));
+            eventually_admitted(|| store.put_value(&key, &value));
             expected.push((key, value));
         }
         store.drain().unwrap();
         for (key, value) in &expected {
-            assert_eq!(
-                store.get_value(namespace_id, key).unwrap().unwrap().value(),
-                value
-            );
+            assert_eq!(store.get_value(key).unwrap().unwrap().value(), value);
         }
 
         // A 256 KiB record leaves insufficient room for another same-shard
@@ -2756,32 +2633,27 @@ mod tests {
         // free Region and then exercise sealed FIFO reuse.
         let rotation_value = vec![0xa5; 256 * 1024];
         let mut recent = Vec::new();
-        let rotations_before = store.detailed_snapshot().unwrap().region_sets[0].rotations;
+        let rotations_before = store.detailed_snapshot().unwrap().region.rotations;
         for ordinal in 0..32 {
-            let key = key_for_shard(data, namespace_id, 0, 100 + ordinal);
-            eventually_admitted(|| store.put_value(namespace_id, &key, &rotation_value));
+            let key = key_for_shard(data, 0, 100 + ordinal);
+            eventually_admitted(|| store.put_value(&key, &rotation_value));
             store.drain().unwrap();
             recent.push(key);
         }
         assert_eq!(
-            store.detailed_snapshot().unwrap().region_sets[0].rotations - rotations_before,
+            store.detailed_snapshot().unwrap().region.rotations - rotations_before,
             31,
             "one full-Region signal must cause exactly one rotation"
         );
         for key in recent.iter().rev().take(2) {
             assert_eq!(
-                store.get_value(namespace_id, key).unwrap().unwrap().value(),
+                store.get_value(key).unwrap().unwrap().value(),
                 rotation_value
             );
         }
 
         let retained_hits: Vec<_> = (0..129)
-            .map(|_| {
-                store
-                    .get_value(namespace_id, recent.last().unwrap())
-                    .unwrap()
-                    .unwrap()
-            })
+            .map(|_| store.get_value(recent.last().unwrap()).unwrap().unwrap())
             .collect();
         assert!(
             retained_hits
@@ -2789,10 +2661,7 @@ mod tests {
                 .all(|hit| hit.value() == rotation_value)
         );
         assert!(
-            store
-                .get_value(namespace_id, b"definite-index-miss")
-                .unwrap()
-                .is_none(),
+            store.get_value(b"definite-index-miss").unwrap().is_none(),
             "an index miss must not acquire a retained-hit buffer"
         );
 
@@ -2806,7 +2675,7 @@ mod tests {
         assert_eq!(recovered.startup(), StartupMode::Warm);
         assert_eq!(
             recovered
-                .get_value(namespace_id, recent.last().unwrap())
+                .get_value(recent.last().unwrap())
                 .unwrap()
                 .unwrap()
                 .value(),
@@ -2913,12 +2782,12 @@ mod tests {
         .unwrap();
         let manager = runtime.manager.inner.lock().unwrap();
         let next_seqno = manager.next_seqno();
-        let hash = hash_namespaced_key(data.hash_seed, 7, b"key");
+        let hash = hash_key(data.hash_seed, b"key");
         let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
 
         assert_eq!(
             runtime
-                .try_stage_value(&staging, 0, hash, record_bytes, 7, b"key", b"value")
+                .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
                 .unwrap(),
             RegionStageValue::NeedsProgress
         );
@@ -2985,10 +2854,10 @@ mod tests {
         let mut staged_records = 0_u64;
         loop {
             let key = format!("file/chunk/{staged_records:04}");
-            let hash = hash_namespaced_key(data.hash_seed, 7, key.as_bytes());
+            let hash = hash_key(data.hash_seed, key.as_bytes());
             let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
             match runtime
-                .try_stage_value(&staging, 0, hash, record_bytes, 7, key.as_bytes(), &value)
+                .try_stage_value(&staging, 0, hash, record_bytes, key.as_bytes(), &value)
                 .unwrap()
             {
                 RegionStageValue::Staged(seqno) => {
@@ -3053,7 +2922,6 @@ mod tests {
                 data.geometry,
                 resources.try_read_buffer(read_buffer_bytes).unwrap(),
                 data.hash_seed,
-                7,
                 last_key.as_bytes(),
             )
             .unwrap()
@@ -3075,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn same_hash_candidate_requires_full_key_and_namespace() {
+    fn same_hash_candidate_requires_full_key() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntime::install(
             PartitionedIndexStorage::anonymous(64).unwrap(),
@@ -3094,11 +2962,10 @@ mod tests {
         let (backend, _) = FaultBackend::open(&directory.files.data).unwrap();
         backend.set_len(data.geometry.data_file_len).unwrap();
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
-        let namespace_id = 7;
         let owner_key = b"collision-owner";
         let foreign_key = b"collision-foreign";
         let value = b"owner-value-must-not-leak";
-        let owner_hash = hash_namespaced_key(data.hash_seed, namespace_id, owner_key);
+        let owner_hash = hash_key(data.hash_seed, owner_key);
         let owner_record_bytes = required_record_bytes(owner_key.len(), value.len()).unwrap();
         let RegionStageValue::Staged(_) = runtime
             .try_stage_value(
@@ -3106,7 +2973,6 @@ mod tests {
                 0,
                 owner_hash,
                 owner_record_bytes,
-                namespace_id,
                 owner_key,
                 value,
             )
@@ -3140,33 +3006,7 @@ mod tests {
                     engine.try_reserve_read().unwrap(),
                     read_buffer,
                     plan,
-                    namespace_id,
                     foreign_key,
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert!(runtime.health.is_healthy());
-        assert_eq!(
-            resources.managed_memory_snapshot().current_bytes,
-            memory_before_read
-        );
-
-        let foreign_namespace = namespace_id + 1;
-        let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
-        let entry = runtime
-            .begin_value_read(owner_hash, foreign_namespace)
-            .expect("a same-hash namespace collision must reach record validation");
-        let plan = plan_read(data.geometry, owner_hash, entry).unwrap();
-        assert!(
-            runtime
-                .read_value_from_plan(
-                    &engine,
-                    engine.try_reserve_read().unwrap(),
-                    read_buffer,
-                    plan,
-                    foreign_namespace,
-                    owner_key,
                 )
                 .unwrap()
                 .is_none()
@@ -3183,7 +3023,6 @@ mod tests {
                 data.geometry,
                 resources.try_read_buffer(read_buffer_bytes).unwrap(),
                 data.hash_seed,
-                namespace_id,
                 owner_key,
             )
             .unwrap()
@@ -3217,10 +3056,10 @@ mod tests {
         let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
         backend.set_len(data.geometry.data_file_len).unwrap();
         let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
-        let hash = hash_namespaced_key(data.hash_seed, 0, b"key");
+        let hash = hash_key(data.hash_seed, b"key");
         let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
         let RegionStageValue::Staged(_) = runtime
-            .try_stage_value(&staging, 0, hash, record_bytes, 0, b"key", &[7; 16 * 1024])
+            .try_stage_value(&staging, 0, hash, record_bytes, b"key", &[7; 16 * 1024])
             .unwrap()
         else {
             panic!("value must stage before the injected write failure");
@@ -3333,50 +3172,6 @@ mod tests {
                 deleted: 0,
             }
         );
-    }
-
-    #[test]
-    fn rotation_wait_in_one_region_set_does_not_block_another_set() {
-        let data = test_data_superblock_with_regions(6);
-        let layout = RegionLayout::build(
-            data.geometry.region_count,
-            2,
-            &[
-                crate::region_layout::RegionSetConfig::new(0),
-                crate::region_layout::RegionSetConfig::new(1),
-            ],
-        )
-        .unwrap();
-        let other_shard = layout.sets()[1].first_shard as usize;
-        let metadata = empty_region_metadata_with_layout(data, 64, &layout).unwrap();
-        let runtime = FileRegionRuntime::install_with_layout(
-            PartitionedIndexStorage::anonymous(64).unwrap(),
-            metadata,
-            Arc::new(layout),
-        )
-        .unwrap();
-        runtime
-            .manager
-            .inner
-            .lock()
-            .unwrap()
-            .request_rotation_for_test(other_shard)
-            .unwrap();
-
-        let core = Arc::clone(&runtime.core);
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let observed = std::thread::scope(|scope| {
-            let held_first_set = runtime.rotation[0].lock().unwrap();
-            let worker = scope.spawn(move || {
-                sender.send(core.rotate_shard(other_shard)).unwrap();
-            });
-            let observed = receiver.recv_timeout(Duration::from_secs(1));
-            drop(held_first_set);
-            worker.join().unwrap();
-            observed
-        });
-
-        assert!(observed.unwrap().unwrap());
     }
 
     fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {

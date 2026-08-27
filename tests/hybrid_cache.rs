@@ -5,8 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cache_rs::{
-    CacheHealth, CacheTier, HybridCacheConfig, IoEngine, RegionSetConfig, RuntimeConfig,
-    StartupMode, StaticConfig,
+    CacheHealth, CacheTier, HybridCacheConfig, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -423,59 +422,29 @@ async fn changing_runtime_write_shards_discards_the_clean_image() {
 }
 
 #[tokio::test]
-async fn namespaces_are_independent() {
-    let files = TestCache::new("namespaces");
-    let cache = files.config(3).open().await.unwrap();
-    cache.put_in(1, "key", "one").unwrap();
-    cache.put_in(2, "key", "two").unwrap();
-    cache.drain().await.unwrap();
-    assert_eq!(
-        cache.get_in(1, "key").await.unwrap().unwrap().as_ref(),
-        b"one"
-    );
-    assert_eq!(
-        cache.get_in(2, "key").await.unwrap().unwrap().as_ref(),
-        b"two"
-    );
-    cache.close_fast().await.unwrap();
-}
-
-#[tokio::test]
-async fn delete_is_namespaced_sequenced_and_warm_recoverable() {
+async fn delete_is_sequenced_and_warm_recoverable() {
     let files = TestCache::new("delete-warm-recovery");
     let cache = files.config(3).open().await.unwrap();
-    let put_sequence = cache.put_in(1, "key", "one").unwrap();
-    cache.put_in(2, "key", "two").unwrap();
+    let put_sequence = cache.put("key", "one").unwrap();
     cache.drain().await.unwrap();
 
-    let delete_sequence = cache.delete_in(1, "key").unwrap();
+    let delete_sequence = cache.delete("key").unwrap();
     assert!(delete_sequence > put_sequence);
     cache.drain().await.unwrap();
-    assert!(cache.get_in(1, "key").await.unwrap().is_none());
-    assert_eq!(
-        cache.get_in(2, "key").await.unwrap().unwrap().as_ref(),
-        b"two"
-    );
+    assert!(cache.get("key").await.unwrap().is_none());
     let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.puts, 2);
+    assert_eq!(snapshot.puts, 1);
     assert_eq!(snapshot.deletes, 1);
     cache.close_warm().await.unwrap();
 
     let reopened = files.config(5).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
-    assert!(reopened.get_in(1, "key").await.unwrap().is_none());
-    assert_eq!(
-        reopened.get_in(2, "key").await.unwrap().unwrap().as_ref(),
-        b"two"
-    );
+    assert!(reopened.get("key").await.unwrap().is_none());
 
-    let replacement_sequence = reopened.put_in(1, "key", "new").unwrap();
+    let replacement_sequence = reopened.put("key", "new").unwrap();
     assert!(replacement_sequence > delete_sequence);
     reopened.drain().await.unwrap();
-    assert_eq!(
-        reopened.get_in(1, "key").await.unwrap().unwrap().as_ref(),
-        b"new"
-    );
+    assert_eq!(reopened.get("key").await.unwrap().unwrap().as_ref(), b"new");
     reopened.close_fast().await.unwrap();
 }
 
@@ -583,85 +552,6 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     assert_eq!(snapshot.io_failures, 0);
     assert!(hits.load(Ordering::Relaxed) > 0);
     cache.close_fast().await.unwrap();
-}
-
-#[tokio::test]
-async fn namespace_region_sets_rotate_and_recover_independently() {
-    const HOT: u32 = 7;
-    const BULK: u32 = 9;
-    const REGION_BYTES: u64 = 512 * 1024;
-
-    let files = TestCache::new("region-set-isolation");
-    let static_config = StaticConfig::new(6 * REGION_BYTES)
-        .with_region_size(REGION_BYTES)
-        .with_expected_entries(3277)
-        .with_region_sets([
-            RegionSetConfig::new(0).with_weight(2),
-            RegionSetConfig::new(1)
-                .with_weight(1)
-                .with_namespaces([HOT]),
-        ]);
-
-    let cache = files
-        .config_with_static(2, static_config.clone())
-        .open()
-        .await
-        .unwrap();
-    let value = vec![0x5a; 240 * 1024];
-
-    // Rotate BULK once so its first Region becomes a reclaimable sealed
-    // candidate. Repeated HOT rotation must never select that Region.
-    eventually_admitted(|| cache.put_in(BULK, "bulk-survivor", &value));
-    eventually_admitted(|| cache.put_in(BULK, "bulk-fill-1", &value));
-    eventually_admitted(|| cache.put_in(BULK, "bulk-fill-2", &value));
-    cache.drain().await.unwrap();
-
-    for ordinal in 0..12 {
-        eventually_admitted(|| cache.put_in(HOT, format!("hot-{ordinal}"), &value));
-        cache.drain().await.unwrap();
-    }
-
-    let detailed = cache.detailed_snapshot().unwrap();
-    assert_eq!(detailed.region_sets.len(), 2);
-    let bulk = detailed
-        .region_sets
-        .iter()
-        .find(|set| set.id.get() == 0)
-        .unwrap();
-    let hot = detailed
-        .region_sets
-        .iter()
-        .find(|set| set.id.get() == 1)
-        .unwrap();
-    assert_eq!(bulk.capacity_bytes, 4 * REGION_BYTES);
-    assert_eq!(hot.capacity_bytes, 2 * REGION_BYTES);
-    assert_eq!(
-        bulk.active_region_count + bulk.free_region_count + bulk.sealed_region_count,
-        4
-    );
-    assert_eq!(
-        hot.active_region_count + hot.free_region_count + hot.sealed_region_count,
-        2
-    );
-    assert!(bulk.rotations > 0);
-    assert!(hot.rotations > bulk.rotations);
-    cache.close_warm().await.unwrap();
-
-    let reopened = files
-        .config_with_static(2, static_config)
-        .open()
-        .await
-        .unwrap();
-    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
-    let survivor = reopened
-        .get_in(BULK, "bulk-survivor")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(survivor.tier(), CacheTier::L2);
-    assert_eq!(survivor.as_ref(), value);
-    drop(survivor);
-    reopened.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -869,13 +759,11 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
             + detailed.index.empty_slots,
         detailed.index.slot_capacity
     );
-    assert_eq!(detailed.region_sets.len(), 1);
-    let region_set = detailed.region_sets[0];
-    assert_eq!(region_set.capacity_bytes, 3 * 512 * 1024);
+    assert_eq!(detailed.region.capacity_bytes, 3 * 512 * 1024);
     assert_eq!(
-        region_set.active_region_count
-            + region_set.free_region_count
-            + region_set.sealed_region_count,
+        detailed.region.active_region_count
+            + detailed.region.free_region_count
+            + detailed.region.sealed_region_count,
         3
     );
     cache.close_fast().await.unwrap();

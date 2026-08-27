@@ -104,8 +104,8 @@ on internal implementation details.
   queue saturation, I/O failures, and Region rotations;
 - [x] expose managed-memory current/peak use and configured logical-disk peak;
 - [x] expose on-demand queue, buffer, worker-I/O, L1/index pressure, and
-  per-RegionSet occupancy detail without adding latency instrumentation to the
-  request path;
+  aggregate Region occupancy detail without adding latency instrumentation to
+  the request path;
 - [x] expose a compact lifecycle/health state for running, draining, miss-only,
   and terminal failure;
 - [x] expose sequenced point deletes through the bounded mutation path with

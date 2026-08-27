@@ -22,7 +22,6 @@ mod recovery;
 mod region;
 mod region_appender;
 mod region_index;
-mod region_layout;
 mod region_manager;
 mod region_metadata;
 mod region_reader;
@@ -34,9 +33,8 @@ mod runtime_config;
 mod snapshot;
 
 pub use cache::{CacheTier, HybridCache, HybridCacheConfig, Result, StaticConfig, Value};
-pub use region_layout::{RegionSetAllocation, RegionSetConfig, RegionSetId};
 pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot,
-    DetailedCacheSnapshot, RegionSetSnapshot, StartupMode,
+    DetailedCacheSnapshot, RegionSnapshot, StartupMode,
 };

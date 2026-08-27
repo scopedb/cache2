@@ -9,31 +9,26 @@ copy of every value must live elsewhere.
 HybridCache
 ├── shared bounded RAM L1
 ├── fixed-capacity partitioned mmap index
-├── namespace → RegionSet router
-│ ├── RegionSet 0: append shards + private Region range + free/sealed FIFO
-│ └── RegionSet N: append shards + private Region range + free/sealed FIFO
+├── append shards + one global Region free/sealed FIFO
 ├── bounded read I/O-engine pool
 ├── bounded write I/O-engine pool
 └── data, state, and clean-image files
 ```
 
-RAM is a process-local L1 and the Region file is L2. Both tiers use the same key
-hash. The hash is seeded XXH3-64; L1 disambiguates a hash
-bucket with the namespace and complete key, while L2 validates the header
-namespace and complete raw key after reading a hash-selected record. A
-collision may therefore become a conservative miss but can never return
-another key's value. There is one SSD format and no Bucket engine, journal, or
-separate write-back executor.
+RAM is a process-local L1 and the Region file is L2. Both tiers use one seeded
+XXH3-64 hash of the complete raw key. L1 disambiguates a hash bucket with the
+complete key, while L2 validates the complete key after reading a hash-selected
+record. A collision may therefore become a conservative miss but can never
+return another key's value. Logical namespaces, when needed, are encoded by the
+caller into that raw key.
 
-A RegionSet is an L2 retention boundary. Static capacity weights assign each
-set a contiguous Region range. At open, runtime append shards are assigned
-contiguous ranges evenly across sets. Every append shard has one Active Region,
-two fixed write buffers, and one ordered worker. Free and sealed FIFOs are
-private to their set, and Region rotation never borrows across sets. L1, the
-global index, I/O pools, memory limit, and statistics stay shared. Runtime L1
-shards and append shards are independent. Changing the append-shard count does
-not change physical Region assignment, but it discards a clean image whose
-active-Region topology has a different shard count.
+Every append shard has one Active Region, two fixed write buffers, and one
+ordered worker. All remaining Regions share one global free/sealed FIFO, so any
+shard can consume free capacity and reclaim the oldest sealed Region. Runtime
+L1 shards and append shards are independent. Changing the append-shard count
+does not change physical Region capacity, but it discards a clean image whose
+active-Region topology has a different shard count. There is one SSD format and
+no Bucket engine, journal, or separate write-back executor.
 
 ## Internal boundaries
 
@@ -52,8 +47,8 @@ lifecycle tests.
 
 A `put` follows a direct bounded path:
 
-1. hash the namespace and full key;
-2. route the namespace to a RegionSet, then select one of its append shards;
+1. hash the complete raw key once;
+2. route that hash to one append shard;
 3. reserve bytes and sequence authority from the Region manager;
 4. encode directly into that shard's aligned staging buffer;
 5. publish the same sequence to RAM when it fits, before returning;
@@ -101,8 +96,8 @@ aligned read range, and reads one record. POSIX uses one dedicated bounded read
 engine, so one reservation observes the complete read-worker capacity. If an
 io_uring hash-selected read lane is full, admission may probe one hash-derived
 alternate lane; it never scans or waits across the pool. Local validation
-checks the planned location, sequence, hash, namespace, complete key, lengths,
-and checksums.
+checks the planned location, sequence, hash, complete key, lengths, and
+checksums.
 There is no retry or second freshness check; a concurrently superseded but
 otherwise valid value may be returned or promoted.
 
@@ -140,21 +135,8 @@ reads; it is never serialized into the clean image.
 
 Static configuration is included in the data superblock fingerprint and clean
 image binding. It consists of capacity, Region size/count, index slots,
-RegionSet ranges, namespace ownership, hash-algorithm identity, and hash seed.
-A mismatch reformats disposable cache state rather than trying to migrate it.
-The single implicit set preserves the original single-pool layout identity.
-
-RegionSet weights are resolved once at open by largest remainder at whole-Region
-granularity, with stable RegionSet ID as the tie breaker. Append shards are
-distributed evenly in the same stable order and are deliberately independent
-of capacity weights. RegionSet zero owns every namespace not explicitly listed
-by another set. A recovered global queue order is partitioned back into per-set
-queues; warm publication flattens them again, so format 1 needs no per-record
-RegionSet field. Runtime reweighting, cross-set borrowing, migration, and
-per-set L1/index/I/O quotas are outside this first boundary.
-Routes that explicitly name RegionSet zero and an explicit single-set-zero
-layout are canonicalized to the implicit default, avoiding cold starts for
-configurations with identical physical behavior.
+hash-algorithm identity, and hash seed. A mismatch reformats disposable cache
+state rather than trying to migrate it.
 
 Runtime configuration is not part of the data-superblock identity and is
 selected on each open. It includes I/O engine and mode, independent read and
@@ -183,9 +165,10 @@ The public resource snapshot exposes current/peak managed reservations, their
 hard limit, and the configured logical-disk peak. The on-demand detailed
 snapshot also exposes L1 entry capacity, resident/retained/fixed-metadata bytes,
 physical index occupancy, and counts of deleted, stale-generation, and live
-slot replacement. The replacement counters follow the optional statistics
-switch; occupancy remains always available. Optional activity statistics
-separately classify read-memory and busy-engine misses.
+slot replacement, plus aggregate Region capacity, occupancy, FIFO state, and
+rotations. The replacement counters follow the optional statistics switch;
+occupancy remains always available. Optional activity statistics separately
+classify read-memory and busy-engine misses.
 
 `HybridCache::snapshot()` also reads relaxed process-local counters for puts,
 deletes, L1/L2 hits and misses, read-memory and busy-engine misses, L1 promotions,

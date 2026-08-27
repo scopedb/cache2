@@ -59,7 +59,7 @@ capacity; this is expected to be uncommon in normal operation.
   behind another request before deciding an L2 candidate.
 - Bound every L1 same-hash bucket to a small constant and bypass L1 when that
   bucket is full. Full-key validation remains mandatory within the bound.
-- Compute the namespaced key hash and planned record size once at the public
+- Compute the complete-key hash and planned record size once at the public
   operation boundary and pass them down unchanged.
 - Give compare-exchange bookkeeping a small constant retry budget. Exhausting
   that budget bypasses optional work or returns a miss instead of spinning.
@@ -72,8 +72,8 @@ capacity; this is expected to be uncommon in normal operation.
 - If a value cannot enter L1, the mutation may still complete through Region.
 - L1 contention, eviction, delayed publication, and L2 promotion may expose an
   older valid value. This is an accepted best-effort outcome.
-- Namespace and full-key validation remain mandatory after hash lookup so hash
-  collisions cannot return another entry.
+- Full-key validation remains mandatory after hash lookup so hash collisions
+  cannot return another entry.
 
 ## Concurrency and Versioning
 
@@ -82,7 +82,7 @@ capacity; this is expected to be uncommon in normal operation.
   part of a bounded mutation, not to guarantee read freshness.
 - Concurrent and delayed operations may expose an older valid version.
 - After Region I/O, validate the returned record locally against the planned
-  location, sequence number, hash, namespace, full key, lengths, and checksum.
+  location, sequence number, hash, full key, lengths, and checksum.
   Do not perform a second index lookup or a global freshness check.
 
 ## Cache and Durability Semantics

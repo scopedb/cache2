@@ -22,7 +22,7 @@ const RECORD_KIND_OFFSET: usize = 6;
 const RECORD_RESERVED8_OFFSET: usize = 7;
 const RECORD_KEY_LEN_OFFSET: usize = 8;
 const RECORD_VALUE_LEN_OFFSET: usize = 12;
-const RECORD_NAMESPACE_ID_OFFSET: usize = 16;
+const RECORD_RESERVED32_OFFSET: usize = 16;
 const RECORD_LEN_OFFSET: usize = 20;
 const RECORD_RESERVED_GENERATION_OFFSET: usize = 24;
 const RECORD_RESERVED_EPOCH_OFFSET: usize = 28;
@@ -36,7 +36,6 @@ const RECORD_KIND_VALUE: u8 = 1;
 pub(crate) struct RecordHeader {
     pub(crate) key_len: u32,
     pub(crate) value_len: u32,
-    pub(crate) namespace_id: u32,
     pub(crate) record_len: u32,
     pub(crate) seqno: u64,
     pub(crate) key_hash: u64,
@@ -60,7 +59,6 @@ impl RecordHeader {
         output[RECORD_KIND_OFFSET] = RECORD_KIND_VALUE;
         put_u32(&mut output, RECORD_KEY_LEN_OFFSET, self.key_len);
         put_u32(&mut output, RECORD_VALUE_LEN_OFFSET, self.value_len);
-        put_u32(&mut output, RECORD_NAMESPACE_ID_OFFSET, self.namespace_id);
         put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
         put_u64(&mut output, RECORD_SEQNO_OFFSET, self.seqno);
         put_u64(&mut output, RECORD_KEY_HASH_OFFSET, self.key_hash);
@@ -77,6 +75,7 @@ impl RecordHeader {
             || get_u16(input, RECORD_VERSION_OFFSET)? != FORMAT_VERSION
             || *input.get(RECORD_KIND_OFFSET)? != RECORD_KIND_VALUE
             || *input.get(RECORD_RESERVED8_OFFSET)? != 0
+            || get_u32(input, RECORD_RESERVED32_OFFSET)? != 0
             || get_u32(input, RECORD_RESERVED_GENERATION_OFFSET)? != 0
             || get_u32(input, RECORD_RESERVED_EPOCH_OFFSET)? != 0
             || !checksum_matches(input, RECORD_HEADER_CRC_OFFSET)
@@ -87,7 +86,6 @@ impl RecordHeader {
         let header = Self {
             key_len: get_u32(input, RECORD_KEY_LEN_OFFSET)?,
             value_len: get_u32(input, RECORD_VALUE_LEN_OFFSET)?,
-            namespace_id: get_u32(input, RECORD_NAMESPACE_ID_OFFSET)?,
             record_len: get_u32(input, RECORD_LEN_OFFSET)?,
             seqno: get_u64(input, RECORD_SEQNO_OFFSET)?,
             key_hash: get_u64(input, RECORD_KEY_HASH_OFFSET)?,
@@ -230,7 +228,6 @@ mod tests {
         let header = RecordHeader {
             key_len: key.len() as u32,
             value_len: value.len() as u32,
-            namespace_id: 0,
             record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
@@ -254,7 +251,6 @@ mod tests {
         let header = RecordHeader {
             key_len: 3,
             value_len: 5,
-            namespace_id: 0,
             record_len: RecordHeader::aligned_len(3, 5).unwrap(),
             seqno: 101,
             key_hash: 0xfedc_ba98_7654_3210,
@@ -263,10 +259,6 @@ mod tests {
 
         assert_eq!(header.record_len, 64);
         assert_eq!(RecordHeader::decode(&header.encode()), Some(header));
-
-        let mut namespaced = header;
-        namespaced.namespace_id = 7;
-        assert_eq!(RecordHeader::decode(&namespaced.encode()), Some(namespaced));
 
         let mut with_batch_padding = header;
         with_batch_padding.record_len = 4 * 1024;
@@ -281,7 +273,6 @@ mod tests {
         let header = RecordHeader {
             key_len: 8,
             value_len: 1,
-            namespace_id: 0,
             record_len: RecordHeader::aligned_len(8, 1).unwrap(),
             seqno: 2,
             key_hash: 3,
@@ -300,7 +291,7 @@ mod tests {
         assert_eq!(RecordHeader::decode(&oversized_value.encode()), None);
 
         let mut reserved = header.encode();
-        put_u32(&mut reserved, RECORD_RESERVED_GENERATION_OFFSET, 1);
+        put_u32(&mut reserved, RECORD_RESERVED32_OFFSET, 1);
         put_u32(&mut reserved, RECORD_HEADER_CRC_OFFSET, 0);
         let checksum = crc32c(&reserved);
         put_u32(&mut reserved, RECORD_HEADER_CRC_OFFSET, checksum);

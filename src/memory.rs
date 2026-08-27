@@ -207,7 +207,6 @@ impl MemoryCharge {
 struct MemoryEntry {
     value: MemoryValue,
     seqno: u64,
-    namespace_id: u32,
     hash_next: u32,
 }
 
@@ -325,12 +324,12 @@ impl MemoryShard {
         self.directory.remove(hash)
     }
 
-    fn find(&self, hash: u64, namespace_id: u32, key: &[u8]) -> Option<usize> {
+    fn find(&self, hash: u64, key: &[u8]) -> Option<usize> {
         let mut cursor = self.directory_head(hash)?;
         for _ in 0..MAX_SAME_HASH_ENTRIES {
             let index = usize::try_from(cursor).ok()?;
             let entry = self.slots.get(index).and_then(Option::as_ref)?;
-            if entry.namespace_id == namespace_id && entry.value.key() == key {
+            if entry.value.key() == key {
                 return Some(index);
             }
             if entry.hash_next == NO_SLOT_INDEX {
@@ -585,11 +584,9 @@ impl MemoryShard {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         hash: u64,
-        namespace_id: u32,
         key: &[u8],
         value: &[u8],
         seqno: u64,
@@ -626,7 +623,6 @@ impl MemoryShard {
         let entry = MemoryEntry {
             value: memory_value,
             seqno,
-            namespace_id,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
         };
         let free_index = self
@@ -815,20 +811,13 @@ impl MemoryStore {
         Ok(total)
     }
 
-    pub(crate) fn publish(
-        &self,
-        hash: u64,
-        namespace_id: u32,
-        key: &[u8],
-        value: &[u8],
-        seqno: u64,
-    ) -> bool {
+    pub(crate) fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
         };
-        let existing = shard.find(hash, namespace_id, key);
+        let existing = shard.find(hash, key);
         if existing.is_some_and(|index| {
             shard.slots[index]
                 .as_ref()
@@ -836,7 +825,7 @@ impl MemoryStore {
         }) {
             return true;
         }
-        let result = shard.insert(hash, namespace_id, key, value, seqno, existing);
+        let result = shard.insert(hash, key, value, seqno, existing);
         drop(shard);
         self.record_insert(result);
         result.inserted
@@ -844,13 +833,13 @@ impl MemoryStore {
 
     /// Best-effort exact-key cleanup for a sequenced delete. Contention
     /// bypasses L1, and a newer resident value is never removed.
-    pub(crate) fn delete(&self, hash: u64, namespace_id: u32, key: &[u8], seqno: u64) -> bool {
+    pub(crate) fn delete(&self, hash: u64, key: &[u8], seqno: u64) -> bool {
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
         };
-        let Some(index) = shard.find(hash, namespace_id, key) else {
+        let Some(index) = shard.find(hash, key) else {
             return true;
         };
         if shard.slots[index]
@@ -863,12 +852,12 @@ impl MemoryStore {
         true
     }
 
-    pub(crate) fn lookup(&self, hash: u64, namespace_id: u32, key: &[u8]) -> MemoryLookup {
+    pub(crate) fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             return MemoryLookup::Miss(MemoryReadToken { shard_id });
         };
-        let Some(index) = shard.find(hash, namespace_id, key) else {
+        let Some(index) = shard.find(hash, key) else {
             return MemoryLookup::Miss(MemoryReadToken { shard_id });
         };
         let shard = &mut *shard;
@@ -883,7 +872,6 @@ impl MemoryStore {
         &self,
         token: MemoryReadToken,
         hash: u64,
-        namespace_id: u32,
         key: &[u8],
         value: &[u8],
         seqno: u64,
@@ -892,13 +880,13 @@ impl MemoryStore {
             return None;
         }
         let mut shard = self.try_lock_shard(token.shard_id)?;
-        if shard.find(hash, namespace_id, key).is_some() {
+        if shard.find(hash, key).is_some() {
             return None;
         }
-        let result = shard.insert(hash, namespace_id, key, value, seqno, None);
+        let result = shard.insert(hash, key, value, seqno, None);
         let promoted = result.inserted.then(|| {
             let index = shard
-                .find(hash, namespace_id, key)
+                .find(hash, key)
                 .expect("a successful promotion installs the exact key");
             shard.slots[index]
                 .as_ref()
@@ -990,25 +978,25 @@ mod tests {
     }
 
     fn assert_hit(store: &MemoryStore, hash: u64, key: &[u8]) {
-        assert!(matches!(store.lookup(hash, 0, key), MemoryLookup::Hit(_)));
+        assert!(matches!(store.lookup(hash, key), MemoryLookup::Hit(_)));
     }
 
     fn assert_miss(store: &MemoryStore, hash: u64, key: &[u8]) {
-        assert!(matches!(store.lookup(hash, 0, key), MemoryLookup::Miss(_)));
+        assert!(matches!(store.lookup(hash, key), MemoryLookup::Miss(_)));
     }
 
     #[test]
     fn published_value_is_visible_and_immediately_evictable() {
         let store = store(512, 1);
-        assert!(store.publish(7, 0, b"a", b"value-a", 1));
+        assert!(store.publish(7, b"a", b"value-a", 1));
         assert!(matches!(
-            store.lookup(7, 0, b"a"),
+            store.lookup(7, b"a"),
             MemoryLookup::Hit(value) if value.as_ref() == b"value-a"
         ));
 
-        assert!(store.publish(8, 0, b"b", &[2; 300], 2));
+        assert!(store.publish(8, b"b", &[2; 300], 2));
         assert!(matches!(
-            store.lookup(8, 0, b"b"),
+            store.lookup(8, b"b"),
             MemoryLookup::Hit(value) if value.len() == 300
         ));
     }
@@ -1016,20 +1004,20 @@ mod tests {
     #[test]
     fn delete_is_exact_and_does_not_remove_a_newer_value() {
         let store = store(4096, 1);
-        assert!(store.publish(7, 1, b"a", b"value-a", 10));
-        assert!(store.publish(7, 1, b"b", b"value-b", 11));
+        assert!(store.publish(7, b"a", b"value-a", 10));
+        assert!(store.publish(7, b"b", b"value-b", 11));
 
-        assert!(store.delete(7, 1, b"a", 12));
-        assert!(matches!(store.lookup(7, 1, b"a"), MemoryLookup::Miss(_)));
+        assert!(store.delete(7, b"a", 12));
+        assert!(matches!(store.lookup(7, b"a"), MemoryLookup::Miss(_)));
         assert!(matches!(
-            store.lookup(7, 1, b"b"),
+            store.lookup(7, b"b"),
             MemoryLookup::Hit(value) if value.as_ref() == b"value-b"
         ));
 
-        assert!(store.publish(7, 1, b"a", b"newer", 20));
-        assert!(store.delete(7, 1, b"a", 19));
+        assert!(store.publish(7, b"a", b"newer", 20));
+        assert!(store.delete(7, b"a", 19));
         assert!(matches!(
-            store.lookup(7, 1, b"a"),
+            store.lookup(7, b"a"),
             MemoryLookup::Hit(value) if value.as_ref() == b"newer"
         ));
     }
@@ -1037,9 +1025,9 @@ mod tests {
     #[test]
     fn delete_bypasses_a_contended_l1_shard() {
         let store = store(4096, 1);
-        assert!(store.publish(7, 0, b"a", b"value", 10));
+        assert!(store.publish(7, b"a", b"value", 10));
         let shard = store.shards[0].lock().unwrap();
-        assert!(!store.delete(7, 0, b"a", 11));
+        assert!(!store.delete(7, b"a", 11));
         drop(shard);
 
         assert_hit(&store, 7, b"a");
@@ -1052,8 +1040,8 @@ mod tests {
         let metadata_bytes = store.metadata_bytes;
         let slot_len = store.shards[0].lock().unwrap().slots.len();
 
-        assert!(store.publish(1, 0, b"a", b"a", 1));
-        assert!(store.publish(2, 0, b"b", &[2; 1024], 2));
+        assert!(store.publish(1, b"a", b"a", 1));
+        assert!(store.publish(2, b"b", &[2; 1024], 2));
 
         assert_miss(&store, 1, b"a");
         assert_hit(&store, 2, b"b");
@@ -1068,11 +1056,11 @@ mod tests {
     #[test]
     fn retained_eviction_is_visible_in_detailed_memory_accounting() {
         let store = MemoryStore::new(4096, 1, 1, true).unwrap();
-        assert!(store.publish(1, 0, b"a", &[1; 128], 1));
-        let MemoryLookup::Hit(retained) = store.lookup(1, 0, b"a") else {
+        assert!(store.publish(1, b"a", &[1; 128], 1));
+        let MemoryLookup::Hit(retained) = store.lookup(1, b"a") else {
             panic!("published value must be visible");
         };
-        assert!(store.publish(2, 0, b"b", &[2; 128], 2));
+        assert!(store.publish(2, b"b", &[2; 128], 2));
 
         let snapshot = store.detailed_snapshot().unwrap();
         assert_eq!(snapshot.resident_entries, 1);
@@ -1087,40 +1075,38 @@ mod tests {
     #[test]
     fn l1_contention_bypasses_and_allows_l2_fallback() {
         let store = store(1024, 1);
-        assert!(store.publish(7, 0, b"key", b"old", 1));
+        assert!(store.publish(7, b"key", b"old", 1));
 
         let shard = store.shards[0].lock().unwrap();
-        assert!(matches!(store.lookup(7, 0, b"key"), MemoryLookup::Miss(_)));
-        assert!(!store.publish(7, 0, b"key", b"new", 2));
+        assert!(matches!(store.lookup(7, b"key"), MemoryLookup::Miss(_)));
+        assert!(!store.publish(7, b"key", b"new", 2));
         drop(shard);
 
         assert!(matches!(
-            store.lookup(7, 0, b"key"),
+            store.lookup(7, b"key"),
             MemoryLookup::Hit(value) if value.as_ref() == b"old"
         ));
     }
 
     #[test]
-    fn same_hash_chain_disambiguates_namespace_and_full_key() {
+    fn same_hash_chain_disambiguates_full_key() {
         let store = store(2048, 1);
         let collision_hash = 42;
-        assert!(store.publish(collision_hash, 7, b"alpha", b"value-alpha-ns7", 1,));
-        assert!(store.publish(collision_hash, 7, b"beta", b"value-beta-ns7", 2,));
-        assert!(store.publish(collision_hash, 8, b"alpha", b"value-alpha-ns8", 3,));
-        assert!(store.publish(collision_hash, 7, b"beta", b"replacement-beta-ns7", 4,));
+        assert!(store.publish(collision_hash, b"alpha", b"value-alpha", 1));
+        assert!(store.publish(collision_hash, b"beta", b"value-beta", 2));
+        assert!(store.publish(collision_hash, b"beta", b"replacement-beta", 3));
 
-        for (namespace, key, expected) in [
-            (7, b"alpha".as_slice(), b"value-alpha-ns7".as_slice()),
-            (7, b"beta".as_slice(), b"replacement-beta-ns7".as_slice()),
-            (8, b"alpha".as_slice(), b"value-alpha-ns8".as_slice()),
+        for (key, expected) in [
+            (b"alpha".as_slice(), b"value-alpha".as_slice()),
+            (b"beta".as_slice(), b"replacement-beta".as_slice()),
         ] {
             assert!(matches!(
-                store.lookup(collision_hash, namespace, key),
+                store.lookup(collision_hash, key),
                 MemoryLookup::Hit(value) if value.as_ref() == expected
             ));
         }
         assert!(matches!(
-            store.lookup(collision_hash, 7, b"foreign"),
+            store.lookup(collision_hash, b"foreign"),
             MemoryLookup::Miss(_)
         ));
     }
@@ -1136,7 +1122,6 @@ mod tests {
         for (ordinal, key) in keys.iter().take(MAX_SAME_HASH_ENTRIES).enumerate() {
             assert!(store.publish(
                 collision_hash,
-                0,
                 key.as_bytes(),
                 &[ordinal as u8],
                 ordinal as u64 + 1,
@@ -1144,7 +1129,6 @@ mod tests {
         }
         assert!(!store.publish(
             collision_hash,
-            0,
             keys[MAX_SAME_HASH_ENTRIES].as_bytes(),
             b"overflow",
             MAX_SAME_HASH_ENTRIES as u64 + 1,
@@ -1152,7 +1136,7 @@ mod tests {
 
         for (ordinal, key) in keys.iter().take(MAX_SAME_HASH_ENTRIES).enumerate() {
             assert!(matches!(
-                store.lookup(collision_hash, 0, key.as_bytes()),
+                store.lookup(collision_hash, key.as_bytes()),
                 MemoryLookup::Hit(value) if value.as_ref() == [ordinal as u8]
             ));
         }
@@ -1162,13 +1146,13 @@ mod tests {
     #[test]
     fn existing_exact_key_blocks_disk_promotion() {
         let store = store(1024, 1);
-        let MemoryLookup::Miss(token) = store.lookup(9, 0, b"key") else {
+        let MemoryLookup::Miss(token) = store.lookup(9, b"key") else {
             panic!("empty memory tier must miss");
         };
-        assert!(store.publish(9, 0, b"key", b"new", 2));
-        assert!(store.promote(token, 9, 0, b"key", b"old", 1).is_none());
+        assert!(store.publish(9, b"key", b"new", 2));
+        assert!(store.promote(token, 9, b"key", b"old", 1).is_none());
         assert!(matches!(
-            store.lookup(9, 0, b"key"),
+            store.lookup(9, b"key"),
             MemoryLookup::Hit(value) if value.as_ref() == b"new"
         ));
     }
@@ -1176,10 +1160,10 @@ mod tests {
     #[test]
     fn newer_exact_key_publication_suppresses_a_delayed_older_put() {
         let store = store(1024, 1);
-        assert!(store.publish(11, 0, b"key", b"new", 2));
-        assert!(store.publish(11, 0, b"key", b"old", 1));
+        assert!(store.publish(11, b"key", b"new", 2));
+        assert!(store.publish(11, b"key", b"old", 1));
         assert!(matches!(
-            store.lookup(11, 0, b"key"),
+            store.lookup(11, b"key"),
             MemoryLookup::Hit(value) if value.as_ref() == b"new"
         ));
     }
@@ -1187,8 +1171,8 @@ mod tests {
     #[test]
     fn newer_unrelated_publication_does_not_suppress_an_older_key() {
         let store = store(1024, 1);
-        assert!(store.publish(12, 0, b"newer", b"newer", 2));
-        assert!(store.publish(11, 0, b"older", b"older", 1));
+        assert!(store.publish(12, b"newer", b"newer", 2));
+        assert!(store.publish(11, b"older", b"older", 1));
         assert_hit(&store, 12, b"newer");
         assert_hit(&store, 11, b"older");
     }
@@ -1196,12 +1180,12 @@ mod tests {
     #[test]
     fn failed_admission_preserves_a_retained_value_and_its_charge() {
         let store = store(512, 1);
-        assert!(store.publish(21, 0, b"a", &[1; 300], 1));
-        let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a") else {
+        assert!(store.publish(21, b"a", &[1; 300], 1));
+        let MemoryLookup::Hit(retained) = store.lookup(21, b"a") else {
             panic!("published value must be visible");
         };
 
-        assert!(!store.publish(22, 0, b"b", &[2; 300], 2));
+        assert!(!store.publish(22, b"b", &[2; 300], 2));
         assert_hit(&store, 21, b"a");
         assert_eq!(
             store.shards[0].lock().unwrap().budget.used_bytes(),
@@ -1213,19 +1197,19 @@ mod tests {
             store.shards[0].lock().unwrap().budget.used_bytes(),
             MEMORY_ENTRY_OVERHEAD_BYTES + 301
         );
-        assert!(store.publish(22, 0, b"b", &[2; 300], 3));
+        assert!(store.publish(22, b"b", &[2; 300], 3));
     }
 
     #[test]
     fn concurrent_retained_value_drops_leave_the_resident_charge_intact() {
         let store = store(512, 1);
-        assert!(store.publish(21, 0, b"a", &[1; 300], 1));
-        let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a") else {
+        assert!(store.publish(21, b"a", &[1; 300], 1));
+        let MemoryLookup::Hit(retained) = store.lookup(21, b"a") else {
             panic!("published value must be visible");
         };
         let clones = (0..8).map(|_| retained.clone()).collect::<Vec<_>>();
 
-        assert!(!store.publish(22, 0, b"b", &[2; 300], 2));
+        assert!(!store.publish(22, b"b", &[2; 300], 2));
         let barrier = Arc::new(std::sync::Barrier::new(clones.len() + 1));
         std::thread::scope(|scope| {
             for value in clones {
@@ -1244,7 +1228,7 @@ mod tests {
             store.shards[0].lock().unwrap().budget.used_bytes(),
             MEMORY_ENTRY_OVERHEAD_BYTES + 301
         );
-        assert!(store.publish(22, 0, b"b", &[2; 300], 3));
+        assert!(store.publish(22, b"b", &[2; 300], 3));
     }
 
     #[test]
@@ -1256,11 +1240,11 @@ mod tests {
 
         let store = store(CAPACITY, 1);
         for hash in 1..=VICTIM_COUNT as u64 {
-            assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
+            assert!(store.publish(hash, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
         }
         let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
 
-        assert!(!store.publish(100, 0, b"c", &candidate, 100));
+        assert!(!store.publish(100, b"c", &candidate, 100));
         for hash in 1..=VICTIM_COUNT as u64 {
             assert_hit(&store, hash, b"k");
         }
@@ -1282,11 +1266,11 @@ mod tests {
 
         let store = store(CAPACITY, 1);
         for hash in 1..=VICTIM_COUNT as u64 {
-            assert!(store.publish(hash, 0, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
+            assert!(store.publish(hash, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
         }
         let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
 
-        assert!(store.publish(100, 0, b"c", &candidate, 100));
+        assert!(store.publish(100, b"c", &candidate, 100));
         assert_hit(&store, 100, b"c");
         assert_miss(&store, 1, b"k");
         assert_eq!(
@@ -1305,13 +1289,13 @@ mod tests {
 
         let store = store(CAPACITY, 1);
         for hash in 1..=ENTRY_COUNT as u64 {
-            assert!(store.publish(hash, 0, b"k", &[hash as u8; VALUE_BYTES], hash));
+            assert!(store.publish(hash, b"k", &[hash as u8; VALUE_BYTES], hash));
         }
         let replacement = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
 
-        assert!(!store.publish(1, 0, b"k", &replacement, 100));
+        assert!(!store.publish(1, b"k", &replacement, 100));
         assert!(matches!(
-            store.lookup(1, 0, b"k"),
+            store.lookup(1, b"k"),
             MemoryLookup::Hit(value) if value.as_ref() == [1; VALUE_BYTES]
         ));
         assert_eq!(
@@ -1324,21 +1308,21 @@ mod tests {
     #[test]
     fn retained_exact_key_replacement_keeps_the_old_value_until_reclaimable() {
         let store = store(512, 1);
-        assert!(store.publish(21, 0, b"a", &[1; 300], 1));
-        let MemoryLookup::Hit(retained) = store.lookup(21, 0, b"a") else {
+        assert!(store.publish(21, b"a", &[1; 300], 1));
+        let MemoryLookup::Hit(retained) = store.lookup(21, b"a") else {
             panic!("expected retained value");
         };
 
-        assert!(!store.publish(21, 0, b"a", &[2; 300], 2));
+        assert!(!store.publish(21, b"a", &[2; 300], 2));
         assert!(matches!(
-            store.lookup(21, 0, b"a"),
+            store.lookup(21, b"a"),
             MemoryLookup::Hit(value) if value.as_ref() == [1; 300]
         ));
 
         drop(retained);
-        assert!(store.publish(21, 0, b"a", &[2; 300], 3));
+        assert!(store.publish(21, b"a", &[2; 300], 3));
         assert!(matches!(
-            store.lookup(21, 0, b"a"),
+            store.lookup(21, b"a"),
             MemoryLookup::Hit(value) if value.as_ref() == [2; 300]
         ));
     }
@@ -1346,9 +1330,9 @@ mod tests {
     #[test]
     fn skewed_shard_admission_cannot_consume_another_shards_budget() {
         let store = store(1024, 2);
-        assert!(store.publish(2, 0, b"even-a", &[1; 300], 1));
-        assert!(store.publish(4, 0, b"even-b", &[2; 300], 2));
-        assert!(store.publish(3, 0, b"odd", &[3; 300], 3));
+        assert!(store.publish(2, b"even-a", &[1; 300], 1));
+        assert!(store.publish(4, b"even-b", &[2; 300], 2));
+        assert!(store.publish(3, b"odd", &[3; 300], 3));
         assert_miss(&store, 2, b"even-a");
         assert_hit(&store, 4, b"even-b");
 

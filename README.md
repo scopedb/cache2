@@ -75,57 +75,10 @@ The supplied runtime must have Tokio time enabled and remain alive until the
 cache is closed. Pass `runtime.handle().clone()` when the caller owns a
 `tokio::runtime::Runtime`; the cache does not take ownership of the runtime.
 
-The default path uses namespace zero. Namespaces are an explicit extension:
-
-```rust
-# use cache_rs::HybridCache;
-# async fn read_namespace(cache: &HybridCache) -> Result<(), std::io::Error> {
-let namespace = 42;
-cache.put_in(namespace, "stable-key", b"namespaced value")?;
-cache.delete_in(namespace, "obsolete-key")?;
-
-let stable = cache.get_in(namespace, "stable-key").await?;
-# let _ = stable;
-# Ok::<(), std::io::Error>(())
-# }
-```
-
-Namespaces may also be assigned to physical RegionSets when workloads need
-different SSD retention. Capacity weights divide the fixed Region count; each
-set owns its active Regions and its own free/sealed FIFO, so rotation in one set
-cannot reclaim another set. The append-shard count remains the global runtime
-`with_write_shards` value and is distributed evenly across sets in
-deterministic ID order:
-
-```rust
-use cache_rs::{RegionSetConfig, StaticConfig};
-
-let write_shards = 8;
-let static_config = StaticConfig::new(96 * 1024 * 1024 * 1024)
-    .with_region_size(32 * 1024 * 1024)
-    .with_region_sets([
-        RegionSetConfig::new(0).with_weight(3), // default, larger cold set
-        RegionSetConfig::new(1)
-            .with_weight(1)
-            .with_namespaces([7]), // compact hot set
-    ]);
-let allocations = static_config.region_set_allocations(write_shards)?;
-# let _ = allocations;
-# Ok::<(), std::io::Error>(())
-```
-
-The L1, fixed L2 index, I/O engines, memory limit, and statistics
-remain shared. RegionSets are therefore physical SSD-retention partitions, not
-independent cache instances or runtime quotas. Weight rounding is deterministic
-at whole-Region granularity. Each set must receive one Region per assigned
-append shard plus at least one spare Region; invalid layouts fail before files
-are created. RegionSet zero is required and receives every namespace not listed
-by another set. Layout and namespace ownership are static identity, so changing
-either intentionally cold-starts empty.
-`StaticConfig::validate()` checks that the physical layout can support at least
-one shard per set without touching cache files.
-`region_set_allocations(write_shards)` validates the requested runtime topology
-and reports its resolved Region count, capacity bytes, and append-shard count.
+`HybridCache` has one raw byte-key space. If an application needs logical
+namespaces, encode the namespace into the key before calling the cache; it then
+participates naturally in hashing and full-key validation without a separate
+cache concept or routing layer.
 
 `put` publishes an admitted RAM value immediately and encodes the same sequence
 into the bounded per-shard write buffer before returning. The value is readable
@@ -159,8 +112,8 @@ After an L1 miss, `get` always asks L2 to decide the result. A true L2 index
 miss returns immediately without allocating a read buffer. An L2 candidate
 plans one exact aligned read range, reserves an immediately available
 read-engine slot, allocates that range, and performs one record read. The result
-is checked locally against the planned location, sequence number, hash,
-namespace, full key, lengths, and checksum. There is no second index lookup or global
+is checked locally against the planned location, sequence number, hash, full
+key, lengths, and checksum. There is no second index lookup or global
 freshness check; a concurrently superseded but otherwise valid record may be
 returned. There is no public read admission policy, fixed read-buffer pool,
 read wait queue, or background-ready state. The transient allocation is
@@ -194,7 +147,6 @@ reads fail open as misses.
 
 - capacity and Region size;
 - expected-entry-derived index slot count;
-- RegionSet capacity layout and namespace ownership;
 - seeded XXH3-64 key hashing with a fixed internal seed.
 
 Changing one of these values safely formats an empty cache. `RuntimeConfig`
@@ -221,7 +173,7 @@ write-shard and write-worker counts.
 
 The RAM tier uses shard-local CLOCK. Victim search and multi-entry eviction use
 fixed per-operation work budgets; budget exhaustion bypasses L1. Resident hits
-still verify namespace and the complete key.
+still verify the complete key.
 
 RAM is never recovered. A warm reopen maps the clean Region index and repopulates
 L1 through read promotion.
@@ -235,7 +187,7 @@ L1 entry slots, eviction metadata, free lists, and the open-addressed directory
 are sized and allocated once during open. The directory consumes the already
 computed seeded XXH3 key hash directly; it never invokes SipHash, reallocates,
 or rehashes under a shard lock. Compact intrusive same-hash chains retain
-namespace and full-key validation. The fixed entry count is derived from the
+full-key validation. The fixed entry count is derived from the
 static expected-key/index plan and the L1/L2 capacity ratio, with enough slots
 for a 4 KiB average L1 entry when the static key plan permits it. Smaller-entry
 workloads may therefore reach the entry bound before the byte bound and bypass
@@ -262,8 +214,8 @@ switch; fixed capacity and physical occupancy remain available when it is off.
 `HybridCache::detailed_snapshot()` adds write-buffer rejection counters,
 aggregate worker I/O activity,
 fixed/resident/retained L1 accounting, physical index occupancy and bounded
-slot-reuse/replacement counters, and per-RegionSet capacity, occupancy, queue
-state, and process-local rotations.
+slot-reuse/replacement counters, and aggregate Region capacity, occupancy,
+queue state, and process-local rotations.
 It adds no request latency instrumentation. Because it briefly locks Region
 metadata and scans all Regions, use it for periodic diagnostics rather than on
 the request hot path.
@@ -297,9 +249,7 @@ recoverable.
 ## Capacity planning
 
 1. Choose a static capacity that is an exact Region-size multiple and provides
-   at least one more Region than the shard count. With RegionSets, apply that
-   rule independently to every weighted assignment: each set needs one active
-   Region per assigned shard plus one spare. More Regions reduce turnover.
+   at least one more Region than the shard count. More Regions reduce turnover.
 2. Set expected entries from the intended live key count; the fixed mmap index
    uses approximately 1.25 slots per entry and 24 bytes per slot, plus one
    64-byte header per 4 KiB page. `StaticConfig::new` assumes 16 KiB per entry;

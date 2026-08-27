@@ -1,5 +1,3 @@
-use crate::region_layout::RegionSetId;
-
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupMode {
@@ -87,8 +85,7 @@ pub struct CacheIndexSnapshot {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RegionSetSnapshot {
-    pub id: RegionSetId,
+pub struct RegionSnapshot {
     pub capacity_bytes: u64,
     pub append_shard_count: u32,
     pub active_region_count: u32,
@@ -109,5 +106,5 @@ pub struct DetailedCacheSnapshot {
     pub io: CacheIoSnapshot,
     pub l1: CacheL1Snapshot,
     pub index: CacheIndexSnapshot,
-    pub region_sets: Box<[RegionSetSnapshot]>,
+    pub region: RegionSnapshot,
 }

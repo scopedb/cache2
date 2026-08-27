@@ -2,8 +2,8 @@
 //!
 //! The encoder uses the stable record envelope while keeping batch padding and
 //! physical location authority in the append reservation. The encoder performs
-//! no allocation and computes the payload CRC incrementally from the logical
-//! namespace key and value.
+//! no allocation and computes the payload CRC incrementally from the key and
+//! value.
 
 use std::fmt;
 
@@ -14,9 +14,6 @@ use crate::format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, RECORD_HEADER_SIZE, RecordHead
 use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation, PackedLocationError};
 use crate::recovery::RECORD_ALIGNMENT;
 use crate::region_manager::RegionAppendReservation;
-
-const NAMESPACE_HASH_DOMAIN: &[u8] = b"cache-rs/ns/v1\0";
-const NAMESPACE_HASH_CONTEXT_SIZE: usize = NAMESPACE_HASH_DOMAIN.len() + size_of::<u32>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecordEncodeError {
@@ -102,21 +99,12 @@ pub(crate) fn encode_value_into(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
     hash_seed: u64,
-    namespace_id: u32,
     key: &[u8],
     value: &[u8],
 ) -> Result<(u64, IndexEntry), RecordEncodeError> {
     let required = required_record_bytes(key.len(), value.len())?;
-    let hash = hash_namespaced_key(hash_seed, namespace_id, key);
-    let entry = encode_value_into_hashed(
-        destination,
-        reservation,
-        hash,
-        required,
-        namespace_id,
-        key,
-        value,
-    )?;
+    let hash = hash_key(hash_seed, key);
+    let entry = encode_value_into_hashed(destination, reservation, hash, required, key, value)?;
     Ok((hash, entry))
 }
 
@@ -126,7 +114,6 @@ pub(crate) fn encode_value_into_hashed(
     reservation: RegionAppendReservation,
     hash: u64,
     required: u32,
-    namespace_id: u32,
     key: &[u8],
     value: &[u8],
 ) -> Result<IndexEntry, RecordEncodeError> {
@@ -189,7 +176,6 @@ pub(crate) fn encode_value_into_hashed(
     let header = RecordHeader {
         key_len,
         value_len,
-        namespace_id,
         record_len: reservation.record_bytes,
         seqno: reservation.seqno,
         key_hash: hash,
@@ -203,19 +189,8 @@ pub(crate) fn encode_value_into_hashed(
     })
 }
 
-pub(crate) fn hash_namespaced_key(seed: u64, namespace_id: u32, key: &[u8]) -> u64 {
-    if namespace_id == 0 {
-        return xxh3_64_with_seed(key, seed);
-    }
-
-    // Deriving a namespace-specific seed keeps the common namespace-zero path
-    // to one XXH3 call and avoids allocating or constructing XXH3's large
-    // streaming state for every point operation.
-    let mut context = [0_u8; NAMESPACE_HASH_CONTEXT_SIZE];
-    context[..NAMESPACE_HASH_DOMAIN.len()].copy_from_slice(NAMESPACE_HASH_DOMAIN);
-    context[NAMESPACE_HASH_DOMAIN.len()..].copy_from_slice(&namespace_id.to_le_bytes());
-    let namespaced_seed = xxh3_64_with_seed(&context, seed);
-    xxh3_64_with_seed(key, namespaced_seed)
+pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
+    xxh3_64_with_seed(key, seed)
 }
 
 #[cfg(test)]
@@ -225,28 +200,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seeded_xxh3_vectors_define_namespace_hashing() {
+    fn seeded_xxh3_vectors_define_key_hashing() {
         let seed = 0x6a09_e667_f3bc_c909;
-        let actual = [
-            hash_namespaced_key(seed, 0, b""),
-            hash_namespaced_key(seed, 0, b"cache-rs\0key"),
-            hash_namespaced_key(seed, 7, b"cache-rs\0key"),
-            hash_namespaced_key(seed, u32::MAX, b"cache-rs\0key"),
-        ];
-        assert_eq!(
-            actual,
-            [
-                0x4e79_f242_1392_7a65,
-                0xc0ec_b0e2_0a80_44ca,
-                0x13a9_9969_cbe6_fa32,
-                0x9102_df2d_b679_ea94,
-            ]
-        );
+        let actual = [hash_key(seed, b""), hash_key(seed, b"cache-rs\0key")];
+        assert_eq!(actual, [0x4e79_f242_1392_7a65, 0xc0ec_b0e2_0a80_44ca,]);
     }
 
     #[test]
-    fn namespaced_16k_value_uses_the_minimum_format_envelope() {
-        let namespace_id = 42;
+    fn sixteen_kib_value_uses_the_minimum_format_envelope() {
         let key = b"file/chunk/0007";
         let value = (0..16 * 1024)
             .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
@@ -270,20 +231,18 @@ mod tests {
             &mut destination,
             reservation,
             0x0123_4567_89ab_cdef,
-            namespace_id,
             key,
             &value,
         )
         .unwrap();
 
-        assert_eq!(hash, 0x3c68_d7f9_bfae_9378);
+        assert_eq!(hash, hash_key(0x0123_4567_89ab_cdef, key));
         assert_eq!(entry.location.region_id(), 7);
         assert_eq!(entry.location.offset(), 0);
         assert_eq!(entry.location.record_len(), required);
         assert_eq!(entry.seqno, 17);
 
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(header.namespace_id, namespace_id);
         assert_eq!(header.key_len, key.len() as u32);
         assert_eq!(header.value_len, value.len() as u32);
         assert_eq!(header.record_len, required);
@@ -340,7 +299,7 @@ mod tests {
         };
         let mut wrong_destination = vec![0xa5; required as usize + 32];
         assert!(matches!(
-            encode_value_into(&mut wrong_destination, reservation, 0, 0, b"key", &[7; 16],),
+            encode_value_into(&mut wrong_destination, reservation, 0, b"key", &[7; 16],),
             Err(RecordEncodeError::DestinationLengthMismatch { .. })
         ));
         assert!(wrong_destination.iter().all(|byte| *byte == 0xa5));

@@ -947,7 +947,6 @@ mod tests {
         let header = RecordHeader {
             key_len: 0,
             value_len: 0,
-            namespace_id: 0,
             record_len: receipt.record_bytes,
             seqno: receipt.seqno,
             key_hash: record.hash(),

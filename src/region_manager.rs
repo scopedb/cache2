@@ -7,14 +7,12 @@
 
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::recovery::{PersistentId, RECORD_ALIGNMENT};
-use crate::region_layout::RegionLayout;
 use crate::region_metadata::{
     PartitionMetadataRecord, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
     RegionMetadataRoot, RegionMetadataState,
 };
-use crate::snapshot::RegionSetSnapshot;
+use crate::snapshot::RegionSnapshot;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 const UNASSIGNED_REGION: u32 = u32::MAX;
 
@@ -117,7 +115,7 @@ pub(crate) struct RegionRotationReceipt {
 /// Read-only selection of the next FIFO rotation victim.
 ///
 /// A caller may retain this value while it drops manager authority. It must
-/// hold the process-wide rotation gate for the selected RegionSet until
+/// hold the process-wide rotation gate until
 /// [`RegionManager::begin_rotation`] consumes the plan.
 /// `victim_incarnation` identifies the generation being replaced; the newly
 /// activated generation advances it by exactly one.
@@ -200,41 +198,23 @@ pub(crate) struct RegionRuntime {
 }
 
 #[derive(Debug)]
-struct RegionSetQueues {
-    free: VecDeque<u32>,
-    sealed: VecDeque<u32>,
-    capacity: usize,
-    rotations: u64,
-}
-
-#[derive(Debug)]
 pub(crate) struct RegionManager {
     binding: RegionMetadataBinding,
     region_size: u64,
     next_seqno: u64,
     regions: Vec<RegionRuntime>,
-    layout: Arc<RegionLayout>,
     active_regions: Vec<u32>,
     shard_mutations: Vec<ShardMutation>,
-    set_queues: Box<[RegionSetQueues]>,
+    free_regions: VecDeque<u32>,
+    sealed_regions: VecDeque<u32>,
+    queue_capacity: usize,
+    rotations: u64,
 }
 
 impl RegionManager {
     /// Consumes one complete CLEAN metadata image and reconstructs runtime
     /// authority without scanning the index or Region data records.
-    #[cfg(test)]
     pub(crate) fn from_metadata(metadata: RegionMetadata) -> Result<Self, RegionMetadataError> {
-        let layout = Arc::new(
-            RegionLayout::single(metadata.root.region_count, metadata.root.shard_count)
-                .map_err(|_| RegionMetadataError::InvalidField("region_layout"))?,
-        );
-        Self::from_metadata_with_layout(metadata, layout)
-    }
-
-    pub(crate) fn from_metadata_with_layout(
-        metadata: RegionMetadata,
-        layout: Arc<RegionLayout>,
-    ) -> Result<Self, RegionMetadataError> {
         metadata.validate()?;
         let RegionMetadata {
             root,
@@ -244,10 +224,6 @@ impl RegionManager {
         // Partition topology and slot counters are owned by the live index.
         // Do not retain the recovered copy as a second authority.
         drop(partitions);
-
-        if root.region_count != layout.region_count() || root.shard_count != layout.shard_count() {
-            return Err(RegionMetadataError::InvalidField("region_layout"));
-        }
 
         let region_count = usize::try_from(root.region_count)
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
@@ -298,9 +274,6 @@ impl RegionManager {
                 "region_queue_permutation",
             ));
         }
-        let set_queues =
-            partition_recovered_queues(&layout, &active_regions, &free_regions, &sealed_regions)?;
-
         let next_seqno = root
             .max_seqno
             .checked_add(1)
@@ -317,10 +290,12 @@ impl RegionManager {
             region_size: root.region_size,
             next_seqno,
             regions,
-            layout,
             active_regions,
             shard_mutations,
-            set_queues,
+            free_regions,
+            sealed_regions,
+            queue_capacity: sealed_capacity,
+            rotations: 0,
         })
     }
 
@@ -341,63 +316,42 @@ impl RegionManager {
         &self.active_regions
     }
 
-    pub(crate) fn region_set_snapshots(
-        &self,
-    ) -> Result<Box<[RegionSetSnapshot]>, RegionMetadataError> {
-        let mut snapshots = Vec::new();
-        snapshots
-            .try_reserve_exact(self.layout.sets().len())
-            .map_err(|_| RegionMetadataError::Allocation)?;
-        for (set, queues) in self.layout.sets().iter().zip(&self.set_queues) {
-            let first = usize::try_from(set.first_region)
-                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-            let end = usize::try_from(
-                set.first_region
-                    .checked_add(set.region_count)
-                    .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-            )
-            .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-            let regions = self
-                .regions
-                .get(first..end)
-                .ok_or(RegionMetadataError::InvalidField("region_layout"))?;
-            let mut snapshot = RegionSetSnapshot {
-                id: set.id,
-                capacity_bytes: u64::from(set.region_count)
-                    .checked_mul(self.region_size)
-                    .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-                append_shard_count: set.shard_count,
-                active_region_count: set.shard_count,
-                free_region_count: u32::try_from(queues.free.len())
-                    .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
-                sealed_region_count: u32::try_from(queues.sealed.len())
-                    .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
-                rotations: queues.rotations,
-                ..RegionSetSnapshot::default()
-            };
-            for region in regions {
-                snapshot.physical_record_count = snapshot
-                    .physical_record_count
-                    .saturating_add(region.physical_record_count);
-                snapshot.physical_bytes = snapshot
-                    .physical_bytes
-                    .saturating_add(region.completed_used);
-            }
-            snapshots.push(snapshot);
+    pub(crate) fn region_snapshot(&self) -> Result<RegionSnapshot, RegionMetadataError> {
+        let mut snapshot = RegionSnapshot {
+            capacity_bytes: u64::try_from(self.regions.len())
+                .ok()
+                .and_then(|count| count.checked_mul(self.region_size))
+                .ok_or(RegionMetadataError::ArithmeticOverflow)?,
+            append_shard_count: u32::try_from(self.active_regions.len())
+                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
+            active_region_count: u32::try_from(self.active_regions.len())
+                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
+            free_region_count: u32::try_from(self.free_regions.len())
+                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
+            sealed_region_count: u32::try_from(self.sealed_regions.len())
+                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
+            rotations: self.rotations,
+            ..RegionSnapshot::default()
+        };
+        for region in &self.regions {
+            snapshot.physical_record_count = snapshot
+                .physical_record_count
+                .saturating_add(region.physical_record_count);
+            snapshot.physical_bytes = snapshot
+                .physical_bytes
+                .saturating_add(region.completed_used);
         }
-        Ok(snapshots.into_boxed_slice())
+        Ok(snapshot)
     }
 
     #[cfg(test)]
     pub(crate) fn free_regions(&self) -> &VecDeque<u32> {
-        assert_eq!(self.set_queues.len(), 1);
-        &self.set_queues[0].free
+        &self.free_regions
     }
 
     #[cfg(test)]
     pub(crate) fn sealed_regions(&self) -> &VecDeque<u32> {
-        assert_eq!(self.set_queues.len(), 1);
-        &self.set_queues[0].sealed
+        &self.sealed_regions
     }
 
     /// Allocates one process-local ordering version. Sequence exhaustion is a
@@ -868,15 +822,10 @@ impl RegionManager {
         let victim_region_id = plan.victim_region_id;
         let reused = plan.reused;
         let created_seqno = self.allocate_seqno()?;
-        let set_index = self
-            .layout
-            .set_index_for_shard(shard_id)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        let queues = &mut self.set_queues[set_index];
         let removed = if reused {
-            queues.sealed.pop_front()
+            self.sealed_regions.pop_front()
         } else {
-            queues.free.pop_front()
+            self.free_regions.pop_front()
         };
         if removed != Some(victim_region_id) {
             return Err(RegionMutationError::Invariant(
@@ -946,20 +895,11 @@ impl RegionManager {
             return Err(RegionMutationError::WouldBlock);
         }
 
-        let set_index = self
-            .layout
-            .set_index_for_shard(shard_id)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        let queues = self
-            .set_queues
-            .get(set_index)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        let free = queues.free.front().copied();
+        let free = self.free_regions.front().copied();
         let (victim_region_id, reused) = match free {
             Some(region_id) => (region_id, false),
             None => (
-                queues
-                    .sealed
+                self.sealed_regions
                     .front()
                     .copied()
                     .ok_or(RegionMutationError::WouldBlock)?,
@@ -983,8 +923,6 @@ impl RegionManager {
         if victim.region_id != victim_region_id
             || victim.state != expected_victim_state
             || victim.region_id == old.region_id
-            || !self.layout.sets()[set_index].contains_region(victim.region_id)
-            || !self.layout.sets()[set_index].contains_region(old.region_id)
         {
             return Err(RegionMutationError::Invariant(
                 "rotation victim queue is inconsistent",
@@ -1043,23 +981,18 @@ impl RegionManager {
         {
             return Err(RegionMutationError::StaleReceipt);
         }
-        let set_index = self
-            .layout
-            .set_index_for_shard(receipt.shard_id)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        if !self.layout.sets()[set_index].contains_region(receipt.sealed_region_id)
-            || !self.layout.sets()[set_index].contains_region(receipt.activated_region_id)
+        if self
+            .free_regions
+            .len()
+            .saturating_add(self.sealed_regions.len())
+            >= self.queue_capacity
         {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let queues = &mut self.set_queues[set_index];
-        if queues.free.len().saturating_add(queues.sealed.len()) >= queues.capacity {
             return Err(RegionMutationError::Invariant(
                 "sealed Region queue exceeded its reserved capacity",
             ));
         }
-        queues.sealed.push_back(receipt.sealed_region_id);
-        queues.rotations = queues.rotations.saturating_add(1);
+        self.sealed_regions.push_back(receipt.sealed_region_id);
+        self.rotations = self.rotations.saturating_add(1);
         self.shard_mutations[receipt.shard_id].rotation = None;
         Ok(())
     }
@@ -1104,24 +1037,10 @@ impl RegionManager {
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
         let shard_count = u32::try_from(self.active_regions.len())
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-        let free_region_count = u32::try_from(
-            self.set_queues
-                .iter()
-                .try_fold(0_usize, |total, queues| {
-                    total.checked_add(queues.free.len())
-                })
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-        )
-        .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-        let sealed_region_count = u32::try_from(
-            self.set_queues
-                .iter()
-                .try_fold(0_usize, |total, queues| {
-                    total.checked_add(queues.sealed.len())
-                })
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?,
-        )
-        .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
+        let free_region_count = u32::try_from(self.free_regions.len())
+            .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
+        let sealed_region_count = u32::try_from(self.sealed_regions.len())
+            .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
         let max_seqno = self
             .next_seqno
             .checked_sub(1)
@@ -1164,17 +1083,13 @@ impl RegionManager {
         install_live_queue(
             &self.regions,
             RegionMetadataState::Free,
-            self.set_queues
-                .iter()
-                .flat_map(|queues| queues.free.iter().copied()),
+            self.free_regions.iter().copied(),
             &mut ordinals,
         )?;
         install_live_queue(
             &self.regions,
             RegionMetadataState::Sealed,
-            self.set_queues
-                .iter()
-                .flat_map(|queues| queues.sealed.iter().copied()),
+            self.sealed_regions.iter().copied(),
             &mut ordinals,
         )?;
         if ordinals.contains(&UNASSIGNED_REGION) {
@@ -1236,78 +1151,6 @@ fn install_recovered_queue_entry(
     }
     *slot = region_id;
     Ok(())
-}
-
-fn partition_recovered_queues(
-    layout: &RegionLayout,
-    active_regions: &[u32],
-    free_regions: &VecDeque<u32>,
-    sealed_regions: &VecDeque<u32>,
-) -> Result<Box<[RegionSetQueues]>, RegionMetadataError> {
-    let mut set_queues = Vec::new();
-    set_queues
-        .try_reserve_exact(layout.sets().len())
-        .map_err(|_| RegionMetadataError::Allocation)?;
-    for set in layout.sets() {
-        let queue_capacity = usize::try_from(
-            set.region_count
-                .checked_sub(set.shard_count)
-                .ok_or(RegionMetadataError::InvalidField("region_layout"))?,
-        )
-        .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-        let mut free = VecDeque::new();
-        free.try_reserve_exact(queue_capacity)
-            .map_err(|_| RegionMetadataError::Allocation)?;
-        let mut sealed = VecDeque::new();
-        sealed
-            .try_reserve_exact(queue_capacity)
-            .map_err(|_| RegionMetadataError::Allocation)?;
-        set_queues.push(RegionSetQueues {
-            free,
-            sealed,
-            capacity: queue_capacity,
-            rotations: 0,
-        });
-    }
-
-    for (shard_id, region_id) in active_regions.iter().copied().enumerate() {
-        let set_index = layout
-            .set_index_for_shard(shard_id)
-            .ok_or(RegionMetadataError::InvalidField("region_layout"))?;
-        if !layout.sets()[set_index].contains_region(region_id) {
-            return Err(RegionMetadataError::InvalidField(
-                "active_region_set_assignment",
-            ));
-        }
-    }
-    for (source, sealed) in [(free_regions, false), (sealed_regions, true)] {
-        for region_id in source.iter().copied() {
-            let set_index = layout
-                .set_index_for_region(region_id)
-                .ok_or(RegionMetadataError::InvalidField("region_layout"))?;
-            let target = if sealed {
-                &mut set_queues[set_index].sealed
-            } else {
-                &mut set_queues[set_index].free
-            };
-            if target.len() == target.capacity() {
-                return Err(RegionMetadataError::InvalidField(
-                    "region_set_queue_capacity",
-                ));
-            }
-            target.push_back(region_id);
-        }
-    }
-    for (set, queues) in layout.sets().iter().zip(&set_queues) {
-        let expected = usize::try_from(set.region_count - set.shard_count)
-            .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-        if queues.free.len() + queues.sealed.len() != expected {
-            return Err(RegionMetadataError::InvalidField(
-                "region_set_queue_permutation",
-            ));
-        }
-    }
-    Ok(set_queues.into_boxed_slice())
 }
 
 fn install_live_queue<I>(
@@ -1798,7 +1641,7 @@ mod tests {
         let sealed = manager.sealed_regions().clone();
 
         // Region 4 is Sealed, so it cannot be selected from the Free FIFO.
-        manager.set_queues[0].free[0] = 4;
+        manager.free_regions[0] = 4;
         request_rotation(&mut manager, 0);
         assert_eq!(
             manager.plan_rotation(0),

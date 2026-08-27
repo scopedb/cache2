@@ -25,12 +25,9 @@ version number documented in `MILESTONES.md`.
   recovered warm close, sentinel validation, file bounds, and fast close.
 - shard-local CLOCK RAM eviction with shared byte bounds, immediate eviction
   eligibility, fixed scan budgets, and collision-safe lookup.
-- static namespace-to-RegionSet routing with weighted physical Region ranges,
-  independent FIFO rotation, deterministic append-shard assignment, and warm
-  recovery without a second disk format.
 - on-demand detailed snapshots for buffer pressure, aggregate worker
   I/O, fixed/resident/retained L1 memory, index occupancy/replacement pressure,
-  and per-RegionSet capacity, occupancy, and process-local rotations.
+  and aggregate Region capacity, occupancy, and process-local rotations.
 - sequenced point deletion through the existing bounded mutation path, with
   best-effort exact-key L1 cleanup and warm-recoverable 24-byte index
   tombstones.
@@ -45,7 +42,7 @@ version number documented in `MILESTONES.md`.
 - removed the public `io_concurrency` setting; read and write worker counts now
   independently bound dedicated POSIX pools, while optional io_uring uses a
   fixed 64-request depth per configured worker in each pool;
-- made `get` and `get_in` native Tokio async operations; L1/index-miss paths
+- made `get` a native Tokio async operation; L1/index-miss paths
   remain immediate, while an admitted L2 read wakes the caller task directly;
 - made `open`, `drain`, and explicit close Tokio-friendly: drain uses native
   shard notifications and blocking recovery/filesystem work stays off runtime
@@ -56,6 +53,9 @@ version number documented in `MILESTONES.md`.
 - moved write-shard count from static disk identity to reopen-time runtime
   topology; changing it discards an incompatible clean image and cold-starts
   empty without migrating or reformatting the physical Region layout;
+- removed namespaces and RegionSets: public operations accept only complete raw
+  keys, all Regions share one free/sealed FIFO, and the static fingerprint
+  schema changed so earlier clean images cold-start empty;
 - stopped requiring the unused io_uring `fsync` opcode after the public data-sync
   operation was removed;
 - replaced FNV-1a key hashing with seeded XXH3-64 and bound the algorithm
@@ -75,8 +75,7 @@ version number documented in `MILESTONES.md`.
 - removed time-based expiration from the API, memory tier, request path, and
   record format; cache lifetime is governed only by eviction and explicit delete.
 - replaced the capacity-overwriting cache builder path with
-  `HybridCacheConfig::from_static`, exposed validated RegionSet allocations,
-  and canonicalized physically equivalent default RegionSet configurations.
+  `HybridCacheConfig::from_static` so the supplied static layout is preserved.
 - renamed the ambiguous snapshot `read_bytes` counter to `served_bytes` to
   distinguish bytes returned to callers from underlying device I/O bytes.
 - replaced the fixed maximum-size foreground read pool with exact-size
@@ -95,7 +94,7 @@ version number documented in `MILESTONES.md`.
 - renamed runtime settings around their actual boundaries: L1 capacity/shards,
   aggregate memory limit, separate read/write I/O workers, and one per-shard
   write-batch capacity.
-- made `put` and `put_in` return their mutation sequence directly
+- made `put` return its mutation sequence directly
   instead of wrapping it in a single-field `PutReceipt`.
 - replaced runtime-growing L1 maps and slot vectors with fixed startup
   allocations keyed directly by seeded XXH3;
