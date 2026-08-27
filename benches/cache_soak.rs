@@ -40,6 +40,7 @@ struct SoakConfig {
     operation_interval: Duration,
     warm_reopen: bool,
     final_warm_verify: bool,
+    require_path_coverage: bool,
     io_engine: IoEngine,
     io_mode: IoMode,
     directory: PathBuf,
@@ -92,6 +93,7 @@ impl SoakConfig {
             Duration::from_micros(env_u64("CACHE_SOAK_OPERATION_INTERVAL_US", 0)?);
         let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
         let final_warm_verify = env_bool("CACHE_SOAK_FINAL_WARM_VERIFY", false)?;
+        let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -136,6 +138,7 @@ impl SoakConfig {
             operation_interval,
             warm_reopen,
             final_warm_verify,
+            require_path_coverage,
             io_engine,
             io_mode,
             directory,
@@ -164,6 +167,7 @@ impl SoakConfig {
 
 struct SoakFiles {
     data: PathBuf,
+    cleanup_on_drop: AtomicBool,
 }
 
 impl SoakFiles {
@@ -177,7 +181,12 @@ impl SoakFiles {
                 "cache2-soak-{}-{timestamp}.cache",
                 std::process::id()
             )),
+            cleanup_on_drop: AtomicBool::new(false),
         }
+    }
+
+    fn mark_success(&self) {
+        self.cleanup_on_drop.store(true, Ordering::Release);
     }
 
     fn logical_bytes(&self) -> io::Result<u64> {
@@ -200,6 +209,13 @@ impl SoakFiles {
 
 impl Drop for SoakFiles {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop.load(Ordering::Acquire) {
+            eprintln!(
+                "soak artifacts preserved after failure: data={}",
+                self.data.display()
+            );
+            return;
+        }
         for path in [
             self.data.clone(),
             sidecar(&self.data, ".state"),
@@ -329,7 +345,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -350,11 +366,13 @@ fn main() -> io::Result<()> {
         config.operation_interval.as_micros(),
         config.warm_reopen,
         config.final_warm_verify,
+        config.require_path_coverage,
         DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
         peak_disk_bytes,
         config.rss_slack_bytes,
+        files.data.display(),
     );
 
     thread::scope(|scope| -> io::Result<()> {
@@ -419,14 +437,7 @@ fn main() -> io::Result<()> {
             }
             let now = Instant::now();
             if now >= next_sample && now < deadline {
-                match resource_sample(
-                    &cache,
-                    &files,
-                    peak_disk_bytes,
-                    config.rss_slack_bytes,
-                    true,
-                    runtime.handle(),
-                ) {
+                match resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes) {
                     Ok(sample) => {
                         max_managed_memory = max_managed_memory
                             .max(sample.detailed.summary.managed_memory_peak_bytes);
@@ -467,15 +478,12 @@ fn main() -> io::Result<()> {
     })?;
 
     runtime.block_on(cache.drain())?;
-    let sample = resource_sample(
-        &cache,
-        &files,
-        peak_disk_bytes,
-        config.rss_slack_bytes,
-        false,
-        runtime.handle(),
-    )?;
+    let sample = resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes)?;
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
+    let final_counters = counters.snapshot();
+    if config.require_path_coverage {
+        validate_measured_path_coverage(final_counters, &sample)?;
+    }
     if config.final_warm_verify {
         runtime.block_on(cache.close_warm())?;
         cache = open_cache(&runtime, &files, &config)?;
@@ -492,14 +500,11 @@ fn main() -> io::Result<()> {
             value_size_count,
             &config.value_bytes,
         )?;
-        let verification_sample = resource_sample(
-            &cache,
-            &files,
-            peak_disk_bytes,
-            config.rss_slack_bytes,
-            false,
-            runtime.handle(),
-        )?;
+        let verification_sample =
+            resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes)?;
+        if config.require_path_coverage {
+            validate_warm_path_coverage(&verification, &verification_sample)?;
+        }
         let verification_resources = verification_sample.detailed.summary;
         max_managed_memory =
             max_managed_memory.max(verification_resources.managed_memory_peak_bytes);
@@ -521,10 +526,11 @@ fn main() -> io::Result<()> {
     report_sample(
         true,
         started.elapsed(),
-        counters.snapshot(),
+        final_counters,
         &sample,
         max_managed_memory,
     );
+    files.mark_success();
     Ok(())
 }
 
@@ -795,12 +801,7 @@ fn resource_sample(
     files: &SoakFiles,
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,
-    drain: bool,
-    runtime: &tokio::runtime::Handle,
 ) -> io::Result<ResourceSample> {
-    if drain {
-        runtime.block_on(cache.drain())?;
-    }
     let logical_bytes = files.logical_bytes()?;
     if logical_bytes > peak_disk_bytes {
         return Err(io::Error::other("soak exceeded the logical disk bound"));
@@ -827,6 +828,47 @@ fn resource_sample(
         current_rss,
         rss_limit,
     })
+}
+
+fn validate_measured_path_coverage(
+    counters: CounterSnapshot,
+    sample: &ResourceSample,
+) -> io::Result<()> {
+    let resources = sample.detailed.summary;
+    let checks = [
+        (counters.writes != 0, "no write completed"),
+        (counters.deletes != 0, "no delete completed"),
+        (
+            counters.hits.saturating_add(counters.misses) != 0,
+            "no read completed",
+        ),
+        (resources.l2_hits != 0, "no L2 hit completed"),
+        (resources.region_rotations != 0, "no Region rotated"),
+        (resources.reclaim.regions != 0, "no Region was reclaimed"),
+    ];
+    match checks.into_iter().find(|(passed, _)| !passed) {
+        Some((_, missing)) => Err(io::Error::other(format!(
+            "soak path coverage failed: {missing}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn validate_warm_path_coverage(
+    verification: &WarmVerification,
+    sample: &ResourceSample,
+) -> io::Result<()> {
+    if verification.hits == 0 {
+        return Err(io::Error::other(
+            "soak path coverage failed: warm verification recovered no value",
+        ));
+    }
+    if sample.detailed.summary.l2_hits == 0 {
+        return Err(io::Error::other(
+            "soak path coverage failed: warm verification completed no L2 hit",
+        ));
+    }
+    Ok(())
 }
 
 fn report_sample(

@@ -122,6 +122,7 @@ CACHE_SOAK_READERS=4 \
 CACHE_SOAK_OPERATION_INTERVAL_US=2000 \
 CACHE_SOAK_WARM_REOPEN=true \
 CACHE_SOAK_FINAL_WARM_VERIFY=true \
+CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=buffered \
 cargo +1.98.0 bench --locked --bench cache_soak
@@ -130,6 +131,13 @@ cargo +1.98.0 bench --locked --bench cache_soak
 The operation interval applies to every foreground client and to the initial
 warm prefill; zero preserves the original unpaced behavior. Intervals above one
 second are rejected so shutdown remains responsive.
+
+Periodic samples are passive and do not drain accepted writes, so backlog and
+resource peaks remain visible across the complete measured phase. Path coverage
+requires accepted writes and deletes, completed reads and L2 hits, Region
+rotation and reclaim, plus a recovered L2 hit during final warm verification.
+Failed runs preserve their data and recovery sidecars; successful runs remove
+them.
 
 Final warm verification publishes the churned state, reopens it, and scans the
 complete key space sequentially. Every recovered hit receives the same key,
