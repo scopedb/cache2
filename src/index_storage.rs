@@ -9,7 +9,7 @@
 use crate::checksum::Crc32c;
 use crate::index::{
     INDEX_CANDIDATES, IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation, PackedLocationError,
-    index_partition_for,
+    index_partition_for, record_size_class_upper_bound,
 };
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -24,7 +24,7 @@ use std::os::fd::AsRawFd;
 
 pub(crate) const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub(crate) const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
-pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 10;
+pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 8;
 pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
     (INDEX_IMAGE_PAGE_SIZE - INDEX_IMAGE_PAGE_HEADER_SIZE) / INDEX_IMAGE_SLOT_SIZE;
 
@@ -60,7 +60,7 @@ const PAGE_STATE_REJECTED: u8 = 4;
 const IMAGE_STATE_USABLE: u8 = 0;
 const IMAGE_STATE_REJECTED: u8 = 1;
 
-const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 403);
+const _: () = assert!(INDEX_IMAGE_SLOTS_PER_PAGE == 504);
 const _: () = assert!(
     INDEX_IMAGE_PAGE_HEADER_SIZE + INDEX_IMAGE_SLOTS_PER_PAGE * INDEX_IMAGE_SLOT_SIZE
         <= INDEX_IMAGE_PAGE_SIZE
@@ -180,13 +180,33 @@ fn final_partition_slots(
 /// Logical fields in one Index Image bucket.
 ///
 /// This type is intentionally not `repr(C)` and is never copied directly to
-/// or from an image. Its stable representation is exactly 10 bytes encoded by
+/// or from an image. Its stable representation is exactly 8 bytes encoded by
 /// [`Self::encode`] and [`Self::decode`]. A zeroed bucket is the empty state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
 pub(crate) struct IndexSlot {
-    pub(crate) encoded_location: u64,
-    pub(crate) control: u16,
+    encoded: u64,
 }
+
+const SLOT_REGION_BITS: u32 = 20;
+const SLOT_OFFSET_BITS: u32 = 20;
+const SLOT_SIZE_CLASS_BITS: u32 = 8;
+const SLOT_FINGERPRINT_BITS: u32 = 14;
+const SLOT_DISPLACEMENT_BITS: u32 = 2;
+
+const SLOT_REGION_SHIFT: u32 = 0;
+const SLOT_OFFSET_SHIFT: u32 = SLOT_REGION_SHIFT + SLOT_REGION_BITS;
+const SLOT_SIZE_CLASS_SHIFT: u32 = SLOT_OFFSET_SHIFT + SLOT_OFFSET_BITS;
+const SLOT_FINGERPRINT_SHIFT: u32 = SLOT_SIZE_CLASS_SHIFT + SLOT_SIZE_CLASS_BITS;
+const SLOT_DISPLACEMENT_SHIFT: u32 = SLOT_FINGERPRINT_SHIFT + SLOT_FINGERPRINT_BITS;
+
+const SLOT_REGION_MASK: u64 = (1_u64 << SLOT_REGION_BITS) - 1;
+const SLOT_OFFSET_MASK: u64 = (1_u64 << SLOT_OFFSET_BITS) - 1;
+const SLOT_SIZE_CLASS_MASK: u64 = (1_u64 << SLOT_SIZE_CLASS_BITS) - 1;
+const SLOT_FINGERPRINT_MASK: u64 = (1_u64 << SLOT_FINGERPRINT_BITS) - 1;
+const SLOT_DISPLACEMENT_MASK: u64 = (1_u64 << SLOT_DISPLACEMENT_BITS) - 1;
+
+const _: () = assert!(SLOT_DISPLACEMENT_SHIFT + SLOT_DISPLACEMENT_BITS == u64::BITS);
 
 /// Typed runtime meaning of one canonical Index Image bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,60 +237,63 @@ impl fmt::Display for IndexSlotSemanticError {
 }
 
 impl IndexSlot {
-    pub(crate) const EMPTY: Self = Self {
-        encoded_location: 0,
-        control: 0,
-    };
+    pub(crate) const EMPTY: Self = Self { encoded: 0 };
 
-    pub(crate) const fn from_state(state: IndexSlotState) -> Self {
+    pub(crate) fn from_state(state: IndexSlotState) -> Self {
         match state {
             IndexSlotState::Empty => Self::EMPTY,
             IndexSlotState::Value {
                 fingerprint,
                 displacement,
                 entry,
-            } => Self {
-                encoded_location: entry.location.raw() + 1,
-                control: fingerprint | ((displacement as u16) << 14),
-            },
+            } => {
+                let location = entry.location;
+                let offset_units = u64::from(location.offset() / crate::format::RECORD_ALIGNMENT);
+                Self {
+                    encoded: u64::from(location.region_id())
+                        | (offset_units << SLOT_OFFSET_SHIFT)
+                        | (u64::from(location.index_size_class()) << SLOT_SIZE_CLASS_SHIFT)
+                        | ((u64::from(fingerprint) & SLOT_FINGERPRINT_MASK)
+                            << SLOT_FINGERPRINT_SHIFT)
+                        | ((u64::from(displacement) & SLOT_DISPLACEMENT_MASK)
+                            << SLOT_DISPLACEMENT_SHIFT),
+                }
+            }
         }
     }
 
     pub(crate) fn encode(self, output: &mut [u8; INDEX_IMAGE_SLOT_SIZE]) {
-        output[0..8].copy_from_slice(&self.encoded_location.to_le_bytes());
-        output[8..10].copy_from_slice(&self.control.to_le_bytes());
+        output.copy_from_slice(&self.encoded.to_le_bytes());
     }
 
     pub(crate) fn decode(input: &[u8; INDEX_IMAGE_SLOT_SIZE]) -> Self {
         Self {
-            encoded_location: read_u64(input, 0),
-            control: read_u16(input, 8),
+            encoded: read_u64(input, 0),
         }
     }
 
     pub(crate) fn runtime_state(self) -> Result<IndexSlotState, IndexSlotSemanticError> {
-        if self.encoded_location == 0 {
-            return if self.control == 0 {
-                Ok(IndexSlotState::Empty)
-            } else {
-                Err(IndexSlotSemanticError::NonCanonicalMarker)
-            };
+        if self.encoded == 0 {
+            return Ok(IndexSlotState::Empty);
         }
-        let raw = self.encoded_location - 1;
-        if raw >> 63 != 0 {
-            return Err(IndexSlotSemanticError::NonCanonicalMarker);
-        }
-        let location =
-            PackedLocation::try_from_raw(raw).map_err(IndexSlotSemanticError::InvalidLocation)?;
+        let size_class = ((self.encoded >> SLOT_SIZE_CLASS_SHIFT) & SLOT_SIZE_CLASS_MASK) as u8;
+        let record_len = record_size_class_upper_bound(size_class)
+            .ok_or(IndexSlotSemanticError::NonCanonicalMarker)?;
+        let region_id = ((self.encoded >> SLOT_REGION_SHIFT) & SLOT_REGION_MASK) as u32;
+        let offset_units = ((self.encoded >> SLOT_OFFSET_SHIFT) & SLOT_OFFSET_MASK) as u32;
+        let offset = offset_units * crate::format::RECORD_ALIGNMENT;
+        let location = PackedLocation::new(region_id, offset, record_len)
+            .map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
-            fingerprint: self.control & 0x3fff,
-            displacement: (self.control >> 14) as u8,
+            fingerprint: ((self.encoded >> SLOT_FINGERPRINT_SHIFT) & SLOT_FINGERPRINT_MASK) as u16,
+            displacement: ((self.encoded >> SLOT_DISPLACEMENT_SHIFT) & SLOT_DISPLACEMENT_MASK)
+                as u8,
             entry: IndexEntry { location },
         })
     }
 
     fn physical_kind(self) -> SlotPhysicalKind {
-        if self.encoded_location == 0 {
+        if self.encoded == 0 {
             SlotPhysicalKind::Empty
         } else {
             SlotPhysicalKind::Value
@@ -2009,12 +2032,17 @@ mod tests {
     }
 
     fn sample_slot(seed: u64) -> IndexSlot {
-        let location =
-            PackedLocation::new((seed % 64) as u32, ((seed % 128) * 8) as u32, 32).unwrap();
-        IndexSlot {
-            encoded_location: location.raw() + 1,
-            control: ((seed as u16 & 3) << 14) | (seed as u16 & 0x3fff),
-        }
+        let location = PackedLocation::new(
+            (seed % 64) as u32,
+            ((seed % 128) * u64::from(crate::format::RECORD_ALIGNMENT)) as u32,
+            32,
+        )
+        .unwrap();
+        IndexSlot::from_state(IndexSlotState::Value {
+            fingerprint: seed as u16 & 0x3fff,
+            displacement: seed as u8 & 3,
+            entry: IndexEntry { location },
+        })
     }
 
     #[test]
@@ -2022,12 +2050,12 @@ mod tests {
         type RangeShape = (usize, usize, usize, usize);
         let cases: &[(usize, &[RangeShape])] = &[
             (8, &[(0, 1, 0, 8)]),
-            (403, &[(0, 1, 0, 403)]),
-            (404, &[(0, 2, 0, 404)]),
-            (406, &[(0, 2, 0, 406)]),
-            (407, &[(0, 1, 0, 403), (1, 1, 403, 4)]),
-            (806, &[(0, 1, 0, 403), (1, 1, 403, 403)]),
-            (807, &[(0, 1, 0, 403), (1, 2, 403, 404)]),
+            (504, &[(0, 1, 0, 504)]),
+            (505, &[(0, 2, 0, 505)]),
+            (507, &[(0, 2, 0, 507)]),
+            (508, &[(0, 1, 0, 504), (1, 1, 504, 4)]),
+            (1008, &[(0, 1, 0, 504), (1, 1, 504, 504)]),
+            (1009, &[(0, 1, 0, 504), (1, 2, 504, 505)]),
         ];
 
         for &(slot_count, expected) in cases {
@@ -2056,7 +2084,7 @@ mod tests {
 
     #[test]
     fn partitioned_storage_mutates_adjacent_ranges_and_roundtrips_stats() {
-        const SLOT_COUNT: usize = 807;
+        const SLOT_COUNT: usize = 1009;
         const GENERATION: u64 = 113;
         const FIRST_RANGE_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
         const SECOND_RANGE_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
@@ -2297,7 +2325,7 @@ mod tests {
             .write_warm_image(&mut image, binding(GENERATION))
             .unwrap();
         let page: &mut [u8; INDEX_IMAGE_PAGE_SIZE] = image.as_mut_slice().try_into().unwrap();
-        put_u64(page, INDEX_IMAGE_PAGE_HEADER_SIZE, u64::MAX);
+        put_u64(page, INDEX_IMAGE_PAGE_HEADER_SIZE, 1);
         let checksum = page_checksum(page);
         put_u32(page, PAGE_CHECKSUM_OFFSET, checksum);
 
@@ -2334,23 +2362,47 @@ mod tests {
         let value = sample_slot(0);
         let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
         value.encode(&mut encoded);
-        assert_eq!(&encoded[0..8], &value.encoded_location.to_le_bytes());
-        assert_eq!(&encoded[8..10], &value.control.to_le_bytes());
+        assert_eq!(encoded, value.encoded.to_le_bytes());
         assert_eq!(IndexSlot::decode(&encoded), value);
-        assert_eq!(IndexSlot::decode(&[0_u8; 10]), IndexSlot::EMPTY);
+        assert_eq!(IndexSlot::decode(&[0_u8; 8]), IndexSlot::EMPTY);
 
-        let noncanonical = IndexSlot {
-            encoded_location: 0,
-            control: 19,
-        };
+        let noncanonical = IndexSlot { encoded: 19 };
         noncanonical.encode(&mut encoded);
-        assert_eq!(&encoded[0..8], &0_u64.to_le_bytes());
-        assert_eq!(&encoded[8..10], &19_u16.to_le_bytes());
+        assert_eq!(encoded, 19_u64.to_le_bytes());
         assert_eq!(IndexSlot::decode(&encoded), noncanonical);
         assert_eq!(
             noncanonical.runtime_state(),
             Err(IndexSlotSemanticError::NonCanonicalMarker)
         );
+    }
+
+    #[test]
+    fn slot_codec_quantizes_only_the_record_length() {
+        let exact = PackedLocation::new(0x54321, 0x12340, 1056).unwrap();
+        let state = IndexSlotState::Value {
+            fingerprint: 0x2345,
+            displacement: 2,
+            entry: IndexEntry { location: exact },
+        };
+        let slot = IndexSlot::from_state(state);
+        let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
+        slot.encode(&mut encoded);
+        assert_eq!(encoded, [0x21, 0x43, 0xa5, 0x91, 0x00, 0x21, 0x45, 0xa3]);
+
+        let IndexSlotState::Value {
+            fingerprint,
+            displacement,
+            entry,
+        } = IndexSlot::decode(&encoded).runtime_state().unwrap()
+        else {
+            panic!("non-empty slot must decode as a value");
+        };
+        assert_eq!(fingerprint, 0x2345);
+        assert_eq!(displacement, 2);
+        assert_eq!(entry.location.region_id(), exact.region_id());
+        assert_eq!(entry.location.offset(), exact.offset());
+        assert_eq!(entry.location.record_len(), 1120);
+        assert!(entry.location.index_equivalent(exact));
     }
 
     #[test]

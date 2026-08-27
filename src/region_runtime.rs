@@ -569,7 +569,7 @@ impl RuntimeConfig {
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
             // Every reclaimer permanently owns one Region-sized buffer. Keep
-            // one additional maximum-size exact read for the foreground.
+            // one additional maximum-size bounded read for the foreground.
             .and_then(|bytes| bytes.checked_add(reclaim_buffers))
             .and_then(|bytes| bytes.checked_add(usable_region))
             .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
@@ -2393,10 +2393,10 @@ mod tests {
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 8).unwrap();
         base.clone()
-            .with_managed_memory_limit_bytes(15 * GIB)
+            .with_managed_memory_limit_bytes(14 * GIB)
             .validate_memory_plan(geometry, index_slots, 8)
             .unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
+        let too_small = base.clone().with_managed_memory_limit_bytes(13 * GIB);
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 8)

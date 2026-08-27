@@ -40,12 +40,13 @@ capacity; this is expected to be uncommon in normal operation.
   shard workers; explicit completion barriers may wait for those workers.
 - An L1 miss must always consult L2. A true L2 index miss returns immediately
   without acquiring a read buffer.
-- L2 owns the final result. An L2 candidate plans one exact record read, expanding
-  it to 4 KiB boundaries only for direct I/O, reserves one non-waiting engine
-  execution slot, charges its owned buffer against the aggregate memory limit,
-  and submits under the reservation.
+- L2 owns the final result. An L2 candidate plans one size-class-bounded record
+  read, truncating the upper bound at its Region end and expanding it to 4 KiB
+  boundaries only for direct I/O. It reserves one non-waiting engine execution
+  slot, charges its owned buffer against the aggregate memory limit, and submits
+  under the reservation.
   Allocation or engine pressure is a miss, not public read backpressure. An
-  admitted request completes one read plus local record validation.
+  admitted request completes one read plus local exact-envelope validation.
 - Do not add a read admission policy, read-buffer pool, read wait, background
   ready table, or retry protocol to `get`. The bounded I/O engine and aggregate
   memory limit are execution safety boundaries, not public read admission.

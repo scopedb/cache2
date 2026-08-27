@@ -2,8 +2,9 @@
 //!
 //! Each key has four deterministic buckets in one canonical partition. A
 //! bucket stores only a 14-bit fingerprint, its two-bit displacement, and the
-//! exact packed record location. Full-key and checksum validation remain the
-//! authority after the single record read. There are no probe chains,
+//! packed Region/offset plus a record-size upper class. Full-key, exact-envelope,
+//! and checksum validation remain the authority after the single record read.
+//! There are no probe chains,
 //! tombstones, generation tables, retries, or request-time allocations.
 
 use std::io;
@@ -376,6 +377,8 @@ impl RegionIndex {
     }
 
     /// Clears a mapping only while it still points at the reclaimed address.
+    /// Persisted lengths are size-class upper bounds, so address identity uses
+    /// Region, offset, and encoded size class rather than an exact byte count.
     pub(crate) fn remove_if_match(
         &self,
         hash: u64,
@@ -385,8 +388,8 @@ impl RegionIndex {
     }
 
     /// Atomically classifies one reclaim candidate under its index partition.
-    /// A hot exact mapping is retained for a later conditional rewrite; every
-    /// other exact mapping is removed before the source Region is freed.
+    /// A hot current mapping is retained for a later conditional rewrite;
+    /// every other current mapping is removed before the source Region is freed.
     pub(crate) fn prepare_reclaim(
         &self,
         hash: u64,
@@ -543,7 +546,7 @@ fn token_location_matches(
             entry,
         } if current == fingerprint
             && usize::from(current_displacement) == displacement
-            && entry.location == location
+            && entry.location.index_equivalent(location)
     )
 }
 

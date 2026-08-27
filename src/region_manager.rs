@@ -1262,14 +1262,15 @@ fn try_unassigned_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_storage::canonical_index_partition_ranges;
+    use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, canonical_index_partition_ranges};
 
     fn id(byte: u8) -> PersistentId {
         PersistentId::from_bytes([byte; 16]).unwrap()
     }
 
     fn sample() -> RegionMetadata {
-        let ranges = canonical_index_partition_ranges(407).unwrap();
+        let index_slots = INDEX_IMAGE_SLOTS_PER_PAGE + 4;
+        let ranges = canonical_index_partition_ranges(index_slots).unwrap();
         let mut shards = ranges
             .iter()
             .map(|range| PartitionMetadataRecord {
@@ -1293,7 +1294,7 @@ mod tests {
                 image_identity: id(4),
                 image_generation: 5,
                 config_fingerprint: 6,
-                index_slots: 407,
+                index_slots: index_slots as u64,
                 index_page_count: 2,
                 region_size: 32 * 1024 * 1024,
                 region_count: 6,

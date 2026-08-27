@@ -1119,7 +1119,7 @@ mod tests {
                 image_identity: id(4),
                 image_generation: 5,
                 config_fingerprint: 6,
-                index_slots: 407,
+                index_slots: 508,
                 index_page_count: 2,
                 region_size: 32 * 1024 * 1024,
                 region_count: 4,
@@ -1167,7 +1167,7 @@ mod tests {
                     first_index_page: 0,
                     index_page_count: 1,
                     first_slot: 0,
-                    slot_count: 403,
+                    slot_count: 504,
                     physical_value_slots: 2,
                     physical_deleted_slots: 0,
                 },
@@ -1175,7 +1175,7 @@ mod tests {
                     partition_id: 1,
                     first_index_page: 1,
                     index_page_count: 1,
-                    first_slot: 403,
+                    first_slot: 504,
                     slot_count: 4,
                     physical_value_slots: 1,
                     physical_deleted_slots: 0,
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(
             &encoded[REGION_METADATA_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET
                 ..REGION_METADATA_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET + 8],
-            &407_u64.to_le_bytes()
+            &508_u64.to_le_bytes()
         );
         let root = &encoded[REGION_METADATA_PAGE_HEADER_SIZE
             ..REGION_METADATA_PAGE_HEADER_SIZE + REGION_METADATA_ROOT_SIZE];

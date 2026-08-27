@@ -866,7 +866,7 @@ impl FileRegionCore {
         let Some(record) = completion.record_bytes() else {
             let error = io::Error::new(
                 io::ErrorKind::InvalidData,
-                "record completion lost its exact record slice",
+                "record completion lost its bounded candidate range",
             );
             self.health
                 .enter_miss_only_with_error("record_read_completion_invalid", &error);
@@ -878,12 +878,27 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.region_generation != completion.plan.region_generation
-            || header.record_len != completion.plan.entry.location.record_len()
-            || header.key_hash != hash
+        if header.region_generation != completion.plan.region_generation || header.key_hash != hash
         {
             return Ok(None);
         }
+        let indexed_location = completion.plan.entry.location;
+        let Ok(exact_location) = PackedLocation::new(
+            indexed_location.region_id(),
+            indexed_location.offset(),
+            header.record_len,
+        ) else {
+            return Ok(None);
+        };
+        if !indexed_location.index_equivalent(exact_location) {
+            return Ok(None);
+        }
+        let Some(record) = usize::try_from(header.record_len)
+            .ok()
+            .and_then(|record_len| record.get(..record_len))
+        else {
+            return Ok(None);
+        };
         let key_len = usize::from(header.key_len);
         let value_len = header.value_len as usize;
         let Some(payload_end) = RECORD_HEADER_SIZE
@@ -3262,10 +3277,13 @@ mod tests {
         let Some(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
             panic!("completed first record must be published");
         };
-        assert_eq!(
-            entry.location.record_len(),
-            required_record_bytes(first_key.len(), value.len()).unwrap()
-        );
+        let first_exact = PackedLocation::new(
+            entry.location.region_id(),
+            entry.location.offset(),
+            required_record_bytes(first_key.len(), value.len()).unwrap(),
+        )
+        .unwrap();
+        assert!(entry.location.index_equivalent(first_exact));
         assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
         let Some(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
             panic!("completed final record must be published");
@@ -3274,18 +3292,26 @@ mod tests {
             last_entry.location.record_len()
                 > required_record_bytes(last_key.len(), value.len()).unwrap()
         );
-        assert_eq!(
-            u64::from(last_entry.location.offset()) + u64::from(last_entry.location.record_len()),
-            published.end_offset
-        );
+        let last_exact_len =
+            u32::try_from(published.end_offset - u64::from(last_entry.location.offset())).unwrap();
+        let last_exact = PackedLocation::new(
+            last_entry.location.region_id(),
+            last_entry.location.offset(),
+            last_exact_len,
+        )
+        .unwrap();
+        assert!(last_entry.location.index_equivalent(last_exact));
         let read = runtime
             .begin_point_read(first_hash)
             .expect("completed entry must plan a Region read");
         assert_eq!(read.entry, entry);
 
-        let read_buffer_bytes = (last_entry.location.record_len() as usize)
-            .div_ceil(RECOVERY_PAGE_SIZE)
-            * RECOVERY_PAGE_SIZE;
+        let last_read = runtime
+            .begin_point_read(last_hash)
+            .expect("completed final entry must plan a Region read");
+        let read_buffer_bytes = plan_read(data.geometry, last_hash, last_read, true)
+            .unwrap()
+            .read_len;
         let memory_before_read = resources.managed_memory_snapshot().current_bytes;
         let hit = runtime
             .read_value(

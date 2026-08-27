@@ -923,8 +923,8 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
 }
 
 #[tokio::test]
-async fn buffered_l2_read_submits_the_exact_record_range() {
-    let files = TestCache::new("buffered-exact-read");
+async fn buffered_l2_read_reports_the_size_class_upper_bound() {
+    let files = TestCache::new("buffered-size-class-read");
     let static_config = StaticConfig::new(3 * 512 * 1024)
         .with_region_size_bytes(512 * 1024)
         .with_expected_entries(3277);
@@ -933,8 +933,9 @@ async fn buffered_l2_read_submits_the_exact_record_range() {
         .open()
         .await
         .unwrap();
-    cache.put("key-1", "value").unwrap();
-    cache.put("key-2", "value").unwrap();
+    let value = vec![0x5a; 1000];
+    cache.put("key-1", &value).unwrap();
+    cache.put("key-2", &value).unwrap();
     cache.close_warm().await.unwrap();
 
     let reopened = files
@@ -942,14 +943,14 @@ async fn buffered_l2_read_submits_the_exact_record_range() {
         .open()
         .await
         .unwrap();
-    assert_eq!(
-        reopened.get("key-1").await.unwrap().unwrap().tier(),
-        CacheTier::L2
-    );
+    let hit = reopened.get("key-1").await.unwrap().unwrap();
+    assert_eq!(hit.tier(), CacheTier::L2);
+    assert_eq!(hit.as_ref(), value);
+    drop(hit);
     let snapshot = reopened.snapshot().unwrap();
     assert_eq!(snapshot.io.read.requests_submitted, 1);
     assert_eq!(snapshot.io.read.buffered.operations, 1);
-    assert_eq!(snapshot.io.read.buffered.bytes, 64);
+    assert_eq!(snapshot.io.read.buffered.bytes, 1120);
     assert_eq!(snapshot.io.read.direct.operations, 0);
     reopened.close_fast().await.unwrap();
 }

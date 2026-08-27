@@ -1,9 +1,10 @@
 //! Owned-buffer record reads for the RegionStore data path.
 //!
 //! A packed record may start on a 32-byte boundary, while direct I/O requires
-//! a 4 KiB-aligned address, offset, and length. Buffered I/O reads the exact
-//! record; direct I/O reads one aligned range and reports the record slice
-//! inside it. Region generation and record contents are validated above.
+//! a 4 KiB-aligned address, offset, and length. The index stores a size-class
+//! upper bound, so buffered I/O reads that bounded range and direct I/O expands
+//! it once to 4 KiB boundaries. Region generation and the exact record envelope
+//! are validated above without another lookup or read.
 
 use std::io;
 use std::ops::Range;
@@ -49,8 +50,8 @@ pub(crate) struct ReadCompletion {
 }
 
 impl ReadCompletion {
-    /// Returns the exact packed-record bytes only after every completion
-    /// invariant has passed. The surrounding aligned bytes stay private.
+    /// Returns the bounded candidate range only after every completion
+    /// invariant has passed. Direct-I/O alignment bytes stay private.
     pub(crate) fn record_bytes(&self) -> Option<&[u8]> {
         if self.result.is_err() {
             return None;
@@ -152,7 +153,7 @@ impl PendingRead {
     }
 }
 
-/// Submits one exact planned range using an owned alignment-rounded buffer.
+/// Submits one bounded planned range using an owned alignment-rounded buffer.
 ///
 /// Validation happens before the lease is prepared or submitted. Any rejected
 /// operation drops its lease immediately.
@@ -184,32 +185,40 @@ pub(crate) fn plan_read(
     } = candidate;
     let location = entry.location;
     let offset = u64::from(location.offset());
-    let record_len = usize::try_from(location.record_len()).map_err(|_| {
+    let record_len_upper = usize::try_from(location.record_len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "Region record length does not fit this platform",
         )
     })?;
-    let record_len_u64 = u64::try_from(record_len).map_err(|_| {
+    let record_len_upper_u64 = u64::try_from(record_len_upper).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "Region record length does not fit the data geometry",
         )
     })?;
-    let record_end = offset.checked_add(record_len_u64);
     if !geometry.is_valid()
         || region_generation == 0
         || location.region_id() >= geometry.region_count
         || offset % u64::from(RECORD_ALIGNMENT) != 0
-        || record_len == 0
-        || record_len % RECORD_ALIGNMENT as usize != 0
-        || record_end.is_none_or(|end| end > geometry.region_size)
+        || offset >= geometry.region_size
+        || record_len_upper == 0
+        || record_len_upper % RECORD_ALIGNMENT as usize != 0
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid durable Region record location",
         ));
     }
+    // A valid final record may end exactly at the Region boundary while its
+    // size class extends beyond it. Never read into the next Region.
+    let record_len_u64 = record_len_upper_u64.min(geometry.region_size - offset);
+    let record_len = usize::try_from(record_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded Region record length does not fit this platform",
+        )
+    })?;
 
     let record_absolute = u64::from(location.region_id())
         .checked_mul(geometry.region_size)
@@ -253,7 +262,7 @@ pub(crate) fn plan_read(
     let overhead = read_len.checked_sub(record_len).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Region read is shorter than its record",
+            "Region read is shorter than its candidate range",
         )
     })?;
     if record_range.end > read_len
@@ -399,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_record_uses_one_exact_read() {
+    fn buffered_record_uses_one_size_class_upper_bound_read() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let resources = ResourceController::try_new(ResourceLimits {
@@ -407,7 +416,7 @@ mod tests {
             reserved_memory_bytes: 0,
         })
         .unwrap();
-        let entry = entry(PackedLocation::new(1, 32, 64).unwrap());
+        let entry = entry(PackedLocation::new(1, 32, 1120).unwrap());
         let plan = plan_read(geometry(), 7, candidate(entry), false).unwrap();
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
 
@@ -415,24 +424,39 @@ mod tests {
             &engine,
             engine.try_reserve_read().unwrap(),
             plan,
-            resources.try_read_buffer(64).unwrap(),
+            resources.try_read_buffer(1120).unwrap(),
         )
         .unwrap()
         .wait(&engine);
         assert!(completion.result.is_ok());
-        assert_eq!(completion.plan.record_range, 0..64);
-        assert_eq!(completion.record_bytes().unwrap().len(), 64);
+        assert_eq!(completion.plan.record_range, 0..1120);
+        assert_eq!(completion.record_bytes().unwrap().len(), 1120);
         assert_eq!(
             backend
                 .reads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
-            &[(record_absolute, 64)]
+            &[(record_absolute, 1120)]
         );
         drop(completion.buffer);
         engine.shutdown().unwrap();
         assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+    }
+
+    #[test]
+    fn final_record_size_class_is_clamped_to_its_region() {
+        let record_len = 1056;
+        let offset = geometry().region_size as u32 - record_len;
+        let entry = entry(PackedLocation::new(1, offset, 1120).unwrap());
+        let plan = plan_read(geometry(), 7, candidate(entry), false).unwrap();
+
+        assert_eq!(plan.record_range, 0..record_len as usize);
+        assert_eq!(plan.read_len, record_len as usize);
+        assert_eq!(
+            plan.absolute,
+            DATA_REGION_AREA_OFFSET + geometry().region_size + u64::from(offset)
+        );
     }
 
     #[test]

@@ -14,8 +14,8 @@ identities and counters:
   `0x8877665544332211`;
 - CLEAN state generation `19`, image identity bytes `03`, image generation
   `11`;
-- 6,448 index slots, a 64 KiB index image, and one 4 KiB Region metadata page;
-- index pages hold 403 stable 10-byte slots each.
+- 8,064 index slots, a 64 KiB index image, and one 4 KiB Region metadata page;
+- index pages hold 504 stable 8-byte slots each.
 
 An intentional change to these bytes requires an explicit format-version decision.
 Tests never regenerate the fixtures.

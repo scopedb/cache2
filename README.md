@@ -11,7 +11,7 @@ chunks. It is disposable acceleration, not durable storage.
   `WouldBlock`. They never wait for device I/O.
 - An L1 miss consults L2. An admitted L2 lookup performs one bounded record
   read; memory or I/O pressure fails open as a miss.
-- Full keys, exact record lengths, Region generations, hashes, locations, and
+- Full keys, exact record envelopes, Region generations, hashes, locations, and
   checksums are validated before an L2 value is returned.
 - There is one raw byte-key space and no TTL. Encode any logical namespace into
   the key.
@@ -84,12 +84,15 @@ fixed-memory cost.
 Keys are limited to 4 KiB. A complete encoded record must fit in one Region.
 Entries charged above 256 KiB bypass L1 but remain valid in L2.
 
-The fixed L2 index uses roughly two slots per expected entry and 10 bytes per
-slot, plus page headers and two volatile heat bits per slot. A 4 TiB cache
-averaging 16 KiB per entry therefore needs about 5.08 GiB for the index plus
-128 MiB for heat bits. The first L2 candidate access marks an entry as seen;
-only a later access makes it eligible for bounded reclaim reinsertion. The
-aggregate managed-memory limit must also cover
+The fixed L2 index uses roughly two slots per expected entry. Each stable slot
+is 8 bytes; 4 KiB page headers raise the physical cost to about 8.13 bytes per
+slot, plus two volatile heat bits. The slot keeps exact Region and offset fields
+but stores record length as a bounded size-class upper limit: records through
+1 KiB remain exact and larger reads add less than 7% before direct-I/O
+alignment. A 4 TiB cache averaging 16 KiB per entry therefore needs about
+4.06 GiB for the index plus 128 MiB for heat bits. The first L2 candidate access
+marks an entry as seen; only a later access makes it eligible for bounded
+reclaim reinsertion. The aggregate managed-memory limit must also cover
 L1, two staging buffers per append shard, one Region reclaim buffer per worker,
 metadata, transient reads, and cache thread stacks. Invalid plans fail before
 cache files are created.
