@@ -726,26 +726,48 @@ mod tests {
 
     #[test]
     fn full_candidate_window_uses_the_bounded_second_relocation_hop() {
+        let trigger = {
+            let index = anonymous(128);
+            index.set_statistics_enabled(true);
+            (0..10_000_u64)
+                .find(|ordinal| {
+                    let hash = hash_key(7, &ordinal.to_le_bytes());
+                    let supplied = entry(1, (*ordinal as u32) * 32);
+                    let before = index.snapshot().unwrap();
+                    index.upsert(hash, supplied).unwrap();
+                    let after = index.snapshot().unwrap();
+                    after.relocations == before.relocations + 2
+                })
+                .expect("test hash stream never exercised a two-hop relocation")
+        };
+
         let index = anonymous(128);
         index.set_statistics_enabled(true);
-        let mut exercised = false;
-        for ordinal in 0..10_000_u64 {
+        let mut published = Vec::new();
+        for ordinal in 0..trigger {
             let hash = hash_key(7, &ordinal.to_le_bytes());
             let supplied = entry(1, (ordinal as u32) * 32);
-            let before = index.snapshot().unwrap();
             index.upsert(hash, supplied).unwrap();
-            let after = index.snapshot().unwrap();
-            if after.relocations == before.relocations + 2 {
-                assert_eq!(after.overflow_evictions, before.overflow_evictions);
-                assert_eq!(index.lookup_raw(hash).unwrap(), Some(supplied));
-                exercised = true;
-                break;
-            }
+            published.push((hash, supplied));
         }
-        assert!(
-            exercised,
-            "test hash stream never exercised a two-hop relocation"
-        );
+        let live_before: Vec<_> = published
+            .into_iter()
+            .filter(|(hash, supplied)| index.lookup_raw(*hash).unwrap() == Some(*supplied))
+            .collect();
+        let hash = hash_key(7, &trigger.to_le_bytes());
+        let supplied = entry(1, (trigger as u32) * 32);
+        let before = index.snapshot().unwrap();
+        index.upsert(hash, supplied).unwrap();
+        let after = index.snapshot().unwrap();
+
+        assert_eq!(after.relocations, before.relocations + 2);
+        assert_eq!(after.overflow_evictions, before.overflow_evictions);
+        assert_eq!(after.physical_value_slots, before.physical_value_slots + 1);
+        assert_eq!(after.empty_slots + 1, before.empty_slots);
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(supplied));
+        for (hash, supplied) in live_before {
+            assert_eq!(index.lookup_raw(hash).unwrap(), Some(supplied));
+        }
     }
 
     #[test]
