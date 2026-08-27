@@ -83,12 +83,14 @@ cache concept or routing layer.
 `put` publishes an admitted RAM value immediately and encodes the same sequence
 into the bounded per-shard write buffer before returning. The value is readable
 from L1 while its device write is still in flight and is immediately eligible
-for normal eviction. Values that do not fit their RAM shard bypass L1 and
-continue through L2. Successful completion publishes the L2 index entry. The
-write admission rejects immediately with `WouldBlock` when the fixed shard
-buffer is saturated or its short mutation path is contended; there is no
-global write-admission gate, wait policy, deadline, or foreground retry loop.
-Neither path holds a lock across device I/O.
+for normal eviction. L1 admits only entries whose key, value, and fixed
+ownership charge total at most 256 KiB; larger entries and values that do not
+fit their RAM shard bypass L1 and continue through L2. This keeps Region-sized
+copies out of shard-local L1 critical sections. Successful completion publishes
+the L2 index entry. The write admission rejects immediately with `WouldBlock`
+when the fixed shard buffer is saturated or its short mutation path is
+contended; there is no global write-admission gate, wait policy, deadline, or
+foreground retry loop. Neither path holds a lock across device I/O.
 
 The public lifecycle and read API is Tokio-async. L1 hits and L2 index misses
 finish on their first poll; an admitted L2 candidate suspends the task until
@@ -131,10 +133,11 @@ one 64-bit hash so collision work remains constant-bounded.
 Use `drain` when the caller needs all accepted Region writes completed. It does
 not sync data or create a recovery image.
 
-Keys are limited to 4 KiB. A value has no smaller independent limit: its complete
-encoded record (36-byte header, key, value, and alignment padding) must fit in
-one Region. Oversized mutations return `InvalidInput`; an oversized-key lookup
-is a miss. Each admitted device operation
+Keys are limited to 4 KiB. A value has no smaller independent public limit: its
+complete encoded record (36-byte header, key, value, and alignment padding) must
+fit in one Region. Entries above the separate 256 KiB L1 admission bound remain
+valid L2-only entries. Oversized mutations return `InvalidInput`; an
+oversized-key lookup is a miss. Each admitted device operation
 also has a fixed five-second completion guardrail. It is an internal
 device-stall safety boundary, not a durability or configurable request-timeout
 setting; a persistent stall takes the cache runtime out of service and later
@@ -286,15 +289,17 @@ Run the release benchmark with:
 cargo bench --bench hybrid_cache
 ```
 
-It measures non-blocking `put` retries plus `drain`, resident L1 reads, warm
-close, direct L2 reads with L1 promotion where admitted, and reads from the
-promoted L1 set. The default data set is 8,192 × 16 KiB.
+It measures concurrent non-blocking `put` retries plus `drain`, resident L1
+reads, warm close, direct L2 reads with L1 promotion where admitted, and reads
+from the promoted L1 set. Entries above the L1 admission bound instead run
+resident and repeated L2 phases. The default data set is 8,192 × 16 KiB with
+four write clients and eight read clients.
 `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`,
 `CACHE_BENCH_RESIDENT_ENTRIES`, `CACHE_BENCH_READ_OPS`,
 `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`,
 `CACHE_BENCH_MEMORY_LIMIT_MIB`, `CACHE_BENCH_SHARDS`,
 `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`,
-`CACHE_BENCH_CLIENTS`,
+`CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_CLIENTS`,
 `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
 `CACHE_BENCH_DIR` adjust the workload and device
 configuration. Set

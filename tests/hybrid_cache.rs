@@ -635,10 +635,14 @@ async fn public_entry_size_limits_are_explicit() {
     );
     cache.put(b"large", &large_value).unwrap();
     cache.drain().await.unwrap();
-    assert_eq!(
-        cache.get(b"large").await.unwrap().unwrap().as_ref(),
-        large_value
-    );
+    let first = cache.get(b"large").await.unwrap().unwrap();
+    assert_eq!(first.tier(), CacheTier::L2);
+    assert_eq!(first.as_ref(), large_value);
+    drop(first);
+    let second = cache.get(b"large").await.unwrap().unwrap();
+    assert_eq!(second.tier(), CacheTier::L2);
+    assert_eq!(second.as_ref(), large_value);
+    drop(second);
     assert_eq!(
         cache.delete(&oversized_key).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
@@ -647,6 +651,7 @@ async fn public_entry_size_limits_are_explicit() {
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.puts, 1);
     assert_eq!(snapshot.deletes, 0);
+    assert_eq!(snapshot.l1_promotions, 0);
     cache.close_warm().await.unwrap();
 
     let reopened = files.config(1).open().await.unwrap();
@@ -655,6 +660,11 @@ async fn public_entry_size_limits_are_explicit() {
     assert_eq!(value.tier(), CacheTier::L2);
     assert_eq!(value.as_ref(), large_value);
     drop(value);
+    let value = reopened.get(b"large").await.unwrap().unwrap();
+    assert_eq!(value.tier(), CacheTier::L2);
+    assert_eq!(value.as_ref(), large_value);
+    drop(value);
+    assert_eq!(reopened.snapshot().unwrap().l1_promotions, 0);
     reopened.close_fast().await.unwrap();
 }
 

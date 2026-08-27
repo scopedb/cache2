@@ -16,6 +16,10 @@ use crate::snapshot::CacheL1Snapshot;
 /// Charged retained-value ownership. Fixed entry, policy, free-list, and
 /// directory storage is planned and allocated separately during open.
 pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
+/// Keep large Region records out of shard-local L1 critical sections. The
+/// complete retained entry, including its key and fixed ownership charge, must
+/// fit this bound before foreground publication or L2 promotion takes the lock.
+const MAX_L1_ENTRY_BYTES: usize = 256 * 1024;
 /// Full-key collision work must stay bounded even when callers supply many
 /// distinct keys with the same 64-bit cache hash.
 const MAX_SAME_HASH_ENTRIES: usize = 8;
@@ -590,6 +594,7 @@ impl MemoryShard {
         key: &[u8],
         value: &[u8],
         seqno: u64,
+        charged_bytes: usize,
         replacement: Option<usize>,
     ) -> MemoryInsertResult {
         if (replacement.is_none() && self.hash_chain_is_full(hash))
@@ -597,12 +602,6 @@ impl MemoryShard {
         {
             return MemoryInsertResult::bypassed();
         }
-        let Some(charged_bytes) = MEMORY_ENTRY_OVERHEAD_BYTES
-            .checked_add(key.len())
-            .and_then(|bytes| bytes.checked_add(value.len()))
-        else {
-            return MemoryInsertResult::bypassed();
-        };
 
         let (charge, evictions) = match self.charge_with_eviction(charged_bytes, replacement) {
             ChargeResult::Charged { charge, evictions } => (charge, evictions),
@@ -812,6 +811,10 @@ impl MemoryStore {
     }
 
     pub(crate) fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
+        let Some(charged_bytes) = memory_entry_bytes(key, value) else {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return false;
+        };
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
@@ -825,7 +828,15 @@ impl MemoryStore {
         }) {
             return true;
         }
-        let result = shard.insert(hash, key, value, seqno, existing);
+        if charged_bytes > MAX_L1_ENTRY_BYTES {
+            if let Some(index) = existing {
+                shard.remove_slot(index);
+            }
+            drop(shard);
+            self.record_insert(MemoryInsertResult::bypassed());
+            return false;
+        }
+        let result = shard.insert(hash, key, value, seqno, charged_bytes, existing);
         drop(shard);
         self.record_insert(result);
         result.inserted
@@ -879,11 +890,19 @@ impl MemoryStore {
         if token.shard_id != self.route(hash) {
             return None;
         }
+        let Some(charged_bytes) = memory_entry_bytes(key, value) else {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return None;
+        };
+        if charged_bytes > MAX_L1_ENTRY_BYTES {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return None;
+        }
         let mut shard = self.try_lock_shard(token.shard_id)?;
         if shard.find(hash, key).is_some() {
             return None;
         }
-        let result = shard.insert(hash, key, value, seqno, None);
+        let result = shard.insert(hash, key, value, seqno, charged_bytes, None);
         let promoted = result.inserted.then(|| {
             let index = shard
                 .find(hash, key)
@@ -955,6 +974,12 @@ impl MemoryStore {
     }
 }
 
+fn memory_entry_bytes(key: &[u8], value: &[u8]) -> Option<usize> {
+    MEMORY_ENTRY_OVERHEAD_BYTES
+        .checked_add(key.len())
+        .and_then(|bytes| bytes.checked_add(value.len()))
+}
+
 fn shard_share(total: usize, shard_count: usize, shard_id: usize) -> usize {
     total / shard_count + usize::from(shard_id < total % shard_count)
 }
@@ -999,6 +1024,39 @@ mod tests {
             store.lookup(8, b"b"),
             MemoryLookup::Hit(value) if value.len() == 300
         ));
+    }
+
+    #[test]
+    fn entries_above_the_l1_limit_bypass_and_clean_an_older_exact_key() {
+        let store = store(2 * MAX_L1_ENTRY_BYTES, 1);
+        assert!(store.publish(7, b"key", b"old", 1));
+        let oversized = vec![0xa5; MAX_L1_ENTRY_BYTES - MEMORY_ENTRY_OVERHEAD_BYTES - 3 + 1];
+
+        assert!(!store.publish(7, b"key", &oversized, 2));
+        assert_miss(&store, 7, b"key");
+        assert_eq!(store.detailed_snapshot().unwrap().resident_entries, 0);
+        assert_eq!(store.metrics_snapshot().bypasses, 1);
+
+        let boundary = vec![0xa5; MAX_L1_ENTRY_BYTES - MEMORY_ENTRY_OVERHEAD_BYTES - 4];
+        assert!(store.publish(8, b"edge", &boundary, 3));
+        assert!(matches!(
+            store.lookup(8, b"edge"),
+            MemoryLookup::Hit(value) if value.len() == boundary.len()
+        ));
+    }
+
+    #[test]
+    fn l2_promotion_bypasses_above_the_l1_entry_limit() {
+        let store = store(2 * MAX_L1_ENTRY_BYTES, 1);
+        let MemoryLookup::Miss(token) = store.lookup(9, b"key") else {
+            panic!("empty memory tier must miss");
+        };
+        let oversized = vec![0xa5; MAX_L1_ENTRY_BYTES - MEMORY_ENTRY_OVERHEAD_BYTES - 3 + 1];
+
+        assert!(store.promote(token, 9, b"key", &oversized, 1).is_none());
+        assert_miss(&store, 9, b"key");
+        assert_eq!(store.detailed_snapshot().unwrap().resident_entries, 0);
+        assert_eq!(store.metrics_snapshot().bypasses, 1);
     }
 
     #[test]

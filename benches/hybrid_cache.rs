@@ -13,6 +13,9 @@ use cache_rs::{
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
+const L1_ENTRY_BYTES: usize = 256 * 1024;
+const L1_ENTRY_OVERHEAD_BYTES: usize = 64;
+const BENCHMARK_KEY_BYTES: usize = 16;
 // The benchmark uses a fixed 16-byte key. Leave one 64-byte format envelope so
 // every accepted benchmark value fits its configured Region.
 const MAX_VALUE_BYTES: usize = REGION_BYTES - 64;
@@ -32,6 +35,7 @@ struct BenchConfig {
     shards: u32,
     read_io_workers: usize,
     write_io_workers: usize,
+    write_clients: usize,
     clients: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
@@ -50,6 +54,7 @@ impl BenchConfig {
         let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
         let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
+        let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
         let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
@@ -76,6 +81,7 @@ impl BenchConfig {
             || read_ops == 0
             || read_io_workers == 0
             || write_io_workers == 0
+            || write_clients == 0
             || clients == 0
             || shards == 0
         {
@@ -114,23 +120,19 @@ impl BenchConfig {
         let memory_limit_bytes = memory_limit_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("benchmark memory limit is too large"))?;
-        let maximum_resident_entries = memory_bytes
-            .saturating_mul(3)
-            .saturating_div(4)
-            .saturating_div(value_bytes.saturating_add(256));
-        let resident_entries = env_usize(
-            "CACHE_BENCH_RESIDENT_ENTRIES",
-            entries.min(maximum_resident_entries),
-        )?;
-        let resident_bytes = resident_entries
-            .checked_mul(value_bytes.saturating_add(256))
-            .ok_or_else(|| invalid("resident benchmark set is too large"))?;
-        if resident_entries == 0
-            || resident_entries > entries
-            || resident_bytes > memory_bytes.saturating_mul(3).saturating_div(4)
-        {
+        let maximum_resident_entries = if benchmark_entry_is_l1_eligible(value_bytes) {
+            memory_bytes
+                .saturating_mul(3)
+                .saturating_div(4)
+                .saturating_div(value_bytes.saturating_add(256))
+                .min(entries)
+        } else {
+            entries
+        };
+        let resident_entries = env_usize("CACHE_BENCH_RESIDENT_ENTRIES", maximum_resident_entries)?;
+        if resident_entries == 0 || resident_entries > maximum_resident_entries {
             return Err(invalid(format!(
-                "resident set must fit within 75% of RAM tier (maximum {maximum_resident_entries} entries)"
+                "resident set exceeds the benchmark maximum of {maximum_resident_entries} entries"
             )));
         }
         let data_bytes = (entries as u128) * (value_bytes as u128);
@@ -151,6 +153,7 @@ impl BenchConfig {
             shards,
             read_io_workers,
             write_io_workers,
+            write_clients,
             clients,
             io_engine,
             io_mode,
@@ -224,6 +227,12 @@ struct Measurement {
     checksum: u64,
 }
 
+struct WriteAdmission {
+    measurement: Measurement,
+    attempts: usize,
+    throttled_writes: usize,
+}
+
 fn main() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -236,11 +245,11 @@ fn main() -> io::Result<()> {
 
 async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
-    let mut value = vec![0xa5; config.value_bytes];
+    let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
 
     println!("cache-rs HybridCache benchmark");
     println!(
-        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} read_workers={} write_workers={} clients={} engine={:?} mode={:?} statistics={}",
+        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
         config.resident_entries,
         config.value_bytes,
@@ -250,7 +259,9 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.shards,
         config.read_io_workers,
         config.write_io_workers,
+        config.write_clients,
         config.clients,
+        l1_entry_eligible,
         config.io_engine,
         config.io_mode,
         config.statistics_enabled,
@@ -258,50 +269,54 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("file={}", files.data.display());
 
     let cache = Arc::new(files.config(&config).open().await?);
-    let started = Instant::now();
-    let mut write_checksum = 0_u64;
-    let mut write_attempts = 0_usize;
-    let mut throttled_writes = 0_usize;
-    for ordinal in 0..config.entries {
-        let key = benchmark_key(ordinal);
-        value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-        let (receipt, attempts) = put_eventually(&cache, black_box(&key), black_box(&value))?;
-        write_attempts = write_attempts.saturating_add(attempts);
-        throttled_writes = throttled_writes.saturating_add(usize::from(attempts > 1));
-        write_checksum = write_checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
-    }
+    let mut write = concurrent_writes(
+        Arc::clone(&cache),
+        config.entries,
+        config.value_bytes,
+        config.write_clients,
+    )?;
+    let drain_started = Instant::now();
     cache.drain().await?;
-    let put = Measurement {
-        elapsed: started.elapsed(),
-        operations: config.entries,
-        bytes: (config.entries as u128) * (config.value_bytes as u128),
-        checksum: write_checksum,
-    };
-    report("put_drain", "put + drain", &put);
+    write.measurement.elapsed += drain_started.elapsed();
+    report("put_drain", "put + drain", &write.measurement);
     println!(
-        "result phase=put_admission attempts={write_attempts} retries={} throttled={throttled_writes}",
-        write_attempts.saturating_sub(config.entries),
+        "result phase=put_admission clients={} attempts={} retries={} throttled={}",
+        config.write_clients,
+        write.attempts,
+        write.attempts.saturating_sub(config.entries),
+        write.throttled_writes,
     );
 
     let resident_start = config.entries - config.resident_entries;
-    for ordinal in resident_start..config.entries {
-        let key = benchmark_key(ordinal);
-        let observed = cache
-            .get(black_box(key))
-            .await?
-            .ok_or_else(|| io::Error::other("resident L1 preparation missed"))?;
-        verify_value(ordinal, &observed)?;
+    if l1_entry_eligible {
+        for ordinal in resident_start..config.entries {
+            let key = benchmark_key(ordinal);
+            let observed = cache
+                .get(black_box(key))
+                .await?
+                .ok_or_else(|| io::Error::other("resident L1 preparation missed"))?;
+            verify_value(ordinal, &observed)?;
+        }
     }
-    let l1 = concurrent_reads(
+    let resident_tier = if l1_entry_eligible {
+        CacheTier::L1
+    } else {
+        CacheTier::L2
+    };
+    let resident = concurrent_reads(
         Arc::clone(&cache),
         resident_start,
         config.resident_entries,
         config.read_ops,
         config.clients,
-        CacheTier::L1,
+        resident_tier,
     )
     .await?;
-    report("resident_l1", "resident L1 get", &l1);
+    if l1_entry_eligible {
+        report("resident_l1", "resident L1 get", &resident);
+    } else {
+        report("resident_l2", "resident L2 get", &resident);
+    }
 
     let started = Instant::now();
     Arc::try_unwrap(cache)
@@ -317,7 +332,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             "benchmark did not reopen from a clean image",
         ));
     }
-    let promotion = concurrent_reads(
+    let l2_read = concurrent_reads(
         Arc::clone(&cache),
         0,
         config.entries,
@@ -326,27 +341,37 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         CacheTier::L2,
     )
     .await?;
-    report("l2_promote", "L2 get + promote", &promotion);
-
-    for ordinal in resident_start..config.entries {
-        let key = benchmark_key(ordinal);
-        let observed = cache
-            .get(black_box(key))
-            .await?
-            .ok_or_else(|| io::Error::other("promoted L1 preparation missed"))?;
-        verify_value(ordinal, &observed)?;
+    if l1_entry_eligible {
+        report("l2_promote", "L2 get + promote", &l2_read);
+    } else {
+        report("l2_read", "L2 get", &l2_read);
     }
 
-    let promoted_l1 = concurrent_reads(
+    if l1_entry_eligible {
+        for ordinal in resident_start..config.entries {
+            let key = benchmark_key(ordinal);
+            let observed = cache
+                .get(black_box(key))
+                .await?
+                .ok_or_else(|| io::Error::other("promoted L1 preparation missed"))?;
+            verify_value(ordinal, &observed)?;
+        }
+    }
+
+    let repeated = concurrent_reads(
         Arc::clone(&cache),
         resident_start,
         config.resident_entries,
         config.read_ops,
         config.clients,
-        CacheTier::L1,
+        resident_tier,
     )
     .await?;
-    report("promoted_l1", "promoted L1 get", &promoted_l1);
+    if l1_entry_eligible {
+        report("promoted_l1", "promoted L1 get", &repeated);
+    } else {
+        report("repeat_l2", "repeat L2 get", &repeated);
+    }
     if config.statistics_enabled {
         let snapshot = cache.snapshot()?;
         println!(
@@ -363,9 +388,73 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         .close_fast()
         .await?;
 
-    enforce_thresholds(&put, &l1, warm_close, &promotion, &promoted_l1)?;
+    enforce_thresholds(
+        &write.measurement,
+        &resident,
+        warm_close,
+        &l2_read,
+        &repeated,
+        l1_entry_eligible,
+    )?;
 
     Ok(())
+}
+
+fn concurrent_writes(
+    cache: Arc<HybridCache>,
+    entries: usize,
+    value_bytes: usize,
+    clients: usize,
+) -> io::Result<WriteAdmission> {
+    let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(clients);
+        for client in 0..clients {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            handles.push(scope.spawn(move || {
+                let mut value = vec![0xa5; value_bytes];
+                barrier.wait();
+                let mut checksum = 0_u64;
+                let mut attempts = 0_usize;
+                let mut throttled_writes = 0_usize;
+                for ordinal in (client..entries).step_by(clients) {
+                    let key = benchmark_key(ordinal);
+                    value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+                    let (receipt, operation_attempts) =
+                        put_eventually(&cache, black_box(&key), black_box(&value))?;
+                    attempts = attempts.saturating_add(operation_attempts);
+                    throttled_writes =
+                        throttled_writes.saturating_add(usize::from(operation_attempts > 1));
+                    checksum = checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
+                }
+                Ok::<_, io::Error>((checksum, attempts, throttled_writes))
+            }));
+        }
+        barrier.wait();
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        let mut attempts = 0_usize;
+        let mut throttled_writes = 0_usize;
+        for handle in handles {
+            let (client_checksum, client_attempts, client_throttled_writes) = handle
+                .join()
+                .map_err(|_| io::Error::other("benchmark writer panicked"))??;
+            checksum = checksum.wrapping_add(client_checksum);
+            attempts = attempts.saturating_add(client_attempts);
+            throttled_writes = throttled_writes.saturating_add(client_throttled_writes);
+        }
+        Ok(WriteAdmission {
+            measurement: Measurement {
+                elapsed: started.elapsed(),
+                operations: entries,
+                bytes: (entries as u128) * (value_bytes as u128),
+                checksum,
+            },
+            attempts,
+            throttled_writes,
+        })
+    })
 }
 
 async fn concurrent_reads(
@@ -474,6 +563,13 @@ fn benchmark_key(ordinal: usize) -> [u8; 16] {
     key
 }
 
+fn benchmark_entry_is_l1_eligible(value_bytes: usize) -> bool {
+    L1_ENTRY_OVERHEAD_BYTES
+        .checked_add(BENCHMARK_KEY_BYTES)
+        .and_then(|bytes| bytes.checked_add(value_bytes))
+        .is_some_and(|bytes| bytes <= L1_ENTRY_BYTES)
+}
+
 fn verify_value(ordinal: usize, value: &[u8]) -> io::Result<()> {
     let observed =
         u64::from_le_bytes(value[..8].try_into().map_err(|_| {
@@ -518,15 +614,21 @@ fn report_latency(phase: &str, name: &str, elapsed: Duration) {
 
 fn enforce_thresholds(
     put: &Measurement,
-    resident_l1: &Measurement,
+    resident: &Measurement,
     warm_close: Duration,
-    l2_promote: &Measurement,
-    promoted_l1: &Measurement,
+    l2_read: &Measurement,
+    repeated: &Measurement,
+    l1_entry_eligible: bool,
 ) -> io::Result<()> {
     require_minimum_rate("CACHE_BENCH_MIN_PUT_OPS", put)?;
-    require_minimum_rate("CACHE_BENCH_MIN_RESIDENT_L1_OPS", resident_l1)?;
-    require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", l2_promote)?;
-    require_minimum_rate("CACHE_BENCH_MIN_PROMOTED_L1_OPS", promoted_l1)?;
+    require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", l2_read)?;
+    if l1_entry_eligible {
+        require_minimum_rate("CACHE_BENCH_MIN_RESIDENT_L1_OPS", resident)?;
+        require_minimum_rate("CACHE_BENCH_MIN_PROMOTED_L1_OPS", repeated)?;
+    } else {
+        require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", resident)?;
+        require_minimum_rate("CACHE_BENCH_MIN_L2_OPS", repeated)?;
+    }
     if let Some(maximum_ms) = env_optional_f64("CACHE_BENCH_MAX_WARM_CLOSE_MS")?
         && warm_close.as_secs_f64() * 1_000.0 > maximum_ms
     {

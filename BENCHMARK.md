@@ -4,13 +4,51 @@ This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
 
 The current harness gives its fixed index extra headroom for the complete L2
-working set and retries rejected writes. A write yields for up to eight brief
-admission conflicts before using a short delay for sustained pressure; the
-reported admission totals expose both retry attempts and affected writes.
-Every measured read retries pressure misses for at most one second with a short
-delay. The L1 phases also retry a valid L2 fallback caused by best-effort
-shard-lock contention; that extra work remains inside the measured latency.
-Rerun the baseline before treating historical thresholds as release gates.
+working set and retries rejected writes from a configurable number of foreground
+writer threads. A write yields for up to eight brief admission conflicts before
+using a short delay for sustained pressure; the reported admission totals expose
+both retry attempts and affected writes. Every measured read retries pressure
+misses for at most one second with a short delay. The L1 phases also retry a
+valid L2 fallback caused by best-effort shard-lock contention; that extra work
+remains inside the measured latency. Entries above the 256 KiB charged L1 bound
+run L2-only read phases. Rerun the baseline before treating historical
+thresholds as release gates.
+
+## Concurrent writer and shard scaling preflight — 2026-08-27
+
+Three release runs per point on the Apple M4 Max developer host used 8,192
+entries × 16 KiB, four POSIX write workers, buffered temporary-file I/O, and
+only 8,192 read operations per phase to keep the sample focused on writes. This
+is a page-cache preflight, not device-qualified evidence.
+
+With four write shards, foreground writer scaling was:
+
+| Writer clients | Median put + drain | Median throughput | Median retries | Median throttled writes |
+|---:|---:|---:|---:|---:|
+| 1 | 27.373 ms | 299,274 ops/s | 41 | 10 |
+| 2 | 18.610 ms | 440,193 ops/s | 89 | 41 |
+| 4 | 15.268 ms | 536,537 ops/s | 310 | 213 |
+| 8 | 16.690 ms | 490,819 ops/s | 672 | 446 |
+| 16 | 17.449 ms | 469,479 ops/s | 887 | 635 |
+
+Four clients matched the four-shard topology best on this host. Additional
+clients increased bounded admission conflicts without improving completion
+throughput.
+
+With eight writer clients and a 1,100 MiB aggregate memory limit, write-shard
+scaling was:
+
+| Write shards | Median put + drain | Median throughput | Median retries | Median throttled writes |
+|---:|---:|---:|---:|---:|
+| 1 | 35.102 ms | 233,379 ops/s | 981 | 28 |
+| 2 | 17.834 ms | 459,357 ops/s | 445 | 251 |
+| 4 | 14.728 ms | 556,212 ops/s | 628 | 504 |
+| 8 | 12.740 ms | 642,997 ops/s | 682 | 568 |
+
+The shard-local path provides real parallelism. Eight shards improved this
+small buffered workload further, at the cost of eight pairs of Region-sized
+staging buffers; production sizing must account for that fixed memory before
+choosing the higher shard count.
 
 ## Best-effort request-path baseline — 2026-08-26
 
