@@ -37,7 +37,9 @@ The main controls are:
 The optional hot-scan mode rewrites a bounded hot set into L1 after warm open,
 then interleaves one-shot hot reads with a single pass over the remaining cold
 keys. It reports L1/L2/miss counts before, during, and after the scan without
-requiring best-effort admission to succeed.
+requiring best-effort admission to succeed. Its discarded initial fill disables
+L1; the measured warm-open scan uses the configured L1 capacity. This avoids
+retaining a second allocator copy of the complete RAM tier in one process.
 
 Use a data set larger than host RAM for L2 device measurements. Run each
 revision at least five times in alternating order, report medians, and retain

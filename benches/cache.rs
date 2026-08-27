@@ -223,8 +223,19 @@ impl BenchFiles {
     }
 
     fn config(&self, config: &BenchConfig) -> CacheBuilder {
-        CacheBuilder::from_static(&self.data, config.static_config())
-            .with_runtime_config(config.runtime_config())
+        self.config_with_l1_capacity(config, config.memory_bytes)
+    }
+
+    fn config_with_l1_capacity(
+        &self,
+        config: &BenchConfig,
+        l1_capacity_bytes: usize,
+    ) -> CacheBuilder {
+        CacheBuilder::from_static(&self.data, config.static_config()).with_runtime_config(
+            config
+                .runtime_config()
+                .with_l1_capacity_bytes(l1_capacity_bytes),
+        )
     }
 }
 
@@ -290,10 +301,15 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
     let index_slots = config.static_config().index_slots();
     let index_load = config.entries as f64 * 100.0 / index_slots as f64;
+    let initial_l1_bytes = if config.hot_entries == 0 {
+        config.memory_bytes
+    } else {
+        0
+    };
 
     println!("C² cache benchmark");
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -303,6 +319,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.value_bytes,
         (config.entries as f64 * config.value_bytes as f64) / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
+        initial_l1_bytes as f64 / MIB as f64,
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config.append_shards,
         config.read_io_workers,
@@ -316,7 +333,12 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     );
     println!("file={}", files.data.display());
 
-    let cache = Arc::new(files.config(&config).open().await?);
+    let cache = Arc::new(
+        files
+            .config_with_l1_capacity(&config, initial_l1_bytes)
+            .open()
+            .await?,
+    );
     let mut write = concurrent_writes(
         Arc::clone(&cache),
         config.entries,
