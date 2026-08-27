@@ -1037,7 +1037,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let nonce = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!(
-                "cache-rs-{label}-{}-{nonce}.cache",
+                "cache2-{label}-{}-{nonce}.cache",
                 std::process::id()
             )))
         }

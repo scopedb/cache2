@@ -311,7 +311,7 @@ run_benchmark_profile() {
     CACHE_BENCH_IO_MODE="$mode" \
     CACHE_BENCH_READ_IO_WORKERS="$read_workers" \
     CACHE_BENCH_WRITE_IO_WORKERS="$write_workers" \
-      cargo +1.98.0 bench --locked --bench hybrid_cache --quiet 2>&1 | tee -a "$log"
+      cargo +1.98.0 bench --locked --bench cache --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
 }
@@ -333,7 +333,7 @@ CACHE_SOAK_SAMPLE_SECONDS="$sample_seconds" \
 CACHE_SOAK_DIR="$cache_directory" \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=direct \
-  cargo +1.98.0 bench --locked --bench hybrid_cache_soak --quiet 2>&1 \
+  cargo +1.98.0 bench --locked --bench cache_soak --quiet 2>&1 \
   | tee "$report_directory/soak-posix-direct.log"
 
 if ! grep -q '^complete .* errors=0 ' "$report_directory/soak-posix-direct.log"; then

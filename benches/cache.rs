@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache_rs::{
-    CacheTier, HybridCache, HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode,
-    StaticConfig,
+use cache2::{
+    Cache, CacheConfig, CacheTier, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -195,14 +194,14 @@ impl BenchFiles {
             .as_nanos();
         Self {
             data: directory.join(format!(
-                "cache-rs-hybrid-bench-{}-{timestamp}.cache",
+                "cache2-bench-{}-{timestamp}.cache",
                 std::process::id()
             )),
         }
     }
 
-    fn config(&self, config: &BenchConfig) -> HybridCacheConfig {
-        HybridCacheConfig::from_static(&self.data, config.static_config())
+    fn config(&self, config: &BenchConfig) -> CacheConfig {
+        CacheConfig::from_static(&self.data, config.static_config())
             .with_runtime_config(config.runtime_config())
     }
 }
@@ -237,7 +236,7 @@ fn main() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.clients.max(2))
-        .thread_name("cache-rs-benchmark")
+        .thread_name("cache2-benchmark")
         .enable_time()
         .build()?;
     runtime.block_on(run(config))
@@ -247,7 +246,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
 
-    println!("cache-rs HybridCache benchmark");
+    println!("C² cache benchmark");
     println!(
         "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
@@ -401,7 +400,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 }
 
 fn concurrent_writes(
-    cache: Arc<HybridCache>,
+    cache: Arc<Cache>,
     entries: usize,
     value_bytes: usize,
     clients: usize,
@@ -458,7 +457,7 @@ fn concurrent_writes(
 }
 
 async fn concurrent_reads(
-    cache: Arc<HybridCache>,
+    cache: Arc<Cache>,
     first_key: usize,
     key_count: usize,
     operations: usize,
@@ -531,7 +530,7 @@ async fn concurrent_reads(
     })
 }
 
-fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<(u64, usize)> {
+fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, usize)> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
     let mut attempts = 0_usize;
     loop {
@@ -558,7 +557,7 @@ fn put_eventually(cache: &HybridCache, key: &[u8], value: &[u8]) -> io::Result<(
 
 fn benchmark_key(ordinal: usize) -> [u8; 16] {
     let mut key = [0_u8; 16];
-    key[..8].copy_from_slice(b"cache-rs");
+    key[..8].copy_from_slice(b"cache2::");
     key[8..].copy_from_slice(&(ordinal as u64).to_le_bytes());
     key
 }

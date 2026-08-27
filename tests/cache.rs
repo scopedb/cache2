@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cache_rs::{
-    CacheHealth, CacheTier, HybridCacheConfig, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
+use cache2::{
+    CacheConfig, CacheHealth, CacheTier, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -19,18 +19,18 @@ impl TestCache {
     fn new(name: &str) -> Self {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
         let data =
-            std::env::temp_dir().join(format!("cache-rs-{name}-{}-{id}.cache", std::process::id()));
+            std::env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
         Self { data }
     }
 
-    fn config(&self, workers: usize) -> HybridCacheConfig {
+    fn config(&self, workers: usize) -> CacheConfig {
         let static_config = StaticConfig::new(3 * 512 * 1024)
             .with_region_size(512 * 1024)
             .with_expected_entries(3277);
         self.config_with_static(workers, static_config)
     }
 
-    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> HybridCacheConfig {
+    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheConfig {
         self.config_with_static_and_shards(workers, static_config, 2)
     }
 
@@ -39,7 +39,7 @@ impl TestCache {
         workers: usize,
         static_config: StaticConfig,
         write_shards: u32,
-    ) -> HybridCacheConfig {
+    ) -> CacheConfig {
         let runtime_config = RuntimeConfig::default()
             .with_io_engine(IoEngine::Posix)
             .with_read_io_workers(workers)
@@ -49,8 +49,7 @@ impl TestCache {
             .with_memory_limit(32 * 1024 * 1024)
             .with_write_batch_size(256 * 1024)
             .with_statistics(true);
-        HybridCacheConfig::from_static(&self.data, static_config)
-            .with_runtime_config(runtime_config)
+        CacheConfig::from_static(&self.data, static_config).with_runtime_config(runtime_config)
     }
 
     fn sidecar(&self, suffix: &str) -> PathBuf {

@@ -416,8 +416,8 @@ mod tests {
     impl TestFile {
         fn create() -> Self {
             let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("cache-rs-index-{}-{id}.tmp", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("cache2-index-{}-{id}.tmp", std::process::id()));
             let file = OpenOptions::new()
                 .create_new(true)
                 .read(true)

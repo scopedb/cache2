@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache_rs::{HybridCacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
+use cache2::{CacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -83,14 +83,14 @@ impl ScaleFiles {
             .as_nanos();
         Self {
             data: directory.join(format!(
-                "cache-rs-recovery-scale-{}-{timestamp}.cache",
+                "cache2-recovery-scale-{}-{timestamp}.cache",
                 std::process::id()
             )),
         }
     }
 
-    fn config(&self, config: &ScaleConfig) -> HybridCacheConfig {
-        HybridCacheConfig::from_static(&self.data, config.static_config())
+    fn config(&self, config: &ScaleConfig) -> CacheConfig {
+        CacheConfig::from_static(&self.data, config.static_config())
             .with_runtime_config(config.runtime_config())
     }
 
@@ -220,7 +220,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     Ok(())
 }
 
-async fn verify_sentinels(cache: &cache_rs::HybridCache, keys: &[[u8; 16]]) -> io::Result<()> {
+async fn verify_sentinels(cache: &cache2::Cache, keys: &[[u8; 16]]) -> io::Result<()> {
     let started = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         let observed = cache
@@ -235,7 +235,7 @@ async fn verify_sentinels(cache: &cache_rs::HybridCache, keys: &[[u8; 16]]) -> i
     Ok(())
 }
 
-fn put_eventually(cache: &cache_rs::HybridCache, key: &[u8], value: &[u8]) -> io::Result<()> {
+fn put_eventually(cache: &cache2::Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
     loop {
         match cache.put(key, value) {

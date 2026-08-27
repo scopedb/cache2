@@ -1,7 +1,7 @@
 use std::env;
 use std::io;
 
-use cache_rs::benchmarking::{
+use cache2::benchmarking::{
     RegionIndexTurnoverConfig, RegionIndexTurnoverPhase, run_region_index_turnover,
 };
 
@@ -25,7 +25,7 @@ fn main() -> io::Result<()> {
     };
     let report = run_region_index_turnover(config)?;
 
-    println!("cache-rs RegionIndex turnover benchmark");
+    println!("C² RegionIndex turnover benchmark");
     println!(
         "regions={} entries_per_region={} physical_entries={} key_space={} index_slots={} load={:.1}% partitions={} partition_slots={}..={} turns={} sample_ops={}",
         report.config.region_count,

@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache_rs::{
-    CacheHealth, DetailedCacheSnapshot, HybridCache, HybridCacheConfig, IoEngine, IoMode,
-    RuntimeConfig, StartupMode, StaticConfig,
+use cache2::{
+    Cache, CacheConfig, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, RuntimeConfig,
+    StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -147,7 +147,7 @@ impl SoakFiles {
             .as_nanos();
         Self {
             data: directory.join(format!(
-                "cache-rs-hybrid-soak-{}-{timestamp}.cache",
+                "cache2-soak-{}-{timestamp}.cache",
                 std::process::id()
             )),
         }
@@ -240,7 +240,7 @@ fn main() -> io::Result<()> {
     let config = SoakConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.readers.max(2))
-        .thread_name("cache-rs-soak")
+        .thread_name("cache2-soak")
         .enable_time()
         .build()?;
     let files = SoakFiles::new(&config.directory);
@@ -294,7 +294,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "cache-rs soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} read_io_workers={} write_io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} read_io_workers={} write_io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -453,9 +453,9 @@ fn open_cache(
     runtime: &tokio::runtime::Runtime,
     files: &SoakFiles,
     config: &SoakConfig,
-) -> io::Result<HybridCache> {
+) -> io::Result<Cache> {
     runtime.block_on(async {
-        HybridCacheConfig::from_static(&files.data, config.static_config())
+        CacheConfig::from_static(&files.data, config.static_config())
             .with_runtime_config(config.runtime_config())
             .open()
             .await
@@ -463,7 +463,7 @@ fn open_cache(
 }
 
 fn populate_for_warm_reopen(
-    cache: &HybridCache,
+    cache: &Cache,
     config: &SoakConfig,
     keys: &[Box<[u8]>],
     expected: &[AtomicU64],
@@ -504,7 +504,7 @@ fn populate_for_warm_reopen(
 
 #[allow(clippy::too_many_arguments)]
 fn run_writer(
-    cache: &HybridCache,
+    cache: &Cache,
     config: &SoakConfig,
     keys: &[Box<[u8]>],
     expected: &[AtomicU64],
@@ -571,7 +571,7 @@ fn run_writer(
 
 #[allow(clippy::too_many_arguments)]
 fn run_reader(
-    cache: &HybridCache,
+    cache: &Cache,
     config: &SoakConfig,
     keys: &[Box<[u8]>],
     expected: &[AtomicU64],
@@ -664,7 +664,7 @@ fn validate_observed(
 }
 
 fn resource_sample(
-    cache: &HybridCache,
+    cache: &Cache,
     files: &SoakFiles,
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,

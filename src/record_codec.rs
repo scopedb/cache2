@@ -191,8 +191,8 @@ mod tests {
     #[test]
     fn seeded_xxh3_vectors_define_key_hashing() {
         let seed = 0x6a09_e667_f3bc_c909;
-        let actual = [hash_key(seed, b""), hash_key(seed, b"cache-rs\0key")];
-        assert_eq!(actual, [0x4e79_f242_1392_7a65, 0xc0ec_b0e2_0a80_44ca,]);
+        let actual = [hash_key(seed, b""), hash_key(seed, b"cache2\0key")];
+        assert_eq!(actual, [0x4e79_f242_1392_7a65, 0xd168_c107_36e1_695c,]);
     }
 
     #[test]

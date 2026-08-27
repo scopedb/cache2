@@ -1,4 +1,4 @@
-# cache-rs milestones
+# C² milestones
 
 Milestones describe maturity, not file-format or crate versions. Promotion is
 based on exit criteria rather than dates.
@@ -12,13 +12,13 @@ source of truth and may be updated with the implementation. After `M4`, an
 incompatible persisted-layout change must use a new format version. Runtime
 configuration never participates in format versioning.
 
-## M0 — HybridCache baseline
+## M0 — Cache baseline
 
 **Status:** complete
 
 Deliver one simple bounded RAM + Region SSD architecture:
 
-- [x] one public `HybridCache` API and one Region format;
+- [x] one public `Cache` API and one Region format;
 - [x] shard-local L1, staging, ordering, and L2 ownership;
 - [x] default POSIX positioned-I/O engine, explicit optional io_uring engine,
   and independently configurable read/write I/O worker counts;

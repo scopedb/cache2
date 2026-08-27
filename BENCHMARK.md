@@ -1,4 +1,4 @@
-# cache-rs benchmark baseline
+# C² benchmark baseline
 
 This file records the reproducible developer baseline. It is a comparison aid,
 not an NVMe claim; device-qualified profiles belong to M2.
@@ -200,7 +200,7 @@ Five consecutive release runs were collected with:
 
 ```sh
 for run in 1 2 3 4 5; do
-  cargo bench --bench hybrid_cache --quiet
+  cargo bench --bench cache --quiet
 done
 ```
 
@@ -224,10 +224,10 @@ predates the current CLOCK-only API and Rust 1.98.0 qualification contract.
 Reader-thread and runtime L1-shard counts varied while persistent topology
 stayed fixed; every returned value's embedded key ordinal was verified.
 
-With 64 L1 shards, cache-rs scaled through four reader threads before the VM's
+With 64 L1 shards, C² scaled through four reader threads before the VM's
 shared-cache and scheduling costs dominated:
 
-| Reader threads | cache-rs | Foyer 0.22.3 |
+| Reader threads | C² | Foyer 0.22.3 |
 |---:|---:|---:|
 | 1 | 16.79 Mops/s | 9.12 Mops/s |
 | 2 | 23.90 Mops/s | 5.28 Mops/s |
@@ -238,7 +238,7 @@ shared-cache and scheduling costs dominated:
 At 16 reader threads, increasing only L1 shards exposed the lock-contention
 curve while leaving the persistent topology unchanged:
 
-| L1 shards | cache-rs | Foyer 0.22.3 |
+| L1 shards | C² | Foyer 0.22.3 |
 |---:|---:|---:|
 | 1 | 2.09 Mops/s | 0.48 Mops/s |
 | 2 | 4.05 Mops/s | 1.16 Mops/s |
@@ -255,7 +255,7 @@ dependencies.
 
 ## M3 observability cost — 2026-08-24
 
-After adding `HybridCache::snapshot()`, the same five-run procedure was repeated
+After adding `Cache::snapshot()`, the same five-run procedure was repeated
 with data-path counters disabled (the default) and with
 `CACHE_BENCH_STATS=true`. Latencies are medians:
 
@@ -411,7 +411,7 @@ set in a new caller-owned report directory:
 ```sh
 ./scripts/qualify-linux-nvme.sh \
   /mnt/nvme \
-  /var/tmp/cache-rs-qualification-2026-08-24
+  /var/tmp/cache2-qualification-2026-08-24
 ```
 
 It requires Linux, a writable cache directory, a new report path under an
@@ -486,7 +486,7 @@ CACHE_SOAK_SAMPLE_SECONDS=10 \
 CACHE_SOAK_DIR=/mnt/nvme \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=direct \
-cargo +1.98.0 bench --locked --bench hybrid_cache_soak
+cargo +1.98.0 bench --locked --bench cache_soak
 ```
 
 `CACHE_SOAK_CAPACITY_MIB`, `CACHE_SOAK_MEMORY_MIB`,

@@ -1,4 +1,4 @@
-//! Bounded shard-local RAM tier for the HybridCache data path.
+//! Bounded shard-local RAM tier for the Cache data path.
 //!
 //! L1 is process-local and never participates in recovery. Entries are visible
 //! immediately, may be discarded at any time, and use a small bounded eviction

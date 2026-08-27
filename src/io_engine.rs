@@ -1745,7 +1745,7 @@ impl BackendIoEngine {
             let worker_shared = Arc::clone(&shared);
             let worker_receiver = Arc::clone(&receiver);
             let spawn_result = std::thread::Builder::new()
-                .name(format!("cache-rs-sync-io-{worker_index}"))
+                .name(format!("cache2-sync-io-{worker_index}"))
                 .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver));
             match spawn_result {
@@ -2070,7 +2070,7 @@ mod uring {
             let worker_shared = Arc::clone(&shared);
             let worker_submit_state = Arc::clone(&submit_state);
             let worker = std::thread::Builder::new()
-                .name("cache-rs-uring-io".into())
+                .name("cache2-uring-io".into())
                 .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || {
                     uring_driver(
@@ -3019,10 +3019,8 @@ mod tests {
     impl TestFile {
         fn new() -> Self {
             let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "cache-rs-io-engine-{}-{id}.bin",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("cache2-io-engine-{}-{id}.bin", std::process::id()));
             Self { path }
         }
 

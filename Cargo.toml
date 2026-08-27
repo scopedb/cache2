@@ -1,26 +1,26 @@
 [package]
-name = "cache-rs"
+name = "cache2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Performance-first bounded RAM and NVMe hybrid cache"
 license = "Apache-2.0"
 readme = "README.md"
-documentation = "https://docs.rs/cache-rs"
+documentation = "https://docs.rs/cache2"
 keywords = ["cache", "nvme", "storage"]
 categories = ["caching", "data-structures"]
 exclude = ["fuzz/", ".github/"]
 
 [lib]
-name = "cache_rs"
+name = "cache2"
 path = "src/lib.rs"
 
 [[bench]]
-name = "hybrid_cache"
+name = "cache"
 harness = false
 
 [[bench]]
-name = "hybrid_cache_soak"
+name = "cache_soak"
 harness = false
 
 [[bench]]

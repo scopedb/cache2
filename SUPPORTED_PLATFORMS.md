@@ -1,6 +1,6 @@
 # Supported platforms
 
-cache-rs is still before its M4/1.0 support freeze. This list distinguishes
+C² is still before its M4/1.0 support freeze. This list distinguishes
 locally validated behavior from intended device support.
 
 | Platform | I/O path | Current status |

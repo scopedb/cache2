@@ -1,6 +1,6 @@
-# cache-rs
+# C²
 
-`cache-rs` is a bounded, performance-first RAM + Region SSD HybridCache for file
+**C²** is a bounded, performance-first RAM + Region SSD cache for file
 chunks. It is disposable acceleration, not durable storage.
 
 The persistence contract is intentionally narrow:
@@ -16,7 +16,7 @@ The persistence contract is intentionally narrow:
 ## Usage
 
 ```rust
-use cache_rs::{HybridCacheConfig, IoEngine, RuntimeConfig, StaticConfig};
+use cache2::{CacheConfig, IoEngine, RuntimeConfig, StaticConfig};
 # async fn run() -> Result<(), std::io::Error> {
 
 let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
@@ -34,7 +34,7 @@ let runtime_config = RuntimeConfig::default()
     .with_write_shards(8)
     .with_write_batch_size(4 * 1024 * 1024);
 
-let cache = HybridCacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
+let cache = CacheConfig::from_static("/mnt/nvme/chunks.cache", static_config)
     .with_runtime_config(runtime_config)
     .open()
     .await?;
@@ -60,9 +60,9 @@ can instead bind cache lifecycle work and L2 read deadlines to a specific
 runtime by passing its cloned handle:
 
 ```rust,no_run
-# use cache_rs::HybridCacheConfig;
+# use cache2::CacheConfig;
 # async fn open_cache(handle: tokio::runtime::Handle) -> std::io::Result<()> {
-let cache = HybridCacheConfig::new("/mnt/nvme/chunks.cache", 64 * 1024 * 1024 * 1024)
+let cache = CacheConfig::new("/mnt/nvme/chunks.cache", 64 * 1024 * 1024 * 1024)
     .with_tokio_handle(handle)
     .open()
     .await?;
@@ -77,7 +77,7 @@ cache is closed. Pass `runtime.handle().clone()` when the caller owns a
 
 ## Logging
 
-`cache-rs` emits structured lifecycle records through the `log` facade and
+**C²** emits structured lifecycle records through the `log` facade and
 leaves the process-global logger under application control. Tokio applications
 can install logforth before opening the cache:
 
@@ -91,7 +91,7 @@ logforth::starter_log::stderr()
     .apply();
 ```
 
-Enable the records with `RUST_LOG=cache_rs=info`. The emitted events cover the
+Enable the records with `RUST_LOG=cache2=info`. The emitted events cover the
 cold-recovery reason, successful or failed open, fast or warm close, and the
 first transition into miss-only mode. Normal `get`, `put`, delete, contention,
 and cache-miss paths do not log. A successful open reports `index_backing` as
@@ -101,10 +101,10 @@ The checked-in example persists a small warm image so two runs demonstrate a
 cold open followed by a warm open:
 
 ```sh
-RUST_LOG=cache_rs=info cargo run --example logforth -- /tmp/cache-rs-logforth.data
+RUST_LOG=cache2=info cargo run --example logforth -- /tmp/cache2-logforth.data
 ```
 
-`HybridCache` has one raw byte-key space. If an application needs logical
+`Cache` has one raw byte-key space. If an application needs logical
 namespaces, encode the namespace into the key before calling the cache; it then
 participates naturally in hashing and full-key validation without a separate
 cache concept or routing layer.
@@ -231,7 +231,7 @@ including the data/state files and both recovery images that may coexist during
 atomic warm publication.
 
 Invalid runtime topology is rejected before cache files are opened or created.
-`HybridCache::snapshot()` reports puts, deletes, tier hits/misses, promotions,
+`Cache::snapshot()` reports puts, deletes, tier hits/misses, promotions,
 L1 evictions and bypasses, served and written bytes,
 overload/failure/rotation counters, lifecycle health, current and peak managed
 memory against its configured limit, and the configured logical-disk peak.
@@ -242,7 +242,7 @@ Data-path counters reset on every open and are enabled with
 the performance-first path. Index reuse/replacement counters follow the same
 switch; fixed capacity and physical occupancy remain available when it is off.
 
-`HybridCache::detailed_snapshot()` adds write-buffer rejection counters,
+`Cache::detailed_snapshot()` adds write-buffer rejection counters,
 aggregate worker I/O activity,
 fixed/resident/retained L1 accounting, physical index occupancy and bounded
 slot-reuse/replacement counters, and aggregate Region capacity, occupancy,
@@ -315,7 +315,7 @@ procedure are in `BENCHMARK.md`.
 Run the release benchmark with:
 
 ```sh
-cargo bench --bench hybrid_cache
+cargo bench --bench cache
 ```
 
 It measures concurrent non-blocking `put` retries plus `drain`, resident L1
@@ -342,7 +342,7 @@ is a hard failure. The resident L1 phase uses only the configured bounded
 subset and explicitly warms that subset before measurement; target-device
 qualification requires an L2 data set larger than host RAM.
 The configurable turnover soak is available through
-`cargo bench --bench hybrid_cache_soak`; use the multi-hour device command in
+`cargo bench --bench cache_soak`; use the multi-hour device command in
 `BENCHMARK.md` for M2 validation. Its engine and mode are independently
 selectable with `CACHE_SOAK_IO_ENGINE` and `CACHE_SOAK_IO_MODE`; the engine
 defaults to `posix`. By default it uses four writers and four readers,

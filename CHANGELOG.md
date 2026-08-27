@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to cache-rs are recorded here. The crate follows semantic
+All notable changes to C² are recorded here. The crate follows semantic
 versioning for its Rust API. The disposable disk format has an independent
 version number documented in `MILESTONES.md`.
 
@@ -8,7 +8,7 @@ version number documented in `MILESTONES.md`.
 
 ### Added
 
-- bounded RAM + Region SSD `HybridCache` with shard-local staging and L1;
+- bounded RAM + Region SSD `Cache` with shard-local staging and L1;
 - POSIX positioned-I/O and optional Linux io_uring engines with runtime worker
   tuning;
 - fast cold restart and graceful warm-image recovery;
@@ -36,6 +36,9 @@ version number documented in `MILESTONES.md`.
 
 ### Changed
 
+- renamed the project to C² and the crate to `cache2`; simplified the public
+  entry points to `Cache` and `CacheConfig` without green-field compatibility
+  aliases;
 - made POSIX positioned I/O the only default engine, renamed `IoEngine::Sync`
   to `IoEngine::Posix`, removed implicit `IoEngine::Auto` selection, and made
   io_uring an explicit opt-in crate feature;
@@ -75,7 +78,7 @@ version number documented in `MILESTONES.md`.
 - removed time-based expiration from the API, memory tier, request path, and
   record format; cache lifetime is governed only by eviction and explicit delete.
 - replaced the capacity-overwriting cache builder path with
-  `HybridCacheConfig::from_static` so the supplied static layout is preserved.
+  `CacheConfig::from_static` so the supplied static layout is preserved.
 - renamed the ambiguous snapshot `read_bytes` counter to `served_bytes` to
   distinguish bytes returned to callers from underlying device I/O bytes.
 - replaced the fixed maximum-size foreground read pool with exact-size

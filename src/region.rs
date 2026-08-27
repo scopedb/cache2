@@ -107,7 +107,7 @@ impl RegionHealthLatch {
     pub(crate) fn enter_miss_only(&self) {
         if self.transition_to_miss_only() {
             log::warn!(
-                target: "cache_rs::health",
+                target: "cache2::health",
                 event = "cache_miss_only",
                 reason = "internal_failure";
                 "cache entered miss-only mode"
@@ -118,7 +118,7 @@ impl RegionHealthLatch {
     fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl std::fmt::Display) {
         if self.transition_to_miss_only() {
             log::warn!(
-                target: "cache_rs::health",
+                target: "cache2::health",
                 event = "cache_miss_only",
                 reason,
                 error:% = error;
@@ -1240,7 +1240,7 @@ where
 
     fn log_cold_recovery(&self, reason: &'static str) {
         log::info!(
-            target: "cache_rs::recovery",
+            target: "cache2::recovery",
             event = "cache_recovery_cold",
             path:% = self.files.data.display(),
             reason;
@@ -2341,7 +2341,7 @@ mod tests {
         fn new() -> Self {
             let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir()
-                .join(format!("cache-rs-region-{}-{ordinal}", std::process::id()));
+                .join(format!("cache2-region-{}-{ordinal}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir(&root).unwrap();
             let files = RegionFiles::new(
@@ -2509,8 +2509,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn external_process_kill_recovery_contract() {
-        const CHILD_CASE: &str = "CACHE_RS_CRASH_CHILD_CASE";
-        const CHILD_ROOT: &str = "CACHE_RS_CRASH_CHILD_ROOT";
+        const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
+        const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
 
         if let Ok(case) = std::env::var(CHILD_CASE) {
             let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child root is set"));

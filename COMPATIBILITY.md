@@ -1,6 +1,6 @@
 # Compatibility policy
 
-cache-rs is currently `0.1.x` and has not reached the M4 compatibility freeze.
+C² is currently `0.1.x` and has not reached the M4 compatibility freeze.
 This document describes the candidate contract; it becomes a release promise
 only when M4 is complete.
 
@@ -8,9 +8,9 @@ only when M4 is complete.
 
 The intended 1.0 surface is deliberately small:
 
-- `HybridCacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and
+- `CacheConfig`, `StaticConfig`, and `RuntimeConfig` configure and
   asynchronously open a cache;
-- `HybridCache` provides synchronous point mutations plus native Tokio-async
+- `Cache` provides synchronous point mutations plus native Tokio-async
   reads and lifecycle operations,
   a completion fence, snapshots, and explicit fast or warm close;
 - `Value`, `CacheTier`, `StartupMode`, and `CacheHealth` describe results;
@@ -26,7 +26,7 @@ returned records directly.
 Public operations use `std::io::Result`. Write admission saturation is
 `std::io::ErrorKind::WouldBlock`; read allocation and I/O pressure fail open as
 cache misses. Persistent runtime health and write-saturation counters are
-available through `HybridCache::snapshot()`.
+available through `Cache::snapshot()`.
 
 ## Disk format
 

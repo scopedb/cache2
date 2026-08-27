@@ -2,7 +2,7 @@
 //!
 //! Ordinary mutations are process-visible cache updates, not durable storage
 //! writes. An unclean restart always opens empty without scanning the data
-//! extent. Only [`HybridCache::close_warm`] publishes a recoverable image.
+//! extent. Only [`Cache::close_warm`] publishes a recoverable image.
 
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]
@@ -35,7 +35,7 @@ mod resources;
 mod runtime_config;
 mod snapshot;
 
-pub use cache::{CacheTier, HybridCache, HybridCacheConfig, Result, StaticConfig, Value};
+pub use cache::{Cache, CacheConfig, CacheTier, Result, StaticConfig, Value};
 pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot,

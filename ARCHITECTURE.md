@@ -1,12 +1,12 @@
-# cache-rs architecture
+# C² architecture
 
 ## Contract
 
-cache-rs optimizes the cache data path ahead of durability. The authoritative
+C² optimizes the cache data path ahead of durability. The authoritative
 copy of every value must live elsewhere.
 
 ```text
-HybridCache
+Cache
 ├── shared bounded RAM L1
 ├── fixed-capacity partitioned mmap index
 ├── append shards + one global Region free/sealed FIFO
@@ -170,7 +170,7 @@ rotations. The replacement counters follow the optional statistics switch;
 occupancy remains always available. Optional activity statistics separately
 classify read-memory and busy-engine misses.
 
-`HybridCache::snapshot()` also reads relaxed process-local counters for puts,
+`Cache::snapshot()` also reads relaxed process-local counters for puts,
 deletes, L1/L2 hits and misses, read-memory and busy-engine misses, L1 promotions,
 evictions/bypasses, logical bytes, write rejections, failures,
 and Region rotations. Health is `Running`,
@@ -182,7 +182,7 @@ remain observable when counters are disabled.
 
 ## Safety boundary
 
-HybridCache loss and stale valid values are acceptable; unchecked, wrong-key,
+Cache loss and stale valid values are acceptable; unchecked, wrong-key,
 out-of-bounds, or corrupt values are not.
 All sizes and offsets are checked, persistent structures are field-encoded and
 checksummed, reads verify full keys, Region reuse advances its created-sequence

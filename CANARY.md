@@ -7,7 +7,7 @@ observed result.
 
 ## Identity
 
-- cache-rs revision:
+- C² revision:
 - service revision:
 - environment and host class:
 - cache device and filesystem:
@@ -55,6 +55,6 @@ observed result.
 - unresolved cache-related findings:
 - owner and approval date:
 
-Attach raw service telemetry and `HybridCache::snapshot()` samples for the full
+Attach raw service telemetry and `Cache::snapshot()` samples for the full
 baseline and canary windows. A missing signal or shortened scenario is an
 incomplete canary, not a pass.

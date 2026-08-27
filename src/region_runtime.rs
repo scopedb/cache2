@@ -1297,7 +1297,7 @@ fn start_running(
     for shard_id in 0..shard_count {
         let worker_shared = Arc::clone(&shared);
         match std::thread::Builder::new()
-            .name(format!("cache-rs-shard-{shard_id}"))
+            .name(format!("cache2-shard-{shard_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || shard_worker(worker_shared, shard_id))
         {
@@ -1676,7 +1676,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
 fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
     let reaper_engine = Arc::clone(engine);
     let spawn = std::thread::Builder::new()
-        .name("cache-rs-io-reaper".to_owned())
+        .name("cache2-io-reaper".to_owned())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
             let _ = reaper_engine.shutdown();
@@ -1742,7 +1742,7 @@ mod tests {
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "cache-rs-read-lane-{}-{id}.cache",
+            "cache2-read-lane-{}-{id}.cache",
             std::process::id()
         ));
         let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());

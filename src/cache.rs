@@ -195,14 +195,14 @@ impl StaticConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct HybridCacheConfig {
+pub struct CacheConfig {
     path: PathBuf,
     static_config: StaticConfig,
     runtime_config: RuntimeConfig,
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
-impl HybridCacheConfig {
+impl CacheConfig {
     pub fn new(path: impl AsRef<Path>, capacity_bytes: u64) -> Self {
         Self::from_static(path, StaticConfig::new(capacity_bytes))
     }
@@ -232,7 +232,7 @@ impl HybridCacheConfig {
     /// Opens the cache on Tokio's blocking pool because recovery and file setup
     /// use blocking filesystem operations. Without an explicit handle, this
     /// captures the current Tokio runtime when the future is first polled.
-    pub async fn open(self) -> Result<HybridCache> {
+    pub async fn open(self) -> Result<Cache> {
         let tokio_handle = match self.tokio_handle.clone() {
             Some(handle) => handle,
             None => tokio::runtime::Handle::try_current().map_err(|error| {
@@ -251,7 +251,7 @@ impl HybridCacheConfig {
         self,
         tokio_handle: tokio::runtime::Handle,
         started: Instant,
-    ) -> Result<HybridCache> {
+    ) -> Result<Cache> {
         let path = self.path.clone();
         let capacity_bytes = self.static_config.capacity_bytes;
         let index_slots = self.static_config.index_slots;
@@ -260,7 +260,7 @@ impl HybridCacheConfig {
             Ok(cache) => {
                 let startup = cache.startup_mode();
                 log::info!(
-                    target: "cache_rs::lifecycle",
+                    target: "cache2::lifecycle",
                     event = "cache_opened",
                     path:% = path.display(),
                     startup = startup_name(startup),
@@ -272,7 +272,7 @@ impl HybridCacheConfig {
                 );
             }
             Err(error) => log::error!(
-                target: "cache_rs::lifecycle",
+                target: "cache2::lifecycle",
                 event = "cache_open_failed",
                 path:% = path.display(),
                 capacity_bytes,
@@ -285,7 +285,7 @@ impl HybridCacheConfig {
         result
     }
 
-    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> Result<HybridCache> {
+    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> Result<Cache> {
         let geometry = self.static_config.geometry()?;
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
         let runtime_config = self.runtime_config;
@@ -320,7 +320,7 @@ impl HybridCacheConfig {
             runtime_config,
         );
         let store = RegionStore::open(self.static_config.index_slots, backend)?;
-        Ok(HybridCache {
+        Ok(Cache {
             store,
             path: self.path,
             logical_disk_peak_bytes,
@@ -366,23 +366,23 @@ impl Value {
     }
 }
 
-pub struct HybridCache {
+pub struct Cache {
     store: RegionStore<FileRegionBackend<SystemRegionFileSystem>>,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
     tokio_handle: tokio::runtime::Handle,
 }
 
-impl fmt::Debug for HybridCache {
+impl fmt::Debug for Cache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("HybridCache")
+            .debug_struct("Cache")
             .field("startup", &self.startup_mode())
             .finish_non_exhaustive()
     }
 }
 
-impl HybridCache {
+impl Cache {
     pub fn startup_mode(&self) -> StartupMode {
         self.store.startup()
     }
@@ -493,7 +493,7 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
 fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &Result<()>) {
     match result {
         Ok(()) => log::info!(
-            target: "cache_rs::lifecycle",
+            target: "cache2::lifecycle",
             event = "cache_closed",
             path:% = path.display(),
             mode,
@@ -501,7 +501,7 @@ fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &
             "cache closed"
         ),
         Err(error) => log::error!(
-            target: "cache_rs::lifecycle",
+            target: "cache2::lifecycle",
             event = "cache_close_failed",
             path:% = path.display(),
             mode,

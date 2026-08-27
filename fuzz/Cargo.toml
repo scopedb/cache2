@@ -1,5 +1,5 @@
 [package]
-name = "cache-rs-fuzz"
+name = "cache2-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -8,7 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-cache-rs = { path = "..", features = ["fuzzing"] }
+cache2 = { path = "..", features = ["fuzzing"] }
 libfuzzer-sys = "0.4"
 
 [[bin]]

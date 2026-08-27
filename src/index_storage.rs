@@ -1997,7 +1997,7 @@ mod tests {
         fn create() -> Self {
             let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "cache-rs-index-image-{}-{id}.tmp",
+                "cache2-index-image-{}-{id}.tmp",
                 std::process::id()
             ));
             let file = OpenOptions::new()

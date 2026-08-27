@@ -1,4 +1,4 @@
-# cache-rs Engineering Constraints
+# C² Engineering Constraints
 
 ## Decision Priority
 
@@ -87,7 +87,7 @@ capacity; this is expected to be uncommon in normal operation.
 
 ## Cache and Durability Semantics
 
-- cache-rs is a best-effort cache, not a database. Eviction, bypass, rejection,
+- C² is a best-effort cache, not a database. Eviction, bypass, rejection,
   throttling, misses, and stale reads are valid outcomes.
 - Publish an L2 index entry only after the corresponding data write completes.
 - `drain` is an accepted-write completion barrier, not a durability sync.
