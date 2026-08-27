@@ -1211,9 +1211,8 @@ fn aggregate_io_stats(
         aggregate.completion_ns = aggregate
             .completion_ns
             .saturating_add(snapshot.completion_ns);
-        // File-set clones intentionally share one path counter so direct-I/O
-        // fallback is globally visible. Read it once rather than multiplying
-        // the same totals by the number of workers.
+        // File-set clones intentionally share one path counter. Read it once
+        // rather than multiplying the same totals by the number of workers.
         if engine_index == 0 {
             aggregate.direct_operations = snapshot.direct_operations;
             aggregate.direct_bytes = snapshot.direct_bytes;
