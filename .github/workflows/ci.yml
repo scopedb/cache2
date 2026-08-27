@@ -55,12 +55,12 @@ jobs:
         run: cargo test --release --all-features
 
   safety-checks:
-    name: persistent fuzz and mmap ASan
+    name: persistent fuzz, ASan, and TSan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly
-        run: rustup toolchain install nightly --profile minimal
+        run: rustup toolchain install nightly --profile minimal --component rust-src
       - name: Select Rust nightly
         run: rustup default nightly
       - name: Install cargo-fuzz
@@ -70,4 +70,8 @@ jobs:
       - name: Check mmap index with AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
-        run: "cargo test --lib index_storage::tests:: -- --test-threads=1"
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib index_storage::tests:: -- --test-threads=1
+      - name: Check concurrency with ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib -- --test-threads=1
