@@ -185,8 +185,9 @@ impl BenchConfig {
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size_bytes(REGION_BYTES as u64)
-            // Keep the benchmark's complete L2 working set comfortably below
-            // every page-aligned index partition's bounded-probe capacity.
+            // Keep every planned request an L2 hit so this harness measures
+            // storage rather than a mixture of hits and fast index misses.
+            // Production-load index behavior has its own turnover benchmark.
             .with_expected_entries(self.entries.saturating_mul(4))
     }
 
@@ -287,11 +288,15 @@ fn main() -> io::Result<()> {
 async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
+    let index_slots = config.static_config().index_slots();
+    let index_load = config.entries as f64 * 100.0 / index_slots as f64;
 
     println!("C² cache benchmark");
     println!(
-        "entries={} resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
+        index_slots,
+        index_load,
         config.resident_entries,
         config.hot_entries,
         config.hot_read_interval,
@@ -440,6 +445,13 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             snapshot.io.read.buffered.bytes,
             snapshot.io.read.direct.operations,
             snapshot.io.read.direct.bytes,
+        );
+        println!(
+            "result phase=memory managed_bytes={} managed_peak_bytes={} managed_limit_bytes={} logical_disk_peak_bytes={}",
+            snapshot.managed_memory_bytes,
+            snapshot.managed_memory_peak_bytes,
+            snapshot.managed_memory_limit_bytes,
+            snapshot.logical_disk_peak_bytes,
         );
     }
     Arc::try_unwrap(cache)

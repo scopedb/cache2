@@ -16,6 +16,10 @@ with best-effort promotion, and resident L1 reads populated in a fresh RAM tier.
 Values contain their key ordinal, so a wrong-key result is fatal. Writes retry
 `WouldBlock` only in the harness; this is not library behavior.
 
+The request-path workload uses 20% physical index load so every planned L2
+operation remains a storage hit. Use `region_index_turnover` below for the
+production 80% index load factor, bounded-probe cost, and replacement rate.
+
 The main controls are:
 
 - `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, and
