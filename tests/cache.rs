@@ -764,7 +764,25 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     }
     cache.drain().await.unwrap();
 
-    let resources = cache.snapshot().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let detailed = loop {
+        let detailed = cache.detailed_snapshot().unwrap();
+        let read = detailed.summary.io.read;
+        let read_terminal = read
+            .requests_succeeded
+            .saturating_add(read.requests_cancelled)
+            .saturating_add(read.requests_failed);
+        if detailed.summary.reclaim.regions > 0
+            && detailed.region.reclaiming_region_count == 0
+            && read.requests_in_flight == 0
+            && read.requests_submitted == read_terminal
+        {
+            break detailed;
+        }
+        assert!(Instant::now() < deadline, "reclaim did not make progress");
+        thread::yield_now();
+    };
+    let resources = detailed.summary;
     assert_eq!(resources.health, CacheHealth::Running);
     assert!(resources.statistics_enabled);
     assert_eq!(resources.puts, 128);
@@ -780,12 +798,10 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     assert!(resources.managed_memory_peak_bytes <= resources.managed_memory_limit_bytes);
     assert_eq!(resources.logical_disk_peak_bytes, expected_disk_peak);
 
-    let detailed = cache.detailed_snapshot().unwrap();
-    assert_eq!(detailed.summary, resources);
     assert_eq!(detailed.write_buffer_rejections, resources.write_rejections);
-    // Drain fences accepted writes, not the independent one-deep reclaim
-    // reader. A final Region cleanup may still be in flight.
-    assert!(resources.io.read.requests_in_flight <= 1);
+    // Drain does not fence the independent reclaimer. The bounded wait above
+    // observes it idle before checking exact cross-counter identities.
+    assert_eq!(resources.io.read.requests_in_flight, 0);
     assert_eq!(resources.io.write.requests_in_flight, 0);
     assert_eq!(
         resources.io.read.requests_submitted,
