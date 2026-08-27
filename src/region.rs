@@ -837,13 +837,7 @@ impl FileRegionCore {
         match submit_read(engine, slot, plan, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
-                if !matches!(
-                    error.kind(),
-                    io::ErrorKind::OutOfMemory
-                        | io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) {
+                if !is_read_availability_error(error.kind()) {
                     self.health
                         .enter_miss_only_with_error("record_read_submit_failed", &error);
                 }
@@ -859,8 +853,10 @@ impl FileRegionCore {
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.plan.hash;
         if let Err(error) = completion.result {
-            self.health
-                .enter_miss_only_with_error("record_read_completion_failed", &error);
+            if !is_read_availability_error(error.kind()) {
+                self.health
+                    .enter_miss_only_with_error("record_read_completion_failed", &error);
+            }
             return Err(error);
         }
         let Some(record) = completion.record_bytes() else {
@@ -1347,6 +1343,17 @@ impl FileRegionCore {
         self.health.enter_miss_only();
         let _ = staging.finish_failure(span, buffer, records);
     }
+}
+
+fn is_read_availability_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::OutOfMemory
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 pub(crate) fn runtime_fixed_memory_bytes(
@@ -3345,6 +3352,45 @@ mod tests {
         assert_eq!(engine.stats().requests.requests_submitted, 2);
         assert_eq!(engine.stats().requests.requests_succeeded, 2);
         engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn read_availability_errors_do_not_latch_miss_only() {
+        let data = data_path_superblock();
+        let runtime = FileRegionRuntime::install(
+            PartitionedIndexStorage::anonymous(64).unwrap(),
+            empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
+        )
+        .unwrap();
+        let entry = IndexEntry {
+            location: PackedLocation::new(0, 0, 64).unwrap(),
+        };
+
+        for kind in [
+            io::ErrorKind::OutOfMemory,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let completion = ReadCompletion {
+                plan: ReadPlan {
+                    hash: 7,
+                    entry,
+                    region_generation: 1,
+                    absolute: DATA_REGION_AREA_OFFSET,
+                    read_len: 64,
+                    record_range: 0..64,
+                },
+                result: Err(io::Error::new(kind, "injected read availability error")),
+                buffer: None,
+            };
+            let Err(error) = runtime.finish_value_read(completion, b"key") else {
+                panic!("injected read availability error unexpectedly succeeded");
+            };
+            assert_eq!(error.kind(), kind);
+            assert!(runtime.is_healthy(), "{kind:?}");
+        }
     }
 
     #[test]

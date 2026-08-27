@@ -2141,6 +2141,7 @@ fn is_read_pressure(kind: io::ErrorKind) -> bool {
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::TimedOut
             | io::ErrorKind::Interrupted
+            | io::ErrorKind::BrokenPipe
     )
 }
 
@@ -2198,6 +2199,13 @@ mod tests {
         drop(alternate);
         drop(primary);
         drop(selected);
+
+        engines[0].stop_accepting_requests();
+        let (selected, alternate) = try_reserve_read_lane(&engines, 0).unwrap();
+        assert!(Arc::ptr_eq(&selected, &engines[1]));
+        drop(alternate);
+        drop(selected);
+
         for engine in &engines {
             engine.shutdown().unwrap();
         }
@@ -2318,6 +2326,7 @@ mod tests {
             io::ErrorKind::WouldBlock,
             io::ErrorKind::TimedOut,
             io::ErrorKind::Interrupted,
+            io::ErrorKind::BrokenPipe,
         ] {
             assert!(is_read_pressure(kind));
         }
