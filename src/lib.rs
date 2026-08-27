@@ -38,6 +38,7 @@ mod snapshot;
 pub use cache::{Cache, CacheBuilder, CacheTier, Result, StaticConfig, Value};
 pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
 pub use snapshot::{
-    CacheHealth, CacheIndexSnapshot, CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot,
-    DetailedCacheSnapshot, RegionSnapshot, StartupMode,
+    CacheHealth, CacheIndexSnapshot, CacheIoDirectionSnapshot, CacheIoPathSnapshot,
+    CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot, DetailedCacheSnapshot, RegionSnapshot,
+    StartupMode,
 };

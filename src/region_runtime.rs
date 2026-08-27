@@ -29,7 +29,9 @@ use crate::resources::{
     ResourceController, ResourceLimits,
 };
 use crate::runtime_config::{MAX_APPEND_SHARDS, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig};
-use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
+use crate::snapshot::{
+    CacheHealth, CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
+};
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
@@ -50,6 +52,7 @@ const LIFECYCLE_FAILED: u8 = 2;
 const MUTATION_DRAINING: usize = 1_usize << (usize::BITS - 1);
 const MUTATION_COUNT_MASK: usize = !MUTATION_DRAINING;
 const MUTATION_ENTER_ATTEMPTS: usize = 8;
+static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 struct LifecycleDrainingGuard<'a> {
     lifecycle: &'a AtomicU8,
@@ -209,6 +212,7 @@ impl Drop for MutationDrainGuard<'_> {
 }
 
 struct RuntimeMetrics {
+    metrics_epoch: u64,
     lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
     write_rejections: AtomicU64,
@@ -261,6 +265,7 @@ impl RuntimeMetrics {
         })?;
         activity.resize_with(shard_count, ActivityMetrics::new);
         Ok(Self {
+            metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
             write_rejections: AtomicU64::new(0),
@@ -338,6 +343,7 @@ impl RuntimeMetrics {
                 l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
         }
         CacheSnapshot {
+            metrics_epoch: self.metrics_epoch,
             health,
             statistics_enabled,
             puts,
@@ -360,6 +366,7 @@ impl RuntimeMetrics {
             managed_memory_peak_bytes: memory.peak_bytes,
             managed_memory_limit_bytes: memory.limit_bytes,
             logical_disk_peak_bytes: 0,
+            io: CacheIoSnapshot::default(),
         }
     }
 }
@@ -1133,7 +1140,6 @@ impl RegionDataPlane {
                 .metrics
                 .write_buffer_rejections
                 .load(Ordering::Relaxed),
-            io: aggregate_io_stats(&running.read_engines, &running.write_engines),
             l1: running.memory.detailed_snapshot()?,
             index: self.core.index_snapshot()?,
             region: self.core.region_snapshot()?,
@@ -1141,12 +1147,14 @@ impl RegionDataPlane {
     }
 
     fn snapshot_running(&self, running: &RunningShared) -> CacheSnapshot {
-        self.metrics.snapshot(
+        let mut snapshot = self.metrics.snapshot(
             self.core.is_healthy(),
             self.config.statistics,
             running.resources.managed_memory_snapshot(),
             running.memory.metrics_snapshot(),
-        )
+        );
+        snapshot.io = aggregate_io_stats(&running.read_engines, &running.write_engines);
+        snapshot
     }
 
     /// Fences admission, drains all workers, and shuts down the I/O engine.
@@ -1194,33 +1202,46 @@ fn aggregate_io_stats(
     let mut aggregate = CacheIoSnapshot::default();
     for (engine_index, engine) in read_engines.iter().chain(write_engines).enumerate() {
         let snapshot = engine.stats();
-        aggregate.submitted = aggregate.submitted.saturating_add(snapshot.submitted);
-        aggregate.completed = aggregate.completed.saturating_add(snapshot.completed);
-        aggregate.cancel_requested = aggregate
-            .cancel_requested
-            .saturating_add(snapshot.cancel_requested);
-        aggregate.cancelled = aggregate.cancelled.saturating_add(snapshot.cancelled);
-        aggregate.errors = aggregate.errors.saturating_add(snapshot.errors);
-        aggregate.requests_in_flight = aggregate
-            .requests_in_flight
-            .saturating_add(snapshot.requests_in_flight);
-        aggregate.requests_in_flight_peak = aggregate
-            .requests_in_flight_peak
-            .saturating_add(snapshot.requests_in_flight_peak);
-        aggregate.slot_wait_ns = aggregate.slot_wait_ns.saturating_add(snapshot.slot_wait_ns);
-        aggregate.completion_ns = aggregate
-            .completion_ns
-            .saturating_add(snapshot.completion_ns);
+        if engine_index < read_engines.len() {
+            add_io_direction(&mut aggregate.read, snapshot.requests);
+        } else {
+            add_io_direction(&mut aggregate.write, snapshot.requests);
+        }
         // File-set clones intentionally share one path counter. Read it once
         // rather than multiplying the same totals by the number of workers.
         if engine_index == 0 {
-            aggregate.direct_operations = snapshot.direct_operations;
-            aggregate.direct_bytes = snapshot.direct_bytes;
-            aggregate.buffered_operations = snapshot.buffered_operations;
-            aggregate.buffered_bytes = snapshot.buffered_bytes;
+            aggregate.read.buffered = snapshot.runtime.read.buffered;
+            aggregate.read.direct = snapshot.runtime.read.direct;
+            aggregate.write.buffered = snapshot.runtime.write.buffered;
+            aggregate.write.direct = snapshot.runtime.write.direct;
         }
     }
     aggregate
+}
+
+fn add_io_direction(aggregate: &mut CacheIoDirectionSnapshot, snapshot: CacheIoDirectionSnapshot) {
+    aggregate.requests_submitted = aggregate
+        .requests_submitted
+        .saturating_add(snapshot.requests_submitted);
+    aggregate.requests_succeeded = aggregate
+        .requests_succeeded
+        .saturating_add(snapshot.requests_succeeded);
+    aggregate.requests_cancelled = aggregate
+        .requests_cancelled
+        .saturating_add(snapshot.requests_cancelled);
+    aggregate.requests_failed = aggregate
+        .requests_failed
+        .saturating_add(snapshot.requests_failed);
+    aggregate.requests_in_flight = aggregate
+        .requests_in_flight
+        .saturating_add(snapshot.requests_in_flight);
+    aggregate.requests_in_flight_peak = aggregate
+        .requests_in_flight_peak
+        .saturating_add(snapshot.requests_in_flight_peak);
+    aggregate.slot_wait_ns = aggregate.slot_wait_ns.saturating_add(snapshot.slot_wait_ns);
+    aggregate.request_time_ns = aggregate
+        .request_time_ns
+        .saturating_add(snapshot.request_time_ns);
 }
 
 fn start_running(

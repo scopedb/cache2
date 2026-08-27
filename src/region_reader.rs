@@ -274,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::index::PackedLocation;
-    use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint, WritePoint};
+    use crate::io_backend::{IoBackend, SyncMode, SyncPoint, WritePoint};
     use crate::io_engine::BackendIoEngine;
     use crate::resources::{ResourceController, ResourceLimits};
 
@@ -317,10 +317,6 @@ mod tests {
 
         fn unlock(&self) -> io::Result<()> {
             Ok(())
-        }
-
-        fn direct_io_stats(&self) -> DirectIoStats {
-            DirectIoStats::default()
         }
     }
 

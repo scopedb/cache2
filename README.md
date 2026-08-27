@@ -92,11 +92,53 @@ cache thread stacks. Invalid plans fail before cache files are created.
 
 ## Operations
 
-`Cache::snapshot()` exposes health, resource bounds, and optional activity
-counters. Enable request-path counters with
-`RuntimeConfig::with_statistics(true)`. `Cache::detailed_snapshot()` also
-reports L1/index pressure, staging, worker I/O, and Region occupancy; it is an
-on-demand diagnostic and should not run on the request hot path.
+`Cache::snapshot()` is lock-free and exposes health, resource bounds, optional
+cache activity, and read/write I/O counters split by buffered/direct path.
+Enable activity counters with `RuntimeConfig::with_statistics(true)`. Runtime
+file-operation counts are application-observed I/O, not physical device IOPS;
+buffer cache, readahead, and the block layer remain outside C².
+
+Export cumulative values rather than calculating rates inside C². An upper
+OpenTelemetry adapter can sample the snapshot on its Tokio runtime and use the
+following instruments. The same instruments translate directly to the shown
+Prometheus names:
+
+| Meaning | OpenTelemetry | Prometheus |
+| --- | --- | --- |
+| Get outcomes | `cache2.get.operations`, unit `{operation}` | `cache2_get_operations_total` |
+| Accepted mutations | `cache2.mutations`, unit `{operation}` | `cache2_mutations_total` |
+| Mutation rejections | `cache2.mutation.rejections`, unit `{operation}` | `cache2_mutation_rejections_total` |
+| Logical payload bytes | `cache2.data.io`, unit `By` | `cache2_data_io_bytes_total` |
+| Runtime file operations | `cache2.io.operations`, unit `{operation}` | `cache2_io_operations_total` |
+| Runtime file bytes | `cache2.io`, unit `By` | `cache2_io_bytes_total` |
+| Engine submissions | `cache2.io.requests`, unit `{request}` | `cache2_io_requests_total` |
+| Terminal outcomes | `cache2.io.request.completions`, unit `{request}` | `cache2_io_request_completions_total` |
+| Request time | `cache2.io.request.time`, unit `s` | `cache2_io_request_time_seconds_total` |
+| Slot-wait time | `cache2.io.slot.wait`, unit `s` | `cache2_io_slot_wait_seconds_total` |
+| Requests in flight | `cache2.io.request.in_flight`, unit `{request}` | `cache2_io_requests_in_flight` |
+| Managed memory | `cache2.memory.usage`, unit `By` | `cache2_memory_usage_bytes` |
+
+Use fixed `direction=read|write`, `path=buffered|direct`, and
+`outcome=success|cancelled|error` attributes. Cache keys, paths, Regions,
+shards, and workers must not become labels. `metrics_epoch` is a reset marker
+for the adapter, not a label: when it changes, use the current cumulative value
+as the first delta for the new open.
+
+For get outcomes, export `l1_hits`, `l2_hits`, and `l2_misses` as the disjoint
+`result=l1_hit|l2_hit|miss` series; `l1_misses` overlaps the latter two and must
+not be summed into that result set. If `statistics_enabled` is false, omit
+activity series rather than exporting misleading zero traffic; health and
+resource gauges remain available.
+
+Prometheus derives runtime IOPS with
+`rate(cache2_io_operations_total[5m])`, throughput with
+`rate(cache2_io_bytes_total[5m])`, and average operation size by dividing the
+byte rate by the operation rate. The current counters support average request
+time, not latency percentiles.
+
+`Cache::detailed_snapshot()` additionally reports L1/index pressure, staging,
+and Region occupancy. It briefly locks and scans Region metadata, so sample it
+slowly or on demand rather than from a scrape callback.
 
 Structural or device failure moves reads to fail-open misses when safe operation
 cannot continue. Writes remain explicit errors. Normal cache misses and request

@@ -2976,8 +2976,8 @@ mod tests {
             faults.events(),
             vec![FaultEvent::Write(WritePoint::Record), FaultEvent::Read]
         );
-        assert_eq!(engine.stats().submitted, 2);
-        assert_eq!(engine.stats().completed, 2);
+        assert_eq!(engine.stats().requests.requests_submitted, 2);
+        assert_eq!(engine.stats().requests.requests_succeeded, 2);
         engine.shutdown().unwrap();
     }
 

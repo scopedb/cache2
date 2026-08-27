@@ -714,6 +714,19 @@ fn report_sample(
     let prefix = if complete { "complete " } else { "" };
     let detailed = &sample.detailed;
     let resources = detailed.summary;
+    let io = resources.io;
+    let io_submitted = io
+        .read
+        .requests_submitted
+        .saturating_add(io.write.requests_submitted);
+    let io_completed = io
+        .read
+        .requests_succeeded
+        .saturating_add(io.read.requests_cancelled)
+        .saturating_add(io.read.requests_failed)
+        .saturating_add(io.write.requests_succeeded)
+        .saturating_add(io.write.requests_cancelled)
+        .saturating_add(io.write.requests_failed);
     println!(
         "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_deleted={} index_deleted_reuses={} index_stale_reuses={} index_live_replacements={} io_submitted={} io_completed={} io_errors={} io_in_flight_peak={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
         elapsed.as_secs_f64(),
@@ -747,10 +760,14 @@ fn report_sample(
         detailed.index.deleted_slot_reuses,
         detailed.index.stale_slot_reuses,
         detailed.index.live_slot_replacements,
-        detailed.io.submitted,
-        detailed.io.completed,
-        detailed.io.errors,
-        detailed.io.requests_in_flight_peak,
+        io_submitted,
+        io_completed,
+        io.read
+            .requests_failed
+            .saturating_add(io.write.requests_failed),
+        io.read
+            .requests_in_flight_peak
+            .saturating_add(io.write.requests_in_flight_peak),
         resources.managed_memory_bytes,
         max_managed_memory,
         resources.managed_memory_limit_bytes,

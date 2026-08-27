@@ -26,7 +26,13 @@ use std::time::{Duration, Instant};
         target_arch = "powerpc64"
     )
 ))]
-use crate::io_backend::DirectIoStatsHandle;
+use crate::io_backend::RuntimeIoStatsHandle;
+use crate::io_backend::{
+    IoBackend, RuntimeIoStats, WritePoint, read_exact_at_uninit_with_progress,
+    write_all_at_with_progress,
+};
+#[cfg(unix)]
+use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 #[cfg(all(
     feature = "io-uring",
     target_os = "linux",
@@ -38,16 +44,11 @@ use crate::io_backend::DirectIoStatsHandle;
         target_arch = "powerpc64"
     )
 ))]
-use crate::io_backend::RuntimeIoPath;
-use crate::io_backend::{
-    IoBackend, WritePoint, read_exact_at_uninit_with_progress, write_all_at_with_progress,
-};
-#[cfg(unix)]
-use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
+use crate::io_backend::{RuntimeIoDirection, RuntimeIoPath};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
 #[cfg(unix)]
 use crate::runtime_config::IoEngine as ConfiguredIoEngine;
-use crate::snapshot::CacheIoSnapshot;
+use crate::snapshot::CacheIoDirectionSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
@@ -58,6 +59,12 @@ pub(crate) const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cancellation is only a request. Give the target operation a short window to
 /// publish its own completion, which is the actual buffer-lifetime fence.
 pub(crate) const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EngineIoSnapshot {
+    pub(crate) requests: CacheIoDirectionSnapshot,
+    pub(crate) runtime: RuntimeIoStats,
+}
 
 /// A logical range of an engine-budgeted aligned buffer lease.
 pub(crate) struct IoBuffer {
@@ -256,6 +263,24 @@ pub(crate) enum OperationKind {
 impl OperationKind {
     const fn uses_write_slot(self) -> bool {
         matches!(self, Self::Write)
+    }
+
+    #[cfg(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        )
+    ))]
+    const fn io_direction(self) -> RuntimeIoDirection {
+        match self {
+            Self::Read => RuntimeIoDirection::Read,
+            Self::Write => RuntimeIoDirection::Write,
+        }
     }
 }
 
@@ -880,7 +905,7 @@ pub(crate) trait IoEngine: Send + Sync {
     fn has_unfenced_writes(&self) -> bool;
     #[cfg(test)]
     fn mark_unfenced_writes_for_test(&self);
-    fn stats(&self) -> CacheIoSnapshot;
+    fn stats(&self) -> EngineIoSnapshot;
 
     #[cfg(test)]
     fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
@@ -943,13 +968,12 @@ struct RuntimeShared {
     /// linearization point.
     slot_state: AtomicU64,
     in_flight_peak: AtomicUsize,
-    submitted: AtomicU64,
-    completed: AtomicU64,
-    cancel_requested: AtomicU64,
-    cancelled: AtomicU64,
-    errors: AtomicU64,
+    requests_submitted: AtomicU64,
+    requests_succeeded: AtomicU64,
+    requests_cancelled: AtomicU64,
+    requests_failed: AtomicU64,
     slot_wait_ns: AtomicU64,
-    completion_ns: AtomicU64,
+    request_time_ns: AtomicU64,
     cancel_scan_needed: AtomicBool,
     unfenced_writes: AtomicBool,
     slot_lock: Mutex<()>,
@@ -970,13 +994,12 @@ impl RuntimeShared {
             accepting: AtomicBool::new(true),
             slot_state: AtomicU64::new(0),
             in_flight_peak: AtomicUsize::new(0),
-            submitted: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
-            cancel_requested: AtomicU64::new(0),
-            cancelled: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
+            requests_submitted: AtomicU64::new(0),
+            requests_succeeded: AtomicU64::new(0),
+            requests_cancelled: AtomicU64::new(0),
+            requests_failed: AtomicU64::new(0),
             slot_wait_ns: AtomicU64::new(0),
-            completion_ns: AtomicU64::new(0),
+            request_time_ns: AtomicU64::new(0),
             cancel_scan_needed: AtomicBool::new(false),
             unfenced_writes: AtomicBool::new(false),
             slot_lock: Mutex::new(()),
@@ -1191,18 +1214,19 @@ impl RuntimeShared {
         submitted_at: Option<Instant>,
     ) {
         if self.statistics_enabled {
-            self.completed.fetch_add(1, Ordering::Relaxed);
             match &status {
-                CompletionStatus::Completed => {}
+                CompletionStatus::Completed => {
+                    self.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
                 CompletionStatus::Cancelled => {
-                    self.cancelled.fetch_add(1, Ordering::Relaxed);
+                    self.requests_cancelled.fetch_add(1, Ordering::Relaxed);
                 }
                 CompletionStatus::Failed(_) => {
-                    self.errors.fetch_add(1, Ordering::Relaxed);
+                    self.requests_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
             if let Some(submitted_at) = submitted_at {
-                add_duration_ns(&self.completion_ns, submitted_at.elapsed());
+                add_duration_ns(&self.request_time_ns, submitted_at.elapsed());
             }
         }
         drop(slot);
@@ -1215,24 +1239,23 @@ impl RuntimeShared {
         });
     }
 
-    fn snapshot(&self) -> CacheIoSnapshot {
-        let in_flight = self.total_in_flight();
-        CacheIoSnapshot {
-            submitted: self.submitted.load(Ordering::Relaxed),
-            completed: self.completed.load(Ordering::Relaxed),
-            cancel_requested: self.cancel_requested.load(Ordering::Relaxed),
-            cancelled: self.cancelled.load(Ordering::Relaxed),
-            errors: self.errors.load(Ordering::Relaxed),
-            requests_in_flight: usize_to_u64(in_flight),
+    fn snapshot(&self) -> CacheIoDirectionSnapshot {
+        let requests_in_flight = self.total_in_flight();
+        CacheIoDirectionSnapshot {
+            requests_submitted: self.requests_submitted.load(Ordering::Relaxed),
+            requests_succeeded: self.requests_succeeded.load(Ordering::Relaxed),
+            requests_cancelled: self.requests_cancelled.load(Ordering::Relaxed),
+            requests_failed: self.requests_failed.load(Ordering::Relaxed),
+            requests_in_flight: usize_to_u64(requests_in_flight),
             requests_in_flight_peak: usize_to_u64(
-                self.in_flight_peak.load(Ordering::Relaxed).max(in_flight),
+                self.in_flight_peak
+                    .load(Ordering::Relaxed)
+                    .max(requests_in_flight),
             ),
             slot_wait_ns: self.slot_wait_ns.load(Ordering::Relaxed),
-            completion_ns: self.completion_ns.load(Ordering::Relaxed),
-            direct_operations: 0,
-            direct_bytes: 0,
-            buffered_operations: 0,
-            buffered_bytes: 0,
+            request_time_ns: self.request_time_ns.load(Ordering::Relaxed),
+            buffered: Default::default(),
+            direct: Default::default(),
         }
     }
 }
@@ -1365,7 +1388,6 @@ impl RuntimeInner {
         slot: ReadSlot,
         operation: IoOperation,
     ) -> Result<IoRequest, SubmitError> {
-        let submit_started = self.shared.statistics_enabled.then(Instant::now);
         if operation.kind() != OperationKind::Read || !Arc::ptr_eq(&slot.slot.shared, &self.shared)
         {
             return Err(SubmitError {
@@ -1379,7 +1401,8 @@ impl RuntimeInner {
         if let Err(error) = operation.validate() {
             return Err(SubmitError { error, operation });
         }
-        self.submit_with_slot(operation, slot.slot, submit_started, true)
+        let request_started = self.shared.statistics_enabled.then(Instant::now);
+        self.submit_with_slot(operation, slot.slot, request_started, true)
     }
 
     #[cfg(test)]
@@ -1407,7 +1430,6 @@ impl RuntimeInner {
         operation: IoOperation,
         slot_mode: SlotMode<'_>,
     ) -> Result<IoRequest, SubmitError> {
-        let submit_started = self.shared.statistics_enabled.then(Instant::now);
         let nonblocking = match slot_mode {
             #[cfg(test)]
             SlotMode::Try => true,
@@ -1419,6 +1441,7 @@ impl RuntimeInner {
             return Err(SubmitError { error, operation });
         }
         let write = operation.kind().uses_write_slot();
+        let slot_wait_started = self.shared.statistics_enabled.then(Instant::now);
         let slot = match slot_mode {
             #[cfg(test)]
             SlotMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(io::Error::new(
@@ -1457,15 +1480,19 @@ impl RuntimeInner {
                 return Err(SubmitError { error, operation });
             }
         };
+        if let Some(slot_wait_started) = slot_wait_started {
+            add_duration_ns(&self.shared.slot_wait_ns, slot_wait_started.elapsed());
+        }
 
-        self.submit_with_slot(operation, slot, submit_started, nonblocking)
+        let request_started = self.shared.statistics_enabled.then(Instant::now);
+        self.submit_with_slot(operation, slot, request_started, nonblocking)
     }
 
     fn submit_with_slot(
         &self,
         operation: IoOperation,
         slot: IoSlot,
-        submit_started: Option<Instant>,
+        request_started: Option<Instant>,
         nonblocking: bool,
     ) -> Result<IoRequest, SubmitError> {
         let submit_state = if nonblocking {
@@ -1502,16 +1529,15 @@ impl RuntimeInner {
             operation,
             completion: Arc::clone(&completion),
             slot,
-            submitted_at: submit_started,
+            submitted_at: request_started,
         };
         if self.shared.statistics_enabled {
-            self.shared.submitted.fetch_add(1, Ordering::Release);
+            self.shared
+                .requests_submitted
+                .fetch_add(1, Ordering::Release);
         }
         match self.commands.try_send(DriverCommand::Submit(task)) {
             Ok(()) => {
-                if let Some(submit_started) = submit_started {
-                    add_duration_ns(&self.shared.slot_wait_ns, submit_started.elapsed());
-                }
                 if let Some(wake) = &self.wake {
                     wake.wake();
                 }
@@ -1524,7 +1550,9 @@ impl RuntimeInner {
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
                 if self.shared.statistics_enabled {
-                    self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                    self.shared
+                        .requests_submitted
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
                 let Task {
                     operation, slot, ..
@@ -1537,7 +1565,9 @@ impl RuntimeInner {
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
                 if self.shared.statistics_enabled {
-                    self.shared.submitted.fetch_sub(1, Ordering::Relaxed);
+                    self.shared
+                        .requests_submitted
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
                 let Task {
                     operation, slot, ..
@@ -1555,9 +1585,7 @@ impl RuntimeInner {
     }
 
     fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        if !state.cancel_requested.swap(true, Ordering::AcqRel) && self.shared.statistics_enabled {
-            self.shared.cancel_requested.fetch_add(1, Ordering::Relaxed);
-        }
+        state.cancel_requested.store(true, Ordering::Release);
         if !state.cancel_notified.swap(true, Ordering::AcqRel) {
             match self.commands.try_send(DriverCommand::Cancel(request_id)) {
                 Ok(()) => {}
@@ -1830,7 +1858,7 @@ impl IoEngine for BackendIoEngine {
 
     #[cfg(test)]
     fn direct_active(&self) -> bool {
-        self.backend.direct_io_stats().direct_active
+        self.backend.runtime_io_stats().direct_active
     }
 
     fn stop_accepting_requests(&self) {
@@ -1850,14 +1878,11 @@ impl IoEngine for BackendIoEngine {
         self.inner.shared.mark_unfenced_writes();
     }
 
-    fn stats(&self) -> CacheIoSnapshot {
-        let mut stats = self.inner.shared.snapshot();
-        let direct = self.backend.direct_io_stats();
-        stats.direct_operations = direct.direct_operations;
-        stats.direct_bytes = direct.direct_bytes;
-        stats.buffered_operations = direct.buffered_operations;
-        stats.buffered_bytes = direct.buffered_bytes;
-        stats
+    fn stats(&self) -> EngineIoSnapshot {
+        EngineIoSnapshot {
+            requests: self.inner.shared.snapshot(),
+            runtime: self.backend.runtime_io_stats(),
+        }
     }
 }
 
@@ -2002,7 +2027,7 @@ mod uring {
     #[derive(Clone)]
     pub(crate) struct UringIoEngine {
         inner: Arc<RuntimeInner>,
-        io_stats: DirectIoStatsHandle,
+        io_stats: RuntimeIoStatsHandle,
     }
 
     impl UringIoEngine {
@@ -2171,14 +2196,11 @@ mod uring {
             self.inner.shared.mark_unfenced_writes();
         }
 
-        fn stats(&self) -> CacheIoSnapshot {
-            let mut stats = self.inner.shared.snapshot();
-            let direct = self.io_stats.snapshot();
-            stats.direct_operations = direct.direct_operations;
-            stats.direct_bytes = direct.direct_bytes;
-            stats.buffered_operations = direct.buffered_operations;
-            stats.buffered_bytes = direct.buffered_bytes;
-            stats
+        fn stats(&self) -> EngineIoSnapshot {
+            EngineIoSnapshot {
+                requests: self.inner.shared.snapshot(),
+                runtime: self.io_stats.snapshot(),
+            }
         }
     }
 
@@ -2594,7 +2616,11 @@ mod uring {
                         self.files
                             .as_ref()
                             .expect("runtime files exist while driver runs")
-                            .record(active_path, completed);
+                            .record(
+                                flight.task.operation.kind().io_direction(),
+                                active_path,
+                                completed,
+                            );
                     }
                     if completed == 0 && remaining != 0 {
                         let kind = if flight.task.operation.kind() == OperationKind::Read {
@@ -3254,10 +3280,10 @@ mod tests {
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
         let stats = engine.stats();
-        assert_eq!(stats.submitted, 2);
-        assert_eq!(stats.completed, 2);
-        assert_eq!(stats.errors, 0);
-        assert!(stats.requests_in_flight_peak >= 1);
+        assert_eq!(stats.requests.requests_submitted, 2);
+        assert_eq!(stats.requests.requests_succeeded, 2);
+        assert_eq!(stats.requests.requests_failed, 0);
+        assert!(stats.requests.requests_in_flight_peak >= 1);
         assert!(
             engine
                 .read_exact_at(read_buffer(&resources, input.len()), 4096)
@@ -3332,8 +3358,6 @@ mod tests {
 
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
-        assert_eq!(engine.stats().cancel_requested, 1);
-
         backend.release();
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
@@ -3406,10 +3430,10 @@ mod tests {
 
         assert!(engine.direct_active());
         let stats = engine.stats();
-        assert_eq!(stats.direct_operations, 1);
-        assert_eq!(stats.direct_bytes, 4096);
-        assert_eq!(stats.buffered_operations, 1);
-        assert_eq!(stats.buffered_bytes, 32);
+        assert_eq!(stats.runtime.write.direct.operations, 1);
+        assert_eq!(stats.runtime.write.direct.bytes, 4096);
+        assert_eq!(stats.runtime.write.buffered.operations, 1);
+        assert_eq!(stats.runtime.write.buffered.bytes, 32);
         engine.shutdown().unwrap();
     }
 
@@ -3530,7 +3554,7 @@ mod tests {
             .unwrap()
             .wait();
         assert!(matches!(completion.status, CompletionStatus::Completed));
-        assert_eq!(engine.stats(), CacheIoSnapshot::default());
+        assert_eq!(engine.stats(), EngineIoSnapshot::default());
         engine.shutdown().unwrap();
     }
 
@@ -3641,7 +3665,10 @@ mod tests {
         assert!(matches!(second.wait().status, CompletionStatus::Completed));
         submitter.join().unwrap();
         assert!(was_blocked);
-        assert_eq!(engine.stats().requests_in_flight_peak, 1);
+        let stats = engine.stats();
+        assert_eq!(stats.requests.requests_in_flight_peak, 1);
+        assert!(stats.requests.slot_wait_ns >= 20_000_000);
+        assert!(stats.requests.request_time_ns > 0);
         engine.shutdown().unwrap();
     }
 
@@ -3719,9 +3746,16 @@ mod tests {
             .wait();
         assert!(matches!(succeeded.status, CompletionStatus::Completed));
         let stats = engine.stats();
-        assert_eq!(stats.submitted, 2);
-        assert_eq!(stats.completed, 2);
-        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.requests.requests_submitted, 2);
+        assert_eq!(stats.requests.requests_succeeded, 1);
+        assert_eq!(stats.requests.requests_failed, 1);
+        assert_eq!(stats.requests.requests_cancelled, 0);
+        assert_eq!(
+            stats.requests.requests_succeeded
+                + stats.requests.requests_cancelled
+                + stats.requests.requests_failed,
+            stats.requests.requests_submitted
+        );
         engine.shutdown().unwrap();
     }
 
@@ -3731,7 +3765,7 @@ mod tests {
         let slot = shared.try_reserve_slot(false).unwrap();
         let request_id = RequestId(1);
         let completion = Arc::new(CompletionState::new());
-        shared.submitted.fetch_add(1, Ordering::Relaxed);
+        shared.requests_submitted.fetch_add(1, Ordering::Relaxed);
 
         let resources = resources(1);
         let task = Task {

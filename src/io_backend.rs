@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::runtime_config::IoMode;
+use crate::snapshot::CacheIoPathSnapshot;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -35,62 +36,106 @@ pub(crate) enum RuntimeIoPath {
     Direct,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeIoDirection {
+    Read,
+    Write,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DirectIoStats {
+pub(crate) struct RuntimeIoDirectionStats {
+    pub(crate) buffered: CacheIoPathSnapshot,
+    pub(crate) direct: CacheIoPathSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeIoStats {
     pub(crate) direct_active: bool,
-    pub(crate) direct_operations: u64,
-    pub(crate) direct_bytes: u64,
-    pub(crate) buffered_operations: u64,
-    pub(crate) buffered_bytes: u64,
+    pub(crate) read: RuntimeIoDirectionStats,
+    pub(crate) write: RuntimeIoDirectionStats,
 }
 
 #[derive(Clone)]
-pub(crate) struct DirectIoStatsHandle {
-    inner: Arc<DirectIoCounters>,
+pub(crate) struct RuntimeIoStatsHandle {
+    inner: Arc<RuntimeIoCounters>,
 }
 
-struct DirectIoCounters {
+struct RuntimeIoCounters {
     direct_active: bool,
     statistics_enabled: AtomicBool,
-    direct_operations: AtomicU64,
-    direct_bytes: AtomicU64,
-    buffered_operations: AtomicU64,
-    buffered_bytes: AtomicU64,
+    read: RuntimeIoDirectionCounters,
+    write: RuntimeIoDirectionCounters,
 }
 
-impl DirectIoStatsHandle {
+struct RuntimeIoDirectionCounters {
+    buffered: RuntimeIoPathCounters,
+    direct: RuntimeIoPathCounters,
+}
+
+struct RuntimeIoPathCounters {
+    operations: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl RuntimeIoPathCounters {
+    fn new() -> Self {
+        Self {
+            operations: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> CacheIoPathSnapshot {
+        CacheIoPathSnapshot {
+            operations: self.operations.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl RuntimeIoDirectionCounters {
+    fn new() -> Self {
+        Self {
+            buffered: RuntimeIoPathCounters::new(),
+            direct: RuntimeIoPathCounters::new(),
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeIoDirectionStats {
+        RuntimeIoDirectionStats {
+            buffered: self.buffered.snapshot(),
+            direct: self.direct.snapshot(),
+        }
+    }
+}
+
+impl RuntimeIoStatsHandle {
     fn new(direct_active: bool) -> Self {
         Self {
-            inner: Arc::new(DirectIoCounters {
+            inner: Arc::new(RuntimeIoCounters {
                 direct_active,
                 statistics_enabled: AtomicBool::new(true),
-                direct_operations: AtomicU64::new(0),
-                direct_bytes: AtomicU64::new(0),
-                buffered_operations: AtomicU64::new(0),
-                buffered_bytes: AtomicU64::new(0),
+                read: RuntimeIoDirectionCounters::new(),
+                write: RuntimeIoDirectionCounters::new(),
             }),
         }
     }
 
-    fn record(&self, path: RuntimeIoPath, length: usize) {
+    fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
         if !self.inner.statistics_enabled.load(Ordering::Relaxed) {
             return;
         }
         let bytes = u64::try_from(length).unwrap_or(u64::MAX);
-        match path {
-            RuntimeIoPath::Direct => {
-                self.inner.direct_operations.fetch_add(1, Ordering::Relaxed);
-                self.inner.direct_bytes.fetch_add(bytes, Ordering::Relaxed);
-            }
-            RuntimeIoPath::Buffered => {
-                self.inner
-                    .buffered_operations
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner
-                    .buffered_bytes
-                    .fetch_add(bytes, Ordering::Relaxed);
-            }
-        }
+        let direction = match direction {
+            RuntimeIoDirection::Read => &self.inner.read,
+            RuntimeIoDirection::Write => &self.inner.write,
+        };
+        let path = match path {
+            RuntimeIoPath::Buffered => &direction.buffered,
+            RuntimeIoPath::Direct => &direction.direct,
+        };
+        path.operations.fetch_add(1, Ordering::Relaxed);
+        path.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
@@ -99,13 +144,11 @@ impl DirectIoStatsHandle {
             .store(enabled, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(&self) -> DirectIoStats {
-        DirectIoStats {
+    pub(crate) fn snapshot(&self) -> RuntimeIoStats {
+        RuntimeIoStats {
             direct_active: self.inner.direct_active,
-            direct_operations: self.inner.direct_operations.load(Ordering::Relaxed),
-            direct_bytes: self.inner.direct_bytes.load(Ordering::Relaxed),
-            buffered_operations: self.inner.buffered_operations.load(Ordering::Relaxed),
-            buffered_bytes: self.inner.buffered_bytes.load(Ordering::Relaxed),
+            read: self.inner.read.snapshot(),
+            write: self.inner.write.snapshot(),
         }
     }
 }
@@ -117,7 +160,7 @@ impl DirectIoStatsHandle {
 pub(crate) struct RuntimeFileSet {
     buffered: File,
     direct: Option<File>,
-    stats: DirectIoStatsHandle,
+    stats: RuntimeIoStatsHandle,
 }
 
 impl RuntimeFileSet {
@@ -126,7 +169,7 @@ impl RuntimeFileSet {
         Self {
             buffered: file,
             direct: None,
-            stats: DirectIoStatsHandle::new(false),
+            stats: RuntimeIoStatsHandle::new(false),
         }
     }
 
@@ -140,7 +183,7 @@ impl RuntimeFileSet {
         Self {
             buffered,
             direct,
-            stats: DirectIoStatsHandle::new(direct_active),
+            stats: RuntimeIoStatsHandle::new(direct_active),
         }
     }
 
@@ -165,8 +208,8 @@ impl RuntimeFileSet {
         }
     }
 
-    pub(crate) fn record(&self, path: RuntimeIoPath, length: usize) {
-        self.stats.record(path, length);
+    pub(crate) fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
+        self.stats.record(direction, path, length);
     }
 
     #[cfg(any(
@@ -183,7 +226,7 @@ impl RuntimeFileSet {
             )
         )
     ))]
-    pub(crate) fn stats_handle(&self) -> DirectIoStatsHandle {
+    pub(crate) fn stats_handle(&self) -> RuntimeIoStatsHandle {
         self.stats.clone()
     }
 
@@ -294,8 +337,8 @@ pub(crate) trait IoBackend: Send + Sync {
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
     fn unlock(&self) -> io::Result<()>;
-    fn direct_io_stats(&self) -> DirectIoStats {
-        DirectIoStats::default()
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
+        RuntimeIoStats::default()
     }
 }
 
@@ -569,10 +612,10 @@ impl IoBackend for FileBackend {
         }
     }
 
-    fn direct_io_stats(&self) -> DirectIoStats {
-        DirectIoStats {
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
+        RuntimeIoStats {
             direct_active: self.direct_active(),
-            ..DirectIoStats::default()
+            ..RuntimeIoStats::default()
         }
     }
 }
@@ -599,7 +642,7 @@ impl IoBackend for RuntimeFileBackend {
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(path, bytes);
+            self.files.record(RuntimeIoDirection::Read, path, bytes);
         }
         result
     }
@@ -620,7 +663,7 @@ impl IoBackend for RuntimeFileBackend {
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(path, bytes);
+            self.files.record(RuntimeIoDirection::Read, path, bytes);
         }
         result
     }
@@ -636,7 +679,7 @@ impl IoBackend for RuntimeFileBackend {
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(path, bytes);
+            self.files.record(RuntimeIoDirection::Write, path, bytes);
         }
         result
     }
@@ -663,7 +706,7 @@ impl IoBackend for RuntimeFileBackend {
         ))
     }
 
-    fn direct_io_stats(&self) -> DirectIoStats {
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
         self.files.stats.snapshot()
     }
 }
@@ -1066,11 +1109,25 @@ mod tests {
             RuntimeIoPath::Buffered
         );
         let cloned = files.try_clone().unwrap();
-        cloned.record(RuntimeIoPath::Direct, DIRECT_IO_ALIGNMENT);
-        assert_eq!(files.stats_handle().snapshot().direct_operations, 1);
+        cloned.record(
+            RuntimeIoDirection::Read,
+            RuntimeIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        cloned.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        let stats = files.stats_handle().snapshot();
+        assert_eq!(stats.read.direct.operations, 1);
+        assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
+        assert_eq!(stats.write.buffered.operations, 1);
+        assert_eq!(stats.write.buffered.bytes, 32);
         cloned.set_statistics_enabled(false);
-        files.record(RuntimeIoPath::Direct, DIRECT_IO_ALIGNMENT);
-        assert_eq!(files.stats_handle().snapshot().direct_operations, 1);
+        files.record(
+            RuntimeIoDirection::Read,
+            RuntimeIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        files.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        assert_eq!(files.stats_handle().snapshot(), stats);
 
         let buffered_only = RuntimeFileSet::buffered(buffered.open());
         assert_eq!(
@@ -1137,13 +1194,20 @@ mod tests {
         assert_eq!(backend.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
 
         assert_eq!(
-            backend.direct_io_stats(),
-            DirectIoStats {
+            backend.runtime_io_stats(),
+            RuntimeIoStats {
                 direct_active: true,
-                direct_operations: 1,
-                direct_bytes: DIRECT_IO_ALIGNMENT as u64,
-                buffered_operations: 1,
-                buffered_bytes: DIRECT_IO_ALIGNMENT as u64,
+                write: RuntimeIoDirectionStats {
+                    buffered: CacheIoPathSnapshot {
+                        operations: 1,
+                        bytes: DIRECT_IO_ALIGNMENT as u64,
+                    },
+                    direct: CacheIoPathSnapshot {
+                        operations: 1,
+                        bytes: DIRECT_IO_ALIGNMENT as u64,
+                    },
+                },
+                ..RuntimeIoStats::default()
             }
         );
     }

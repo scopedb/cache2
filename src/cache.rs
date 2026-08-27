@@ -454,6 +454,9 @@ impl Cache {
         self.store.drain_async().await
     }
 
+    /// Returns a lock-free operational snapshot. Activity and I/O counters are
+    /// cumulative for this open and are populated only when statistics are
+    /// enabled; health and resource gauges are always available.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
         let mut snapshot = self.store.snapshot()?;
         snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;

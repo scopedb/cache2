@@ -221,7 +221,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::io_backend::{DirectIoStats, IoBackend, SyncMode, SyncPoint};
+    use crate::io_backend::{IoBackend, SyncMode, SyncPoint};
     use crate::io_engine::BackendIoEngine;
     use crate::resources::BufferLease;
 
@@ -261,10 +261,6 @@ mod tests {
 
         fn unlock(&self) -> io::Result<()> {
             Ok(())
-        }
-
-        fn direct_io_stats(&self) -> DirectIoStats {
-            DirectIoStats::default()
         }
     }
 

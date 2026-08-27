@@ -772,13 +772,25 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
     let detailed = cache.detailed_snapshot().unwrap();
     assert_eq!(detailed.summary, resources);
     assert_eq!(detailed.write_buffer_rejections, resources.write_rejections);
-    assert_eq!(detailed.io.requests_in_flight, 0);
-    assert_eq!(detailed.io.completed, detailed.io.submitted);
+    assert_eq!(resources.io.read.requests_in_flight, 0);
+    assert_eq!(resources.io.write.requests_in_flight, 0);
+    assert_eq!(
+        resources.io.read.requests_succeeded,
+        resources.io.read.requests_submitted
+    );
+    assert_eq!(
+        resources.io.write.requests_succeeded,
+        resources.io.write.requests_submitted
+    );
     assert!(
-        detailed
+        resources
             .io
-            .direct_operations
-            .saturating_add(detailed.io.buffered_operations)
+            .read
+            .direct
+            .operations
+            .saturating_add(resources.io.read.buffered.operations)
+            .saturating_add(resources.io.write.direct.operations)
+            .saturating_add(resources.io.write.buffered.operations)
             > 0
     );
     assert!(detailed.l1.entry_capacity > 0);
@@ -829,6 +841,16 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(before_close.served_bytes, 5);
     assert_eq!(before_close.l1_promotions, 0);
     assert_eq!(before_close.io_failures, 0);
+    assert_ne!(before_close.metrics_epoch, 0);
+    assert!(before_close.io.write.requests_submitted > 0);
+    assert_eq!(
+        before_close.io.write.requests_succeeded,
+        before_close.io.write.requests_submitted
+    );
+    assert_eq!(before_close.io.write.requests_cancelled, 0);
+    assert_eq!(before_close.io.write.requests_failed, 0);
+    assert!(before_close.io.write.buffered.operations > 0);
+    assert_eq!(before_close.io.write.direct.operations, 0);
     cache.close_warm().await.unwrap();
 
     let reopened = files.config(3).open().await.unwrap();
@@ -837,6 +859,8 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(fresh.deletes, 0);
     assert_eq!(fresh.l1_hits, 0);
     assert_eq!(fresh.l2_hits, 0);
+    assert_ne!(fresh.metrics_epoch, before_close.metrics_epoch);
+    assert_eq!(fresh.io, cache2::CacheIoSnapshot::default());
     assert_eq!(
         reopened.get("key").await.unwrap().unwrap().tier(),
         CacheTier::L2
@@ -855,6 +879,12 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(warmed.l2_read_busy_misses, 0);
     assert_eq!(warmed.served_bytes, 10);
     assert_eq!(warmed.l1_promotions, 1);
+    assert_eq!(warmed.io.read.requests_submitted, 1);
+    assert_eq!(warmed.io.read.requests_succeeded, 1);
+    assert_eq!(warmed.io.read.requests_cancelled, 0);
+    assert_eq!(warmed.io.read.requests_failed, 0);
+    assert!(warmed.io.read.buffered.operations > 0);
+    assert_eq!(warmed.io.read.direct.operations, 0);
     reopened.close_fast().await.unwrap();
 }
 

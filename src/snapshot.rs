@@ -15,10 +15,15 @@ pub enum CacheHealth {
 }
 
 /// Lock-free point-in-time operational counters and cache-owned resource
-/// accounting. Counters are process-local and reset on every open.
+/// accounting. Counters are process-local and reset on every open. Concurrent
+/// updates may appear across fields at slightly different instants.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {
+    /// Process-local identity for this set of cumulative counters. This changes
+    /// whenever a cache is opened and is not intended to be exported as a
+    /// metric label.
+    pub metrics_epoch: u64,
     pub health: CacheHealth,
     pub statistics_enabled: bool,
     pub puts: u64,
@@ -41,24 +46,47 @@ pub struct CacheSnapshot {
     pub managed_memory_peak_bytes: usize,
     pub managed_memory_limit_bytes: usize,
     pub logical_disk_peak_bytes: u64,
+    pub io: CacheIoSnapshot,
 }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheIoSnapshot {
-    pub submitted: u64,
-    pub completed: u64,
-    pub cancel_requested: u64,
-    pub cancelled: u64,
-    pub errors: u64,
+    pub read: CacheIoDirectionSnapshot,
+    pub write: CacheIoDirectionSnapshot,
+}
+
+/// Cumulative engine-request and runtime-file-I/O statistics for one
+/// direction. Request counters describe logical engine requests. Path counters
+/// describe positive runtime file operations and are not physical device I/O.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheIoDirectionSnapshot {
+    /// Requests accepted by the engine command queue.
+    pub requests_submitted: u64,
+    /// Mutually exclusive terminal outcomes for submitted requests.
+    pub requests_succeeded: u64,
+    pub requests_cancelled: u64,
+    pub requests_failed: u64,
     pub requests_in_flight: u64,
     pub requests_in_flight_peak: u64,
+    /// Nanoseconds spent acquiring an engine slot. Pre-reserved nonwaiting
+    /// reads do not contribute to this counter.
     pub slot_wait_ns: u64,
-    pub completion_ns: u64,
-    pub direct_operations: u64,
-    pub direct_bytes: u64,
-    pub buffered_operations: u64,
-    pub buffered_bytes: u64,
+    /// Nanoseconds from slot reservation to terminal completion for submitted
+    /// requests.
+    pub request_time_ns: u64,
+    pub buffered: CacheIoPathSnapshot,
+    pub direct: CacheIoPathSnapshot,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheIoPathSnapshot {
+    /// Positive runtime file operations. Short I/O can produce more than one
+    /// operation for one engine request.
+    pub operations: u64,
+    pub bytes: u64,
 }
 
 #[non_exhaustive]
@@ -103,7 +131,6 @@ pub struct RegionSnapshot {
 pub struct DetailedCacheSnapshot {
     pub summary: CacheSnapshot,
     pub write_buffer_rejections: u64,
-    pub io: CacheIoSnapshot,
     pub l1: CacheL1Snapshot,
     pub index: CacheIndexSnapshot,
     pub region: RegionSnapshot,
