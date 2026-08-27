@@ -9,6 +9,10 @@ use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, RuntimeConfig,
     StartupMode, StaticConfig,
 };
+use logforth::append::Stderr;
+use logforth::bridge::log::LogBridge;
+use logforth::filter::rustlog::RustLogFilterBuilder;
+use logforth::layout::JsonLayout;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
@@ -249,6 +253,7 @@ struct ResourceSample {
 }
 
 fn main() -> io::Result<()> {
+    init_logforth()?;
     let config = SoakConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.readers.max(2))
@@ -462,6 +467,20 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn init_logforth() -> io::Result<()> {
+    let logger = logforth::core::builder()
+        .dispatch(|dispatch| {
+            dispatch
+                .filter(RustLogFilterBuilder::from_default_env().build())
+                .append(Stderr::default().with_layout(JsonLayout::default()))
+        })
+        .build();
+    log::set_boxed_logger(Box::new(LogBridge::new(logger)))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    log::set_max_level(log::LevelFilter::Trace);
+    Ok(())
+}
+
 fn open_cache(
     runtime: &tokio::runtime::Runtime,
     files: &SoakFiles,
@@ -483,9 +502,7 @@ fn populate_for_warm_reopen(
     key_count: u64,
     value_size_count: u64,
 ) -> io::Result<u64> {
-    let total = key_count
-        .checked_mul(value_size_count)
-        .ok_or_else(|| invalid("warm-reopen population count overflow"))?;
+    let total = key_count;
     let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     for ordinal in 0..total {
@@ -494,8 +511,7 @@ fn populate_for_warm_reopen(
             .ok_or_else(|| invalid("warm-reopen write ordinal exhausted"))?;
         let key_index = usize::try_from(ordinal % key_count)
             .map_err(|_| invalid("warm-reopen key index exceeds usize"))?;
-        let value_index = usize::try_from(ordinal / key_count % value_size_count)
-            .map_err(|_| invalid("warm-reopen value-size index exceeds usize"))?;
+        let value_index = mixed_value_index(ordinal, value_size_count)?;
         let value_bytes = config.value_bytes[value_index];
         let pattern = (ordinal ^ key_index as u64) as u8;
         value[..value_bytes].fill(pattern);
@@ -536,8 +552,7 @@ fn run_writer(
             .ok_or_else(|| invalid("soak write ordinal exhausted"))?;
         let key_index = usize::try_from(ordinal % key_count)
             .map_err(|_| invalid("soak key index exceeds usize"))?;
-        let value_index = usize::try_from(ordinal / key_count % value_size_count)
-            .map_err(|_| invalid("soak value-size index exceeds usize"))?;
+        let value_index = mixed_value_index(ordinal, value_size_count)?;
         let value_bytes = config.value_bytes[value_index];
         let pattern = (ordinal ^ key_index as u64) as u8;
         value[..value_bytes].fill(pattern);
@@ -610,7 +625,6 @@ fn run_reader(
                     sampled,
                     &observed,
                     latest,
-                    key_count,
                     value_size_count,
                     &config.value_bytes,
                 )?;
@@ -632,7 +646,6 @@ fn validate_observed(
     sampled: usize,
     observed: &[u8],
     latest: u64,
-    key_count: u64,
     value_size_count: u64,
     value_bytes: &[usize],
 ) -> io::Result<bool> {
@@ -659,8 +672,7 @@ fn validate_observed(
             "soak read returned a wrong-key or future value",
         ));
     }
-    let value_index = usize::try_from(sequence / key_count % value_size_count)
-        .map_err(|_| invalid("observed value-size index exceeds usize"))?;
+    let value_index = mixed_value_index(sequence, value_size_count)?;
     let expected_length = value_bytes[value_index];
     let expected_pattern = (sequence ^ sampled as u64) as u8;
     if observed.len() != expected_length
@@ -674,6 +686,14 @@ fn validate_observed(
         ));
     }
     Ok(observed_version < latest)
+}
+
+fn mixed_value_index(sequence: u64, value_size_count: u64) -> io::Result<usize> {
+    let mut mixed = sequence.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    usize::try_from(mixed % value_size_count).map_err(|_| invalid("value-size index exceeds usize"))
 }
 
 fn resource_sample(
