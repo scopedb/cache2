@@ -22,10 +22,10 @@ pub(crate) struct PolicySlot {
 }
 
 impl PolicySlot {
-    fn new(hash: u64) -> Self {
+    fn new(hash: u64, visited: bool) -> Self {
         Self {
             hash,
-            flags: RESIDENT_BIT | VISITED_BIT,
+            flags: RESIDENT_BIT | (u8::from(visited) * VISITED_BIT),
         }
     }
 
@@ -57,7 +57,9 @@ impl EvictionState {
 
     pub(crate) fn insert(&mut self, slots: &mut [PolicySlot], index: usize, hash: u64) {
         debug_assert!(!slots[index].is_resident());
-        slots[index] = PolicySlot::new(hash);
+        // One-shot scans receive no free second chance. A real L1 hit sets the
+        // visited bit before this entry reaches the hand.
+        slots[index] = PolicySlot::new(hash, false);
     }
 
     pub(crate) fn record_hit(&mut self, slots: &mut [PolicySlot], index: usize) {
@@ -84,7 +86,7 @@ impl EvictionState {
         hash: u64,
     ) {
         debug_assert!(!slots[index].is_resident());
-        slots[index] = PolicySlot::new(hash);
+        slots[index] = PolicySlot::new(hash, true);
     }
 
     pub(crate) fn select_victim<F>(
@@ -152,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn new_entries_receive_one_second_chance() {
+    fn new_entries_are_immediately_evictable() {
         let mut policy = EvictionState::new();
         let mut slots = Vec::new();
         let first = install(&mut policy, &mut slots, 1);
@@ -174,7 +176,8 @@ mod tests {
         let mut policy = EvictionState::new();
         let mut slots = Vec::new();
         for hash in 0..100 {
-            install(&mut policy, &mut slots, hash);
+            let index = install(&mut policy, &mut slots, hash);
+            policy.record_hit(&mut slots, index);
         }
         let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
 
@@ -194,6 +197,21 @@ mod tests {
         policy.restore_for_admission(&mut slots, index, 7);
 
         assert_eq!(slots[index].hash(), 7);
-        policy.record_hit(&mut slots, index);
+        assert!(slots[index].is_visited());
+    }
+
+    #[test]
+    fn a_hit_is_preferred_over_a_cold_one_shot_entry() {
+        let mut policy = EvictionState::new();
+        let mut slots = Vec::new();
+        let hot = install(&mut policy, &mut slots, 1);
+        let cold = install(&mut policy, &mut slots, 2);
+        policy.record_hit(&mut slots, hot);
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+
+        assert_eq!(
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| true),
+            Some(cold)
+        );
     }
 }
