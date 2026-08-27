@@ -4,6 +4,9 @@
 //! writes. An unclean restart always opens empty without scanning the data
 //! extent. Only [`HybridCache::close_warm`] publishes a recoverable image.
 
+#[cfg(feature = "benchmarking")]
+#[doc(hidden)]
+pub mod benchmarking;
 mod cache;
 mod checksum;
 mod eviction;

@@ -27,6 +27,11 @@ harness = false
 name = "recovery_scale"
 harness = false
 
+[[bench]]
+name = "region_index_turnover"
+harness = false
+required-features = ["benchmarking"]
+
 [dependencies]
 crc32c = "=0.6.8"
 tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
@@ -37,6 +42,7 @@ tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
+benchmarking = []
 io-uring = ["dep:io-uring"]
 fuzzing = []
 

@@ -50,6 +50,45 @@ small buffered workload further, at the cost of eight pairs of Region-sized
 staging buffers; production sizing must account for that fixed memory before
 choosing the higher shard count.
 
+## RegionIndex turnover audit — 2026-08-27
+
+The dedicated diagnostic uses the real `RegionIndex` with benchmark-only probe
+accounting, seeded XXH3 hashes, Region generation advancement, and a correctness
+oracle that rejects wrong, future, or stale results. The balanced default has
+100 Regions × 43 records, a 4× key ring, 5,375 slots at 80% initial load, and 32
+partitions containing 167–168 slots. A 500-turn release run on the Apple M4 Max
+developer host reached steady state by turn 10:
+
+| Turn | Physical values / slots | Publish probes/op | Recent probes/op | Missing probes/op |
+|---:|---:|---:|---:|---:|
+| 0 | 4,297 / 5,375 | 3.02 | 2.99 | 12.06 |
+| 1 | 5,348 / 5,375 | 37.09 | 8.66 | 58.56 |
+| 10 | 5,375 / 5,375 | 64.00 | 9.86 | 64.00 |
+| 100 | 5,375 / 5,375 | 64.00 | 10.15 | 64.00 |
+| 500 | 5,375 / 5,375 | 64.00 | 10.02 | 64.00 |
+
+The 500-turn point still returned 99.5% of sampled current-generation keys and
+rejected every stale and missing key. It sustained 3.31 million publications,
+20.51 million recent lookups, and 7.15 million true misses per second in this
+small hot-memory profile. All operations remained within the 64-slot bound.
+
+A second run used 1,100,800 live records, 1,376,000 slots, 4,096 partitions,
+and a roughly 184 MiB benchmark working set. It confirmed the same transition:
+
+| Turn | Publish | Recent lookup | True miss | Publish probes/op | Recent probes/op | Missing probes/op |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 12.25 Mops/s | 22.58 Mops/s | 9.56 Mops/s | 2.97 | 1.15 | 11.81 |
+| 10 | 2.72 Mops/s | 12.65 Mops/s | 5.06 Mops/s | 64.00 | 10.28 | 64.00 |
+
+Generation reclaim is therefore correct, bounded, and stable, and stale-slot
+reuse keeps publications succeeding. It does not restore empty open-addressing
+sentinels: new hashes eventually consume every physical slot, after which
+publish and true-miss probes stay at 64. Absolute publication capacity remains
+well above the expected 16 KiB POSIX/NVMe record rate, so this evidence does not
+justify a reverse index or reclaim-time cluster rebuild. Large-index Linux/NUMA
+qualification should still check true-miss CPU and memory-bandwidth cost before
+calling the issue closed.
+
 ## Best-effort request-path baseline — 2026-08-26
 
 Five consecutive release runs used an Apple M4 Max with 16 CPU cores and

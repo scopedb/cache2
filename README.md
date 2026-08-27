@@ -324,6 +324,21 @@ A validated older version is counted as `stale_hits`; a future version, wrong
 key, malformed value, resource bound violation, or runtime failure terminates
 the run.
 
+The Region index can be aged independently from storage I/O with:
+
+```sh
+cargo +1.98.0 bench --features benchmarking --bench region_index_turnover
+```
+
+The default diagnostic fills a balanced 80%-loaded index, reclaims and rewrites
+its complete Region set 100 times over a 4× key ring, and reports fresh, 1-, 10-,
+and 100-turn publish, recent-hit, stale-miss, and true-miss probe costs. It uses
+the real `RegionIndex`; probe accounting exists only under the non-default
+`benchmarking` feature. `CACHE_INDEX_TURNOVER_REGIONS`,
+`CACHE_INDEX_TURNOVER_ENTRIES_PER_REGION`, `CACHE_INDEX_TURNOVER_TURNS`,
+`CACHE_INDEX_TURNOVER_SAMPLE_OPS`, and
+`CACHE_INDEX_TURNOVER_KEY_MULTIPLIER` adjust the accelerated geometry.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the data and recovery paths,
 [BENCHMARK.md](BENCHMARK.md) for the current reproducible baseline, and
 [MILESTONES.md](MILESTONES.md) for maturity stages and release criteria.

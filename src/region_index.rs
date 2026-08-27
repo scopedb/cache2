@@ -10,6 +10,9 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(feature = "benchmarking")]
+use std::cell::Cell;
+
 use crate::hashing::route_hash;
 use crate::index::{IndexEntry, MAX_INDEX_PROBES};
 use crate::index_storage::{IndexSlotState, IndexStorageError, PartitionedIndexStorage};
@@ -32,6 +35,62 @@ enum InstallKind {
     Deleted,
     Stale,
     LiveVictim,
+}
+
+#[cfg(feature = "benchmarking")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BenchmarkProbeStats {
+    pub(crate) operations: u64,
+    pub(crate) probes: u64,
+    pub(crate) stale_slots: u64,
+    pub(crate) full_windows: u64,
+    pub(crate) max_probes: usize,
+}
+
+#[cfg(feature = "benchmarking")]
+thread_local! {
+    static BENCHMARK_PROBE_STATS: Cell<BenchmarkProbeStats> =
+        const { Cell::new(BenchmarkProbeStats::EMPTY) };
+}
+
+#[cfg(feature = "benchmarking")]
+impl BenchmarkProbeStats {
+    const EMPTY: Self = Self {
+        operations: 0,
+        probes: 0,
+        stale_slots: 0,
+        full_windows: 0,
+        max_probes: 0,
+    };
+}
+
+#[cfg(feature = "benchmarking")]
+pub(crate) fn reset_benchmark_probe_stats() {
+    BENCHMARK_PROBE_STATS.set(BenchmarkProbeStats::EMPTY);
+}
+
+#[cfg(feature = "benchmarking")]
+pub(crate) fn take_benchmark_probe_stats() -> BenchmarkProbeStats {
+    BENCHMARK_PROBE_STATS.replace(BenchmarkProbeStats::EMPTY)
+}
+
+#[cfg(feature = "benchmarking")]
+fn record_benchmark_probe(probes: usize, stale_slots: usize, limit: usize) {
+    BENCHMARK_PROBE_STATS.with(|cell| {
+        let mut stats = cell.get();
+        stats.operations = stats.operations.saturating_add(1);
+        stats.probes = stats
+            .probes
+            .saturating_add(u64::try_from(probes).unwrap_or(u64::MAX));
+        stats.stale_slots = stats
+            .stale_slots
+            .saturating_add(u64::try_from(stale_slots).unwrap_or(u64::MAX));
+        stats.full_windows = stats
+            .full_windows
+            .saturating_add(u64::from(probes == limit));
+        stats.max_probes = stats.max_probes.max(probes);
+        cell.set(stats);
+    });
 }
 
 impl RegionIndex {
@@ -108,11 +167,18 @@ impl RegionIndex {
     pub(crate) fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let start = start_slot(hash, partition.slot_count());
+        let limit = probe_limit(partition.slot_count());
         let mut found = None;
-        partition.probe(
-            start,
-            probe_limit(partition.slot_count()),
-            |_, state| match state {
+        #[cfg(feature = "benchmarking")]
+        let mut benchmark_probes = 0_usize;
+        #[cfg(feature = "benchmarking")]
+        let mut benchmark_stale_slots = 0_usize;
+        partition.probe(start, limit, |_, state| {
+            #[cfg(feature = "benchmarking")]
+            {
+                benchmark_probes = benchmark_probes.saturating_add(1);
+            }
+            match state {
                 IndexSlotState::Empty => true,
                 IndexSlotState::Deleted => false,
                 IndexSlotState::Value {
@@ -120,7 +186,12 @@ impl RegionIndex {
                     entry,
                 } => {
                     if current_hash == hash {
-                        if !self.is_stale(entry) {
+                        if self.is_stale(entry) {
+                            #[cfg(feature = "benchmarking")]
+                            {
+                                benchmark_stale_slots = benchmark_stale_slots.saturating_add(1);
+                            }
+                        } else {
                             found = Some(entry);
                         }
                         true
@@ -128,8 +199,10 @@ impl RegionIndex {
                         false
                     }
                 }
-            },
-        )?;
+            }
+        })?;
+        #[cfg(feature = "benchmarking")]
+        record_benchmark_probe(benchmark_probes, benchmark_stale_slots, limit);
         Ok(found)
     }
 
@@ -211,11 +284,18 @@ impl RegionIndex {
         let mut victim = None;
         let mut apply = None;
         let mut rejected = false;
+        let limit = probe_limit(slot_count);
+        #[cfg(feature = "benchmarking")]
+        let mut benchmark_probes = 0_usize;
+        #[cfg(feature = "benchmarking")]
+        let mut benchmark_stale_slots = 0_usize;
 
-        partition.probe(
-            start,
-            probe_limit(slot_count),
-            |local_slot, state| match state {
+        partition.probe(start, limit, |local_slot, state| {
+            #[cfg(feature = "benchmarking")]
+            {
+                benchmark_probes = benchmark_probes.saturating_add(1);
+            }
+            match state {
                 IndexSlotState::Empty => {
                     if install_missing {
                         apply = Some(deleted.or(stale).unwrap_or((
@@ -243,6 +323,10 @@ impl RegionIndex {
                         true
                     } else {
                         if self.is_stale(current) {
+                            #[cfg(feature = "benchmarking")]
+                            {
+                                benchmark_stale_slots = benchmark_stale_slots.saturating_add(1);
+                            }
                             stale.get_or_insert((local_slot, state, InstallKind::Stale));
                         } else if install_missing && victim.is_none() {
                             victim = Some((local_slot, state, InstallKind::LiveVictim));
@@ -250,8 +334,10 @@ impl RegionIndex {
                         false
                     }
                 }
-            },
-        )?;
+            }
+        })?;
+        #[cfg(feature = "benchmarking")]
+        record_benchmark_probe(benchmark_probes, benchmark_stale_slots, limit);
         if rejected {
             return Ok(false);
         }
