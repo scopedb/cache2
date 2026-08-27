@@ -2064,8 +2064,6 @@ fn empty_region_metadata(
             ordinal
         };
         regions.push(RegionMetadataRecord {
-            region_id,
-            incarnation: u32::from(active),
             state: if active {
                 RegionMetadataState::Active
             } else {
@@ -2074,7 +2072,6 @@ fn empty_region_metadata(
             queue_ordinal,
             created_seqno: if active { u64::from(region_id) + 1 } else { 0 },
             durable_used_offset: 0,
-            max_seqno: 0,
             physical_record_count: 0,
         });
     }
@@ -3218,7 +3215,6 @@ mod tests {
         metadata.root.free_region_count = data.geometry.region_count - 1;
         metadata.root.max_seqno = 1;
         for (ordinal, region) in metadata.regions.iter_mut().skip(1).enumerate() {
-            region.incarnation = 0;
             region.state = RegionMetadataState::Free;
             region.queue_ordinal = u32::try_from(ordinal).unwrap();
             region.created_seqno = 0;

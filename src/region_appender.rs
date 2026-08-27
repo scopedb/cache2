@@ -284,9 +284,7 @@ mod tests {
     fn span() -> RegionWriteSpan {
         RegionWriteSpan {
             shard_id: 0,
-            span_id: 7,
             region_id: 1,
-            region_incarnation: 9,
             start_offset: 0,
             end_offset: 4096,
             record_count: 3,

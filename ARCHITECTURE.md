@@ -184,6 +184,6 @@ remain observable when counters are disabled.
 HybridCache loss and stale valid values are acceptable; unchecked, wrong-key,
 out-of-bounds, or corrupt values are not.
 All sizes and offsets are checked, persistent structures are field-encoded and
-checksummed, reads verify full keys, Region reuse uses incarnation authority,
-and bounded buffers retain ownership through I/O completion. Device or
-structural failures may reject work or turn reads into misses.
+checksummed, reads verify full keys, Region reuse advances its created-sequence
+watermark, and bounded buffers retain ownership through I/O completion. Device
+or structural failures may reject work or turn reads into misses.

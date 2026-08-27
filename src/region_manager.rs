@@ -35,7 +35,6 @@ pub(crate) enum RegionMutationError {
     RegionFull,
     StaleReceipt,
     SequenceExhausted,
-    IncarnationExhausted,
     ArithmeticOverflow,
     Invariant(&'static str),
 }
@@ -48,7 +47,6 @@ pub(crate) enum RegionMutationError {
 pub(crate) struct RegionAppendReservation {
     pub(crate) shard_id: usize,
     pub(crate) region_id: u32,
-    pub(crate) region_incarnation: u32,
     pub(crate) offset: u32,
     pub(crate) record_bytes: u32,
     pub(crate) seqno: u64,
@@ -67,7 +65,6 @@ impl RegionAppendReservation {
 pub(crate) struct RegionPaddingReceipt {
     pub(crate) shard_id: usize,
     pub(crate) region_id: u32,
-    pub(crate) region_incarnation: u32,
     pub(crate) span_start_offset: u64,
     pub(crate) unpadded_end_offset: u64,
     pub(crate) padded_end_offset: u64,
@@ -90,9 +87,7 @@ impl RegionPaddingReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionWriteSpan {
     pub(crate) shard_id: usize,
-    pub(crate) span_id: u64,
     pub(crate) region_id: u32,
-    pub(crate) region_incarnation: u32,
     pub(crate) start_offset: u64,
     pub(crate) end_offset: u64,
     pub(crate) record_count: u64,
@@ -107,7 +102,6 @@ pub(crate) struct RegionRotationReceipt {
     pub(crate) shard_id: usize,
     pub(crate) sealed_region_id: u32,
     pub(crate) activated_region_id: u32,
-    pub(crate) activated_incarnation: u32,
     pub(crate) activated_created_seqno: u64,
     pub(crate) reused: bool,
 }
@@ -117,13 +111,12 @@ pub(crate) struct RegionRotationReceipt {
 /// A caller may retain this value while it drops manager authority. It must
 /// hold the process-wide rotation gate until
 /// [`RegionManager::begin_rotation`] consumes the plan.
-/// `victim_incarnation` identifies the generation being replaced; the newly
-/// activated generation advances it by exactly one.
+/// `victim_created_seqno` identifies the generation being replaced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionRotationPlan {
     pub(crate) shard_id: usize,
     pub(crate) victim_region_id: u32,
-    pub(crate) victim_incarnation: u32,
+    pub(crate) victim_created_seqno: u64,
     pub(crate) reused: bool,
 }
 
@@ -131,22 +124,19 @@ pub(crate) struct RegionRotationPlan {
 struct RegionRotationSelection {
     plan: RegionRotationPlan,
     old_index: usize,
-    old: RegionRuntime,
     victim_index: usize,
-    activated_incarnation: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OpenWriteSpan {
     region_id: u32,
-    region_incarnation: u32,
     start_offset: u64,
     end_offset: u64,
     record_count: u64,
     max_seqno: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ShardMutation {
     tail: Option<RegionAppendReservation>,
     open_span: Option<OpenWriteSpan>,
@@ -154,21 +144,6 @@ struct ShardMutation {
     submitted_span: Option<RegionWriteSpan>,
     rotation_requested: bool,
     rotation: Option<RegionRotationReceipt>,
-    next_span_id: u64,
-}
-
-impl Default for ShardMutation {
-    fn default() -> Self {
-        Self {
-            tail: None,
-            open_span: None,
-            pending_padding: None,
-            submitted_span: None,
-            rotation_requested: false,
-            rotation: None,
-            next_span_id: 1,
-        }
-    }
 }
 
 impl ShardMutation {
@@ -183,8 +158,6 @@ impl ShardMutation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionRuntime {
-    pub(crate) region_id: u32,
-    pub(crate) incarnation: u32,
     pub(crate) state: RegionMetadataState,
     pub(crate) created_seqno: u64,
     /// Last byte covered by a successful write completion. A buffered or
@@ -193,7 +166,6 @@ pub(crate) struct RegionRuntime {
     /// Reservation cursor. A clean recovery has no outstanding writes, so it
     /// starts exactly at `completed_used`.
     pub(crate) reserved_used: u64,
-    pub(crate) max_seqno: u64,
     pub(crate) physical_record_count: u64,
 }
 
@@ -244,21 +216,20 @@ impl RegionManager {
         let mut free_regions = try_unassigned_queue(free_count, free_count)?;
         let mut sealed_regions = try_unassigned_queue(sealed_count, sealed_capacity)?;
 
-        for encoded in encoded_regions.iter().copied() {
+        for (region_id, encoded) in encoded_regions.iter().copied().enumerate() {
+            let region_id =
+                u32::try_from(region_id).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
             let runtime = RegionRuntime {
-                region_id: encoded.region_id,
-                incarnation: encoded.incarnation,
                 state: encoded.state,
                 created_seqno: encoded.created_seqno,
                 completed_used: encoded.durable_used_offset,
                 reserved_used: encoded.durable_used_offset,
-                max_seqno: encoded.max_seqno,
                 physical_record_count: encoded.physical_record_count,
             };
             install_recovered_queue_entry(
                 runtime.state,
                 encoded.queue_ordinal,
-                runtime.region_id,
+                region_id,
                 &mut active_regions,
                 &mut free_regions,
                 &mut sealed_regions,
@@ -397,7 +368,7 @@ impl RegionManager {
                 .ok_or(RegionMutationError::Invariant(
                     "active Region id is out of bounds",
                 ))?;
-        if region.state != RegionMetadataState::Active || region.region_id != region_id {
+        if region.state != RegionMetadataState::Active {
             return Err(RegionMutationError::Invariant(
                 "data shard does not own an Active Region",
             ));
@@ -425,7 +396,6 @@ impl RegionManager {
         let receipt = RegionAppendReservation {
             shard_id,
             region_id,
-            region_incarnation: region.incarnation,
             offset,
             record_bytes,
             seqno,
@@ -459,8 +429,8 @@ impl RegionManager {
         let next_span = match shard.open_span {
             Some(span)
                 if span.region_id == receipt.region_id
-                    && span.region_incarnation == receipt.region_incarnation
-                    && span.end_offset == u64::from(receipt.offset) =>
+                    && span.end_offset == u64::from(receipt.offset)
+                    && span.max_seqno < receipt.seqno =>
             {
                 OpenWriteSpan {
                     end_offset: end,
@@ -474,7 +444,6 @@ impl RegionManager {
             }
             None => OpenWriteSpan {
                 region_id: receipt.region_id,
-                region_incarnation: receipt.region_incarnation,
                 start_offset: u64::from(receipt.offset),
                 end_offset: end,
                 record_count: 1,
@@ -535,7 +504,7 @@ impl RegionManager {
                 ))?;
         if self.active_regions.get(shard_id) != Some(&open.region_id)
             || region.state != RegionMetadataState::Active
-            || region.incarnation != open.region_incarnation
+            || open.max_seqno < region.created_seqno
             || region.reserved_used != open.end_offset
         {
             return Err(RegionMutationError::Invariant(
@@ -564,7 +533,6 @@ impl RegionManager {
         let receipt = RegionPaddingReceipt {
             shard_id,
             region_id: open.region_id,
-            region_incarnation: open.region_incarnation,
             span_start_offset: open.start_offset,
             unpadded_end_offset: open.end_offset,
             padded_end_offset,
@@ -599,7 +567,7 @@ impl RegionManager {
             .ok_or(RegionMutationError::StaleReceipt)?;
         if self.active_regions.get(receipt.shard_id) != Some(&receipt.region_id)
             || region.state != RegionMetadataState::Active
-            || region.incarnation != receipt.region_incarnation
+            || receipt.seqno < region.created_seqno
             || region.reserved_used
                 != receipt
                     .end_offset()
@@ -657,7 +625,6 @@ impl RegionManager {
         }
         let open = shard.open_span.ok_or(RegionMutationError::StaleReceipt)?;
         if open.region_id != padding.region_id
-            || open.region_incarnation != padding.region_incarnation
             || open.start_offset != padding.span_start_offset
             || open.end_offset != padding.unpadded_end_offset
             || open.record_count != padding.record_count
@@ -679,7 +646,7 @@ impl RegionManager {
             .ok_or(RegionMutationError::StaleReceipt)?;
         if self.active_regions.get(padding.shard_id) != Some(&padding.region_id)
             || region.state != RegionMetadataState::Active
-            || region.incarnation != padding.region_incarnation
+            || padding.max_seqno < region.created_seqno
             || region.reserved_used != padding.padded_end_offset
         {
             return Err(RegionMutationError::StaleReceipt);
@@ -708,21 +675,15 @@ impl RegionManager {
                 "submitted write span is not direct-I/O aligned",
             ));
         }
-        if shard.next_span_id == u64::MAX {
-            return Err(RegionMutationError::SequenceExhausted);
-        }
         let receipt = RegionWriteSpan {
             shard_id,
-            span_id: shard.next_span_id,
             region_id: open.region_id,
-            region_incarnation: open.region_incarnation,
             start_offset: open.start_offset,
             end_offset,
             record_count: open.record_count,
             max_seqno: open.max_seqno,
         };
         let shard = &mut self.shard_mutations[shard_id];
-        shard.next_span_id += 1;
         shard.open_span = None;
         shard.pending_padding = None;
         shard.submitted_span = Some(receipt);
@@ -731,7 +692,7 @@ impl RegionManager {
 
     /// Advances the completed prefix for one exact, ordered device completion.
     /// Duplicate, cancelled, wrong-generation, and late completions are
-    /// rejected without touching the current Region incarnation.
+    /// rejected without touching the current Region generation.
     pub(crate) fn complete_write_span(
         &mut self,
         receipt: RegionWriteSpan,
@@ -752,7 +713,7 @@ impl RegionManager {
             .ok_or(RegionMutationError::StaleReceipt)?;
         if self.active_regions.get(receipt.shard_id) != Some(&receipt.region_id)
             || region.state != RegionMetadataState::Active
-            || region.incarnation != receipt.region_incarnation
+            || receipt.max_seqno < region.created_seqno
             || region.completed_used != receipt.start_offset
             || receipt.end_offset > region.reserved_used
             || receipt.start_offset >= receipt.end_offset
@@ -766,7 +727,6 @@ impl RegionManager {
             .ok_or(RegionMutationError::ArithmeticOverflow)?;
         let region = &mut self.regions[region_index];
         region.completed_used = receipt.end_offset;
-        region.max_seqno = region.max_seqno.max(receipt.max_seqno);
         region.physical_record_count = physical_record_count;
         self.shard_mutations[receipt.shard_id].submitted_span = None;
         Ok(())
@@ -813,9 +773,7 @@ impl RegionManager {
         }
         let RegionRotationSelection {
             old_index,
-            old,
             victim_index,
-            activated_incarnation: incarnation,
             ..
         } = selection;
         let shard_id = plan.shard_id;
@@ -835,21 +793,18 @@ impl RegionManager {
 
         self.regions[old_index].state = RegionMetadataState::Sealed;
         self.regions[victim_index] = RegionRuntime {
-            region_id: victim_region_id,
-            incarnation,
             state: RegionMetadataState::Active,
             created_seqno,
             completed_used: 0,
             reserved_used: 0,
-            max_seqno: 0,
             physical_record_count: 0,
         };
         self.active_regions[shard_id] = victim_region_id;
         let receipt = RegionRotationReceipt {
             shard_id,
-            sealed_region_id: old.region_id,
+            sealed_region_id: u32::try_from(old_index)
+                .map_err(|_| RegionMutationError::ArithmeticOverflow)?,
             activated_region_id: victim_region_id,
-            activated_incarnation: incarnation,
             activated_created_seqno: created_seqno,
             reused,
         };
@@ -888,10 +843,7 @@ impl RegionManager {
             .ok_or(RegionMutationError::Invariant(
                 "active Region id is out of bounds",
             ))?;
-        if old.region_id != old_region_id
-            || old.state != RegionMetadataState::Active
-            || old.reserved_used != old.completed_used
-        {
+        if old.state != RegionMetadataState::Active || old.reserved_used != old.completed_used {
             return Err(RegionMutationError::WouldBlock);
         }
 
@@ -920,30 +872,20 @@ impl RegionManager {
         } else {
             RegionMetadataState::Free
         };
-        if victim.region_id != victim_region_id
-            || victim.state != expected_victim_state
-            || victim.region_id == old.region_id
-        {
+        if victim.state != expected_victim_state || victim_region_id == old_region_id {
             return Err(RegionMutationError::Invariant(
                 "rotation victim queue is inconsistent",
             ));
         }
-        let activated_incarnation = victim
-            .incarnation
-            .checked_add(1)
-            .filter(|incarnation| *incarnation != u32::MAX)
-            .ok_or(RegionMutationError::IncarnationExhausted)?;
         Ok(RegionRotationSelection {
             plan: RegionRotationPlan {
                 shard_id,
                 victim_region_id,
-                victim_incarnation: victim.incarnation,
+                victim_created_seqno: victim.created_seqno,
                 reused,
             },
             old_index,
-            old,
             victim_index,
-            activated_incarnation,
         })
     }
 
@@ -976,7 +918,6 @@ impl RegionManager {
         if self.active_regions.get(receipt.shard_id) != Some(&receipt.activated_region_id)
             || sealed.state != RegionMetadataState::Sealed
             || activated.state != RegionMetadataState::Active
-            || activated.incarnation != receipt.activated_incarnation
             || activated.created_seqno != receipt.activated_created_seqno
         {
             return Err(RegionMutationError::StaleReceipt);
@@ -1016,19 +957,14 @@ impl RegionManager {
         let mut records = try_vec(self.regions.len())?;
 
         for (expected_id, region) in self.regions.iter().enumerate() {
-            if region.region_id as usize != expected_id
-                || region.reserved_used != region.completed_used
-            {
+            if region.reserved_used != region.completed_used {
                 return Err(RegionMetadataError::InvalidField("live_region_authority"));
             }
             records.push(RegionMetadataRecord {
-                region_id: region.region_id,
-                incarnation: region.incarnation,
                 state: region.state,
                 queue_ordinal: queue_ordinals[expected_id],
                 created_seqno: region.created_seqno,
                 durable_used_offset: region.completed_used,
-                max_seqno: region.max_seqno,
                 physical_record_count: region.physical_record_count,
             });
         }
@@ -1170,10 +1106,7 @@ where
             .ok_or(RegionMetadataError::InvalidField("live_region_queue"))?;
         let ordinal =
             u32::try_from(ordinal).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-        if region.region_id != region_id
-            || region.state != expected_state
-            || ordinals[region_index] != UNASSIGNED_REGION
-        {
+        if region.state != expected_state || ordinals[region_index] != UNASSIGNED_REGION {
             return Err(RegionMetadataError::InvalidField(
                 "live_region_queue_permutation",
             ));
@@ -1256,12 +1189,12 @@ mod tests {
                 sealed_region_count: 2,
             },
             regions: vec![
-                region(0, 3, RegionMetadataState::Active, 1, 2, 0, 0),
-                region(1, 4, RegionMetadataState::Free, 1, 0, 0, 0),
-                region(2, 2, RegionMetadataState::Sealed, 1, 7, 64, 7),
-                region(3, 1, RegionMetadataState::Active, 0, 1, 0, 0),
-                region(4, 8, RegionMetadataState::Sealed, 0, 4, 128, 5),
-                region(5, 7, RegionMetadataState::Free, 0, 0, 0, 0),
+                region(RegionMetadataState::Active, 1, 2, 0),
+                region(RegionMetadataState::Free, 1, 0, 0),
+                region(RegionMetadataState::Sealed, 1, 7, 64),
+                region(RegionMetadataState::Active, 0, 1, 0),
+                region(RegionMetadataState::Sealed, 0, 4, 128),
+                region(RegionMetadataState::Free, 0, 0, 0),
             ]
             .into_boxed_slice(),
             partitions: shards.into_boxed_slice(),
@@ -1269,22 +1202,16 @@ mod tests {
     }
 
     fn region(
-        region_id: u32,
-        incarnation: u32,
         state: RegionMetadataState,
         queue_ordinal: u32,
         created_seqno: u64,
         used_bytes: u64,
-        max_seqno: u64,
     ) -> RegionMetadataRecord {
         RegionMetadataRecord {
-            region_id,
-            incarnation,
             state,
             queue_ordinal,
             created_seqno,
             durable_used_offset: used_bytes,
-            max_seqno,
             physical_record_count: used_bytes / 64,
         }
     }
@@ -1389,7 +1316,6 @@ mod tests {
             RegionAppendReservation {
                 shard_id: 0,
                 region_id: 3,
-                region_incarnation: 1,
                 offset: 0,
                 record_bytes: 64,
                 seqno: 8,
@@ -1472,7 +1398,6 @@ mod tests {
         manager.complete_write_span(submitted).unwrap();
         assert_eq!(manager.regions[3].completed_used, 4096);
         assert_eq!(manager.regions[3].physical_record_count, 2);
-        assert_eq!(manager.regions[3].max_seqno, second.seqno);
         assert_eq!(
             manager.complete_write_span(submitted),
             Err(RegionMutationError::StaleReceipt)
@@ -1530,7 +1455,7 @@ mod tests {
             RegionRotationPlan {
                 shard_id: 0,
                 victim_region_id: 5,
-                victim_incarnation: 7,
+                victim_created_seqno: 0,
                 reused: false,
             }
         );
@@ -1538,7 +1463,6 @@ mod tests {
         assert!(!rotation.reused);
         assert_eq!(rotation.sealed_region_id, 3);
         assert_eq!(rotation.activated_region_id, 5);
-        assert_eq!(rotation.activated_incarnation, 8);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.active_regions(), &[5, 0]);
         assert_eq!(
@@ -1587,14 +1511,13 @@ mod tests {
             RegionRotationPlan {
                 shard_id: 0,
                 victim_region_id: 4,
-                victim_incarnation: 8,
+                victim_created_seqno: 3,
                 reused: true,
             }
         );
         let rotation = manager.begin_rotation(plan).unwrap();
         assert!(rotation.reused);
         assert_eq!(rotation.activated_region_id, 4);
-        assert_eq!(rotation.activated_incarnation, 9);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.regions[4].physical_record_count, 0);
 
@@ -1679,25 +1602,6 @@ mod tests {
         assert_eq!(
             manager.regions[rotation.activated_region_id as usize],
             activated
-        );
-    }
-
-    #[test]
-    fn incarnation_exhaustion_does_not_consume_fifo_or_seqno() {
-        let mut metadata = sample();
-        metadata.regions[5].incarnation = u32::MAX - 1;
-        let mut manager = RegionManager::from_metadata(metadata).unwrap();
-        let next_seqno = manager.next_seqno();
-        request_rotation(&mut manager, 0);
-        assert_eq!(
-            manager.plan_rotation(0),
-            Err(RegionMutationError::IncarnationExhausted)
-        );
-        assert_eq!(manager.next_seqno(), next_seqno);
-        assert_eq!(manager.active_regions(), &[3, 0]);
-        assert_eq!(
-            manager.free_regions().iter().copied().collect::<Vec<_>>(),
-            [5, 1]
         );
     }
 }

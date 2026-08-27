@@ -109,7 +109,6 @@ struct FillChunk {
     buffer: Option<BufferLease>,
     records: Vec<StagedRecord>,
     region_id: u32,
-    region_incarnation: u32,
     start_offset: u64,
     end_offset: u64,
     max_seqno: u64,
@@ -121,7 +120,6 @@ impl FillChunk {
             buffer: Some(buffer),
             records,
             region_id: 0,
-            region_incarnation: 0,
             start_offset: 0,
             end_offset: 0,
             max_seqno: 0,
@@ -140,7 +138,6 @@ impl FillChunk {
         self.records.clear();
         self.buffer = Some(buffer);
         self.region_id = 0;
-        self.region_incarnation = 0;
         self.start_offset = 0;
         self.end_offset = 0;
         self.max_seqno = 0;
@@ -400,7 +397,6 @@ impl RegionStaging {
             }
             if !fill.is_empty()
                 && (fill.region_id != receipt.region_id
-                    || fill.region_incarnation != receipt.region_incarnation
                     || fill.end_offset != u64::from(receipt.offset)
                     || receipt.seqno <= fill.max_seqno)
             {
@@ -454,7 +450,6 @@ impl RegionStaging {
                 )))?;
         if state.fill.is_empty() {
             state.fill.region_id = receipt.region_id;
-            state.fill.region_incarnation = receipt.region_incarnation;
             state.fill.start_offset = u64::from(receipt.offset);
         }
         state.fill.end_offset = reservation_end(receipt).ok_or(StagingEncodeError::Staging(
@@ -496,8 +491,7 @@ impl RegionStaging {
                         && *padding % RECORD_ALIGNMENT == 0
                 })
                 .ok_or(StagingError::StaleReceipt)?;
-            if receipt.region_incarnation == 0
-                || receipt.span_start_offset >= receipt.unpadded_end_offset
+            if receipt.span_start_offset >= receipt.unpadded_end_offset
                 || !receipt
                     .span_start_offset
                     .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
@@ -510,7 +504,6 @@ impl RegionStaging {
                 || receipt.padded_end_offset > self.region_size
                 || fill.is_empty()
                 || fill.region_id != receipt.region_id
-                || fill.region_incarnation != receipt.region_incarnation
                 || fill.start_offset != receipt.span_start_offset
                 || fill.end_offset != receipt.unpadded_end_offset
                 || fill.records.len() as u64 != receipt.record_count
@@ -620,7 +613,6 @@ impl RegionStaging {
         }
         if !span_matches_records(span, &state.fill.records)
             || state.fill.region_id != span.region_id
-            || state.fill.region_incarnation != span.region_incarnation
             || state.fill.start_offset != span.start_offset
             || state.fill.end_offset != span.end_offset
             || state.fill.max_seqno != span.max_seqno
@@ -767,8 +759,7 @@ impl RegionStaging {
 
     fn validate_reservation(&self, receipt: RegionAppendReservation) -> Result<(), StagingError> {
         let end = reservation_end(receipt).ok_or(StagingError::StaleReceipt)?;
-        if receipt.region_incarnation == 0
-            || receipt.seqno == 0
+        if receipt.seqno == 0
             || receipt.record_bytes == 0
             || !receipt.record_bytes.is_multiple_of(RECORD_ALIGNMENT)
             || !receipt.offset.is_multiple_of(RECORD_ALIGNMENT)
@@ -871,7 +862,6 @@ mod tests {
         let receipt = RegionAppendReservation {
             shard_id: 0,
             region_id: 1,
-            region_incarnation: 7,
             offset,
             record_bytes,
             seqno,
@@ -891,13 +881,10 @@ mod tests {
         end_offset: u64,
         record_count: u64,
         max_seqno: u64,
-        span_id: u64,
     ) -> RegionWriteSpan {
         RegionWriteSpan {
             shard_id: 0,
-            span_id,
             region_id: 1,
-            region_incarnation: 7,
             start_offset,
             end_offset,
             record_count,
@@ -947,7 +934,7 @@ mod tests {
             StageAppend::Appended
         );
         assert_eq!(first_pointer % BUFFER_ALIGNMENT, 0);
-        let first_span = span(0, 64, 1, 11, 1);
+        let first_span = span(0, 64, 1, 11);
         let first_job = staging.take_sealed(first_span).unwrap().unwrap();
         assert_eq!(first_job.span, first_span);
         assert_eq!(
@@ -968,7 +955,7 @@ mod tests {
             .unwrap();
         assert_ne!(second_pointer, first_pointer);
         assert_eq!(second_pointer % BUFFER_ALIGNMENT, 0);
-        let second_span = span(64, 160, 1, 12, 2);
+        let second_span = span(64, 160, 1, 12);
         assert!(matches!(
             staging.take_sealed(second_span),
             Err(StagingError::WouldBlock)
@@ -1016,7 +1003,7 @@ mod tests {
             })
         );
 
-        let submitted = span(4096, 4160, 1, 11, 1);
+        let submitted = span(4096, 4160, 1, 11);
         let job = staging.take_sealed(submitted).unwrap().unwrap();
         assert_eq!(
             staging.shard_fill_snapshot(0),
@@ -1104,7 +1091,6 @@ mod tests {
         let padding = RegionPaddingReceipt {
             shard_id: 0,
             region_id: 1,
-            region_incarnation: 7,
             span_start_offset: 4096,
             unpadded_end_offset: unpadded_end,
             padded_end_offset: 8192,
@@ -1115,7 +1101,7 @@ mod tests {
         assert_eq!(padding.padding_bytes(), Some(padding_bytes));
         staging.apply_write_padding(padding).unwrap();
 
-        let padded_span = span(4096, 8192, 2, 12, 1);
+        let padded_span = span(4096, 8192, 2, 12);
         let job = staging.take_sealed(padded_span).unwrap().unwrap();
         assert_eq!(job.buffer.len(), 4096);
         let bytes = job.buffer.as_slice().unwrap();
@@ -1178,7 +1164,7 @@ mod tests {
         );
         assert!(!called);
 
-        let metadata_span = span(0, u64::from(offset), 4096, 4096, 1);
+        let metadata_span = span(0, u64::from(offset), 4096, 4096);
         let job = staging.take_sealed(metadata_span).unwrap().unwrap();
         let StagedWrite {
             buffer, records, ..
@@ -1235,10 +1221,10 @@ mod tests {
                 Ok::<StagedRecord, ()>(record)
             })
             .unwrap();
-        let submitted = span(4096, 4160, 1, 11, 1);
+        let submitted = span(4096, 4160, 1, 11);
         let job = staging.take_sealed(submitted).unwrap().unwrap();
         let mut stale = submitted;
-        stale.span_id += 1;
+        stale.max_seqno += 1;
         let StagedWrite {
             buffer, records, ..
         } = job;

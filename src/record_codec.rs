@@ -132,11 +132,7 @@ pub(crate) fn encode_value_into_hashed(
             reserved: reservation.record_bytes,
         });
     }
-    if reservation.region_incarnation == 0
-        || reservation.region_incarnation == u32::MAX
-        || reservation.seqno == 0
-        || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT)
-    {
+    if reservation.seqno == 0 || !reservation.offset.is_multiple_of(RECORD_ALIGNMENT) {
         return Err(RecordEncodeError::InvalidReservation);
     }
 
@@ -220,7 +216,6 @@ mod tests {
         let reservation = RegionAppendReservation {
             shard_id: 0,
             region_id: 7,
-            region_incarnation: 3,
             offset: 0,
             record_bytes: required,
             seqno: 17,
@@ -292,7 +287,6 @@ mod tests {
         let reservation = RegionAppendReservation {
             shard_id: 0,
             region_id: 0,
-            region_incarnation: 1,
             offset: 0,
             record_bytes: required,
             seqno: 1,

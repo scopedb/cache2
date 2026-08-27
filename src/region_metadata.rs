@@ -18,7 +18,7 @@ use std::fmt;
 pub(crate) const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 pub(crate) const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
 pub(crate) const REGION_METADATA_ROOT_SIZE: usize = 256;
-pub(crate) const REGION_METADATA_REGION_SIZE: usize = 48;
+pub(crate) const REGION_METADATA_REGION_SIZE: usize = 21;
 pub(crate) const REGION_METADATA_PARTITION_SIZE: usize = 16;
 pub(crate) const REGION_METADATA_REGIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_REGION_SIZE;
@@ -72,18 +72,11 @@ const ROOT_ACTIVE_REGION_COUNT_OFFSET: usize = 244;
 const ROOT_SEALED_REGION_COUNT_OFFSET: usize = 248;
 const ROOT_RESERVED_OFFSET: usize = 252;
 
-const REGION_ID_OFFSET: usize = 0;
-const REGION_INCARNATION_OFFSET: usize = 4;
-const REGION_STATE_OFFSET: usize = 8;
-const REGION_FLAGS_OFFSET: usize = 9;
-const REGION_RESERVED16_OFFSET: usize = 10;
-const REGION_QUEUE_ORDINAL_OFFSET: usize = 12;
-const REGION_CREATED_SEQNO_OFFSET: usize = 16;
-const REGION_DURABLE_USED_OFFSET: usize = 24;
-const REGION_RECORD_COUNT_OFFSET: usize = 28;
-const REGION_MAX_SEQNO_OFFSET: usize = 32;
-const REGION_RESERVED_START: usize = 40;
-const REGION_RESERVED_END: usize = 48;
+const REGION_CREATED_SEQNO_OFFSET: usize = 0;
+const REGION_DURABLE_USED_OFFSET: usize = 8;
+const REGION_RECORD_COUNT_OFFSET: usize = 12;
+const REGION_QUEUE_ORDINAL_OFFSET: usize = 16;
+const REGION_STATE_OFFSET: usize = 20;
 
 const PARTITION_ID_OFFSET: usize = 0;
 const PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET: usize = 4;
@@ -91,7 +84,7 @@ const PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET: usize = 8;
 const PARTITION_RESERVED_OFFSET: usize = 12;
 
 const _: () = assert!(REGION_METADATA_PAGE_SIZE == INDEX_IMAGE_PAGE_SIZE);
-const _: () = assert!(REGION_METADATA_REGIONS_PER_PAGE == 84);
+const _: () = assert!(REGION_METADATA_REGIONS_PER_PAGE == 192);
 const _: () = assert!(REGION_METADATA_PARTITIONS_PER_PAGE == 252);
 
 #[repr(u16)]
@@ -156,16 +149,11 @@ pub(crate) struct RegionMetadataRoot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionMetadataRecord {
-    pub(crate) region_id: u32,
-    /// Last assigned incarnation. Free Regions retain it so reuse can advance
-    /// without making stale bytes from an older session reachable.
-    pub(crate) incarnation: u32,
     pub(crate) state: RegionMetadataState,
     /// Free queue position, Active shard id, or Sealed FIFO position.
     pub(crate) queue_ordinal: u32,
     pub(crate) created_seqno: u64,
     pub(crate) durable_used_offset: u64,
-    pub(crate) max_seqno: u64,
     pub(crate) physical_record_count: u64,
 }
 
@@ -549,12 +537,8 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
     let mut free_seen = zeroed_bytes(root.free_region_count as usize)?;
     let mut active_seen = zeroed_bytes(root.active_region_count as usize)?;
     let mut sealed_seen = zeroed_bytes(root.sealed_region_count as usize)?;
-    for (expected_id, region) in regions.iter().copied().enumerate() {
-        if region.region_id as usize != expected_id
-            || region.incarnation == u32::MAX
-            || region.durable_used_offset > root.region_size
-            || region.durable_used_offset % 32 != 0
-        {
+    for region in regions.iter().copied() {
+        if region.durable_used_offset > root.region_size || region.durable_used_offset % 32 != 0 {
             return Err(RegionMetadataError::InvalidField("region_geometry"));
         }
         let (seen, state_count) = match region.state {
@@ -570,7 +554,6 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
         if region.state == RegionMetadataState::Free {
             if region.created_seqno != 0
                 || region.durable_used_offset != 0
-                || region.max_seqno != 0
                 || region.physical_record_count != 0
             {
                 return Err(RegionMetadataError::InvalidField("free_region"));
@@ -580,13 +563,9 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
 
         let used_bytes = region.durable_used_offset;
         let empty = used_bytes == 0;
-        if region.incarnation == 0
-            || region.created_seqno == 0
+        if region.created_seqno == 0
             || region.created_seqno > root.max_seqno
             || empty != (region.physical_record_count == 0)
-            || (empty && region.max_seqno != 0)
-            || (!empty
-                && (region.max_seqno < region.created_seqno || region.max_seqno > root.max_seqno))
             || !minimum_bytes_fit(region.physical_record_count, used_bytes)?
         {
             return Err(RegionMetadataError::InvalidField("allocated_region"));
@@ -986,38 +965,23 @@ fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
         .expect("validated Region used offset fits its packed field");
     let physical_record_count = u32::try_from(region.physical_record_count)
         .expect("validated Region record count fits its packed field");
-    put_u32(output, REGION_ID_OFFSET, region.region_id);
-    put_u32(output, REGION_INCARNATION_OFFSET, region.incarnation);
-    output[REGION_STATE_OFFSET] = region.state as u8;
-    output[REGION_FLAGS_OFFSET] = 0;
-    put_u16(output, REGION_RESERVED16_OFFSET, 0);
-    put_u32(output, REGION_QUEUE_ORDINAL_OFFSET, region.queue_ordinal);
     put_u64(output, REGION_CREATED_SEQNO_OFFSET, region.created_seqno);
     put_u32(output, REGION_DURABLE_USED_OFFSET, durable_used);
     put_u32(output, REGION_RECORD_COUNT_OFFSET, physical_record_count);
-    put_u64(output, REGION_MAX_SEQNO_OFFSET, region.max_seqno);
-    output[REGION_RESERVED_START..REGION_RESERVED_END].fill(0);
+    put_u32(output, REGION_QUEUE_ORDINAL_OFFSET, region.queue_ordinal);
+    output[REGION_STATE_OFFSET] = region.state as u8;
 }
 
 fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
-    if input.len() != REGION_METADATA_REGION_SIZE
-        || input[REGION_FLAGS_OFFSET] != 0
-        || get_u16(input, REGION_RESERVED16_OFFSET)? != 0
-        || input[REGION_RESERVED_START..REGION_RESERVED_END]
-            .iter()
-            .any(|byte| *byte != 0)
-    {
+    if input.len() != REGION_METADATA_REGION_SIZE {
         return Err(RegionMetadataError::InvalidField("region_encoding"));
     }
     Ok(RegionMetadataRecord {
-        region_id: get_u32(input, REGION_ID_OFFSET)?,
-        incarnation: get_u32(input, REGION_INCARNATION_OFFSET)?,
         state: RegionMetadataState::decode(input[REGION_STATE_OFFSET])
             .ok_or(RegionMetadataError::InvalidField("region_state"))?,
         queue_ordinal: get_u32(input, REGION_QUEUE_ORDINAL_OFFSET)?,
         created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)?,
         durable_used_offset: u64::from(get_u32(input, REGION_DURABLE_USED_OFFSET)?),
-        max_seqno: get_u64(input, REGION_MAX_SEQNO_OFFSET)?,
         physical_record_count: u64::from(get_u32(input, REGION_RECORD_COUNT_OFFSET)?),
     })
 }
@@ -1170,43 +1134,31 @@ mod tests {
             },
             regions: vec![
                 RegionMetadataRecord {
-                    region_id: 0,
-                    incarnation: 1,
                     state: RegionMetadataState::Active,
                     queue_ordinal: 0,
                     created_seqno: 1,
                     durable_used_offset: 0,
-                    max_seqno: 0,
                     physical_record_count: 0,
                 },
                 RegionMetadataRecord {
-                    region_id: 1,
-                    incarnation: 1,
                     state: RegionMetadataState::Sealed,
                     queue_ordinal: 0,
                     created_seqno: 2,
                     durable_used_offset: 128,
-                    max_seqno: 3,
                     physical_record_count: 2,
                 },
                 RegionMetadataRecord {
-                    region_id: 2,
-                    incarnation: 1,
                     state: RegionMetadataState::Sealed,
                     queue_ordinal: 1,
                     created_seqno: 4,
                     durable_used_offset: 64,
-                    max_seqno: 4,
                     physical_record_count: 1,
                 },
                 RegionMetadataRecord {
-                    region_id: 3,
-                    incarnation: 0,
                     state: RegionMetadataState::Free,
                     queue_ordinal: 0,
                     created_seqno: 0,
                     durable_used_offset: 0,
-                    max_seqno: 0,
                     physical_record_count: 0,
                 },
             ]
@@ -1263,7 +1215,7 @@ mod tests {
     fn round_trip_preserves_exact_frozen_authority() {
         let expected = sample();
         let encoded = expected.encode().unwrap();
-        assert_eq!(REGION_METADATA_REGION_SIZE, 48);
+        assert_eq!(REGION_METADATA_REGION_SIZE, 21);
         assert_eq!(REGION_METADATA_PARTITION_SIZE, 16);
         assert_eq!(encoded.len() as u64, expected.encoded_len().unwrap());
         assert_eq!(RegionMetadata::decode(&encoded).unwrap(), expected);
@@ -1323,18 +1275,6 @@ mod tests {
         assert_eq!(
             RegionMetadata::decode(&reserved_epoch),
             Err(RegionMetadataError::InvalidField("root_encoding"))
-        );
-    }
-
-    #[test]
-    fn reserved_region_slots_are_rejected() {
-        let mut encoded = sample().encode().unwrap();
-        let region_page = page_mut(&mut encoded, 1).unwrap();
-        page_payload_mut(region_page, 0, REGION_METADATA_REGION_SIZE)[REGION_RESERVED_START] = 1;
-        finish_page(region_page);
-        assert_eq!(
-            RegionMetadata::decode(&encoded),
-            Err(RegionMetadataError::InvalidField("region_encoding"))
         );
     }
 
