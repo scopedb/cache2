@@ -348,6 +348,7 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(7)
         .with_write_io_workers(2)
+        .with_reclaim_workers(2)
         .with_append_shards(2)
         .with_l1_capacity_bytes(2 * 1024 * 1024)
         .with_managed_memory_limit_bytes(32 * 1024 * 1024)
@@ -562,10 +563,16 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 11] = [
+    let cases: [RuntimeConfigCase; 13] = [
         ("zero-append-shards", |config| config.with_append_shards(0)),
         ("too-many-append-shards", |config| {
             config.with_append_shards(257)
+        }),
+        ("zero-reclaim-workers", |config| {
+            config.with_reclaim_workers(0)
+        }),
+        ("too-many-reclaim-workers", |config| {
+            config.with_reclaim_workers(3)
         }),
         ("zero-read-workers", |config| config.with_read_io_workers(0)),
         ("zero-write-workers", |config| {

@@ -476,6 +476,13 @@ impl FileRegionCore {
         runtime_fixed_memory_bytes(self.index.storage().slot_count(), region_count)
     }
 
+    pub(crate) fn configure_reclaim_workers(&self, workers: usize) -> io::Result<()> {
+        self.manager
+            .lock()?
+            .configure_reclaim_workers(workers)
+            .map_err(region_metadata_io_error)
+    }
+
     pub(crate) fn append_shard(&self, hash: u64) -> usize {
         route_hash(hash, self.shards.len())
     }

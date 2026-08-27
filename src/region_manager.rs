@@ -192,7 +192,8 @@ pub(crate) struct RegionManager {
     shard_mutations: Vec<ShardMutation>,
     free_regions: VecDeque<u32>,
     sealed_regions: VecDeque<u32>,
-    reclaiming: Option<RegionReclaimReceipt>,
+    reclaiming: Vec<RegionReclaimReceipt>,
+    reclaim_limit: usize,
     queue_capacity: usize,
     rotations: u64,
 }
@@ -229,6 +230,7 @@ impl RegionManager {
         shard_mutations.resize(active_count, ShardMutation::default());
         let mut free_regions = try_unassigned_queue(free_count, free_count)?;
         let mut sealed_regions = try_unassigned_queue(sealed_count, sealed_capacity)?;
+        let reclaiming = try_vec(1)?;
 
         for (region_id, encoded) in encoded_regions.iter().copied().enumerate() {
             let region_id =
@@ -279,7 +281,8 @@ impl RegionManager {
             shard_mutations,
             free_regions,
             sealed_regions,
-            reclaiming: None,
+            reclaiming,
+            reclaim_limit: 1,
             queue_capacity: sealed_capacity,
             rotations: 0,
         })
@@ -316,7 +319,8 @@ impl RegionManager {
                 .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
             sealed_region_count: u32::try_from(self.sealed_regions.len())
                 .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
-            reclaiming_region_count: u32::from(self.reclaiming.is_some()),
+            reclaiming_region_count: u32::try_from(self.reclaiming.len())
+                .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
             rotations: self.rotations,
             ..RegionSnapshot::default()
         };
@@ -341,10 +345,30 @@ impl RegionManager {
         &self.sealed_regions
     }
 
+    pub(crate) fn configure_reclaim_workers(
+        &mut self,
+        workers: usize,
+    ) -> Result<(), RegionMetadataError> {
+        if workers == 0 || workers > self.active_regions.len() || !self.reclaiming.is_empty() {
+            return Err(RegionMetadataError::InvalidField("reclaim_workers"));
+        }
+        if self.reclaiming.capacity() < workers {
+            self.reclaiming
+                .try_reserve_exact(workers)
+                .map_err(|_| RegionMetadataError::Allocation)?;
+        }
+        self.reclaim_limit = workers;
+        Ok(())
+    }
+
     pub(crate) fn reclaim_needed(&self) -> bool {
-        self.reclaiming.is_none()
+        self.reclaiming.len() < self.reclaim_limit
             && !self.sealed_regions.is_empty()
-            && self.free_regions.len() < self.active_regions.len().max(1)
+            && self
+                .free_regions
+                .len()
+                .saturating_add(self.reclaiming.len())
+                < self.active_regions.len().max(1)
     }
 
     /// Allocates one process-local ordering version. Sequence exhaustion is a
@@ -1007,7 +1031,9 @@ impl RegionManager {
             physical_record_count: region.physical_record_count,
             second_chances,
         };
-        self.reclaiming = Some(receipt);
+        debug_assert!(self.reclaiming.len() < self.reclaim_limit);
+        debug_assert!(self.reclaiming.len() < self.reclaiming.capacity());
+        self.reclaiming.push(receipt);
         Ok(Some(receipt))
     }
 
@@ -1018,9 +1044,11 @@ impl RegionManager {
         &mut self,
         receipt: RegionReclaimReceipt,
     ) -> Result<(), RegionMutationError> {
-        if self.reclaiming != Some(receipt) {
-            return Err(RegionMutationError::StaleReceipt);
-        }
+        let reclaiming = self
+            .reclaiming
+            .iter()
+            .position(|current| *current == receipt)
+            .ok_or(RegionMutationError::StaleReceipt)?;
         let index = usize::try_from(receipt.region_id)
             .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
         let region = self
@@ -1052,7 +1080,7 @@ impl RegionManager {
             physical_record_count: 0,
         };
         self.free_regions.push_back(receipt.region_id);
-        self.reclaiming = None;
+        self.reclaiming.swap_remove(reclaiming);
         Ok(())
     }
 
@@ -1063,7 +1091,7 @@ impl RegionManager {
         &self,
         partitions: Box<[PartitionMetadataRecord]>,
     ) -> Result<RegionMetadata, RegionMetadataError> {
-        if self.reclaiming.is_some()
+        if !self.reclaiming.is_empty()
             || self
                 .shard_mutations
                 .iter()
@@ -1650,6 +1678,44 @@ mod tests {
         );
         let frozen = manager.freeze_metadata(shards).unwrap();
         assert_eq!(frozen.regions[4].physical_record_count, 0);
+    }
+
+    #[test]
+    fn configured_reclaim_workers_own_distinct_regions_and_finish_out_of_order() {
+        let metadata = sample_without_free_regions();
+        let partitions = metadata.partitions.clone();
+        let mut manager = RegionManager::from_metadata(metadata).unwrap();
+        assert_eq!(
+            manager.configure_reclaim_workers(0),
+            Err(RegionMetadataError::InvalidField("reclaim_workers"))
+        );
+        assert_eq!(
+            manager.configure_reclaim_workers(3),
+            Err(RegionMetadataError::InvalidField("reclaim_workers"))
+        );
+        manager.configure_reclaim_workers(2).unwrap();
+
+        let first = manager.begin_reclaim(|_| false).unwrap().unwrap();
+        let second = manager.begin_reclaim(|_| false).unwrap().unwrap();
+        assert_eq!((first.region_id, second.region_id), (4, 1));
+        assert_eq!(manager.begin_reclaim(|_| false).unwrap(), None);
+        assert_eq!(
+            manager.region_snapshot().unwrap().reclaiming_region_count,
+            2
+        );
+
+        manager.finish_reclaim(second).unwrap();
+        assert_eq!(manager.begin_reclaim(|_| false).unwrap(), None);
+        assert_eq!(
+            manager.region_snapshot().unwrap().reclaiming_region_count,
+            1
+        );
+        manager.finish_reclaim(first).unwrap();
+        assert_eq!(
+            manager.region_snapshot().unwrap().reclaiming_region_count,
+            0
+        );
+        manager.freeze_metadata(partitions).unwrap();
     }
 
     #[test]

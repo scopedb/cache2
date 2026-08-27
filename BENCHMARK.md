@@ -33,7 +33,8 @@ The main controls are:
 - `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, and
   `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB` for capacity;
 - `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, and
-  `CACHE_BENCH_WRITE_IO_WORKERS` for topology;
+  `CACHE_BENCH_WRITE_IO_WORKERS` for foreground topology;
+- `CACHE_BENCH_RECLAIM_WORKERS` for concurrent Region reclaim;
 - `CACHE_BENCH_WRITE_CLIENTS` and `CACHE_BENCH_CLIENTS` for concurrency;
 - `CACHE_BENCH_HOT_ENTRIES` enables the focused hot-set/cold-scan workload;
   `CACHE_BENCH_HOT_READ_INTERVAL` controls one hot read per N cold reads;

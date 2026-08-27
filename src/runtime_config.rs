@@ -5,7 +5,8 @@ const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_APPEND_SHARDS: u32 = 4;
 const IO_URING_DEPTH_PER_WORKER: usize = 64;
 
-/// Runtime implementation used by the independent read and write I/O pools.
+/// Runtime implementation used by the independent read, write, and reclaim
+/// I/O pools.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IoEngine {
@@ -44,6 +45,7 @@ pub struct RuntimeConfig {
     pub(crate) io_mode: IoMode,
     pub(crate) read_io_workers: usize,
     pub(crate) write_io_workers: usize,
+    pub(crate) reclaim_workers: usize,
     pub(crate) append_shards: u32,
     pub(crate) l1_capacity_bytes: usize,
     pub(crate) managed_memory_limit_bytes: usize,
@@ -59,6 +61,7 @@ impl Default for RuntimeConfig {
             io_mode: IoMode::Buffered,
             read_io_workers: 4,
             write_io_workers: 4,
+            reclaim_workers: 1,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             managed_memory_limit_bytes: 1024 * 1024 * 1024,
@@ -70,7 +73,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Selects the implementation used by both independent I/O pools.
+    /// Selects the implementation used by the independent I/O pools.
     ///
     /// POSIX worker-backed positioned I/O is the default. `IoUring` requires
     /// the `io-uring` crate feature and a supported Linux target.
@@ -105,6 +108,16 @@ impl RuntimeConfig {
     /// the number of independent fixed-depth rings.
     pub fn with_write_io_workers(mut self, workers: usize) -> Self {
         self.write_io_workers = workers;
+        self
+    }
+
+    /// Sets the number of concurrent Region reclaim workers.
+    ///
+    /// Each worker owns one Region-sized scan buffer and one reclaim I/O lane.
+    /// The count must be non-zero and no greater than the append-shard count;
+    /// additional workers cannot increase the per-shard clean reserve.
+    pub fn with_reclaim_workers(mut self, workers: usize) -> Self {
+        self.reclaim_workers = workers;
         self
     }
 
@@ -192,6 +205,11 @@ impl RuntimeConfig {
         self.write_io_workers
     }
 
+    /// Returns the number of concurrent Region reclaim workers.
+    pub const fn reclaim_workers(&self) -> usize {
+        self.reclaim_workers
+    }
+
     /// Returns the number of hash-routed append shards.
     pub const fn append_shards(&self) -> u32 {
         self.append_shards
@@ -248,6 +266,7 @@ mod tests {
         assert_eq!(config.io_mode(), IoMode::Buffered);
         assert_eq!(config.read_io_workers(), 4);
         assert_eq!(config.write_io_workers(), 4);
+        assert_eq!(config.reclaim_workers(), 1);
         assert_eq!(config.append_shards(), 4);
         assert_eq!(config.io_engine_count(config.read_io_workers()), 1);
         assert_eq!(config.io_depth_per_engine(config.read_io_workers()), 4);

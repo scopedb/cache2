@@ -35,6 +35,7 @@ let runtime_config = RuntimeConfig::default()
     .with_l1_shards(64)
     .with_read_io_workers(16)
     .with_write_io_workers(4)
+    .with_reclaim_workers(2)
     .with_append_shards(8);
 
 let cache = CacheBuilder::from_static("/mnt/nvme/chunks.cache", static_config)

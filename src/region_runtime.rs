@@ -414,6 +414,12 @@ impl RuntimeConfig {
                 "append shards must be in 1..=256",
             ));
         }
+        if self.reclaim_workers == 0 || self.reclaim_workers > self.append_shards as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reclaim workers must be non-zero and no greater than append shards",
+            ));
+        }
         if self.read_io_workers == 0 || self.write_io_workers == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -547,11 +553,15 @@ impl RuntimeConfig {
             .checked_add(self.l1_capacity_bytes)
             .and_then(|bytes| bytes.checked_add(topology_bytes))
             .ok_or_else(|| invalid_runtime_config("reserved memory plan overflow"))?;
+        let reclaim_buffers = usable_region
+            .checked_mul(self.reclaim_workers)
+            .ok_or_else(|| invalid_runtime_config("reclaim buffer memory plan overflow"))?;
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
-            // One Region-sized buffer is permanently owned by reclaim. Keep a
-            // second maximum-size exact read available to the foreground.
-            .and_then(|bytes| bytes.checked_add(usable_region.checked_mul(2)?))
+            // Every reclaimer permanently owns one Region-sized buffer. Keep
+            // one additional maximum-size exact read for the foreground.
+            .and_then(|bytes| bytes.checked_add(reclaim_buffers))
+            .and_then(|bytes| bytes.checked_add(usable_region))
             .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
         Ok((reserved_memory, minimum))
     }
@@ -646,14 +656,14 @@ pub(crate) struct RegionDataPlane {
 struct RunningOwner {
     shared: Arc<RunningShared>,
     shard_workers: Vec<JoinHandle<()>>,
-    reclaim_worker: Option<JoinHandle<()>>,
+    reclaim_workers: Vec<JoinHandle<()>>,
 }
 
 struct RunningShared {
     core: Arc<FileRegionCore>,
     read_engines: Box<[Arc<dyn IoEngine>]>,
     write_engines: Box<[Arc<dyn IoEngine>]>,
-    reclaim_engine: Arc<dyn IoEngine>,
+    reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
     resources: Arc<ResourceController>,
     metrics: Arc<RuntimeMetrics>,
@@ -667,7 +677,7 @@ struct RunningShared {
 
 #[derive(Default)]
 struct ReclaimControlState {
-    notified: bool,
+    generation: u64,
     stop: bool,
 }
 
@@ -686,15 +696,15 @@ impl ReclaimControl {
 
     fn notify(&self) -> io::Result<()> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
-        state.notified = true;
-        self.changed.notify_one();
+        state.generation = state.generation.wrapping_add(1);
+        self.changed.notify_all();
         Ok(())
     }
 
     fn stop(&self) -> io::Result<()> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
         state.stop = true;
-        self.changed.notify_one();
+        self.changed.notify_all();
         Ok(())
     }
 
@@ -706,9 +716,9 @@ impl ReclaimControl {
             .stop)
     }
 
-    fn wait(&self) -> io::Result<bool> {
+    fn wait(&self, observed_generation: &mut u64) -> io::Result<bool> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
-        while !state.notified && !state.stop {
+        while state.generation == *observed_generation && !state.stop {
             state = self
                 .changed
                 .wait(state)
@@ -717,7 +727,7 @@ impl ReclaimControl {
         if state.stop {
             return Ok(false);
         }
-        state.notified = false;
+        *observed_generation = state.generation;
         Ok(true)
     }
 }
@@ -735,7 +745,7 @@ impl RunningShared {
         self.read_engines
             .iter()
             .chain(self.write_engines.iter())
-            .chain(std::iter::once(&self.reclaim_engine))
+            .chain(self.reclaim_engines.iter())
     }
 }
 
@@ -889,6 +899,7 @@ impl RegionDataPlane {
         files: RuntimeFileSet,
         config: RuntimeConfig,
     ) -> io::Result<Self> {
+        core.configure_reclaim_workers(config.reclaim_workers)?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
         let running = start_running(
@@ -1259,7 +1270,7 @@ impl RegionDataPlane {
         snapshot.io = aggregate_io_stats(
             &running.read_engines,
             &running.write_engines,
-            running.reclaim_engine.as_ref(),
+            &running.reclaim_engines,
         );
         snapshot
     }
@@ -1305,7 +1316,7 @@ impl RegionDataPlane {
 fn aggregate_io_stats(
     read_engines: &[Arc<dyn IoEngine>],
     write_engines: &[Arc<dyn IoEngine>],
-    reclaim_engine: &dyn IoEngine,
+    reclaim_engines: &[Arc<dyn IoEngine>],
 ) -> CacheIoSnapshot {
     let mut aggregate = CacheIoSnapshot::default();
     for (engine_index, engine) in read_engines.iter().chain(write_engines).enumerate() {
@@ -1324,7 +1335,9 @@ fn aggregate_io_stats(
             aggregate.write.direct = snapshot.runtime.write.direct;
         }
     }
-    add_io_direction(&mut aggregate.read, reclaim_engine.stats().requests);
+    for engine in reclaim_engines {
+        add_io_direction(&mut aggregate.read, engine.stats().requests);
+    }
     aggregate
 }
 
@@ -1399,18 +1412,28 @@ fn start_running(
         config.l1_shards,
         config.statistics,
     )?);
-    let reclaim_buffer = resources.try_read_buffer(usable_region).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "cannot allocate the fixed Region reclaim buffer",
-        )
-    })?;
+    let mut reclaim_buffers = Vec::new();
+    reclaim_buffers
+        .try_reserve_exact(config.reclaim_workers)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate Region reclaim buffer owners",
+            )
+        })?;
+    for _ in 0..config.reclaim_workers {
+        reclaim_buffers.push(resources.try_read_buffer(usable_region).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate a fixed Region reclaim buffer",
+            )
+        })?);
+    }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
     let read_engines = build_engine_pool(files, &config, config.read_io_workers)?;
     let write_engines = build_engine_pool(write_files, &config, config.write_io_workers)?;
-    let reclaim_engine =
-        build_file_engine(reclaim_files, 1, 1, config.io_engine(), config.statistics)?;
+    let reclaim_engines = build_engine_pool(reclaim_files, &config, config.reclaim_workers)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1420,7 +1443,7 @@ fn start_running(
         core,
         read_engines,
         write_engines,
-        reclaim_engine,
+        reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         resources,
         metrics,
@@ -1434,6 +1457,12 @@ fn start_running(
     // Inspect the recovered queue before workers can contend with foreground
     // mutations. Fresh caches have no sealed Regions and need no wakeup.
     let reclaim_on_start = shared.core.reclaim_needed()?;
+    let mut reclaim_workers = Vec::new();
+    reclaim_workers
+        .try_reserve_exact(config.reclaim_workers)
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate worker handles")
+        })?;
     let mut shard_workers = Vec::new();
     shard_workers.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate worker handles")
@@ -1461,64 +1490,73 @@ fn start_running(
             }
         }
     }
-    let reclaim_shared = Arc::clone(&shared);
-    let reclaim_worker = match std::thread::Builder::new()
-        .name("cache2-reclaim".to_owned())
-        .stack_size(CACHE_THREAD_STACK_BYTES)
-        .spawn(move || reclaim_worker(reclaim_shared, reclaim_buffer))
-    {
-        Ok(worker) => worker,
-        Err(error) => {
-            for shard in &shared.shards {
-                let _ = shard.request_drain(true);
+    for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
+        let reclaim_shared = Arc::clone(&shared);
+        match std::thread::Builder::new()
+            .name(format!("cache2-reclaim-{worker_id}"))
+            .stack_size(CACHE_THREAD_STACK_BYTES)
+            .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id))
+        {
+            Ok(worker) => reclaim_workers.push(worker),
+            Err(error) => {
+                let _ = shared.reclaim_control.stop();
+                for worker in reclaim_workers {
+                    let _ = worker.join();
+                }
+                for shard in &shared.shards {
+                    let _ = shard.request_drain(true);
+                }
+                for worker in shard_workers {
+                    let _ = worker.join();
+                }
+                shared.staging.close();
+                for engine in shared.engines() {
+                    let _ = engine.shutdown();
+                }
+                return Err(error);
             }
-            for worker in shard_workers {
-                let _ = worker.join();
-            }
-            shared.staging.close();
-            for engine in shared.engines() {
-                let _ = engine.shutdown();
-            }
-            return Err(error);
         }
-    };
+    }
     if reclaim_on_start {
         shared.reclaim_control.notify()?;
     }
     Ok(RunningOwner {
         shared,
         shard_workers,
-        reclaim_worker: Some(reclaim_worker),
+        reclaim_workers,
     })
 }
 
 fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> Option<usize> {
-    // Reserve one stack per configured worker, one possible shutdown reaper per
-    // engine, and one worker per append shard.
+    // Reserve one stack per configured I/O worker, one possible shutdown
+    // reaper per engine, and every append/reclaim worker.
     let read_engine_count = config.io_engine_count(config.read_io_workers);
     let write_engine_count = config.io_engine_count(config.write_io_workers);
+    let reclaim_engine_count = config.io_engine_count(config.reclaim_workers);
     let engine_count = read_engine_count
         .checked_add(write_engine_count)?
-        .checked_add(1)?;
+        .checked_add(reclaim_engine_count)?;
     let stack_count = config
         .read_io_workers
         .checked_add(config.write_io_workers)?
-        .checked_add(1)?
+        .checked_add(config.reclaim_workers)?
         .checked_add(engine_count)?
         .checked_add(shard_count)?
-        .checked_add(1)?;
+        .checked_add(config.reclaim_workers)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
     let read_queue =
         read_engine_count.checked_mul(config.io_depth_per_engine(config.read_io_workers))?;
+    let reclaim_queue =
+        reclaim_engine_count.checked_mul(config.io_depth_per_engine(config.reclaim_workers))?;
     let queue = write_engine_count
         .checked_mul(config.io_depth_per_engine(config.write_io_workers))?
         .checked_add(read_queue)?
-        .checked_add(1)?
+        .checked_add(reclaim_queue)?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let controls = engine_count
         .checked_add(shard_count)?
         .checked_add(config.l1_shards)?
-        .checked_add(1)?
+        .checked_add(config.reclaim_workers)?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
     let metrics = shard_count.checked_mul(std::mem::size_of::<ActivityMetrics>())?;
     stacks
@@ -1602,10 +1640,10 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     }
 }
 
-fn reclaim_worker(shared: Arc<RunningShared>, buffer: BufferLease) {
+fn reclaim_worker(shared: Arc<RunningShared>, buffer: BufferLease, worker_id: usize) {
     let mut buffer = Some(buffer);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        reclaim_worker_result(&shared, &mut buffer)
+        reclaim_worker_result(&shared, &mut buffer, worker_id)
     }));
     let error = match result {
         Ok(Ok(())) => return,
@@ -1623,6 +1661,7 @@ fn reclaim_worker(shared: Arc<RunningShared>, buffer: BufferLease) {
     log::error!(
         target: "cache2::health",
         event = "cache_reclaim_worker_failed",
+        worker_id,
         error:% = error;
         "cache Region reclaim worker failed"
     );
@@ -1634,8 +1673,21 @@ fn reclaim_worker(shared: Arc<RunningShared>, buffer: BufferLease) {
 fn reclaim_worker_result(
     shared: &RunningShared,
     buffer: &mut Option<BufferLease>,
+    worker_id: usize,
 ) -> io::Result<()> {
-    while shared.reclaim_control.wait()? {
+    let engine_index = if shared.reclaim_engines.len() == 1 {
+        0
+    } else {
+        worker_id
+    };
+    let engine = shared.reclaim_engines.get(engine_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reclaim worker has no I/O engine",
+        )
+    })?;
+    let mut observed_generation = 0_u64;
+    while shared.reclaim_control.wait(&mut observed_generation)? {
         loop {
             // Finish an already-started victim, but do not begin another once
             // shutdown has asked the worker to stop. A large clean-reserve
@@ -1653,7 +1705,7 @@ fn reclaim_worker_result(
                 )
             })?;
             if used != 0 {
-                let slot = shared.reclaim_engine.try_reserve_read()?;
+                let slot = engine.try_reserve_read()?;
                 let owned = buffer.take().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "reclaim worker lost its buffer")
                 })?;
@@ -1663,13 +1715,13 @@ fn reclaim_worker_result(
                 };
                 let absolute = shared.core.reclaim_absolute(receipt)?;
                 let request = submit_cache_read(
-                    shared.reclaim_engine.as_ref(),
+                    engine.as_ref(),
                     slot,
                     IoOperation::read(io_buffer, absolute),
                 )
                 .map_err(|error| error.into_lease().0)?;
                 let completion = request
-                    .wait(shared.reclaim_engine.as_ref())
+                    .wait(engine.as_ref())
                     .map_err(|error| error.into_lease().0)?;
                 let (result, returned) = completion.into_lease();
                 let transferred = result?;
@@ -1706,6 +1758,7 @@ fn reclaim_worker_result(
             log::debug!(
                 target: "cache2::reclaim",
                 event = "cache_region_reclaimed",
+                worker_id,
                 region_id = receipt.region_id,
                 bytes = stats.bytes_read,
                 records_scanned = stats.records_scanned,
@@ -1916,12 +1969,10 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     if let Err(error) = owner.shared.reclaim_control.stop() {
         join_error.get_or_insert(error);
     }
-    if owner
-        .reclaim_worker
-        .take()
-        .is_some_and(|worker| worker.join().is_err())
-    {
-        join_error.get_or_insert_with(|| io::Error::other("Region reclaim worker panicked"));
+    for worker in owner.reclaim_workers.drain(..) {
+        if worker.join().is_err() {
+            join_error.get_or_insert_with(|| io::Error::other("Region reclaim worker panicked"));
+        }
     }
     owner.shared.staging.close();
     let in_flight = owner
@@ -2052,6 +2103,7 @@ mod tests {
     use super::*;
     use crate::io_backend::{FileBackend, IoBackend};
     use crate::io_engine::BackendIoEngine;
+    use std::sync::Barrier;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2160,6 +2212,29 @@ mod tests {
     }
 
     #[test]
+    fn one_reclaim_notification_reaches_every_worker() {
+        let control = Arc::new(ReclaimControl::new());
+        let ready = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let control = Arc::clone(&control);
+            let ready = Arc::clone(&ready);
+            workers.push(std::thread::spawn(move || {
+                let mut observed_generation = 0;
+                ready.wait();
+                let notified = control.wait(&mut observed_generation).unwrap();
+                (notified, observed_generation)
+            }));
+        }
+
+        ready.wait();
+        control.notify().unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), (true, 1));
+        }
+    }
+
+    #[test]
     fn transient_read_pressure_is_not_a_cache_failure() {
         for kind in [
             io::ErrorKind::OutOfMemory,
@@ -2257,5 +2332,30 @@ mod tests {
             MemoryStore::allocation_bytes(base.l1_capacity_bytes, entry_capacity, base.l1_shards)
                 .unwrap();
         assert!(metadata < 384 * 1024 * 1024);
+    }
+
+    #[test]
+    fn each_additional_reclaimer_is_fully_memory_accounted() {
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
+            region_size: 512 * 1024,
+            region_count: 10,
+        };
+        let base = RuntimeConfig::default()
+            .with_append_shards(4)
+            .with_l1_capacity_bytes(0);
+        let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
+        let (_, parallel_minimum) = base
+            .with_reclaim_workers(2)
+            .memory_plan_bytes(geometry, 4, 0)
+            .unwrap();
+
+        assert_eq!(
+            parallel_minimum - base_minimum,
+            geometry.region_size as usize
+                + 2 * CACHE_THREAD_STACK_BYTES
+                + IO_QUEUE_ENTRY_RESERVATION_BYTES
+                + RUNTIME_CONTROL_RESERVATION_BYTES
+        );
     }
 }

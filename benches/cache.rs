@@ -37,6 +37,7 @@ struct BenchConfig {
     append_shards: u32,
     read_io_workers: usize,
     write_io_workers: usize,
+    reclaim_workers: usize,
     write_clients: usize,
     clients: usize,
     io_engine: IoEngine,
@@ -57,6 +58,7 @@ impl BenchConfig {
         let append_shards = env_u32("CACHE_BENCH_APPEND_SHARDS", 4)?;
         let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
         let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
+        let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
         let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
@@ -84,6 +86,8 @@ impl BenchConfig {
             || read_ops == 0
             || read_io_workers == 0
             || write_io_workers == 0
+            || reclaim_workers == 0
+            || reclaim_workers > append_shards as usize
             || write_clients == 0
             || clients == 0
             || append_shards == 0
@@ -173,6 +177,7 @@ impl BenchConfig {
             append_shards,
             read_io_workers,
             write_io_workers,
+            reclaim_workers,
             write_clients,
             clients,
             io_engine,
@@ -197,6 +202,7 @@ impl BenchConfig {
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
             .with_write_io_workers(self.write_io_workers)
+            .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
@@ -319,7 +325,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -334,6 +340,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.append_shards,
         config.read_io_workers,
         config.write_io_workers,
+        config.reclaim_workers,
         config.write_clients,
         config.clients,
         config.l2_clients(),

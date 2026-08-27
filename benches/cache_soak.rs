@@ -30,6 +30,7 @@ struct SoakConfig {
     append_shards: u32,
     read_io_workers: usize,
     write_io_workers: usize,
+    reclaim_workers: usize,
     writers: usize,
     readers: usize,
     warm_reopen: bool,
@@ -50,11 +51,16 @@ impl SoakConfig {
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
         let append_shards = env_u32("CACHE_SOAK_APPEND_SHARDS", 4)?;
+        let reclaim_workers = env_usize("CACHE_SOAK_RECLAIM_WORKERS", 1)?;
         let shard_count = usize::try_from(append_shards)
             .map_err(|_| invalid("soak shard count does not fit usize"))?;
+        let read_reservation_bytes = reclaim_workers
+            .checked_add(1)
+            .and_then(|buffers| buffers.checked_mul(REGION_BYTES))
+            .ok_or_else(|| invalid("soak read reservation is too large"))?;
         let default_managed_memory_limit_mib = shard_count
             .checked_mul(2 * REGION_BYTES)
-            .and_then(|bytes| bytes.checked_add(2 * REGION_BYTES))
+            .and_then(|bytes| bytes.checked_add(read_reservation_bytes))
             .and_then(|bytes| bytes.checked_add(memory_bytes))
             .ok_or_else(|| invalid("soak default managed memory limit is too large"))?
             .div_ceil(MIB);
@@ -87,6 +93,8 @@ impl SoakConfig {
                 .any(|bytes| !(VALUE_HEADER_BYTES..=MAX_VALUE_BYTES).contains(bytes))
             || key_count == 0
             || append_shards == 0
+            || reclaim_workers == 0
+            || reclaim_workers > shard_count
             || read_io_workers == 0
             || write_io_workers == 0
             || writers == 0
@@ -109,6 +117,7 @@ impl SoakConfig {
             append_shards,
             read_io_workers,
             write_io_workers,
+            reclaim_workers,
             writers,
             readers,
             warm_reopen,
@@ -130,6 +139,7 @@ impl SoakConfig {
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
             .with_write_io_workers(self.write_io_workers)
+            .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
@@ -296,7 +306,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -311,6 +321,7 @@ fn main() -> io::Result<()> {
         config.append_shards,
         config.read_io_workers,
         config.write_io_workers,
+        config.reclaim_workers,
         config.writers,
         config.readers,
         config.warm_reopen,
