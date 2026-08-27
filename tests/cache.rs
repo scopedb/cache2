@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cache2::{
-    CacheConfig, CacheHealth, CacheTier, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
+    CacheBuilder, CacheHealth, CacheTier, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -23,14 +23,14 @@ impl TestCache {
         Self { data }
     }
 
-    fn config(&self, workers: usize) -> CacheConfig {
+    fn config(&self, workers: usize) -> CacheBuilder {
         let static_config = StaticConfig::new(3 * 512 * 1024)
-            .with_region_size(512 * 1024)
+            .with_region_size_bytes(512 * 1024)
             .with_expected_entries(3277);
         self.config_with_static(workers, static_config)
     }
 
-    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheConfig {
+    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheBuilder {
         self.config_with_static_and_shards(workers, static_config, 2)
     }
 
@@ -38,18 +38,18 @@ impl TestCache {
         &self,
         workers: usize,
         static_config: StaticConfig,
-        write_shards: u32,
-    ) -> CacheConfig {
+        append_shards: u32,
+    ) -> CacheBuilder {
         let runtime_config = RuntimeConfig::default()
             .with_io_engine(IoEngine::Posix)
             .with_read_io_workers(workers)
             .with_write_io_workers(workers)
-            .with_write_shards(write_shards)
-            .with_l1_capacity(4 * 1024 * 1024)
-            .with_memory_limit(32 * 1024 * 1024)
-            .with_write_batch_size(256 * 1024)
+            .with_append_shards(append_shards)
+            .with_l1_capacity_bytes(4 * 1024 * 1024)
+            .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+            .with_write_flush_threshold_bytes(256 * 1024)
             .with_statistics(true);
-        CacheConfig::from_static(&self.data, static_config).with_runtime_config(runtime_config)
+        CacheBuilder::from_static(&self.data, static_config).with_runtime_config(runtime_config)
     }
 
     fn sidecar(&self, suffix: &str) -> PathBuf {
@@ -181,7 +181,7 @@ async fn immediate_l1_publication_is_best_effort() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(2)
         .with_write_io_workers(2)
-        .with_write_shards(2)
+        .with_append_shards(2)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -213,17 +213,17 @@ async fn immediate_l1_publication_is_best_effort() {
 }
 
 #[tokio::test]
-async fn write_batch_threshold_does_not_cap_region_sized_staging() {
+async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
-        .with_write_shards(2)
-        .with_l1_capacity(1024 * 1024)
-        .with_memory_limit(32 * 1024 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(1024 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_batch_size(256 * 1024)
+        .with_write_flush_threshold_bytes(256 * 1024)
         .with_statistics(true);
     let cache = files
         .config(1)
@@ -254,11 +254,11 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(2)
         .with_write_io_workers(2)
-        .with_write_shards(2)
-        .with_l1_capacity(512)
-        .with_memory_limit(32 * 1024 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(512)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_batch_size(128 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024)
         .with_statistics(true);
     let cache = files
         .config(2)
@@ -301,10 +301,10 @@ async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
         .with_io_engine(IoEngine::IoUring)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
-        .with_write_shards(2)
-        .with_l1_capacity(4 * 1024 * 1024)
-        .with_memory_limit(32 * 1024 * 1024)
-        .with_write_batch_size(128 * 1024);
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(4 * 1024 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024);
 
     let error = files
         .config(1)
@@ -348,11 +348,11 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(7)
         .with_write_io_workers(2)
-        .with_write_shards(2)
-        .with_l1_capacity(2 * 1024 * 1024)
-        .with_memory_limit(32 * 1024 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(2 * 1024 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(7)
-        .with_write_batch_size(64 * 1024);
+        .with_write_flush_threshold_bytes(64 * 1024);
     let reopened = files
         .config(7)
         .with_runtime_config(retuned)
@@ -377,10 +377,10 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
 }
 
 #[tokio::test]
-async fn changing_runtime_write_shards_discards_the_clean_image() {
-    let files = TestCache::new("runtime-write-shards");
+async fn changing_append_shards_discards_the_clean_image() {
+    let files = TestCache::new("append-shards");
     let static_config = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size(512 * 1024)
+        .with_region_size_bytes(512 * 1024)
         .with_expected_entries(3277);
 
     let cache = files
@@ -563,9 +563,9 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
     let cases: [RuntimeConfigCase; 11] = [
-        ("zero-write-shards", |config| config.with_write_shards(0)),
-        ("too-many-write-shards", |config| {
-            config.with_write_shards(257)
+        ("zero-append-shards", |config| config.with_append_shards(0)),
+        ("too-many-append-shards", |config| {
+            config.with_append_shards(257)
         }),
         ("zero-read-workers", |config| config.with_read_io_workers(0)),
         ("zero-write-workers", |config| {
@@ -579,24 +579,24 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         }),
         ("l1-exceeds-budget", |config| {
             config
-                .with_l1_capacity(64 * 1024 * 1024)
-                .with_memory_limit(32 * 1024 * 1024)
+                .with_l1_capacity_bytes(64 * 1024 * 1024)
+                .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         }),
         ("fixed-plan-exceeds-budget", |config| {
             config
                 .with_io_engine(IoEngine::Posix)
                 .with_read_io_workers(2)
                 .with_write_io_workers(2)
-                .with_l1_capacity(0)
-                .with_memory_limit(2 * 1024 * 1024)
-                .with_write_batch_size(128 * 1024)
+                .with_l1_capacity_bytes(0)
+                .with_managed_memory_limit_bytes(2 * 1024 * 1024)
+                .with_write_flush_threshold_bytes(128 * 1024)
         }),
         ("zero-l1-shards", |config| config.with_l1_shards(0)),
-        ("unaligned-write-batch", |config| {
-            config.with_write_batch_size(4097)
+        ("unaligned-write-flush-threshold", |config| {
+            config.with_write_flush_threshold_bytes(4097)
         }),
-        ("oversized-write-batch", |config| {
-            config.with_write_batch_size(4 * 1024 * 1024 + 4096)
+        ("oversized-write-flush-threshold", |config| {
+            config.with_write_flush_threshold_bytes(4 * 1024 * 1024 + 4096)
         }),
     ];
 
@@ -604,7 +604,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         let files = TestCache::new(case);
         let error = files
             .config(2)
-            .with_runtime_config(configure(RuntimeConfig::default().with_write_shards(2)))
+            .with_runtime_config(configure(RuntimeConfig::default().with_append_shards(2)))
             .open()
             .await
             .unwrap_err();
@@ -685,7 +685,7 @@ async fn cold_start_removes_stale_recovery_files() {
 async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
     let static_config = StaticConfig::new(2 * 4096)
-        .with_region_size(4096)
+        .with_region_size_bytes(4096)
         .with_expected_entries(51);
     let value = vec![0x5a; 128];
 
@@ -714,7 +714,7 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
 async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
     let static_config = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size(512 * 1024)
+        .with_region_size_bytes(512 * 1024)
         .with_expected_entries(3277);
     let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
 
@@ -746,7 +746,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 async fn cache_snapshot_stays_within_the_configured_bounds() {
     let files = TestCache::new("resource-snapshot");
     let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size(512 * 1024)
+        .with_region_size_bytes(512 * 1024)
         .with_expected_entries(3277)
         .peak_disk_bytes()
         .unwrap();
@@ -865,10 +865,10 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
-        .with_write_shards(2)
-        .with_l1_capacity(0)
-        .with_memory_limit(32 * 1024 * 1024)
-        .with_write_batch_size(128 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(0)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024)
         .with_statistics(true);
     let cache = files
         .config(1)
@@ -901,11 +901,11 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
-        .with_write_shards(2)
-        .with_l1_capacity(64 * 1024)
-        .with_memory_limit(32 * 1024 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(64 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_batch_size(128 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024)
         .with_statistics(true);
     let cache = files
         .config(1)
@@ -947,10 +947,10 @@ async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation()
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
-        .with_write_shards(2)
-        .with_l1_capacity(0)
-        .with_memory_limit(32 * 1024 * 1024)
-        .with_write_batch_size(128 * 1024)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(0)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024)
         .with_statistics(true);
     let cache = files
         .config(1)
@@ -990,7 +990,7 @@ async fn static_config_change_discards_the_old_image() {
     cache.close_warm().await.unwrap();
 
     let changed = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size(512 * 1024)
+        .with_region_size_bytes(512 * 1024)
         .with_expected_entries(6553);
     let reopened = files.config_with_static(5, changed).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);

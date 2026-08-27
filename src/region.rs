@@ -1496,7 +1496,7 @@ where
             return self.cold_recovery("metadata_identity_mismatch");
         }
         if metadata.root.shard_count != self.shard_count {
-            return self.cold_recovery("write_shards_mismatch");
+            return self.cold_recovery("append_shards_mismatch");
         }
         let file = image.try_clone_control_file()?;
         self.cold_reset_needed = false;
@@ -2733,9 +2733,9 @@ mod tests {
                 .with_io_engine(crate::runtime_config::IoEngine::Posix)
                 .with_read_io_workers(1)
                 .with_write_io_workers(1)
-                .with_l1_capacity(0)
-                .with_memory_limit(32 * 1024 * 1024)
-                .with_write_batch_size(128 * 1024);
+                .with_l1_capacity_bytes(0)
+                .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+                .with_write_flush_threshold_bytes(128 * 1024);
             let mut store = RegionStore::open(
                 4096,
                 FileRegionBackend::new_with_configs(
@@ -2815,7 +2815,7 @@ mod tests {
         let resources = data_path_resources();
         let staging = RegionStaging::try_new(
             1,
-            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
+            crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
             data.geometry.region_size,
             &resources,
         )
@@ -2878,7 +2878,7 @@ mod tests {
         let resources = data_path_resources();
         let staging = RegionStaging::try_new(
             1,
-            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
+            crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
             data.geometry.region_size,
             &resources,
         )
@@ -2992,7 +2992,7 @@ mod tests {
         let resources = data_path_resources();
         let staging = RegionStaging::try_new(
             1,
-            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
+            crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
             data.geometry.region_size,
             &resources,
         )
@@ -3086,7 +3086,7 @@ mod tests {
         let resources = data_path_resources();
         let staging = RegionStaging::try_new(
             1,
-            crate::runtime_config::MAX_WRITE_BATCH_BYTES,
+            crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
             data.geometry.region_size,
             &resources,
         )

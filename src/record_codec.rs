@@ -79,7 +79,7 @@ pub(crate) fn required_record_bytes(
     Ok(record_bytes)
 }
 
-/// Returns the minimum record envelope used while filling a write batch.
+/// Returns the minimum record envelope used while filling an append staging span.
 ///
 /// Direct-I/O alignment belongs to the batch seal: staging extends only the
 /// final record under a manager-issued padding receipt.

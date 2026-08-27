@@ -39,16 +39,26 @@ const STATIC_FINGERPRINT_SCHEMA: u64 = 2;
 
 pub type Result<T> = std::io::Result<T>;
 
+/// Persistent L2 geometry and fixed-index sizing.
+///
+/// These values define the static disk identity. A clean image created with a
+/// different static configuration is discarded and the cache starts empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticConfig {
     capacity_bytes: u64,
-    region_size: u64,
+    region_size_bytes: u64,
     index_slots: usize,
     hash_seed: u64,
 }
 
 impl StaticConfig {
-    /// Creates a static configuration sized for an average 16 KiB entry.
+    /// Creates static L2 geometry and sizes its index assuming an average
+    /// 16 KiB live entry.
+    ///
+    /// `capacity_bytes` is the total Region extent, excluding the data
+    /// superblock, state, and clean-image files. The default Region size is
+    /// 32 MiB. Use [`Self::peak_disk_bytes`] for the cache-owned logical disk
+    /// bound.
     pub fn new(capacity_bytes: u64) -> Self {
         let expected_entries = capacity_bytes / DEFAULT_EXPECTED_ENTRY_BYTES;
         let index_slots = expected_entries
@@ -59,17 +69,29 @@ impl StaticConfig {
             as usize;
         Self {
             capacity_bytes,
-            region_size: DEFAULT_REGION_SIZE,
+            region_size_bytes: DEFAULT_REGION_SIZE,
             index_slots,
             hash_seed: DEFAULT_HASH_SEED,
         }
     }
 
-    pub fn with_region_size(mut self, bytes: u64) -> Self {
-        self.region_size = bytes;
+    /// Sets the Region size in bytes.
+    ///
+    /// It must be a 4 KiB multiple no larger than 32 MiB, and the L2 capacity
+    /// must be an exact multiple containing at least two Regions. A complete
+    /// encoded record must fit in one Region. Every append shard eagerly owns
+    /// two Region-sized staging buffers.
+    pub fn with_region_size_bytes(mut self, bytes: u64) -> Self {
+        self.region_size_bytes = bytes;
         self
     }
 
+    /// Sizes the fixed L2 index for the expected number of simultaneously live
+    /// keys.
+    ///
+    /// This is not a lifetime-write count. The resulting index uses roughly
+    /// 1.25 physical slots per expected live key and is part of the static disk
+    /// identity.
     pub fn with_expected_entries(mut self, entries: usize) -> Self {
         self.index_slots = entries
             .saturating_mul(5)
@@ -79,14 +101,17 @@ impl StaticConfig {
         self
     }
 
+    /// Returns the total Region extent in bytes.
     pub const fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
 
-    pub const fn region_size(&self) -> u64 {
-        self.region_size
+    /// Returns the Region size in bytes.
+    pub const fn region_size_bytes(&self) -> u64 {
+        self.region_size_bytes
     }
 
+    /// Returns the fixed number of physical L2 index slots.
     pub const fn index_slots(&self) -> usize {
         self.index_slots
     }
@@ -133,17 +158,17 @@ impl StaticConfig {
     }
 
     fn geometry(&self) -> Result<DataGeometry> {
-        if self.region_size == 0
-            || self.region_size > MAX_PACKED_REGION_SIZE
-            || !self.region_size.is_multiple_of(4096)
+        if self.region_size_bytes == 0
+            || self.region_size_bytes > MAX_PACKED_REGION_SIZE
+            || !self.region_size_bytes.is_multiple_of(4096)
             || self.capacity_bytes == 0
-            || !self.capacity_bytes.is_multiple_of(self.region_size)
+            || !self.capacity_bytes.is_multiple_of(self.region_size_bytes)
         {
             return Err(invalid_config(
                 "capacity must be a non-zero multiple of an aligned representable Region size",
             ));
         }
-        let region_count = u32::try_from(self.capacity_bytes / self.region_size)
+        let region_count = u32::try_from(self.capacity_bytes / self.region_size_bytes)
             .ok()
             .filter(|count| *count <= MAX_PACKED_REGION_COUNT)
             .ok_or_else(|| invalid_config("cache Region count is not representable"))?;
@@ -153,11 +178,11 @@ impl StaticConfig {
         if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
             return Err(invalid_config("index slots must be in 8..=536870912"));
         }
-        let data_file_len = DataGeometry::expected_file_len(self.region_size, region_count)
+        let data_file_len = DataGeometry::expected_file_len(self.region_size_bytes, region_count)
             .ok_or_else(|| invalid_config("cache data length overflow"))?;
         let geometry = DataGeometry {
             data_file_len,
-            region_size: self.region_size,
+            region_size: self.region_size_bytes,
             region_count,
         };
         if !geometry.is_valid() {
@@ -194,15 +219,21 @@ impl StaticConfig {
     }
 }
 
+/// Builder that combines a cache path, static geometry, runtime tuning, and a
+/// Tokio runtime binding before opening a [`Cache`].
 #[derive(Clone, Debug)]
-pub struct CacheConfig {
+pub struct CacheBuilder {
     path: PathBuf,
     static_config: StaticConfig,
     runtime_config: RuntimeConfig,
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
-impl CacheConfig {
+impl CacheBuilder {
+    /// Creates a builder using default static and runtime tuning.
+    ///
+    /// The L2 index is sized for 16 KiB live entries. Use
+    /// [`Self::from_static`] when Region or index geometry must be explicit.
     pub fn new(path: impl AsRef<Path>, capacity_bytes: u64) -> Self {
         Self::from_static(path, StaticConfig::new(capacity_bytes))
     }
@@ -217,6 +248,7 @@ impl CacheConfig {
         }
     }
 
+    /// Replaces the process-local runtime tuning used by [`Self::open`].
     pub fn with_runtime_config(mut self, config: RuntimeConfig) -> Self {
         self.runtime_config = config;
         self
@@ -290,15 +322,15 @@ impl CacheConfig {
         let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
         let runtime_config = self.runtime_config;
         runtime_config.validate()?;
-        if geometry.region_count <= runtime_config.write_shards {
+        if geometry.region_count <= runtime_config.append_shards {
             return Err(invalid_config(
-                "write shards require one Active Region each plus one spare Region",
+                "append shards require one Active Region each plus one spare Region",
             ));
         }
         runtime_config.validate_memory_plan(
             geometry,
             self.static_config.index_slots,
-            runtime_config.write_shards as usize,
+            runtime_config.append_shards as usize,
         )?;
         let format_data = DataSuperblock {
             generation: 1,
@@ -316,7 +348,7 @@ impl CacheConfig {
         let backend = FileRegionBackend::new_with_configs(
             files,
             format_data,
-            runtime_config.write_shards,
+            runtime_config.append_shards,
             runtime_config,
         );
         let store = RegionStore::open(self.static_config.index_slots, backend)?;
@@ -572,7 +604,7 @@ mod tests {
 
     #[test]
     fn minimum_static_region_geometry_is_encodable() {
-        let config = StaticConfig::new(5 * 4096).with_region_size(4096);
+        let config = StaticConfig::new(5 * 4096).with_region_size_bytes(4096);
         config.validate().unwrap();
         let geometry = config.geometry().unwrap();
         let data = DataSuperblock {

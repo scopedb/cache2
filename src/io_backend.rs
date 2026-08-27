@@ -138,7 +138,7 @@ impl RuntimeFileSet {
 
     #[cfg(test)]
     pub(crate) fn new(buffered: File, direct: Option<File>) -> Self {
-        Self::with_mode(buffered, direct, IoMode::Auto)
+        Self::with_mode(buffered, direct, IoMode::PreferDirect)
     }
 
     fn with_mode(buffered: File, direct: Option<File>, mode: IoMode) -> Self {
@@ -432,11 +432,13 @@ impl FileBackend {
                 direct: Some(direct),
                 direct_mode: mode,
             }),
-            Err(error) if mode == IoMode::Auto && direct_io_unavailable(&error) => Ok(Self {
-                file,
-                direct: None,
-                direct_mode: mode,
-            }),
+            Err(error) if mode == IoMode::PreferDirect && direct_io_unavailable(&error) => {
+                Ok(Self {
+                    file,
+                    direct: None,
+                    direct_mode: mode,
+                })
+            }
             Err(error) => Err(error),
         }
     }
@@ -1264,18 +1266,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_falls_back_but_required_reports_unsupported_direct_open() {
-        let auto_file = TestFile::new("direct-auto");
-        let auto = FileBackend::finish_direct_open(
-            auto_file.open(),
-            IoMode::Auto,
+    fn preferred_direct_falls_back_but_required_reports_unsupported_direct_open() {
+        let preferred_file = TestFile::new("direct-preferred");
+        let preferred = FileBackend::finish_direct_open(
+            preferred_file.open(),
+            IoMode::PreferDirect,
             Err(io::Error::from_raw_os_error(22)),
         )
         .unwrap();
-        assert!(!auto.direct_active());
+        assert!(!preferred.direct_active());
         let policy_denied = FileBackend::finish_direct_open(
-            auto_file.open(),
-            IoMode::Auto,
+            preferred_file.open(),
+            IoMode::PreferDirect,
             Err(io::Error::from_raw_os_error(13)),
         )
         .unwrap();
@@ -1294,9 +1296,9 @@ mod tests {
         let buffered = TestFile::new("runtime-fallback-buffered");
         let direct = TestFile::new("runtime-fallback-direct");
         let unavailable = io::Error::from_raw_os_error(22);
-        let auto_files =
-            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::Auto);
-        assert!(auto_files.should_fallback(RuntimeIoPath::Direct, &unavailable));
+        let preferred_files =
+            RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::PreferDirect);
+        assert!(preferred_files.should_fallback(RuntimeIoPath::Direct, &unavailable));
         let required_files =
             RuntimeFileSet::with_mode(buffered.open(), Some(direct.open()), IoMode::Direct);
         assert!(!required_files.should_fallback(RuntimeIoPath::Direct, &unavailable));

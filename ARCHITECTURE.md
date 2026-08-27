@@ -39,7 +39,7 @@ there is no foreground retry protocol or global admission queue.
 1. Probe one L1 shard under a short critical section.
 2. On miss, probe one L2 index partition without waiting for contention.
 3. For a candidate, reserve one immediately available read-engine slot and
-   allocate its exact aligned range against the aggregate memory limit.
+   allocate its exact aligned range against the managed-memory limit.
 4. Perform one record read and validate location, sequence, hash, full key,
    lengths, and checksum locally.
 5. Promote to L1 when bounded admission succeeds; otherwise return the

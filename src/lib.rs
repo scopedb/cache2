@@ -35,7 +35,7 @@ mod resources;
 mod runtime_config;
 mod snapshot;
 
-pub use cache::{Cache, CacheConfig, CacheTier, Result, StaticConfig, Value};
+pub use cache::{Cache, CacheBuilder, CacheTier, Result, StaticConfig, Value};
 pub use runtime_config::{IoEngine, IoMode, RuntimeConfig};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoSnapshot, CacheL1Snapshot, CacheSnapshot,

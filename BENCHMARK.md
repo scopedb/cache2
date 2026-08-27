@@ -21,8 +21,8 @@ The main controls are:
 - `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, and
   `CACHE_BENCH_RESIDENT_ENTRIES` for the data set;
 - `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, and
-  `CACHE_BENCH_MEMORY_LIMIT_MIB` for capacity;
-- `CACHE_BENCH_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, and
+  `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB` for capacity;
+- `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, and
   `CACHE_BENCH_WRITE_IO_WORKERS` for topology;
 - `CACHE_BENCH_WRITE_CLIENTS` and `CACHE_BENCH_CLIENTS` for concurrency;
 - `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
@@ -69,8 +69,8 @@ managed memory, RSS, logical disk use, and latency. Valid older values count as
 `stale_hits`; future, wrong-key, or malformed values fail the run.
 
 Use `CACHE_SOAK_WARM_REOPEN=true` to publish and reopen a clean image before the
-measured phase. `CACHE_SOAK_*` variables control capacity, memory, keys, shard
-and worker counts, clients, value sizes, and RSS slack.
+measured phase. `CACHE_SOAK_*` variables control capacity, managed memory, keys,
+append-shard and worker counts, clients, value sizes, and RSS slack.
 
 ## Focused diagnostics
 

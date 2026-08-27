@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheConfig, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, RuntimeConfig,
+    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, RuntimeConfig,
     StartupMode, StaticConfig,
 };
 
@@ -23,11 +23,11 @@ struct SoakConfig {
     sample_period: Duration,
     capacity_bytes: u64,
     memory_bytes: usize,
-    memory_limit_bytes: usize,
+    managed_memory_limit_bytes: usize,
     value_bytes: Box<[usize]>,
     rss_slack_bytes: usize,
     key_count: usize,
-    shards: u32,
+    append_shards: u32,
     read_io_workers: usize,
     write_io_workers: usize,
     writers: usize,
@@ -49,19 +49,21 @@ impl SoakConfig {
         let memory_bytes = memory_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
-        let shards = env_u32("CACHE_SOAK_SHARDS", 4)?;
-        let shard_count =
-            usize::try_from(shards).map_err(|_| invalid("soak shard count does not fit usize"))?;
-        let default_memory_limit_mib = shard_count
+        let append_shards = env_u32("CACHE_SOAK_APPEND_SHARDS", 4)?;
+        let shard_count = usize::try_from(append_shards)
+            .map_err(|_| invalid("soak shard count does not fit usize"))?;
+        let default_managed_memory_limit_mib = shard_count
             .checked_mul(2 * REGION_BYTES)
             .and_then(|bytes| bytes.checked_add(2 * REGION_BYTES))
             .and_then(|bytes| bytes.checked_add(memory_bytes))
-            .ok_or_else(|| invalid("soak default memory limit is too large"))?
+            .ok_or_else(|| invalid("soak default managed memory limit is too large"))?
             .div_ceil(MIB);
-        let memory_limit_bytes =
-            env_usize("CACHE_SOAK_MEMORY_LIMIT_MIB", default_memory_limit_mib)?
-                .checked_mul(MIB)
-                .ok_or_else(|| invalid("soak memory limit is too large"))?;
+        let managed_memory_limit_bytes = env_usize(
+            "CACHE_SOAK_MANAGED_MEMORY_LIMIT_MIB",
+            default_managed_memory_limit_mib,
+        )?
+        .checked_mul(MIB)
+        .ok_or_else(|| invalid("soak managed memory limit is too large"))?;
         let value_bytes = env_usize_list("CACHE_SOAK_VALUE_BYTES", &DEFAULT_VALUE_BYTES)?;
         let rss_slack_bytes = env_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?
             .checked_mul(MIB)
@@ -84,7 +86,7 @@ impl SoakConfig {
                 .iter()
                 .any(|bytes| !(VALUE_HEADER_BYTES..=MAX_VALUE_BYTES).contains(bytes))
             || key_count == 0
-            || shards == 0
+            || append_shards == 0
             || read_io_workers == 0
             || write_io_workers == 0
             || writers == 0
@@ -100,11 +102,11 @@ impl SoakConfig {
             sample_period,
             capacity_bytes,
             memory_bytes,
-            memory_limit_bytes,
+            managed_memory_limit_bytes,
             value_bytes,
             rss_slack_bytes,
             key_count,
-            shards,
+            append_shards,
             read_io_workers,
             write_io_workers,
             writers,
@@ -118,7 +120,7 @@ impl SoakConfig {
 
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
-            .with_region_size(REGION_BYTES as u64)
+            .with_region_size_bytes(REGION_BYTES as u64)
             .with_expected_entries(self.key_count)
     }
 
@@ -128,9 +130,9 @@ impl SoakConfig {
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
             .with_write_io_workers(self.write_io_workers)
-            .with_write_shards(self.shards)
-            .with_l1_capacity(self.memory_bytes)
-            .with_memory_limit(self.memory_limit_bytes)
+            .with_append_shards(self.append_shards)
+            .with_l1_capacity_bytes(self.memory_bytes)
+            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(true)
     }
 }
@@ -294,11 +296,11 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB memory_limit={:.1}MiB values={} keys={} shards={} read_io_workers={} write_io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} writers={} readers={} warm_reopen={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
-        config.memory_limit_bytes as f64 / MIB as f64,
+        config.managed_memory_limit_bytes as f64 / MIB as f64,
         config
             .value_bytes
             .iter()
@@ -306,7 +308,7 @@ fn main() -> io::Result<()> {
             .collect::<Vec<_>>()
             .join(","),
         config.key_count,
-        config.shards,
+        config.append_shards,
         config.read_io_workers,
         config.write_io_workers,
         config.writers,
@@ -455,7 +457,7 @@ fn open_cache(
     config: &SoakConfig,
 ) -> io::Result<Cache> {
     runtime.block_on(async {
-        CacheConfig::from_static(&files.data, config.static_config())
+        CacheBuilder::from_static(&files.data, config.static_config())
             .with_runtime_config(config.runtime_config())
             .open()
             .await
@@ -870,11 +872,11 @@ fn parse_io_engine(name: &str) -> io::Result<IoEngine> {
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {
     match env::var(name)
-        .unwrap_or_else(|_| "auto".to_owned())
+        .unwrap_or_else(|_| "prefer-direct".to_owned())
         .as_str()
     {
         "buffered" => Ok(IoMode::Buffered),
-        "auto" => Ok(IoMode::Auto),
+        "prefer-direct" => Ok(IoMode::PreferDirect),
         "direct" => Ok(IoMode::Direct),
         value => Err(invalid(format!("unsupported I/O mode: {value}"))),
     }

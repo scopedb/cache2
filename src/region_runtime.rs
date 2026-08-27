@@ -28,7 +28,7 @@ use crate::resources::{
     CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot, ResourceBuildError,
     ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{MAX_WRITE_BATCH_BYTES, MAX_WRITE_SHARDS, RuntimeConfig};
+use crate::runtime_config::{MAX_APPEND_SHARDS, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig};
 use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot};
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
@@ -366,10 +366,10 @@ impl RuntimeMetrics {
 
 impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.write_shards == 0 || self.write_shards > MAX_WRITE_SHARDS {
+        if self.append_shards == 0 || self.append_shards > MAX_APPEND_SHARDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "write shards must be in 1..=256",
+                "append shards must be in 1..=256",
             ));
         }
         if self.read_io_workers == 0 || self.write_io_workers == 0 {
@@ -389,16 +389,16 @@ impl RuntimeConfig {
                 ),
             ));
         }
-        if self.memory_limit_bytes == 0 {
+        if self.managed_memory_limit_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "memory limit must be non-zero",
+                "managed memory limit must be non-zero",
             ));
         }
-        if self.l1_capacity_bytes > self.memory_limit_bytes {
+        if self.l1_capacity_bytes > self.managed_memory_limit_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "L1 capacity must not exceed the aggregate memory limit",
+                "L1 capacity must not exceed the managed memory limit",
             ));
         }
         if self.l1_shards == 0 || self.l1_shards > MAX_CONFIG_COUNT {
@@ -407,15 +407,15 @@ impl RuntimeConfig {
                 "L1 shards must be in 1..=65536",
             ));
         }
-        if self.write_batch_bytes == 0
-            || self.write_batch_bytes > MAX_WRITE_BATCH_BYTES
+        if self.write_flush_threshold_bytes == 0
+            || self.write_flush_threshold_bytes > MAX_WRITE_FLUSH_THRESHOLD_BYTES
             || !self
-                .write_batch_bytes
+                .write_flush_threshold_bytes
                 .is_multiple_of(crate::resources::BUFFER_ALIGNMENT)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "write batch size must be aligned and within 1..=4 MiB",
+                "write flush threshold must be 4 KiB aligned and within 4 KiB..=4 MiB",
             ));
         }
         Ok(())
@@ -474,12 +474,12 @@ impl RuntimeConfig {
     ) -> io::Result<usize> {
         let (reserved_memory, minimum) =
             self.memory_plan_bytes(geometry, shard_count, fixed_bytes)?;
-        if minimum > self.memory_limit_bytes {
+        if minimum > self.managed_memory_limit_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "memory limit cannot hold the fixed cache memory plan: requires {minimum} bytes, configured {} bytes",
-                    self.memory_limit_bytes
+                    "managed memory limit cannot hold the fixed cache memory plan: requires {minimum} bytes, configured {} bytes",
+                    self.managed_memory_limit_bytes
                 ),
             ));
         }
@@ -616,7 +616,7 @@ struct RunningShared {
     memory: Arc<MemoryStore>,
     staging: Arc<RegionStaging>,
     shards: Box<[Arc<ShardControl>]>,
-    write_batch_bytes: usize,
+    write_flush_threshold_bytes: usize,
     statistics: bool,
 }
 
@@ -1244,7 +1244,7 @@ fn start_running(
         .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
     let reserved_memory =
         config.validated_reserved_memory_bytes(data.geometry, shard_count, fixed_memory)?;
-    let memory_limit = config.memory_limit_bytes;
+    let memory_limit = config.managed_memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: memory_limit,
@@ -1287,7 +1287,7 @@ fn start_running(
         memory,
         staging,
         shards: shards.into_boxed_slice(),
-        write_batch_bytes: config.write_batch_bytes,
+        write_flush_threshold_bytes: config.write_flush_threshold_bytes,
         statistics: config.statistics,
     });
     let mut shard_workers = Vec::new();
@@ -1436,7 +1436,7 @@ fn shard_worker_result(
                         || invalid_runtime_config("partial flush deadline overflow"),
                     )?);
                 }
-                if force_flush || fill.bytes >= shared.write_batch_bytes {
+                if force_flush || fill.bytes >= shared.write_flush_threshold_bytes {
                     let engine = shared.write_engine_for(shard_id as u64);
                     shared
                         .core
@@ -1908,17 +1908,17 @@ mod tests {
         };
         let index_slots = 335_544_320;
         let base = RuntimeConfig::default()
-            .with_l1_capacity(10 * GIB)
-            .with_memory_limit(24 * GIB)
+            .with_l1_capacity_bytes(10 * GIB)
+            .with_managed_memory_limit_bytes(24 * GIB)
             .with_l1_shards(64);
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 8).unwrap();
         base.clone()
-            .with_memory_limit(19 * GIB)
+            .with_managed_memory_limit_bytes(19 * GIB)
             .validate_memory_plan(geometry, index_slots, 8)
             .unwrap();
-        let too_small = base.clone().with_memory_limit(18 * GIB);
+        let too_small = base.clone().with_managed_memory_limit_bytes(18 * GIB);
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 8)

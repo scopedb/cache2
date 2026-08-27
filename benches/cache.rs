@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheConfig, CacheTier, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig,
+    Cache, CacheBuilder, CacheTier, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -30,8 +30,8 @@ struct BenchConfig {
     read_ops: usize,
     capacity_bytes: u64,
     memory_bytes: usize,
-    memory_limit_bytes: usize,
-    shards: u32,
+    managed_memory_limit_bytes: usize,
+    append_shards: u32,
     read_io_workers: usize,
     write_io_workers: usize,
     write_clients: usize,
@@ -49,7 +49,7 @@ impl BenchConfig {
         let read_ops = env_usize("CACHE_BENCH_READ_OPS", 1_048_576)?;
         let capacity_mib = env_usize("CACHE_BENCH_CAPACITY_MIB", 512)?;
         let memory_mib = env_usize("CACHE_BENCH_MEMORY_MIB", 256)?;
-        let shards = env_u32("CACHE_BENCH_SHARDS", 4)?;
+        let append_shards = env_u32("CACHE_BENCH_APPEND_SHARDS", 4)?;
         let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
         let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
@@ -63,11 +63,11 @@ impl BenchConfig {
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_BENCH_IO_MODE")
-            .unwrap_or_else(|_| "auto".to_owned())
+            .unwrap_or_else(|_| "prefer-direct".to_owned())
             .as_str()
         {
             "buffered" => IoMode::Buffered,
-            "auto" => IoMode::Auto,
+            "prefer-direct" => IoMode::PreferDirect,
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
@@ -82,7 +82,7 @@ impl BenchConfig {
             || write_io_workers == 0
             || write_clients == 0
             || clients == 0
-            || shards == 0
+            || append_shards == 0
         {
             return Err(invalid(
                 "entry, operation, worker, client, and shard counts must be positive",
@@ -110,15 +110,18 @@ impl BenchConfig {
         let estimated_index_bytes = entries
             .checked_mul(160)
             .ok_or_else(|| invalid("benchmark index estimate is too large"))?;
-        let default_memory_limit_mib = memory_bytes
+        let default_managed_memory_limit_mib = memory_bytes
             .checked_add(estimated_index_bytes)
             .and_then(|bytes| bytes.checked_add(512 * MIB))
-            .ok_or_else(|| invalid("benchmark memory limit is too large"))?
+            .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?
             .div_ceil(MIB);
-        let memory_limit_mib = env_usize("CACHE_BENCH_MEMORY_LIMIT_MIB", default_memory_limit_mib)?;
-        let memory_limit_bytes = memory_limit_mib
+        let managed_memory_limit_mib = env_usize(
+            "CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB",
+            default_managed_memory_limit_mib,
+        )?;
+        let managed_memory_limit_bytes = managed_memory_limit_mib
             .checked_mul(MIB)
-            .ok_or_else(|| invalid("benchmark memory limit is too large"))?;
+            .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?;
         let maximum_resident_entries = if benchmark_entry_is_l1_eligible(value_bytes) {
             memory_bytes
                 .saturating_mul(3)
@@ -148,8 +151,8 @@ impl BenchConfig {
             read_ops,
             capacity_bytes,
             memory_bytes,
-            memory_limit_bytes,
-            shards,
+            managed_memory_limit_bytes,
+            append_shards,
             read_io_workers,
             write_io_workers,
             write_clients,
@@ -163,7 +166,7 @@ impl BenchConfig {
 
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
-            .with_region_size(REGION_BYTES as u64)
+            .with_region_size_bytes(REGION_BYTES as u64)
             // Keep the benchmark's complete L2 working set comfortably below
             // every page-aligned index partition's bounded-probe capacity.
             .with_expected_entries(self.entries.saturating_mul(4))
@@ -175,9 +178,9 @@ impl BenchConfig {
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
             .with_write_io_workers(self.write_io_workers)
-            .with_write_shards(self.shards)
-            .with_l1_capacity(self.memory_bytes)
-            .with_memory_limit(self.memory_limit_bytes)
+            .with_append_shards(self.append_shards)
+            .with_l1_capacity_bytes(self.memory_bytes)
+            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(self.statistics_enabled)
     }
 }
@@ -200,8 +203,8 @@ impl BenchFiles {
         }
     }
 
-    fn config(&self, config: &BenchConfig) -> CacheConfig {
-        CacheConfig::from_static(&self.data, config.static_config())
+    fn config(&self, config: &BenchConfig) -> CacheBuilder {
+        CacheBuilder::from_static(&self.data, config.static_config())
             .with_runtime_config(config.runtime_config())
     }
 }
@@ -248,14 +251,14 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!(
-        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB memory_limit={:.1} MiB shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} resident_entries={} value={} B data={:.1} MiB memory={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
         config.resident_entries,
         config.value_bytes,
         (config.entries as f64 * config.value_bytes as f64) / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
-        config.memory_limit_bytes as f64 / MIB as f64,
-        config.shards,
+        config.managed_memory_limit_bytes as f64 / MIB as f64,
+        config.append_shards,
         config.read_io_workers,
         config.write_io_workers,
         config.write_clients,

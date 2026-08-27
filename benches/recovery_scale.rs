@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache2::{CacheConfig, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
+use cache2::{CacheBuilder, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -13,7 +13,7 @@ struct ScaleConfig {
     expected_entries: usize,
     capacity_bytes: u64,
     memory_bytes: usize,
-    memory_limit_bytes: usize,
+    managed_memory_limit_bytes: usize,
     sentinel_count: usize,
     value_bytes: usize,
     directory: PathBuf,
@@ -28,9 +28,10 @@ impl ScaleConfig {
         let memory_bytes = env_usize("CACHE_RECOVERY_MEMORY_MIB", 16)?
             .checked_mul(MIB)
             .ok_or_else(|| invalid("recovery benchmark RAM tier is too large"))?;
-        let memory_limit_bytes = env_usize("CACHE_RECOVERY_MEMORY_LIMIT_MIB", 1_024)?
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("recovery benchmark memory limit is too large"))?;
+        let managed_memory_limit_bytes =
+            env_usize("CACHE_RECOVERY_MANAGED_MEMORY_LIMIT_MIB", 1_024)?
+                .checked_mul(MIB)
+                .ok_or_else(|| invalid("recovery benchmark managed memory limit is too large"))?;
         let sentinel_count = env_usize("CACHE_RECOVERY_SENTINELS", 1_024)?;
         let value_bytes = env_usize("CACHE_RECOVERY_VALUE_BYTES", 1_024)?;
         let directory = env::var_os("CACHE_RECOVERY_DIR")
@@ -45,7 +46,7 @@ impl ScaleConfig {
             expected_entries,
             capacity_bytes,
             memory_bytes,
-            memory_limit_bytes,
+            managed_memory_limit_bytes,
             sentinel_count,
             value_bytes,
             directory,
@@ -54,7 +55,7 @@ impl ScaleConfig {
 
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
-            .with_region_size(32 * MIB as u64)
+            .with_region_size_bytes(32 * MIB as u64)
             .with_expected_entries(self.expected_entries)
     }
 
@@ -64,9 +65,9 @@ impl ScaleConfig {
             .with_io_mode(IoMode::Buffered)
             .with_read_io_workers(1)
             .with_write_io_workers(1)
-            .with_write_shards(4)
-            .with_l1_capacity(self.memory_bytes)
-            .with_memory_limit(self.memory_limit_bytes)
+            .with_append_shards(4)
+            .with_l1_capacity_bytes(self.memory_bytes)
+            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(false)
     }
 }
@@ -89,8 +90,8 @@ impl ScaleFiles {
         }
     }
 
-    fn config(&self, config: &ScaleConfig) -> CacheConfig {
-        CacheConfig::from_static(&self.data, config.static_config())
+    fn config(&self, config: &ScaleConfig) -> CacheBuilder {
+        CacheBuilder::from_static(&self.data, config.static_config())
             .with_runtime_config(config.runtime_config())
     }
 
@@ -157,12 +158,12 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
     println!(
-        "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
+        "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} managed_memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
         config.expected_entries,
         static_config.index_slots(),
         config.capacity_bytes,
         config.memory_bytes,
-        config.memory_limit_bytes,
+        config.managed_memory_limit_bytes,
         config.sentinel_count,
         config.value_bytes,
         peak_disk_bytes,
