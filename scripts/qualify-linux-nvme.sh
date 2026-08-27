@@ -327,23 +327,23 @@ for workers in 1 2 4 8 16; do
     posix direct "$workers" "$workers" 1
 done
 
-echo "starting ${soak_seconds}s POSIX/direct turnover soak"
+echo "starting ${soak_seconds}s POSIX/buffered turnover soak"
 CACHE_SOAK_SECONDS="$soak_seconds" \
 CACHE_SOAK_SAMPLE_SECONDS="$sample_seconds" \
 CACHE_SOAK_DIR="$cache_directory" \
 CACHE_SOAK_IO_ENGINE=posix \
-CACHE_SOAK_IO_MODE=direct \
+CACHE_SOAK_IO_MODE=buffered \
   cargo +1.98.0 bench --locked --bench cache_soak --quiet 2>&1 \
-  | tee "$report_directory/soak-posix-direct.log"
+  | tee "$report_directory/soak-posix-buffered.log"
 
-if ! grep -q '^complete .* errors=0 ' "$report_directory/soak-posix-direct.log"; then
+if ! grep -q '^complete .* errors=0 ' "$report_directory/soak-posix-buffered.log"; then
   echo "soak did not produce a successful completion record" >&2
   exit 1
 fi
 
 (
   cd -- "$report_directory"
-  sha256sum environment.txt summary.tsv benchmark-*.log soak-posix-direct.log \
+  sha256sum environment.txt summary.tsv benchmark-*.log soak-posix-buffered.log \
     >SHA256SUMS
 )
 {

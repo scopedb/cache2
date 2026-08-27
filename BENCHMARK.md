@@ -59,7 +59,7 @@ CACHE_SOAK_SECONDS=14400 \
 CACHE_SOAK_SAMPLE_SECONDS=10 \
 CACHE_SOAK_DIR=/mnt/nvme \
 CACHE_SOAK_IO_ENGINE=posix \
-CACHE_SOAK_IO_MODE=direct \
+CACHE_SOAK_IO_MODE=buffered \
 cargo +1.98.0 bench --locked --bench cache_soak
 ```
 
