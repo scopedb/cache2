@@ -145,7 +145,7 @@ impl PendingRead {
     }
 }
 
-/// Submits one planned positioned read using an exact-size owned buffer.
+/// Submits one exact planned range using an owned alignment-rounded buffer.
 ///
 /// Validation happens before the lease is prepared or submitted. Any rejected
 /// operation drops its lease immediately.

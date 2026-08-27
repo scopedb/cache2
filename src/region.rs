@@ -2705,8 +2705,8 @@ mod tests {
             "an index miss must not acquire a retained-hit buffer"
         );
 
-        // Retained exact-size hits own their transient allocations, but cannot
-        // pin the runtime operation barrier or prevent a warm shutdown.
+        // Retained zero-copy hits own their transient aligned allocations, but
+        // cannot pin the runtime operation barrier or prevent a warm shutdown.
         store.close_warm().unwrap();
         assert_eq!(retained_hits[0].value(), rotation_value);
         drop(retained_hits);

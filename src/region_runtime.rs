@@ -533,8 +533,8 @@ pub(crate) enum HybridValueRead {
     L1(MemoryValue),
     L2(RegionValueRead),
     /// An L2 hit copied into the bounded L1 tier. The public tier remains
-    /// L2 because that is where this lookup was served, but the exact-size
-    /// transient read allocation can be released before `get` returns.
+    /// L2 because that is where this lookup was served, but the transient
+    /// aligned read allocation can be released before `get` returns.
     PromotedL2(MemoryValue),
 }
 

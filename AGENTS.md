@@ -52,7 +52,7 @@ capacity; this is expected to be uncommon in normal operation.
 - A successful L1 promotion returns an L1-backed value and releases the
   transient aligned buffer before `get` returns while preserving Region as the
   hit source. If promotion bypasses, the zero-copy Region value may retain its
-  exact-size allocation until the caller drops it.
+  alignment-rounded allocation until the caller drops it.
 - Preflight shard capacity before allocating an append receipt. Reserve the
   Region tail and commit its open-span accounting under one manager try-lock;
   the shard mutation gate then protects encoding without holding that manager.

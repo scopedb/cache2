@@ -1,7 +1,8 @@
 //! Bounded write admission and aligned record buffers.
 //!
-//! Foreground reads allocate one exact-size transient buffer after an L2 index
-//! hit. Write waiting uses a separate request gate.
+//! Foreground reads allocate one alignment-rounded transient buffer for the
+//! exact planned range after an L2 index hit. Write waiting uses a separate
+//! request gate.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::fmt;
@@ -81,8 +82,9 @@ impl ResourceController {
         })
     }
 
-    /// Allocates one exact-size foreground read buffer against the cache-wide
-    /// hard memory limit. Failure is a cache miss, never caller backpressure.
+    /// Allocates one alignment-rounded foreground read buffer against the
+    /// cache-wide hard memory limit. Failure is a cache miss, never caller
+    /// backpressure.
     pub(crate) fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
         BufferLease::try_standalone(length, Arc::clone(&self.memory))
     }

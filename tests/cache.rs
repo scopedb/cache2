@@ -1003,8 +1003,8 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
 }
 
 #[tokio::test]
-async fn retained_l2_values_use_exact_transient_memory_without_slot_saturation() {
-    let files = TestCache::new("exact-transient-read-memory");
+async fn retained_l2_values_charge_and_release_transient_memory() {
+    let files = TestCache::new("retained-read-memory");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(1)
