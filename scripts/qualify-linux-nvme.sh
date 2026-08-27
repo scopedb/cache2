@@ -209,7 +209,7 @@ record_command() {
   echo "physical_memory_bytes=$physical_memory_bytes"
   echo "backing_source=$backing_source"
   echo "device_qualification=$device_qualification"
-  echo "performance_gates_configured=$performance_gate_count/5"
+  echo "performance_gates_configured=$performance_gate_count/4"
   echo "[performance-gates]"
   for gate in "${performance_gates[@]}"; do
     echo "$gate=${!gate:-unset}"

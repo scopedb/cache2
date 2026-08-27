@@ -185,9 +185,9 @@ impl BenchConfig {
     fn static_config(&self) -> StaticConfig {
         StaticConfig::new(self.capacity_bytes)
             .with_region_size_bytes(REGION_BYTES as u64)
-            // Keep every planned request an L2 hit so this harness measures
-            // storage rather than a mixture of hits and fast index misses.
-            // Production-load index behavior has its own turnover benchmark.
+            // Keep replacement rare so the successful-hit rate measures
+            // storage. Legal bounded-index eviction remains an explicit miss.
+            // Production-load behavior has its own turnover benchmark.
             .with_expected_entries(self.entries.saturating_mul(4))
     }
 
@@ -201,6 +201,15 @@ impl BenchConfig {
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(self.statistics_enabled)
+    }
+
+    fn l2_clients(&self) -> usize {
+        match self.io_engine {
+            // Keep the benchmark at the POSIX engine's exact admission depth.
+            // Saturation misses belong in the soak, not the device-rate phase.
+            IoEngine::Posix => self.clients.min(self.read_io_workers),
+            _ => self.clients,
+        }
     }
 }
 
@@ -283,6 +292,7 @@ struct TierCounts {
 
 struct ReadMeasurement {
     measurement: Measurement,
+    primary: TierCounts,
     sampled: TierCounts,
 }
 
@@ -309,7 +319,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -326,6 +336,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.write_io_workers,
         config.write_clients,
         config.clients,
+        config.l2_clients(),
         l1_entry_eligible,
         config.io_engine,
         config.io_mode,
@@ -377,7 +388,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             0,
             config.entries,
             config.entries,
-            config.clients,
+            config.l2_clients(),
             CacheTier::L2,
             None,
         )
@@ -387,6 +398,12 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         } else {
             report("l2_read", "L2 get", &l2_read.measurement);
         }
+        report_tiers(
+            "l2_outcomes",
+            "L2 outcomes",
+            l2_read.measurement.elapsed,
+            &l2_read.primary,
+        );
         l2_read.measurement
     } else {
         let _ = concurrent_writes(
@@ -412,7 +429,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             config.hot_entries,
             config.entries - config.hot_entries,
             config.entries - config.hot_entries,
-            config.clients,
+            config.l2_clients(),
             CacheTier::L2,
             Some(HotReadPlan {
                 entries: config.hot_entries,
@@ -421,6 +438,12 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         )
         .await?;
         report("l2_hot_scan", "L2 cold scan", &cold_scan.measurement);
+        report_tiers(
+            "l2_scan_outcomes",
+            "L2 scan outcomes",
+            cold_scan.measurement.elapsed,
+            &cold_scan.primary,
+        );
         report_tiers(
             "hot_during_scan",
             "hot during scan",
@@ -451,7 +474,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     };
 
     if config.statistics_enabled {
-        let snapshot = cache.snapshot()?;
+        let detailed = cache.detailed_snapshot()?;
+        let snapshot = detailed.summary;
         println!(
             "result phase=l1_clock evictions={} bypasses={} promotions={} l1_hits={} l1_misses={}",
             snapshot.l1_evictions,
@@ -461,12 +485,33 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             snapshot.l1_misses,
         );
         println!(
-            "result phase=read_io requests={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={}",
+            "result phase=read_io requests={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={} busy_misses={} memory_misses={}",
             snapshot.io.read.requests_succeeded,
             snapshot.io.read.buffered.operations,
             snapshot.io.read.buffered.bytes,
             snapshot.io.read.direct.operations,
             snapshot.io.read.direct.bytes,
+            snapshot.l2_read_busy_misses,
+            snapshot.l2_read_memory_misses,
+        );
+        println!(
+            "result phase=index slots={} values={} empty={} relocations={} overflow_evictions={} conditional_remove_misses={}",
+            detailed.index.slot_capacity,
+            detailed.index.physical_value_slots,
+            detailed.index.empty_slots,
+            detailed.index.relocations,
+            detailed.index.overflow_evictions,
+            detailed.index.conditional_remove_misses,
+        );
+        println!(
+            "result phase=region records={} bytes={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reclaim_index_removed={}",
+            detailed.region.physical_record_count,
+            detailed.region.physical_bytes,
+            detailed.region.rotations,
+            snapshot.reclaim.regions,
+            snapshot.reclaim.bytes_read,
+            snapshot.reclaim.records_scanned,
+            snapshot.reclaim.index_entries_removed,
         );
         println!(
             "result phase=memory managed_bytes={} managed_peak_bytes={} managed_limit_bytes={} logical_disk_peak_bytes={}",
@@ -593,17 +638,29 @@ async fn concurrent_reads(
         let barrier = Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            let mut bytes = 0_u128;
-            let mut checksum = 0_u64;
+            let mut primary = TierCounts::default();
             let mut sampled = TierCounts::default();
             for ordinal in (client..operations).step_by(clients) {
                 let key_ordinal = first_key + ordinal % key_count;
-                let value = read_expected(&cache, key_ordinal, expected_tier, client).await?;
-                bytes += value.len() as u128;
-                checksum = checksum.wrapping_add(
-                    (ordinal as u64).rotate_left(17) ^ u64::from(value[ordinal % value.len()]),
-                );
-                black_box(value.as_ref());
+                let value = if expected_tier == CacheTier::L2 {
+                    read_l2_once(&cache, key_ordinal).await?
+                } else {
+                    Some(read_l1_eventually(&cache, key_ordinal, client).await?)
+                };
+                primary.operations += 1;
+                if let Some(value) = value {
+                    primary.bytes += value.len() as u128;
+                    primary.checksum = primary.checksum.wrapping_add(
+                        (ordinal as u64).rotate_left(17) ^ u64::from(value[ordinal % value.len()]),
+                    );
+                    match value.tier() {
+                        CacheTier::L1 => primary.l1_hits += 1,
+                        CacheTier::L2 => primary.l2_hits += 1,
+                    }
+                    black_box(value.as_ref());
+                } else {
+                    primary.misses += 1;
+                }
                 if let Some(plan) = hot_reads
                     && ordinal.is_multiple_of(plan.interval)
                 {
@@ -611,31 +668,48 @@ async fn concurrent_reads(
                     sample_tier(&cache, hot_key, ordinal, &mut sampled).await?;
                 }
             }
-            Ok::<_, io::Error>((bytes, checksum, sampled))
+            Ok::<_, io::Error>((primary, sampled))
         }));
     }
     barrier.wait().await;
     let started = Instant::now();
-    let mut bytes = 0_u128;
-    let mut checksum = 0_u64;
+    let mut primary = TierCounts::default();
     let mut sampled = TierCounts::default();
     for handle in handles {
-        let (task_bytes, task_checksum, task_sampled) = handle
+        let (task_primary, task_sampled) = handle
             .await
             .map_err(|_| io::Error::other("benchmark reader panicked"))??;
-        bytes += task_bytes;
-        checksum = checksum.wrapping_add(task_checksum);
+        merge_tiers(&mut primary, task_primary);
         merge_tiers(&mut sampled, task_sampled);
     }
+    let successful_operations = match expected_tier {
+        CacheTier::L1 => primary.l1_hits,
+        CacheTier::L2 => primary.l2_hits,
+    };
     Ok(ReadMeasurement {
         measurement: Measurement {
             elapsed: started.elapsed(),
-            operations,
-            bytes,
-            checksum,
+            operations: successful_operations,
+            bytes: primary.bytes,
+            checksum: primary.checksum,
         },
+        primary,
         sampled,
     })
+}
+
+async fn read_l2_once(cache: &Cache, key_ordinal: usize) -> io::Result<Option<Value>> {
+    let Some(value) = cache.get(black_box(benchmark_key(key_ordinal))).await? else {
+        return Ok(None);
+    };
+    verify_value(key_ordinal, &value)?;
+    if value.tier() != CacheTier::L2 {
+        return Err(io::Error::other(format!(
+            "expected L2 hit, observed {:?}",
+            value.tier()
+        )));
+    }
+    Ok(Some(value))
 }
 
 async fn tier_reads(cache: &Cache, entries: usize) -> io::Result<(Duration, TierCounts)> {
@@ -682,33 +756,22 @@ fn merge_tiers(total: &mut TierCounts, sampled: TierCounts) {
     total.misses += sampled.misses;
 }
 
-async fn read_expected(
-    cache: &Cache,
-    key_ordinal: usize,
-    expected_tier: CacheTier,
-    client: usize,
-) -> io::Result<Value> {
+async fn read_l1_eventually(cache: &Cache, key_ordinal: usize, client: usize) -> io::Result<Value> {
     let key = benchmark_key(key_ordinal);
     let mut attempts = 1;
     let mut retry_deadline = None;
     loop {
         if let Some(value) = cache.get(black_box(key)).await? {
             verify_value(key_ordinal, &value)?;
-            if value.tier() == expected_tier {
+            if value.tier() == CacheTier::L1 {
                 return Ok(value);
-            }
-            if expected_tier != CacheTier::L1 {
-                return Err(io::Error::other(format!(
-                    "expected {expected_tier:?} hit, observed {:?}",
-                    value.tier()
-                )));
             }
             black_box(value.as_ref());
         }
         let deadline = retry_deadline.get_or_insert_with(|| Instant::now() + READ_RETRY_TIMEOUT);
         if Instant::now() >= *deadline {
             return Err(io::Error::other(format!(
-                "benchmark key {key_ordinal} did not produce an {expected_tier:?} hit on client {client} after {attempts} attempts",
+                "benchmark key {key_ordinal} did not produce an L1 hit on client {client} after {attempts} attempts",
             )));
         }
         attempts += 1;
@@ -792,13 +855,18 @@ fn report(phase: &str, name: &str, measurement: &Measurement) {
 fn report_tiers(phase: &str, name: &str, elapsed: Duration, tiers: &TierCounts) {
     let seconds = elapsed.as_secs_f64();
     let operations_per_second = tiers.operations as f64 / seconds;
+    let hit_rate = if tiers.operations == 0 {
+        0.0
+    } else {
+        tiers.l1_hits.saturating_add(tiers.l2_hits) as f64 * 100.0 / tiers.operations as f64
+    };
     let l1_hit_rate = if tiers.operations == 0 {
         0.0
     } else {
         tiers.l1_hits as f64 * 100.0 / tiers.operations as f64
     };
     println!(
-        "{name:<20} {:>9.3} ms  {:>12.0} ops/s  l1={l1_hit_rate:>7.3}% l2={} miss={} checksum={:016x}",
+        "{name:<20} {:>9.3} ms  {:>12.0} ops/s  hit={hit_rate:>7.3}% l1={l1_hit_rate:>7.3}% l2={} miss={} checksum={:016x}",
         seconds * 1_000.0,
         operations_per_second,
         tiers.l2_hits,
@@ -806,7 +874,7 @@ fn report_tiers(phase: &str, name: &str, elapsed: Duration, tiers: &TierCounts) 
         tiers.checksum,
     );
     println!(
-        "result phase={phase} elapsed_ns={} operations={} bytes={} ops_per_sec={operations_per_second:.3} l1_hits={} l2_hits={} misses={} l1_hit_rate={l1_hit_rate:.6} checksum={:016x}",
+        "result phase={phase} elapsed_ns={} operations={} bytes={} ops_per_sec={operations_per_second:.3} l1_hits={} l2_hits={} misses={} hit_rate={hit_rate:.6} l1_hit_rate={l1_hit_rate:.6} checksum={:016x}",
         elapsed.as_nanos(),
         tiers.operations,
         tiers.bytes,

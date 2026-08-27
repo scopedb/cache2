@@ -16,9 +16,15 @@ with best-effort promotion, and resident L1 reads populated in a fresh RAM tier.
 Values contain their key ordinal, so a wrong-key result is fatal. Writes retry
 `WouldBlock` only in the harness; this is not library behavior.
 
-The request-path workload uses 20% physical index load so every planned L2
-operation remains a storage hit. Use `region_index_turnover` below for the
-production 50% index load factor, bounded-candidate cost, and replacement rate.
+The request-path workload overprovisions the index so replacement is rare. It
+reports attempted reads, L2 hits, misses, and the successful-hit rate; a legal
+bounded-index eviction does not abort the run. The `l2_promote`/`l2_read`
+throughput is successful L2 hits per elapsed second, so fast misses cannot
+inflate the storage result. Use `region_index_turnover` below for the production
+50% index load factor, bounded-candidate cost, and replacement rate.
+For POSIX, the harness caps measured L2 concurrency at the configured read
+worker count so execution-admission misses do not obscure the storage rate;
+the turnover soak deliberately exercises overload behavior separately.
 
 The main controls are:
 
@@ -61,7 +67,7 @@ configuration, raw output, checksums, and turnover soak:
 ```
 
 A release-quality run requires a clean worktree, exact Rust 1.98.0, a data set
-larger than physical RAM, a non-rotational NVMe device, five configured
+larger than physical RAM, a non-rotational NVMe device, four configured
 performance gates, and the full four-hour soak. Shorter or relaxed runs are
 preflight evidence only; the script records that distinction.
 
