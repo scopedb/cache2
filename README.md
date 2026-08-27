@@ -95,7 +95,9 @@ marks an entry as seen; only a later access makes it eligible for bounded
 reclaim reinsertion. The aggregate managed-memory limit must also cover
 L1, two staging buffers per append shard, one Region reclaim buffer per worker,
 metadata, transient reads, and cache thread stacks. Invalid plans fail before
-cache files are created.
+cache files are created. With a 10 GiB L1, four append shards, and two reclaim
+workers, the complete 4 TiB/16 KiB plan requires a managed-memory limit of at
+least 15 GiB; process and kernel memory remain outside that limit.
 `StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound.
 
 ## Operations

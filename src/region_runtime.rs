@@ -2377,29 +2377,26 @@ mod tests {
     }
 
     #[test]
-    fn production_l1_entry_plan_scales_from_the_static_index() {
+    fn four_tib_memory_plan_covers_the_complete_production_shape() {
         const GIB: usize = 1024 * 1024 * 1024;
         let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 32 * 1024).unwrap(),
+            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 128 * 1024).unwrap(),
             region_size: 32 * 1024 * 1024,
-            region_count: 32 * 1024,
+            region_count: 128 * 1024,
         };
-        let index_slots = 335_544_320;
+        let index_slots = crate::index::MAX_INDEX_SLOTS;
         let base = RuntimeConfig::default()
             .with_l1_capacity_bytes(10 * GIB)
-            .with_managed_memory_limit_bytes(24 * GIB)
+            .with_managed_memory_limit_bytes(15 * GIB)
+            .with_reclaim_workers(2)
             .with_l1_shards(64);
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
-        base.validate_memory_plan(geometry, index_slots, 8).unwrap();
-        base.clone()
-            .with_managed_memory_limit_bytes(14 * GIB)
-            .validate_memory_plan(geometry, index_slots, 8)
-            .unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(13 * GIB);
+        base.validate_memory_plan(geometry, index_slots, 4).unwrap();
+        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
         assert_eq!(
             too_small
-                .validate_memory_plan(geometry, index_slots, 8)
+                .validate_memory_plan(geometry, index_slots, 4)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
