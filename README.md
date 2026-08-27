@@ -85,9 +85,11 @@ Keys are limited to 4 KiB. A complete encoded record must fit in one Region.
 Entries charged above 256 KiB bypass L1 but remain valid in L2.
 
 The fixed L2 index uses roughly two slots per expected entry and 10 bytes per
-slot, plus page headers and one volatile reference bit per slot. A 4 TiB cache
+slot, plus page headers and two volatile heat bits per slot. A 4 TiB cache
 averaging 16 KiB per entry therefore needs about 5.08 GiB for the index plus
-64 MiB for reference bits. The aggregate managed-memory limit must also cover
+128 MiB for heat bits. The first L2 candidate access marks an entry as seen;
+only a later access makes it eligible for bounded reclaim reinsertion. The
+aggregate managed-memory limit must also cover
 L1, two staging buffers per append shard, one Region reclaim buffer per worker,
 metadata, transient reads, and cache thread stacks. Invalid plans fail before
 cache files are created.

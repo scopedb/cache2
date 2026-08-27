@@ -58,6 +58,9 @@ capacity; this is expected to be uncommon in normal operation.
   the shard mutation gate then protects encoding without holding that manager.
 - Index-partition and warm-page contention are misses. Never wait or spin
   behind another request before deciding an L2 candidate.
+- An L2 candidate may perform one bounded, lossy relaxed-atomic heat update.
+  Heat bookkeeping must never acquire an exclusive index lock, wait, retry,
+  allocate, perform another index lookup, or change the read outcome.
 - Bound every L1 same-hash bucket to a small constant and bypass L1 when that
   bucket is full. Full-key validation remains mandatory within the bound.
 - Compute the complete-key hash and planned record size once at the public

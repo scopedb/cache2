@@ -40,7 +40,7 @@ use crate::recovery::{
     prepare_running_barrier, recovery_image_index_len,
 };
 use crate::region_appender::submit_span;
-use crate::region_index::{ReclaimIndexAction, RegionIndex, reference_memory_bytes};
+use crate::region_index::{ReclaimIndexAction, RegionIndex, heat_memory_bytes};
 use crate::region_manager::{RegionManager, RegionMutationError, RegionReclaimReceipt};
 use crate::region_metadata::{
     PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
@@ -538,7 +538,7 @@ impl FileRegionCore {
     }
 
     /// Scans one exact sealed prefix, removes cold mappings, and offers each
-    /// referenced current record once to a bounded reinsertion sink. The
+    /// hot current record once to a bounded reinsertion sink. The
     /// source Region remains exclusively pinned until [`Self::complete_reclaim`].
     pub(crate) fn scan_reclaim(
         &self,
@@ -1376,14 +1376,14 @@ pub(crate) fn runtime_fixed_memory_bytes(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(WARM_IMAGE_WRITE_BATCH_BYTES))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recovery memory overflow"))?;
-    let reference_bytes = reference_memory_bytes(index_slots).ok_or_else(|| {
+    let heat_bytes = heat_memory_bytes(index_slots).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "index reference memory does not fit the platform",
+            "index heat memory does not fit the platform",
         )
     })?;
     index_bytes
-        .checked_add(reference_bytes)
+        .checked_add(heat_bytes)
         .and_then(|bytes| bytes.checked_add(region_bytes))
         .and_then(|bytes| bytes.checked_add(recovery_scratch))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))
@@ -2993,6 +2993,7 @@ mod tests {
         }
         store.drain().unwrap();
         for (key, value) in &expected {
+            assert_eq!(store.get_value(key).unwrap().unwrap().value(), value);
             assert_eq!(store.get_value(key).unwrap().unwrap().value(), value);
         }
 

@@ -23,60 +23,78 @@ const CANDIDATE_OFFSETS: [usize; INDEX_CANDIDATES] = [0, 23, 61, 97];
 const FINGERPRINT_MASK: u16 = (1 << 14) - 1;
 const REFERENCE_WORD_BITS: usize = u64::BITS as usize;
 
-pub(crate) fn reference_memory_bytes(slot_count: usize) -> Option<usize> {
-    slot_count
+pub(crate) fn heat_memory_bytes(slot_count: usize) -> Option<usize> {
+    let bitmap_bytes = slot_count
         .div_ceil(REFERENCE_WORD_BITS)
-        .checked_mul(std::mem::size_of::<AtomicU64>())
+        .checked_mul(std::mem::size_of::<AtomicU64>())?;
+    bitmap_bytes.checked_mul(2)
 }
 
-struct SlotReferences {
-    words: Box<[AtomicU64]>,
+struct SlotHeat {
+    seen: Box<[AtomicU64]>,
+    hot: Box<[AtomicU64]>,
 }
 
-impl SlotReferences {
+impl SlotHeat {
     fn try_new(slot_count: usize) -> Result<Self, IndexStorageError> {
         let word_count = slot_count.div_ceil(REFERENCE_WORD_BITS);
-        let mut words = Vec::new();
-        words.try_reserve_exact(word_count).map_err(|_| {
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(word_count).map_err(|_| {
             IndexStorageError::Io(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                "unable to allocate index reference bitmap",
+                "unable to allocate index heat bitmap",
             ))
         })?;
-        words.resize_with(word_count, || AtomicU64::new(0));
+        let mut hot = Vec::new();
+        hot.try_reserve_exact(word_count).map_err(|_| {
+            IndexStorageError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "unable to allocate index heat bitmap",
+            ))
+        })?;
+        seen.resize_with(word_count, || AtomicU64::new(0));
+        hot.resize_with(word_count, || AtomicU64::new(0));
         Ok(Self {
-            words: words.into_boxed_slice(),
+            seen: seen.into_boxed_slice(),
+            hot: hot.into_boxed_slice(),
         })
     }
 
     fn mark(&self, slot: usize) {
         let word = slot / REFERENCE_WORD_BITS;
         let mask = 1_u64 << (slot % REFERENCE_WORD_BITS);
-        if let Some(current) = self.words.get(word) {
-            // The caller retains this slot's partition guard. Writers cannot
-            // clear the same bit between the load and RMW; atomics are still
-            // required because concurrent readers and adjacent partitions can
-            // share one bitmap word.
-            if current.load(Ordering::Relaxed) & mask == 0 {
-                current.fetch_or(mask, Ordering::Relaxed);
-            }
+        let (Some(seen), Some(hot)) = (self.seen.get(word), self.hot.get(word)) else {
+            return;
+        };
+        // The caller retains this slot's partition guard. Reclaim cannot clear
+        // the same slot while it is observed, but concurrent readers may
+        // deliberately undercount one another. Each candidate performs at most
+        // one relaxed RMW; once hot, later candidates are read-only.
+        if hot.load(Ordering::Relaxed) & mask != 0 {
+            return;
+        }
+        if seen.load(Ordering::Relaxed) & mask == 0 {
+            seen.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            hot.fetch_or(mask, Ordering::Relaxed);
         }
     }
 
-    fn take(&self, slot: usize) -> bool {
+    fn take_hot(&self, slot: usize) -> bool {
         let word = slot / REFERENCE_WORD_BITS;
         let mask = 1_u64 << (slot % REFERENCE_WORD_BITS);
-        self.words.get(word).is_some_and(|current| {
-            if current.load(Ordering::Relaxed) & mask == 0 {
-                false
-            } else {
-                current.fetch_and(!mask, Ordering::Relaxed) & mask != 0
-            }
-        })
+        let was_hot = self
+            .hot
+            .get(word)
+            .is_some_and(|current| current.fetch_and(!mask, Ordering::Relaxed) & mask != 0);
+        if let Some(current) = self.seen.get(word) {
+            current.fetch_and(!mask, Ordering::Relaxed);
+        }
+        was_hot
     }
 
     fn clear(&self, slot: usize) {
-        let _ = self.take(slot);
+        let _ = self.take_hot(slot);
     }
 }
 
@@ -89,7 +107,7 @@ pub(crate) enum ReclaimIndexAction {
 
 pub(crate) struct RegionIndex {
     storage: PartitionedIndexStorage,
-    references: SlotReferences,
+    heat: SlotHeat,
     statistics_enabled: AtomicBool,
     relocations: AtomicU64,
     overflow_evictions: AtomicU64,
@@ -154,10 +172,10 @@ impl RegionIndex {
     pub(crate) fn from_storage(
         storage: PartitionedIndexStorage,
     ) -> Result<Self, IndexStorageError> {
-        let references = SlotReferences::try_new(storage.slot_count())?;
+        let heat = SlotHeat::try_new(storage.slot_count())?;
         Ok(Self {
             storage,
-            references,
+            heat,
             statistics_enabled: AtomicBool::new(false),
             relocations: AtomicU64::new(0),
             overflow_evictions: AtomicU64::new(0),
@@ -217,7 +235,7 @@ impl RegionIndex {
                 && current == fingerprint
                 && usize::from(current_displacement) == displacement
             {
-                self.references.mark(partition.global_slot(slot)?);
+                self.heat.mark(partition.global_slot(slot)?);
                 #[cfg(feature = "benchmarking")]
                 record_benchmark_probe(probes);
                 return Ok(Some(entry));
@@ -367,8 +385,8 @@ impl RegionIndex {
     }
 
     /// Atomically classifies one reclaim candidate under its index partition.
-    /// A referenced exact mapping is retained for a later conditional rewrite;
-    /// every other exact mapping is removed before the source Region is freed.
+    /// A hot exact mapping is retained for a later conditional rewrite; every
+    /// other exact mapping is removed before the source Region is freed.
     pub(crate) fn prepare_reclaim(
         &self,
         hash: u64,
@@ -388,7 +406,7 @@ impl RegionIndex {
                 continue;
             }
             let global_slot = partition.global_slot(slot)?;
-            if self.references.take(global_slot) {
+            if self.heat.take_hot(global_slot) {
                 return Ok(ReclaimIndexAction::Reinsert);
             }
             self.replace_slot(&mut partition, slot, state, IndexSlotState::Empty)?;
@@ -487,7 +505,7 @@ impl RegionIndex {
     ) -> Result<(), IndexStorageError> {
         let global_slot = partition.global_slot(slot)?;
         partition.replace_observed(slot, previous, next)?;
-        self.references.clear(global_slot);
+        self.heat.clear(global_slot);
         Ok(())
     }
 }
@@ -586,10 +604,10 @@ mod tests {
     }
 
     #[test]
-    fn production_reference_bitmap_is_exactly_one_bit_per_slot() {
+    fn production_heat_bitmaps_are_exactly_two_bits_per_slot() {
         assert_eq!(
-            reference_memory_bytes(crate::index::MAX_INDEX_SLOTS),
-            Some(64 * 1024 * 1024)
+            heat_memory_bytes(crate::index::MAX_INDEX_SLOTS),
+            Some(128 * 1024 * 1024)
         );
     }
 
@@ -632,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_reinserts_only_a_referenced_exact_mapping() {
+    fn reclaim_reinserts_only_an_exact_mapping_seen_at_least_twice() {
         let index = anonymous(128);
         let hash = 17;
         let old = entry(1, 0);
@@ -648,6 +666,15 @@ mod tests {
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
         assert_eq!(
             index.prepare_reclaim(hash, old.location).unwrap(),
+            ReclaimIndexAction::Removed,
+            "one candidate access must not survive a scan"
+        );
+
+        index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+        assert_eq!(
+            index.prepare_reclaim(hash, old.location).unwrap(),
             ReclaimIndexAction::Reinsert
         );
         assert!(
@@ -658,7 +685,7 @@ mod tests {
         assert_eq!(
             index.prepare_reclaim(hash, replacement.location).unwrap(),
             ReclaimIndexAction::Removed,
-            "conditional publication must reset the reference bit"
+            "conditional publication must reset both heat bits"
         );
     }
 
@@ -671,6 +698,7 @@ mod tests {
         let newer = entry(3, 0);
 
         index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
         assert_eq!(
             index.prepare_reclaim(hash, old.location).unwrap(),
@@ -693,6 +721,7 @@ mod tests {
         let replacement = entry(2, 0);
 
         index.upsert(hash, old).unwrap();
+        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
         assert_eq!(
             index.prepare_reclaim(hash, old.location).unwrap(),
