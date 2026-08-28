@@ -3501,7 +3501,6 @@ mod tests {
         let timeout = request.wait(&engine).unwrap_err();
         let pending = engine.in_flight();
         let pending_writes = engine.writes_in_flight();
-        backend.release();
         let (error, buffer) = timeout.into_buffer();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(buffer.is_none());
@@ -3513,6 +3512,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
 
+        backend.release();
         engine.shutdown().unwrap();
         assert_eq!(engine.in_flight(), 0);
     }

@@ -99,7 +99,7 @@ fn rewrite_page_version(path: &std::path::Path, offset: u64, version: u16) {
     file.read_exact(&mut page).unwrap();
     page[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&version.to_le_bytes());
     page[CRC_OFFSET..].fill(0);
-    let checksum = crc32c::crc32c(&page);
+    let checksum = crc_fast::crc32_iscsi(&page);
     page[CRC_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&page).unwrap();
