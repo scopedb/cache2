@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;

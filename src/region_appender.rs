@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! One owned-buffer Region span submission for the data path.
 //!
 //! A successful write completion advances only the written prefix. The

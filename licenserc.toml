@@ -1,0 +1,10 @@
+[header]
+text = "Copyright 2026 ScopeDB\nSPDX-License-Identifier: Apache-2.0"
+keywords = ["SPDX-License-Identifier"]
+
+[files]
+includes = ["**/*.rs", "**/*.sh"]
+
+[git]
+ignore = "auto"
+file_attrs = "disable"

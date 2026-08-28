@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded RAM + Region SSD cache for Tokio applications.
 //!
 //! Mutations provide process-local visibility. An unclean restart opens empty;

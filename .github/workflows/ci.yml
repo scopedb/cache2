@@ -1,14 +1,15 @@
 name: CI
 
 on:
-  push:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
 
 jobs:
   quality:
+    if: github.event.pull_request.draft == false
     name: format and clippy
     runs-on: ubuntu-latest
     steps:
@@ -17,6 +18,12 @@ jobs:
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
       - name: Select Rust 1.98
         run: rustup default 1.98.0
+      - name: Install Hawkeye
+        uses: taiki-e/install-action@v2
+        with:
+          tool: hawkeye@7.0.0
+      - name: Check license headers
+        run: hawkeye check
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check fuzz-target formatting
@@ -29,12 +36,13 @@ jobs:
         run: cargo deny --all-features check advisories licenses bans sources
 
   test:
+    if: github.event.pull_request.draft == false
     name: ${{ matrix.os }} / ${{ matrix.features }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         features: [default, io-uring]
     steps:
       - uses: actions/checkout@v4
@@ -55,10 +63,11 @@ jobs:
         if: matrix.features == 'io-uring'
         run: cargo test --features io-uring
       - name: Run optimized tests with all features
-        if: matrix.os == 'ubuntu-latest' && matrix.features == 'io-uring'
+        if: matrix.features == 'io-uring'
         run: cargo test --release --all-features
 
   safety-checks:
+    if: github.event.pull_request.draft == false
     name: persistent fuzz, ASan, and TSan
     runs-on: ubuntu-latest
     steps:

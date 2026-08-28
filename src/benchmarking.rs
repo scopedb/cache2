@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Internal benchmark entry points. This module is available only with the
 //! `benchmarking` feature and is not part of the supported cache API.
 

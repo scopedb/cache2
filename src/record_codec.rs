@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Checked value-record encoding for the RegionStore append path.
 //!
 //! The encoder uses the stable record envelope while keeping batch padding and

@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Owned-buffer record reads for the RegionStore data path.
 //!
 //! A packed record may start on a 32-byte boundary, while direct I/O requires

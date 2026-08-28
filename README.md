@@ -176,3 +176,7 @@ cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
   and recovery.
 - [Validation](BENCHMARK.md) — benchmarks, mixed turnover, and Linux NVMe
   qualification.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

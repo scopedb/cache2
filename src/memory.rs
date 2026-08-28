@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded shard-local RAM tier for the Cache data path.
 //!
 //! L1 is process-local and never participates in recovery. Entries are visible

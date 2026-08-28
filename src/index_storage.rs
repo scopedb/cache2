@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable, mmap-friendly storage for the Region fixed-size index.
 //!
 //! The runtime index deliberately does not persist a Rust structure. Every

@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use std::io;
 
 const EMPTY_VALUE: u32 = u32::MAX;

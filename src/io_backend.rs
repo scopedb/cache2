@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Synchronous positioned I/O abstraction used for open, recovery, and the
 //! reference runtime path.
 //!

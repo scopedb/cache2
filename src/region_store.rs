@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Recovery and shutdown state machine for the Region-backed cache.
 //!
 //! The coordinator owns no file-format or data-plane logic. A

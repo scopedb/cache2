@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable, bounded Region/FIFO metadata for a clean recovery image.
 //!
 //! The complete section is eagerly validated before any recovered Region

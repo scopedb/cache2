@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable codecs for the recovery control plane.
 //!
 //! Session state deliberately lives outside the data superblock. The data

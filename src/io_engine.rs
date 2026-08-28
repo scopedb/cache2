@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Owned-buffer I/O runtime.
 //!
 //! Requests transfer ownership of their aligned buffer to the engine. The

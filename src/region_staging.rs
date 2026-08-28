@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fixed-memory, zero-copy staging for the RegionStore append path.
 //!
 //! Region manager receipts are the only span authority.

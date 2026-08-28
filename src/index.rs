@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared packed-location and index-entry primitives for the index.
 
 use std::fmt;

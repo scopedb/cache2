@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Internal libFuzzer entry points. This module is available only with the
 //! `fuzzing` feature and is not part of the supported cache API.
 
