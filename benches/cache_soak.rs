@@ -33,6 +33,7 @@ struct SoakConfig {
     managed_memory_limit_bytes: usize,
     value_bytes: Box<[usize]>,
     rss_slack_bytes: usize,
+    rss_reopen_allowance_bytes: usize,
     key_count: usize,
     append_shards: u32,
     read_io_workers: usize,
@@ -96,6 +97,15 @@ impl SoakConfig {
             Duration::from_micros(env_u64("CACHE_SOAK_OPERATION_INTERVAL_US", 0)?);
         let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
         let final_warm_verify = env_bool("CACHE_SOAK_FINAL_WARM_VERIFY", false)?;
+        // A same-process reopen can leave the retired L1's freed allocations in
+        // libc arenas while the replacement L1 fills. This is allocator RSS,
+        // not cache-owned managed memory, and is bounded by one L1 capacity for
+        // this harness's fixed reopen topology.
+        let rss_reopen_allowance_bytes = if warm_reopen || final_warm_verify {
+            memory_bytes
+        } else {
+            0
+        };
         let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
@@ -131,6 +141,7 @@ impl SoakConfig {
             managed_memory_limit_bytes,
             value_bytes,
             rss_slack_bytes,
+            rss_reopen_allowance_bytes,
             key_count,
             append_shards,
             read_io_workers,
@@ -336,7 +347,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -363,6 +374,7 @@ fn main() -> io::Result<()> {
         config.io_mode,
         peak_disk_bytes,
         config.rss_slack_bytes,
+        config.rss_reopen_allowance_bytes,
         files.data.display(),
     );
 
@@ -425,7 +437,13 @@ fn main() -> io::Result<()> {
             }
             let now = Instant::now();
             if now >= next_sample && now < deadline {
-                match resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes) {
+                match resource_sample(
+                    &cache,
+                    &files,
+                    peak_disk_bytes,
+                    config.rss_slack_bytes,
+                    config.rss_reopen_allowance_bytes,
+                ) {
                     Ok(sample) => {
                         max_managed_memory = max_managed_memory
                             .max(sample.detailed.summary.managed_memory_peak_bytes);
@@ -466,7 +484,13 @@ fn main() -> io::Result<()> {
     })?;
 
     runtime.block_on(cache.drain())?;
-    let sample = resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes)?;
+    let sample = resource_sample(
+        &cache,
+        &files,
+        peak_disk_bytes,
+        config.rss_slack_bytes,
+        config.rss_reopen_allowance_bytes,
+    )?;
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
     let final_counters = counters.snapshot();
     if config.require_path_coverage {
@@ -487,8 +511,13 @@ fn main() -> io::Result<()> {
             value_size_count,
             &config.value_bytes,
         )?;
-        let verification_sample =
-            resource_sample(&cache, &files, peak_disk_bytes, config.rss_slack_bytes)?;
+        let verification_sample = resource_sample(
+            &cache,
+            &files,
+            peak_disk_bytes,
+            config.rss_slack_bytes,
+            config.rss_reopen_allowance_bytes,
+        )?;
         if config.require_path_coverage {
             validate_warm_path_coverage(&verification, &verification_sample)?;
         }
@@ -794,6 +823,7 @@ fn resource_sample(
     files: &SoakFiles,
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,
+    rss_reopen_allowance_bytes: usize,
 ) -> io::Result<ResourceSample> {
     let logical_bytes = files.logical_bytes()?;
     if logical_bytes > peak_disk_bytes {
@@ -810,8 +840,9 @@ fn resource_sample(
         return Err(io::Error::other("soak observed a cache runtime failure"));
     }
     let current_rss = current_rss_bytes()?;
-    let rss_limit =
-        (resources.managed_memory_limit_bytes as u64).saturating_add(rss_slack_bytes as u64);
+    let rss_limit = (resources.managed_memory_limit_bytes as u64)
+        .saturating_add(rss_slack_bytes as u64)
+        .saturating_add(rss_reopen_allowance_bytes as u64);
     if current_rss != 0 && current_rss > rss_limit {
         return Err(io::Error::other("soak exceeded the process RSS bound"));
     }
