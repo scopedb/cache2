@@ -74,6 +74,7 @@ impl ScaleConfig {
 
 struct ScaleFiles {
     data: PathBuf,
+    cleanup_on_drop: bool,
 }
 
 impl ScaleFiles {
@@ -87,7 +88,12 @@ impl ScaleFiles {
                 "cache2-recovery-scale-{}-{timestamp}.cache",
                 std::process::id()
             )),
+            cleanup_on_drop: false,
         }
+    }
+
+    fn mark_success(&mut self) {
+        self.cleanup_on_drop = true;
     }
 
     fn config(&self, config: &ScaleConfig) -> CacheBuilder {
@@ -139,6 +145,13 @@ impl ScaleFiles {
 
 impl Drop for ScaleFiles {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            eprintln!(
+                "recovery-scale artifacts preserved after failure: data={}",
+                self.data.display()
+            );
+            return;
+        }
         for path in self.paths() {
             let _ = std::fs::remove_file(path);
         }
@@ -154,7 +167,7 @@ fn main() -> io::Result<()> {
 }
 
 async fn run(config: ScaleConfig) -> io::Result<()> {
-    let files = ScaleFiles::new(&config.directory);
+    let mut files = ScaleFiles::new(&config.directory);
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
     println!(
@@ -201,7 +214,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     let cache = files.config(&config).open().await?;
     emit("warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
-    verify_sentinels(&cache, &keys).await?;
+    verify_sentinels(&cache, &keys, config.value_bytes).await?;
 
     let closed = Instant::now();
     cache.close_warm().await?;
@@ -212,23 +225,31 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     let cache = files.config(&config).open().await?;
     emit("second_warm_open", reopened.elapsed());
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
-    verify_sentinels(&cache, &keys).await?;
+    verify_sentinels(&cache, &keys, config.value_bytes).await?;
 
     let closed = Instant::now();
     cache.close_fast().await?;
     emit("close_fast", closed.elapsed());
+    files.mark_success();
     println!("complete status=pass");
     Ok(())
 }
 
-async fn verify_sentinels(cache: &cache2::Cache, keys: &[[u8; 16]]) -> io::Result<()> {
+async fn verify_sentinels(
+    cache: &cache2::Cache,
+    keys: &[[u8; 16]],
+    value_bytes: usize,
+) -> io::Result<()> {
     let started = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         let observed = cache
             .get(key)
             .await?
             .ok_or_else(|| io::Error::other("recovered sentinel is missing"))?;
-        if observed.len() < 8 || observed[..8] != (ordinal as u64).to_le_bytes() {
+        if observed.len() != value_bytes
+            || observed[..8] != (ordinal as u64).to_le_bytes()
+            || observed[8..].iter().any(|byte| *byte != 0xa5)
+        {
             return Err(io::Error::other("recovered sentinel value is incorrect"));
         }
     }
