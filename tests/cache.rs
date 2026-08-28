@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
 use cache2::{
-    CacheBuilder, CacheHealth, CacheTier, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
+    CacheBuilder, CacheHealth, CacheTier, IoEngine, L1EvictionPolicy, RuntimeConfig, StartupMode,
+    StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -373,6 +374,7 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
         .with_reclaim_workers(2)
         .with_append_shards(2)
         .with_l1_capacity_bytes(2 * 1024 * 1024)
+        .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
         .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(7)
         .with_write_flush_threshold_bytes(64 * 1024);

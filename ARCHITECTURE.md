@@ -5,7 +5,7 @@ the design favors a short bounded request path over freshness or durability.
 
 ```text
 Cache
-├── bounded shard-local CLOCK L1
+├── bounded shard-local CLOCK or S3-FIFO L1
 ├── fixed partitioned mmap L2 index
 ├── append shards + global Region FIFO
 ├── bounded read I/O pool
@@ -97,10 +97,10 @@ bounded eviction. The exact record envelope is recovered and validated from
 the one bounded read. Index-partition contention is a miss or mutation
 overload, never a wait.
 
-L1 uses fixed startup allocations for entries, CLOCK metadata, free lists, and
-its prehashed directory. Each same-hash chain is capped at eight full keys.
-CLOCK selection and multi-victim admission have fixed work budgets; exhaustion
-bypasses L1. Returned values retain their memory charge until dropped.
+L1 uses fixed startup allocations for entries, eviction metadata, free lists,
+and its prehashed directory. Each same-hash chain is capped at eight full keys.
+CLOCK and S3-FIFO selection plus multi-victim admission have fixed work budgets;
+exhaustion bypasses L1. Returned values retain their memory charge until dropped.
 
 Read and write submissions use independent bounded pools. POSIX uses one engine
 per direction with one execution slot per configured worker. Optional io_uring

@@ -62,6 +62,17 @@ impl IoMode {
     }
 }
 
+/// Eviction policy for the process-local L1 tier.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum L1EvictionPolicy {
+    /// One-bit shard-local CLOCK with bounded victim scans.
+    #[default]
+    Clock,
+    /// Three static FIFO queues: small, main, and a metadata-only ghost queue.
+    S3Fifo,
+}
+
 /// Process-local cache topology and resource tuning validated during open.
 ///
 /// These values do not form the static disk identity. They may change across
@@ -76,6 +87,7 @@ pub struct RuntimeConfig {
     pub(crate) reclaim_workers: usize,
     pub(crate) append_shards: u32,
     pub(crate) l1_capacity_bytes: usize,
+    pub(crate) l1_eviction_policy: L1EvictionPolicy,
     pub(crate) managed_memory_limit_bytes: usize,
     pub(crate) l1_shards: usize,
     pub(crate) write_flush_threshold_bytes: usize,
@@ -92,6 +104,7 @@ impl Default for RuntimeConfig {
             reclaim_workers: 1,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
+            l1_eviction_policy: L1EvictionPolicy::Clock,
             managed_memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
             write_flush_threshold_bytes: MAX_WRITE_FLUSH_THRESHOLD_BYTES,
@@ -167,10 +180,19 @@ impl RuntimeConfig {
     /// Sets the retained-entry byte budget for L1. Zero disables L1.
     ///
     /// Entry charges include the key, value, and fixed ownership charge. L1
-    /// slot, CLOCK, free-list, and directory allocations are accounted
-    /// separately against the managed-memory limit.
+    /// slot, eviction-policy, free-list, and directory allocations are
+    /// accounted separately against the managed-memory limit.
     pub fn with_l1_capacity_bytes(mut self, bytes: usize) -> Self {
         self.l1_capacity_bytes = bytes;
+        self
+    }
+
+    /// Selects the bounded shard-local L1 eviction policy.
+    ///
+    /// CLOCK is the default. S3-FIFO adds a metadata-only ghost queue and uses
+    /// a two-bit hit counter without moving entries on the hit path.
+    pub fn with_l1_eviction_policy(mut self, policy: L1EvictionPolicy) -> Self {
+        self.l1_eviction_policy = policy;
         self
     }
 
@@ -248,6 +270,11 @@ impl RuntimeConfig {
         self.l1_capacity_bytes
     }
 
+    /// Returns the configured L1 eviction policy.
+    pub const fn l1_eviction_policy(&self) -> L1EvictionPolicy {
+        self.l1_eviction_policy
+    }
+
     /// Returns the aggregate cache-managed memory budget.
     pub const fn managed_memory_limit_bytes(&self) -> usize {
         self.managed_memory_limit_bytes
@@ -285,7 +312,7 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoEngine, IoMode, RuntimeConfig};
+    use super::{IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig};
 
     #[test]
     fn runtime_defaults_to_posix_buffered_io() {
@@ -296,13 +323,21 @@ mod tests {
         assert_eq!(config.write_io_workers(), 4);
         assert_eq!(config.reclaim_workers(), 1);
         assert_eq!(config.append_shards(), 4);
+        assert_eq!(config.l1_eviction_policy(), L1EvictionPolicy::Clock);
         assert_eq!(config.io_engine_count(config.read_io_workers()), 1);
         assert_eq!(config.io_depth_per_engine(config.read_io_workers()), 4);
         assert_eq!(
             config
+                .clone()
                 .with_io_engine(IoEngine::IoUring)
                 .io_depth_per_engine(4),
             64
+        );
+        assert_eq!(
+            config
+                .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
+                .l1_eviction_policy(),
+            L1EvictionPolicy::S3Fifo
         );
     }
 }

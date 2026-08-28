@@ -28,8 +28,8 @@ capacity; this is expected to be uncommon in normal operation.
   cases to the normal hit path.
 - L1 lookup and publication retain only short shard-local critical sections.
   Optional insertion and promotion may bypass on pressure.
-- Give every CLOCK selection and multi-victim admission a small constant work
-  budget. Exhausting that budget bypasses L1.
+- Give every L1 victim selection and multi-victim admission a small constant
+  work budget. Exhausting that budget bypasses L1.
 - Never hold a lock across device I/O. Keep mutation critical sections short
   and shard-local whenever possible.
 - Publish Region writes in batches. Never add per-record flushes, syncs, or

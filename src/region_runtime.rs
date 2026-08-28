@@ -509,6 +509,7 @@ impl RuntimeConfig {
             self.l1_capacity_bytes,
             l1_entry_capacity,
             self.l1_shards,
+            self.l1_eviction_policy,
         )?;
         let fixed_bytes =
             crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
@@ -1427,6 +1428,7 @@ fn start_running(
         config.l1_capacity_bytes,
         l1_entry_capacity,
         config.l1_shards,
+        config.l1_eviction_policy,
     )?;
     let fixed_memory = core
         .runtime_reserved_memory_bytes()?
@@ -1458,6 +1460,7 @@ fn start_running(
         config.l1_capacity_bytes,
         l1_entry_capacity,
         config.l1_shards,
+        config.l1_eviction_policy,
         config.statistics,
     )?);
     let mut reclaim_buffers = Vec::new();
@@ -2431,10 +2434,39 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
 
-        let metadata =
-            MemoryStore::allocation_bytes(base.l1_capacity_bytes, entry_capacity, base.l1_shards)
-                .unwrap();
+        let metadata = MemoryStore::allocation_bytes(
+            base.l1_capacity_bytes,
+            entry_capacity,
+            base.l1_shards,
+            base.l1_eviction_policy,
+        )
+        .unwrap();
         assert!(metadata < 384 * 1024 * 1024);
+
+        let s3fifo = base
+            .clone()
+            .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
+            .with_managed_memory_limit_bytes(16 * GIB);
+        s3fifo
+            .validate_memory_plan(geometry, index_slots, 4)
+            .unwrap();
+        assert_eq!(
+            base.clone()
+                .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
+                .validate_memory_plan(geometry, index_slots, 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let s3fifo_metadata = MemoryStore::allocation_bytes(
+            s3fifo.l1_capacity_bytes,
+            entry_capacity,
+            s3fifo.l1_shards,
+            s3fifo.l1_eviction_policy,
+        )
+        .unwrap();
+        assert_eq!(s3fifo_metadata - metadata, 228 * 1024 * 1024);
+        assert!(s3fifo_metadata < 640 * 1024 * 1024);
     }
 
     #[test]

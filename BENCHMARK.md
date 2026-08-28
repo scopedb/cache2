@@ -38,6 +38,7 @@ The main controls are:
 - `CACHE_BENCH_WRITE_CLIENTS` and `CACHE_BENCH_CLIENTS` for concurrency;
 - `CACHE_BENCH_HOT_ENTRIES` enables the focused hot-set/cold-scan workload;
   `CACHE_BENCH_HOT_READ_INTERVAL` controls one hot read per N cold reads;
+- `CACHE_BENCH_L1_EVICTION=clock|s3-fifo` selects the L1 policy for A/B runs;
 - `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
   `CACHE_BENCH_DIR` for the execution path.
 
@@ -109,7 +110,8 @@ more weight in a production-shaped distribution.
 
 Use `CACHE_SOAK_WARM_REOPEN=true` to publish and reopen a clean image before the
 measured phase. `CACHE_SOAK_*` variables control capacity, managed memory, keys,
-append-shard and worker counts, clients, value sizes, and RSS slack.
+append-shard and worker counts, clients, value sizes, and RSS slack. Use
+`CACHE_SOAK_L1_EVICTION=clock|s3-fifo` for policy comparisons.
 For same-process warm reopen, the RSS bound automatically allows one additional
 L1 capacity for freed allocations retained by libc; configured RSS slack covers
 the runtime, harness, and other non-cache-managed memory.

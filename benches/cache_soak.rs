@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, RuntimeConfig,
-    StartupMode, StaticConfig,
+    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, L1EvictionPolicy,
+    RuntimeConfig, StartupMode, StaticConfig,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -48,6 +48,7 @@ struct SoakConfig {
     require_reinsert_coverage: bool,
     io_engine: IoEngine,
     io_mode: IoMode,
+    l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
 }
 
@@ -111,6 +112,7 @@ impl SoakConfig {
         let require_reinsert_coverage = env_bool("CACHE_SOAK_REQUIRE_REINSERT_COVERAGE", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
+        let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
@@ -158,6 +160,7 @@ impl SoakConfig {
             require_reinsert_coverage,
             io_engine,
             io_mode,
+            l1_eviction_policy,
             directory,
         })
     }
@@ -177,6 +180,7 @@ impl SoakConfig {
             .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
+            .with_l1_eviction_policy(self.l1_eviction_policy)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(true)
     }
@@ -350,7 +354,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -374,6 +378,7 @@ fn main() -> io::Result<()> {
         config.require_path_coverage,
         config.require_reinsert_coverage,
         DELETE_INTERVAL,
+        config.l1_eviction_policy,
         config.io_engine,
         config.io_mode,
         peak_disk_bytes,
@@ -1122,6 +1127,17 @@ fn parse_io_mode(name: &str) -> io::Result<IoMode> {
         "buffered" => Ok(IoMode::Buffered),
         "direct" => Ok(IoMode::Direct),
         value => Err(invalid(format!("unsupported I/O mode: {value}"))),
+    }
+}
+
+fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
+    match env::var(name)
+        .unwrap_or_else(|_| "clock".to_owned())
+        .as_str()
+    {
+        "clock" => Ok(L1EvictionPolicy::Clock),
+        "s3-fifo" => Ok(L1EvictionPolicy::S3Fifo),
+        value => Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
     }
 }
 

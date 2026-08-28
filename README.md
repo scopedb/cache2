@@ -22,7 +22,7 @@ chunks. It is disposable acceleration, not durable storage.
 ## Usage
 
 ```rust
-use cache2::{CacheBuilder, RuntimeConfig, StaticConfig};
+use cache2::{CacheBuilder, L1EvictionPolicy, RuntimeConfig, StaticConfig};
 # async fn run() -> std::io::Result<()> {
 
 let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
@@ -31,6 +31,7 @@ let static_config = StaticConfig::new(64 * 1024 * 1024 * 1024)
 
 let runtime_config = RuntimeConfig::default()
     .with_l1_capacity_bytes(8 * 1024 * 1024 * 1024)
+    .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
     .with_managed_memory_limit_bytes(10 * 1024 * 1024 * 1024)
     .with_l1_shards(64)
     .with_read_io_workers(16)
@@ -66,11 +67,12 @@ fences accepted work.
 from expected entries, and the key-hash identity. A mismatch safely opens an
 empty cache.
 
-`RuntimeConfig` selects L1 capacity and shards, aggregate managed-memory limit,
-append shards, independent read/write I/O workers, I/O mode, write flush
-threshold, and optional statistics. Runtime tuning may change across opens,
-except that an append-shard count different from the clean image cold-starts
-empty.
+`RuntimeConfig` selects L1 capacity, eviction policy, and shards, aggregate
+managed-memory limit, append shards, independent read/write I/O workers, I/O
+mode, write flush threshold, and optional statistics. CLOCK is the default;
+S3-FIFO is available for stronger scan resistance. Runtime tuning may change
+across opens, except that an append-shard count different from the clean image
+cold-starts empty.
 
 POSIX positioned I/O with `IoMode::Buffered` is the default production path.
 `IoMode::Direct` explicitly enables Linux `O_DIRECT` for aligned runtime record

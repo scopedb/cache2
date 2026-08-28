@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheTier, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig,
-    Value,
+    Cache, CacheBuilder, CacheTier, IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig, StartupMode,
+    StaticConfig, Value,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -42,6 +42,7 @@ struct BenchConfig {
     clients: usize,
     io_engine: IoEngine,
     io_mode: IoMode,
+    l1_eviction_policy: L1EvictionPolicy,
     statistics_enabled: bool,
     directory: PathBuf,
 }
@@ -76,6 +77,16 @@ impl BenchConfig {
             "buffered" => IoMode::Buffered,
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
+        };
+        let l1_eviction_policy = match env::var("CACHE_BENCH_L1_EVICTION")
+            .unwrap_or_else(|_| "clock".to_owned())
+            .as_str()
+        {
+            "clock" => L1EvictionPolicy::Clock,
+            "s3-fifo" => L1EvictionPolicy::S3Fifo,
+            value => {
+                return Err(invalid(format!("unsupported L1 eviction policy: {value}")));
+            }
         };
         let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
         let directory = env::var_os("CACHE_BENCH_DIR")
@@ -182,6 +193,7 @@ impl BenchConfig {
             clients,
             io_engine,
             io_mode,
+            l1_eviction_policy,
             statistics_enabled,
             directory,
         })
@@ -205,6 +217,7 @@ impl BenchConfig {
             .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
+            .with_l1_eviction_policy(self.l1_eviction_policy)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
             .with_statistics(self.statistics_enabled)
     }
@@ -325,7 +338,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -345,6 +358,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.clients,
         config.l2_clients(),
         l1_entry_eligible,
+        config.l1_eviction_policy,
         config.io_engine,
         config.io_mode,
         config.statistics_enabled,
@@ -460,7 +474,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         if let Some(before) = scan_start {
             let after = cache.snapshot()?;
             println!(
-                "result phase=hot_scan_clock evictions={} bypasses={} promotions={} l1_hits={} l1_misses={} l2_hits={} l2_misses={}",
+                "result phase=hot_scan_l1 policy={:?} evictions={} bypasses={} promotions={} l1_hits={} l1_misses={} l2_hits={} l2_misses={}",
+                config.l1_eviction_policy,
                 after.l1_evictions.saturating_sub(before.l1_evictions),
                 after.l1_bypasses.saturating_sub(before.l1_bypasses),
                 after.l1_promotions.saturating_sub(before.l1_promotions),
@@ -484,7 +499,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         let detailed = cache.detailed_snapshot()?;
         let snapshot = detailed.summary;
         println!(
-            "result phase=l1_clock evictions={} bypasses={} promotions={} l1_hits={} l1_misses={}",
+            "result phase=l1 policy={:?} evictions={} bypasses={} promotions={} l1_hits={} l1_misses={}",
+            config.l1_eviction_policy,
             snapshot.l1_evictions,
             snapshot.l1_bypasses,
             snapshot.l1_promotions,
