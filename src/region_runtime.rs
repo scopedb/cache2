@@ -424,6 +424,12 @@ impl RuntimeConfig {
                 "io_uring is unavailable on this build or platform",
             ));
         }
+        if !self.io_mode.is_available() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct I/O is unavailable on this platform",
+            ));
+        }
         if self.append_shards == 0 || self.append_shards > MAX_APPEND_SHARDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "linux"))]
+use cache2::IoMode;
 use cache2::{
     CacheBuilder, CacheHealth, CacheTier, IoEngine, RuntimeConfig, StartupMode, StaticConfig,
 };
@@ -299,6 +301,29 @@ async fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::IoUring)
+        .with_read_io_workers(1)
+        .with_write_io_workers(1)
+        .with_append_shards(2)
+        .with_l1_capacity_bytes(4 * 1024 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+        .with_write_flush_threshold_bytes(128 * 1024);
+
+    let error = files
+        .config(1)
+        .with_runtime_config(runtime)
+        .open()
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    files.assert_absent();
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn unavailable_direct_io_is_rejected_before_file_creation() {
+    let files = TestCache::new("unavailable-direct-io");
+    let runtime = RuntimeConfig::default()
+        .with_io_mode(IoMode::Direct)
         .with_read_io_workers(1)
         .with_write_io_workers(1)
         .with_append_shards(2)

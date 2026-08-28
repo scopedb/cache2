@@ -53,6 +53,15 @@ pub enum IoMode {
     Direct,
 }
 
+impl IoMode {
+    pub(crate) const fn is_available(self) -> bool {
+        match self {
+            Self::Buffered => true,
+            Self::Direct => cfg!(target_os = "linux"),
+        }
+    }
+}
+
 /// Process-local cache topology and resource tuning validated during open.
 ///
 /// These values do not form the static disk identity. They may change across
