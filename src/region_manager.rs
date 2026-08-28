@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-memory Region authority reconstructed from one validated clean image.
 //!
 //! The manager deliberately does not retain the recovered index partition

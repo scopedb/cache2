@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::index::{IndexEntry, PackedLocation};
 use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, IndexSlot};

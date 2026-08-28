@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! File ownership, recovery, and lifecycle adapter for the Region core.
 
 use std::fs::File;

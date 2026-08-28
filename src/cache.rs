@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Public cache API and configuration.
 //!
 //! Static configuration defines disk identity; runtime configuration is chosen

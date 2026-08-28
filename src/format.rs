@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Explicit little-endian codecs for the persistent cache metadata and records.
 //!
 //! These types are deliberately encoded field-by-field. Their Rust layout is

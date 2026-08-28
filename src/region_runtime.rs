@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Self-owned steady-state runtime for RegionStore .
 //!
 //! Foreground writers encode directly into the fixed per-shard write

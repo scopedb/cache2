@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded shard-local eviction for the volatile RAM tier.
 //!
 //! Capacity accounting and key correctness stay in `memory`; this module owns

@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! CRC32C (Castagnoli) used by the on-disk format.
 //!
 //! The dependency selects hardware acceleration when the host supports it and

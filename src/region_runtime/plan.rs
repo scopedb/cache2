@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use std::io;
 
 use crate::io_engine::MAX_IO_REQUESTS_PER_ENGINE;

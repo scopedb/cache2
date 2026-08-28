@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::Duration;
 
 pub(crate) const DEFAULT_L1_SHARDS: usize = 32;

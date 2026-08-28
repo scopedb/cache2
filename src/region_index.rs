@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fixed-candidate point index for Region records.
 //!
 //! Each key has four deterministic buckets in one canonical partition. A

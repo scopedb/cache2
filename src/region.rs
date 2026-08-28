@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Region storage facade.
 //!
 //! `core` owns bounded steady-state operations. `file_backend` composes that

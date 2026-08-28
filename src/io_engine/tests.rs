@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::io_backend::{SyncMode, SyncPoint};
 use std::fs::{File, OpenOptions};

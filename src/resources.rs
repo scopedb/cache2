@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded write admission and aligned record buffers.
 //!
 //! Foreground reads allocate one alignment-rounded transient buffer for the

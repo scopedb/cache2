@@ -1,3 +1,6 @@
+// Copyright 2026 ScopeDB
+// SPDX-License-Identifier: Apache-2.0
+
 //! Steady-state Region authority and bounded request-path operations.
 
 use std::io;
