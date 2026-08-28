@@ -4,31 +4,32 @@
 //! retains a portable software fallback. This wrapper keeps the cache's codec
 //! API and checksum values independent from that implementation detail.
 
-use crc32c::{crc32c as accelerated_crc32c, crc32c_append};
+use crc_fast::{CrcAlgorithm, Digest, crc32_iscsi};
 
 /// Computes the standard CRC32C checksum of `bytes`.
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
-    accelerated_crc32c(bytes)
+    crc32_iscsi(bytes)
 }
 
 /// Incremental CRC32C state, useful for checksumming a key and value without
 /// first joining them in a temporary allocation.
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct Crc32c {
-    state: u32,
+    digest: Digest,
 }
 
 impl Crc32c {
-    pub(crate) const fn new() -> Self {
-        Self { state: 0 }
+    pub(crate) fn new() -> Self {
+        Self {
+            digest: Digest::new(CrcAlgorithm::Crc32Iscsi),
+        }
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) {
-        self.state = crc32c_append(self.state, bytes);
+        self.digest.update(bytes);
     }
 
-    pub(crate) const fn finish(self) -> u32 {
-        self.state
+    pub(crate) fn finish(self) -> u32 {
+        self.digest.finalize() as u32
     }
 }
 
