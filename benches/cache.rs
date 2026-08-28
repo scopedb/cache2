@@ -44,6 +44,7 @@ struct BenchConfig {
     io_mode: IoMode,
     statistics_enabled: bool,
     directory: PathBuf,
+    additional_directories: Box<[PathBuf]>,
 }
 
 impl BenchConfig {
@@ -81,6 +82,10 @@ impl BenchConfig {
         let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
+        let additional_directories = env::var_os("CACHE_BENCH_ADDITIONAL_DIRS")
+            .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_boxed_slice();
 
         if entries == 0
             || read_ops == 0
@@ -102,6 +107,15 @@ impl BenchConfig {
             )));
         }
         if !directory.is_dir() {
+            return Err(invalid(format!(
+                "benchmark directory does not exist: {}",
+                directory.display()
+            )));
+        }
+        if let Some(directory) = additional_directories
+            .iter()
+            .find(|directory| !directory.is_dir())
+        {
             return Err(invalid(format!(
                 "benchmark directory does not exist: {}",
                 directory.display()
@@ -184,6 +198,7 @@ impl BenchConfig {
             io_mode,
             statistics_enabled,
             directory,
+            additional_directories,
         })
     }
 
@@ -221,20 +236,29 @@ impl BenchConfig {
 
 struct BenchFiles {
     data: PathBuf,
+    additional_data: Box<[PathBuf]>,
 }
 
 impl BenchFiles {
-    fn new(directory: &Path) -> Self {
+    fn new(directory: &Path, additional_directories: &[PathBuf]) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let file_name = format!("cache2-bench-{}-{timestamp}.cache", std::process::id());
         Self {
-            data: directory.join(format!(
-                "cache2-bench-{}-{timestamp}.cache",
-                std::process::id()
-            )),
+            data: directory.join(&file_name),
+            additional_data: additional_directories
+                .iter()
+                .map(|directory| directory.join(&file_name))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
+    }
+
+    fn data_paths(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.data.as_path())
+            .chain(self.additional_data.iter().map(PathBuf::as_path))
     }
 
     fn config(&self, config: &BenchConfig) -> CacheBuilder {
@@ -246,18 +270,22 @@ impl BenchFiles {
         config: &BenchConfig,
         l1_capacity_bytes: usize,
     ) -> CacheBuilder {
-        CacheBuilder::from_static(&self.data, config.static_config()).with_runtime_config(
-            config
-                .runtime_config()
-                .with_l1_capacity_bytes(l1_capacity_bytes),
-        )
+        CacheBuilder::from_static(&self.data, config.static_config())
+            .with_additional_data_paths(self.additional_data.iter())
+            .with_runtime_config(
+                config
+                    .runtime_config()
+                    .with_l1_capacity_bytes(l1_capacity_bytes),
+            )
     }
 }
 
 impl Drop for BenchFiles {
     fn drop(&mut self) {
+        for path in self.data_paths() {
+            let _ = std::fs::remove_file(path);
+        }
         for path in [
-            self.data.clone(),
             sidecar(&self.data, ".state"),
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
@@ -313,7 +341,7 @@ fn main() -> io::Result<()> {
 }
 
 async fn run(config: BenchConfig) -> io::Result<()> {
-    let files = BenchFiles::new(&config.directory);
+    let files = BenchFiles::new(&config.directory, &config.additional_directories);
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
     let index_slots = config.static_config().index_slots();
     let index_load = config.entries as f64 * 100.0 / index_slots as f64;
@@ -349,7 +377,15 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.io_mode,
         config.statistics_enabled,
     );
-    println!("file={}", files.data.display());
+    println!(
+        "data_files={} files={}",
+        files.additional_data.len().saturating_add(1),
+        files
+            .data_paths()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 
     let cache = Arc::new(
         files

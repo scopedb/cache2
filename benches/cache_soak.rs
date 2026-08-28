@@ -49,6 +49,7 @@ struct SoakConfig {
     io_engine: IoEngine,
     io_mode: IoMode,
     directory: PathBuf,
+    additional_directories: Box<[PathBuf]>,
 }
 
 impl SoakConfig {
@@ -114,6 +115,10 @@ impl SoakConfig {
         let directory = env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
+        let additional_directories = env::var_os("CACHE_SOAK_ADDITIONAL_DIRS")
+            .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_boxed_slice();
         if duration.is_zero()
             || sample_period.is_zero()
             || value_bytes.is_empty()
@@ -130,6 +135,9 @@ impl SoakConfig {
             || readers == 0
             || operation_interval > Duration::from_secs(1)
             || !directory.is_dir()
+            || additional_directories
+                .iter()
+                .any(|directory| !directory.is_dir())
         {
             return Err(invalid(
                 "invalid soak duration, pacing, topology, value, or directory",
@@ -159,6 +167,7 @@ impl SoakConfig {
             io_engine,
             io_mode,
             directory,
+            additional_directories,
         })
     }
 
@@ -184,20 +193,24 @@ impl SoakConfig {
 
 struct SoakFiles {
     data: PathBuf,
+    additional_data: Box<[PathBuf]>,
     cleanup_on_drop: AtomicBool,
 }
 
 impl SoakFiles {
-    fn new(directory: &Path) -> Self {
+    fn new(directory: &Path, additional_directories: &[PathBuf]) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let file_name = format!("cache2-soak-{}-{timestamp}.cache", std::process::id());
         Self {
-            data: directory.join(format!(
-                "cache2-soak-{}-{timestamp}.cache",
-                std::process::id()
-            )),
+            data: directory.join(&file_name),
+            additional_data: additional_directories
+                .iter()
+                .map(|directory| directory.join(&file_name))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             cleanup_on_drop: AtomicBool::new(false),
         }
     }
@@ -207,34 +220,55 @@ impl SoakFiles {
     }
 
     fn logical_bytes(&self) -> io::Result<u64> {
-        [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ]
-        .into_iter()
-        .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
-            Ok(metadata) => total
-                .checked_add(metadata.len())
-                .ok_or_else(|| invalid("logical disk byte count overflow")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-            Err(error) => Err(error),
-        })
+        let mut total = 0_u64;
+        for path in self.data_paths().chain(
+            [
+                sidecar(&self.data, ".state"),
+                sidecar(&self.data, ".image"),
+                sidecar(&self.data, ".image.next"),
+            ]
+            .iter()
+            .map(PathBuf::as_path),
+        ) {
+            total = match std::fs::metadata(path) {
+                Ok(metadata) => total
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| invalid("logical disk byte count overflow")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
+                Err(error) => Err(error),
+            }?;
+        }
+        Ok(total)
+    }
+
+    fn data_paths(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.data.as_path())
+            .chain(self.additional_data.iter().map(PathBuf::as_path))
+    }
+
+    fn data_file_count(&self) -> usize {
+        self.additional_data.len().saturating_add(1)
     }
 }
 
 impl Drop for SoakFiles {
     fn drop(&mut self) {
         if !self.cleanup_on_drop.load(Ordering::Acquire) {
+            let paths = self
+                .data_paths()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             eprintln!(
-                "soak artifacts preserved after failure: data={}",
+                "soak artifacts preserved after failure: data={paths} sidecars={}",
                 self.data.display()
             );
             return;
         }
+        for path in self.data_paths() {
+            let _ = std::fs::remove_file(path);
+        }
         for path in [
-            self.data.clone(),
             sidecar(&self.data, ".state"),
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
@@ -311,9 +345,9 @@ fn main() -> io::Result<()> {
         .thread_name("cache2-soak")
         .enable_time()
         .build()?;
-    let files = SoakFiles::new(&config.directory);
+    let files = SoakFiles::new(&config.directory, &config.additional_directories);
     let static_config = config.static_config();
-    let peak_disk_bytes = static_config.peak_disk_bytes()?;
+    let peak_disk_bytes = static_config.peak_disk_bytes_for_data_files(files.data_file_count())?;
     let mut cache = open_cache(&runtime, &files, &config)?;
     let key_count =
         u64::try_from(config.key_count).map_err(|_| invalid("soak key count exceeds u64"))?;
@@ -350,7 +384,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data_files={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -379,7 +413,12 @@ fn main() -> io::Result<()> {
         peak_disk_bytes,
         config.rss_slack_bytes,
         config.rss_reopen_allowance_bytes,
-        files.data.display(),
+        files.data_file_count(),
+        files
+            .data_paths()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
     );
 
     thread::scope(|scope| -> io::Result<()> {
@@ -578,6 +617,7 @@ fn open_cache(
 ) -> io::Result<Cache> {
     runtime.block_on(async {
         CacheBuilder::from_static(&files.data, config.static_config())
+            .with_additional_data_paths(files.additional_data.iter())
             .with_runtime_config(config.runtime_config())
             .open()
             .await

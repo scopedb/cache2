@@ -39,7 +39,9 @@ The main controls are:
 - `CACHE_BENCH_HOT_ENTRIES` enables the focused hot-set/cold-scan workload;
   `CACHE_BENCH_HOT_READ_INTERVAL` controls one hot read per N cold reads;
 - `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_STATS`, and
-  `CACHE_BENCH_DIR` for the execution path.
+  `CACHE_BENCH_DIR` for the execution path;
+- `CACHE_BENCH_ADDITIONAL_DIRS` for a platform path-separated list of
+  additional POSIX data-device directories.
 
 The optional hot-scan mode rewrites a bounded hot set into L1 after warm open,
 then interleaves one-shot hot reads with a single pass over the remaining cold
@@ -108,6 +110,14 @@ append-shard and worker counts, clients, value sizes, and RSS slack.
 For same-process warm reopen, the RSS bound automatically allows one additional
 L1 capacity for freed allocations retained by libc; configured RSS slack covers
 the runtime, harness, and other non-cache-managed memory.
+
+For a POSIX multi-device run, keep `CACHE_SOAK_DIR` as device zero and set
+`CACHE_SOAK_ADDITIONAL_DIRS` to the platform path-separated list of the other
+mounts (for example, `/mnt/nvme1:/mnt/nvme2` on Linux). The configured capacity,
+I/O workers, managed-memory limit, and reported disk bound remain aggregate
+totals. Path order is persistent identity, so use the same order for warm
+reopen. Failed runs preserve every data file; successful runs remove all data
+files and the primary path's sidecars.
 
 ## Long correctness and stability run
 
