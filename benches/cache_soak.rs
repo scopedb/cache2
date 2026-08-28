@@ -45,6 +45,7 @@ struct SoakConfig {
     warm_reopen: bool,
     final_warm_verify: bool,
     require_path_coverage: bool,
+    require_reinsert_coverage: bool,
     io_engine: IoEngine,
     io_mode: IoMode,
     directory: PathBuf,
@@ -107,6 +108,7 @@ impl SoakConfig {
             0
         };
         let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
+        let require_reinsert_coverage = env_bool("CACHE_SOAK_REQUIRE_REINSERT_COVERAGE", false)?;
         let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -153,6 +155,7 @@ impl SoakConfig {
             warm_reopen,
             final_warm_verify,
             require_path_coverage,
+            require_reinsert_coverage,
             io_engine,
             io_mode,
             directory,
@@ -347,7 +350,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -369,6 +372,7 @@ fn main() -> io::Result<()> {
         config.warm_reopen,
         config.final_warm_verify,
         config.require_path_coverage,
+        config.require_reinsert_coverage,
         DELETE_INTERVAL,
         config.io_engine,
         config.io_mode,
@@ -495,6 +499,9 @@ fn main() -> io::Result<()> {
     let final_counters = counters.snapshot();
     if config.require_path_coverage {
         validate_measured_path_coverage(final_counters, &sample)?;
+    }
+    if config.require_reinsert_coverage {
+        validate_reinsert_coverage(&sample)?;
     }
     if config.final_warm_verify {
         runtime.block_on(cache.close_warm())?;
@@ -890,6 +897,21 @@ fn validate_warm_path_coverage(
     if sample.detailed.summary.l2_hits == 0 {
         return Err(io::Error::other(
             "soak path coverage failed: warm verification completed no L2 hit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reinsert_coverage(sample: &ResourceSample) -> io::Result<()> {
+    let reclaim = sample.detailed.summary.reclaim;
+    if reclaim.reinsert_records == 0 {
+        return Err(io::Error::other(
+            "soak reinsert coverage failed: no hot record was reinserted",
+        ));
+    }
+    if reclaim.reinsert_skipped == 0 {
+        return Err(io::Error::other(
+            "soak reinsert coverage failed: no hot record exhausted a bounded budget",
         ));
     }
     Ok(())
