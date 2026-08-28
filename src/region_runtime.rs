@@ -7,61 +7,58 @@
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
 use std::io;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mea::semaphore::{OwnedSemaphorePermit, Semaphore};
 
+mod metrics;
+mod plan;
+
+use self::metrics::RuntimeMetrics;
+#[cfg(test)]
+use self::plan::{
+    IO_QUEUE_ENTRY_RESERVATION_BYTES, RUNTIME_CONTROL_RESERVATION_BYTES,
+    runtime_topology_memory_bytes,
+};
+
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
 use crate::io_engine::{
-    IoBuffer, IoEngine, IoOperation, MAX_IO_REQUESTS_PER_ENGINE, ReadSlot, build_file_engine,
-    submit_cache_io,
+    IoBuffer, IoEngine, IoOperation, ReadSlot, build_file_engine, submit_cache_io,
 };
-use crate::memory::{
-    MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
-};
+use crate::memory::{MemoryLookup, MemoryReadToken, MemoryStore, MemoryValue};
 use crate::record_codec::{hash_key, required_record_bytes};
-use crate::recovery::{DataGeometry, DataSuperblock};
-use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
+use crate::recovery::DataSuperblock;
+use crate::region::core::{FileRegionCore, RegionStageValue, RegionValueRead};
 use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, plan_read};
 use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
-    BufferLease, CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
-    ResourceBuildError, ResourceController, ResourceLimits,
+    BufferLease, CACHE_THREAD_STACK_BYTES, ResourceBuildError, ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{
-    IoMode, MAX_APPEND_SHARDS, MAX_READ_IO_WAIT_TIMEOUT, MAX_WRITE_FLUSH_THRESHOLD_BYTES,
-    RuntimeConfig,
-};
+use crate::runtime_config::{IoMode, RuntimeConfig};
 use crate::snapshot::{
-    CacheHealth, CacheIoDirectionSnapshot, CacheIoSnapshot, CacheReclaimSnapshot, CacheSnapshot,
-    DetailedCacheSnapshot,
+    CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
 };
+
+#[cfg(test)]
+use crate::memory::MemoryMetricsSnapshot;
+#[cfg(test)]
+use crate::recovery::DataGeometry;
+#[cfg(test)]
+use crate::resources::ManagedMemorySnapshot;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
-// Covers the bounded engine registry, command channel, and driver-side
-// bookkeeping for one admitted I/O operation. Payload buffers are charged by
-// ResourceController separately.
-const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
-// Covers worker/shard controls and handles whose size does not scale with the
-// payload or engine depth.
-const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
-// Keep the fixed L1 directory useful when the configured L2 has deliberate
-// headroom. Smaller entries may still bypass before the byte budget fills;
-// this avoids sizing metadata for the theoretical 64-byte minimum.
-const PLANNED_MIN_L1_ENTRY_BYTES: usize = 4 * 1024;
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
 const MUTATION_DRAINING: usize = 1_usize << (usize::BITS - 1);
 const MUTATION_COUNT_MASK: usize = !MUTATION_DRAINING;
 const MUTATION_ENTER_ATTEMPTS: usize = 8;
-static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 struct LifecycleDrainingGuard<'a> {
     lifecycle: &'a AtomicU8,
@@ -217,407 +214,6 @@ impl Drop for MutationDrainGuard<'_> {
             .state
             .fetch_and(MUTATION_COUNT_MASK, Ordering::Release);
         debug_assert_ne!(previous & MUTATION_DRAINING, 0);
-    }
-}
-
-struct RuntimeMetrics {
-    metrics_epoch: u64,
-    lifecycle: AtomicU8,
-    activity: Box<[ActivityMetrics]>,
-    l2_read_overloads: AtomicU64,
-    l2_read_wait_ns: AtomicU64,
-    write_rejections: AtomicU64,
-    write_buffer_rejections: AtomicU64,
-    io_failures: AtomicU64,
-    region_rotations: AtomicU64,
-    reclaimed_regions: AtomicU64,
-    reclaimed_bytes: AtomicU64,
-    reclaim_records_scanned: AtomicU64,
-    reclaim_index_entries_removed: AtomicU64,
-    reclaim_reinsert_records: AtomicU64,
-    reclaim_reinsert_bytes: AtomicU64,
-    reclaim_reinsert_skipped: AtomicU64,
-    reclaim_reinsert_budget_skipped: AtomicU64,
-}
-
-#[repr(align(64))]
-struct ActivityMetrics {
-    puts: AtomicU64,
-    deletes: AtomicU64,
-    written_bytes: AtomicU64,
-    l1_hits: AtomicU64,
-    l1_misses: AtomicU64,
-    l2_hits: AtomicU64,
-    l2_misses: AtomicU64,
-    l2_read_memory_misses: AtomicU64,
-    l2_read_busy_misses: AtomicU64,
-    served_bytes: AtomicU64,
-    l1_promotions: AtomicU64,
-}
-
-impl ActivityMetrics {
-    fn new() -> Self {
-        Self {
-            puts: AtomicU64::new(0),
-            deletes: AtomicU64::new(0),
-            written_bytes: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l1_misses: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            l2_misses: AtomicU64::new(0),
-            l2_read_memory_misses: AtomicU64::new(0),
-            l2_read_busy_misses: AtomicU64::new(0),
-            served_bytes: AtomicU64::new(0),
-            l1_promotions: AtomicU64::new(0),
-        }
-    }
-}
-
-impl RuntimeMetrics {
-    fn new(shard_count: usize) -> io::Result<Self> {
-        let mut activity = Vec::new();
-        activity.try_reserve_exact(shard_count).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate shard activity counters",
-            )
-        })?;
-        activity.resize_with(shard_count, ActivityMetrics::new);
-        Ok(Self {
-            metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
-            lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
-            activity: activity.into_boxed_slice(),
-            l2_read_overloads: AtomicU64::new(0),
-            l2_read_wait_ns: AtomicU64::new(0),
-            write_rejections: AtomicU64::new(0),
-            write_buffer_rejections: AtomicU64::new(0),
-            io_failures: AtomicU64::new(0),
-            region_rotations: AtomicU64::new(0),
-            reclaimed_regions: AtomicU64::new(0),
-            reclaimed_bytes: AtomicU64::new(0),
-            reclaim_records_scanned: AtomicU64::new(0),
-            reclaim_index_entries_removed: AtomicU64::new(0),
-            reclaim_reinsert_records: AtomicU64::new(0),
-            reclaim_reinsert_bytes: AtomicU64::new(0),
-            reclaim_reinsert_skipped: AtomicU64::new(0),
-            reclaim_reinsert_budget_skipped: AtomicU64::new(0),
-        })
-    }
-
-    fn activity(&self, shard_id: usize) -> &ActivityMetrics {
-        &self.activity[shard_id]
-    }
-
-    fn activity_for_hash(&self, hash: u64) -> &ActivityMetrics {
-        self.activity(route_hash(hash, self.activity.len()))
-    }
-
-    fn add(counter: &AtomicU64, value: usize) {
-        let value = u64::try_from(value).unwrap_or(u64::MAX);
-        counter.fetch_add(value, Ordering::Relaxed);
-    }
-
-    fn increment(counter: &AtomicU64) {
-        Self::add(counter, 1);
-    }
-
-    fn record_write_rejection(&self) {
-        Self::increment(&self.write_rejections);
-    }
-
-    fn record_read_overload(&self) {
-        Self::increment(&self.l2_read_overloads);
-    }
-
-    fn record_read_wait(&self, elapsed: Duration) {
-        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.l2_read_wait_ns.fetch_add(nanos, Ordering::Relaxed);
-    }
-
-    fn record_reclaim(&self, stats: crate::region::RegionReclaimStats) {
-        Self::increment(&self.reclaimed_regions);
-        self.reclaimed_bytes
-            .fetch_add(stats.bytes_read, Ordering::Relaxed);
-        self.reclaim_records_scanned
-            .fetch_add(stats.records_scanned, Ordering::Relaxed);
-        self.reclaim_index_entries_removed
-            .fetch_add(stats.records_removed, Ordering::Relaxed);
-        self.reclaim_reinsert_records
-            .fetch_add(stats.reinsert_records, Ordering::Relaxed);
-        self.reclaim_reinsert_bytes
-            .fetch_add(stats.reinsert_bytes, Ordering::Relaxed);
-        self.reclaim_reinsert_skipped
-            .fetch_add(stats.reinsert_skipped, Ordering::Relaxed);
-        self.reclaim_reinsert_budget_skipped
-            .fetch_add(stats.reinsert_budget_skipped, Ordering::Relaxed);
-    }
-
-    fn snapshot(
-        &self,
-        core_healthy: bool,
-        statistics_enabled: bool,
-        memory: ManagedMemorySnapshot,
-        memory_metrics: MemoryMetricsSnapshot,
-    ) -> CacheSnapshot {
-        let lifecycle = self.lifecycle.load(Ordering::Acquire);
-        let health = if lifecycle == LIFECYCLE_FAILED {
-            CacheHealth::Failed
-        } else if !core_healthy {
-            CacheHealth::MissOnly
-        } else if lifecycle == LIFECYCLE_DRAINING {
-            CacheHealth::Draining
-        } else {
-            CacheHealth::Running
-        };
-        let mut puts = 0_u64;
-        let mut deletes = 0_u64;
-        let mut written_bytes = 0_u64;
-        let mut l1_hits = 0_u64;
-        let mut l1_misses = 0_u64;
-        let mut l2_hits = 0_u64;
-        let mut l2_misses = 0_u64;
-        let mut l2_read_memory_misses = 0_u64;
-        let mut l2_read_busy_misses = 0_u64;
-        let mut served_bytes = 0_u64;
-        let mut l1_promotions = 0_u64;
-        for activity in &self.activity {
-            puts = puts.saturating_add(activity.puts.load(Ordering::Relaxed));
-            deletes = deletes.saturating_add(activity.deletes.load(Ordering::Relaxed));
-            written_bytes =
-                written_bytes.saturating_add(activity.written_bytes.load(Ordering::Relaxed));
-            l1_hits = l1_hits.saturating_add(activity.l1_hits.load(Ordering::Relaxed));
-            l1_misses = l1_misses.saturating_add(activity.l1_misses.load(Ordering::Relaxed));
-            l2_hits = l2_hits.saturating_add(activity.l2_hits.load(Ordering::Relaxed));
-            l2_misses = l2_misses.saturating_add(activity.l2_misses.load(Ordering::Relaxed));
-            l2_read_memory_misses = l2_read_memory_misses
-                .saturating_add(activity.l2_read_memory_misses.load(Ordering::Relaxed));
-            l2_read_busy_misses = l2_read_busy_misses
-                .saturating_add(activity.l2_read_busy_misses.load(Ordering::Relaxed));
-            served_bytes =
-                served_bytes.saturating_add(activity.served_bytes.load(Ordering::Relaxed));
-            l1_promotions =
-                l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
-        }
-        CacheSnapshot {
-            metrics_epoch: self.metrics_epoch,
-            health,
-            statistics_enabled,
-            puts,
-            deletes,
-            written_bytes,
-            l1_hits,
-            l1_misses,
-            l2_hits,
-            l2_misses,
-            l2_read_memory_misses,
-            l2_read_busy_misses,
-            l2_read_overloads: self.l2_read_overloads.load(Ordering::Relaxed),
-            l2_read_wait_ns: self.l2_read_wait_ns.load(Ordering::Relaxed),
-            served_bytes,
-            l1_promotions,
-            l1_evictions: memory_metrics.evictions,
-            l1_bypasses: memory_metrics.bypasses,
-            write_rejections: self.write_rejections.load(Ordering::Relaxed),
-            io_failures: self.io_failures.load(Ordering::Relaxed),
-            region_rotations: self.region_rotations.load(Ordering::Relaxed),
-            reclaim: CacheReclaimSnapshot {
-                regions: self.reclaimed_regions.load(Ordering::Relaxed),
-                bytes_read: self.reclaimed_bytes.load(Ordering::Relaxed),
-                records_scanned: self.reclaim_records_scanned.load(Ordering::Relaxed),
-                index_entries_removed: self.reclaim_index_entries_removed.load(Ordering::Relaxed),
-                reinsert_records: self.reclaim_reinsert_records.load(Ordering::Relaxed),
-                reinsert_bytes: self.reclaim_reinsert_bytes.load(Ordering::Relaxed),
-                reinsert_skipped: self.reclaim_reinsert_skipped.load(Ordering::Relaxed),
-                reinsert_budget_skipped: self
-                    .reclaim_reinsert_budget_skipped
-                    .load(Ordering::Relaxed),
-            },
-            managed_memory_bytes: memory.current_bytes,
-            managed_memory_peak_bytes: memory.peak_bytes,
-            managed_memory_limit_bytes: memory.limit_bytes,
-            logical_disk_peak_bytes: 0,
-            io: CacheIoSnapshot::default(),
-        }
-    }
-}
-
-impl RuntimeConfig {
-    pub(crate) fn validate(&self) -> io::Result<()> {
-        if !self.io_engine.is_available() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "io_uring is unavailable on this build or platform",
-            ));
-        }
-        if !self.io_mode.is_available() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "direct I/O is unavailable on this platform",
-            ));
-        }
-        if self.append_shards == 0 || self.append_shards > MAX_APPEND_SHARDS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "append shards must be in 1..=256",
-            ));
-        }
-        if self.reclaim_workers == 0 || self.reclaim_workers > self.append_shards as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "reclaim workers must be non-zero and no greater than append shards",
-            ));
-        }
-        if self.read_io_workers == 0 || self.write_io_workers == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read and write I/O worker counts must be non-zero",
-            ));
-        }
-        if self.read_io_wait_timeout > MAX_READ_IO_WAIT_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read I/O wait timeout must not exceed five seconds",
-            ));
-        }
-        if self.io_engine == crate::runtime_config::IoEngine::Posix
-            && (self.read_io_workers > MAX_IO_REQUESTS_PER_ENGINE
-                || self.write_io_workers > MAX_IO_REQUESTS_PER_ENGINE)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "POSIX read and write I/O workers must each be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"
-                ),
-            ));
-        }
-        if self.managed_memory_limit_bytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed memory limit must be non-zero",
-            ));
-        }
-        if self.l1_capacity_bytes > self.managed_memory_limit_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "L1 capacity must not exceed the managed memory limit",
-            ));
-        }
-        if self.l1_shards == 0 || self.l1_shards > MAX_CONFIG_COUNT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "L1 shards must be in 1..=65536",
-            ));
-        }
-        if self.write_flush_threshold_bytes == 0
-            || self.write_flush_threshold_bytes > MAX_WRITE_FLUSH_THRESHOLD_BYTES
-            || !self
-                .write_flush_threshold_bytes
-                .is_multiple_of(crate::resources::BUFFER_ALIGNMENT)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "write flush threshold must be 4 KiB aligned and within 4 KiB..=4 MiB",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_memory_plan(
-        &self,
-        geometry: DataGeometry,
-        index_slots: usize,
-        shard_count: usize,
-    ) -> io::Result<()> {
-        let l1_entry_capacity = self.l1_entry_capacity(geometry, index_slots)?;
-        let l1_metadata_bytes = MemoryStore::allocation_bytes(
-            self.l1_capacity_bytes,
-            l1_entry_capacity,
-            self.l1_shards,
-            self.l1_eviction_policy,
-        )?;
-        let fixed_bytes =
-            crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
-                .checked_add(l1_metadata_bytes)
-                .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
-        self.validated_reserved_memory_bytes(geometry, shard_count, fixed_bytes)?;
-        Ok(())
-    }
-
-    fn l1_entry_capacity(&self, geometry: DataGeometry, index_slots: usize) -> io::Result<usize> {
-        if self.l1_capacity_bytes == 0 {
-            return Ok(0);
-        }
-        let l2_capacity = u128::from(geometry.region_size)
-            .checked_mul(u128::from(geometry.region_count))
-            .filter(|capacity| *capacity != 0)
-            .ok_or_else(|| invalid_runtime_config("L2 capacity does not fit the L1 plan"))?;
-        let expected_entries = index_slots.div_ceil(2).max(1);
-        let proportional = (expected_entries as u128)
-            .checked_mul(self.l1_capacity_bytes as u128)
-            .and_then(|entries| entries.checked_add(l2_capacity - 1))
-            .map(|entries| entries / l2_capacity)
-            .and_then(|entries| usize::try_from(entries).ok())
-            .ok_or_else(|| invalid_runtime_config("L1 entry capacity does not fit usize"))?;
-        let four_kib_density = self.l1_capacity_bytes.div_ceil(PLANNED_MIN_L1_ENTRY_BYTES);
-        let maximum = MemoryStore::maximum_entry_capacity(self.l1_capacity_bytes, self.l1_shards);
-        let minimum = self.l1_shards.min(maximum);
-        Ok(proportional
-            .max(four_kib_density)
-            .min(expected_entries)
-            .max(minimum)
-            .min(maximum))
-    }
-
-    fn validated_reserved_memory_bytes(
-        &self,
-        geometry: DataGeometry,
-        shard_count: usize,
-        fixed_bytes: usize,
-    ) -> io::Result<usize> {
-        let (reserved_memory, minimum) =
-            self.memory_plan_bytes(geometry, shard_count, fixed_bytes)?;
-        if minimum > self.managed_memory_limit_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "managed memory limit cannot hold the fixed cache memory plan: requires {minimum} bytes, configured {} bytes",
-                    self.managed_memory_limit_bytes
-                ),
-            ));
-        }
-        Ok(reserved_memory)
-    }
-
-    fn memory_plan_bytes(
-        &self,
-        geometry: DataGeometry,
-        shard_count: usize,
-        fixed_bytes: usize,
-    ) -> io::Result<(usize, usize)> {
-        self.validate()?;
-        let topology_bytes = runtime_topology_memory_bytes(shard_count, self)
-            .ok_or_else(|| invalid_runtime_config("runtime topology memory plan overflow"))?;
-        let usable_region = usize::try_from(geometry.region_size)
-            .map_err(|_| invalid_runtime_config("Region size does not fit the memory plan"))?;
-        let chunk_bytes = usable_region;
-        let write_buffer_reservation =
-            RegionStaging::reservation_bytes(shard_count, chunk_bytes)
-                .ok_or_else(|| invalid_runtime_config("write buffer memory plan overflow"))?;
-        let reserved_memory = fixed_bytes
-            .checked_add(self.l1_capacity_bytes)
-            .and_then(|bytes| bytes.checked_add(topology_bytes))
-            .ok_or_else(|| invalid_runtime_config("reserved memory plan overflow"))?;
-        let reclaim_buffers = usable_region
-            .checked_mul(self.reclaim_workers)
-            .ok_or_else(|| invalid_runtime_config("reclaim buffer memory plan overflow"))?;
-        let minimum = reserved_memory
-            .checked_add(write_buffer_reservation)
-            // Every reclaimer permanently owns one Region-sized buffer. Keep
-            // one additional maximum-size bounded read for the foreground.
-            .and_then(|bytes| bytes.checked_add(reclaim_buffers))
-            .and_then(|bytes| bytes.checked_add(usable_region))
-            .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
-        Ok((reserved_memory, minimum))
     }
 }
 
@@ -1857,50 +1453,6 @@ fn start_running(
     })
 }
 
-fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> Option<usize> {
-    // Reserve one stack per configured I/O worker, one possible shutdown
-    // reaper per engine, and every append/reclaim worker.
-    let read_engine_count = config.io_engine_count(config.read_io_workers);
-    let write_engine_count = config.io_engine_count(config.write_io_workers);
-    let reclaim_engine_count = config.io_engine_count(config.reclaim_workers);
-    let engine_count = read_engine_count
-        .checked_add(write_engine_count)?
-        .checked_add(reclaim_engine_count)?;
-    let stack_count = config
-        .read_io_workers
-        .checked_add(config.write_io_workers)?
-        .checked_add(config.reclaim_workers)?
-        .checked_add(engine_count)?
-        .checked_add(shard_count)?
-        .checked_add(config.reclaim_workers)?;
-    let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let read_queue =
-        read_engine_count.checked_mul(config.io_depth_per_engine(config.read_io_workers))?;
-    let read_wait_queue = if config.read_io_wait_timeout.is_zero() {
-        0
-    } else {
-        config.read_io_workers
-    };
-    let reclaim_queue =
-        reclaim_engine_count.checked_mul(config.io_depth_per_engine(config.reclaim_workers))?;
-    let queue = write_engine_count
-        .checked_mul(config.io_depth_per_engine(config.write_io_workers))?
-        .checked_add(read_queue)?
-        .checked_add(read_wait_queue)?
-        .checked_add(reclaim_queue)?
-        .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
-    let controls = engine_count
-        .checked_add(shard_count)?
-        .checked_add(config.l1_shards)?
-        .checked_add(config.reclaim_workers)?
-        .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
-    let metrics = shard_count.checked_mul(std::mem::size_of::<ActivityMetrics>())?;
-    stacks
-        .checked_add(queue)?
-        .checked_add(controls)?
-        .checked_add(metrics)
-}
-
 fn build_engine_pool(
     files: RuntimeFileSet,
     config: &RuntimeConfig,
@@ -2099,12 +1651,11 @@ fn reclaim_worker_result(
                     .core
                     .try_stage_reinsert(&shared.staging, reinsert_shard, record)?
                 {
-                    crate::region::RegionStageValue::Staged(_) => {
+                    RegionStageValue::Staged(_) => {
                         staged_reinsert = true;
                         Ok(true)
                     }
-                    crate::region::RegionStageValue::NeedsProgress
-                    | crate::region::RegionStageValue::NeedsRotation => {
+                    RegionStageValue::NeedsProgress | RegionStageValue::NeedsRotation => {
                         accepting_reinserts = false;
                         Ok(false)
                     }
@@ -2477,6 +2028,7 @@ mod tests {
     use crate::io_backend::{FileBackend, IoBackend};
     use crate::io_engine::BackendIoEngine;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicU64;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
