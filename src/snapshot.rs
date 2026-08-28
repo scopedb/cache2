@@ -70,6 +70,9 @@ pub struct CacheIoDirectionSnapshot {
     pub requests_cancelled: u64,
     pub requests_failed: u64,
     pub requests_in_flight: u64,
+    /// Sum of the participating engines' high-water marks. This is a
+    /// conservative bound when a direction spans multiple engines, not a
+    /// synchronized process-wide peak.
     pub requests_in_flight_peak: u64,
     /// Nanoseconds spent acquiring an engine slot. Pre-reserved nonwaiting
     /// reads do not contribute to this counter.

@@ -56,7 +56,9 @@ cache.close_warm().await?;
 
 `open()` captures the current Tokio runtime. Use
 `CacheBuilder::with_tokio_handle` to bind the cache to another runtime; that
-runtime must have time enabled and outlive the cache.
+runtime must have time enabled and outlive the cache. Close explicitly from
+async code: dropping an open cache performs a synchronous fast close while it
+fences accepted work.
 
 ## Configuration
 

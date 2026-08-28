@@ -392,6 +392,11 @@ impl Value {
     }
 }
 
+/// An open cache bound to one Tokio runtime.
+///
+/// Prefer [`Self::close_fast`] or [`Self::close_warm`] for async shutdown.
+/// Dropping an open cache is a synchronous fast close and may block the thread
+/// performing the drop while accepted work is fenced.
 pub struct Cache {
     store: RegionStore<FileRegionBackend<SystemRegionFileSystem>>,
     path: PathBuf,
