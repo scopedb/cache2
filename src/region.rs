@@ -282,7 +282,11 @@ struct RegionShard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionStageValue {
     Staged(u64),
-    NeedsProgress,
+    /// A short foreground conflict rejected this attempt; shard-worker progress
+    /// is neither required nor requested.
+    Busy,
+    /// The bounded fill span must be published before admission can continue.
+    NeedsFlush,
     NeedsRotation,
 }
 
@@ -1002,9 +1006,9 @@ impl FileRegionCore {
         let _shard_mutation = self.lock_shard_mutation(shard_id)?;
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended) => {}
-            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),
+            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsFlush),
             Err(StagingError::WouldBlock) => {
-                return Ok(RegionStageValue::NeedsProgress);
+                return Ok(RegionStageValue::Busy);
             }
             Err(error) => {
                 self.health.enter_miss_only();
@@ -1014,15 +1018,15 @@ impl FileRegionCore {
         }
         let receipt = {
             let Some(mut manager) = self.manager.try_lock()? else {
-                return Ok(RegionStageValue::NeedsProgress);
+                return Ok(RegionStageValue::Busy);
             };
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
                 Err(RegionMutationError::WouldBlock) => {
-                    return Ok(RegionStageValue::NeedsProgress);
+                    return Ok(RegionStageValue::Busy);
                 }
                 Err(RegionMutationError::FlushBeforeRotation) => {
-                    return Ok(RegionStageValue::NeedsProgress);
+                    return Ok(RegionStageValue::NeedsFlush);
                 }
                 Err(RegionMutationError::RegionFull) => {
                     return Ok(RegionStageValue::NeedsRotation);
@@ -3232,7 +3236,7 @@ mod tests {
             runtime
                 .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
                 .unwrap(),
-            RegionStageValue::NeedsProgress
+            RegionStageValue::Busy
         );
         assert_eq!(manager.next_seqno(), next_seqno);
     }
@@ -3309,7 +3313,7 @@ mod tests {
                     last = Some((key, hash, seqno));
                     staged_records += 1;
                 }
-                RegionStageValue::NeedsProgress => break,
+                RegionStageValue::NeedsFlush => break,
                 outcome => panic!("unexpected staging outcome: {outcome:?}"),
             }
         }

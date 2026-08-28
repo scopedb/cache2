@@ -39,7 +39,9 @@ use crate::snapshot::{
     DetailedCacheSnapshot,
 };
 
-const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
+// Give partial shard spans a short NVMe-friendly coalescing window. Full spans,
+// staging pressure, drain, and rotation still request immediate progress.
+const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(4);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
 // Covers the bounded engine registry, command channel, and driver-side
 // bookkeeping for one admitted I/O operation. Payload buffers are charged by
@@ -1029,7 +1031,8 @@ impl RegionDataPlane {
                 }
                 Ok(seqno)
             }
-            RegionStageValue::NeedsProgress => {
+            RegionStageValue::Busy => reject_staged_write(running, control, 0, operation),
+            RegionStageValue::NeedsFlush => {
                 reject_staged_write(running, control, WAKE_URGENT, operation)
             }
             RegionStageValue::NeedsRotation => {
@@ -1834,7 +1837,8 @@ fn reclaim_worker_result(
                         staged_reinsert = true;
                         Ok(true)
                     }
-                    crate::region::RegionStageValue::NeedsProgress
+                    crate::region::RegionStageValue::Busy
+                    | crate::region::RegionStageValue::NeedsFlush
                     | crate::region::RegionStageValue::NeedsRotation => {
                         accepting_reinserts = false;
                         Ok(false)
@@ -1993,7 +1997,9 @@ fn reject_staged_write<Operation>(
     flags: u8,
     operation: Operation,
 ) -> io::Result<u64> {
-    control.notify(flags)?;
+    if flags != 0 {
+        control.notify(flags)?;
+    }
     drop(operation);
     if running.statistics {
         RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
