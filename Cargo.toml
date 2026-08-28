@@ -36,7 +36,7 @@ required-features = ["benchmarking"]
 [dependencies]
 crc32c = "0.6.8"
 log = { version = "0.4.31", features = ["kv"] }
-mea = "0.6.7"
+mea = "0.6.5"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 xxhash-rust = { version = "0.8.18", default-features = false, features = ["xxh3"] }
 
