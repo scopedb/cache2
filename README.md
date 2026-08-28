@@ -4,14 +4,12 @@
 
 **A bounded RAM + SSD cache for Tokio applications.**
 
-C² (`cache2`) is disposable acceleration for large file chunks. It keeps the
-request path short, bounds every cache-owned resource, and treats cache loss as
-an availability event rather than a data-loss event.
+C² (`cache2`) provides bounded, disposable acceleration for large file chunks.
+It keeps request paths short and cache-owned resources fixed.
 
 - Sharded CLOCK or S3-FIFO L1 with a compact, fixed-size L2 index.
 - Batched Region writes and independent read, write, and reclaim I/O capacity.
-- Best-effort consistency: stale hits are allowed; corrupt or wrong-key values
-  are never returned.
+- Best-effort consistency with stale, fully validated hits.
 
 ## Quick start
 
@@ -44,74 +42,70 @@ async fn run() -> io::Result<()> {
 `CacheBuilder::with_tokio_handle` to bind C² to another runtime; it must have
 time enabled and outlive the cache.
 
-## Contract
+## Semantics
 
-C² is a cache, not a source of truth:
+C² returns fully validated, potentially stale values. Misses, eviction, L1
+bypass, and bounded overload are normal cache outcomes.
 
-- Hits may be stale. Misses, eviction, L1 bypass, and bounded overload are
-  normal outcomes.
-- Keys are raw bytes in one key space. There are no namespaces or TTLs.
-- Keys may be at most 4 KiB. A complete encoded record must fit in one Region.
-- Sequence numbers order cheap internal updates; they are not freshness tokens.
+- Keys are raw bytes in one key space, up to 4 KiB. Each encoded record fits in
+  one Region.
+- Resource pressure returns a miss, bypass, `WouldBlock`, or explicit read
+  overload according to the operation.
+- Sequence numbers provide advisory ordering for internal updates.
 
-The public operations have deliberately different completion points:
+### Operations
 
-- **`put`** attempts immediate L1 admission and stages the same value for L2.
-- **`put_l2`** stages a prefetch without admitting its payload to L1. It becomes
-  visible after the completed Region write publishes to the index.
-- **`delete`** removes the current L2 mapping and cleans L1 best effort. It
-  appends no record.
-- **`get`** checks L1 and then L2. A true index miss returns immediately; an
-  admitted L2 candidate performs one bounded record read and local validation.
+| Operation | Behavior |
+| --- | --- |
+| `put` | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission. |
+| `put_l2` | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes. |
+| `get` | Checks L1, then performs at most one bounded, locally validated L2 record read. |
+| `delete` | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work. |
+| `drain` | Waits for accepted Region writes and L2 index publication. |
 
-`put`, `put_l2`, and `delete` may return `WouldBlock`, but they never wait for
-device I/O. `drain` waits for accepted mutations to complete; it is not a
-durability sync.
+### Lifecycle
 
-A crash, drop, or `close_fast` reopens empty. `close_warm` is the only shutdown
-that publishes a recoverable clean image. Prefer explicit async close because
-dropping an open cache performs a synchronous fast close.
+`close_fast`, drop, and an unclean exit make the next open a cold start.
+`close_warm` publishes a clean recovery image for a warm start. Prefer explicit
+async close because drop closes the cache synchronously.
 
 ## Configuration
 
-`StaticConfig` defines the persistent L2 layout. `RuntimeConfig` controls the
-process-local topology and may normally change between opens.
+`StaticConfig` defines the persistent L2 layout. `RuntimeConfig` selects the
+process-local topology for each open.
 
-### Static layout
+### Persistent layout
 
 - `StaticConfig::new(capacity_bytes)` uses 32 MiB Regions and assumes 16 KiB
   average live entries when sizing the fixed index.
 - `with_region_size_bytes` changes Region geometry.
 - `with_expected_entries` sizes the index for the expected simultaneously live
-  key count, not lifetime writes.
+  key count.
 - `peak_disk_bytes` reports the maximum cache-owned logical disk space.
 
-Changing static layout safely cold-starts the cache. The complete geometry and
-memory plan are validated before cache files are created.
+Changing the persistent layout starts with an empty cache. Open validates the
+complete geometry and memory plan before creating cache files.
 
 ### Runtime tuning
 
-- **L1:** `with_l1_capacity_bytes`, `with_l1_shards`, and
-  `with_l1_eviction_policy`. Zero capacity disables L1. Entries charged above
-  256 KiB bypass L1 but remain valid in L2.
-- **Reads:** `with_read_io_workers` and `with_read_io_wait_timeout`.
-- **Writes:** `with_write_io_workers`, `with_append_shards`, and
-  `with_write_flush_threshold_bytes`.
-- **Reclaim:** `with_reclaim_workers`.
-- **Memory:** `with_managed_memory_limit_bytes`.
-- **I/O:** `with_io_engine` and `with_io_mode`.
-- **Metrics:** `with_statistics`.
+| Area | Controls | Default and behavior |
+| --- | --- | --- |
+| L1 | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy` | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
+| Reads | `with_read_io_workers`, `with_read_io_wait_timeout` | Four workers and immediate admission. |
+| Writes | `with_write_io_workers`, `with_append_shards`, `with_write_flush_threshold_bytes` | Four workers, four append shards, 4 MiB flush threshold. |
+| Reclaim | `with_reclaim_workers` | One worker with its own Region-sized scan buffer and read lane. |
+| Memory | `with_managed_memory_limit_bytes` | 1 GiB across cache-managed allocations. |
+| I/O | `with_io_engine`, `with_io_mode` | Buffered POSIX I/O. |
+| Metrics | `with_statistics` | Health and resource gauges enabled; cumulative activity counters opt in. |
 
-The defaults use buffered POSIX I/O, CLOCK, four read workers, four write
-workers, four append shards, one reclaim worker, a 256 MiB L1, and a 1 GiB
-managed-memory limit. Changing the append-shard count makes an existing clean
-image ineligible and safely cold-starts the cache.
+Changing the append-shard count starts with an empty cache because shard
+topology participates in recovery eligibility.
 
-Read waiting is disabled by default, so read-engine or buffer pressure fails
-open as a miss. A non-zero `with_read_io_wait_timeout` lets an L2 candidate wait
-briefly for execution capacity. The queue allows at most one waiter per read
-worker and holds no record buffer while waiting. Queue saturation, memory
-pressure, or timeout is returned as explicit overload.
+The default read-wait timeout is zero, so read-engine or buffer pressure returns
+a miss. A positive timeout enables a short queue with at most one waiter per
+read worker. Queued requests retain their read plan and allocate a buffer after
+admission. Queue saturation, memory pressure, and timeout return explicit
+overload.
 
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
 mode. io_uring requires the `io-uring` feature and is experimental in 0.1.
@@ -120,27 +114,27 @@ mode. io_uring requires the `io-uring` feature and is experimental in 0.1.
 
 C² accepts one data-file path. For multiple homogeneous SSDs, expose RAID0 or
 an equivalent striped block device below the filesystem. Losing any member
-discards the complete cache, which matches C²'s failure contract.
+discards the complete cache.
 
 The managed-memory limit covers the index, L1, append and reclaim buffers,
-metadata, cache-owned threads, recovery scratch, and transient reads. It does
-not bound allocator metadata, Tokio, process overhead, or the kernel page cache.
+metadata, cache-owned threads, recovery scratch, and transient reads. Total
+deployment memory additionally includes allocator metadata, Tokio, process
+overhead, and the kernel page cache.
 
-The on-disk format is versioned, but 0.x releases do not promise cache-data
-compatibility. Deployments must tolerate a cold start and should monitor
-`Cache::startup_mode()`.
+The on-disk format is versioned. During 0.x, deployments should expect cold
+starts across releases and monitor `Cache::startup_mode()`.
 
 ## Observability
 
 ### Metrics
 
-`Cache::snapshot()` is lock-free. It always reports health and resource gauges;
-`RuntimeConfig::with_statistics(true)` also enables cumulative cache and I/O
-counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure,
-and Region metadata, so call it slowly or on demand.
+`Cache::snapshot()` provides lock-free health and resource gauges.
+`RuntimeConfig::with_statistics(true)` adds cumulative cache and I/O counters.
+`Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and
+Region metadata for periodic diagnostics.
 
-C² has no metrics SDK dependency. An OpenTelemetry or Prometheus adapter should
-export cumulative values and derive rates in the backend:
+C² exposes snapshots for integration with the application's metrics SDK. An
+OpenTelemetry or Prometheus adapter can export:
 
 - get outcomes from `l1_hits`, `l2_hits`, `l2_misses`, and
   `l2_read_overloads`;
@@ -148,13 +142,13 @@ export cumulative values and derive rates in the backend:
 - I/O requests, operations, bytes, request time, and slot-wait time;
 - reclaim progress, managed memory, and cache health.
 
-Use only fixed labels such as direction, path, and outcome. Never label by key,
-file, Region, shard, or worker. Treat `metrics_epoch` as a reset marker, not a
-label. `l1_misses` overlaps the L2 outcomes and must not be added to them.
+Export counters cumulatively and derive rates in the backend. Use fixed labels
+such as direction, path, and outcome. Treat `metrics_epoch` as a reset marker.
+Report `l1_misses` separately because it overlaps L2 outcomes.
 
-Runtime file-operation counters describe application-level operations, not
-physical device IOPS. Convert nanoseconds to seconds before export, and omit
-activity series when statistics are disabled.
+Runtime file-operation counters describe application-level operations; system
+telemetry supplies physical device IOPS. Convert nanoseconds to seconds before
+export. Activity series correspond to statistics-enabled opens.
 
 ### Logs
 

@@ -1,10 +1,7 @@
-//! Public performance-first RAM + Region SSD hybrid cache.
+//! Public cache API and configuration.
 //!
-//! Static configuration defines the on-disk identity and clean recovery image.
-//! Runtime configuration is selected on every open; changing the append-shard
-//! topology discards an incompatible clean image. Ordinary mutations are never
-//! made durable; only `close_warm` publishes state that a later process may
-//! recover.
+//! Static configuration defines disk identity; runtime configuration is chosen
+//! per open. `close_warm` publishes recoverable state.
 
 use std::fmt;
 use std::future::Future;
@@ -77,10 +74,10 @@ impl StaticConfig {
 
     /// Sets the Region size in bytes.
     ///
-    /// It must be a 4 KiB multiple no larger than 32 MiB, and the L2 capacity
-    /// must be an exact multiple containing at least two Regions. A complete
-    /// encoded record must fit in one Region. Every append shard eagerly owns
-    /// two Region-sized staging buffers.
+    /// Valid sizes are 4 KiB multiples through 32 MiB. L2 capacity is an exact
+    /// multiple containing at least two Regions. A complete encoded record fits
+    /// in one Region. Every append shard eagerly owns two Region-sized staging
+    /// buffers.
     pub fn with_region_size_bytes(mut self, bytes: u64) -> Self {
         self.region_size_bytes = bytes;
         self
@@ -89,7 +86,7 @@ impl StaticConfig {
     /// Sizes the fixed L2 index for the expected number of simultaneously live
     /// keys.
     ///
-    /// This is not a lifetime-write count. The resulting index uses roughly
+    /// This counts simultaneously live keys. The resulting index uses roughly
     /// two physical buckets per expected live key and is part of the static disk
     /// identity.
     pub fn with_expected_entries(mut self, entries: usize) -> Self {
@@ -112,7 +109,7 @@ impl StaticConfig {
         self.index_slots
     }
 
-    /// Validates the static physical geometry without opening cache files.
+    /// Validates the static physical geometry before opening cache files.
     pub fn validate(&self) -> Result<()> {
         self.geometry().map(|_| ())
     }
@@ -258,8 +255,8 @@ impl CacheBuilder {
     }
 
     /// Opens the cache on Tokio's blocking pool because recovery and file setup
-    /// use blocking filesystem operations. Without an explicit handle, this
-    /// captures the current Tokio runtime when the future is first polled.
+    /// use blocking filesystem operations. The default captures the current
+    /// Tokio runtime when the future is first polled.
     pub async fn open(self) -> Result<Cache> {
         let tokio_handle = match self.tokio_handle.clone() {
             Some(handle) => handle,
@@ -424,42 +421,35 @@ impl Cache {
     /// Stores a value and returns its monotonic mutation sequence.
     ///
     /// Keys are limited to 4 KiB. The complete encoded record must fit in one
-    /// Region; values have no smaller independent limit.
+    /// Region; the Region fit determines the value limit.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.store.put_value(key.as_ref(), value.as_ref())
     }
 
-    /// Stores a value in L2 without admitting it to L1 and returns its
-    /// monotonic mutation sequence.
+    /// Stages a value directly for L2 and returns its monotonic mutation
+    /// sequence.
     ///
-    /// An older exact-key L1 value is removed best effort. A later demand read
-    /// may promote the completed L2 record into L1. Like [`Self::put`], success
-    /// means the mutation entered bounded staging; use [`Self::drain`] before
-    /// requiring the L2 index publication to be complete.
-    /// Keys are limited to 4 KiB, and the encoded record must fit one Region.
+    /// An older L1 value is removed best effort. Success means the value entered
+    /// bounded staging; use [`Self::drain`] to wait for L2 publication. Keys are
+    /// limited to 4 KiB, and the encoded record must fit one Region.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.store.put_value_l2(key.as_ref(), value.as_ref())
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
     ///
-    /// Delete performs a bounded in-memory index removal and best-effort L1
-    /// cleanup. It does not append a physical Region record.
-    /// Keys are limited to 4 KiB.
+    /// This removes the L2 mapping and cleans L1 best effort using bounded
+    /// in-memory work. Keys are limited to 4 KiB.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
         self.store.delete_value(key.as_ref())
     }
 
     /// Looks up a value in L1 and then L2.
     ///
-    /// An L2 index miss returns directly. An L2 candidate reserves one engine
-    /// slot, allocates one alignment-rounded buffer, performs one
-    /// size-class-bounded record read, and validates the exact envelope locally.
-    /// By default, internal allocation or I/O pressure fails open as a cache
-    /// miss. When bounded read waiting is configured, slot pressure waits up to
-    /// that deadline; queue, allocation, and timeout overloads are returned as
-    /// errors rather than false misses.
-    /// A key longer than 4 KiB is also a miss.
+    /// An L2 candidate performs at most one bounded, locally validated record
+    /// read. By default, memory or I/O pressure is a miss. With read waiting
+    /// enabled, queue, memory, or timeout pressure is an overload error. A key
+    /// longer than 4 KiB is also a miss.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
         self.store
             .get_value_async(key.as_ref(), &self.tokio_handle)
@@ -468,8 +458,8 @@ impl Cache {
     }
 
     /// Waits until all accepted mutations have completed their Region writes
-    /// and index publication. This is a completion barrier, not a durability
-    /// sync; use [`Self::close_warm`] to publish a recoverable image.
+    /// and index publication. Use [`Self::close_warm`] to publish a recoverable
+    /// image.
     pub async fn drain(&self) -> Result<()> {
         self.store.drain_async().await
     }
@@ -484,18 +474,17 @@ impl Cache {
     }
 
     /// Samples L1, index, write-buffer rejection, I/O, and Region state in
-    /// addition to the regular cache summary. This is intended for periodic
-    /// diagnostics rather than a request hot path because it briefly reads
-    /// every configured L1 shard and index partition and scans Region metadata.
-    /// It never scans index slots or Region data.
+    /// addition to the regular cache summary. This periodic diagnostic briefly
+    /// reads every configured L1 shard and index partition and scans Region
+    /// metadata. Sampling is limited to metadata.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
         let mut snapshot = self.store.detailed_snapshot()?;
         snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
     }
 
-    /// Stops without publishing a recovery image on Tokio's blocking pool.
-    /// Once called, the close continues even if the returned future is dropped.
+    /// Stops on Tokio's blocking pool and makes the next open a cold start. Once
+    /// called, the close continues even if the returned future is dropped.
     pub fn close_fast(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
         let tokio_handle = self.tokio_handle.clone();
         let started = Instant::now();

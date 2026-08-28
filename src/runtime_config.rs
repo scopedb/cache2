@@ -78,9 +78,8 @@ pub enum L1EvictionPolicy {
 
 /// Process-local cache topology and resource tuning validated during open.
 ///
-/// These values do not form the static disk identity. They may change across
-/// opens, although changing the append-shard count makes an existing clean
-/// recovery image ineligible and therefore starts with an empty cache.
+/// These values may change across opens. The append-shard count participates in
+/// recovery eligibility, so changing it starts with an empty cache.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
@@ -131,7 +130,7 @@ impl RuntimeConfig {
     /// Selects the buffered/direct policy for runtime record I/O.
     ///
     /// Buffered I/O is the default. `Direct` requires Linux `O_DIRECT` support
-    /// and returns direct-I/O errors without retrying through buffered I/O.
+    /// and returns direct-I/O errors directly.
     pub fn with_io_mode(mut self, mode: IoMode) -> Self {
         self.io_mode = mode;
         self
@@ -149,12 +148,10 @@ impl RuntimeConfig {
 
     /// Sets how long an L2 candidate may wait for read execution capacity.
     ///
-    /// Zero, the default, preserves immediate fail-open misses under read-pool
-    /// pressure. A non-zero timeout enables a bounded wait queue with at most
-    /// one waiter per configured read worker. Queue saturation, allocation
-    /// pressure, and timeout are returned as overload errors rather than cache
-    /// misses, allowing the caller to prefer local backpressure over origin I/O.
-    /// The timeout must not exceed five seconds.
+    /// Zero, the default, makes read-pool pressure a miss. A non-zero timeout
+    /// allows at most one waiter per read worker. A full queue, memory pressure,
+    /// or timeout is an overload error. Valid timeouts range from zero through
+    /// five seconds.
     pub fn with_read_io_wait_timeout(mut self, timeout: Duration) -> Self {
         self.read_io_wait_timeout = timeout;
         self
@@ -173,8 +170,8 @@ impl RuntimeConfig {
     /// Sets the number of concurrent Region reclaim workers.
     ///
     /// Each worker owns one Region-sized scan buffer and one reclaim I/O lane.
-    /// The count must be non-zero and no greater than the append-shard count;
-    /// additional workers cannot increase the per-shard clean reserve.
+    /// Valid counts range from one through the append-shard count; that range
+    /// matches the available per-shard clean reserve.
     pub fn with_reclaim_workers(mut self, workers: usize) -> Self {
         self.reclaim_workers = workers;
         self
@@ -187,9 +184,8 @@ impl RuntimeConfig {
     /// per append shard plus at least one spare Region. The valid range is
     /// `1..=256`.
     ///
-    /// Changing this value across opens safely cold-starts the disposable cache
-    /// instead of migrating recovered shard state; it does not change the
-    /// static disk identity.
+    /// Changing this value across opens safely cold-starts the disposable cache.
+    /// The value remains part of process-local topology.
     pub fn with_append_shards(mut self, shards: u32) -> Self {
         self.append_shards = shards;
         self
@@ -207,8 +203,8 @@ impl RuntimeConfig {
 
     /// Selects the bounded shard-local L1 eviction policy.
     ///
-    /// CLOCK is the default. S3-FIFO adds a metadata-only ghost queue and uses
-    /// a two-bit hit counter without moving entries on the hit path.
+    /// CLOCK is the default. S3-FIFO adds a metadata-only ghost queue, uses a
+    /// two-bit hit counter, and preserves queue position on the hit path.
     pub fn with_l1_eviction_policy(mut self, policy: L1EvictionPolicy) -> Self {
         self.l1_eviction_policy = policy;
         self
@@ -218,8 +214,8 @@ impl RuntimeConfig {
     ///
     /// The budget accounts for the index mapping extent, L1, append staging,
     /// cache-owned thread topology, metadata, recovery scratch, and transient
-    /// record reads. It is not a bound on process RSS, allocator metadata,
-    /// Tokio, or the kernel page cache.
+    /// record reads. Total deployment memory additionally includes allocator
+    /// metadata, Tokio, process overhead, and the kernel page cache.
     pub fn with_managed_memory_limit_bytes(mut self, bytes: usize) -> Self {
         self.managed_memory_limit_bytes = bytes;
         self
@@ -236,10 +232,9 @@ impl RuntimeConfig {
 
     /// Sets the per-append-shard buffered-byte threshold for requesting a flush.
     ///
-    /// This is not a maximum record or I/O size: a record may cross the
-    /// threshold, and partial buffers also flush after the bounded delay or
-    /// during pressure and lifecycle barriers. The value must be a non-zero
-    /// 4 KiB multiple no larger than 4 MiB.
+    /// A record may cross the threshold, and partial buffers also flush after
+    /// the bounded delay or during pressure and lifecycle barriers. Valid values
+    /// are 4 KiB multiples from 4 KiB through 4 MiB.
     pub fn with_write_flush_threshold_bytes(mut self, bytes: usize) -> Self {
         self.write_flush_threshold_bytes = bytes;
         self

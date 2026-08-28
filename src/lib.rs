@@ -1,8 +1,7 @@
-//! Performance-first bounded RAM + Region SSD hybrid cache.
+//! Bounded RAM + Region SSD cache for Tokio applications.
 //!
-//! Ordinary mutations are process-visible cache updates, not durable storage
-//! writes. An unclean restart always opens empty without scanning the data
-//! extent. Only [`Cache::close_warm`] publishes a recoverable image.
+//! Mutations provide process-local visibility. An unclean restart opens empty;
+//! [`Cache::close_warm`] publishes a recoverable image.
 
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]

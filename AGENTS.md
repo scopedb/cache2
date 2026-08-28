@@ -1,120 +1,79 @@
 # C² Engineering Constraints
 
-## Decision Priority
+## Priorities
 
-Use this order whenever correctness and performance goals conflict:
+Use this order when correctness and performance goals compete:
 
 1. Keep the request path simple and fast.
 2. Preserve or improve hit rate.
-3. Prefer a newer value when sequence information makes that cheap.
+3. Prefer newer values when sequence information makes that cheap.
 
-Consistency is best effort. A cache hit may be stale. Sequence numbers may
-help prefer newer records, but must not add a fence, retry protocol, or second
-validation pass to a read. Writes and deletes may throttle on bounded internal
-capacity; this is expected to be uncommon in normal operation.
+C² uses best-effort consistency and may return stale hits. Sequence numbers
+provide advisory ordering. Each L2 attempt uses one index lookup and one local
+validation pass.
 
-## Performance Contract
+## Global bounds
 
-- Steady-state `put`, `put_l2`, and delete operations may wait for bounded in-memory
-  admission, but must not wait for device I/O, batch completion, data
-  synchronization, or recovery publication.
-- An admitted L2 hit may wait only for configured bounded read-execution
-  admission and its own single bounded record read.
-- Keep memory, queues, staging buffers, index probes, and eviction work strictly
-  bounded. Never introduce an unbounded allocation, scan, retry loop, or queue.
-- On saturation, bypass L1, return a cache miss, throttle a mutation, or reject
-  it with an overload result.
-- Keep the admitted L1 path limited to shard routing and short, bounded
-  in-memory critical sections. Do not add work needed only by bypass or failure
-  cases to the normal hit path.
-- L1 lookup and publication retain only short shard-local critical sections.
-  Optional insertion and promotion may bypass on pressure.
-- Give every L1 victim selection and multi-victim admission a small constant
-  work budget. Exhausting that budget bypasses L1.
-- Never hold a lock across device I/O. Keep mutation critical sections short
-  and shard-local whenever possible.
-- Publish Region writes in batches. Never add per-record flushes, syncs, or
-  completion waits.
-- Read and write submissions use separate bounded I/O-engine pools. Writes must
-  never consume read-engine slots. Reads may use the complete read-pool depth
-  and default to no waiting. Optional read waiting is bounded by both a short
-  deadline and at most one waiter per read worker. Write-slot waits remain
-  confined to background shard workers; explicit completion barriers may wait
-  for those workers.
-- An L1 miss must always consult L2. A true L2 index miss returns immediately
-  without acquiring a read buffer.
-- L2 owns the final result. An L2 candidate plans one size-class-bounded record
-  read, truncating the upper bound at its Region end and expanding it to 4 KiB
-  boundaries only for direct I/O. It reserves one engine execution slot,
-  charges its owned buffer against the aggregate memory limit, and submits
-  under the reservation. In no-wait mode, allocation or engine pressure is a
-  miss. With bounded read waiting enabled, slot pressure waits only after the
-  candidate exists; queue saturation, allocation pressure, or deadline expiry
-  is an explicit overload rather than a false cache miss. An admitted request
-  completes one read plus local exact-envelope validation.
-- Do not add a read-buffer pool, index wait, background ready table, or retry
-  protocol to `get`. The optional read wait is the single bounded engine-slot
-  admission mechanism; it must not hold a read buffer while queued.
-- A successful L1 promotion returns an L1-backed value and releases the
-  transient aligned buffer before `get` returns while preserving Region as the
-  hit source. If promotion bypasses, the zero-copy Region value may retain its
-  alignment-rounded allocation until the caller drops it.
+- Bound every cache-owned allocation, queue, buffer, probe, scan, retry, and
+  eviction decision.
+- Resolve saturation through L1 bypass, a cache miss, mutation throttling, or
+  explicit overload.
+- Keep critical sections short and shard-local. Release locks before device I/O.
+- Keep read, write, and reclaim I/O pools bounded and independent.
+- Compute the full-key hash and record size once at the public boundary.
+- Give compare-exchange bookkeeping a small retry budget, then bypass or miss.
+- Keep statistics optional and implement enabled counters with low-cost atomics.
+
+## Read path
+
+- Probe L1 through shard routing and one short critical section. Bound
+  same-hash chains and victim work; pressure bypasses insertion and promotion.
+- Consult L2 after every L1 miss. Index misses and index or warm-page contention
+  return a miss before read-buffer allocation.
+- Admit one Region- and size-class-bounded read. Reserve one read slot, charge
+  one managed buffer, and validate the record locally.
+- Expand direct-I/O reads to 4 KiB boundaries within the selected Region.
+- Use the full read-pool depth for immediate admission.
+- Optional waiting begins after candidate selection and is limited by a short
+  deadline and one waiter per worker. A queued request retains its plan and
+  allocates its buffer after admission.
+- Queue, memory, and timeout pressure return overload in wait mode. Memory and
+  engine pressure return a miss in immediate mode.
+- Validate address, generation, size class, hash, full key, lengths, checksums,
+  and sequence structure in one pass.
+- Successful promotion returns an L1-backed value, preserves Region as the hit
+  source, and releases the transient read buffer. Bypassed promotion may return
+  a zero-copy Region value that owns the aligned allocation until drop.
+- Heat updates are single, bounded, lossy relaxed-atomic operations independent
+  of the read result.
+
+## Mutation path
+
+- Finish foreground mutations after bounded in-memory work. Accepted writes
+  publish asynchronously.
 - Preflight shard capacity before allocating an append receipt. Reserve the
-  Region tail and commit its open-span accounting under one manager try-lock;
-  the shard mutation gate then protects encoding without holding that manager.
-- Index-partition and warm-page contention are misses. Never wait or spin
-  behind another request before deciding an L2 candidate.
-- An L2 candidate may perform one bounded, lossy relaxed-atomic heat update.
-  Heat bookkeeping must never acquire an exclusive index lock, wait, retry,
-  allocate, perform another index lookup, or change the read outcome.
-- Bound every L1 same-hash bucket to a small constant and bypass L1 when that
-  bucket is full. Full-key validation remains mandatory within the bound.
-- Compute the complete-key hash and planned record size once at the public
-  operation boundary and pass them down unchanged.
-- Give compare-exchange bookkeeping a small constant retry budget. Exhausting
-  that budget bypasses optional work or returns a miss instead of spinning.
-- Statistics must remain optional and use low-cost atomic accounting when
-  enabled.
+  Region tail and open span under one manager try-lock; encode under the shard
+  mutation gate after releasing the manager guard.
+- Batch Region writes. Background shard workers own write-slot waits; explicit
+  completion barriers may wait for those workers.
+- Publish an L2 index entry after its data write completes.
+- Make L1 admission immediately readable and evictable. L1 bypass continues
+  through Region.
+- Route `put_l2` payloads through Region, apply best-effort L1 cleanup, and make
+  them visible after L2 publication.
+- Preserve logical sequence numbers across reinsertion and use them to cheaply
+  prefer newer L1 values. L2 stores compact location metadata.
+- Accept older valid values from contention, eviction, delayed publication, and
+  promotion. Validate the complete key after every hash match.
+- Treat `drain` as the completion barrier for accepted writes.
 
-## Visibility Semantics
+## Recovery and failure
 
-- A value admitted to L1 is immediately readable and immediately evictable.
-- `put_l2` never admits its payload to L1. Exact-key L1 cleanup is best effort,
-  and the value becomes visible only after its Region write publishes to L2.
-- If a value cannot enter L1, the mutation may still complete through Region.
-- L1 contention, eviction, delayed publication, and L2 promotion may expose an
-  older valid value. This is an accepted best-effort outcome.
-- Full-key validation remains mandatory after hash lookup so hash collisions
-  cannot return another entry.
-
-## Concurrency and Versioning
-
-- Every Region record has a logical sequence number. Preserve it across
-  reinsertion and use it to prefer a newer value where this is already part of
-  a bounded L1 mutation. The compact L2 index does not retain it, so it is not
-  a read token and does not guarantee freshness.
-- Concurrent and delayed operations may expose an older valid version.
-- After Region I/O, validate the returned record locally against the planned
-  physical address, Region generation, size class, hash, full key, lengths,
-  and header and payload checksums. Require a structurally valid logical
-  sequence for L1 promotion, but do not perform a second index lookup or a
-  global freshness check.
-
-## Cache and Durability Semantics
-
-- C² is a best-effort cache, not a database. Eviction, bypass, rejection,
-  throttling, misses, and stale reads are valid outcomes.
-- Publish an L2 index entry only after the corresponding data write completes.
-- `drain` is an accepted-write completion barrier, not a durability sync.
-- Warm close publishes a clean recovery image. Fast close or an unclean exit
-  must recover safely as an empty cache rather than trust incomplete state.
-
-## Failure Semantics
-
-- Internal I/O, index, or metadata failures should move the cache to miss-only
-  when safe operation can no longer be guaranteed.
-- Reads in miss-only mode fail open as cache misses rather than application data
-  errors.
-- Resource overload remains explicit, bounded, and observable.
-- Invalid, out-of-bounds, wrong-key, or corrupt records are misses and must
-  never be returned.
+- Treat eviction, bypass, rejection, throttling, misses, stale reads, overload,
+  and cache loss as valid cache outcomes.
+- Publish a clean recovery image during warm close. Fast close and unclean exit
+  reopen empty.
+- Move unsafe I/O, index, or metadata failures to miss-only. Reads then return
+  misses, while mutations report errors.
+- Return values that pass bounds, key, and checksum validation. Failed
+  validation returns a miss.
