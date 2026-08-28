@@ -35,7 +35,8 @@ const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
-const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
+const MAX_DATA_FILES: usize = 64;
+const STATIC_FINGERPRINT_SCHEMA: u64 = 4;
 
 pub type Result<T> = std::io::Result<T>;
 
@@ -119,13 +120,29 @@ impl StaticConfig {
         self.geometry().map(|_| ())
     }
 
-    /// Maximum cache-owned logical disk bytes after a successful open.
+    /// Maximum cache-owned logical disk bytes for one data file after open.
     ///
     /// The bound includes the fixed data and state files plus both the current
     /// clean image and the temporary image used for atomic warm publication.
     /// Filesystem metadata and block-allocation granularity are outside it.
     pub fn peak_disk_bytes(&self) -> Result<u64> {
+        self.peak_disk_bytes_for_data_files(1)
+    }
+
+    /// Maximum cache-owned logical disk bytes for a striped data-file count.
+    ///
+    /// Each data file owns one 4 KiB superblock. State and recovery images
+    /// remain beside the primary data file and are counted once.
+    pub fn peak_disk_bytes_for_data_files(&self, data_files: usize) -> Result<u64> {
         let geometry = self.geometry()?;
+        if data_files == 0
+            || data_files > MAX_DATA_FILES
+            || data_files > geometry.region_count as usize
+        {
+            return Err(invalid_config(
+                "data file count must be in 1..=min(64, Region count)",
+            ));
+        }
         let index_slots = u64::try_from(self.index_slots)
             .map_err(|_| invalid_config("index capacity does not fit u64"))?;
         let index_len = recovery_image_index_len(index_slots)
@@ -148,9 +165,13 @@ impl StaticConfig {
             .checked_add(index_len)
             .and_then(|bytes| bytes.checked_add(metadata_len))
             .ok_or_else(|| invalid_config("recovery image length overflow"))?;
-        geometry
-            .data_file_len
-            .checked_add(STATE_FILE_SIZE as u64)
+        let data_file_headers = u64::try_from(data_files)
+            .ok()
+            .and_then(|count| count.checked_mul(crate::recovery::RECOVERY_PAGE_SIZE as u64))
+            .ok_or_else(|| invalid_config("data-file header size overflow"))?;
+        self.capacity_bytes
+            .checked_add(data_file_headers)
+            .and_then(|bytes| bytes.checked_add(STATE_FILE_SIZE as u64))
             .and_then(|bytes| bytes.checked_add(image_len.checked_mul(2)?))
             .ok_or_else(|| invalid_config("peak disk usage overflow"))
     }
@@ -189,13 +210,18 @@ impl StaticConfig {
         Ok(geometry)
     }
 
-    fn fingerprint(&self, geometry: DataGeometry) -> u64 {
-        self.fingerprint_with_hash_algorithm(geometry, u64::from(KEY_HASH_ALGORITHM_XXH3_64))
+    fn fingerprint(&self, geometry: DataGeometry, data_files: u32) -> u64 {
+        self.fingerprint_with_hash_algorithm(
+            geometry,
+            data_files,
+            u64::from(KEY_HASH_ALGORITHM_XXH3_64),
+        )
     }
 
     fn fingerprint_with_hash_algorithm(
         &self,
         geometry: DataGeometry,
+        data_files: u32,
         hash_algorithm_id: u64,
     ) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -206,6 +232,7 @@ impl StaticConfig {
             u64::from(geometry.region_count),
             self.index_slots as u64,
             self.hash_seed,
+            u64::from(data_files),
             hash_algorithm_id,
         ] {
             for byte in value.to_le_bytes() {
@@ -222,6 +249,7 @@ impl StaticConfig {
 #[derive(Clone, Debug)]
 pub struct CacheBuilder {
     path: PathBuf,
+    additional_data_paths: Vec<PathBuf>,
     static_config: StaticConfig,
     runtime_config: RuntimeConfig,
     tokio_handle: Option<tokio::runtime::Handle>,
@@ -240,10 +268,28 @@ impl CacheBuilder {
     pub fn from_static(path: impl AsRef<Path>, static_config: StaticConfig) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            additional_data_paths: Vec::new(),
             static_config,
             runtime_config: RuntimeConfig::default(),
             tokio_handle: None,
         }
+    }
+
+    /// Stripes global Regions across these additional data-file paths.
+    ///
+    /// The path passed to [`Self::new`] or [`Self::from_static`] remains device
+    /// zero and owns the state and recovery-image sidecars. Capacity is total
+    /// across at most 64 data files. Path order is part of the static disk
+    /// identity. Multi-device operation currently requires the POSIX I/O
+    /// engine.
+    pub fn with_additional_data_paths<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.additional_data_paths
+            .extend(paths.into_iter().map(|path| path.as_ref().to_path_buf()));
+        self
     }
 
     /// Replaces the process-local runtime tuning used by [`Self::open`].
@@ -285,6 +331,7 @@ impl CacheBuilder {
         let path = self.path.clone();
         let capacity_bytes = self.static_config.capacity_bytes;
         let index_slots = self.static_config.index_slots;
+        let data_files = self.additional_data_paths.len().saturating_add(1);
         let result = self.open_blocking_inner(tokio_handle);
         match &result {
             Ok(cache) => {
@@ -297,6 +344,7 @@ impl CacheBuilder {
                     index_backing = index_backing_name(startup),
                     capacity_bytes,
                     index_slots,
+                    data_files,
                     elapsed_us = elapsed_micros(started.elapsed());
                     "cache opened"
                 );
@@ -307,6 +355,7 @@ impl CacheBuilder {
                 path:% = path.display(),
                 capacity_bytes,
                 index_slots,
+                data_files,
                 elapsed_us = elapsed_micros(started.elapsed()),
                 error:% = error;
                 "cache open failed"
@@ -317,7 +366,20 @@ impl CacheBuilder {
 
     fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> Result<Cache> {
         let geometry = self.static_config.geometry()?;
-        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
+        let data_file_count = self
+            .additional_data_paths
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| invalid_config("data file count overflow"))?;
+        let device_count = u32::try_from(data_file_count)
+            .ok()
+            .filter(|count| data_file_count <= MAX_DATA_FILES && *count <= geometry.region_count)
+            .ok_or_else(|| {
+                invalid_config("data file count must be in 1..=min(64, Region count)")
+            })?;
+        let logical_disk_peak_bytes = self
+            .static_config
+            .peak_disk_bytes_for_data_files(data_file_count)?;
         let runtime_config = self.runtime_config;
         runtime_config.validate()?;
         if geometry.region_count <= runtime_config.append_shards {
@@ -330,20 +392,44 @@ impl CacheBuilder {
             self.static_config.index_slots,
             runtime_config.append_shards as usize,
         )?;
-        let format_data = DataSuperblock {
+        let format_base = DataSuperblock {
             generation: 1,
             cache_uuid: next_persistent_id(),
             data_identity: next_persistent_id(),
             geometry,
             hash_seed: self.static_config.hash_seed,
-            config_fingerprint: self.static_config.fingerprint(geometry),
+            config_fingerprint: self.static_config.fingerprint(geometry, device_count),
+            device_count,
+            device_id: 0,
+            device_file_len: geometry
+                .expected_device_file_len(device_count, 0)
+                .expect("validated device zero has an extent"),
         };
+        let mut format_data = Vec::new();
+        format_data
+            .try_reserve_exact(data_file_count)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "cannot allocate data-device superblocks",
+                )
+            })?;
+        for device_id in 0..device_count {
+            format_data.push(
+                format_base
+                    .for_device(device_id, device_count)
+                    .ok_or_else(|| {
+                        invalid_config("data device is not representable by the Region geometry")
+                    })?,
+            );
+        }
         let files = RegionFiles::new(
             &self.path,
             sidecar_path(&self.path, ".state"),
             sidecar_path(&self.path, ".image"),
-        );
-        let backend = FileRegionBackend::new_with_configs(
+        )
+        .with_additional_data(self.additional_data_paths);
+        let backend = FileRegionBackend::new_with_data_set_configs(
             files,
             format_data,
             runtime_config.append_shards,
@@ -610,12 +696,16 @@ mod tests {
         let geometry = config.geometry().unwrap();
         let algorithm = u64::from(KEY_HASH_ALGORITHM_XXH3_64);
         assert_eq!(
-            config.fingerprint(geometry),
-            config.fingerprint_with_hash_algorithm(geometry, algorithm)
+            config.fingerprint(geometry, 1),
+            config.fingerprint_with_hash_algorithm(geometry, 1, algorithm)
         );
         assert_ne!(
-            config.fingerprint(geometry),
-            config.fingerprint_with_hash_algorithm(geometry, algorithm + 1)
+            config.fingerprint(geometry, 1),
+            config.fingerprint_with_hash_algorithm(geometry, 1, algorithm + 1)
+        );
+        assert_ne!(
+            config.fingerprint(geometry, 1),
+            config.fingerprint(geometry, 2)
         );
     }
 
@@ -630,7 +720,10 @@ mod tests {
             data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
             geometry,
             hash_seed: config.hash_seed,
-            config_fingerprint: config.fingerprint(geometry),
+            config_fingerprint: config.fingerprint(geometry, 1),
+            device_count: 1,
+            device_id: 0,
+            device_file_len: geometry.data_file_len,
         };
         assert!(data.encode().is_ok());
     }
@@ -641,6 +734,25 @@ mod tests {
 
         assert_eq!(config.index_slots(), 536_870_912);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn striped_peak_disk_bound_counts_one_superblock_per_data_file() {
+        let config = StaticConfig::new(5 * DEFAULT_REGION_SIZE);
+        let single = config.peak_disk_bytes().unwrap();
+        let striped = config.peak_disk_bytes_for_data_files(3).unwrap();
+
+        assert_eq!(
+            striped - single,
+            2 * crate::recovery::RECOVERY_PAGE_SIZE as u64
+        );
+        assert!(config.peak_disk_bytes_for_data_files(0).is_err());
+        assert!(config.peak_disk_bytes_for_data_files(6).is_err());
+        assert!(
+            config
+                .peak_disk_bytes_for_data_files(MAX_DATA_FILES + 1)
+                .is_err()
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ const PAGE_CRC_OFFSET: usize = RECOVERY_PAGE_SIZE - size_of::<u32>();
 
 const _: () = assert!(RECOVERY_PAGE_SIZE == INDEX_IMAGE_PAGE_SIZE);
 
-const DATA_HEADER_SIZE: u16 = 112;
+const DATA_HEADER_SIZE: u16 = 128;
 const DATA_VERSION_OFFSET: usize = 8;
 const DATA_HEADER_SIZE_OFFSET: usize = 10;
 const DATA_HASH_ALGORITHM_OFFSET: usize = 12;
@@ -42,6 +42,9 @@ const DATA_RECORD_ALIGNMENT_OFFSET: usize = 84;
 const DATA_RECORD_FORMAT_OFFSET: usize = 88;
 const DATA_HASH_SEED_OFFSET: usize = 96;
 const DATA_CONFIG_FINGERPRINT_OFFSET: usize = 104;
+const DATA_DEVICE_COUNT_OFFSET: usize = 112;
+const DATA_DEVICE_ID_OFFSET: usize = 116;
+const DATA_DEVICE_FILE_LEN_OFFSET: usize = 120;
 
 const STATE_HEADER_SIZE: u16 = 120;
 const STATE_VERSION_OFFSET: usize = 8;
@@ -121,6 +124,20 @@ impl DataGeometry {
             && Self::expected_file_len(self.region_size, self.region_count)
                 == Some(self.data_file_len)
     }
+
+    pub(crate) fn expected_device_file_len(self, device_count: u32, device_id: u32) -> Option<u64> {
+        if !self.is_valid()
+            || device_count == 0
+            || device_count > self.region_count
+            || device_id >= device_count
+        {
+            return None;
+        }
+        let device_regions = (self.region_count - 1 - device_id) / device_count + 1;
+        self.region_size
+            .checked_mul(u64::from(device_regions))?
+            .checked_add(DATA_REGION_AREA_OFFSET)
+    }
 }
 
 /// Immutable metadata at offset zero of a data file.
@@ -135,6 +152,9 @@ pub(crate) struct DataSuperblock {
     pub(crate) geometry: DataGeometry,
     pub(crate) hash_seed: u64,
     pub(crate) config_fingerprint: u64,
+    pub(crate) device_count: u32,
+    pub(crate) device_id: u32,
+    pub(crate) device_file_len: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +211,9 @@ impl DataSuperblock {
             DATA_CONFIG_FINGERPRINT_OFFSET,
             self.config_fingerprint,
         );
+        put_u32(&mut page, DATA_DEVICE_COUNT_OFFSET, self.device_count);
+        put_u32(&mut page, DATA_DEVICE_ID_OFFSET, self.device_id);
+        put_u64(&mut page, DATA_DEVICE_FILE_LEN_OFFSET, self.device_file_len);
         write_page_crc(&mut page);
         Ok(page)
     }
@@ -255,6 +278,9 @@ impl DataSuperblock {
                 },
                 hash_seed: get_u64(page, DATA_HASH_SEED_OFFSET)?,
                 config_fingerprint: get_u64(page, DATA_CONFIG_FINGERPRINT_OFFSET)?,
+                device_count: get_u32(page, DATA_DEVICE_COUNT_OFFSET)?,
+                device_id: get_u32(page, DATA_DEVICE_ID_OFFSET)?,
+                device_file_len: get_u64(page, DATA_DEVICE_FILE_LEN_OFFSET)?,
             })
         })() else {
             return DataSuperblockProbe::Corrupt;
@@ -267,7 +293,20 @@ impl DataSuperblock {
     }
 
     fn is_valid(self) -> bool {
-        self.generation != 0 && self.geometry.is_valid()
+        self.generation != 0
+            && self
+                .geometry
+                .expected_device_file_len(self.device_count, self.device_id)
+                == Some(self.device_file_len)
+    }
+
+    pub(crate) fn for_device(mut self, device_id: u32, device_count: u32) -> Option<Self> {
+        self.device_count = device_count;
+        self.device_id = device_id;
+        self.device_file_len = self
+            .geometry
+            .expected_device_file_len(device_count, device_id)?;
+        Some(self)
     }
 }
 
@@ -990,6 +1029,9 @@ mod tests {
             },
             hash_seed: 0x1234_5678_9abc_def0,
             config_fingerprint: 0x8877_6655_4433_2211,
+            device_count: 1,
+            device_id: 0,
+            device_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
         }
     }
 
@@ -1065,7 +1107,39 @@ mod tests {
             DataSuperblock::probe(&encoded),
             DataSuperblockProbe::Valid(expected)
         );
-        assert_eq!(&encoded[112..PAGE_CRC_OFFSET], &[0; PAGE_CRC_OFFSET - 112]);
+        assert_eq!(&encoded[128..PAGE_CRC_OFFSET], &[0; PAGE_CRC_OFFSET - 128]);
+    }
+
+    #[test]
+    fn data_superblock_binds_each_striped_device_extent() {
+        let data = data_superblock();
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(data.geometry.region_size, 5).unwrap(),
+            region_size: data.geometry.region_size,
+            region_count: 5,
+        };
+        let base = DataSuperblock { geometry, ..data };
+        let first = base.for_device(0, 2).unwrap();
+        let second = base.for_device(1, 2).unwrap();
+
+        assert_eq!(
+            first.device_file_len,
+            DataGeometry::expected_file_len(geometry.region_size, 3).unwrap()
+        );
+        assert_eq!(
+            second.device_file_len,
+            DataGeometry::expected_file_len(geometry.region_size, 2).unwrap()
+        );
+        assert_eq!(
+            DataSuperblock::decode(&first.encode().unwrap()),
+            Some(first)
+        );
+        assert_eq!(
+            DataSuperblock::decode(&second.encode().unwrap()),
+            Some(second)
+        );
+        assert!(base.for_device(2, 2).is_none());
+        assert!(base.for_device(0, 6).is_none());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
 use crate::runtime_config::IoMode;
 use crate::snapshot::CacheIoPathSnapshot;
 
@@ -157,18 +158,32 @@ impl RuntimeIoStatsHandle {
 /// the descriptor that owns flock, so retaining this set also retains the
 /// cache lock if an issued write or flush cannot be fenced. `direct`, when present,
 /// is a separate O_DIRECT open used only for aligned runtime data requests.
-pub(crate) struct RuntimeFileSet {
+struct RuntimeDataFile {
     buffered: File,
     direct: Option<File>,
+}
+
+pub(crate) struct RuntimeFileSet {
+    data: Box<[RuntimeDataFile]>,
+    geometry: Option<DataGeometry>,
     stats: RuntimeIoStatsHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeIoTarget {
+    device_id: usize,
+    offset: u64,
 }
 
 impl RuntimeFileSet {
     #[cfg(test)]
     pub(crate) fn buffered(file: File) -> Self {
         Self {
-            buffered: file,
-            direct: None,
+            data: Box::new([RuntimeDataFile {
+                buffered: file,
+                direct: None,
+            }]),
+            geometry: None,
             stats: RuntimeIoStatsHandle::new(false),
         }
     }
@@ -181,10 +196,48 @@ impl RuntimeFileSet {
     fn with_direct(buffered: File, direct: Option<File>) -> Self {
         let direct_active = direct.is_some();
         Self {
-            buffered,
-            direct,
+            data: Box::new([RuntimeDataFile { buffered, direct }]),
+            geometry: None,
             stats: RuntimeIoStatsHandle::new(direct_active),
         }
+    }
+
+    pub(crate) fn striped(sets: Vec<Self>, geometry: DataGeometry) -> io::Result<Self> {
+        if !geometry.is_valid() || sets.is_empty() || sets.len() > geometry.region_count as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid runtime data-device geometry",
+            ));
+        }
+        let direct_active = sets[0]
+            .data
+            .first()
+            .is_some_and(|data| data.direct.is_some());
+        let mut data = Vec::new();
+        data.try_reserve_exact(sets.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate runtime data-device files",
+            )
+        })?;
+        for set in sets {
+            let mut files = set.data.into_vec();
+            if set.geometry.is_some()
+                || files.len() != 1
+                || files[0].direct.is_some() != direct_active
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime data-device files are inconsistent",
+                ));
+            }
+            data.push(files.pop().expect("one runtime data file was checked"));
+        }
+        Ok(Self {
+            data: data.into_boxed_slice(),
+            geometry: Some(geometry),
+            stats: RuntimeIoStatsHandle::new(direct_active),
+        })
     }
 
     pub(crate) fn select_path(
@@ -194,7 +247,7 @@ impl RuntimeFileSet {
         offset: u64,
         allow_direct: bool,
     ) -> RuntimeIoPath {
-        if !allow_direct || self.direct.is_none() {
+        if !allow_direct || self.data.first().is_none_or(|data| data.direct.is_none()) {
             return RuntimeIoPath::Buffered;
         }
         // Never issue malformed O_DIRECT. Unaligned record fragments and an
@@ -249,22 +302,112 @@ impl RuntimeFileSet {
         allow(dead_code)
     )]
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(self.data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate cloned runtime data-device files",
+            )
+        })?;
+        for file in &self.data {
+            data.push(RuntimeDataFile {
+                buffered: file.buffered.try_clone()?,
+                direct: file.direct.as_ref().map(File::try_clone).transpose()?,
+            });
+        }
         Ok(Self {
-            buffered: self.buffered.try_clone()?,
-            direct: self.direct.as_ref().map(File::try_clone).transpose()?,
+            data: data.into_boxed_slice(),
+            geometry: self.geometry,
             stats: self.stats.clone(),
         })
     }
 
     #[cfg(unix)]
     pub(crate) fn file_for(&self, path: RuntimeIoPath) -> &File {
+        self.file_for_device(path, 0)
+    }
+
+    #[cfg(unix)]
+    fn file_for_device(&self, path: RuntimeIoPath, device_id: usize) -> &File {
+        let data = &self.data[device_id];
         match path {
-            RuntimeIoPath::Buffered => &self.buffered,
-            RuntimeIoPath::Direct => self
+            RuntimeIoPath::Buffered => &data.buffered,
+            RuntimeIoPath::Direct => data
                 .direct
                 .as_ref()
                 .expect("direct path requires a direct descriptor"),
         }
+    }
+
+    fn io_target(&self, offset: u64, length: usize) -> io::Result<RuntimeIoTarget> {
+        let Some(geometry) = self.geometry else {
+            return Ok(RuntimeIoTarget {
+                device_id: 0,
+                offset,
+            });
+        };
+        let length = u64::try_from(length).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime I/O length is too large",
+            )
+        })?;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= geometry.data_file_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime I/O exceeds data geometry",
+                )
+            })?;
+        if offset < DATA_REGION_AREA_OFFSET {
+            if end <= DATA_REGION_AREA_OFFSET {
+                return Ok(RuntimeIoTarget {
+                    device_id: 0,
+                    offset,
+                });
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime I/O crosses the data superblock",
+            ));
+        }
+        let relative = offset - DATA_REGION_AREA_OFFSET;
+        let region_id = relative / geometry.region_size;
+        let region_offset = relative % geometry.region_size;
+        if region_id >= u64::from(geometry.region_count)
+            || region_offset
+                .checked_add(length)
+                .is_none_or(|end| end > geometry.region_size)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime I/O crosses a Region boundary",
+            ));
+        }
+        let device_count = self.data.len() as u64;
+        let device_id = usize::try_from(region_id % device_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime device id is too large",
+            )
+        })?;
+        let local_region_id = region_id / device_count;
+        let local_offset = local_region_id
+            .checked_mul(geometry.region_size)
+            .and_then(|base| base.checked_add(DATA_REGION_AREA_OFFSET))
+            .and_then(|base| base.checked_add(region_offset))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime device offset overflow",
+                )
+            })?;
+        Ok(RuntimeIoTarget {
+            device_id,
+            offset: local_offset,
+        })
     }
 }
 
@@ -623,14 +766,23 @@ impl IoBackend for FileBackend {
 #[cfg(unix)]
 impl IoBackend for RuntimeFileBackend {
     fn len(&self) -> io::Result<u64> {
-        Ok(self
-            .files
-            .file_for(RuntimeIoPath::Buffered)
-            .metadata()?
-            .len())
+        match self.files.geometry {
+            Some(geometry) => Ok(geometry.data_file_len),
+            None => Ok(self
+                .files
+                .file_for(RuntimeIoPath::Buffered)
+                .metadata()?
+                .len()),
+        }
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
+        if self.files.data.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot resize a striped runtime data set",
+            ));
+        }
         self.files.file_for(RuntimeIoPath::Buffered).set_len(len)
     }
 
@@ -638,7 +790,11 @@ impl IoBackend for RuntimeFileBackend {
         let path = self
             .files
             .select_path(buffer.as_ptr(), buffer.len(), offset, true);
-        let result = self.files.file_for(path).read_at(buffer, offset);
+        let target = self.files.io_target(offset, buffer.len())?;
+        let result = self
+            .files
+            .file_for_device(path, target.device_id)
+            .read_at(buffer, target.offset);
         if let Ok(bytes) = result
             && bytes != 0
         {
@@ -656,10 +812,17 @@ impl IoBackend for RuntimeFileBackend {
         let path = self
             .files
             .select_path(buffer.cast_const(), length, offset, true);
+        let target = self.files.io_target(offset, length)?;
         // SAFETY: the caller supplies a writable destination for `length`
         // bytes; the selected descriptor is held by `self` for this call.
-        let result =
-            unsafe { read_file_at_uninit(self.files.file_for(path), buffer, length, offset) };
+        let result = unsafe {
+            read_file_at_uninit(
+                self.files.file_for_device(path, target.device_id),
+                buffer,
+                length,
+                target.offset,
+            )
+        };
         if let Ok(bytes) = result
             && bytes != 0
         {
@@ -675,7 +838,11 @@ impl IoBackend for RuntimeFileBackend {
             offset,
             point == WritePoint::Record,
         );
-        let result = self.files.file_for(path).write_at(buffer, offset);
+        let target = self.files.io_target(offset, buffer.len())?;
+        let result = self
+            .files
+            .file_for_device(path, target.device_id)
+            .write_at(buffer, target.offset);
         if let Ok(bytes) = result
             && bytes != 0
         {
@@ -685,11 +852,13 @@ impl IoBackend for RuntimeFileBackend {
     }
 
     fn sync(&self, _point: SyncPoint, mode: SyncMode) -> io::Result<()> {
-        let file = self.files.file_for(RuntimeIoPath::Buffered);
-        match mode {
-            SyncMode::Data => file.sync_data(),
-            SyncMode::All => file.sync_all(),
+        for file in &self.files.data {
+            match mode {
+                SyncMode::Data => file.buffered.sync_data()?,
+                SyncMode::All => file.buffered.sync_all()?,
+            }
         }
+        Ok(())
     }
 
     fn try_lock_exclusive(&self) -> io::Result<()> {
@@ -1146,6 +1315,68 @@ mod tests {
             RuntimeIoPath::Buffered,
             "metadata remains on the buffered control descriptor"
         );
+    }
+
+    #[test]
+    fn striped_runtime_files_map_global_regions_without_a_lookup_table() {
+        let region_size = 2 * DIRECT_IO_ALIGNMENT as u64;
+        let region_count = 5;
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
+            region_size,
+            region_count,
+        };
+        let first = TestFile::new("striped-runtime-first");
+        let second = TestFile::new("striped-runtime-second");
+        let first_file = first.open();
+        let second_file = second.open();
+        first_file
+            .set_len(geometry.expected_device_file_len(2, 0).unwrap())
+            .unwrap();
+        second_file
+            .set_len(geometry.expected_device_file_len(2, 1).unwrap())
+            .unwrap();
+        let files = RuntimeFileSet::striped(
+            vec![
+                RuntimeFileSet::buffered(first_file.try_clone().unwrap()),
+                RuntimeFileSet::buffered(second_file.try_clone().unwrap()),
+            ],
+            geometry,
+        )
+        .unwrap();
+
+        for (region_id, expected_device, local_region) in [
+            (0_u32, 0_usize, 0_u32),
+            (1, 1, 0),
+            (2, 0, 1),
+            (3, 1, 1),
+            (4, 0, 2),
+        ] {
+            let global = DATA_REGION_AREA_OFFSET + u64::from(region_id) * region_size;
+            assert_eq!(
+                files.io_target(global, 32).unwrap(),
+                RuntimeIoTarget {
+                    device_id: expected_device,
+                    offset: DATA_REGION_AREA_OFFSET + u64::from(local_region) * region_size,
+                }
+            );
+        }
+        let last_byte = DATA_REGION_AREA_OFFSET + region_size - 1;
+        assert!(files.io_target(last_byte, 2).is_err());
+
+        let backend = RuntimeFileBackend::new(files);
+        let global = DATA_REGION_AREA_OFFSET + region_size + 64;
+        assert_eq!(
+            backend
+                .write_at(WritePoint::Record, &[0x5a; 32], global)
+                .unwrap(),
+            32
+        );
+        let mut observed = [0_u8; 32];
+        second_file
+            .read_at(&mut observed, DATA_REGION_AREA_OFFSET + 64)
+            .unwrap();
+        assert_eq!(observed, [0x5a; 32]);
     }
 
     #[test]

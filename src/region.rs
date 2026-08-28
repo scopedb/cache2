@@ -69,6 +69,7 @@ const REGION_SHARDS: u32 = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegionFiles {
     pub(crate) data: PathBuf,
+    additional_data: Box<[PathBuf]>,
     pub(crate) state: PathBuf,
     pub(crate) image: PathBuf,
 }
@@ -81,9 +82,24 @@ impl RegionFiles {
     ) -> Self {
         Self {
             data: data.into(),
+            additional_data: Box::new([]),
             state: state.into(),
             image: image.into(),
         }
+    }
+
+    pub(crate) fn with_additional_data(mut self, paths: Vec<PathBuf>) -> Self {
+        self.additional_data = paths.into_boxed_slice();
+        self
+    }
+
+    fn data_paths(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.data.as_path())
+            .chain(self.additional_data.iter().map(PathBuf::as_path))
+    }
+
+    fn data_path_count(&self) -> usize {
+        self.additional_data.len().saturating_add(1)
     }
 }
 
@@ -1503,13 +1519,13 @@ where
     /// Used when the data file is missing or empty. Existing
     /// files retain their on-disk identities but must match this geometry and
     /// configuration fingerprint.
-    format_data: DataSuperblock,
+    format_data: Box<[DataSuperblock]>,
     shard_count: u32,
     runtime_config: RuntimeConfig,
     file_system: F,
-    data_file: Option<F::File>,
+    data_files: Vec<F::File>,
     state_file: Option<F::File>,
-    data: Option<DataSuperblock>,
+    data: Option<Box<[DataSuperblock]>>,
     current_state: Option<SelectedState>,
     prepared_clean: Option<(u8, StateRecord)>,
     cold_reset_needed: bool,
@@ -1523,9 +1539,25 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeConfig::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_configs(
         files: RegionFiles,
         format_data: DataSuperblock,
+        shards: u32,
+        runtime_config: RuntimeConfig,
+    ) -> Self {
+        Self::new_with_file_system_and_configs(
+            files,
+            vec![format_data],
+            SystemRegionFileSystem,
+            shards,
+            runtime_config,
+        )
+    }
+
+    pub(crate) fn new_with_data_set_configs(
+        files: RegionFiles,
+        format_data: Vec<DataSuperblock>,
         shards: u32,
         runtime_config: RuntimeConfig,
     ) -> Self {
@@ -1551,7 +1583,7 @@ where
     ) -> Self {
         Self::new_with_file_system_and_configs(
             files,
-            format_data,
+            vec![format_data],
             file_system,
             REGION_SHARDS,
             RuntimeConfig::default(),
@@ -1560,18 +1592,18 @@ where
 
     fn new_with_file_system_and_configs(
         files: RegionFiles,
-        format_data: DataSuperblock,
+        format_data: Vec<DataSuperblock>,
         file_system: F,
         shard_count: u32,
         runtime_config: RuntimeConfig,
     ) -> Self {
         Self {
             files,
-            format_data,
+            format_data: format_data.into_boxed_slice(),
             shard_count,
             runtime_config,
             file_system,
-            data_file: None,
+            data_files: Vec::new(),
             state_file: None,
             data: None,
             current_state: None,
@@ -1589,10 +1621,22 @@ where
     }
 
     fn data_superblock(&self) -> io::Result<DataSuperblock> {
-        self.data.ok_or_else(|| {
+        self.data
+            .as_deref()
+            .and_then(|data| data.first().copied())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data superblocks were not inspected",
+                )
+            })
+    }
+
+    fn data_superblocks(&self) -> io::Result<&[DataSuperblock]> {
+        self.data.as_deref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "data superblock was not inspected",
+                "data superblocks were not inspected",
             )
         })
     }
@@ -1633,16 +1677,47 @@ where
             ));
         }
         self.runtime_config.validate()?;
-        if self.shard_count == 0 || self.format_data.geometry.region_count <= self.shard_count {
+        let format_primary = self.format_data.first().copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RegionStore has no data device",
+            )
+        })?;
+        let device_count = u32::try_from(self.format_data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many RegionStore data devices",
+            )
+        })?;
+        if self.files.data_path_count() != self.format_data.len()
+            || self
+                .format_data
+                .iter()
+                .enumerate()
+                .any(|(device_id, data)| {
+                    format_primary.for_device(device_id as u32, device_count) != Some(*data)
+                })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RegionStore data paths and device superblocks do not match",
+            ));
+        }
+        if self.format_data.len() > 1
+            && self.runtime_config.io_engine() == crate::runtime_config::IoEngine::IoUring
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "multi-device RegionStore currently requires the POSIX I/O engine",
+            ));
+        }
+        if self.shard_count == 0 || format_primary.geometry.region_count <= self.shard_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore requires at least one data shard and one additional Region",
             ));
         }
-        if self.files.data == self.files.state
-            || self.files.data == self.files.image
-            || self.files.state == self.files.image
-        {
+        if self.files.state == self.files.image {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore data/state/image paths must be distinct",
@@ -1657,45 +1732,118 @@ where
             ));
         }
         let temporary = recovery_temporary_path(&self.files.image);
-        if temporary == self.files.data
-            || temporary == self.files.state
-            || temporary == self.files.image
-        {
+        if temporary == self.files.state || temporary == self.files.image {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore recovery temporary path collides with a cache file",
             ));
         }
-        let data =
-            self.file_system
-                .open_data(&self.files.data, true, self.runtime_config.io_mode())?;
-        data.try_lock_exclusive()?;
+        for (device_id, path) in self.files.data_paths().enumerate() {
+            if path == self.files.state || path == self.files.image || path == temporary {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RegionStore data/state/image paths must be distinct",
+                ));
+            }
+            if self
+                .files
+                .data_paths()
+                .take(device_id)
+                .any(|prior| prior == path)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RegionStore data paths must be distinct",
+                ));
+            }
+        }
+
+        let mut data_files: Vec<F::File> = Vec::new();
+        data_files
+            .try_reserve_exact(self.files.data_path_count())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate RegionStore data file owners",
+                )
+            })?;
+        for path in self.files.data_paths() {
+            let data = match self
+                .file_system
+                .open_data(path, true, self.runtime_config.io_mode())
+            {
+                Ok(data) => data,
+                Err(error) => {
+                    for file in &data_files {
+                        let _ = file.unlock();
+                    }
+                    return Err(error);
+                }
+            };
+            for existing in &data_files {
+                match existing.is_same_file(&data) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        for file in &data_files {
+                            let _ = file.unlock();
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "RegionStore data paths resolve to the same file",
+                        ));
+                    }
+                    Err(error) => {
+                        for file in &data_files {
+                            let _ = file.unlock();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if let Err(error) = data.try_lock_exclusive() {
+                for file in &data_files {
+                    let _ = file.unlock();
+                }
+                return Err(error);
+            }
+            data_files.push(data);
+        }
         let state = match self.file_system.open(&self.files.state, true) {
             Ok(state) => state,
             Err(error) => {
-                let _ = data.unlock();
+                for file in &data_files {
+                    let _ = file.unlock();
+                }
                 return Err(error);
             }
         };
-        let aliases_data = match data.is_same_file(&state) {
-            Ok(aliases_data) => aliases_data,
-            Err(error) => {
-                let _ = data.unlock();
-                return Err(error);
+        for data in &data_files {
+            match data.is_same_file(&state) {
+                Ok(false) => {}
+                Ok(true) => {
+                    for file in &data_files {
+                        let _ = file.unlock();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RegionStore data and state paths resolve to the same file",
+                    ));
+                }
+                Err(error) => {
+                    for file in &data_files {
+                        let _ = file.unlock();
+                    }
+                    return Err(error);
+                }
             }
-        };
-        if aliases_data {
-            let _ = data.unlock();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RegionStore data and state paths resolve to the same file",
-            ));
         }
         if let Err(error) = state.try_lock_exclusive() {
-            let _ = data.unlock();
+            for file in &data_files {
+                let _ = file.unlock();
+            }
             return Err(error);
         }
-        self.data_file = Some(data);
+        self.data_files = data_files;
         self.state_file = Some(state);
         self.locked = true;
         Ok(())
@@ -1707,17 +1855,20 @@ where
     ) -> io::Result<RecoveryPlan<Self::CleanImage>> {
         self.file_system
             .remove_file(&recovery_temporary_path(&self.files.image))?;
-        let format_data = self.format_data;
-        let (data, fresh) = {
-            let data_file = self.data_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "data file is not open")
-            })?;
+        let (data_set, fresh) = {
+            if self.data_files.len() != self.format_data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "data files are not open",
+                ));
+            }
             let state_file = self.state_file.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "state file is not open")
             })?;
-            inspect_or_format_data(data_file, state_file, format_data)?
+            inspect_or_format_data_set(&self.data_files, state_file, &self.format_data)?
         };
-        self.data = Some(data);
+        self.data = Some(data_set);
+        let data = self.data_superblock()?;
         self.cold_reset_needed = !fresh;
 
         let pages = read_state_pages(self.state_file()?)?;
@@ -1755,15 +1906,15 @@ where
             }
             Err(error) => return Err(error),
         };
-        let data_file = self
-            .data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
         let state_file = self
             .state_file
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "state file is not open"))?;
-        if image.is_same_file(data_file)? || image.is_same_file(state_file)? {
+        let mut image_aliases_data = false;
+        for data in &self.data_files {
+            image_aliases_data |= image.is_same_file(data)?;
+        }
+        if image.is_same_file(state_file)? || image_aliases_data {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore image aliases the data or state file",
@@ -1872,13 +2023,10 @@ where
             .remove_file(&recovery_temporary_path(&self.files.image))?;
         let data = self.data_superblock()?;
         if self.cold_reset_needed {
-            let data_file = self.data_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "data file is not open")
-            })?;
             let state_file = self.state_file.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "state file is not open")
             })?;
-            format_empty_data(data_file, state_file, data)?;
+            format_empty_data_set(&self.data_files, state_file, self.data_superblocks()?)?;
             self.current_state = None;
             self.cold_reset_needed = false;
         }
@@ -1956,13 +2104,29 @@ where
 
     fn start_runtime(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::Runtime> {
         let data = self.data_superblock()?;
-        let data_file = self
-            .data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        if let Some(files) = self.file_system.try_clone_runtime_files(data_file)? {
-            runtime.attach_data_plane(data, files, self.runtime_config.clone())?;
+        let mut runtime_files = Vec::new();
+        runtime_files
+            .try_reserve_exact(self.data_files.len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate runtime data files",
+                )
+            })?;
+        for data_file in &self.data_files {
+            let Some(files) = self.file_system.try_clone_runtime_files(data_file)? else {
+                return Ok(runtime);
+            };
+            runtime_files.push(files);
         }
+        let files = if runtime_files.len() == 1 {
+            runtime_files
+                .pop()
+                .expect("one runtime data file was checked")
+        } else {
+            RuntimeFileSet::striped(runtime_files, data.geometry)?
+        };
+        runtime.attach_data_plane(data, files, self.runtime_config.clone())?;
         Ok(runtime)
     }
 
@@ -2099,11 +2263,15 @@ where
             ));
         }
 
-        let data_file = self
-            .data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        data_file.sync(SyncPoint::WarmData, SyncMode::Data)?;
+        if self.data_files.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "data files are not open",
+            ));
+        }
+        for data_file in &self.data_files {
+            data_file.sync(SyncPoint::WarmData, SyncMode::Data)?;
+        }
 
         let temporary = recovery_temporary_path(&self.files.image);
         self.file_system.remove_file(&temporary)?;
@@ -2195,80 +2363,137 @@ where
             .as_ref()
             .map(IoBackend::unlock)
             .unwrap_or(Ok(()));
-        let data_result = if self.retain_lock {
-            Ok(())
-        } else {
-            self.data_file
-                .as_ref()
-                .map(IoBackend::unlock)
-                .unwrap_or(Ok(()))
-        };
+        let mut data_result = Ok(());
+        if !self.retain_lock {
+            for data_file in &self.data_files {
+                if let Err(error) = data_file.unlock()
+                    && data_result.is_ok()
+                {
+                    data_result = Err(error);
+                }
+            }
+        }
         self.locked = false;
         self.prepared_clean = None;
         self.state_file.take();
-        self.data_file.take();
+        self.data_files.clear();
         state_result.and(data_result)
     }
 }
 
-fn inspect_or_format_data<D, S>(
-    file: &D,
+fn inspect_or_format_data_set<D, S>(
+    files: &[D],
     state: &S,
-    format_data: DataSuperblock,
-) -> io::Result<(DataSuperblock, bool)>
+    format_data: &[DataSuperblock],
+) -> io::Result<(Box<[DataSuperblock]>, bool)>
 where
     D: IoBackend,
     S: IoBackend,
 {
-    let file_len = file.len()?;
-    if file_len >= RECOVERY_PAGE_SIZE as u64 {
+    if files.is_empty() || files.len() != format_data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data files and device superblocks do not match",
+        ));
+    }
+    let mut observed = Vec::new();
+    observed.try_reserve_exact(files.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate inspected data superblocks",
+        )
+    })?;
+    let mut eligible = true;
+    for (file, expected) in files.iter().zip(format_data) {
+        let file_len = file.len()?;
+        if file_len < RECOVERY_PAGE_SIZE as u64 {
+            eligible = false;
+            break;
+        }
         let mut page = [0_u8; RECOVERY_PAGE_SIZE];
         read_exact_at(file, &mut page, 0)?;
-        match DataSuperblock::probe(&page) {
-            DataSuperblockProbe::Valid(data) => {
-                if data.geometry != format_data.geometry
-                    || data.hash_seed != format_data.hash_seed
-                    || data.config_fingerprint != format_data.config_fingerprint
-                    || file_len != data.geometry.data_file_len
-                {
-                    format_empty_data(file, state, format_data)?;
-                    return Ok((format_data, true));
-                }
-                return Ok((data, false));
-            }
-            DataSuperblockProbe::Unsupported(_)
-            | DataSuperblockProbe::Empty
-            | DataSuperblockProbe::Corrupt
-            | DataSuperblockProbe::Unrecognized
-            | DataSuperblockProbe::Truncated => {}
+        let DataSuperblockProbe::Valid(data) = DataSuperblock::probe(&page) else {
+            eligible = false;
+            break;
+        };
+        if data.geometry != expected.geometry
+            || data.hash_seed != expected.hash_seed
+            || data.config_fingerprint != expected.config_fingerprint
+            || data.device_count != expected.device_count
+            || data.device_id != expected.device_id
+            || data.device_file_len != expected.device_file_len
+            || file_len != data.device_file_len
+        {
+            eligible = false;
+            break;
         }
+        observed.push(data);
+    }
+    if eligible && observed.len() == files.len() {
+        let primary = observed[0];
+        eligible = observed.iter().all(|data| {
+            data.generation == primary.generation
+                && data.cache_uuid == primary.cache_uuid
+                && data.data_identity == primary.data_identity
+                && data.geometry == primary.geometry
+                && data.hash_seed == primary.hash_seed
+                && data.config_fingerprint == primary.config_fingerprint
+                && data.device_count == primary.device_count
+        });
+    }
+    if eligible {
+        return Ok((observed.into_boxed_slice(), false));
     }
 
-    format_empty_data(file, state, format_data)?;
-    Ok((format_data, true))
+    format_empty_data_set(files, state, format_data)?;
+    let mut formatted = Vec::new();
+    formatted
+        .try_reserve_exact(format_data.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate formatted data superblocks",
+            )
+        })?;
+    formatted.extend_from_slice(format_data);
+    Ok((formatted.into_boxed_slice(), true))
 }
 
 /// Invalidates every old recovery authority before discarding Region bytes.
 /// Truncating the cold data extent prevents a later record-version domain from
 /// ever matching stale bytes, without scanning the file or its old records.
-fn format_empty_data<D, S>(file: &D, state: &S, format_data: DataSuperblock) -> io::Result<()>
+fn format_empty_data_set<D, S>(
+    files: &[D],
+    state: &S,
+    format_data: &[DataSuperblock],
+) -> io::Result<()>
 where
     D: IoBackend,
     S: IoBackend,
 {
-    let encoded = format_data
-        .encode()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid data format"))?;
+    if files.is_empty() || files.len() != format_data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data files and device superblocks do not match",
+        ));
+    }
     state.set_len(0)?;
     state.sync(SyncPoint::StateReset, SyncMode::Data)?;
-    file.set_len(0)?;
-    file.sync(SyncPoint::FormatTruncate, SyncMode::All)?;
+    for file in files {
+        file.set_len(0)?;
+        file.sync(SyncPoint::FormatTruncate, SyncMode::All)?;
+    }
     // Establish the complete extent once. Runtime shard writes then remain
     // positioned and sequential within Regions instead of allocating blocks
     // on the latency-sensitive path or discovering ENOSPC after admission.
-    file.preallocate(format_data.geometry.data_file_len)?;
-    write_all_at(file, WritePoint::DataSuperblock, &encoded, 0)?;
-    file.sync(SyncPoint::FormatData, SyncMode::All)?;
+    for (file, data) in files.iter().zip(format_data) {
+        let encoded = data
+            .encode()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid data format"))?;
+        file.preallocate(data.device_file_len)?;
+        write_all_at(file, WritePoint::DataSuperblock, &encoded, 0)?;
+        file.sync(SyncPoint::FormatData, SyncMode::All)?;
+    }
     Ok(())
 }
 
@@ -2838,6 +3063,9 @@ mod tests {
             },
             hash_seed: 3,
             config_fingerprint: 4,
+            device_count: 1,
+            device_id: 0,
+            device_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
         }
     }
 
@@ -2854,6 +3082,8 @@ mod tests {
                 region_size,
                 region_count: REGION_SHARDS + 1,
             },
+            device_file_len: DataGeometry::expected_file_len(region_size, REGION_SHARDS + 1)
+                .unwrap(),
             ..test_data_superblock()
         }
     }
@@ -2983,6 +3213,9 @@ mod tests {
             },
             hash_seed: 23,
             config_fingerprint: 24,
+            device_count: 1,
+            device_id: 0,
+            device_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
         }
     }
 
