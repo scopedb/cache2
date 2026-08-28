@@ -15,7 +15,7 @@ capacity; this is expected to be uncommon in normal operation.
 
 ## Performance Contract
 
-- Steady-state `put` and delete operations may wait for bounded in-memory
+- Steady-state `put`, `put_l2`, and delete operations may wait for bounded in-memory
   admission, but must not wait for device I/O, batch completion, data
   synchronization, or recovery publication.
 - An admitted L2 hit may wait only for its own single bounded record read.
@@ -74,6 +74,8 @@ capacity; this is expected to be uncommon in normal operation.
 ## Visibility Semantics
 
 - A value admitted to L1 is immediately readable and immediately evictable.
+- `put_l2` never admits its payload to L1. Exact-key L1 cleanup is best effort,
+  and the value becomes visible only after its Region write publishes to L2.
 - If a value cannot enter L1, the mutation may still complete through Region.
 - L1 contention, eviction, delayed publication, and L2 promotion may expose an
   older valid value. This is an accepted best-effort outcome.

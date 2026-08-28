@@ -439,6 +439,10 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.put(key, value)
     }
 
+    pub(crate) fn put_value_l2(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.put_l2(key, value)
+    }
+
     #[cfg(test)]
     pub(crate) fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?.data_plane()?.get(key)

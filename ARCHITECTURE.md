@@ -26,7 +26,8 @@ the full record after I/O.
 2. Reserve the Region tail and open-span accounting under one short manager
    try-lock.
 3. Encode into the selected append shard's existing aligned buffer.
-4. Publish to L1 immediately when bounded admission succeeds.
+4. `put` publishes to L1 when bounded admission succeeds. `put_l2` skips value
+   admission and attempts only best-effort exact-key L1 cleanup.
 5. Return without waiting for device I/O.
 6. The shard worker writes sealed batches and publishes L2 index entries only
    after completion.
@@ -34,6 +35,8 @@ the full record after I/O.
 Each append shard has two Region-sized buffers, so it may fill one while the
 other is in flight. Saturation or short-path contention returns `WouldBlock`;
 there is no foreground retry protocol or global admission queue.
+An accepted `put_l2` becomes visible only after its completed Region write
+publishes the L2 index entry. A later demand read may promote it to L1.
 
 ### Get
 

@@ -216,6 +216,53 @@ async fn immediate_l1_publication_is_best_effort() {
 }
 
 #[tokio::test]
+async fn l2_only_put_avoids_l1_until_the_first_demand_read() {
+    let files = TestCache::new("l2-only-put");
+    let cache = files.config(2).open().await.unwrap();
+
+    let sequence = eventually_admitted(|| cache.put_l2("key", [7_u8; 16 * 1024]));
+    assert_ne!(sequence, 0);
+    assert_eq!(cache.detailed_snapshot().unwrap().l1.resident_entries, 0);
+    cache.drain().await.unwrap();
+    assert_eq!(cache.detailed_snapshot().unwrap().l1.resident_entries, 0);
+
+    let first = cache.get("key").await.unwrap().unwrap();
+    assert_eq!(first.tier(), CacheTier::L2);
+    assert_eq!(first.as_ref(), &[7_u8; 16 * 1024]);
+    drop(first);
+    let second = cache.get("key").await.unwrap().unwrap();
+    assert_eq!(second.tier(), CacheTier::L1);
+    assert_eq!(second.as_ref(), &[7_u8; 16 * 1024]);
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.puts, 1);
+    assert_eq!(snapshot.l1_promotions, 1);
+    assert_eq!(snapshot.l1_bypasses, 0);
+    cache.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn l2_only_put_best_effort_invalidates_an_older_l1_value() {
+    let files = TestCache::new("l2-only-replacement");
+    let cache = files.config(2).open().await.unwrap();
+
+    let old_sequence = eventually_admitted(|| cache.put("key", b"old"));
+    let old = cache.get("key").await.unwrap().unwrap();
+    assert_eq!(old.tier(), CacheTier::L1);
+    drop(old);
+
+    let new_value = vec![9_u8; 16 * 1024];
+    let new_sequence = eventually_admitted(|| cache.put_l2("key", &new_value));
+    assert!(new_sequence > old_sequence);
+    assert_eq!(cache.detailed_snapshot().unwrap().l1.resident_entries, 0);
+    cache.drain().await.unwrap();
+
+    let current = cache.get("key").await.unwrap().unwrap();
+    assert_eq!(current.tier(), CacheTier::L2);
+    assert_eq!(current.as_ref(), new_value);
+    cache.close_fast().await.unwrap();
+}
+
+#[tokio::test]
 async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()

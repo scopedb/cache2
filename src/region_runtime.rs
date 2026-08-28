@@ -966,6 +966,14 @@ impl RegionDataPlane {
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.put_with_l1::<true>(key, value)
+    }
+
+    pub(crate) fn put_l2(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.put_with_l1::<false>(key, value)
+    }
+
+    fn put_with_l1<const ADMIT_L1: bool>(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1006,7 +1014,14 @@ impl RegionDataPlane {
         )?;
         match staged {
             RegionStageValue::Staged(seqno) => {
-                let _published = running.memory.publish(hash, key, value, seqno);
+                if ADMIT_L1 {
+                    let _published = running.memory.publish(hash, key, value, seqno);
+                } else {
+                    // Prevent an older exact-key L1 value from indefinitely
+                    // shadowing the prefetched L2 record. Contention remains a
+                    // valid best-effort stale outcome.
+                    let _removed = running.memory.delete(hash, key, seqno);
+                }
                 control.notify(WAKE_DATA)?;
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.puts);

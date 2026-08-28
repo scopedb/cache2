@@ -430,6 +430,18 @@ impl Cache {
         self.store.put_value(key.as_ref(), value.as_ref())
     }
 
+    /// Stores a value in L2 without admitting it to L1 and returns its
+    /// monotonic mutation sequence.
+    ///
+    /// An older exact-key L1 value is removed best effort. A later demand read
+    /// may promote the completed L2 record into L1. Like [`Self::put`], success
+    /// means the mutation entered bounded staging; use [`Self::drain`] before
+    /// requiring the L2 index publication to be complete.
+    /// Keys are limited to 4 KiB, and the encoded record must fit one Region.
+    pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
+        self.store.put_value_l2(key.as_ref(), value.as_ref())
+    }
+
     /// Deletes a key and returns its monotonic mutation sequence.
     ///
     /// Delete performs a bounded in-memory index removal and best-effort L1

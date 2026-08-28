@@ -55,6 +55,12 @@ cache.close_warm().await?;
 # }
 ```
 
+Use `put_l2` for prefetched data that should not displace current L1 entries.
+It enters the same bounded Region staging as `put`, removes an older exact-key
+L1 value best effort, and becomes L2-visible after write completion. A later
+demand read may promote it into L1; call `drain` after a prefetch batch when the
+caller requires every accepted L2 publication to have completed.
+
 `open()` captures the current Tokio runtime. Use
 `CacheBuilder::with_tokio_handle` to bind the cache to another runtime; that
 runtime must have time enabled and outlive the cache. Close explicitly from
