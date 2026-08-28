@@ -17,7 +17,7 @@ use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
 use crate::io_engine::{
     IoBuffer, IoEngine, IoOperation, MAX_IO_REQUESTS_PER_ENGINE, ReadSlot, build_file_engine,
-    submit_cache_read,
+    submit_cache_io,
 };
 use crate::memory::{
     MemoryLookup, MemoryMetricsSnapshot, MemoryReadToken, MemoryStore, MemoryValue,
@@ -1747,7 +1747,6 @@ fn reclaim_worker_result(
                 )
             })?;
             if used != 0 {
-                let slot = engine.try_reserve_read()?;
                 let owned = buffer.take().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "reclaim worker lost its buffer")
                 })?;
@@ -1756,12 +1755,13 @@ fn reclaim_worker_result(
                     Err(error) => return Err(error.error),
                 };
                 let absolute = shared.core.reclaim_absolute(receipt)?;
-                let request = submit_cache_read(
-                    engine.as_ref(),
-                    slot,
-                    IoOperation::read(io_buffer, absolute),
-                )
-                .map_err(|error| error.into_lease().0)?;
+                // Reclaim owns a dedicated pool whose depth matches its worker
+                // count. Use the bounded background wait so transient CAS
+                // contention cannot turn a healthy cache miss-only; foreground
+                // reads retain their non-waiting reservation path.
+                let request =
+                    submit_cache_io(engine.as_ref(), IoOperation::read(io_buffer, absolute))
+                        .map_err(|error| error.into_lease().0)?;
                 let completion = request
                     .wait(engine.as_ref())
                     .map_err(|error| error.into_lease().0)?;
