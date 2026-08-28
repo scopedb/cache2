@@ -161,6 +161,65 @@ run emits `warm_verification ... errors=0` followed by
 not include the unpaced prefill or final verification scan; the final reported
 elapsed time does include the verification work.
 
+## Production acceptance profiles
+
+Use this high-cardinality profile to exercise the complete 512 GiB Region
+capacity with 33,554,432 keys and an exact 16 KiB average value size:
+
+```sh
+CACHE_SOAK_SECONDS=3600 \
+CACHE_SOAK_SAMPLE_SECONDS=60 \
+CACHE_SOAK_DIR=/mnt/nvme \
+CACHE_SOAK_CAPACITY_MIB=524288 \
+CACHE_SOAK_MEMORY_MIB=10240 \
+CACHE_SOAK_MANAGED_MEMORY_LIMIT_MIB=12288 \
+CACHE_SOAK_RSS_SLACK_MIB=2048 \
+CACHE_SOAK_KEYS=33554432 \
+CACHE_SOAK_VALUE_BYTES=12288,14336,15360,16384,17408,18432,20480 \
+CACHE_SOAK_APPEND_SHARDS=4 \
+CACHE_SOAK_RECLAIM_WORKERS=2 \
+CACHE_SOAK_READ_IO_WORKERS=4 \
+CACHE_SOAK_WRITE_IO_WORKERS=4 \
+CACHE_SOAK_WRITERS=2 \
+CACHE_SOAK_READERS=4 \
+CACHE_SOAK_OPERATION_INTERVAL_US=2000 \
+CACHE_SOAK_WARM_REOPEN=true \
+CACHE_SOAK_FINAL_WARM_VERIFY=true \
+CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
+CACHE_SOAK_IO_ENGINE=posix \
+CACHE_SOAK_IO_MODE=buffered \
+cargo +1.98.0 bench --locked --bench cache_soak
+```
+
+Use this read-heavy profile to require both bounded hot-record reinsertion and
+an exact byte-budget skip while Region turnover continues:
+
+```sh
+CACHE_SOAK_SECONDS=3600 \
+CACHE_SOAK_SAMPLE_SECONDS=60 \
+CACHE_SOAK_DIR=/mnt/nvme \
+CACHE_SOAK_CAPACITY_MIB=32768 \
+CACHE_SOAK_MEMORY_MIB=1024 \
+CACHE_SOAK_MANAGED_MEMORY_LIMIT_MIB=3072 \
+CACHE_SOAK_RSS_SLACK_MIB=512 \
+CACHE_SOAK_KEYS=4194304 \
+CACHE_SOAK_VALUE_BYTES=12288,14336,15360,16384,17408,18432,20480 \
+CACHE_SOAK_APPEND_SHARDS=4 \
+CACHE_SOAK_RECLAIM_WORKERS=2 \
+CACHE_SOAK_READ_IO_WORKERS=8 \
+CACHE_SOAK_WRITE_IO_WORKERS=4 \
+CACHE_SOAK_WRITERS=1 \
+CACHE_SOAK_READERS=16 \
+CACHE_SOAK_OPERATION_INTERVAL_US=100 \
+CACHE_SOAK_WARM_REOPEN=true \
+CACHE_SOAK_FINAL_WARM_VERIFY=true \
+CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
+CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true \
+CACHE_SOAK_IO_ENGINE=posix \
+CACHE_SOAK_IO_MODE=buffered \
+cargo +1.98.0 bench --locked --bench cache_soak
+```
+
 ## Focused diagnostics
 
 Exercise long-turnover index behavior without storage I/O:
