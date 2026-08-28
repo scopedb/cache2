@@ -3873,7 +3873,9 @@ mod tests {
             .unwrap();
         let mut page = [0_u8; RECOVERY_PAGE_SIZE];
         image.read_exact_at(&mut page, 0).unwrap();
-        let header = RecoveryImageHeader::decode(&page).unwrap();
+        let RecoveryImageHeaderProbe::Valid(header) = RecoveryImageHeader::probe(&page) else {
+            panic!("warm recovery image header must be valid");
+        };
         image
             .write_all_at(&[0x5a], header.region_table_offset + 100)
             .unwrap();

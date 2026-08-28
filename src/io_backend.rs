@@ -1108,26 +1108,6 @@ mod tests {
             files.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
             RuntimeIoPath::Buffered
         );
-        let cloned = files.try_clone().unwrap();
-        cloned.record(
-            RuntimeIoDirection::Read,
-            RuntimeIoPath::Direct,
-            DIRECT_IO_ALIGNMENT,
-        );
-        cloned.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
-        let stats = files.stats_handle().snapshot();
-        assert_eq!(stats.read.direct.operations, 1);
-        assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
-        assert_eq!(stats.write.buffered.operations, 1);
-        assert_eq!(stats.write.buffered.bytes, 32);
-        cloned.set_statistics_enabled(false);
-        files.record(
-            RuntimeIoDirection::Read,
-            RuntimeIoPath::Direct,
-            DIRECT_IO_ALIGNMENT,
-        );
-        files.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
-        assert_eq!(files.stats_handle().snapshot(), stats);
 
         let buffered_only = RuntimeFileSet::buffered(buffered.open());
         assert_eq!(
@@ -1146,6 +1126,35 @@ mod tests {
             RuntimeIoPath::Buffered,
             "metadata remains on the buffered control descriptor"
         );
+    }
+
+    #[test]
+    fn runtime_io_statistics_are_shared_and_can_be_disabled() {
+        let buffered = TestFile::new("buffered-stats");
+        let direct = TestFile::new("direct-stats");
+        let files = RuntimeFileSet::new(buffered.open(), Some(direct.open()));
+        let cloned = files.try_clone().unwrap();
+
+        cloned.record(
+            RuntimeIoDirection::Read,
+            RuntimeIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        cloned.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        let stats = files.stats_handle().snapshot();
+        assert_eq!(stats.read.direct.operations, 1);
+        assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
+        assert_eq!(stats.write.buffered.operations, 1);
+        assert_eq!(stats.write.buffered.bytes, 32);
+
+        cloned.set_statistics_enabled(false);
+        files.record(
+            RuntimeIoDirection::Read,
+            RuntimeIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        files.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        assert_eq!(files.stats_handle().snapshot(), stats);
     }
 
     #[test]

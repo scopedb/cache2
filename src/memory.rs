@@ -1317,52 +1317,41 @@ mod tests {
     }
 
     #[test]
-    fn admission_requiring_seventeen_victims_bypasses_without_eviction() {
-        const VICTIM_COUNT: usize = MAX_EVICTIONS_PER_INSERT + 1;
+    fn multi_victim_admission_honors_the_fixed_eviction_budget() {
         const VICTIM_VALUE_BYTES: usize = 32;
         const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
-        const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
 
-        let store = store(CAPACITY, 1);
-        for hash in 1..=VICTIM_COUNT as u64 {
-            assert!(store.publish(hash, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
+        for victim_count in [MAX_EVICTIONS_PER_INSERT, MAX_EVICTIONS_PER_INSERT + 1] {
+            let capacity = victim_count * VICTIM_BYTES;
+            let store = store(capacity, 1);
+            for hash in 1..=victim_count as u64 {
+                assert!(store.publish(hash, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash));
+            }
+            let candidate = vec![0xa5; capacity - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
+            let within_budget = victim_count == MAX_EVICTIONS_PER_INSERT;
+
+            assert_eq!(store.publish(100, b"c", &candidate, 100), within_budget);
+            assert_eq!(
+                store.shards[0].lock().unwrap().budget.used_bytes(),
+                capacity
+            );
+            let metrics = store.metrics_snapshot();
+            if within_budget {
+                assert_hit(&store, 100, b"c");
+                for hash in 1..=victim_count as u64 {
+                    assert_miss(&store, hash, b"k");
+                }
+                assert_eq!(metrics.evictions, victim_count as u64);
+                assert_eq!(metrics.bypasses, 0);
+            } else {
+                assert_miss(&store, 100, b"c");
+                for hash in 1..=victim_count as u64 {
+                    assert_hit(&store, hash, b"k");
+                }
+                assert_eq!(metrics.evictions, 0);
+                assert_eq!(metrics.bypasses, 1);
+            }
         }
-        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
-
-        assert!(!store.publish(100, b"c", &candidate, 100));
-        for hash in 1..=VICTIM_COUNT as u64 {
-            assert_hit(&store, hash, b"k");
-        }
-        assert_eq!(
-            store.shards[0].lock().unwrap().budget.used_bytes(),
-            CAPACITY
-        );
-        let metrics = store.metrics_snapshot();
-        assert_eq!(metrics.evictions, 0);
-        assert_eq!(metrics.bypasses, 1);
-    }
-
-    #[test]
-    fn admission_requiring_sixteen_victims_commits_once_planned() {
-        const VICTIM_COUNT: usize = MAX_EVICTIONS_PER_INSERT;
-        const VICTIM_VALUE_BYTES: usize = 32;
-        const VICTIM_BYTES: usize = MEMORY_ENTRY_OVERHEAD_BYTES + 1 + VICTIM_VALUE_BYTES;
-        const CAPACITY: usize = VICTIM_COUNT * VICTIM_BYTES;
-
-        let store = store(CAPACITY, 1);
-        for hash in 1..=VICTIM_COUNT as u64 {
-            assert!(store.publish(hash, b"k", &[hash as u8; VICTIM_VALUE_BYTES], hash,));
-        }
-        let candidate = vec![0xa5; CAPACITY - MEMORY_ENTRY_OVERHEAD_BYTES - 1];
-
-        assert!(store.publish(100, b"c", &candidate, 100));
-        assert_hit(&store, 100, b"c");
-        assert_miss(&store, 1, b"k");
-        assert_eq!(
-            store.shards[0].lock().unwrap().budget.used_bytes(),
-            CAPACITY
-        );
-        assert_eq!(store.metrics_snapshot().evictions, VICTIM_COUNT as u64);
     }
 
     #[test]

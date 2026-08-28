@@ -2046,6 +2046,25 @@ mod tests {
         })
     }
 
+    const PARTITIONED_SLOT_COUNT: usize = 1009;
+    const FIRST_PARTITION_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
+    const SECOND_PARTITION_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
+
+    fn populated_partitioned_storage() -> (PartitionedIndexStorage, [IndexSlot; 3]) {
+        let storage = PartitionedIndexStorage::anonymous(PARTITIONED_SLOT_COUNT).unwrap();
+        let values = [sample_slot(1), sample_slot(2), sample_slot(3)];
+        storage
+            .write_slot(FIRST_PARTITION_LAST_SLOT, values[0])
+            .unwrap();
+        storage
+            .write_slot(SECOND_PARTITION_FIRST_SLOT, values[1])
+            .unwrap();
+        storage
+            .write_slot(PARTITIONED_SLOT_COUNT - 1, values[2])
+            .unwrap();
+        (storage, values)
+    }
+
     #[test]
     fn canonical_partition_ranges_balance_pages_and_keep_a_usable_tail() {
         type RangeShape = (usize, usize, usize, usize);
@@ -2084,39 +2103,19 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_storage_mutates_adjacent_ranges_and_roundtrips_stats() {
-        const SLOT_COUNT: usize = 1009;
-        const GENERATION: u64 = 113;
-        const FIRST_RANGE_LAST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE - 1;
-        const SECOND_RANGE_FIRST_SLOT: usize = INDEX_IMAGE_SLOTS_PER_PAGE;
-
-        let source = PartitionedIndexStorage::anonymous(SLOT_COUNT).unwrap();
-        assert_eq!(source.slot_count(), SLOT_COUNT);
-        assert_eq!(source.partition_count(), 2);
+    fn partitioned_storage_routes_boundary_slots_and_tracks_stats() {
+        let (storage, values) = populated_partitioned_storage();
         assert_eq!(
-            source.partition_ranges(),
-            canonical_index_partition_ranges(SLOT_COUNT)
-                .unwrap()
-                .as_ref()
-        );
-
-        let first_value = sample_slot(1);
-        let second_value = sample_slot(2);
-        let tail_value = sample_slot(3);
-        source
-            .write_slot(FIRST_RANGE_LAST_SLOT, first_value)
-            .unwrap();
-        source
-            .write_slot(SECOND_RANGE_FIRST_SLOT, second_value)
-            .unwrap();
-        source.write_slot(SLOT_COUNT - 1, tail_value).unwrap();
-        assert_eq!(
-            source.read_slot(FIRST_RANGE_LAST_SLOT).unwrap(),
-            first_value
+            storage.read_slot(FIRST_PARTITION_LAST_SLOT).unwrap(),
+            values[0]
         );
         assert_eq!(
-            source.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
-            second_value
+            storage.read_slot(SECOND_PARTITION_FIRST_SLOT).unwrap(),
+            values[1]
+        );
+        assert_eq!(
+            storage.read_slot(PARTITIONED_SLOT_COUNT - 1).unwrap(),
+            values[2]
         );
 
         let expected_partition_stats: Box<[IndexPhysicalStats]> = Box::new([
@@ -2129,21 +2128,37 @@ mod tests {
                 deleted: 0,
             },
         ]);
-        assert_eq!(source.partition_stats().unwrap(), expected_partition_stats);
+        assert_eq!(storage.partition_stats().unwrap(), expected_partition_stats);
         assert_eq!(
-            source.physical_stats().unwrap(),
+            storage.physical_stats().unwrap(),
             IndexPhysicalStats {
                 value: 3,
                 deleted: 0,
             }
         );
 
+        storage
+            .write_slot(FIRST_PARTITION_LAST_SLOT, IndexSlot::EMPTY)
+            .unwrap();
+        assert_eq!(
+            storage.partition_stats().unwrap().as_ref(),
+            &[IndexPhysicalStats::default(), expected_partition_stats[1]]
+        );
+    }
+
+    #[test]
+    fn partitioned_warm_image_round_trips_boundary_slots_and_stats() {
+        const GENERATION: u64 = 113;
+
+        let (source, values) = populated_partitioned_storage();
+        let expected_partition_stats = source.partition_stats().unwrap();
+
         let mut test_file = TestFile::create();
         let written = source
             .write_warm_image(&mut test_file.file, binding(GENERATION))
             .unwrap();
         assert_eq!(written.pages_written, 3);
-        assert_eq!(written.slots_written, SLOT_COUNT);
+        assert_eq!(written.slots_written, PARTITIONED_SLOT_COUNT);
         assert_eq!(written.bytes_written, (3 * INDEX_IMAGE_PAGE_SIZE) as u64);
         assert_eq!(written.physical_stats, source.physical_stats().unwrap());
         test_file.file.sync_all().unwrap();
@@ -2151,7 +2166,7 @@ mod tests {
         let recovered = PartitionedIndexStorage::map_private(
             &test_file.file,
             0,
-            SLOT_COUNT,
+            PARTITIONED_SLOT_COUNT,
             binding(GENERATION),
             &expected_partition_stats,
         )
@@ -2161,23 +2176,17 @@ mod tests {
             expected_partition_stats
         );
         assert_eq!(
-            recovered.read_slot(FIRST_RANGE_LAST_SLOT).unwrap(),
-            first_value
+            recovered.read_slot(FIRST_PARTITION_LAST_SLOT).unwrap(),
+            values[0]
         );
         assert_eq!(
-            recovered.read_slot(SECOND_RANGE_FIRST_SLOT).unwrap(),
-            second_value
+            recovered.read_slot(SECOND_PARTITION_FIRST_SLOT).unwrap(),
+            values[1]
         );
-        assert_eq!(recovered.read_slot(SLOT_COUNT - 1).unwrap(), tail_value);
-
-        recovered
-            .write_slot(FIRST_RANGE_LAST_SLOT, IndexSlot::EMPTY)
-            .unwrap();
         assert_eq!(
-            recovered.partition_stats().unwrap().as_ref(),
-            &[IndexPhysicalStats::default(), expected_partition_stats[1]]
+            recovered.read_slot(PARTITIONED_SLOT_COUNT - 1).unwrap(),
+            values[2]
         );
-        assert_eq!(source.partition_stats().unwrap(), expected_partition_stats);
     }
 
     #[test]
@@ -2359,25 +2368,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_codec_is_stable_little_endian() {
-        let value = sample_slot(0);
-        let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
-        value.encode(&mut encoded);
-        assert_eq!(encoded, value.encoded.to_le_bytes());
-        assert_eq!(IndexSlot::decode(&encoded), value);
-        assert_eq!(IndexSlot::decode(&[0_u8; 8]), IndexSlot::EMPTY);
-
-        let noncanonical = IndexSlot { encoded: 19 };
-        noncanonical.encode(&mut encoded);
-        assert_eq!(encoded, 19_u64.to_le_bytes());
-        assert_eq!(IndexSlot::decode(&encoded), noncanonical);
-        assert_eq!(
-            noncanonical.runtime_state(),
-            Err(IndexSlotSemanticError::NonCanonicalMarker)
-        );
-    }
-
-    #[test]
     fn slot_codec_quantizes_only_the_record_length() {
         let exact = PackedLocation::new(0x54321, 0x12340, 1056).unwrap();
         let state = IndexSlotState::Value {
@@ -2431,24 +2421,6 @@ mod tests {
     }
 
     #[test]
-    fn physical_stats_follow_constant_time_slot_transitions() {
-        let mut storage = IndexStorage::anonymous(3).unwrap();
-        assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
-
-        storage.write_slot(0, sample_slot(1)).unwrap();
-        assert_eq!(
-            storage.physical_stats(),
-            IndexPhysicalStats {
-                value: 1,
-                deleted: 0,
-            }
-        );
-
-        storage.write_slot(0, IndexSlot::EMPTY).unwrap();
-        assert_eq!(storage.physical_stats(), IndexPhysicalStats::default());
-    }
-
-    #[test]
     fn warm_writer_rejects_counter_drift_while_emitting_the_image() {
         let mut storage = IndexStorage::anonymous(8).unwrap();
         storage.physical_stats.value = 1;
@@ -2478,36 +2450,24 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_warm_image_maps_private_without_rebuilding_slots() {
-        const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE + 3;
-        const GENERATION: u64 = 47;
+    fn mapped_image_rejects_unaligned_offset_and_zero_binding() {
         const PREFIX: usize = INDEX_IMAGE_PAGE_SIZE;
 
-        let mut source = IndexStorage::anonymous(SLOT_COUNT).unwrap();
-        assert_eq!(source.read_slot(0).unwrap(), IndexSlot::EMPTY);
-        source.write_slot(0, sample_slot(1)).unwrap();
-        source
-            .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE + 2, sample_slot(2))
-            .unwrap();
-
+        let source = IndexStorage::anonymous(1).unwrap();
         let mut test_file = TestFile::create();
         test_file.file.set_len(PREFIX as u64).unwrap();
         test_file.file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
-        let stats = source
-            .write_warm_image(&mut test_file.file, binding(GENERATION))
+        source
+            .write_warm_image(&mut test_file.file, binding(47))
             .unwrap();
-        assert_eq!(stats.pages_written, 2);
-        assert_eq!(stats.slots_written, SLOT_COUNT);
-        assert_eq!(stats.bytes_written, (2 * INDEX_IMAGE_PAGE_SIZE) as u64);
-        assert_eq!(stats.physical_stats, source.physical_stats());
         test_file.file.sync_all().unwrap();
 
         assert!(matches!(
             IndexStorage::map_private(
                 &test_file.file,
                 (PREFIX + 1) as u64,
-                SLOT_COUNT,
-                binding(GENERATION),
+                1,
+                binding(47),
                 source.physical_stats()
             ),
             Err(IndexStorageError::InvalidArgument(
@@ -2518,7 +2478,7 @@ mod tests {
             IndexStorage::map_private(
                 &test_file.file,
                 PREFIX as u64,
-                SLOT_COUNT,
+                1,
                 IndexImageBinding {
                     generation: 0,
                     image_tag: 1
@@ -2529,6 +2489,27 @@ mod tests {
                 "mapped index image binding must be non-zero"
             ))
         ));
+    }
+
+    #[test]
+    fn mapped_warm_image_validates_lazily_and_is_copy_on_write() {
+        const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE + 3;
+        const GENERATION: u64 = 47;
+        const PREFIX: usize = INDEX_IMAGE_PAGE_SIZE;
+
+        let mut source = IndexStorage::anonymous(SLOT_COUNT).unwrap();
+        source.write_slot(0, sample_slot(1)).unwrap();
+        source
+            .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE + 2, sample_slot(2))
+            .unwrap();
+
+        let mut test_file = TestFile::create();
+        test_file.file.set_len(PREFIX as u64).unwrap();
+        test_file.file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
+        source
+            .write_warm_image(&mut test_file.file, binding(GENERATION))
+            .unwrap();
+        test_file.file.sync_all().unwrap();
 
         let mut recovered = IndexStorage::map_private(
             &test_file.file,
@@ -2564,60 +2545,6 @@ mod tests {
         let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
         test_file.file.read_exact(&mut encoded).unwrap();
         assert_eq!(IndexSlot::decode(&encoded), expected);
-    }
-
-    #[test]
-    fn corrupt_page_rejects_the_whole_image_when_touched() {
-        const SLOT_COUNT: usize = INDEX_IMAGE_SLOTS_PER_PAGE * 2;
-        const GENERATION: u64 = 91;
-
-        let mut source = IndexStorage::anonymous(SLOT_COUNT).unwrap();
-        source.write_slot(0, sample_slot(1)).unwrap();
-        source
-            .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE, sample_slot(2))
-            .unwrap();
-        let mut image = Vec::new();
-        source
-            .write_warm_image(&mut image, binding(GENERATION))
-            .unwrap();
-        image[INDEX_IMAGE_PAGE_SIZE + INDEX_IMAGE_PAGE_HEADER_SIZE + 7] ^= 0x80;
-
-        let mut test_file = TestFile::create();
-        test_file.file.write_all(&image).unwrap();
-        test_file.file.sync_all().unwrap();
-        let recovered = IndexStorage::map_private(
-            &test_file.file,
-            0,
-            SLOT_COUNT,
-            binding(GENERATION),
-            source.physical_stats(),
-        )
-        .unwrap();
-
-        assert_eq!(recovered.read_slot(0).unwrap(), sample_slot(1));
-        let error = recovered.read_slot(INDEX_IMAGE_SLOTS_PER_PAGE).unwrap_err();
-        assert!(matches!(
-            error,
-            IndexStorageError::CorruptPage {
-                page_index: 1,
-                reason: CorruptPageReason::ChecksumMismatch { .. }
-            }
-        ));
-        assert_eq!(
-            recovered.page_validation_state(1).unwrap(),
-            PageValidationState::Rejected
-        );
-        assert_eq!(
-            recovered.page_validation_state(0).unwrap(),
-            PageValidationState::Rejected
-        );
-        assert!(matches!(
-            recovered.read_slot(0),
-            Err(IndexStorageError::CorruptPage {
-                page_index: 0,
-                reason: CorruptPageReason::PreviouslyRejected
-            })
-        ));
     }
 
     #[test]

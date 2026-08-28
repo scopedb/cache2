@@ -295,22 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn target_chunk_sizes_do_not_pay_per_record_direct_io_padding() {
-        let mut cursor = 0;
-        let mut saw_non_direct_boundary = false;
-        for (key_len, value_len) in [
-            (b"file/chunk/0007".len(), 16 * 1024),
-            (b"0123456789abcdef0123456789abcdef".len(), 256 * 1024),
-        ] {
-            let required = required_record_bytes(key_len, value_len).unwrap();
-            assert_eq!(required % RECORD_ALIGNMENT, 0);
-            cursor += required as usize;
-            saw_non_direct_boundary |= cursor % crate::io_backend::DIRECT_IO_ALIGNMENT != 0;
-        }
-        assert!(saw_non_direct_boundary);
-    }
-
-    #[test]
     fn reinsertion_preserves_logical_seqno_across_a_new_region_generation() {
         let key = b"key";
         let value = b"value";

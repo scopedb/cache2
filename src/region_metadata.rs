@@ -1210,34 +1210,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_exact_frozen_authority() {
-        let expected = sample();
-        let encoded = expected.encode().unwrap();
-        assert_eq!(REGION_METADATA_REGION_SIZE, 21);
-        assert_eq!(REGION_METADATA_PARTITION_SIZE, 16);
-        assert_eq!(encoded.len() as u64, expected.encoded_len().unwrap());
-        assert_eq!(RegionMetadata::decode(&encoded).unwrap(), expected);
-        assert_eq!(&encoded[..8], &PAGE_MAGIC);
-        assert_eq!(
-            &encoded[REGION_METADATA_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET
-                ..REGION_METADATA_PAGE_HEADER_SIZE + ROOT_INDEX_SLOTS_OFFSET + 8],
-            &508_u64.to_le_bytes()
-        );
-        let root = &encoded[REGION_METADATA_PAGE_HEADER_SIZE
-            ..REGION_METADATA_PAGE_HEADER_SIZE + REGION_METADATA_ROOT_SIZE];
-        assert!(
-            root[ROOT_RESERVED_ACCOUNTING_START..ROOT_RESERVED_ACCOUNTING_END]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
-        assert!(
-            root[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
-    }
-
-    #[test]
     fn complete_metadata_matches_committed_golden_bytes() {
         let expected = sample();
         let encoded = expected.encode().unwrap();

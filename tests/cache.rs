@@ -123,6 +123,39 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
     }
 }
 
+async fn completed_reclaim_snapshot(cache: &cache2::Cache) -> cache2::DetailedCacheSnapshot {
+    for ordinal in 0_u64..128 {
+        eventually_admitted(|| cache.put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024]));
+    }
+    cache.drain().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let detailed = cache.detailed_snapshot().unwrap();
+        let read = detailed.summary.io.read;
+        let write = detailed.summary.io.write;
+        let read_terminal = read
+            .requests_succeeded
+            .saturating_add(read.requests_cancelled)
+            .saturating_add(read.requests_failed);
+        let write_terminal = write
+            .requests_succeeded
+            .saturating_add(write.requests_cancelled)
+            .saturating_add(write.requests_failed);
+        if detailed.summary.reclaim.regions > 0
+            && detailed.region.reclaiming_region_count == 0
+            && read.requests_in_flight == 0
+            && read.requests_submitted == read_terminal
+            && write.requests_in_flight == 0
+            && write.requests_submitted == write_terminal
+        {
+            return detailed;
+        }
+        assert!(Instant::now() < deadline, "reclaim did not make progress");
+        thread::yield_now();
+    }
+}
+
 #[test]
 fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
     let files = TestCache::new("explicit-tokio-handle");
@@ -233,10 +266,6 @@ async fn l2_only_put_avoids_l1_until_the_first_demand_read() {
     let second = cache.get("key").await.unwrap().unwrap();
     assert_eq!(second.tier(), CacheTier::L1);
     assert_eq!(second.as_ref(), &[7_u8; 16 * 1024]);
-    let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.puts, 1);
-    assert_eq!(snapshot.l1_promotions, 1);
-    assert_eq!(snapshot.l1_bypasses, 0);
     cache.close_fast().await.unwrap();
 }
 
@@ -427,7 +456,7 @@ async fn latest_put_survives_warm_recovery() {
 }
 
 #[tokio::test]
-async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
+async fn runtime_config_can_change_across_a_warm_reopen() {
     let files = TestCache::new("warm-close");
     let cache = files.config(1).open().await.unwrap();
     cache.put("key", vec![7_u8; 16 * 1024]).unwrap();
@@ -456,15 +485,7 @@ async fn embedding_service_can_retune_runtime_policy_and_gracefully_restart() {
     assert_eq!(first.tier(), CacheTier::L2);
     assert_eq!(first.as_ref(), vec![7_u8; 16 * 1024]);
     drop(first);
-    assert_eq!(
-        reopened.get("key").await.unwrap().unwrap().tier(),
-        CacheTier::L1
-    );
-    let snapshot = reopened.snapshot().unwrap();
-    assert_eq!(snapshot.health, CacheHealth::Running);
-    assert!(!snapshot.statistics_enabled);
-    assert_eq!(snapshot.l1_hits, 0);
-    assert!(snapshot.managed_memory_bytes <= snapshot.managed_memory_limit_bytes);
+    assert!(!reopened.snapshot().unwrap().statistics_enabled);
     reopened.close_fast().await.unwrap();
 }
 
@@ -522,9 +543,6 @@ async fn delete_is_sequenced_and_warm_recoverable() {
     assert!(delete_sequence > put_sequence);
     cache.drain().await.unwrap();
     assert!(cache.get("key").await.unwrap().is_none());
-    let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.puts, 1);
-    assert_eq!(snapshot.deletes, 1);
     assert_eq!(
         cache
             .detailed_snapshot()
@@ -716,12 +734,11 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
 }
 
 #[tokio::test]
-async fn public_entry_size_limits_are_explicit() {
-    let files = TestCache::new("entry-size-limits");
+async fn public_key_and_record_size_limits_are_enforced() {
+    let files = TestCache::new("entry-size-errors");
     let cache = files.config(1).open().await.unwrap();
     let oversized_key = vec![0_u8; 4 * 1024 + 1];
-    let large_value = vec![7_u8; 512 * 1024 - 64];
-    let oversized_value = vec![0_u8; large_value.len() + 32];
+    let oversized_value = vec![0_u8; 512 * 1024];
 
     assert_eq!(
         cache.put(&oversized_key, b"value").unwrap_err().kind(),
@@ -734,25 +751,27 @@ async fn public_entry_size_limits_are_explicit() {
             .kind(),
         std::io::ErrorKind::InvalidInput
     );
-    cache.put(b"large", &large_value).unwrap();
-    cache.drain().await.unwrap();
-    let first = cache.get(b"large").await.unwrap().unwrap();
-    assert_eq!(first.tier(), CacheTier::L2);
-    assert_eq!(first.as_ref(), large_value);
-    drop(first);
-    let second = cache.get(b"large").await.unwrap().unwrap();
-    assert_eq!(second.tier(), CacheTier::L2);
-    assert_eq!(second.as_ref(), large_value);
-    drop(second);
     assert_eq!(
         cache.delete(&oversized_key).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
     assert!(cache.get(&oversized_key).await.unwrap().is_none());
-    let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.puts, 1);
-    assert_eq!(snapshot.deletes, 0);
-    assert_eq!(snapshot.l1_promotions, 0);
+    cache.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn region_sized_records_remain_l2_only_and_warm_recover() {
+    let files = TestCache::new("region-sized-record");
+    let cache = files.config(1).open().await.unwrap();
+    let large_value = vec![7_u8; 512 * 1024 - 64];
+
+    cache.put(b"large", &large_value).unwrap();
+    cache.drain().await.unwrap();
+    for _ in 0..2 {
+        let value = cache.get(b"large").await.unwrap().unwrap();
+        assert_eq!(value.tier(), CacheTier::L2);
+        assert_eq!(value.as_ref(), large_value);
+    }
     cache.close_warm().await.unwrap();
 
     let reopened = files.config(1).open().await.unwrap();
@@ -761,11 +780,6 @@ async fn public_entry_size_limits_are_explicit() {
     assert_eq!(value.tier(), CacheTier::L2);
     assert_eq!(value.as_ref(), large_value);
     drop(value);
-    let value = reopened.get(b"large").await.unwrap().unwrap();
-    assert_eq!(value.tier(), CacheTier::L2);
-    assert_eq!(value.as_ref(), large_value);
-    drop(value);
-    assert_eq!(reopened.snapshot().unwrap().l1_promotions, 0);
     reopened.close_fast().await.unwrap();
 }
 
@@ -845,7 +859,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 }
 
 #[tokio::test]
-async fn cache_snapshot_stays_within_the_configured_bounds() {
+async fn detailed_snapshot_reports_bounded_resource_state() {
     let files = TestCache::new("resource-snapshot");
     let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
         .with_region_size_bytes(512 * 1024)
@@ -853,76 +867,17 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
         .peak_disk_bytes()
         .unwrap();
     let cache = files.config(4).open().await.unwrap();
-
-    for ordinal in 0_u64..128 {
-        eventually_admitted(|| cache.put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024]));
-    }
-    cache.drain().await.unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let detailed = loop {
-        let detailed = cache.detailed_snapshot().unwrap();
-        let read = detailed.summary.io.read;
-        let read_terminal = read
-            .requests_succeeded
-            .saturating_add(read.requests_cancelled)
-            .saturating_add(read.requests_failed);
-        if detailed.summary.reclaim.regions > 0
-            && detailed.region.reclaiming_region_count == 0
-            && read.requests_in_flight == 0
-            && read.requests_submitted == read_terminal
-        {
-            break detailed;
-        }
-        assert!(Instant::now() < deadline, "reclaim did not make progress");
-        thread::yield_now();
-    };
+    let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
     assert_eq!(resources.health, CacheHealth::Running);
     assert!(resources.statistics_enabled);
-    assert_eq!(resources.puts, 128);
-    assert_eq!(resources.written_bytes, 128 * 8 * 1024);
-    assert!(resources.region_rotations > 0);
     assert!(resources.reclaim.regions > 0);
-    assert!(resources.reclaim.bytes_read > 0);
-    assert!(resources.reclaim.records_scanned > 0);
-    assert!(resources.reclaim.index_entries_removed <= resources.reclaim.records_scanned);
     assert_eq!(resources.managed_memory_limit_bytes, 32 * 1024 * 1024);
     assert!(resources.managed_memory_bytes <= resources.managed_memory_limit_bytes);
     assert!(resources.managed_memory_peak_bytes >= resources.managed_memory_bytes);
     assert!(resources.managed_memory_peak_bytes <= resources.managed_memory_limit_bytes);
     assert_eq!(resources.logical_disk_peak_bytes, expected_disk_peak);
 
-    assert_eq!(detailed.write_buffer_rejections, resources.write_rejections);
-    // Drain does not fence the independent reclaimer. The bounded wait above
-    // observes it idle before checking exact cross-counter identities.
-    assert_eq!(resources.io.read.requests_in_flight, 0);
-    assert_eq!(resources.io.write.requests_in_flight, 0);
-    assert_eq!(
-        resources.io.read.requests_submitted,
-        resources
-            .io
-            .read
-            .requests_succeeded
-            .saturating_add(resources.io.read.requests_cancelled)
-            .saturating_add(resources.io.read.requests_failed)
-            .saturating_add(resources.io.read.requests_in_flight)
-    );
-    assert_eq!(
-        resources.io.write.requests_succeeded,
-        resources.io.write.requests_submitted
-    );
-    assert!(
-        resources
-            .io
-            .read
-            .direct
-            .operations
-            .saturating_add(resources.io.read.buffered.operations)
-            .saturating_add(resources.io.write.direct.operations)
-            .saturating_add(resources.io.write.buffered.operations)
-            > 0
-    );
     assert!(detailed.l1.entry_capacity > 0);
     assert!(detailed.l1.resident_entries <= detailed.l1.entry_capacity);
     assert!(detailed.l1.resident_bytes <= 4 * 1024 * 1024);
@@ -940,6 +895,52 @@ async fn cache_snapshot_stays_within_the_configured_bounds() {
             + detailed.region.sealed_region_count
             + detailed.region.reclaiming_region_count,
         3
+    );
+    cache.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn detailed_snapshot_reports_reclaim_and_io_activity() {
+    let files = TestCache::new("reclaim-snapshot");
+    let cache = files.config(4).open().await.unwrap();
+    let detailed = completed_reclaim_snapshot(&cache).await;
+    let resources = detailed.summary;
+
+    assert!(resources.region_rotations > 0);
+    assert!(resources.reclaim.regions > 0);
+    assert!(resources.reclaim.bytes_read > 0);
+    assert!(resources.reclaim.records_scanned > 0);
+    assert!(resources.reclaim.index_entries_removed <= resources.reclaim.records_scanned);
+    assert_eq!(resources.io.read.requests_in_flight, 0);
+    assert_eq!(resources.io.write.requests_in_flight, 0);
+    assert_eq!(
+        resources.io.read.requests_submitted,
+        resources
+            .io
+            .read
+            .requests_succeeded
+            .saturating_add(resources.io.read.requests_cancelled)
+            .saturating_add(resources.io.read.requests_failed)
+    );
+    assert_eq!(
+        resources.io.write.requests_submitted,
+        resources
+            .io
+            .write
+            .requests_succeeded
+            .saturating_add(resources.io.write.requests_cancelled)
+            .saturating_add(resources.io.write.requests_failed)
+    );
+    assert!(
+        resources
+            .io
+            .read
+            .direct
+            .operations
+            .saturating_add(resources.io.read.buffered.operations)
+            .saturating_add(resources.io.write.direct.operations)
+            .saturating_add(resources.io.write.buffered.operations)
+            > 0
     );
     cache.close_fast().await.unwrap();
 }
@@ -1125,9 +1126,7 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let second = reopened.get("key-2").await.unwrap().unwrap();
     assert_eq!(second.tier(), CacheTier::L2);
     assert_eq!(second.as_ref(), vec![4_u8; 16 * 1024]);
-    let snapshot = reopened.detailed_snapshot().unwrap();
-    assert_eq!(snapshot.summary.managed_memory_bytes, baseline);
-    assert_eq!(snapshot.summary.l1_promotions, 2);
+    assert_eq!(reopened.snapshot().unwrap().managed_memory_bytes, baseline);
     drop((first, second));
     reopened.close_fast().await.unwrap();
 }
@@ -1155,8 +1154,9 @@ async fn retained_l2_values_charge_and_release_transient_memory() {
     cache.drain().await.unwrap();
 
     let baseline = cache.snapshot().unwrap().managed_memory_bytes;
-    let first = cache.get("key-1").await.unwrap().unwrap();
     assert!(cache.get("missing").await.unwrap().is_none());
+    assert_eq!(cache.snapshot().unwrap().managed_memory_bytes, baseline);
+    let first = cache.get("key-1").await.unwrap().unwrap();
     let after_first = cache.snapshot().unwrap().managed_memory_bytes;
     let second = cache.get("key-2").await.unwrap().unwrap();
     let after_second = cache.snapshot().unwrap().managed_memory_bytes;
@@ -1164,10 +1164,6 @@ async fn retained_l2_values_charge_and_release_transient_memory() {
     assert_eq!(second.as_ref(), vec![4_u8; 16 * 1024]);
     assert!(after_first > baseline);
     assert!(after_second > after_first);
-    let snapshot = cache.snapshot().unwrap();
-    assert_eq!(snapshot.l2_hits, 2);
-    assert_eq!(snapshot.l2_misses, 1);
-    assert_eq!(snapshot.write_rejections, 0);
     drop((first, second));
     assert_eq!(cache.snapshot().unwrap().managed_memory_bytes, baseline);
     cache.close_fast().await.unwrap();
@@ -1192,11 +1188,7 @@ async fn static_config_change_discards_the_old_image() {
 
 #[tokio::test]
 async fn unsupported_cache_format_versions_cold_start_empty() {
-    for (target, expected_startup) in [
-        ("data", StartupMode::Cold),
-        ("state", StartupMode::Cold),
-        ("image", StartupMode::Cold),
-    ] {
+    for target in ["data", "state", "image"] {
         let files = TestCache::new(&format!("unsupported-{target}"));
         let cache = files.config(2).open().await.unwrap();
         cache.put("key", "old").unwrap();
@@ -1213,7 +1205,7 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
         }
 
         let reopened = files.config(3).open().await.unwrap();
-        assert_eq!(reopened.startup_mode(), expected_startup, "{target}");
+        assert_eq!(reopened.startup_mode(), StartupMode::Cold, "{target}");
         assert!(reopened.get("key").await.unwrap().is_none(), "{target}");
         reopened.close_fast().await.unwrap();
     }

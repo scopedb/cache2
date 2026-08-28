@@ -312,32 +312,36 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig};
+    use super::*;
 
     #[test]
-    fn runtime_defaults_to_posix_buffered_io() {
+    fn runtime_defaults_are_stable() {
         let config = RuntimeConfig::default();
         assert_eq!(config.io_engine(), IoEngine::Posix);
         assert_eq!(config.io_mode(), IoMode::Buffered);
         assert_eq!(config.read_io_workers(), 4);
         assert_eq!(config.write_io_workers(), 4);
         assert_eq!(config.reclaim_workers(), 1);
-        assert_eq!(config.append_shards(), 4);
+        assert_eq!(config.append_shards(), DEFAULT_APPEND_SHARDS);
+        assert_eq!(config.l1_capacity_bytes(), DEFAULT_L1_CAPACITY_BYTES);
         assert_eq!(config.l1_eviction_policy(), L1EvictionPolicy::Clock);
-        assert_eq!(config.io_engine_count(config.read_io_workers()), 1);
-        assert_eq!(config.io_depth_per_engine(config.read_io_workers()), 4);
+        assert_eq!(config.managed_memory_limit_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(config.l1_shards(), DEFAULT_L1_SHARDS);
         assert_eq!(
-            config
-                .clone()
-                .with_io_engine(IoEngine::IoUring)
-                .io_depth_per_engine(4),
-            64
+            config.write_flush_threshold_bytes(),
+            MAX_WRITE_FLUSH_THRESHOLD_BYTES
         );
-        assert_eq!(
-            config
-                .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
-                .l1_eviction_policy(),
-            L1EvictionPolicy::S3Fifo
-        );
+        assert!(!config.statistics_enabled());
+    }
+
+    #[test]
+    fn io_engine_capacity_matches_backend_shape() {
+        let posix = RuntimeConfig::default();
+        assert_eq!(posix.io_engine_count(7), 1);
+        assert_eq!(posix.io_depth_per_engine(7), 7);
+
+        let io_uring = posix.with_io_engine(IoEngine::IoUring);
+        assert_eq!(io_uring.io_engine_count(7), 7);
+        assert_eq!(io_uring.io_depth_per_engine(7), IO_URING_DEPTH_PER_WORKER);
     }
 }

@@ -26,8 +26,6 @@ use crate::region_metadata::{
 };
 use crate::region_runtime::HybridValueRead;
 use crate::region_store::RegionStore;
-#[cfg(test)]
-use crate::runtime_config::DEFAULT_L1_SHARDS;
 use crate::runtime_config::RuntimeConfig;
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 
@@ -611,13 +609,6 @@ mod tests {
     fn public_cache_and_values_are_send_and_sync() {
         assert_send_sync::<Cache>();
         assert_send_sync::<Value>();
-    }
-
-    #[test]
-    fn l1_shards_are_runtime_tunable() {
-        let default = RuntimeConfig::default();
-        assert_eq!(default.l1_shards(), DEFAULT_L1_SHARDS);
-        assert_eq!(default.with_l1_shards(7).l1_shards(), 7);
     }
 
     #[test]

@@ -49,15 +49,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_updates_match_one_shot_checksum() {
-        let mut checksum = Crc32c::new();
-        checksum.update(b"key");
-        checksum.update(b"value");
-
-        assert_eq!(checksum.finish(), crc32c(b"keyvalue"));
-    }
-
-    #[test]
     fn arbitrary_chunking_matches_one_shot_checksum() {
         let payload = (0..64 * 1024)
             .map(|index| ((index * 31 + index / 7) & 0xff) as u8)

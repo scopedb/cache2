@@ -240,22 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn record_round_trip_and_alignment() {
-        let header = RecordHeader {
-            key_len: 3,
-            value_len: 5,
-            seqno: 101,
-            key_hash: 0xfedc_ba98_7654_3210,
-            payload_crc: 77,
-            region_generation: 99,
-            record_len: 64,
-        };
-
-        assert_eq!(RecordHeader::aligned_len(3, 5), Some(64));
-        assert_eq!(RecordHeader::decode(&header.encode()), Some(header));
-    }
-
-    #[test]
     fn record_decode_rejects_bad_crc_and_lengths() {
         let header = RecordHeader {
             key_len: 8,

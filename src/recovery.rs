@@ -195,14 +195,6 @@ impl DataSuperblock {
         Ok(page)
     }
 
-    #[cfg(test)]
-    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
-        match Self::probe(page) {
-            DataSuperblockProbe::Valid(superblock) => Some(superblock),
-            _ => None,
-        }
-    }
-
     pub(crate) fn probe(page: &[u8]) -> DataSuperblockProbe {
         if page.len() != RECOVERY_PAGE_SIZE {
             return DataSuperblockProbe::Truncated;
@@ -370,14 +362,6 @@ impl RecoveryImageHeader {
         );
         write_page_crc(&mut page);
         Ok(page)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
-        match Self::probe(page) {
-            RecoveryImageHeaderProbe::Valid(header) => Some(header),
-            _ => None,
-        }
     }
 
     pub(crate) fn probe(page: &[u8]) -> RecoveryImageHeaderProbe {
@@ -1033,52 +1017,64 @@ mod tests {
     }
 
     #[test]
-    fn recovery_control_pages_match_committed_golden_bytes() {
+    fn data_superblock_matches_committed_golden_bytes() {
         let data = data_superblock();
-        let clean = record(19, RecoveryState::Clean);
-        let image = image_header();
         let data_golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/data_superblock.golden"
         ));
+
+        assert_eq!(data.encode().unwrap().as_slice(), data_golden);
+        assert_eq!(
+            DataSuperblock::probe(&data_golden),
+            DataSuperblockProbe::Valid(data)
+        );
+    }
+
+    #[test]
+    fn clean_state_matches_committed_golden_bytes() {
+        let clean = record(19, RecoveryState::Clean);
         let clean_golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/clean_state.golden"
         ));
+
+        assert_eq!(clean.encode().unwrap().as_slice(), clean_golden);
+        assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
+    }
+
+    #[test]
+    fn recovery_image_header_matches_committed_golden_bytes() {
+        let data = data_superblock();
+        let header = image_header();
         let image_golden = sparse_golden(include_str!(
             "../tests/fixtures/format_v1/recovery_image_header.golden"
         ));
 
-        assert_eq!(data.encode().unwrap().as_slice(), data_golden);
-        assert_eq!(clean.encode().unwrap().as_slice(), clean_golden);
-        assert_eq!(image.encode().unwrap().as_slice(), image_golden);
-        assert_eq!(DataSuperblock::decode(&data_golden), Some(data));
-        assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
-        assert_eq!(RecoveryImageHeader::decode(&image_golden), Some(image));
-    }
-
-    #[test]
-    fn data_superblock_round_trips_without_session_state() {
-        let expected = data_superblock();
-        let encoded = expected.encode().unwrap();
-
-        assert_eq!(DataSuperblock::decode(&encoded), Some(expected));
+        assert_eq!(header.encode().unwrap().as_slice(), image_golden);
         assert_eq!(
-            DataSuperblock::probe(&encoded),
-            DataSuperblockProbe::Valid(expected)
+            RecoveryImageHeader::probe(&image_golden),
+            RecoveryImageHeaderProbe::Valid(header)
         );
-        assert_eq!(&encoded[112..PAGE_CRC_OFFSET], &[0; PAGE_CRC_OFFSET - 112]);
+        assert!(header.matches_data(data));
+        assert_eq!(header.image_binding(), image());
+
+        let mut wrong_data = data;
+        wrong_data.generation += 1;
+        assert!(!header.matches_data(wrong_data));
     }
 
     #[test]
-    fn data_superblock_rejects_corruption_torn_pages_and_bad_geometry() {
-        let mut corrupt = data_superblock().encode().unwrap();
+    fn data_superblock_probe_rejects_corrupt_truncated_and_reserved_pages() {
+        let encoded = data_superblock().encode().unwrap();
+        assert_eq!(
+            DataSuperblock::probe(&encoded[..2048]),
+            DataSuperblockProbe::Truncated
+        );
+
+        let mut corrupt = encoded;
         corrupt[64] ^= 1;
         assert_eq!(
             DataSuperblock::probe(&corrupt),
             DataSuperblockProbe::Corrupt
-        );
-        assert_eq!(
-            DataSuperblock::probe(&corrupt[..2048]),
-            DataSuperblockProbe::Truncated
         );
 
         let mut reserved = data_superblock().encode().unwrap();
@@ -1098,7 +1094,10 @@ mod tests {
             DataSuperblock::probe(&legacy_hash),
             DataSuperblockProbe::Corrupt
         );
+    }
 
+    #[test]
+    fn data_superblock_encode_rejects_unrepresentable_geometry() {
         let mut bad = data_superblock();
         bad.geometry.data_file_len += 4096;
         assert_eq!(bad.encode(), Err(CodecError::DataSuperblock));
@@ -1136,28 +1135,17 @@ mod tests {
     }
 
     #[test]
-    fn recovery_image_header_round_trips_and_binds_data() {
-        let expected = image_header();
-        let encoded = expected.encode().unwrap();
-
-        assert_eq!(RecoveryImageHeader::decode(&encoded), Some(expected));
-        assert!(expected.matches_data(data_superblock()));
-        assert_eq!(expected.image_binding(), image());
-        assert_eq!(
-            &encoded[usize::from(IMAGE_HEADER_SIZE)..PAGE_CRC_OFFSET],
-            &[0; PAGE_CRC_OFFSET - IMAGE_HEADER_SIZE as usize]
-        );
-    }
-
-    #[test]
-    fn recovery_image_header_rejects_corruption_and_non_page_index() {
+    fn recovery_image_header_probe_rejects_corruption() {
         let mut corrupt = image_header().encode().unwrap();
         corrupt[IMAGE_INDEX_SLOTS_OFFSET] ^= 1;
         assert_eq!(
             RecoveryImageHeader::probe(&corrupt),
             RecoveryImageHeaderProbe::Corrupt
         );
+    }
 
+    #[test]
+    fn recovery_image_header_encode_rejects_invalid_layouts() {
         let mut bad = image_header();
         bad.index_offset += RECOVERY_PAGE_SIZE as u64;
         assert_eq!(bad.encode(), Err(CodecError::RecoveryImageHeader));
@@ -1188,10 +1176,6 @@ mod tests {
         index_only.region_table_len = 0;
         index_only.image_file_len = index_only.index_offset + index_only.index_len;
         assert_eq!(index_only.encode(), Err(CodecError::RecoveryImageHeader));
-
-        let mut wrong_data = data_superblock();
-        wrong_data.generation += 1;
-        assert!(!image_header().matches_data(wrong_data));
     }
 
     #[test]
@@ -1213,18 +1197,16 @@ mod tests {
     #[test]
     fn latest_valid_ignores_a_torn_or_corrupt_newer_slot() {
         let older = record(8, RecoveryState::Clean).encode().unwrap();
-        let mut newer = record(9, RecoveryState::Running).encode().unwrap();
-        newer[72] ^= 1;
+        let newer = record(9, RecoveryState::Running).encode().unwrap();
+        let mut corrupt = newer;
+        corrupt[72] ^= 1;
 
-        let selected = latest_state([&older, &newer]).unwrap().unwrap();
-        assert_eq!(selected.slot, 0);
-        assert_eq!(selected.record.generation, 8);
-        assert_eq!(selected.record.state, RecoveryState::Clean);
-
-        assert_eq!(
-            StateRecord::probe(&newer[..2048]),
-            StateSlotProbe::Truncated
-        );
+        for invalid_newer in [&corrupt[..], &newer[..2048]] {
+            let selected = latest_state([&older, invalid_newer]).unwrap().unwrap();
+            assert_eq!(selected.slot, 0);
+            assert_eq!(selected.record.generation, 8);
+            assert_eq!(selected.record.state, RecoveryState::Clean);
+        }
     }
 
     #[test]
