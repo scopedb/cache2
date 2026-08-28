@@ -94,6 +94,9 @@ Reclaim samples also report reinsert rewrite records and bytes, skipped hot
 records, and conditional replacement misses. A turnover run with L2 hits should
 exercise reinsertion without allowing cumulative rewritten bytes to exceed the
 bounded reclaim budget.
+Set `CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true` for a focused read-heavy run;
+the harness then requires both an accepted hot-record rewrite and a hot record
+skipped by bounded budget or staging pressure.
 
 Value sizes are deterministically mixed on every write instead of running in
 size phases. Repeat a size in `CACHE_SOAK_VALUE_BYTES` to give it proportionally
@@ -175,6 +178,22 @@ index or its 128 MiB volatile heat bitmaps.
 Measure fresh/warm open and close costs at a configurable index scale:
 
 ```sh
+cargo +1.98.0 bench --locked --bench recovery_scale
+```
+
+The harness reports current and peak process RSS after every phase. This shape
+uses a 512 GiB data file while exercising the exact 536,870,912-slot index for
+a 4 TiB cache averaging 16 KiB; it is an index/recovery-scale test, not a
+physical 4 TiB data test:
+
+```sh
+CACHE_RECOVERY_EXPECTED_ENTRIES=268435456 \
+CACHE_RECOVERY_CAPACITY_MIB=524288 \
+CACHE_RECOVERY_MEMORY_MIB=64 \
+CACHE_RECOVERY_MANAGED_MEMORY_LIMIT_MIB=8192 \
+CACHE_RECOVERY_SENTINELS=65536 \
+CACHE_RECOVERY_VALUE_BYTES=16384 \
+CACHE_RECOVERY_DIR=/mnt/nvme \
 cargo +1.98.0 bench --locked --bench recovery_scale
 ```
 
