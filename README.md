@@ -1,6 +1,6 @@
 # C²
 
-[![CI](https://github.com/leiysky/cache-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/leiysky/cache-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/scopedb/cache2/actions/workflows/ci.yml/badge.svg)](https://github.com/scopedb/cache2/actions/workflows/ci.yml)
 
 **A bounded RAM + SSD cache for Tokio applications.**
 
