@@ -102,6 +102,9 @@ more weight in a production-shaped distribution.
 Use `CACHE_SOAK_WARM_REOPEN=true` to publish and reopen a clean image before the
 measured phase. `CACHE_SOAK_*` variables control capacity, managed memory, keys,
 append-shard and worker counts, clients, value sizes, and RSS slack.
+For same-process warm reopen, the RSS bound automatically allows one additional
+L1 capacity for freed allocations retained by libc; configured RSS slack covers
+the runtime, harness, and other non-cache-managed memory.
 
 ## Long correctness and stability run
 
@@ -135,8 +138,9 @@ CACHE_SOAK_IO_MODE=buffered \
 cargo +1.98.0 bench --locked --bench cache_soak
 ```
 
-The operation interval applies to every foreground client and to the initial
-warm prefill; zero preserves the original unpaced behavior. Intervals above one
+The operation interval applies to every measured foreground client. Warm
+prefill is intentionally unpaced and retries bounded `WouldBlock` results so a
+large key space does not add hours before measurement. Intervals above one
 second are rejected so shutdown remains responsive.
 
 Periodic samples are passive and do not drain accepted writes, so backlog and
@@ -151,7 +155,7 @@ complete key space sequentially. Every recovered hit receives the same key,
 version, length, and payload validation as the measured readers. A successful
 run emits `warm_verification ... errors=0` followed by
 `complete ... errors=0 ... io_errors=0`. The configured measured duration does
-not include the paced prefill or final verification scan; the final reported
+not include the unpaced prefill or final verification scan; the final reported
 elapsed time does include the verification work.
 
 ## Focused diagnostics
