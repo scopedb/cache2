@@ -57,14 +57,18 @@ impl StaticConfig {
     ///
     /// `capacity_bytes` is the total Region extent, excluding the data
     /// superblock, state, and clean-image files. The default Region size is
-    /// 32 MiB. Use [`Self::peak_disk_bytes`] for the cache-owned logical disk
-    /// bound.
+    /// 32 MiB. A default plan above 4 TiB exceeds the supported index size and
+    /// fails validation; use [`Self::with_expected_entries`] when a larger
+    /// average entry permits a smaller explicit index. Use
+    /// [`Self::peak_disk_bytes`] for the cache-owned logical disk bound.
     pub fn new(capacity_bytes: u64) -> Self {
         let expected_entries = capacity_bytes / DEFAULT_EXPECTED_ENTRY_BYTES;
-        let index_slots = expected_entries
-            .saturating_mul(2)
-            .clamp(MIN_INDEX_SLOTS as u64, MAX_INDEX_SLOTS as u64)
-            as usize;
+        let index_slots = usize::try_from(
+            expected_entries
+                .saturating_mul(2)
+                .max(MIN_INDEX_SLOTS as u64),
+        )
+        .unwrap_or(usize::MAX);
         Self {
             capacity_bytes,
             region_size_bytes: DEFAULT_REGION_SIZE,
@@ -627,5 +631,19 @@ mod tests {
 
         assert_eq!(config.index_slots(), 536_870_912);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn default_index_sizing_does_not_silently_clamp_above_four_tib() {
+        let capacity = (4_u64 << 40) + DEFAULT_REGION_SIZE;
+        let implicit = StaticConfig::new(capacity);
+
+        assert!(implicit.index_slots() > MAX_INDEX_SLOTS);
+        assert!(implicit.validate().is_err());
+
+        StaticConfig::new(capacity)
+            .with_expected_entries(MAX_INDEX_SLOTS / 2)
+            .validate()
+            .unwrap();
     }
 }
