@@ -17,29 +17,27 @@ an availability event rather than a data-loss event.
 
 ```rust
 use cache2::CacheBuilder;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 
-# async fn example() -> std::io::Result<()> {
-let cache = CacheBuilder::new("/var/tmp/cache2.data", 1024 * 1024 * 1024)
-    .open()
-    .await?;
+async fn run() -> io::Result<()> {
+    let cache = CacheBuilder::new("/var/tmp/cache2.data", 1024 * 1024 * 1024)
+        .open()
+        .await?;
 
-match cache.put(b"chunk:42", b"cached bytes") {
-    Ok(_) => {}
-    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-        // Cache admission is full. Continue through the authoritative path.
+    match cache.put(b"chunk:42", b"cached bytes") {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            // Cache admission is full. Continue through the authoritative path.
+        }
+        Err(error) => return Err(error),
     }
-    Err(error) => return Err(error),
-}
 
-if let Some(value) = cache.get(b"chunk:42").await? {
-    consume(value.as_ref());
-}
+    if let Some(value) = cache.get(b"chunk:42").await? {
+        println!("cache hit: {} bytes", value.len());
+    }
 
-cache.close_warm().await?;
-# Ok(())
-# }
-# fn consume(_: &[u8]) {}
+    cache.close_warm().await
+}
 ```
 
 `open` uses the current Tokio runtime. Use
