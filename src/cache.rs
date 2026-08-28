@@ -467,9 +467,11 @@ impl Cache {
         Ok(snapshot)
     }
 
-    /// Samples queue, I/O, and Region state in addition to the regular
-    /// cache summary. This is intended for periodic diagnostics rather than a
-    /// request hot path because it briefly locks and scans Region metadata.
+    /// Samples L1, index, queue, I/O, and Region state in addition to the
+    /// regular cache summary. This is intended for periodic diagnostics rather
+    /// than a request hot path because it briefly reads every configured L1
+    /// shard and index partition and scans Region metadata. It never scans
+    /// index slots or Region data.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
         let mut snapshot = self.store.detailed_snapshot()?;
         snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;

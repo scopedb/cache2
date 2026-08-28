@@ -145,8 +145,9 @@ pub struct RegionSnapshot {
     pub rotations: u64,
 }
 
-/// On-demand operational detail. Producing this value briefly locks and scans
-/// Region metadata.
+/// On-demand operational detail. Producing this value briefly reads every L1
+/// shard and index partition and scans Region metadata. It does not scan index
+/// slots or Region data.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {

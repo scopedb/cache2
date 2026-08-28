@@ -158,8 +158,9 @@ byte rate by the operation rate. The current counters support average request
 time, not latency percentiles.
 
 `Cache::detailed_snapshot()` additionally reports L1/index pressure, staging,
-and Region occupancy. It briefly locks and scans Region metadata, so sample it
-slowly or on demand rather than from a scrape callback.
+and Region occupancy. It briefly reads every configured L1 shard and index
+partition and scans Region metadata, but never scans index slots or Region
+data. Sample it slowly or on demand rather than from a scrape callback.
 
 Structural or device failure moves reads to fail-open misses when safe operation
 cannot continue. Writes remain explicit errors. Normal cache misses and request
