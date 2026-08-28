@@ -16,9 +16,11 @@ use logforth::layout::JsonLayout;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
+const KEY_BYTES: usize = 25;
+const KEY_PREFIX: &[u8; 17] = b"cache2-soak-key-v";
 const VALUE_HEADER_BYTES: usize = 16;
 // The generated key is 25 bytes; reserve it and the 48-byte v1 record header.
-const MAX_VALUE_BYTES: usize = REGION_BYTES - 25 - 48;
+const MAX_VALUE_BYTES: usize = REGION_BYTES - KEY_BYTES - 48;
 const DELETE_INTERVAL: u64 = 64;
 const OVERLOAD_DELAY: Duration = Duration::from_micros(50);
 const DEFAULT_VALUE_BYTES: [usize; 4] = [256, 4 * 1024, 16 * 1024, 256 * 1024];
@@ -299,26 +301,14 @@ fn main() -> io::Result<()> {
     let static_config = config.static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes()?;
     let mut cache = open_cache(&runtime, &files, &config)?;
-    let keys: Vec<Box<[u8]>> = (0..config.key_count)
-        .map(|ordinal| {
-            format!("soak-key-{ordinal:016x}")
-                .into_bytes()
-                .into_boxed_slice()
-        })
-        .collect();
-    let key_count = u64::try_from(keys.len()).map_err(|_| invalid("soak key count exceeds u64"))?;
+    let key_count =
+        u64::try_from(config.key_count).map_err(|_| invalid("soak key count exceeds u64"))?;
     let value_size_count = u64::try_from(config.value_bytes.len())
         .map_err(|_| invalid("soak value-size count exceeds u64"))?;
     let expected: Vec<_> = (0..config.key_count).map(|_| AtomicU64::new(0)).collect();
     let first_write = if config.warm_reopen {
-        let next = populate_for_warm_reopen(
-            &cache,
-            &config,
-            &keys,
-            &expected,
-            key_count,
-            value_size_count,
-        )?;
+        let next =
+            populate_for_warm_reopen(&cache, &config, &expected, key_count, value_size_count)?;
         runtime.block_on(cache.drain())?;
         runtime.block_on(cache.close_warm())?;
         cache = open_cache(&runtime, &files, &config)?;
@@ -383,7 +373,6 @@ fn main() -> io::Result<()> {
                 let result = run_writer(
                     &cache,
                     &config,
-                    &keys,
                     &expected,
                     key_count,
                     value_size_count,
@@ -400,7 +389,6 @@ fn main() -> io::Result<()> {
         for reader_id in 0..config.readers {
             let cache = &cache;
             let config = &config;
-            let keys = &keys;
             let expected = &expected;
             let next_read = &next_read;
             let stop = &stop;
@@ -410,7 +398,6 @@ fn main() -> io::Result<()> {
                 let result = run_reader(
                     cache,
                     config,
-                    keys,
                     expected,
                     key_count,
                     value_size_count,
@@ -496,7 +483,6 @@ fn main() -> io::Result<()> {
         let verification = verify_warm_reopen(
             &runtime,
             &cache,
-            &keys,
             &expected,
             value_size_count,
             &config.value_bytes,
@@ -512,7 +498,7 @@ fn main() -> io::Result<()> {
         runtime.block_on(cache.close_fast())?;
         println!(
             "warm_verification keys={} hits={} stale_hits={} misses={} l2_hits={} l2_misses={} managed={} managed_peak={} errors=0",
-            keys.len(),
+            config.key_count,
             verification.hits,
             verification.stale_hits,
             verification.misses,
@@ -565,7 +551,6 @@ fn open_cache(
 fn populate_for_warm_reopen(
     cache: &Cache,
     config: &SoakConfig,
-    keys: &[Box<[u8]>],
     expected: &[AtomicU64],
     key_count: u64,
     value_size_count: u64,
@@ -574,7 +559,6 @@ fn populate_for_warm_reopen(
     let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     for ordinal in 0..total {
-        pace(config.operation_interval);
         let announced = ordinal
             .checked_add(1)
             .ok_or_else(|| invalid("warm-reopen write ordinal exhausted"))?;
@@ -587,8 +571,9 @@ fn populate_for_warm_reopen(
         value[..8].copy_from_slice(&ordinal.to_le_bytes());
         value[8..VALUE_HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
         expected[key_index].fetch_max(announced, Ordering::SeqCst);
+        let key = soak_key(key_index as u64);
         loop {
-            match cache.put(&keys[key_index], &value[..value_bytes]) {
+            match cache.put(key, &value[..value_bytes]) {
                 Ok(_) => break,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(OVERLOAD_DELAY);
@@ -604,7 +589,6 @@ fn populate_for_warm_reopen(
 fn run_writer(
     cache: &Cache,
     config: &SoakConfig,
-    keys: &[Box<[u8]>],
     expected: &[AtomicU64],
     key_count: u64,
     value_size_count: u64,
@@ -636,8 +620,9 @@ fn run_writer(
         // visible value as future. Rejected attempts only make validation more
         // conservative; stale and missing values are permitted.
         expected[key_index].fetch_max(announced, Ordering::SeqCst);
+        let key = soak_key(key_index as u64);
         let put_started = Instant::now();
-        match cache.put(&keys[key_index], &value[..value_bytes]) {
+        match cache.put(key, &value[..value_bytes]) {
             Ok(_) => {
                 record_latency(&counters.max_put_ns, put_started.elapsed());
                 counters.writes.fetch_add(1, Ordering::Relaxed);
@@ -653,7 +638,7 @@ fn run_writer(
 
         if announced.is_multiple_of(DELETE_INTERVAL) {
             let delete_started = Instant::now();
-            match cache.delete(&keys[key_index]) {
+            match cache.delete(key) {
                 Ok(_) => {
                     record_latency(&counters.max_delete_ns, delete_started.elapsed());
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
@@ -674,7 +659,6 @@ fn run_writer(
 fn run_reader(
     cache: &Cache,
     config: &SoakConfig,
-    keys: &[Box<[u8]>],
     expected: &[AtomicU64],
     key_count: u64,
     value_size_count: u64,
@@ -693,8 +677,9 @@ fn run_reader(
         let ordinal = next_read.fetch_add(1, Ordering::Relaxed);
         let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
             .map_err(|_| invalid("soak sampled key exceeds usize"))?;
+        let key = soak_key(sampled as u64);
         let get_started = Instant::now();
-        match runtime.block_on(cache.get(&keys[sampled]))? {
+        match runtime.block_on(cache.get(&key))? {
             Some(observed) => {
                 record_latency(&counters.max_get_ns, get_started.elapsed());
                 let latest = expected[sampled].load(Ordering::SeqCst);
@@ -722,16 +707,16 @@ fn run_reader(
 fn verify_warm_reopen(
     runtime: &tokio::runtime::Runtime,
     cache: &Cache,
-    keys: &[Box<[u8]>],
     expected: &[AtomicU64],
     value_size_count: u64,
     value_bytes: &[usize],
 ) -> io::Result<WarmVerification> {
     let mut verification = WarmVerification::default();
-    for (sampled, key) in keys.iter().enumerate() {
-        match runtime.block_on(cache.get(key))? {
+    for (sampled, expected) in expected.iter().enumerate() {
+        let key = soak_key(sampled as u64);
+        match runtime.block_on(cache.get(&key))? {
             Some(observed) => {
-                let latest = expected[sampled].load(Ordering::SeqCst);
+                let latest = expected.load(Ordering::SeqCst);
                 if validate_observed(sampled, &observed, latest, value_size_count, value_bytes)? {
                     verification.stale_hits = verification.stale_hits.saturating_add(1);
                 }
@@ -741,6 +726,13 @@ fn verify_warm_reopen(
         }
     }
     Ok(verification)
+}
+
+fn soak_key(ordinal: u64) -> [u8; KEY_BYTES] {
+    let mut key = [0_u8; KEY_BYTES];
+    key[..KEY_PREFIX.len()].copy_from_slice(KEY_PREFIX);
+    key[KEY_PREFIX.len()..].copy_from_slice(&ordinal.to_le_bytes());
+    key
 }
 
 fn validate_observed(
