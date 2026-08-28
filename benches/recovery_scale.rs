@@ -287,10 +287,58 @@ fn require_startup(observed: StartupMode, expected: StartupMode) -> io::Result<(
 
 fn emit(phase: &str, elapsed: Duration) {
     println!(
-        "result phase={phase} elapsed_ns={} elapsed_seconds={:.6}",
+        "result phase={phase} elapsed_ns={} elapsed_seconds={:.6} current_rss_bytes={} peak_rss_bytes={}",
         elapsed.as_nanos(),
         elapsed.as_secs_f64(),
+        current_rss_bytes(),
+        peak_rss_bytes(),
     );
+}
+
+#[cfg(unix)]
+fn peak_rss_bytes() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` points to writable storage for one `rusage` value.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: a successful getrusage initialized the complete value.
+    let usage = unsafe { usage.assume_init() };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        u64::try_from(usage.ru_maxrss).unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        u64::try_from(usage.ru_maxrss)
+            .unwrap_or(0)
+            .saturating_mul(1024)
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_ascii_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        })
+        .unwrap_or(0)
+        .saturating_mul(1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> u64 {
+    0
 }
 
 fn emit_sizes(files: &ScaleFiles, peak_disk_bytes: u64) -> io::Result<()> {
