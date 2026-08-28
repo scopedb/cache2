@@ -535,8 +535,7 @@ impl FileRegionCore {
             Ok(result) if self.health.is_healthy() => Ok(result),
             Ok(_) => Ok(None),
             Err(error) => {
-                self.health
-                    .enter_miss_only_with_error("index_lookup_failed", &error);
+                enter_miss_only_for_index_error(&self.health, &error);
                 Ok(None)
             }
         }
@@ -554,8 +553,7 @@ impl FileRegionCore {
                 return None;
             }
             Err(error) => {
-                self.health
-                    .enter_miss_only_with_error("index_lookup_failed", &error);
+                enter_miss_only_for_index_error(&self.health, &error);
                 return None;
             }
         };
@@ -875,7 +873,7 @@ impl FileRegionCore {
                 Ok(None)
             }
             Err(error) => {
-                self.health.enter_miss_only();
+                enter_miss_only_for_index_error(&self.health, &error);
                 Err(index_storage_io_error(error))
             }
         }
@@ -1109,7 +1107,7 @@ impl FileRegionCore {
                 None => self.index.upsert(record.hash(), entry),
             };
             if let Err(error) = published {
-                self.health.enter_miss_only();
+                enter_miss_only_for_index_error(&self.health, &error);
                 return Err(index_storage_io_error(error));
             }
         }
@@ -1241,7 +1239,19 @@ pub(super) fn guarded_index_result<T>(
     result: Result<T, IndexStorageError>,
 ) -> io::Result<T> {
     result.map_err(|error| {
-        health.enter_miss_only();
+        enter_miss_only_for_index_error(health, &error);
         index_storage_io_error(error)
     })
+}
+
+fn enter_miss_only_for_index_error(health: &RegionHealthLatch, error: &IndexStorageError) {
+    let reason = match error {
+        IndexStorageError::CorruptPage { .. } | IndexStorageError::CorruptSlot { .. } => {
+            "index_recovery_validation_failed"
+        }
+        IndexStorageError::PartitionPoisoned { .. } => "index_partition_poisoned",
+        IndexStorageError::Io(_) => "index_storage_io_failed",
+        _ => "index_storage_invalid",
+    };
+    health.enter_miss_only_with_error(reason, error);
 }
