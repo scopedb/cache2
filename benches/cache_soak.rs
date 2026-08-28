@@ -17,7 +17,8 @@ use logforth::layout::JsonLayout;
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
 const VALUE_HEADER_BYTES: usize = 16;
-const MAX_VALUE_BYTES: usize = REGION_BYTES - 64;
+// The generated key is 25 bytes; reserve it and the 48-byte v1 record header.
+const MAX_VALUE_BYTES: usize = REGION_BYTES - 25 - 48;
 const DELETE_INTERVAL: u64 = 64;
 const OVERLOAD_DELAY: Duration = Duration::from_micros(50);
 const DEFAULT_VALUE_BYTES: [usize; 4] = [256, 4 * 1024, 16 * 1024, 256 * 1024];
