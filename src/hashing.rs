@@ -79,23 +79,52 @@ impl FixedPrehashedMap {
     }
 
     pub(crate) fn remove(&mut self, hash: u64) -> Option<u32> {
-        let slots = &mut self.slots;
-        if slots.is_empty() {
+        if self.slots.is_empty() {
             return None;
         }
-        let start = fixed_map_start(hash, slots.len());
-        for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let slot = &mut slots[(start + step) & (slots.len() - 1)];
+        let start = fixed_map_start(hash, self.slots.len());
+        for step in 0..self.slots.len().min(MAX_FIXED_MAP_PROBES) {
+            let index = (start + step) & (self.slots.len() - 1);
+            let slot = self.slots[index];
             if slot.value == EMPTY_VALUE {
                 return None;
             }
             if slot.value != DELETED_VALUE && slot.hash == hash {
                 let previous = slot.value;
-                slot.value = DELETED_VALUE;
+                self.slots[index].value = DELETED_VALUE;
+                self.compact_deleted(index);
                 return Some(previous);
             }
         }
         None
+    }
+
+    /// Moves one deletion hole toward the end of its linear-probe cluster.
+    /// Finding an empty slot restores the hole to Empty, so lifetime key churn
+    /// cannot turn the whole fixed table into tombstones. Pathological clusters
+    /// retain one tombstone after the same fixed probe budget used by lookups.
+    fn compact_deleted(&mut self, mut hole: usize) {
+        let slot_count = self.slots.len();
+        debug_assert!(slot_count.is_power_of_two());
+        let mask = slot_count - 1;
+        let scan_steps = slot_count.saturating_sub(1).min(MAX_FIXED_MAP_PROBES);
+        let mut cursor = (hole + 1) & mask;
+        for _ in 0..scan_steps {
+            let candidate = self.slots[cursor];
+            if candidate.value == EMPTY_VALUE {
+                self.slots[hole] = FixedMapSlot::default();
+                return;
+            }
+            if candidate.value != DELETED_VALUE {
+                let home = fixed_map_start(candidate.hash, slot_count);
+                if probe_distance(home, hole, mask) < probe_distance(home, cursor, mask) {
+                    self.slots[hole] = candidate;
+                    self.slots[cursor].value = DELETED_VALUE;
+                    hole = cursor;
+                }
+            }
+            cursor = (cursor + 1) & mask;
+        }
     }
 
     fn find_upsert_slot(&self, hash: u64) -> Option<(usize, Option<u32>)> {
@@ -137,6 +166,10 @@ fn fixed_map_start(hash: u64, slots: usize) -> usize {
     route_hash(hash.rotate_left(32), slots)
 }
 
+fn probe_distance(home: usize, index: usize, mask: usize) -> usize {
+    index.wrapping_sub(home) & mask
+}
+
 /// Preserves modulo routing while avoiding integer division for the common
 /// power-of-two shard and worker counts.
 pub(crate) fn route_hash(hash: u64, buckets: usize) -> usize {
@@ -165,6 +198,66 @@ mod tests {
         assert_eq!(map.get(7), None);
         assert_eq!(map.insert(23, 19), Some(None));
         assert_eq!(map.get(23), Some(19));
+    }
+
+    #[test]
+    fn fixed_map_delete_preserves_a_wrapped_collision_chain() {
+        let mut map = FixedPrehashedMap::try_new(4).unwrap();
+        let hashes = [7_u64 << 32, 15_u64 << 32, 23_u64 << 32];
+        for (value, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(map.insert(hash, value as u32), Some(None));
+        }
+
+        assert_eq!(map.remove(hashes[0]), Some(0));
+        assert_eq!(map.get(hashes[0]), None);
+        assert_eq!(map.get(hashes[1]), Some(1));
+        assert_eq!(map.get(hashes[2]), Some(2));
+        assert_eq!(map.remove(hashes[1]), Some(1));
+        assert_eq!(map.get(hashes[2]), Some(2));
+    }
+
+    #[test]
+    fn lifetime_key_turnover_restores_empty_directory_slots() {
+        let mut map = FixedPrehashedMap::try_new(32).unwrap();
+        let slot_count = map.slots.len();
+        for start in 0..slot_count {
+            let hash = (start as u64) << 32;
+            assert_eq!(fixed_map_start(hash, slot_count), start);
+            assert_eq!(map.insert(hash, start as u32), Some(None));
+            assert_eq!(map.remove(hash), Some(start as u32));
+        }
+
+        assert!(map.slots.iter().all(|slot| slot.value == EMPTY_VALUE));
+    }
+
+    #[test]
+    fn bounded_delete_compaction_matches_long_churn_reference() {
+        let mut map = FixedPrehashedMap::try_new(32).unwrap();
+        let mut expected = Vec::<(u64, u32)>::new();
+        for ordinal in 0_u32..100_000 {
+            if expected.len() == 32 {
+                let victim = (ordinal as usize * 17) % expected.len();
+                let (hash, value) = expected.swap_remove(victim);
+                assert_eq!(map.remove(hash), Some(value));
+            }
+
+            let hash = (u64::from(ordinal & 7) << 32) | u64::from(ordinal);
+            assert_eq!(map.insert(hash, ordinal), Some(None));
+            expected.push((hash, ordinal));
+
+            if ordinal % 11 == 0 {
+                let victim = (ordinal as usize * 13) % expected.len();
+                let (hash, value) = expected.swap_remove(victim);
+                assert_eq!(map.remove(hash), Some(value));
+            }
+            if ordinal % 64 == 0 {
+                for &(hash, value) in &expected {
+                    assert_eq!(map.get(hash), Some(value));
+                }
+                let missing = u64::from(ordinal) | (1_u64 << 63);
+                assert_eq!(map.get(missing), None);
+            }
+        }
     }
 
     #[test]
