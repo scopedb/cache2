@@ -69,8 +69,10 @@ configuration, raw output, checksums, and turnover soak:
 
 A release-quality run requires a clean worktree, exact Rust 1.98.0, a data set
 larger than physical RAM, a non-rotational NVMe device, four configured
-performance gates, and the full four-hour soak. Shorter or relaxed runs are
-preflight evidence only; the script records that distinction.
+performance gates, and the full four-hour soak. The soak forces an initial warm
+reopen, measured-path coverage, and a final all-key warm-recovery verification.
+Shorter or relaxed runs are preflight evidence only; the script records that
+distinction.
 
 ## Turnover soak
 

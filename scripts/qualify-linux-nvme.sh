@@ -330,12 +330,21 @@ echo "starting ${soak_seconds}s POSIX/buffered turnover soak"
 CACHE_SOAK_SECONDS="$soak_seconds" \
 CACHE_SOAK_SAMPLE_SECONDS="$sample_seconds" \
 CACHE_SOAK_DIR="$cache_directory" \
+CACHE_SOAK_WARM_REOPEN=true \
+CACHE_SOAK_FINAL_WARM_VERIFY=true \
+CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=buffered \
   cargo +1.98.0 bench --locked --bench cache_soak --quiet 2>&1 \
   | tee "$report_directory/soak-posix-buffered.log"
 
-if ! grep -q '^complete .* errors=0 ' "$report_directory/soak-posix-buffered.log"; then
+if ! grep -q '^warm_verification .* errors=0$' \
+  "$report_directory/soak-posix-buffered.log"; then
+  echo "soak did not produce a successful warm-recovery verification" >&2
+  exit 1
+fi
+if ! grep -q '^complete .* errors=0 .* io_errors=0 ' \
+  "$report_directory/soak-posix-buffered.log"; then
   echo "soak did not produce a successful completion record" >&2
   exit 1
 fi
