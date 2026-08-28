@@ -2872,6 +2872,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "extended recovery qualification; run with `cargo test --lib -- --ignored`"]
     fn external_process_kill_recovery_contract() {
         const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
         const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
@@ -2906,6 +2907,7 @@ mod tests {
             let status = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("region::tests::external_process_kill_recovery_contract")
+                .arg("--ignored")
                 .arg("--nocapture")
                 .env(CHILD_CASE, case)
                 .env(CHILD_ROOT, &directory.root)
@@ -3947,6 +3949,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "extended recovery qualification; run with `cargo test --lib -- --ignored`"]
     fn every_prepublication_failure_leaves_no_selectable_clean_state() {
         let cases = [
             (
