@@ -3168,6 +3168,31 @@ mod tests {
     }
 
     #[test]
+    fn four_tib_region_metadata_round_trips_into_runtime_authority() {
+        const CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+        const REGION_SIZE: u64 = 32 * 1024 * 1024;
+        const REGION_COUNT: u32 = (CAPACITY_BYTES / REGION_SIZE) as u32;
+
+        let mut data = test_data_superblock_with_regions(REGION_COUNT);
+        data.geometry.region_size = REGION_SIZE;
+        data.geometry.data_file_len =
+            DataGeometry::expected_file_len(REGION_SIZE, REGION_COUNT).unwrap();
+        let metadata =
+            empty_region_metadata(data, crate::index::MAX_INDEX_SLOTS, REGION_SHARDS).unwrap();
+        let encoded = metadata.encode().unwrap();
+        assert_eq!(encoded.len() as u64, metadata.encoded_len().unwrap());
+
+        let recovered = RegionMetadata::decode(&encoded).unwrap();
+        let manager = RegionManager::from_metadata(recovered).unwrap();
+        let snapshot = manager.region_snapshot().unwrap();
+        assert_eq!(snapshot.capacity_bytes, CAPACITY_BYTES);
+        assert_eq!(snapshot.active_region_count, REGION_SHARDS);
+        assert_eq!(snapshot.free_region_count, REGION_COUNT - REGION_SHARDS);
+        assert_eq!(snapshot.sealed_region_count, 0);
+        assert_eq!(manager.next_seqno(), u64::from(REGION_SHARDS) + 1);
+    }
+
+    #[test]
     fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
         let data = data_path_superblock();
         let runtime = FileRegionRuntime::install(
