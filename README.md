@@ -1,129 +1,168 @@
 # C²
 
-C² (`cache2`) is a bounded RAM and SSD cache for Tokio applications. It is
-designed for large, disposable file-chunk caches where request-path simplicity
-matters more than freshness or durability.
+[![CI](https://github.com/leiysky/cache-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/leiysky/cache-rs/actions/workflows/ci.yml)
 
-## Semantics
+**A bounded RAM + SSD cache for Tokio applications.**
 
-- C² is not a source of truth. A hit may be stale, and a miss, eviction, bypass,
-  or overload is a valid result.
-- Keys are raw bytes in one key space. There are no namespaces or TTLs. Keys may
-  be at most 4 KiB; one encoded record must fit in a Region.
-- `put`, `put_l2`, and `delete` use bounded in-memory admission. They may return
-  `WouldBlock`, but never wait for device I/O.
-- `get` checks L1 and then L2. A true index miss returns immediately. An admitted
-  L2 hit performs one bounded read and validates the complete record locally.
-- Sequence numbers help order bounded internal updates. They are not freshness
-  tokens and do not prevent stale reads.
-- `drain` waits for accepted mutations to finish; it does not make them durable.
-  A crash or fast close reopens empty. Only `close_warm` creates a recoverable
-  clean image.
+C² (`cache2`) is disposable acceleration for large file chunks. It keeps the
+request path short, bounds every cache-owned resource, and treats cache loss as
+an availability event rather than a data-loss event.
+
+- Sharded CLOCK or S3-FIFO L1 with a compact, fixed-size L2 index.
+- Batched Region writes and independent read, write, and reclaim I/O capacity.
+- Best-effort consistency: stale hits are allowed; corrupt or wrong-key values
+  are never returned.
 
 ## Quick start
 
 ```rust
 use cache2::CacheBuilder;
+use std::io::ErrorKind;
 
 # async fn example() -> std::io::Result<()> {
-let cache = CacheBuilder::new("/mnt/nvme/cache2.data", 64 * 1024 * 1024 * 1024)
+let cache = CacheBuilder::new("/var/tmp/cache2.data", 1024 * 1024 * 1024)
     .open()
     .await?;
 
-cache.put(b"chunk:42", b"cached bytes")?;
+match cache.put(b"chunk:42", b"cached bytes") {
+    Ok(_) => {}
+    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+        // Cache admission is full. Continue through the authoritative path.
+    }
+    Err(error) => return Err(error),
+}
 
 if let Some(value) = cache.get(b"chunk:42").await? {
     consume(value.as_ref());
 }
 
-cache.delete(b"chunk:42")?;
 cache.close_warm().await?;
 # Ok(())
 # }
 # fn consume(_: &[u8]) {}
 ```
 
-Treat `WouldBlock` as a cache admission rejection and continue through the
-authoritative path. `put_l2` is useful for prefetch: it skips L1 admission and
-becomes visible after its Region write publishes to the L2 index. Call `drain`
-when a caller must wait for all accepted prefetches to become visible.
+`open` uses the current Tokio runtime. Use
+`CacheBuilder::with_tokio_handle` to bind C² to another runtime; it must have
+time enabled and outlive the cache.
 
-`open` uses the current Tokio runtime. `CacheBuilder::with_tokio_handle` binds
-the cache to another runtime, which must have time enabled and outlive the
-cache. Prefer an explicit async close; dropping an open cache performs a
-synchronous fast close.
+## Contract
+
+C² is a cache, not a source of truth:
+
+- Hits may be stale. Misses, eviction, L1 bypass, and bounded overload are
+  normal outcomes.
+- Keys are raw bytes in one key space. There are no namespaces or TTLs.
+- Keys may be at most 4 KiB. A complete encoded record must fit in one Region.
+- Sequence numbers order cheap internal updates; they are not freshness tokens.
+
+The public operations have deliberately different completion points:
+
+- **`put`** attempts immediate L1 admission and stages the same value for L2.
+- **`put_l2`** stages a prefetch without admitting its payload to L1. It becomes
+  visible after the completed Region write publishes to the index.
+- **`delete`** removes the current L2 mapping and cleans L1 best effort. It
+  appends no record.
+- **`get`** checks L1 and then L2. A true index miss returns immediately; an
+  admitted L2 candidate performs one bounded record read and local validation.
+
+`put`, `put_l2`, and `delete` may return `WouldBlock`, but they never wait for
+device I/O. `drain` waits for accepted mutations to complete; it is not a
+durability sync.
+
+A crash, drop, or `close_fast` reopens empty. `close_warm` is the only shutdown
+that publishes a recoverable clean image. Prefer explicit async close because
+dropping an open cache performs a synchronous fast close.
 
 ## Configuration
 
-Defaults are intended to be safe starting points. Tune from measurements, not
-from device count alone.
+`StaticConfig` defines the persistent L2 layout. `RuntimeConfig` controls the
+process-local topology and may normally change between opens.
 
-| Area | Controls | Notes |
-| --- | --- | --- |
-| L2 layout | `StaticConfig` capacity, Region size, expected entries | The default assumes 16 KiB average entries and allocates about two index slots per live key. Layout changes cold-start the cache. |
-| L1 | capacity, shard count, CLOCK or S3-FIFO | Set capacity to zero to disable L1. Entries charged above 256 KiB bypass L1 but remain valid in L2. |
-| Writes | append shards, write workers, flush threshold | Each append shard owns one Active Region, two Region-sized buffers, and one ordered worker. |
-| Reads | read workers, optional wait timeout | Read and write execution capacity are independent. Zero wait is the default. |
-| Reclaim | reclaim workers | Each worker owns one Region-sized scan buffer and an independent read lane. |
-| Memory | managed-memory limit | Covers cache-owned index, L1, staging, metadata, threads, reclaim, and transient reads; it does not bound allocator, Tokio, or kernel memory. |
-| I/O | POSIX or io_uring; buffered or direct | Buffered POSIX I/O is the default and production path. io_uring is an optional experimental feature in 0.1. |
-| Metrics | statistics on or off | Health and resource gauges are always available; activity counters are opt-in. |
+### Static layout
 
-A non-zero read wait is for deployments where a short local queue is cheaper
-than an origin fetch:
+- `StaticConfig::new(capacity_bytes)` uses 32 MiB Regions and assumes 16 KiB
+  average live entries when sizing the fixed index.
+- `with_region_size_bytes` changes Region geometry.
+- `with_expected_entries` sizes the index for the expected simultaneously live
+  key count, not lifetime writes.
+- `peak_disk_bytes` reports the maximum cache-owned logical disk space.
 
-```rust
-use cache2::RuntimeConfig;
-use std::time::Duration;
+Changing static layout safely cold-starts the cache. The complete geometry and
+memory plan are validated before cache files are created.
 
-let runtime = RuntimeConfig::default()
-    .with_read_io_wait_timeout(Duration::from_millis(2));
-```
+### Runtime tuning
 
-Only read-engine capacity is queued, with at most one waiter per read worker.
-No record buffer is held while waiting. Queue saturation, memory pressure, or
-deadline expiry is returned as overload; with the default zero timeout the same
-resource pressure fails open as a miss.
+- **L1:** `with_l1_capacity_bytes`, `with_l1_shards`, and
+  `with_l1_eviction_policy`. Zero capacity disables L1. Entries charged above
+  256 KiB bypass L1 but remain valid in L2.
+- **Reads:** `with_read_io_workers` and `with_read_io_wait_timeout`.
+- **Writes:** `with_write_io_workers`, `with_append_shards`, and
+  `with_write_flush_threshold_bytes`.
+- **Reclaim:** `with_reclaim_workers`.
+- **Memory:** `with_managed_memory_limit_bytes`.
+- **I/O:** `with_io_engine` and `with_io_mode`.
+- **Metrics:** `with_statistics`.
 
-C² accepts one data-file path. Put multiple homogeneous SSDs behind RAID0 or an
-equivalent striped block device instead of adding a second striping layer to the
-cache. RAID loss discards the whole cache, which matches the cache contract.
+The defaults use buffered POSIX I/O, CLOCK, four read workers, four write
+workers, four append shards, one reclaim worker, a 256 MiB L1, and a 1 GiB
+managed-memory limit. Changing the append-shard count makes an existing clean
+image ineligible and safely cold-starts the cache.
 
-`StaticConfig::peak_disk_bytes()` reports the maximum cache-owned logical disk
-space. Opening validates the complete static geometry and managed-memory plan
-before creating files. A static mismatch, incompatible format, or changed
-append-shard topology safely starts empty.
+Read waiting is disabled by default, so read-engine or buffer pressure fails
+open as a miss. A non-zero `with_read_io_wait_timeout` lets an L2 candidate wait
+briefly for execution capacity. The queue allows at most one waiter per read
+worker and holds no record buffer while waiting. Queue saturation, memory
+pressure, or timeout is returned as explicit overload.
+
+Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
+mode. io_uring requires the `io-uring` feature and is experimental in 0.1.
+
+## Deployment
+
+C² accepts one data-file path. For multiple homogeneous SSDs, expose RAID0 or
+an equivalent striped block device below the filesystem. Losing any member
+discards the complete cache, which matches C²'s failure contract.
+
+The managed-memory limit covers the index, L1, append and reclaim buffers,
+metadata, cache-owned threads, recovery scratch, and transient reads. It does
+not bound allocator metadata, Tokio, process overhead, or the kernel page cache.
+
+The on-disk format is versioned, but 0.x releases do not promise cache-data
+compatibility. Deployments must tolerate a cold start and should monitor
+`Cache::startup_mode()`.
 
 ## Observability
 
-`Cache::snapshot()` is lock-free. With statistics enabled it returns cumulative
-cache and I/O counters for the current open; health and resource gauges are
-always populated. `Cache::detailed_snapshot()` also samples L1, index,
-write-buffer pressure, and Region metadata, so use it slowly or on demand.
+### Metrics
 
-C² deliberately has no metrics SDK dependency. An OpenTelemetry or Prometheus
-adapter should sample snapshots and export:
+`Cache::snapshot()` is lock-free. It always reports health and resource gauges;
+`RuntimeConfig::with_statistics(true)` also enables cumulative cache and I/O
+counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure,
+and Region metadata, so call it slowly or on demand.
+
+C² has no metrics SDK dependency. An OpenTelemetry or Prometheus adapter should
+export cumulative values and derive rates in the backend:
 
 - get outcomes from `l1_hits`, `l2_hits`, `l2_misses`, and
   `l2_read_overloads`;
 - mutation volume and `write_rejections`;
-- request counts, file-operation counts, bytes, request time, and slot-wait
-  time from `io`;
+- I/O requests, operations, bytes, request time, and slot-wait time;
 - reclaim progress, managed memory, and cache health.
 
-Export cumulative values and derive rates in the backend. Convert nanoseconds
-to seconds. Use only fixed labels such as direction, path, and outcome; never
-label by key, file, Region, shard, or worker. `metrics_epoch` marks a reset and
-must not become a label. Runtime file-operation counters are application-level
-operations, not physical device IOPS.
+Use only fixed labels such as direction, path, and outcome. Never label by key,
+file, Region, shard, or worker. Treat `metrics_epoch` as a reset marker, not a
+label. `l1_misses` overlaps the L2 outcomes and must not be added to them.
 
-`l1_misses` overlaps the L2 outcome counters and must not be added to them. When
-statistics are disabled, omit activity series instead of exporting zero
-traffic.
+Runtime file-operation counters describe application-level operations, not
+physical device IOPS. Convert nanoseconds to seconds before export, and omit
+activity series when statistics are disabled.
+
+### Logs
 
 Lifecycle, recovery, reclaim, and terminal failure events use the `log` facade
-under `cache2::*`. Applications own the global logger. The example uses
-logforth:
+under `cache2::*`. Applications own the global logger. The included example
+uses logforth:
 
 ```sh
 RUST_LOG=cache2=info cargo run --example logforth -- /tmp/cache2.data
@@ -139,5 +178,9 @@ cargo +1.98.0 test --all-features
 cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation boundaries and
-[BENCHMARK.md](BENCHMARK.md) for performance and device qualification.
+## Further reading
+
+- [Architecture](ARCHITECTURE.md) — data structures, request paths, reclaim,
+  and recovery.
+- [Validation](BENCHMARK.md) — benchmarks, mixed turnover, and Linux NVMe
+  qualification.
