@@ -160,6 +160,11 @@ uses logforth:
 RUST_LOG=cache2=info cargo run --example logforth -- /tmp/cache2.data
 ```
 
+`cache_opened` reports the index backing, mapping extent, validation mode, and
+whether warm mutations use copy-on-write. `cache_recovery_cold` records why a
+clean image was rejected or why private mapping fell back to a cold start.
+`cache_miss_only` records the first terminal index-validation or I/O failure.
+
 ## Development
 
 C² requires Rust 1.98.0.

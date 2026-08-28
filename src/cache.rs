@@ -283,6 +283,10 @@ impl CacheBuilder {
         let path = self.path.clone();
         let capacity_bytes = self.static_config.capacity_bytes;
         let index_slots = self.static_config.index_slots;
+        let index_bytes = u64::try_from(index_slots)
+            .ok()
+            .and_then(recovery_image_index_len)
+            .unwrap_or(0);
         let result = self.open_blocking_inner(tokio_handle);
         match &result {
             Ok(cache) => {
@@ -293,8 +297,11 @@ impl CacheBuilder {
                     path:% = path.display(),
                     startup = startup_name(startup),
                     index_backing = index_backing_name(startup),
+                    index_validation = index_validation_name(startup),
+                    index_copy_on_write = matches!(startup, StartupMode::Warm),
                     capacity_bytes,
                     index_slots,
+                    index_mapping_bytes = index_mapping_bytes(startup, index_bytes),
                     elapsed_us = elapsed_micros(started.elapsed());
                     "cache opened"
                 );
@@ -530,8 +537,33 @@ fn startup_name(startup: StartupMode) -> &'static str {
 
 fn index_backing_name(startup: StartupMode) -> &'static str {
     match startup {
-        StartupMode::Cold => "anonymous",
+        StartupMode::Cold => anonymous_index_backing_name(),
         StartupMode::Warm => "file_private_mmap",
+    }
+}
+
+const fn anonymous_index_backing_name() -> &'static str {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        "anonymous_mmap"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "heap"
+    }
+}
+
+fn index_validation_name(startup: StartupMode) -> &'static str {
+    match startup {
+        StartupMode::Cold => "not_required",
+        StartupMode::Warm => "lazy_crc32c",
+    }
+}
+
+fn index_mapping_bytes(startup: StartupMode, index_bytes: u64) -> u64 {
+    match startup {
+        StartupMode::Cold => index_bytes,
+        StartupMode::Warm => RECOVERY_IMAGE_INDEX_OFFSET.saturating_add(index_bytes),
     }
 }
 

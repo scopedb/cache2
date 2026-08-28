@@ -431,8 +431,30 @@ where
             target: "cache2::recovery",
             event = "cache_recovery_cold",
             path:% = self.files.data.display(),
+            image_path:% = self.files.image.display(),
             reason;
             "cache recovery selected cold start"
+        );
+    }
+
+    fn log_cold_recovery_error(
+        &self,
+        reason: &'static str,
+        index_slots: usize,
+        index_mapping_bytes: u64,
+        error: &impl std::fmt::Display,
+    ) {
+        log::warn!(
+            target: "cache2::recovery",
+            event = "cache_recovery_cold",
+            path:% = self.files.data.display(),
+            image_path:% = self.files.image.display(),
+            reason,
+            index_backing = "file_private_mmap",
+            index_slots,
+            index_mapping_bytes,
+            error:% = error;
+            "warm index mapping failed; cache recovery selected cold start"
         );
     }
 
@@ -712,8 +734,26 @@ where
             self.cold_reset_needed = false;
         }
         let metadata = empty_region_metadata(data, index_slots, self.shard_count)?;
-        let index =
-            PartitionedIndexStorage::anonymous(index_slots).map_err(index_storage_io_error)?;
+        let index = match PartitionedIndexStorage::anonymous(index_slots) {
+            Ok(index) => index,
+            Err(error) => {
+                let index_mapping_bytes = u64::try_from(index_slots)
+                    .ok()
+                    .and_then(recovery_image_index_len)
+                    .unwrap_or(0);
+                log::error!(
+                    target: "cache2::recovery",
+                    event = "cache_index_backing_failed",
+                    path:% = self.files.data.display(),
+                    index_backing = anonymous_index_backing_name(),
+                    index_slots,
+                    index_mapping_bytes,
+                    error:% = error;
+                    "anonymous index backing could not be created"
+                );
+                return Err(index_storage_io_error(error));
+            }
+        };
         let runtime = FileRegionRuntime::install(index, metadata)?;
         Ok(runtime)
     }
@@ -753,14 +793,26 @@ where
         }
         let partition_stats = metadata_partition_stats(&clean.metadata)?;
         let binding = index_image_binding(clean.header);
-        let index = PartitionedIndexStorage::map_private(
+        let index_mapping_bytes = clean.header.index_offset.saturating_add(expected_index_len);
+        let index = match PartitionedIndexStorage::map_private(
             &clean.file,
             clean.header.index_offset,
             index_slots,
             binding,
             &partition_stats,
-        )
-        .map_err(index_storage_io_error)?;
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                self.cold_reset_needed = true;
+                self.log_cold_recovery_error(
+                    "index_private_mmap_failed",
+                    index_slots,
+                    index_mapping_bytes,
+                    &error,
+                );
+                return Ok(None);
+            }
+        };
         let runtime = FileRegionRuntime::install(index, clean.metadata)?;
         Ok(Some(runtime))
     }
@@ -1397,6 +1449,17 @@ fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+const fn anonymous_index_backing_name() -> &'static str {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        "anonymous_mmap"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "heap"
+    }
 }
 
 struct PositionedIoWriter<'a, B: IoBackend + ?Sized> {
