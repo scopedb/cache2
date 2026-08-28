@@ -589,6 +589,14 @@ fn next_persistent_id() -> PersistentId {
 mod tests {
     use super::*;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_cache_and_values_are_send_and_sync() {
+        assert_send_sync::<Cache>();
+        assert_send_sync::<Value>();
+    }
+
     #[test]
     fn l1_shards_are_runtime_tunable() {
         let default = RuntimeConfig::default();

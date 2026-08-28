@@ -292,6 +292,11 @@ pub(crate) struct RegionValueRead {
     seqno: u64,
 }
 
+// SAFETY: this type is constructed only after the owned record read reaches
+// terminal completion. From then until drop, it exposes initialized bytes only
+// through shared slices and never returns the allocation to a mutable pool.
+unsafe impl Sync for RegionValueRead {}
+
 impl RegionValueRead {
     pub(crate) fn value(&self) -> &[u8] {
         &self
