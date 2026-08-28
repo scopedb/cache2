@@ -44,16 +44,23 @@ let cache = CacheBuilder::from_static("/mnt/nvme/chunks.cache", static_config)
     .open()
     .await?;
 
-cache.put("chunk-key", b"chunk bytes")?;
-let value = cache.get("chunk-key").await?.expect("cache hit");
-assert_eq!(value.as_ref(), b"chunk bytes");
+let _ = cache.put("chunk-key", b"chunk bytes");
+if let Some(value) = cache.get("chunk-key").await? {
+    assert_eq!(value.as_ref(), b"chunk bytes");
+}
 
-cache.delete("chunk-key")?;
+let _ = cache.delete("chunk-key");
 cache.drain().await?;
 cache.close_warm().await?;
 # Ok(())
 # }
 ```
+
+Mutation results should feed cache health and rejection metrics, but should not
+fail the authoritative application path. `WouldBlock` means bounded admission
+was full and the mutation was not accepted; continuing without caching is the
+normal response. Other cache errors normally disable or replace this disposable
+cache rather than fail the source-of-truth operation.
 
 Use `put_l2` for prefetched data that should not displace current L1 entries.
 It enters the same bounded Region staging as `put`, removes an older exact-key
@@ -84,7 +91,8 @@ POSIX positioned I/O with `IoMode::Buffered` is the default production path.
 `IoMode::Direct` explicitly enables Linux `O_DIRECT` for aligned runtime record
 I/O and reports direct-I/O errors without retrying through buffered I/O. Control,
 recovery, and necessarily unaligned remainder I/O stay buffered. Linux io_uring
-is an explicit `io-uring` crate feature and runtime selection.
+is an explicit `io-uring` crate feature and runtime selection. It is
+experimental in 0.1; buffered POSIX I/O is the production-qualified path.
 
 C² intentionally accepts one data-file path. Deployments with multiple
 homogeneous devices should expose them as one RAID0 or equivalent striped block
@@ -117,6 +125,11 @@ cache files are created. With a 10 GiB L1, four append shards, and two reclaim
 workers, the complete 4 TiB/16 KiB plan requires a managed-memory limit of at
 least 15 GiB; process and kernel memory remain outside that limit.
 `StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound.
+
+The on-disk format is versioned, but 0.x releases do not promise cache-data
+compatibility. An incompatible format or static configuration safely starts
+empty. Rollouts must therefore leave enough source-of-truth capacity for a cold
+cache and should monitor `startup_mode` for unexpected cold opens.
 
 ## Operations
 
@@ -173,10 +186,17 @@ Prometheus derives runtime IOPS with
 byte rate by the operation rate. The current counters support average request
 time, not latency percentiles.
 
-`Cache::detailed_snapshot()` additionally reports L1/index pressure, staging,
-and Region occupancy. It briefly reads every configured L1 shard and index
-partition and scans Region metadata, but never scans index slots or Region
-data. Sample it slowly or on demand rather than from a scrape callback.
+`Cache::detailed_snapshot()` additionally reports L1/index pressure,
+write-buffer rejections, and Region occupancy. It briefly reads every
+configured L1 shard and index partition and scans Region metadata, but never
+scans index slots or Region data. Sample it slowly or on demand rather than
+from a scrape callback.
+
+At minimum, alert when health leaves `Running`, `io_failures` increases,
+mutation rejection or L2 resource-miss rates remain elevated, index overflow
+evictions grow unexpectedly, managed memory approaches its configured limit,
+or a deployment cold-starts unexpectedly. A cache in miss-only mode should be
+closed and recreated after the device or filesystem fault is resolved.
 
 Structural or device failure moves reads to fail-open misses when safe operation
 cannot continue. Writes remain explicit errors. Normal cache misses and request

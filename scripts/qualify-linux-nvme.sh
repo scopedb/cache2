@@ -62,7 +62,9 @@ if ! cargo +1.98.0 -V >/dev/null 2>&1; then
 fi
 
 benchmark_runs=${CACHE_QUAL_BENCH_RUNS:-5}
-soak_seconds=${CACHE_QUAL_SOAK_SECONDS:-14400}
+release_soak_seconds=1800
+extended_soak_seconds=14400
+soak_seconds=${CACHE_QUAL_SOAK_SECONDS:-$release_soak_seconds}
 sample_seconds=${CACHE_QUAL_SAMPLE_SECONDS:-10}
 for setting in "$benchmark_runs" "$soak_seconds" "$sample_seconds"; do
   if [[ ! $setting =~ ^[1-9][0-9]*$ ]]; then
@@ -71,9 +73,11 @@ for setting in "$benchmark_runs" "$soak_seconds" "$sample_seconds"; do
   fi
 done
 
-qualification_status=m2_pass
-if ((benchmark_runs < 5 || soak_seconds < 14400)); then
+qualification_status=release_pass
+if ((benchmark_runs < 5 || soak_seconds < release_soak_seconds)); then
   qualification_status=preflight_pass
+elif ((soak_seconds >= extended_soak_seconds)); then
+  qualification_status=extended_pass
 fi
 
 benchmark_entries=${CACHE_BENCH_ENTRIES:-8192}

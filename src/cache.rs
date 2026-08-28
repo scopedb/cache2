@@ -418,6 +418,7 @@ impl fmt::Debug for Cache {
 }
 
 impl Cache {
+    /// Reports whether this open started empty or mapped a clean recovery image.
     pub fn startup_mode(&self) -> StartupMode {
         self.store.startup()
     }
@@ -466,6 +467,9 @@ impl Cache {
             .map(|value| value.map(|inner| Value { inner }))
     }
 
+    /// Waits until all accepted mutations have completed their Region writes
+    /// and index publication. This is a completion barrier, not a durability
+    /// sync; use [`Self::close_warm`] to publish a recoverable image.
     pub async fn drain(&self) -> Result<()> {
         self.store.drain_async().await
     }
@@ -479,11 +483,11 @@ impl Cache {
         Ok(snapshot)
     }
 
-    /// Samples L1, index, queue, I/O, and Region state in addition to the
-    /// regular cache summary. This is intended for periodic diagnostics rather
-    /// than a request hot path because it briefly reads every configured L1
-    /// shard and index partition and scans Region metadata. It never scans
-    /// index slots or Region data.
+    /// Samples L1, index, write-buffer rejection, I/O, and Region state in
+    /// addition to the regular cache summary. This is intended for periodic
+    /// diagnostics rather than a request hot path because it briefly reads
+    /// every configured L1 shard and index partition and scans Region metadata.
+    /// It never scans index slots or Region data.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
         let mut snapshot = self.store.detailed_snapshot()?;
         snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;

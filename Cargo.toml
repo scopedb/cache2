@@ -7,6 +7,7 @@ description = "Performance-first bounded RAM and NVMe hybrid cache"
 license = "Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/cache2"
+repository = "https://github.com/leiysky/cache-rs"
 keywords = ["cache", "nvme", "storage"]
 categories = ["caching", "data-structures"]
 exclude = ["fuzz/", ".github/", "AGENTS.md"]
@@ -33,14 +34,14 @@ harness = false
 required-features = ["benchmarking"]
 
 [dependencies]
-crc32c = "=0.6.8"
-log = { version = "=0.4.31", features = ["kv"] }
-tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
-xxhash-rust = { version = "=0.8.18", default-features = false, features = ["xxh3"] }
+crc32c = "0.6.8"
+log = { version = "0.4.31", features = ["kv"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+xxhash-rust = { version = "0.8.18", default-features = false, features = ["xxh3"] }
 
 [dev-dependencies]
-logforth = { version = "=0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
@@ -49,10 +50,10 @@ io-uring = ["dep:io-uring"]
 fuzzing = []
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
-io-uring = { version = "=0.7.14", optional = true }
+io-uring = { version = "0.7.14", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "0.2.189"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
