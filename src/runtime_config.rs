@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 pub(crate) const DEFAULT_L1_SHARDS: usize = 32;
 pub(crate) const MAX_APPEND_SHARDS: u32 = 256;
 pub(crate) const MAX_WRITE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_READ_IO_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_APPEND_SHARDS: u32 = 4;
 const IO_URING_DEPTH_PER_WORKER: usize = 64;
@@ -83,6 +86,7 @@ pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
     pub(crate) io_mode: IoMode,
     pub(crate) read_io_workers: usize,
+    pub(crate) read_io_wait_timeout: Duration,
     pub(crate) write_io_workers: usize,
     pub(crate) reclaim_workers: usize,
     pub(crate) append_shards: u32,
@@ -100,6 +104,7 @@ impl Default for RuntimeConfig {
             io_engine: IoEngine::Posix,
             io_mode: IoMode::Buffered,
             read_io_workers: 4,
+            read_io_wait_timeout: Duration::ZERO,
             write_io_workers: 4,
             reclaim_workers: 1,
             append_shards: DEFAULT_APPEND_SHARDS,
@@ -139,6 +144,19 @@ impl RuntimeConfig {
     /// the number of independent fixed-depth rings.
     pub fn with_read_io_workers(mut self, workers: usize) -> Self {
         self.read_io_workers = workers;
+        self
+    }
+
+    /// Sets how long an L2 candidate may wait for read execution capacity.
+    ///
+    /// Zero, the default, preserves immediate fail-open misses under read-pool
+    /// pressure. A non-zero timeout enables a bounded wait queue with at most
+    /// one waiter per configured read worker. Queue saturation, allocation
+    /// pressure, and timeout are returned as overload errors rather than cache
+    /// misses, allowing the caller to prefer local backpressure over origin I/O.
+    /// The timeout must not exceed five seconds.
+    pub fn with_read_io_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.read_io_wait_timeout = timeout;
         self
     }
 
@@ -250,6 +268,11 @@ impl RuntimeConfig {
         self.read_io_workers
     }
 
+    /// Returns the maximum wait for L2 read execution capacity.
+    pub const fn read_io_wait_timeout(&self) -> Duration {
+        self.read_io_wait_timeout
+    }
+
     /// Returns the configured write execution concurrency.
     pub const fn write_io_workers(&self) -> usize {
         self.write_io_workers
@@ -320,6 +343,7 @@ mod tests {
         assert_eq!(config.io_engine(), IoEngine::Posix);
         assert_eq!(config.io_mode(), IoMode::Buffered);
         assert_eq!(config.read_io_workers(), 4);
+        assert_eq!(config.read_io_wait_timeout(), Duration::ZERO);
         assert_eq!(config.write_io_workers(), 4);
         assert_eq!(config.reclaim_workers(), 1);
         assert_eq!(config.append_shards(), DEFAULT_APPEND_SHARDS);

@@ -35,6 +35,11 @@ pub struct CacheSnapshot {
     pub l2_misses: u64,
     pub l2_read_memory_misses: u64,
     pub l2_read_busy_misses: u64,
+    /// L2 candidates rejected after bounded read waiting was enabled and its
+    /// queue, memory, or deadline bound was exhausted.
+    pub l2_read_overloads: u64,
+    /// Nanoseconds spent in the optional bounded L2 read execution queue.
+    pub l2_read_wait_ns: u64,
     pub served_bytes: u64,
     pub l1_promotions: u64,
     pub l1_evictions: u64,

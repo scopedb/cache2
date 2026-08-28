@@ -3003,6 +3003,102 @@ mod tests {
     }
 
     #[test]
+    fn configured_read_wait_is_bounded_and_cancel_safe() {
+        let directory = TestDirectory::new();
+        let data = production_data_superblock(512 * 1024);
+        let runtime_config = RuntimeConfig::default()
+            .with_read_io_workers(1)
+            .with_read_io_wait_timeout(Duration::from_millis(30))
+            .with_l1_capacity_bytes(0)
+            .with_statistics(true);
+        let mut store = RegionStore::open(
+            4096,
+            FileRegionBackend::new_with_configs(
+                directory.files.clone(),
+                data,
+                REGION_SHARDS,
+                runtime_config,
+            ),
+        )
+        .unwrap();
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        eventually_admitted(|| store.put_value(b"queued-read", b"local-value"));
+        store.drain().unwrap();
+        let slot = store
+            .runtime()
+            .unwrap()
+            .data_plane()
+            .unwrap()
+            .reserve_read_slot_for_test();
+        let cancelled = tokio_runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                store.get_value_async(b"queued-read", tokio_runtime.handle()),
+            )
+            .await
+        });
+        assert!(cancelled.is_err());
+        let value = tokio_runtime.block_on(async {
+            let mut waiting =
+                Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+            std::future::poll_fn(|context| {
+                match std::future::Future::poll(waiting.as_mut(), context) {
+                    std::task::Poll::Pending => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(_) => {
+                        panic!("a cancelled read must release its wait-queue permit")
+                    }
+                }
+            })
+            .await;
+            drop(slot);
+            waiting.await.unwrap().unwrap()
+        });
+        assert_eq!(value.value(), b"local-value");
+        drop(value);
+        let blocked = store
+            .runtime()
+            .unwrap()
+            .data_plane()
+            .unwrap()
+            .reserve_read_slot_for_test();
+        tokio_runtime.block_on(async {
+            let mut waiting =
+                Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+            std::future::poll_fn(|context| {
+                match std::future::Future::poll(waiting.as_mut(), context) {
+                    std::task::Poll::Pending => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(_) => {
+                        panic!("saturated read must enter the bounded wait queue")
+                    }
+                }
+            })
+            .await;
+            let queue_full = match store
+                .get_value_async(b"queued-read", tokio_runtime.handle())
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("a second saturated read must not enter a full wait queue"),
+            };
+            assert_eq!(queue_full.kind(), io::ErrorKind::WouldBlock);
+            let timed_out = match waiting.await {
+                Err(error) => error,
+                Ok(_) => panic!("a queued read must honor its configured deadline"),
+            };
+            assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut);
+        });
+        drop(blocked);
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.l2_read_overloads, 2);
+        assert!(snapshot.l2_read_wait_ns > 0);
+        store.close_fast().unwrap();
+    }
+
+    #[test]
     fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);

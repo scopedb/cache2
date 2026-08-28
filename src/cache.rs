@@ -452,11 +452,13 @@ impl Cache {
 
     /// Looks up a value in L1 and then L2.
     ///
-    /// An L2 index miss returns directly. An L2 candidate reserves one
-    /// immediately available engine slot, allocates one alignment-rounded
-    /// buffer, performs one size-class-bounded record read, and validates the
-    /// exact envelope locally. Internal allocation or I/O pressure fails open
-    /// as a cache miss.
+    /// An L2 index miss returns directly. An L2 candidate reserves one engine
+    /// slot, allocates one alignment-rounded buffer, performs one
+    /// size-class-bounded record read, and validates the exact envelope locally.
+    /// By default, internal allocation or I/O pressure fails open as a cache
+    /// miss. When bounded read waiting is configured, slot pressure waits up to
+    /// that deadline; queue, allocation, and timeout overloads are returned as
+    /// errors rather than false misses.
     /// A key longer than 4 KiB is also a miss.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
         self.store

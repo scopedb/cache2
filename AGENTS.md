@@ -18,7 +18,8 @@ capacity; this is expected to be uncommon in normal operation.
 - Steady-state `put`, `put_l2`, and delete operations may wait for bounded in-memory
   admission, but must not wait for device I/O, batch completion, data
   synchronization, or recovery publication.
-- An admitted L2 hit may wait only for its own single bounded record read.
+- An admitted L2 hit may wait only for configured bounded read-execution
+  admission and its own single bounded record read.
 - Keep memory, queues, staging buffers, index probes, and eviction work strictly
   bounded. Never introduce an unbounded allocation, scan, retry loop, or queue.
 - On saturation, bypass L1, return a cache miss, throttle a mutation, or reject
@@ -36,20 +37,24 @@ capacity; this is expected to be uncommon in normal operation.
   completion waits.
 - Read and write submissions use separate bounded I/O-engine pools. Writes must
   never consume read-engine slots. Reads may use the complete read-pool depth
-  but never wait for a slot. Write-slot waits remain confined to background
-  shard workers; explicit completion barriers may wait for those workers.
+  and default to no waiting. Optional read waiting is bounded by both a short
+  deadline and at most one waiter per read worker. Write-slot waits remain
+  confined to background shard workers; explicit completion barriers may wait
+  for those workers.
 - An L1 miss must always consult L2. A true L2 index miss returns immediately
   without acquiring a read buffer.
 - L2 owns the final result. An L2 candidate plans one size-class-bounded record
   read, truncating the upper bound at its Region end and expanding it to 4 KiB
-  boundaries only for direct I/O. It reserves one non-waiting engine execution
-  slot, charges its owned buffer against the aggregate memory limit, and submits
-  under the reservation.
-  Allocation or engine pressure is a miss, not public read backpressure. An
-  admitted request completes one read plus local exact-envelope validation.
-- Do not add a read admission policy, read-buffer pool, read wait, background
-  ready table, or retry protocol to `get`. The bounded I/O engine and aggregate
-  memory limit are execution safety boundaries, not public read admission.
+  boundaries only for direct I/O. It reserves one engine execution slot,
+  charges its owned buffer against the aggregate memory limit, and submits
+  under the reservation. In no-wait mode, allocation or engine pressure is a
+  miss. With bounded read waiting enabled, slot pressure waits only after the
+  candidate exists; queue saturation, allocation pressure, or deadline expiry
+  is an explicit overload rather than a false cache miss. An admitted request
+  completes one read plus local exact-envelope validation.
+- Do not add a read-buffer pool, index wait, background ready table, or retry
+  protocol to `get`. The optional read wait is the single bounded engine-slot
+  admission mechanism; it must not hold a read buffer while queued.
 - A successful L1 promotion returns an L1-backed value and releases the
   transient aligned buffer before `get` returns while preserving Region as the
   hit source. If promotion bypasses, the zero-copy Region value may retain its

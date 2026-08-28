@@ -10,7 +10,8 @@ chunks. It is disposable acceleration, not durable storage.
 - `put` and `delete` use bounded in-memory admission and may return
   `WouldBlock`. They never wait for device I/O.
 - An L1 miss consults L2. An admitted L2 lookup performs one bounded record
-  read; memory or I/O pressure fails open as a miss.
+  read. Pressure fails open as a miss by default; optional bounded read waiting
+  reports exhausted queue, memory, or deadline limits as overload instead.
 - Full keys, exact record envelopes, Region generations, hashes, locations, and
   checksums are validated before an L2 value is returned.
 - There is one raw byte-key space and no TTL. Encode any logical namespace into
@@ -82,10 +83,10 @@ empty cache.
 
 `RuntimeConfig` selects L1 capacity, eviction policy, and shards, aggregate
 managed-memory limit, append shards, independent read/write I/O workers, I/O
-mode, write flush threshold, and optional statistics. CLOCK is the default;
-S3-FIFO is available for stronger scan resistance. Runtime tuning may change
-across opens, except that an append-shard count different from the clean image
-cold-starts empty.
+mode, bounded read-wait timeout, write flush threshold, and optional statistics.
+CLOCK is the default; S3-FIFO is available for stronger scan resistance.
+Runtime tuning may change across opens, except that an append-shard count
+different from the clean image cold-starts empty.
 
 POSIX positioned I/O with `IoMode::Buffered` is the default production path.
 `IoMode::Direct` explicitly enables Linux `O_DIRECT` for aligned runtime record
@@ -106,6 +107,14 @@ Each append shard owns one Active Region, two Region-sized staging buffers, and
 one ordered append worker. Read and write I/O workers bound separate execution
 pools; increasing append shards can raise write parallelism but has a direct
 fixed-memory cost.
+
+L2 reads default to zero queueing: a busy read pool fails open as a cache miss.
+`RuntimeConfig::with_read_io_wait_timeout` can instead wait briefly after an L2
+index candidate is found. The wait queue is hard-bounded to one waiter per read
+worker and holds no record buffer while queued. A full queue, unavailable read
+buffer, or expired wait returns an overload error rather than a false miss, so
+the caller can prefer local backpressure over a more expensive origin read.
+The configured timeout may be zero through five seconds.
 
 Keys are limited to 4 KiB. A complete encoded record must fit in one Region.
 Entries charged above 256 KiB bypass L1 but remain valid in L2.
@@ -156,6 +165,7 @@ Prometheus names:
 | Terminal outcomes | `cache2.io.request.completions`, unit `{request}` | `cache2_io_request_completions_total` |
 | Request time | `cache2.io.request.time`, unit `s` | `cache2_io_request_time_seconds_total` |
 | Slot-wait time | `cache2.io.slot.wait`, unit `s` | `cache2_io_slot_wait_seconds_total` |
+| Optional L2 read-queue time | `cache2.l2.read.wait`, unit `s` | `cache2_l2_read_wait_seconds_total` |
 | Requests in flight | `cache2.io.request.in_flight`, unit `{request}` | `cache2_io_requests_in_flight` |
 | Region reclaim | `cache2.reclaim`, unit `{operation}` | `cache2_reclaim_total` |
 | Reclaim bytes | `cache2.reclaim.io`, unit `By` | `cache2_reclaim_io_bytes_total` |
@@ -174,11 +184,12 @@ records and bytes, and skipped hot records. Conditional index-replacement
 misses expose races in which a newer foreground mutation won over delayed
 reinsertion.
 
-For get outcomes, export `l1_hits`, `l2_hits`, and `l2_misses` as the disjoint
-`result=l1_hit|l2_hit|miss` series; `l1_misses` overlaps the latter two and must
-not be summed into that result set. If `statistics_enabled` is false, omit
-activity series rather than exporting misleading zero traffic; health and
-resource gauges remain available.
+For get outcomes, export `l1_hits`, `l2_hits`, `l2_misses`, and
+`l2_read_overloads` as the disjoint `result=l1_hit|l2_hit|miss|overload` series;
+`l1_misses` overlaps the latter three and must not be summed into that result
+set. If `statistics_enabled` is false, omit activity series rather than
+exporting misleading zero traffic; health and resource gauges remain
+available.
 
 Prometheus derives runtime IOPS with
 `rate(cache2_io_operations_total[5m])`, throughput with

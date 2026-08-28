@@ -15,6 +15,8 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use mea::semaphore::OwnedSemaphorePermit;
+
 #[cfg(all(
     feature = "io-uring",
     target_os = "linux",
@@ -935,12 +937,23 @@ pub(crate) trait IoEngine: Send + Sync {
 struct IoSlot {
     shared: Arc<RuntimeShared>,
     write: bool,
+    // The opt-in async admission permit drops only after the engine slot has
+    // been published as available by `IoSlot::drop`.
+    _read_permit: Option<OwnedSemaphorePermit>,
 }
 
-/// One non-waiting read reservation against the engine's complete depth.
+/// One read reservation against the engine's complete depth.
 /// Dropping it before submission releases the slot immediately.
 pub(crate) struct ReadSlot {
     slot: IoSlot,
+}
+
+impl ReadSlot {
+    pub(crate) fn with_async_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        debug_assert!(!self.slot.write);
+        self.slot._read_permit = Some(permit);
+        self
+    }
 }
 
 impl Drop for IoSlot {
@@ -1046,6 +1059,7 @@ impl RuntimeShared {
                     return Some(IoSlot {
                         shared: Arc::clone(self),
                         write,
+                        _read_permit: None,
                     });
                 }
                 Err(observed) => current = observed,

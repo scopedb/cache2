@@ -466,6 +466,7 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
     let retuned = RuntimeConfig::default()
         .with_io_engine(IoEngine::Posix)
         .with_read_io_workers(7)
+        .with_read_io_wait_timeout(Duration::from_millis(10))
         .with_write_io_workers(2)
         .with_reclaim_workers(2)
         .with_append_shards(2)
@@ -676,7 +677,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 13] = [
+    let cases: [RuntimeConfigCase; 14] = [
         ("zero-append-shards", |config| config.with_append_shards(0)),
         ("too-many-append-shards", |config| {
             config.with_append_shards(257)
@@ -696,6 +697,9 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         }),
         ("too-many-write-workers", |config| {
             config.with_write_io_workers(4097)
+        }),
+        ("excessive-read-wait", |config| {
+            config.with_read_io_wait_timeout(Duration::from_secs(5) + Duration::from_nanos(1))
         }),
         ("l1-exceeds-budget", |config| {
             config
@@ -968,6 +972,8 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(before_close.l2_misses, 1);
     assert_eq!(before_close.l2_read_memory_misses, 0);
     assert_eq!(before_close.l2_read_busy_misses, 0);
+    assert_eq!(before_close.l2_read_overloads, 0);
+    assert_eq!(before_close.l2_read_wait_ns, 0);
     assert_eq!(before_close.served_bytes, 5);
     assert_eq!(before_close.l1_promotions, 0);
     assert_eq!(before_close.io_failures, 0);
@@ -1007,6 +1013,8 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(warmed.l2_misses, 0);
     assert_eq!(warmed.l2_read_memory_misses, 0);
     assert_eq!(warmed.l2_read_busy_misses, 0);
+    assert_eq!(warmed.l2_read_overloads, 0);
+    assert_eq!(warmed.l2_read_wait_ns, 0);
     assert_eq!(warmed.served_bytes, 10);
     assert_eq!(warmed.l1_promotions, 1);
     assert_eq!(warmed.io.read.requests_submitted, 1);

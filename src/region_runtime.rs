@@ -12,6 +12,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use mea::semaphore::{OwnedSemaphorePermit, Semaphore};
+
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
@@ -25,14 +27,15 @@ use crate::memory::{
 use crate::record_codec::{hash_key, required_record_bytes};
 use crate::recovery::{DataGeometry, DataSuperblock};
 use crate::region::{FileRegionCore, RegionStageValue, RegionValueRead};
-use crate::region_reader::{PendingRead, ReadCompletion, plan_read};
+use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, plan_read};
 use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     BufferLease, CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT, ManagedMemorySnapshot,
     ResourceBuildError, ResourceController, ResourceLimits,
 };
 use crate::runtime_config::{
-    IoMode, MAX_APPEND_SHARDS, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig,
+    IoMode, MAX_APPEND_SHARDS, MAX_READ_IO_WAIT_TIMEOUT, MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+    RuntimeConfig,
 };
 use crate::snapshot::{
     CacheHealth, CacheIoDirectionSnapshot, CacheIoSnapshot, CacheReclaimSnapshot, CacheSnapshot,
@@ -221,6 +224,8 @@ struct RuntimeMetrics {
     metrics_epoch: u64,
     lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
+    l2_read_overloads: AtomicU64,
+    l2_read_wait_ns: AtomicU64,
     write_rejections: AtomicU64,
     write_buffer_rejections: AtomicU64,
     io_failures: AtomicU64,
@@ -282,6 +287,8 @@ impl RuntimeMetrics {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
+            l2_read_overloads: AtomicU64::new(0),
+            l2_read_wait_ns: AtomicU64::new(0),
             write_rejections: AtomicU64::new(0),
             write_buffer_rejections: AtomicU64::new(0),
             io_failures: AtomicU64::new(0),
@@ -316,6 +323,15 @@ impl RuntimeMetrics {
 
     fn record_write_rejection(&self) {
         Self::increment(&self.write_rejections);
+    }
+
+    fn record_read_overload(&self) {
+        Self::increment(&self.l2_read_overloads);
+    }
+
+    fn record_read_wait(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.l2_read_wait_ns.fetch_add(nanos, Ordering::Relaxed);
     }
 
     fn record_reclaim(&self, stats: crate::region::RegionReclaimStats) {
@@ -395,6 +411,8 @@ impl RuntimeMetrics {
             l2_misses,
             l2_read_memory_misses,
             l2_read_busy_misses,
+            l2_read_overloads: self.l2_read_overloads.load(Ordering::Relaxed),
+            l2_read_wait_ns: self.l2_read_wait_ns.load(Ordering::Relaxed),
             served_bytes,
             l1_promotions,
             l1_evictions: memory_metrics.evictions,
@@ -453,6 +471,12 @@ impl RuntimeConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "read and write I/O worker counts must be non-zero",
+            ));
+        }
+        if self.read_io_wait_timeout > MAX_READ_IO_WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read I/O wait timeout must not exceed five seconds",
             ));
         }
         if self.io_engine == crate::runtime_config::IoEngine::Posix
@@ -613,11 +637,30 @@ pub(crate) enum HybridValueRead {
 enum PreparedGet {
     Complete(Option<HybridValueRead>),
     Pending(PendingGet),
+    Waiting(WaitingGet),
 }
 
 struct PendingGet {
     engine: Arc<dyn IoEngine>,
     read: PendingRead,
+    read_token: MemoryReadToken,
+    hash: u64,
+}
+
+struct WaitingGet {
+    engine: Arc<dyn IoEngine>,
+    slots: Arc<Semaphore>,
+    plan: ReadPlan,
+    read_token: MemoryReadToken,
+    hash: u64,
+    timeout: Duration,
+    waiter_permit: OwnedSemaphorePermit,
+}
+
+struct ReservedGet {
+    engine: Arc<dyn IoEngine>,
+    slot: ReadSlot,
+    plan: ReadPlan,
     read_token: MemoryReadToken,
     hash: u64,
 }
@@ -659,6 +702,37 @@ impl PendingGet {
     }
 }
 
+impl WaitingGet {
+    async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
+        let Self {
+            engine,
+            slots,
+            plan,
+            read_token,
+            hash,
+            timeout,
+            waiter_permit,
+        } = self;
+        let acquire = Arc::clone(&slots).acquire_owned(1);
+        let timed_acquire = {
+            let _entered = tokio_handle.enter();
+            tokio::time::timeout(timeout, acquire)
+        };
+        let slot_permit = timed_acquire.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired")
+        })?;
+        let slot = engine.try_reserve_read()?.with_async_permit(slot_permit);
+        drop(waiter_permit);
+        Ok(ReservedGet {
+            engine,
+            slot,
+            plan,
+            read_token,
+            hash,
+        })
+    }
+}
+
 impl HybridValueRead {
     pub(crate) fn value(&self) -> &[u8] {
         match self {
@@ -692,6 +766,7 @@ struct RunningOwner {
 struct RunningShared {
     core: Arc<FileRegionCore>,
     read_engines: Box<[Arc<dyn IoEngine>]>,
+    read_admission: Option<ReadAdmission>,
     write_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
@@ -704,6 +779,11 @@ struct RunningShared {
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
     statistics: bool,
+}
+
+struct ReadAdmission {
+    slots: Box<[Arc<Semaphore>]>,
+    waiters: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -769,7 +849,38 @@ impl RunningShared {
     }
 
     fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-        try_reserve_read_lane(&self.read_engines, route)
+        match &self.read_admission {
+            Some(admission) => try_reserve_admitted_read_lane(&self.read_engines, admission, route),
+            None => try_reserve_read_lane(&self.read_engines, route),
+        }
+    }
+
+    fn try_queue_read(
+        &self,
+        route: u64,
+        plan: ReadPlan,
+        read_token: MemoryReadToken,
+        timeout: Duration,
+    ) -> io::Result<WaitingGet> {
+        let admission = self
+            .read_admission
+            .as_ref()
+            .expect("non-zero read wait timeout creates a waiter bound");
+        let waiter_permit = Arc::clone(&admission.waiters)
+            .try_acquire_owned(1)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "L2 read wait queue is full")
+            })?;
+        let lane = route_hash(route, self.read_engines.len());
+        Ok(WaitingGet {
+            engine: Arc::clone(&self.read_engines[lane]),
+            slots: Arc::clone(&admission.slots[lane]),
+            plan,
+            read_token,
+            hash: route,
+            timeout,
+            waiter_permit,
+        })
     }
 
     fn engines(&self) -> impl Iterator<Item = &Arc<dyn IoEngine>> {
@@ -784,16 +895,44 @@ fn try_reserve_read_lane(
     engines: &[Arc<dyn IoEngine>],
     route: u64,
 ) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-    debug_assert!(!engines.is_empty());
-    let primary = route_hash(route, engines.len());
-    match engines[primary].try_reserve_read() {
-        Ok(slot) => Ok((Arc::clone(&engines[primary]), slot)),
-        Err(error) if engines.len() == 1 || !is_read_pressure(error.kind()) => Err(error),
+    try_reserve_read_lane_with(engines.len(), route, |lane| {
+        let slot = engines[lane].try_reserve_read()?;
+        Ok((Arc::clone(&engines[lane]), slot))
+    })
+}
+
+fn try_reserve_admitted_read_lane(
+    engines: &[Arc<dyn IoEngine>],
+    admission: &ReadAdmission,
+    route: u64,
+) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+    debug_assert_eq!(engines.len(), admission.slots.len());
+    try_reserve_read_lane_with(engines.len(), route, |lane| {
+        let permit = Arc::clone(&admission.slots[lane])
+            .try_acquire_owned(1)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "no L2 read slot is available")
+            })?;
+        let slot = engines[lane].try_reserve_read()?.with_async_permit(permit);
+        Ok((Arc::clone(&engines[lane]), slot))
+    })
+}
+
+fn try_reserve_read_lane_with(
+    lane_count: usize,
+    route: u64,
+    mut reserve: impl FnMut(usize) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)>,
+) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+    debug_assert_ne!(lane_count, 0);
+    let primary = route_hash(route, lane_count);
+    match reserve(primary) {
+        Ok(reservation) => Ok(reservation),
+        Err(error) if lane_count == 1 || !is_read_pressure(error.kind()) => Err(error),
         Err(primary_error) => {
-            let offset = 1 + route_hash(route.rotate_right(32), engines.len() - 1);
-            let alternate = (primary + offset) % engines.len();
-            match engines[alternate].try_reserve_read() {
-                Ok(slot) => Ok((Arc::clone(&engines[alternate]), slot)),
+            let offset = 1 + route_hash(route.rotate_right(32), lane_count - 1);
+            let alternate = (primary + offset) % lane_count;
+            match reserve(alternate) {
+                Ok(reservation) => Ok(reservation),
                 Err(error) if !is_read_pressure(error.kind()) => Err(error),
                 Err(_) => Err(primary_error),
             }
@@ -1078,6 +1217,9 @@ impl RegionDataPlane {
         match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => self.finish_get(pending.wait(), key),
+            PreparedGet::Waiting(_) => Err(io::Error::other(
+                "bounded read waiting requires the async get path",
+            )),
         }
     }
 
@@ -1090,6 +1232,70 @@ impl RegionDataPlane {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => {
                 self.finish_get(pending.wait_async(tokio_handle).await, key)
+            }
+            PreparedGet::Waiting(waiting) => {
+                let wait_started = self.config.statistics.then(Instant::now);
+                let reserved = waiting.reserve_async(tokio_handle).await;
+                if let Some(wait_started) = wait_started {
+                    self.metrics.record_read_wait(wait_started.elapsed());
+                }
+                let reserved = reserved.inspect_err(|error| self.record_read_wait_error(error))?;
+                let Some(pending) = self.submit_reserved_get(reserved)? else {
+                    return Ok(None);
+                };
+                self.finish_get(pending.wait_async(tokio_handle).await, key)
+            }
+        }
+    }
+
+    fn record_read_wait_error(&self, error: &io::Error) {
+        if !self.config.statistics {
+            return;
+        }
+        if is_read_pressure(error.kind()) {
+            self.metrics.record_read_overload();
+        } else {
+            RuntimeMetrics::increment(&self.metrics.io_failures);
+        }
+    }
+
+    fn submit_reserved_get(&self, reserved: ReservedGet) -> io::Result<Option<PendingGet>> {
+        let ReservedGet {
+            engine,
+            slot,
+            plan,
+            read_token,
+            hash,
+        } = reserved;
+        let Some(buffer) = self.running.shared.resources.try_read_buffer(plan.read_len) else {
+            if self.config.statistics {
+                self.metrics.record_read_overload();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "L2 read could not reserve its bounded buffer after waiting",
+            ));
+        };
+        match self
+            .core
+            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+        {
+            Ok(read) => Ok(Some(PendingGet {
+                engine,
+                read,
+                read_token,
+                hash,
+            })),
+            Err(_) if !self.core.is_healthy() => {
+                if self.config.statistics {
+                    RuntimeMetrics::increment(&self.metrics.io_failures);
+                    RuntimeMetrics::increment(&self.metrics.activity_for_hash(hash).l2_misses);
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                self.record_read_wait_error(&error);
+                Err(error)
             }
         }
     }
@@ -1160,6 +1366,19 @@ impl RegionDataPlane {
         };
         let (engine, slot) = match running.try_reserve_read(hash) {
             Ok(reservation) => reservation,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && !self.config.read_io_wait_timeout.is_zero() =>
+            {
+                let waiting = running
+                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout)
+                    .inspect_err(|_| {
+                        if running.statistics {
+                            running.metrics.record_read_overload();
+                        }
+                    })?;
+                return Ok(PreparedGet::Waiting(waiting));
+            }
             Err(error) if is_read_pressure(error.kind()) => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
@@ -1180,6 +1399,15 @@ impl RegionDataPlane {
             }
         };
         let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
+            if !self.config.read_io_wait_timeout.is_zero() {
+                if running.statistics {
+                    running.metrics.record_read_overload();
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "L2 read could not reserve its bounded buffer",
+                ));
+            }
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
                 RuntimeMetrics::increment(&activity.l2_read_memory_misses);
@@ -1208,6 +1436,12 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
+                if !self.config.read_io_wait_timeout.is_zero() {
+                    if running.statistics {
+                        running.metrics.record_read_overload();
+                    }
+                    return Err(error);
+                }
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                     RuntimeMetrics::increment(&activity.l2_read_busy_misses);
@@ -1361,6 +1595,15 @@ impl RegionDataPlane {
     }
 
     #[cfg(test)]
+    pub(crate) fn reserve_read_slot_for_test(&self) -> ReadSlot {
+        self.running
+            .shared
+            .try_reserve_read(0)
+            .map(|(_, slot)| slot)
+            .expect("test read slot is available")
+    }
+
+    #[cfg(test)]
     pub(crate) fn poison_shard_for_test(&self, shard_id: usize) {
         let shard = self
             .running
@@ -1498,6 +1741,25 @@ fn start_running(
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
     let read_engines = build_engine_pool(files, &config, config.read_io_workers)?;
+    let read_admission = if config.read_io_wait_timeout.is_zero() {
+        None
+    } else {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(read_engines.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate L2 read admission lanes",
+            )
+        })?;
+        let engine_depth = config.io_depth_per_engine(config.read_io_workers);
+        slots.resize_with(read_engines.len(), || {
+            Arc::new(Semaphore::new(engine_depth))
+        });
+        Some(ReadAdmission {
+            slots: slots.into_boxed_slice(),
+            waiters: Arc::new(Semaphore::new(config.read_io_workers)),
+        })
+    };
     let write_engines = build_engine_pool(write_files, &config, config.write_io_workers)?;
     let reclaim_engines = build_engine_pool(reclaim_files, &config, config.reclaim_workers)?;
     let mut shards = Vec::new();
@@ -1508,6 +1770,7 @@ fn start_running(
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
+        read_admission,
         write_engines,
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
@@ -1613,11 +1876,17 @@ fn runtime_topology_memory_bytes(shard_count: usize, config: &RuntimeConfig) -> 
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
     let read_queue =
         read_engine_count.checked_mul(config.io_depth_per_engine(config.read_io_workers))?;
+    let read_wait_queue = if config.read_io_wait_timeout.is_zero() {
+        0
+    } else {
+        config.read_io_workers
+    };
     let reclaim_queue =
         reclaim_engine_count.checked_mul(config.io_depth_per_engine(config.reclaim_workers))?;
     let queue = write_engine_count
         .checked_mul(config.io_depth_per_engine(config.write_io_workers))?
         .checked_add(read_queue)?
+        .checked_add(read_wait_queue)?
         .checked_add(reclaim_queue)?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let controls = engine_count
@@ -1783,7 +2052,7 @@ fn reclaim_worker_result(
                 // Reclaim owns a dedicated pool whose depth matches its worker
                 // count. Use the bounded background wait so transient CAS
                 // contention cannot turn a healthy cache miss-only; foreground
-                // reads retain their non-waiting reservation path.
+                // reads use their separately configured admission path.
                 let request =
                     submit_cache_io(engine.as_ref(), IoOperation::read(io_buffer, absolute))
                         .map_err(|error| error.into_lease().0)?;
@@ -2407,6 +2676,8 @@ mod tests {
         RuntimeMetrics::add(&activity.l2_misses, 2);
         RuntimeMetrics::increment(&activity.l2_read_memory_misses);
         RuntimeMetrics::increment(&activity.l2_read_busy_misses);
+        metrics.record_read_overload();
+        metrics.record_read_wait(Duration::from_nanos(7));
         let snapshot = metrics.snapshot(
             true,
             true,
@@ -2421,6 +2692,21 @@ mod tests {
         assert_eq!(snapshot.l2_misses, 2);
         assert_eq!(snapshot.l2_read_memory_misses, 1);
         assert_eq!(snapshot.l2_read_busy_misses, 1);
+        assert_eq!(snapshot.l2_read_overloads, 1);
+        assert_eq!(snapshot.l2_read_wait_ns, 7);
+    }
+
+    #[test]
+    fn optional_read_wait_queue_is_memory_accounted() {
+        let base = RuntimeConfig::default().with_read_io_workers(7);
+        let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
+        let with_wait = runtime_topology_memory_bytes(
+            4,
+            &base.with_read_io_wait_timeout(Duration::from_millis(1)),
+        )
+        .unwrap();
+
+        assert_eq!(with_wait - no_wait, 7 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
     }
 
     #[test]

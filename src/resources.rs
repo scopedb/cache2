@@ -83,8 +83,8 @@ impl ResourceController {
     }
 
     /// Allocates one alignment-rounded foreground read buffer against the
-    /// cache-wide hard memory limit. Failure is a cache miss, never caller
-    /// backpressure.
+    /// cache-wide hard memory limit. The caller maps failure to either a
+    /// fail-open miss or an explicit bounded-wait overload.
     pub(crate) fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
         BufferLease::try_standalone(length, Arc::clone(&self.memory))
     }
