@@ -96,7 +96,7 @@ exercise reinsertion without allowing cumulative rewritten bytes to exceed the
 bounded reclaim budget.
 Set `CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true` for a focused read-heavy run;
 the harness then requires both an accepted hot-record rewrite and a hot record
-skipped by bounded budget or staging pressure.
+skipped specifically because the bounded byte budget was exhausted.
 
 Value sizes are deterministically mixed on every write instead of running in
 size phases. Repeat a size in `CACHE_SOAK_VALUE_BYTES` to give it proportionally

@@ -106,6 +106,8 @@ pub struct CacheReclaimSnapshot {
     pub reinsert_bytes: u64,
     /// Referenced records dropped after validation failure or budget/staging pressure.
     pub reinsert_skipped: u64,
+    /// Valid referenced records dropped specifically because the byte budget was exhausted.
+    pub reinsert_budget_skipped: u64,
 }
 
 #[non_exhaustive]

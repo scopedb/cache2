@@ -244,6 +244,7 @@ pub(crate) struct RegionReclaimStats {
     pub(crate) reinsert_records: u64,
     pub(crate) reinsert_bytes: u64,
     pub(crate) reinsert_skipped: u64,
+    pub(crate) reinsert_budget_skipped: u64,
 }
 
 pub(crate) struct RegionReinsertRecord<'a> {
@@ -649,6 +650,7 @@ impl FileRegionCore {
                     let payload_valid =
                         crc32c(&bytes[header_end..payload_end]) == header.payload_crc;
                     let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
+                    let budget_exhausted = payload_valid && !within_budget;
                     let reinserted = payload_valid
                         && within_budget
                         && try_reinsert(RegionReinsertRecord {
@@ -666,6 +668,10 @@ impl FileRegionCore {
                             .reinsert_bytes
                             .saturating_add(u64::from(rewrite_bytes));
                     } else {
+                        if budget_exhausted {
+                            stats.reinsert_budget_skipped =
+                                stats.reinsert_budget_skipped.saturating_add(1);
+                        }
                         if self
                             .index
                             .remove_if_match(header.key_hash, location)

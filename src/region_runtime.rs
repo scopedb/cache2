@@ -232,6 +232,7 @@ struct RuntimeMetrics {
     reclaim_reinsert_records: AtomicU64,
     reclaim_reinsert_bytes: AtomicU64,
     reclaim_reinsert_skipped: AtomicU64,
+    reclaim_reinsert_budget_skipped: AtomicU64,
 }
 
 #[repr(align(64))]
@@ -292,6 +293,7 @@ impl RuntimeMetrics {
             reclaim_reinsert_records: AtomicU64::new(0),
             reclaim_reinsert_bytes: AtomicU64::new(0),
             reclaim_reinsert_skipped: AtomicU64::new(0),
+            reclaim_reinsert_budget_skipped: AtomicU64::new(0),
         })
     }
 
@@ -330,6 +332,8 @@ impl RuntimeMetrics {
             .fetch_add(stats.reinsert_bytes, Ordering::Relaxed);
         self.reclaim_reinsert_skipped
             .fetch_add(stats.reinsert_skipped, Ordering::Relaxed);
+        self.reclaim_reinsert_budget_skipped
+            .fetch_add(stats.reinsert_budget_skipped, Ordering::Relaxed);
     }
 
     fn snapshot(
@@ -406,6 +410,9 @@ impl RuntimeMetrics {
                 reinsert_records: self.reclaim_reinsert_records.load(Ordering::Relaxed),
                 reinsert_bytes: self.reclaim_reinsert_bytes.load(Ordering::Relaxed),
                 reinsert_skipped: self.reclaim_reinsert_skipped.load(Ordering::Relaxed),
+                reinsert_budget_skipped: self
+                    .reclaim_reinsert_budget_skipped
+                    .load(Ordering::Relaxed),
             },
             managed_memory_bytes: memory.current_bytes,
             managed_memory_peak_bytes: memory.peak_bytes,
@@ -1835,7 +1842,8 @@ fn reclaim_worker_result(
                 records_removed = stats.records_removed,
                 reinsert_records = stats.reinsert_records,
                 reinsert_bytes = stats.reinsert_bytes,
-                reinsert_skipped = stats.reinsert_skipped;
+                reinsert_skipped = stats.reinsert_skipped,
+                reinsert_budget_skipped = stats.reinsert_budget_skipped;
                 "cache Region reclaimed"
             );
             for shard in &shared.shards {
