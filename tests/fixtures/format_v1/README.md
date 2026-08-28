@@ -9,7 +9,6 @@ The fixtures bind one 128-Region, 32 MiB-per-Region cache with asymmetric
 identities and counters:
 
 - data generation `7`, cache UUID bytes `01`, data identity bytes `02`;
-- one data device (`id 0`) whose bound extent contains all 128 Regions;
 - key hash algorithm `1` (seeded XXH3-64);
 - hash seed `0x123456789abcdef0` and config fingerprint
   `0x8877665544332211`;

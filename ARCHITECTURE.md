@@ -11,7 +11,7 @@ Cache
 ├── bounded read I/O pool
 ├── bounded write I/O pool
 ├── bounded one-depth background reclaim I/O lanes
-└── one or more striped data files + primary state and clean-image files
+└── data, state, and clean-image files
 ```
 
 Both tiers use one seeded XXH3-64 hash computed from the complete raw key. Hash
@@ -30,9 +30,6 @@ the full record after I/O.
 5. Return without waiting for device I/O.
 6. The shard worker writes sealed batches and publishes L2 index entries only
    after completion.
-
-The global Region id maps arithmetically to a data device and local Region;
-striping adds no index field, lookup table, allocation, or lock.
 
 Each append shard has two Region-sized buffers, so it may fill one while the
 other is in flight. Saturation or short-path contention returns `WouldBlock`;
@@ -108,10 +105,14 @@ bypasses L1. Returned values retain their memory charge until dropped.
 Read and write submissions use independent bounded pools. POSIX uses one engine
 per direction with one execution slot per configured worker. Optional io_uring
 uses a fixed-depth ring per configured worker. Reads never consume write slots,
-and no lock is held across device I/O. POSIX workers share the ordered data-file
-set and can execute work for any device, so configured worker counts remain
-global bounds instead of multiplying with device count. Multi-device io_uring
-is intentionally unsupported.
+and no lock is held across device I/O.
+
+Physical striping is deliberately outside C². Multiple homogeneous devices
+should be combined into one RAID0 or equivalent block device, while C² retains
+one data file, one persistent identity, and one bounded set of I/O engines.
+Native file-level striping would duplicate block-layer scheduling, tie recovery
+format to path order, multiply file descriptors, and still provide no degraded
+mode under the whole-cache failure contract.
 
 ## Recovery
 
@@ -123,14 +124,13 @@ open starts empty without scanning the data extent.
 
 1. stop admission and drain accepted work;
 2. freeze Region and index authority;
-3. sync completed writes on every data device;
+3. sync completed data writes;
 4. write, sync, and atomically install a checksummed recovery image;
 5. publish matching `CLEAN` state last.
 
 A matching clean image is mapped private on the next open. Missing, corrupt,
-stale, unsupported, configuration-mismatched, missing, or reordered data-device
-state is discarded. L1 is always rebuilt empty and warms through normal L2
-reads.
+stale, unsupported, or configuration-mismatched state is discarded. L1 is
+always rebuilt empty and warms through normal L2 reads.
 
 ## Failure boundary
 

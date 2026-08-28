@@ -39,8 +39,6 @@ let runtime_config = RuntimeConfig::default()
     .with_append_shards(8);
 
 let cache = CacheBuilder::from_static("/mnt/nvme/chunks.cache", static_config)
-    // Optional: stripe global Regions across more POSIX data files.
-    // .with_additional_data_paths(["/mnt/nvme1/chunks.cache"])
     .with_runtime_config(runtime_config)
     .open()
     .await?;
@@ -80,17 +78,13 @@ I/O and reports direct-I/O errors without retrying through buffered I/O. Control
 recovery, and necessarily unaligned remainder I/O stay buffered. Linux io_uring
 is an explicit `io-uring` crate feature and runtime selection.
 
-`CacheBuilder::with_additional_data_paths` stripes the total L2 capacity across
-up to 64 ordered data-file paths. Global Region `r` lives on device
-`r % device_count`; the index representation is unchanged. The primary path
-owns the state and recovery-image sidecars. Every data file has its own bound
-superblock and exclusive lock; a missing, reordered, or mismatched set safely
-cold-starts the whole disposable cache. There is no replication or per-device
-degraded mode. Multi-device operation currently requires the POSIX engine, and
-read/write worker counts remain aggregate process totals rather than per-device
-counts. Buffered POSIX operation retains about four descriptors per data path;
-direct mode adds about four more, so the process file-descriptor limit must
-cover the configured device count.
+C² intentionally accepts one data-file path. Deployments with multiple
+homogeneous devices should expose them as one RAID0 or equivalent striped block
+device and place the cache file on that filesystem. Keeping device topology
+below C² avoids a second striping policy in the request path and keeps file
+ownership, recovery identity, and I/O worker bounds independent of device
+count. RAID0 provides no redundancy; losing any member discards the complete
+cache, which already matches C²'s failure contract.
 
 Each append shard owns one Active Region, two Region-sized staging buffers, and
 one ordered append worker. Read and write I/O workers bound separate execution
@@ -114,8 +108,7 @@ metadata, transient reads, and cache thread stacks. Invalid plans fail before
 cache files are created. With a 10 GiB L1, four append shards, and two reclaim
 workers, the complete 4 TiB/16 KiB plan requires a managed-memory limit of at
 least 15 GiB; process and kernel memory remain outside that limit.
-`StaticConfig::peak_disk_bytes()` reports the single-data-file logical disk
-bound; use `peak_disk_bytes_for_data_files` for a striped layout.
+`StaticConfig::peak_disk_bytes()` reports the cache-owned logical disk bound.
 
 ## Operations
 
