@@ -418,6 +418,12 @@ impl RuntimeMetrics {
 
 impl RuntimeConfig {
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if !self.io_engine.is_available() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring is unavailable on this build or platform",
+            ));
+        }
         if self.append_shards == 0 || self.append_shards > MAX_APPEND_SHARDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

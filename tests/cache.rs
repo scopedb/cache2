@@ -295,7 +295,7 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
     )
 )))]
 #[tokio::test]
-async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
+async fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeConfig::default()
         .with_io_engine(IoEngine::IoUring)
@@ -313,10 +313,7 @@ async fn unavailable_io_engine_fails_during_open_and_releases_the_lock() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-
-    let reopened = files.config(1).open().await.unwrap();
-    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
-    reopened.close_fast().await.unwrap();
+    files.assert_absent();
 }
 
 #[tokio::test]

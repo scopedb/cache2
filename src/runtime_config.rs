@@ -17,6 +17,25 @@ pub enum IoEngine {
     IoUring,
 }
 
+impl IoEngine {
+    pub(crate) const fn is_available(self) -> bool {
+        match self {
+            Self::Posix => true,
+            Self::IoUring => cfg!(all(
+                feature = "io-uring",
+                target_os = "linux",
+                any(
+                    target_arch = "x86_64",
+                    target_arch = "aarch64",
+                    target_arch = "riscv64",
+                    target_arch = "loongarch64",
+                    target_arch = "powerpc64"
+                )
+            )),
+        }
+    }
+}
+
 /// Buffered/direct policy for runtime cache-record I/O.
 ///
 /// Control files, recovery images, and any necessarily unaligned remainder use
