@@ -1000,6 +1000,8 @@ struct RuntimeShared {
     unfenced_writes: AtomicBool,
     slot_lock: Mutex<()>,
     slot_available: Condvar,
+    #[cfg(test)]
+    quarantined_buffers: Mutex<Vec<IoBuffer>>,
 }
 
 enum SlotWaitError {
@@ -1026,6 +1028,8 @@ impl RuntimeShared {
             unfenced_writes: AtomicBool::new(false),
             slot_lock: Mutex::new(()),
             slot_available: Condvar::new(),
+            #[cfg(test)]
+            quarantined_buffers: Mutex::new(Vec::new()),
         }
     }
 
@@ -1210,6 +1214,11 @@ impl RuntimeShared {
         } = task;
         let kind = operation.kind();
         if let Some(buffer) = operation.into_buffer() {
+            #[cfg(test)]
+            // Keep it unreachable until fixture teardown without creating an
+            // intentional LeakSanitizer finding.
+            lock_unpoisoned(&self.quarantined_buffers).push(buffer);
+            #[cfg(not(test))]
             std::mem::forget(buffer);
         }
         self.publish_completion(
@@ -3825,5 +3834,10 @@ mod tests {
             aligned_buffer_capacity(1).unwrap()
         );
         assert!(resources.try_read_buffer(1).is_some());
+
+        drop(completed);
+        drop(completion);
+        drop(shared);
+        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
     }
 }
