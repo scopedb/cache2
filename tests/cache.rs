@@ -263,6 +263,26 @@ async fn l2_only_put_best_effort_invalidates_an_older_l1_value() {
 }
 
 #[tokio::test]
+async fn l2_only_put_survives_warm_recovery() {
+    let files = TestCache::new("l2-only-warm-recovery");
+    let cache = files.config(2).open().await.unwrap();
+    let expected = vec![7_u8; 16 * 1024];
+
+    let sequence = eventually_admitted(|| cache.put_l2("key", &expected));
+    assert_ne!(sequence, 0);
+    cache.close_warm().await.unwrap();
+
+    let reopened = files.config(3).open().await.unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    assert_eq!(reopened.detailed_snapshot().unwrap().l1.resident_entries, 0);
+    let value = reopened.get("key").await.unwrap().unwrap();
+    assert_eq!(value.tier(), CacheTier::L2);
+    assert_eq!(value.as_ref(), expected);
+    drop(value);
+    reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
 async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
     let runtime = RuntimeConfig::default()
@@ -571,7 +591,11 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
                     value[..8].copy_from_slice(&version.to_le_bytes());
                     value[8..HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
                     announced[key_index].store(version, Ordering::SeqCst);
-                    eventually_admitted(|| cache.put(&keys[key_index], &value[..value_len]));
+                    if ordinal % 2 == 0 {
+                        eventually_admitted(|| cache.put(&keys[key_index], &value[..value_len]));
+                    } else {
+                        eventually_admitted(|| cache.put_l2(&keys[key_index], &value[..value_len]));
+                    }
                     if ordinal % 11 == 10 {
                         eventually_admitted(|| cache.delete(&keys[key_index]));
                     }

@@ -19,3 +19,7 @@ identities and counters:
 
 An intentional change to these bytes requires an explicit format-version decision.
 Tests never regenerate the fixtures.
+
+The committed set covers a value record, the recovery control pages, one
+complete 504-slot index page with one value, and a separate three-page Region
+metadata image containing four Regions and two index partitions.

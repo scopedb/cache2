@@ -175,39 +175,40 @@ fn put_u64(output: &mut [u8], offset: usize, value: u64) {
 }
 
 #[cfg(test)]
+pub(crate) fn sparse_golden(input: &str) -> Vec<u8> {
+    let mut output: Option<Vec<u8>> = None;
+    for raw_line in input.lines() {
+        let line = raw_line.split('#').next().unwrap().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let first = fields.next().unwrap();
+        if first == "length" {
+            let length = fields.next().unwrap().parse::<usize>().unwrap();
+            assert!(output.replace(vec![0_u8; length]).is_none());
+            continue;
+        }
+        let offset = usize::from_str_radix(first, 16).unwrap();
+        let encoded = fields.next().unwrap();
+        assert_eq!(encoded.len() % 2, 0);
+        let bytes = encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let output = output.as_mut().expect("golden length must come first");
+        output[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        assert!(fields.next().is_none());
+    }
+    output.expect("golden fixture must declare its length")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sparse_golden(input: &str) -> Vec<u8> {
-        let mut output: Option<Vec<u8>> = None;
-        for raw_line in input.lines() {
-            let line = raw_line.split('#').next().unwrap().trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut fields = line.split_whitespace();
-            let first = fields.next().unwrap();
-            if first == "length" {
-                let length = fields.next().unwrap().parse::<usize>().unwrap();
-                assert!(output.replace(vec![0_u8; length]).is_none());
-                continue;
-            }
-            let offset = usize::from_str_radix(first, 16).unwrap();
-            let encoded = fields.next().unwrap();
-            assert_eq!(encoded.len() % 2, 0);
-            let bytes = encoded
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect::<Vec<_>>();
-            let output = output.as_mut().expect("golden length must come first");
-            output[offset..offset + bytes.len()].copy_from_slice(&bytes);
-            assert!(fields.next().is_none());
-        }
-        output.expect("golden fixture must declare its length")
-    }
 
     #[test]
     fn value_record_matches_committed_golden_bytes() {

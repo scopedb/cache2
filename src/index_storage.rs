@@ -1989,6 +1989,7 @@ unsafe impl Sync for Mapping {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::sparse_golden;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use std::path::PathBuf;
@@ -2403,6 +2404,30 @@ mod tests {
         assert_eq!(entry.location.offset(), exact.offset());
         assert_eq!(entry.location.record_len(), 1120);
         assert!(entry.location.index_equivalent(exact));
+    }
+
+    #[test]
+    fn index_page_matches_committed_golden_bytes() {
+        let source = PartitionedIndexStorage::anonymous(INDEX_IMAGE_SLOTS_PER_PAGE).unwrap();
+        let location = PackedLocation::new(0x54321, 0x12340, 1056).unwrap();
+        source
+            .write_slot(
+                0,
+                IndexSlot::from_state(IndexSlotState::Value {
+                    fingerprint: 0x2345,
+                    displacement: 2,
+                    entry: IndexEntry { location },
+                }),
+            )
+            .unwrap();
+        let mut encoded = Vec::new();
+        source
+            .write_warm_image(&mut encoded, binding(0x1122_3344_5566_7788))
+            .unwrap();
+        let golden = sparse_golden(include_str!(
+            "../tests/fixtures/format_v1/index_page.golden"
+        ));
+        assert_eq!(encoded, golden);
     }
 
     #[test]
