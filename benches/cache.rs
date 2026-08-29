@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheTier, IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig, StartupMode,
-    StaticConfig, Value,
+    Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode,
+    L1EvictionPolicy, RuntimeConfig, StartupMode, StaticConfig, Value,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -812,7 +812,7 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
         attempts = attempts.saturating_add(1);
         match cache.put(key, value) {
             Ok(receipt) => return Ok((receipt, attempts)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -825,7 +825,7 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
                     thread::sleep(RETRY_DELAY);
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
 }

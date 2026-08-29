@@ -5,12 +5,14 @@
 //!
 //! Mutations provide process-local visibility. An unclean restart opens empty;
 //! [`Cache::close_warm`] publishes a recoverable image.
+//! See the [`error`] module for failure classifications and handling policy.
 
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]
 pub mod benchmarking;
 mod cache;
 mod checksum;
+pub mod error;
 mod eviction;
 mod format;
 #[cfg(feature = "fuzzing")]
@@ -37,7 +39,8 @@ mod resources;
 mod runtime_config;
 mod snapshot;
 
-pub use cache::{Cache, CacheBuilder, CacheTier, Result, StaticConfig, Value};
+pub use cache::{Cache, CacheBuilder, CacheTier, StaticConfig, Value};
+pub use error::{Error, ErrorKind, ErrorOperation, Result};
 pub use runtime_config::{IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoDirectionSnapshot, CacheIoPathSnapshot,

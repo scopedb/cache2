@@ -14,17 +14,16 @@ It keeps request paths short and cache-owned resources fixed.
 ## Quick start
 
 ```rust
-use cache2::CacheBuilder;
-use std::io::{self, ErrorKind};
+use cache2::{CacheBuilder, ErrorKind, Result};
 
-async fn run() -> io::Result<()> {
+async fn run() -> Result<()> {
     let cache = CacheBuilder::new("/var/tmp/cache2.data", 1024 * 1024 * 1024)
         .open()
         .await?;
 
     match cache.put(b"chunk:42", b"cached bytes") {
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+        Err(error) if error.kind() == ErrorKind::Overloaded => {
             // Cache admission is full. Continue through the authoritative path.
         }
         Err(error) => return Err(error),
@@ -49,9 +48,14 @@ bypass, and bounded overload are normal cache outcomes.
 
 - Keys are raw bytes in one key space, up to 4 KiB. Each encoded record fits in
   one Region.
-- Resource pressure returns a miss, bypass, `WouldBlock`, or explicit read
-  overload according to the operation.
+- Resource pressure returns a miss, bypass, or `ErrorKind::Overloaded`
+  according to the operation.
 - Sequence numbers provide advisory ordering for internal updates.
+
+Public failures are `cache2::Error` values with an actionable `ErrorKind`, the
+failed `ErrorOperation`, and the original `std::io::Error` source. See
+[Error handling](ERRORS.md) for the classification table, retry policy,
+diagnostic fields, and migration from the former `io::Result` API.
 
 ### Operations
 
@@ -180,6 +184,8 @@ cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
 
 - [Architecture](ARCHITECTURE.md) — data structures, request paths, reclaim,
   and recovery.
+- [Error handling](ERRORS.md) — structured classifications, operation context,
+  overload policy, and standard I/O interoperability.
 - [Validation](BENCHMARK.md) — benchmarks, mixed turnover, and Linux NVMe
   qualification.
 

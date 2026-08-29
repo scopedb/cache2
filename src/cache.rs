@@ -8,13 +8,15 @@
 
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::error::{Error, ErrorOperation, Result};
 use crate::index::{MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
-use crate::index_storage::canonical_index_partition_ranges;
+use crate::index_storage::{IndexStorageError, canonical_index_partition_ranges};
 use crate::recovery::{
     DataGeometry, DataSuperblock, KEY_HASH_ALGORITHM_XXH3_64, PersistentId,
     RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE, recovery_image_index_len,
@@ -34,8 +36,6 @@ const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 const KEY_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
 const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
-
-pub type Result<T> = std::io::Result<T>;
 
 /// Persistent L2 geometry and fixed-index sizing.
 ///
@@ -111,8 +111,13 @@ impl StaticConfig {
     }
 
     /// Validates the static physical geometry before opening cache files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::InvalidInput`] when the capacity, Region
+    /// geometry, or index size is not representable.
     pub fn validate(&self) -> Result<()> {
-        self.geometry().map(|_| ())
+        public_result(ErrorOperation::ValidateConfig, self.geometry().map(|_| ()))
     }
 
     /// Maximum cache-owned logical disk bytes after a successful open.
@@ -120,7 +125,16 @@ impl StaticConfig {
     /// The bound includes the fixed data and state files plus both the current
     /// clean image and the temporary image used for atomic warm publication.
     /// Filesystem metadata and block-allocation granularity are outside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::InvalidInput`] when the static geometry is
+    /// invalid or its disk bound overflows.
     pub fn peak_disk_bytes(&self) -> Result<u64> {
+        public_result(ErrorOperation::PeakDiskBytes, self.peak_disk_bytes_inner())
+    }
+
+    fn peak_disk_bytes_inner(&self) -> io::Result<u64> {
         let geometry = self.geometry()?;
         let index_slots = u64::try_from(self.index_slots)
             .map_err(|_| invalid_config("index capacity does not fit u64"))?;
@@ -128,7 +142,7 @@ impl StaticConfig {
             .ok_or_else(|| invalid_config("index image length overflow"))?;
         let partition_count = u64::try_from(
             canonical_index_partition_ranges(self.index_slots)
-                .map_err(|_| invalid_config("index partition layout is invalid"))?
+                .map_err(index_layout_error)?
                 .len(),
         )
         .map_err(|_| invalid_config("index partition count does not fit u64"))?;
@@ -151,7 +165,7 @@ impl StaticConfig {
             .ok_or_else(|| invalid_config("peak disk usage overflow"))
     }
 
-    fn geometry(&self) -> Result<DataGeometry> {
+    fn geometry(&self) -> io::Result<DataGeometry> {
         if self.region_size_bytes == 0
             || self.region_size_bytes > MAX_PACKED_REGION_SIZE
             || !self.region_size_bytes.is_multiple_of(4096)
@@ -258,26 +272,43 @@ impl CacheBuilder {
     /// Opens the cache on Tokio's blocking pool because recovery and file setup
     /// use blocking filesystem operations. The default captures the current
     /// Tokio runtime when the future is first polled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured [`crate::Error`] with
+    /// [`crate::ErrorOperation::Open`]. Invalid or unsupported configuration is
+    /// rejected before file creation; [`crate::ErrorKind::Busy`] means another
+    /// owner holds the cache files. Allocation, filesystem, device, and worker
+    /// startup failures retain their underlying [`io::Error`].
     pub async fn open(self) -> Result<Cache> {
         let tokio_handle = match self.tokio_handle.clone() {
             Some(handle) => handle,
             None => tokio::runtime::Handle::try_current().map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+                Error::from_io(
+                    ErrorOperation::Open,
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
+                )
             })?,
         };
         let cache_handle = tokio_handle.clone();
         let started = Instant::now();
-        tokio_handle
+        let result = tokio_handle
             .spawn_blocking(move || self.open_blocking(cache_handle, started))
             .await
-            .map_err(|error| blocking_task_error("cache open", error))?
+            .map_err(|error| {
+                Error::from_io(
+                    ErrorOperation::Open,
+                    blocking_task_error("cache open", error),
+                )
+            })?;
+        public_result(ErrorOperation::Open, result)
     }
 
     fn open_blocking(
         self,
         tokio_handle: tokio::runtime::Handle,
         started: Instant,
-    ) -> Result<Cache> {
+    ) -> io::Result<Cache> {
         let path = self.path.clone();
         let capacity_bytes = self.static_config.capacity_bytes;
         let index_slots = self.static_config.index_slots;
@@ -318,9 +349,9 @@ impl CacheBuilder {
         result
     }
 
-    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> Result<Cache> {
+    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> io::Result<Cache> {
         let geometry = self.static_config.geometry()?;
-        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes()?;
+        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes_inner()?;
         let runtime_config = self.runtime_config;
         runtime_config.validate()?;
         if geometry.region_count <= runtime_config.append_shards {
@@ -430,8 +461,18 @@ impl Cache {
     ///
     /// Keys are limited to 4 KiB. The complete encoded record must fit in one
     /// Region; the Region fit determines the value limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key or
+    /// record and [`crate::ErrorKind::Overloaded`] when bounded mutation
+    /// admission is busy. Runtime and device failures use their corresponding
+    /// structured classifications.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
-        self.store.put_value(key.as_ref(), value.as_ref())
+        public_result(
+            ErrorOperation::Put,
+            self.store.put_value(key.as_ref(), value.as_ref()),
+        )
     }
 
     /// Stages a value directly for L2 and returns its monotonic mutation
@@ -440,16 +481,33 @@ impl Cache {
     /// An older L1 value is removed best effort. Success means the value entered
     /// bounded staging; use [`Self::drain`] to wait for L2 publication. Keys are
     /// limited to 4 KiB, and the encoded record must fit one Region.
+    ///
+    /// # Errors
+    ///
+    /// Uses the same input, overload, runtime, and device classifications as
+    /// [`Self::put`], with [`crate::ErrorOperation::PutL2`] as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
-        self.store.put_value_l2(key.as_ref(), value.as_ref())
+        public_result(
+            ErrorOperation::PutL2,
+            self.store.put_value_l2(key.as_ref(), value.as_ref()),
+        )
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
     ///
     /// This removes the L2 mapping and cleans L1 best effort using bounded
     /// in-memory work. Keys are limited to 4 KiB.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key and
+    /// [`crate::ErrorKind::Overloaded`] when bounded mutation admission is
+    /// busy. Runtime and device failures remain explicit.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
-        self.store.delete_value(key.as_ref())
+        public_result(
+            ErrorOperation::Delete,
+            self.store.delete_value(key.as_ref()),
+        )
     }
 
     /// Looks up a value in L1 and then L2.
@@ -458,25 +516,44 @@ impl Cache {
     /// read. By default, memory or I/O pressure is a miss. With read waiting
     /// enabled, queue, memory, or timeout pressure is an overload error. A key
     /// longer than 4 KiB is also a miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::Overloaded`] for explicit read pressure when
+    /// waiting is enabled. Cache data and device failures that can safely fail
+    /// open transition reads to misses instead of surfacing an application
+    /// error.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
-        self.store
-            .get_value_async(key.as_ref(), &self.tokio_handle)
-            .await
-            .map(|value| value.map(|inner| Value { inner }))
+        public_result(
+            ErrorOperation::Get,
+            self.store
+                .get_value_async(key.as_ref(), &self.tokio_handle)
+                .await,
+        )
+        .map(|value| value.map(|inner| Value { inner }))
     }
 
     /// Waits until all accepted mutations have completed their Region writes
     /// and index publication. Use [`Self::close_warm`] to publish a recoverable
     /// image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::Overloaded`] if another drain is active, or
+    /// a structured runtime/device failure if accepted work cannot complete.
     pub async fn drain(&self) -> Result<()> {
-        self.store.drain_async().await
+        public_result(ErrorOperation::Drain, self.store.drain_async().await)
     }
 
     /// Returns a lock-free operational snapshot. Activity and I/O counters are
     /// cumulative for this open and are populated only when statistics are
     /// enabled; health and resource gauges are always available.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured runtime failure if the snapshot cannot be read.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
-        let mut snapshot = self.store.snapshot()?;
+        let mut snapshot = public_result(ErrorOperation::Snapshot, self.store.snapshot())?;
         snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
     }
@@ -485,14 +562,27 @@ impl Cache {
     /// addition to the regular cache summary. This periodic diagnostic briefly
     /// reads every configured L1 shard and index partition and scans Region
     /// metadata. Sampling is limited to metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured runtime failure if any diagnostic partition cannot
+    /// be sampled.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
-        let mut snapshot = self.store.detailed_snapshot()?;
+        let mut snapshot = public_result(
+            ErrorOperation::DetailedSnapshot,
+            self.store.detailed_snapshot(),
+        )?;
         snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
     }
 
     /// Stops on Tokio's blocking pool and makes the next open a cold start. Once
     /// called, the close continues even if the returned future is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured runtime, worker, or filesystem failure with
+    /// [`crate::ErrorOperation::CloseFast`].
     pub fn close_fast(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
         let tokio_handle = self.tokio_handle.clone();
         let started = Instant::now();
@@ -502,14 +592,22 @@ impl Cache {
             result
         });
         async move {
-            close
-                .await
-                .map_err(|error| blocking_task_error("fast close", error))?
+            let result = match close.await {
+                Ok(result) => result,
+                Err(error) => Err(blocking_task_error("fast close", error)),
+            };
+            public_result(ErrorOperation::CloseFast, result)
         }
     }
 
     /// Publishes a clean recovery image on Tokio's blocking pool. Once called,
     /// the close continues even if the returned future is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured runtime, worker, filesystem, or device failure with
+    /// [`crate::ErrorOperation::CloseWarm`]. A failed warm close does not
+    /// publish a recoverable image.
     pub fn close_warm(mut self) -> impl Future<Output = Result<()>> + Send + 'static {
         let tokio_handle = self.tokio_handle.clone();
         let started = Instant::now();
@@ -519,9 +617,11 @@ impl Cache {
             result
         });
         async move {
-            close
-                .await
-                .map_err(|error| blocking_task_error("warm close", error))?
+            let result = match close.await {
+                Ok(result) => result,
+                Err(error) => Err(blocking_task_error("warm close", error)),
+            };
+            public_result(ErrorOperation::CloseWarm, result)
         }
     }
 }
@@ -569,7 +669,7 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
-fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &Result<()>) {
+fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &io::Result<()>) {
     match result {
         Ok(()) => log::info!(
             target: "cache2::lifecycle",
@@ -591,8 +691,8 @@ fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &
     }
 }
 
-fn blocking_task_error(operation: &'static str, error: tokio::task::JoinError) -> std::io::Error {
-    std::io::Error::other(format!("{operation} task failed: {error}"))
+fn blocking_task_error(operation: &'static str, error: tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("{operation} task failed: {error}"))
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -601,8 +701,19 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn invalid_config(message: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+fn invalid_config(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn index_layout_error(error: IndexStorageError) -> io::Error {
+    match error {
+        IndexStorageError::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidInput, error),
+    }
+}
+
+fn public_result<T>(operation: ErrorOperation, result: io::Result<T>) -> Result<T> {
+    result.map_err(|error| Error::from_io(operation, error))
 }
 
 fn next_persistent_id() -> PersistentId {
@@ -686,5 +797,15 @@ mod tests {
             .with_expected_entries(MAX_INDEX_SLOTS / 2)
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn index_layout_allocation_error_remains_out_of_memory() {
+        let error = index_layout_error(IndexStorageError::Io(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "injected allocation failure",
+        )));
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 }

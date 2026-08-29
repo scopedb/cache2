@@ -97,7 +97,8 @@ pub(crate) fn canonical_index_partition_ranges(
     let first_extra = partition_count - extra_pages;
     let mut ranges = Vec::new();
     ranges.try_reserve_exact(partition_count).map_err(|_| {
-        IndexStorageError::Io(io::Error::other(
+        IndexStorageError::Io(io::Error::new(
+            io::ErrorKind::OutOfMemory,
             "unable to allocate canonical index partition directory",
         ))
     })?;
@@ -1223,7 +1224,8 @@ impl PartitionedIndexStorage {
         let layout = ImageLayout::new(slot_count)?;
         let mut ranges = Vec::new();
         ranges.try_reserve_exact(1).map_err(|_| {
-            IndexStorageError::Io(io::Error::other(
+            IndexStorageError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
                 "unable to allocate benchmark index partition",
             ))
         })?;
@@ -1360,7 +1362,8 @@ impl PartitionedIndexStorage {
         stats
             .try_reserve_exact(self.partitions.len())
             .map_err(|_| {
-                IndexStorageError::Io(io::Error::other(
+                IndexStorageError::Io(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
                     "unable to allocate index partition statistics",
                 ))
             })?;
@@ -1403,7 +1406,8 @@ impl PartitionedIndexStorage {
         frozen_partitions
             .try_reserve_exact(self.partitions.len())
             .map_err(|_| {
-                IndexStorageError::Io(io::Error::other(
+                IndexStorageError::Io(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
                     "unable to allocate frozen index partition guards",
                 ))
             })?;
@@ -1465,7 +1469,10 @@ impl PartitionedIndexStorage {
         }
         let mut partitions = Vec::new();
         partitions.try_reserve_exact(ranges.len()).map_err(|_| {
-            IndexStorageError::Io(io::Error::other("unable to allocate index partition locks"))
+            IndexStorageError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "unable to allocate index partition locks",
+            ))
         })?;
         for (index, range) in ranges.iter().copied().enumerate() {
             let physical_stats = partition_stats
@@ -1586,7 +1593,12 @@ impl<'a, W: Write + ?Sized> WarmImageBatchWriter<'a, W> {
         if self.buffer.is_empty() {
             self.buffer
                 .try_reserve_exact(WARM_IMAGE_WRITE_BATCH_BYTES)
-                .map_err(|_| io::Error::other("unable to allocate warm index write batch"))?;
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "unable to allocate warm index write batch",
+                    )
+                })?;
             self.buffer.resize(WARM_IMAGE_WRITE_BATCH_BYTES, 0);
         }
         Ok(())
@@ -1667,7 +1679,8 @@ fn allocate_page_states(
 ) -> Result<Box<[AtomicU8]>, IndexStorageError> {
     let mut states = Vec::new();
     states.try_reserve_exact(page_count).map_err(|_| {
-        IndexStorageError::Io(io::Error::other(
+        IndexStorageError::Io(io::Error::new(
+            io::ErrorKind::OutOfMemory,
             "unable to allocate index page validation bitmap",
         ))
     })?;
@@ -1694,7 +1707,10 @@ impl Backing {
         {
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(length).map_err(|_| {
-                IndexStorageError::Io(io::Error::other("unable to allocate anonymous index image"))
+                IndexStorageError::Io(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "unable to allocate anonymous index image",
+                ))
             })?;
             bytes.resize(length, 0);
             Ok(Self::Heap(bytes.into_boxed_slice()))
