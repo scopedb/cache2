@@ -2,9 +2,14 @@
 
 ## Unreleased
 
-### Changed
+## v0.2.0 (2026-08-29)
 
-- **Breaking:** Public fallible operations now return `cache2::Error` through
+This release keeps the version 1 on-disk format and requires no disk
+migration. It contains source-breaking public API changes described below.
+
+### Breaking Changes
+
+- Public fallible operations now return `cache2::Error` through
   `cache2::Result`. Errors expose an actionable `ErrorKind`, the failed
   `ErrorOperation`, and the original `std::io::Error`; conversion back to
   `std::io::Error` preserves the original error by default, with an explicit
@@ -13,6 +18,29 @@
 - Request-path saturation is classified as `ErrorKind::Overloaded`, while
   exclusive cache-file contention during `open` is classified as
   `ErrorKind::Busy`.
+- `CacheTier` is non-exhaustive so future backing tiers can be added without
+  another source-breaking enum change. Downstream matches require a wildcard
+  arm.
+
+### Improvements
+
+- L1 lookups use bounded contention retries, concurrent promotions reuse an
+  already-published exact-key value, and CLOCK victim scans visit resident
+  entries instead of sparse capacity slots.
+- L1 free lists, hash directories, fixed entry slots, and S3-FIFO ghost state
+  use compact fixed-width storage. In the 4 TiB L2, 10 GiB L1, 64-shard
+  reference plan, CLOCK metadata falls from 184 MiB to 130 MiB and S3-FIFO
+  metadata falls from 338 MiB to 240 MiB.
+- Full hashes, full-key validation, bounded probes, and bounded victim work
+  remain in force for both L1 policies.
+
+### Documentation and Validation
+
+- Public cache values, status enums, snapshots, and every metrics field now
+  document their semantics, including L2 values promoted before return.
+- Supported platform and I/O combinations are explicit. CI now rejects
+  missing public documentation, verifies the publishable package, and runs
+  the extended crash and recovery contracts.
 
 ## v0.1.2 (2026-08-29)
 
