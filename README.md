@@ -115,6 +115,14 @@ overload.
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
 mode. io_uring requires the `io-uring` feature and is experimental in 0.1.
 
+### Platform support
+
+C² supports 64-bit Linux and macOS. Buffered positioned I/O is available on
+both platforms. Direct I/O and io_uring are Linux-only; io_uring is limited to
+the architectures listed by the optional `io-uring` feature. Other Unix
+targets may compile, but cache open returns `ErrorKind::Unsupported` when the
+platform cannot provide physical file preallocation. Windows is not supported.
+
 ## Deployment
 
 C² accepts one data-file path. For multiple homogeneous SSDs, expose RAID0 or

@@ -393,12 +393,24 @@ impl CacheBuilder {
     }
 }
 
+/// Storage tier that backs a returned [`Value`].
+///
+/// This describes the value's backing after the lookup completes, not
+/// necessarily the tier where the lookup began. A successful L2 promotion is
+/// therefore backed by L1.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheTier {
+    /// Process-local in-memory storage.
     L1,
+    /// A transient buffer read from the Region store.
     L2,
 }
 
+/// Owned cache value returned by [`Cache::get`].
+///
+/// The value dereferences to its bytes and keeps its L1 or transient L2
+/// backing alive until it is dropped.
 pub struct Value {
     inner: HybridValueRead,
 }
@@ -418,9 +430,10 @@ impl AsRef<[u8]> for Value {
 }
 
 impl Value {
-    /// Returns the tier that served this lookup.
+    /// Returns the storage tier backing this value.
     ///
-    /// A Region hit may already be backed by its promoted L1 value.
+    /// A Region hit successfully promoted before return reports
+    /// [`CacheTier::L1`]; hit counters still record it as an L2 hit.
     pub const fn tier(&self) -> CacheTier {
         if self.inner.is_l1() {
             CacheTier::L1
