@@ -189,6 +189,8 @@ cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
 
 ## Further reading
 
+- [Configuration guide](CONFIGURATION.md) — parameter interactions,
+  resource tradeoffs, goal-oriented profiles, and diagnostic tuning.
 - [Architecture](ARCHITECTURE.md) — data structures, request paths, reclaim,
   and recovery.
 - [Error handling](ERRORS.md) — structured classifications, operation context,
