@@ -696,6 +696,7 @@ async fn concurrent_reads(
                     match value.tier() {
                         CacheTier::L1 => primary.l1_hits += 1,
                         CacheTier::L2 => primary.l2_hits += 1,
+                        _ => return Err(io::Error::other("benchmark observed an unknown tier")),
                     }
                     black_box(value.as_ref());
                 } else {
@@ -725,6 +726,7 @@ async fn concurrent_reads(
     let successful_operations = match expected_tier {
         CacheTier::L1 => primary.l1_hits,
         CacheTier::L2 => primary.l2_hits,
+        _ => return Err(io::Error::other("benchmark expected an unknown tier")),
     };
     Ok(ReadMeasurement {
         measurement: Measurement {
@@ -774,6 +776,7 @@ async fn sample_tier(
             match value.tier() {
                 CacheTier::L1 => tiers.l1_hits += 1,
                 CacheTier::L2 => tiers.l2_hits += 1,
+                _ => return Err(io::Error::other("benchmark observed an unknown tier")),
             }
             tiers.bytes += value.len() as u128;
             tiers.checksum = tiers.checksum.wrapping_add(
