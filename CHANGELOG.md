@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.2 (2026-08-29)
+
+This release keeps the version 1 on-disk format and requires no migration.
+
+### Dependency Licensing
+
+- Replaced the BSL-1.0-licensed `xxhash-rust` dependency with the MIT-licensed
+  `twox-hash` implementation while preserving seeded XXH3-64 key hashes, and
+  removed BSL-1.0 from the allowed dependency licenses.
+
 ## v0.1.1 (2026-08-29)
 
 This release keeps the version 1 on-disk format and requires no migration.
