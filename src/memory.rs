@@ -19,8 +19,8 @@ use crate::hashing::{FixedPrehashedMap, route_hash};
 use crate::runtime_config::L1EvictionPolicy;
 use crate::snapshot::CacheL1Snapshot;
 
-/// Charged retained-value ownership. Fixed entry, policy, free-list, and
-/// directory storage is planned and allocated separately during open.
+/// Charged retained-value ownership. Fixed entry, policy, and directory
+/// storage is planned and allocated separately during open.
 pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// Keep large Region records out of shard-local L1 critical sections. The
 /// complete retained entry, including its key and fixed ownership charge, must
@@ -276,7 +276,8 @@ struct MemoryShard {
     directory: FixedPrehashedMap,
     slots: Box<[Option<MemoryEntry>]>,
     policy_slots: Box<[PolicySlot]>,
-    free_slots: Vec<u32>,
+    free_head: u32,
+    free_count: usize,
     resident_bytes: usize,
 }
 
@@ -303,22 +304,26 @@ impl MemoryShard {
                 )
             })?;
         policy_slots.resize(maximum_entries, PolicySlot::default());
-        let mut free_slots = Vec::new();
-        free_slots.try_reserve_exact(maximum_entries).map_err(|_| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate L1 free slots")
-        })?;
-        free_slots.extend(
-            (0..maximum_entries).rev().map(|index| {
-                u32::try_from(index).expect("validated L1 entry capacity exceeds u32")
-            }),
-        );
+        for (index, slot) in policy_slots.iter_mut().enumerate() {
+            let next = if index + 1 == maximum_entries {
+                NO_SLOT_INDEX
+            } else {
+                u32::try_from(index + 1).expect("validated L1 entry capacity exceeds u32")
+            };
+            *slot = PolicySlot::new_free(next);
+        }
         Ok(Self {
             budget,
             eviction: EvictionState::new(eviction_policy, capacity_bytes, maximum_entries)?,
             directory,
             slots: slots.into_boxed_slice(),
             policy_slots: policy_slots.into_boxed_slice(),
-            free_slots,
+            free_head: if maximum_entries == 0 {
+                NO_SLOT_INDEX
+            } else {
+                0
+            },
+            free_count: maximum_entries,
             resident_bytes: 0,
         })
     }
@@ -456,9 +461,11 @@ impl MemoryShard {
         }
         let _entry = self.slots[index].take().expect("resident slot disappeared");
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
-        debug_assert!(self.free_slots.len() < self.slots.len());
-        self.free_slots
-            .push(u32::try_from(index).expect("memory slot index exceeds u32"));
+        debug_assert!(self.free_count < self.slots.len());
+        let packed = u32::try_from(index).expect("memory slot index exceeds u32");
+        self.policy_slots[index] = PolicySlot::new_free(self.free_head);
+        self.free_head = packed;
+        self.free_count += 1;
     }
 
     fn detach_for_admission(&mut self, index: usize) -> DetachedAdmissionEntry {
@@ -512,7 +519,7 @@ impl MemoryShard {
         if required > self.budget.capacity_bytes {
             return ChargeResult::Rejected { evictions: 0 };
         }
-        let needs_slot = replacement.is_none() && self.free_slots.is_empty();
+        let needs_slot = replacement.is_none() && self.free_head == NO_SLOT_INDEX;
         match self.budget.try_charge(required) {
             MemoryChargeAttempt::Charged(charge) => {
                 if let Some(replacement) = replacement {
@@ -628,9 +635,10 @@ impl MemoryShard {
                 return MemoryInsertResult::rejected(evictions);
             }
         };
-        let Some(packed_index) = self.free_slots.last().copied() else {
+        let packed_index = self.free_head;
+        if packed_index == NO_SLOT_INDEX {
             return MemoryInsertResult::rejected(evictions);
-        };
+        }
         let Ok(index) = usize::try_from(packed_index) else {
             return MemoryInsertResult::rejected(evictions);
         };
@@ -643,11 +651,9 @@ impl MemoryShard {
             seqno,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
         };
-        let free_index = self
-            .free_slots
-            .pop()
-            .expect("fixed L1 admission prepared one free slot");
-        debug_assert_eq!(free_index, packed_index);
+        self.free_head = self.policy_slots[index].free_next();
+        debug_assert_ne!(self.free_count, 0);
+        self.free_count -= 1;
         self.slots[index] = Some(entry);
         self.resident_bytes = self.resident_bytes.saturating_add(charged_bytes);
         self.eviction
@@ -823,11 +829,6 @@ impl MemoryStore {
                         .checked_mul(std::mem::size_of::<PolicySlot>())
                         .and_then(|policy| bytes.checked_add(policy))
                 })
-                .and_then(|bytes| {
-                    shard_entries
-                        .checked_mul(std::mem::size_of::<u32>())
-                        .and_then(|free| bytes.checked_add(free))
-                })
                 .ok_or_else(|| invalid_memory_plan("L1 slot memory plan overflow"))?;
             let directory = FixedPrehashedMap::allocation_bytes(shard_entries)?;
             let eviction = EvictionState::allocation_bytes(eviction_policy, shard_entries)?;
@@ -985,7 +986,7 @@ impl MemoryStore {
                 .lock()
                 .map_err(|_| io::Error::other("L1 shard is poisoned"))?;
             resident_entries = resident_entries
-                .checked_add(shard.slots.len().saturating_sub(shard.free_slots.len()))
+                .checked_add(shard.slots.len().saturating_sub(shard.free_count))
                 .ok_or_else(|| invalid_memory_plan("L1 resident entry count overflow"))?;
             resident_bytes = resident_bytes
                 .checked_add(shard.resident_bytes)
@@ -1150,6 +1151,33 @@ mod tests {
 
         assert_hit(&store, 7, b"a");
         assert_eq!(store.metrics_snapshot().bypasses, 1);
+    }
+
+    #[test]
+    fn resident_reuses_an_unlinked_slot() {
+        let store = MemoryStore::new(4096, 2, 1, L1EvictionPolicy::Clock, true).unwrap();
+        {
+            let shard = store.shards[0].lock().unwrap();
+            assert_eq!(shard.free_head, 0);
+            assert_eq!(shard.free_count, 2);
+            assert_eq!(shard.policy_slots[0].free_next(), 1);
+        }
+
+        assert!(store.publish(1, b"a", b"value-a", 1));
+        assert!(store.delete(1, b"a", 2));
+        assert!(store.publish(2, b"b", b"value-b", 3));
+
+        let shard = store.shards[0].lock().unwrap();
+        assert_eq!(shard.free_head, 1);
+        assert_eq!(shard.free_count, 1);
+        assert_eq!(
+            shard.slots[0]
+                .as_ref()
+                .expect("released slot must be reused")
+                .value
+                .key(),
+            b"b"
+        );
     }
 
     #[test]
