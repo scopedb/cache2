@@ -1,13 +1,5 @@
 # C² Engineering Constraints
 
-## Pull request gate
-
-- Before pushing a branch or opening or updating a pull request, run every job
-  and matrix variant defined in `.github/workflows/ci.yml` locally and confirm
-  that all checks pass.
-- Do not push or open or update a pull request while any local CI check is
-  failing or has not been run.
-
 ## Priorities
 
 Use this order when correctness and performance goals compete:

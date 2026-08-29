@@ -494,7 +494,7 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
 }
 
 #[tokio::test]
-async fn changing_append_shards_discards_the_clean_image() {
+async fn append_shards_rebind_across_warm_reopens() {
     let files = TestCache::new("append-shards");
     let static_config = StaticConfig::new(3 * 512 * 1024)
         .with_region_size_bytes(512 * 1024)
@@ -513,13 +513,16 @@ async fn changing_append_shards_discards_the_clean_image() {
         .open()
         .await
         .unwrap();
-    assert_eq!(reopened.startup_mode(), StartupMode::Cold);
-    assert!(reopened.get("old-key").await.unwrap().is_none());
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    assert_eq!(
+        reopened.get("old-key").await.unwrap().unwrap().as_ref(),
+        &[7_u8; 1024]
+    );
     reopened.put("new-key", [9_u8; 1024]).unwrap();
     reopened.close_warm().await.unwrap();
 
     let recovered = files
-        .config_with_static_and_shards(2, static_config, 2)
+        .config_with_static_and_shards(2, static_config.clone(), 2)
         .open()
         .await
         .unwrap();
@@ -528,7 +531,36 @@ async fn changing_append_shards_discards_the_clean_image() {
         recovered.get("new-key").await.unwrap().unwrap().as_ref(),
         &[9_u8; 1024]
     );
-    recovered.close_fast().await.unwrap();
+    recovered.close_warm().await.unwrap();
+
+    let shrunk = files
+        .config_with_static_and_shards(1, static_config.clone(), 1)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(shrunk.startup_mode(), StartupMode::Warm);
+    assert_eq!(
+        shrunk.get("old-key").await.unwrap().unwrap().as_ref(),
+        &[7_u8; 1024]
+    );
+    assert_eq!(
+        shrunk.get("new-key").await.unwrap().unwrap().as_ref(),
+        &[9_u8; 1024]
+    );
+    shrunk.put("shrunk-key", [11_u8; 1024]).unwrap();
+    shrunk.close_warm().await.unwrap();
+
+    let stable = files
+        .config_with_static_and_shards(1, static_config, 1)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(stable.startup_mode(), StartupMode::Warm);
+    assert_eq!(
+        stable.get("shrunk-key").await.unwrap().unwrap().as_ref(),
+        &[11_u8; 1024]
+    );
+    stable.close_fast().await.unwrap();
 }
 
 #[tokio::test]

@@ -140,8 +140,9 @@ or fast close, the next open starts empty in constant time.
 `close_warm` stops admission, drains accepted work, syncs completed data,
 writes and syncs a checksummed image, installs it atomically, and publishes a
 matching `CLEAN` state last. A warm open maps the image privately and validates
-pages lazily. L1 always starts empty. Missing, corrupt, stale, unsupported, or
-configuration-mismatched state is discarded.
+pages lazily. L1 always starts empty. A changed append-shard count rebinds
+recovered Active Regions when enough Free Regions are available. Missing,
+corrupt, stale, unsupported, or configuration-mismatched state is discarded.
 
 Stale data, overload, and cache loss are valid outcomes. Every returned value
 passes address, key, and checksum validation. Structural or device faults move

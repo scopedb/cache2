@@ -31,7 +31,7 @@ use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
-const DEFAULT_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
+const KEY_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
 const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
 
@@ -46,7 +46,6 @@ pub struct StaticConfig {
     capacity_bytes: u64,
     region_size_bytes: u64,
     index_slots: usize,
-    hash_seed: u64,
 }
 
 impl StaticConfig {
@@ -71,7 +70,6 @@ impl StaticConfig {
             capacity_bytes,
             region_size_bytes: DEFAULT_REGION_SIZE,
             index_slots,
-            hash_seed: DEFAULT_HASH_SEED,
         }
     }
 
@@ -203,7 +201,7 @@ impl StaticConfig {
             geometry.region_size,
             u64::from(geometry.region_count),
             self.index_slots as u64,
-            self.hash_seed,
+            KEY_HASH_SEED,
             hash_algorithm_id,
         ] {
             for byte in value.to_le_bytes() {
@@ -340,7 +338,7 @@ impl CacheBuilder {
             cache_uuid: next_persistent_id(),
             data_identity: next_persistent_id(),
             geometry,
-            hash_seed: self.static_config.hash_seed,
+            hash_seed: KEY_HASH_SEED,
             config_fingerprint: self.static_config.fingerprint(geometry),
         };
         let files = RegionFiles::new(
@@ -662,7 +660,7 @@ mod tests {
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
             data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
             geometry,
-            hash_seed: config.hash_seed,
+            hash_seed: KEY_HASH_SEED,
             config_fingerprint: config.fingerprint(geometry),
         };
         assert!(data.encode().is_ok());
