@@ -2297,17 +2297,16 @@ mod tests {
             base.l1_eviction_policy,
         )
         .unwrap();
-        assert!(metadata < 384 * 1024 * 1024);
+        assert!(metadata < 224 * 1024 * 1024);
 
         let s3fifo = base
             .clone()
-            .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
-            .with_managed_memory_limit_bytes(16 * GIB);
+            .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo);
         s3fifo
             .validate_memory_plan(geometry, index_slots, 4)
             .unwrap();
         assert_eq!(
-            base.clone()
+            too_small
                 .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
                 .validate_memory_plan(geometry, index_slots, 4)
                 .unwrap_err()
@@ -2321,8 +2320,8 @@ mod tests {
             s3fifo.l1_eviction_policy,
         )
         .unwrap();
-        assert_eq!(s3fifo_metadata - metadata, 218 * 1024 * 1024);
-        assert!(s3fifo_metadata < 640 * 1024 * 1024);
+        assert_eq!(s3fifo_metadata - metadata, 154 * 1024 * 1024);
+        assert!(s3fifo_metadata < 384 * 1024 * 1024);
     }
 
     #[test]
