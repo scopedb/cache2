@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
-use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+use twox_hash::XxHash3_64;
 
 use super::*;
 
@@ -253,7 +254,7 @@ struct UringDriver {
     shared: Arc<RuntimeShared>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
-    flights: HashMap<RequestId, Flight, Xxh3DefaultBuilder>,
+    flights: HashMap<RequestId, Flight, BuildHasherDefault<XxHash3_64>>,
     pending_targets: VecDeque<RequestId>,
     pending_cancels: VecDeque<RequestId>,
     requested_cancels: Vec<RequestId>,
@@ -284,7 +285,7 @@ fn uring_driver(
         shared,
         submit_state,
         receiver,
-        flights: HashMap::with_capacity_and_hasher(max_in_flight, Xxh3DefaultBuilder::new()),
+        flights: HashMap::with_capacity_and_hasher(max_in_flight, BuildHasherDefault::default()),
         pending_targets: VecDeque::with_capacity(max_in_flight),
         pending_cancels: VecDeque::with_capacity(max_in_flight),
         requested_cancels: Vec::with_capacity(max_in_flight),
