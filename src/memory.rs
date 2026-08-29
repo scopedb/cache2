@@ -26,6 +26,9 @@ pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// complete retained entry, including its key and fixed ownership charge, must
 /// fit this bound before foreground publication or L2 promotion takes the lock.
 const MAX_L1_ENTRY_BYTES: usize = 256 * 1024;
+/// A sequence trailer uses the spare tail of the fixed entry-overhead charge
+/// so compact resident slots do not enlarge the hot Arc allocation.
+const MEMORY_VALUE_SEQNO_BYTES: usize = std::mem::size_of::<u64>();
 /// Full-key collision work stays bounded for entries sharing one directory
 /// fingerprint, including distinct keys with the same 64-bit cache hash.
 const MAX_SAME_HASH_ENTRIES: usize = 8;
@@ -147,8 +150,17 @@ struct MemoryValueInner {
 pub(crate) struct MemoryValue(Arc<MemoryValueInner>);
 
 impl MemoryValue {
-    fn try_new(key: &[u8], value: &[u8], charge: MemoryCharge) -> Result<Self, MemoryCharge> {
-        let Some(length) = key.len().checked_add(value.len()) else {
+    fn try_new(
+        key: &[u8],
+        value: &[u8],
+        seqno: u64,
+        charge: MemoryCharge,
+    ) -> Result<Self, MemoryCharge> {
+        let Some(length) = key
+            .len()
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(MEMORY_VALUE_SEQNO_BYTES))
+        else {
             return Err(charge);
         };
         let mut bytes = Vec::new();
@@ -157,6 +169,7 @@ impl MemoryValue {
         }
         bytes.extend_from_slice(key);
         bytes.extend_from_slice(value);
+        bytes.extend_from_slice(&seqno.to_le_bytes());
         Ok(Self(Arc::new(MemoryValueInner {
             bytes: bytes.into_boxed_slice(),
             key_length: key.len(),
@@ -165,15 +178,21 @@ impl MemoryValue {
     }
 
     pub(crate) fn charged_bytes(&self) -> usize {
-        MEMORY_ENTRY_OVERHEAD_BYTES + self.0.bytes.len()
+        MEMORY_ENTRY_OVERHEAD_BYTES + self.0.bytes.len() - MEMORY_VALUE_SEQNO_BYTES
     }
 
     pub(crate) fn key(&self) -> &[u8] {
         &self.0.bytes[..self.0.key_length]
     }
 
+    fn seqno(&self) -> u64 {
+        let mut encoded = [0_u8; MEMORY_VALUE_SEQNO_BYTES];
+        encoded.copy_from_slice(&self.0.bytes[self.0.bytes.len() - MEMORY_VALUE_SEQNO_BYTES..]);
+        u64::from_le_bytes(encoded)
+    }
+
     fn value(&self) -> &[u8] {
-        &self.0.bytes[self.0.key_length..]
+        &self.0.bytes[self.0.key_length..self.0.bytes.len() - MEMORY_VALUE_SEQNO_BYTES]
     }
 
     fn releases_charge_on_remove(&self) -> bool {
@@ -219,7 +238,6 @@ impl MemoryCharge {
 
 struct MemoryEntry {
     value: MemoryValue,
-    seqno: u64,
     hash_next: u32,
 }
 
@@ -642,13 +660,12 @@ impl MemoryShard {
         let Ok(index) = usize::try_from(packed_index) else {
             return MemoryInsertResult::rejected(evictions);
         };
-        let Ok(memory_value) = MemoryValue::try_new(key, value, charge) else {
+        let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge) else {
             return MemoryInsertResult::rejected(evictions);
         };
         let previous_head = self.directory_head(hash);
         let entry = MemoryEntry {
             value: memory_value,
-            seqno,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
         };
         self.free_head = self.policy_slots[index].free_next();
@@ -855,7 +872,7 @@ impl MemoryStore {
         if existing.is_some_and(|index| {
             shard.slots[index]
                 .as_ref()
-                .is_some_and(|entry| entry.seqno >= seqno)
+                .is_some_and(|entry| entry.value.seqno() >= seqno)
         }) {
             return true;
         }
@@ -886,7 +903,7 @@ impl MemoryStore {
         };
         if shard.slots[index]
             .as_ref()
-            .is_some_and(|entry| entry.seqno > seqno)
+            .is_some_and(|entry| entry.value.seqno() > seqno)
         {
             return true;
         }
@@ -944,7 +961,7 @@ impl MemoryStore {
         if let Some(index) = existing
             && shard.slots[index]
                 .as_ref()
-                .is_some_and(|entry| entry.seqno >= seqno)
+                .is_some_and(|entry| entry.value.seqno() >= seqno)
         {
             let shard = &mut *shard;
             shard.eviction.record_hit(&mut shard.policy_slots, index);
@@ -1069,6 +1086,13 @@ mod tests {
 
     fn assert_miss(store: &MemoryStore, hash: u64, key: &[u8]) {
         assert!(matches!(store.lookup(hash, key), MemoryLookup::Miss(_)));
+    }
+
+    #[test]
+    fn memory_entry_slot_uses_two_machine_words() {
+        let expected = 2 * std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<MemoryEntry>(), expected);
+        assert_eq!(std::mem::size_of::<Option<MemoryEntry>>(), expected);
     }
 
     #[test]

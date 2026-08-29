@@ -2297,7 +2297,7 @@ mod tests {
             base.l1_eviction_policy,
         )
         .unwrap();
-        assert_eq!(metadata, 150 * 1024 * 1024);
+        assert_eq!(metadata, 130 * 1024 * 1024);
 
         let s3fifo = base
             .clone()
@@ -2321,7 +2321,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s3fifo_metadata - metadata, 120 * 1024 * 1024);
-        assert_eq!(s3fifo_metadata, 270 * 1024 * 1024);
+        assert_eq!(s3fifo_metadata, 250 * 1024 * 1024);
     }
 
     #[test]
