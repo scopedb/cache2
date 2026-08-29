@@ -458,6 +458,20 @@ where
         );
     }
 
+    fn log_append_shards_rebind_planned(&self, previous: u32, current: u32) {
+        log::info!(
+            target: "cache2::recovery",
+            event = "cache_append_shards_rebind_planned",
+            path:% = self.files.data.display(),
+            previous_append_shards = previous,
+            append_shards = current,
+            reused_active_regions = previous.min(current),
+            activated_free_regions = current.saturating_sub(previous),
+            sealed_active_regions = previous.saturating_sub(current);
+            "warm recovery planned append shard rebind"
+        );
+    }
+
     fn cold_recovery(
         &self,
         reason: &'static str,
@@ -705,9 +719,6 @@ where
         if !metadata.matches_image(data, header) {
             return self.cold_recovery("metadata_identity_mismatch");
         }
-        if metadata.root.shard_count != self.shard_count {
-            return self.cold_recovery("append_shards_mismatch");
-        }
         let file = image.try_clone_control_file()?;
         self.cold_reset_needed = false;
         Ok(RecoveryPlan::Clean(CleanFileRegionImage {
@@ -760,7 +771,7 @@ where
 
     fn map_clean_runtime(
         &mut self,
-        clean: Self::CleanImage,
+        mut clean: Self::CleanImage,
         index_slots: usize,
     ) -> io::Result<Option<Self::Runtime>> {
         let data = self.data_superblock()?;
@@ -784,12 +795,30 @@ where
                 expected_index_len,
             )
         }) && clean.metadata.matches_image(data, clean.header)
-            && clean.metadata.root.shard_count == self.shard_count
             && clean.metadata.validate().is_ok();
         if !eligible {
             self.cold_reset_needed = true;
             self.log_cold_recovery("image_became_ineligible");
             return Ok(None);
+        }
+        let previous_append_shards = clean.metadata.root.shard_count;
+        if previous_append_shards != self.shard_count {
+            let added_shards = self.shard_count.saturating_sub(previous_append_shards);
+            if added_shards > clean.metadata.root.free_region_count {
+                self.cold_reset_needed = true;
+                self.log_cold_recovery("append_shards_rebind_insufficient_free_regions");
+                return Ok(None);
+            }
+            if clean
+                .metadata
+                .rebind_append_shards(self.shard_count)
+                .is_err()
+            {
+                self.cold_reset_needed = true;
+                self.log_cold_recovery("append_shards_rebind_invalid");
+                return Ok(None);
+            }
+            self.log_append_shards_rebind_planned(previous_append_shards, self.shard_count);
         }
         let partition_stats = metadata_partition_stats(&clean.metadata)?;
         let binding = index_image_binding(clean.header);

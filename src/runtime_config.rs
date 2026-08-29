@@ -81,8 +81,8 @@ pub enum L1EvictionPolicy {
 
 /// Process-local cache topology and resource tuning validated during open.
 ///
-/// These values may change across opens. The append-shard count participates in
-/// recovery eligibility, so changing it starts with an empty cache.
+/// These values may change across opens. Warm recovery rebinds append shards
+/// from recovered Active and Free Regions when the requested topology fits.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
@@ -187,8 +187,9 @@ impl RuntimeConfig {
     /// per append shard plus at least one spare Region. The valid range is
     /// `1..=256`.
     ///
-    /// Changing this value across opens safely cold-starts the disposable cache.
-    /// The value remains part of process-local topology.
+    /// Changing this value across opens rebinds a clean recovery image when
+    /// enough Free Regions are available. Otherwise the disposable cache safely
+    /// starts empty.
     pub fn with_append_shards(mut self, shards: u32) -> Self {
         self.append_shards = shards;
         self

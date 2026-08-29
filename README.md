@@ -98,8 +98,9 @@ complete geometry and memory plan before creating cache files.
 | I/O | `with_io_engine`, `with_io_mode` | Buffered POSIX I/O. |
 | Metrics | `with_statistics` | Health and resource gauges enabled; cumulative activity counters opt in. |
 
-Changing the append-shard count starts with an empty cache because shard
-topology participates in recovery eligibility.
+Changing the append-shard count rebinds recovered Active Regions during a warm
+open. Growth uses available Free Regions; when there are not enough, the
+disposable cache safely starts empty.
 
 The default read-wait timeout is zero, so read-engine or buffer pressure returns
 a miss. A positive timeout enables a short queue with at most one waiter per

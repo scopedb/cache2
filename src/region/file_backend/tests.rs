@@ -1125,44 +1125,95 @@ fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
     dirty.close_fast().unwrap();
 }
 
+fn publish_custom_clean_image(
+    directory: &TestDirectory,
+    index_slots: usize,
+    data: DataSuperblock,
+    metadata: RegionMetadata,
+) {
+    let shard_count = metadata.root.shard_count;
+    let runtime_config = RuntimeConfig::default().with_append_shards(shard_count);
+    let mut backend = FileRegionBackend::new_with_configs(
+        directory.files.clone(),
+        data,
+        shard_count,
+        runtime_config,
+    );
+    backend.acquire_exclusive().unwrap();
+    assert!(matches!(
+        backend.inspect_recovery(index_slots).unwrap(),
+        RecoveryPlan::Fresh
+    ));
+    let runtime = FileRegionRuntime::install(
+        PartitionedIndexStorage::anonymous(index_slots).unwrap(),
+        metadata,
+    )
+    .unwrap();
+    backend.publish_running().unwrap();
+    let runtime = backend.start_runtime(runtime).unwrap();
+    let frozen = backend.freeze_warm(runtime).unwrap();
+    let prepared = backend.persist_frozen(&frozen).unwrap();
+    backend.publish_clean(prepared).unwrap();
+    backend.release_exclusive().unwrap();
+}
+
 #[test]
-fn clean_image_with_a_different_shard_topology_cold_starts_safely() {
+fn clean_image_rebinds_a_different_append_shard_topology() {
     let directory = TestDirectory::new();
     let config = 8;
     let data = test_data_superblock();
 
-    // Build one otherwise valid CLEAN image with the previous one-shard
-    // topology. This exercises the real state/image selection path rather
-    // than treating a shard mismatch as malformed recovery metadata.
-    let mut metadata = empty_region_metadata(data, config, REGION_SHARDS).unwrap();
-    metadata.root.shard_count = 1;
-    metadata.root.active_region_count = 1;
-    metadata.root.free_region_count = data.geometry.region_count - 1;
-    metadata.root.max_seqno = 1;
-    for (ordinal, region) in metadata.regions.iter_mut().skip(1).enumerate() {
-        region.state = RegionMetadataState::Free;
-        region.queue_ordinal = u32::try_from(ordinal).unwrap();
-        region.created_seqno = 0;
-    }
-    metadata.validate().unwrap();
+    let metadata = empty_region_metadata(data, config, 1).unwrap();
+    publish_custom_clean_image(&directory, config, data, metadata);
 
-    let mut old = FileRegionBackend::new(directory.files.clone(), data);
-    old.acquire_exclusive().unwrap();
-    assert!(matches!(
-        old.inspect_recovery(config).unwrap(),
-        RecoveryPlan::Fresh
-    ));
-    let runtime = FileRegionRuntime::install(
-        PartitionedIndexStorage::anonymous(config).unwrap(),
-        metadata,
+    let mut reopened = RegionStore::open(
+        config,
+        FileRegionBackend::new(directory.files.clone(), data),
     )
     .unwrap();
-    old.publish_running().unwrap();
-    let runtime = old.start_runtime(runtime).unwrap();
-    let frozen = old.freeze_warm(runtime).unwrap();
-    let prepared = old.persist_frozen(&frozen).unwrap();
-    old.publish_clean(prepared).unwrap();
-    old.release_exclusive().unwrap();
+    assert_eq!(reopened.startup(), StartupMode::Warm);
+    let manager = reopened.runtime().unwrap().manager.lock().unwrap();
+    assert_eq!(manager.active_regions(), &[0, 2, 3, 4]);
+    assert_eq!(manager.free_regions().len(), 1);
+    drop(manager);
+    reopened.close_warm().unwrap();
+
+    let mut stable = RegionStore::open(
+        config,
+        FileRegionBackend::new(directory.files.clone(), data),
+    )
+    .unwrap();
+    assert_eq!(stable.startup(), StartupMode::Warm);
+    assert_eq!(
+        stable
+            .runtime()
+            .unwrap()
+            .manager
+            .lock()
+            .unwrap()
+            .active_regions(),
+        &[0, 2, 3, 4]
+    );
+    stable.close_fast().unwrap();
+}
+
+#[test]
+fn append_shard_growth_without_free_regions_cold_starts_safely() {
+    let directory = TestDirectory::new();
+    let config = 8;
+    let data = test_data_superblock();
+    let mut metadata = empty_region_metadata(data, config, 1).unwrap();
+    for (ordinal, region) in metadata.regions[1..4].iter_mut().enumerate() {
+        region.state = RegionMetadataState::Sealed;
+        region.queue_ordinal = u32::try_from(ordinal).unwrap();
+        region.created_seqno = u64::try_from(ordinal + 2).unwrap();
+    }
+    metadata.regions[4].queue_ordinal = 0;
+    metadata.root.max_seqno = 4;
+    metadata.root.free_region_count = 1;
+    metadata.root.sealed_region_count = 3;
+    metadata.validate().unwrap();
+    publish_custom_clean_image(&directory, config, data, metadata);
 
     let mut reopened = RegionStore::open(
         config,

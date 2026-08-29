@@ -425,6 +425,82 @@ impl RegionMetadata {
         validate_partitions(self.root, &self.partitions)?;
         Ok(())
     }
+
+    /// Rebinds validated recovered Active Regions to a new process-local append
+    /// topology.
+    ///
+    /// Shrinking seals excess Active Regions at the back of the sealed FIFO.
+    /// Growing activates Regions from the back of the free FIFO so its existing
+    /// rotation order remains stable. No index or Region data needs rewriting.
+    pub(crate) fn rebind_append_shards(&mut self, shard_count: u32) -> Result<()> {
+        let old_shard_count = self.root.shard_count;
+        if shard_count == old_shard_count {
+            return Ok(());
+        }
+        if shard_count == 0
+            || shard_count as usize > MAX_SHARDS
+            || shard_count >= self.root.region_count
+        {
+            return Err(RegionMetadataError::InvalidField("append_shards"));
+        }
+
+        if shard_count < old_shard_count {
+            let removed = old_shard_count - shard_count;
+            let first_new_sealed = self.root.sealed_region_count;
+            let sealed_region_count = first_new_sealed
+                .checked_add(removed)
+                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+            for region in &mut self.regions {
+                if region.state == RegionMetadataState::Active
+                    && region.queue_ordinal >= shard_count
+                {
+                    let removed_ordinal = region.queue_ordinal - shard_count;
+                    region.state = RegionMetadataState::Sealed;
+                    region.queue_ordinal = first_new_sealed
+                        .checked_add(removed_ordinal)
+                        .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+                }
+            }
+            self.root.shard_count = shard_count;
+            self.root.active_region_count = shard_count;
+            self.root.sealed_region_count = sealed_region_count;
+        } else {
+            let added = shard_count - old_shard_count;
+            let free_region_count = self.root.free_region_count.checked_sub(added).ok_or(
+                RegionMetadataError::InvalidField("append_shards_free_capacity"),
+            )?;
+            let max_seqno = self
+                .root
+                .max_seqno
+                .checked_add(u64::from(added))
+                .filter(|seqno| *seqno != u64::MAX)
+                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+            let first_seqno = self
+                .root
+                .max_seqno
+                .checked_add(1)
+                .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+            for region in &mut self.regions {
+                if region.state == RegionMetadataState::Free
+                    && region.queue_ordinal >= free_region_count
+                {
+                    let added_ordinal = region.queue_ordinal - free_region_count;
+                    region.state = RegionMetadataState::Active;
+                    region.queue_ordinal = old_shard_count
+                        .checked_add(added_ordinal)
+                        .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+                    region.created_seqno = first_seqno
+                        .checked_add(u64::from(added_ordinal))
+                        .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+                }
+            }
+            self.root.shard_count = shard_count;
+            self.root.active_region_count = shard_count;
+            self.root.free_region_count = free_region_count;
+            self.root.max_seqno = max_seqno;
+        }
+        self.validate()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1210,6 +1286,45 @@ mod tests {
             .into_boxed_slice();
         metadata.partitions[0].physical_value_slots = 3;
         metadata
+    }
+
+    #[test]
+    fn append_shards_rebind_between_active_and_free_or_sealed_queues() {
+        let mut metadata = sample();
+
+        metadata.rebind_append_shards(2).unwrap();
+        assert_eq!(metadata.root.shard_count, 2);
+        assert_eq!(metadata.root.active_region_count, 2);
+        assert_eq!(metadata.root.free_region_count, 0);
+        assert_eq!(metadata.root.sealed_region_count, 2);
+        assert_eq!(metadata.root.max_seqno, 5);
+        assert_eq!(metadata.regions[3].state, RegionMetadataState::Active);
+        assert_eq!(metadata.regions[3].queue_ordinal, 1);
+        assert_eq!(metadata.regions[3].created_seqno, 5);
+
+        metadata.rebind_append_shards(1).unwrap();
+        assert_eq!(metadata.root.shard_count, 1);
+        assert_eq!(metadata.root.active_region_count, 1);
+        assert_eq!(metadata.root.free_region_count, 0);
+        assert_eq!(metadata.root.sealed_region_count, 3);
+        assert_eq!(metadata.root.max_seqno, 5);
+        assert_eq!(metadata.regions[3].state, RegionMetadataState::Sealed);
+        assert_eq!(metadata.regions[3].queue_ordinal, 2);
+        metadata.validate().unwrap();
+    }
+
+    #[test]
+    fn append_shard_growth_requires_free_regions() {
+        let mut metadata = sample();
+        let original = metadata.clone();
+
+        assert_eq!(
+            metadata.rebind_append_shards(3),
+            Err(RegionMetadataError::InvalidField(
+                "append_shards_free_capacity"
+            ))
+        );
+        assert_eq!(metadata, original);
     }
 
     #[test]
