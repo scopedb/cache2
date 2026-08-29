@@ -32,13 +32,15 @@ const S3FIFO_MOVE_TO_MAIN_THRESHOLD: u8 = 2;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PolicySlot {
     hash: u64,
+    clock_position: u32,
     flags: u8,
 }
 
 impl PolicySlot {
-    fn new_clock(hash: u64, visited: bool) -> Self {
+    fn new_clock(hash: u64, visited: bool, position: u32) -> Self {
         Self {
             hash,
+            clock_position: position,
             flags: RESIDENT_BIT | (u8::from(visited) * CLOCK_VISITED_BIT),
         }
     }
@@ -47,6 +49,7 @@ impl PolicySlot {
         debug_assert!(frequency <= S3FIFO_MAX_FREQUENCY);
         Self {
             hash,
+            clock_position: 0,
             flags: RESIDENT_BIT
                 | ((frequency << S3FIFO_FREQUENCY_SHIFT) & S3FIFO_FREQUENCY_MASK)
                 | (u8::from(queue == QueueKind::Main) * S3FIFO_MAIN_BIT),
@@ -67,6 +70,14 @@ impl PolicySlot {
 
     fn set_clock_visited(&mut self, visited: bool) {
         self.flags = (self.flags & !CLOCK_VISITED_BIT) | (u8::from(visited) * CLOCK_VISITED_BIT);
+    }
+
+    const fn clock_position(&self) -> u32 {
+        self.clock_position
+    }
+
+    fn set_clock_position(&mut self, position: u32) {
+        self.clock_position = position;
     }
 
     const fn s3fifo_queue(&self) -> QueueKind {
@@ -143,7 +154,9 @@ impl EvictionState {
         maximum_entries: usize,
     ) -> io::Result<Self> {
         let policy = match policy {
-            L1EvictionPolicy::Clock => EvictionPolicyState::Clock(ClockState::new()),
+            L1EvictionPolicy::Clock => {
+                EvictionPolicyState::Clock(ClockState::new(maximum_entries)?)
+            }
             L1EvictionPolicy::S3Fifo => {
                 EvictionPolicyState::S3Fifo(S3FifoState::new(capacity_bytes, maximum_entries)?)
             }
@@ -156,7 +169,7 @@ impl EvictionState {
         maximum_entries: usize,
     ) -> io::Result<usize> {
         match policy {
-            L1EvictionPolicy::Clock => Ok(0),
+            L1EvictionPolicy::Clock => ClockState::allocation_bytes(maximum_entries),
             L1EvictionPolicy::S3Fifo => S3FifoState::allocation_bytes(maximum_entries),
         }
     }
@@ -170,10 +183,10 @@ impl EvictionState {
     ) {
         debug_assert!(!slots[index].is_resident());
         match &mut self.policy {
-            EvictionPolicyState::Clock(_) => {
+            EvictionPolicyState::Clock(state) => {
                 // One-shot scans receive no free second chance. A real L1 hit
                 // sets the bit before this entry reaches the hand.
-                slots[index] = PolicySlot::new_clock(hash, false);
+                state.insert(slots, index, hash, false);
             }
             EvictionPolicyState::S3Fifo(state) => {
                 state.insert(slots, index, hash, weight);
@@ -193,7 +206,7 @@ impl EvictionState {
             return;
         }
         match &mut self.policy {
-            EvictionPolicyState::Clock(_) => slots[index] = PolicySlot::default(),
+            EvictionPolicyState::Clock(state) => state.remove(slots, index),
             EvictionPolicyState::S3Fifo(state) => state.remove(slots, index),
         }
     }
@@ -208,9 +221,9 @@ impl EvictionState {
         weight: usize,
     ) -> DetachedPolicy {
         match &mut self.policy {
-            EvictionPolicyState::Clock(_) => {
+            EvictionPolicyState::Clock(state) => {
                 let hash = slots[index].hash();
-                slots[index] = PolicySlot::default();
+                state.remove(slots, index);
                 DetachedPolicy {
                     hash,
                     weight,
@@ -229,10 +242,10 @@ impl EvictionState {
     ) {
         debug_assert!(!slots[index].is_resident());
         match (&mut self.policy, detached.kind) {
-            (EvictionPolicyState::Clock(_), DetachedPolicyKind::Clock) => {
+            (EvictionPolicyState::Clock(state), DetachedPolicyKind::Clock) => {
                 // A failed admission is optional work and must not make its
                 // temporarily detached victim immediately vulnerable again.
-                slots[index] = PolicySlot::new_clock(detached.hash, true);
+                state.insert(slots, index, detached.hash, true);
             }
             (
                 EvictionPolicyState::S3Fifo(state),
@@ -284,11 +297,57 @@ impl EvictionState {
 
 struct ClockState {
     hand: usize,
+    residents: Vec<u32>,
 }
 
 impl ClockState {
-    const fn new() -> Self {
-        Self { hand: 0 }
+    fn new(maximum_entries: usize) -> io::Result<Self> {
+        let mut residents = Vec::new();
+        residents.try_reserve_exact(maximum_entries).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate CLOCK resident positions",
+            )
+        })?;
+        Ok(Self { hand: 0, residents })
+    }
+
+    fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
+        maximum_entries
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CLOCK is too large"))
+    }
+
+    fn insert(&mut self, slots: &mut [PolicySlot], index: usize, hash: u64, visited: bool) {
+        assert!(
+            self.residents.len() < slots.len() && self.residents.len() < self.residents.capacity(),
+            "CLOCK resident capacity exhausted"
+        );
+        let position = u32::try_from(self.residents.len())
+            .expect("validated CLOCK resident position exceeds u32");
+        let packed_index =
+            u32::try_from(index).expect("validated CLOCK resident index exceeds u32");
+        slots[index] = PolicySlot::new_clock(hash, visited, position);
+        self.residents.push(packed_index);
+    }
+
+    fn remove(&mut self, slots: &mut [PolicySlot], index: usize) {
+        let position = usize::try_from(slots[index].clock_position())
+            .expect("CLOCK resident position exceeds usize");
+        let removed = self.residents.swap_remove(position);
+        debug_assert_eq!(usize::try_from(removed).ok(), Some(index));
+        if position < self.residents.len() {
+            let moved = usize::try_from(self.residents[position])
+                .expect("CLOCK resident index exceeds usize");
+            slots[moved].set_clock_position(
+                u32::try_from(position).expect("CLOCK resident position exceeds u32"),
+            );
+        }
+        slots[index] = PolicySlot::default();
+
+        if self.hand >= self.residents.len() {
+            self.hand = 0;
+        }
     }
 
     fn select_victim<F>(
@@ -300,24 +359,24 @@ impl ClockState {
     where
         F: Fn(usize) -> bool,
     {
-        for _ in 0..maximum_scan_steps(slots.len()) {
-            if slots.is_empty() || !take_scan_step(remaining_steps) {
+        for _ in 0..maximum_scan_steps(self.residents.len()) {
+            if self.residents.is_empty() || !take_scan_step(remaining_steps) {
                 break;
             }
-            let index = if self.hand < slots.len() {
+            let position = if self.hand < self.residents.len() {
                 self.hand
             } else {
                 0
             };
-            self.hand = if index + 1 == slots.len() {
+            self.hand = if position + 1 == self.residents.len() {
                 0
             } else {
-                index + 1
+                position + 1
             };
+            let index = usize::try_from(self.residents[position])
+                .expect("CLOCK resident index exceeds usize");
             let slot = &mut slots[index];
-            if !slot.is_resident() {
-                continue;
-            }
+            debug_assert!(slot.is_resident());
             if slot.clock_visited() {
                 slot.set_clock_visited(false);
                 continue;
@@ -811,7 +870,7 @@ mod tests {
 
     #[test]
     fn clock_new_entries_are_immediately_evictable() {
-        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 0);
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 2);
         let mut slots = Vec::new();
         let first = install(&mut policy, &mut slots, 1, 1);
         let second = install(&mut policy, &mut slots, 2, 1);
@@ -828,8 +887,39 @@ mod tests {
     }
 
     #[test]
+    fn clock_scans_residents_in_sparse_slot_arrays() {
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 128);
+        let mut slots = vec![PolicySlot::default(); 128];
+        policy.insert(&mut slots, 96, 7, 1);
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+
+        assert_eq!(
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| true),
+            Some(96)
+        );
+    }
+
+    #[test]
+    fn clock_removal_updates_a_moved_resident_position() {
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 8);
+        let mut slots = vec![PolicySlot::default(); 8];
+        policy.insert(&mut slots, 1, 1, 1);
+        policy.insert(&mut slots, 4, 4, 1);
+        policy.insert(&mut slots, 7, 7, 1);
+
+        policy.remove(&mut slots, 4);
+        policy.remove(&mut slots, 7);
+        let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
+
+        assert_eq!(
+            policy.select_victim(&mut slots, &mut remaining_steps, |_| true),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn one_clock_admission_has_one_fixed_scan_budget() {
-        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 0);
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 100);
         let mut slots = Vec::new();
         for hash in 0..100 {
             let index = install(&mut policy, &mut slots, hash, 1);
@@ -846,7 +936,7 @@ mod tests {
 
     #[test]
     fn failed_clock_plan_restores_a_detached_entry() {
-        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 0);
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 1);
         let mut slots = Vec::new();
         let index = install(&mut policy, &mut slots, 7, 11);
         let detached = policy.detach_for_admission(&mut slots, index, 11);
@@ -858,7 +948,7 @@ mod tests {
 
     #[test]
     fn clock_prefers_a_hit_over_a_cold_one_shot_entry() {
-        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 0);
+        let mut policy = policy(L1EvictionPolicy::Clock, 1024, 2);
         let mut slots = Vec::new();
         let hot = install(&mut policy, &mut slots, 1, 1);
         let cold = install(&mut policy, &mut slots, 2, 1);
