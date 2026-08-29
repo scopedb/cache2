@@ -62,7 +62,7 @@ impl FixedPrehashedMap {
         let fingerprint = fixed_map_fingerprint(hash);
         let start = fixed_map_start(hash, slots.len());
         for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let slot = slots[(start + step) & (slots.len() - 1)];
+            let slot = slots[probe_index(start, step, slots.len())];
             if slot.value == EMPTY_VALUE {
                 return None;
             }
@@ -94,7 +94,7 @@ impl FixedPrehashedMap {
         let fingerprint = fixed_map_fingerprint(hash);
         let start = fixed_map_start(hash, self.slots.len());
         for step in 0..self.slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let index = (start + step) & (self.slots.len() - 1);
+            let index = probe_index(start, step, self.slots.len());
             let slot = self.slots[index];
             if slot.value == EMPTY_VALUE {
                 return None;
@@ -115,10 +115,8 @@ impl FixedPrehashedMap {
     /// retain one tombstone after the same fixed probe budget used by lookups.
     fn compact_deleted(&mut self, mut hole: usize) {
         let slot_count = self.slots.len();
-        debug_assert!(slot_count.is_power_of_two());
-        let mask = slot_count - 1;
         let scan_steps = slot_count.saturating_sub(1).min(MAX_FIXED_MAP_PROBES);
-        let mut cursor = (hole + 1) & mask;
+        let mut cursor = next_probe_index(hole, slot_count);
         for _ in 0..scan_steps {
             let candidate = self.slots[cursor];
             if candidate.value == EMPTY_VALUE {
@@ -127,13 +125,14 @@ impl FixedPrehashedMap {
             }
             if candidate.value != DELETED_VALUE {
                 let home = fixed_map_fingerprint_start(candidate.fingerprint, slot_count);
-                if probe_distance(home, hole, mask) < probe_distance(home, cursor, mask) {
+                if probe_distance(home, hole, slot_count) < probe_distance(home, cursor, slot_count)
+                {
                     self.slots[hole] = candidate;
                     self.slots[cursor].value = DELETED_VALUE;
                     hole = cursor;
                 }
             }
-            cursor = (cursor + 1) & mask;
+            cursor = next_probe_index(cursor, slot_count);
         }
     }
 
@@ -146,7 +145,7 @@ impl FixedPrehashedMap {
         let start = fixed_map_start(hash, slots.len());
         let mut deleted = None;
         for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let index = (start + step) & (slots.len() - 1);
+            let index = probe_index(start, step, slots.len());
             let slot = slots[index];
             if slot.value == EMPTY_VALUE {
                 return Some((deleted.unwrap_or(index), None));
@@ -166,7 +165,6 @@ impl FixedPrehashedMap {
         }
         maximum_entries
             .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fixed map is too large"))
     }
 }
@@ -181,12 +179,32 @@ fn fixed_map_fingerprint(hash: u64) -> u32 {
 
 fn fixed_map_fingerprint_start(fingerprint: u32, slots: usize) -> usize {
     // Folding both halves retains entropy after shard routing has consumed a
-    // fixed subset of the original XXH3 low bits.
-    route_hash(u64::from(fingerprint), slots)
+    // fixed subset of the original XXH3 low bits. Fibonacci scrambling keeps
+    // that entropy visible to multiply-high, which maps across an exact-sized
+    // table without integer division.
+    let mixed = fingerprint.wrapping_mul(0x9e37_79b9);
+    ((u128::from(mixed) * slots as u128) >> 32) as usize
 }
 
-fn probe_distance(home: usize, index: usize, mask: usize) -> usize {
-    index.wrapping_sub(home) & mask
+fn probe_index(start: usize, step: usize, slots: usize) -> usize {
+    let remaining = slots - start;
+    if step < remaining {
+        start + step
+    } else {
+        step - remaining
+    }
+}
+
+fn next_probe_index(index: usize, slots: usize) -> usize {
+    if index + 1 == slots { 0 } else { index + 1 }
+}
+
+fn probe_distance(home: usize, index: usize, slots: usize) -> usize {
+    if index >= home {
+        index - home
+    } else {
+        slots - (home - index)
+    }
 }
 
 /// Preserves modulo routing while avoiding integer division for the common
@@ -202,11 +220,24 @@ pub(crate) fn route_hash(hash: u64, buckets: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
     fn fixed_map_slot_is_one_u64() {
         assert_eq!(std::mem::size_of::<FixedMapSlot>(), 8);
+    }
+
+    #[test]
+    fn fixed_map_keeps_exactly_one_empty_slot_per_entry() {
+        assert_eq!(FixedPrehashedMap::slot_count(0).unwrap(), 0);
+        assert_eq!(FixedPrehashedMap::slot_count(5).unwrap(), 10);
+        assert_eq!(FixedPrehashedMap::slot_count(40_960).unwrap(), 81_920);
+        assert_eq!(
+            FixedPrehashedMap::allocation_bytes(40_960).unwrap(),
+            40_960 * 2 * std::mem::size_of::<FixedMapSlot>()
+        );
     }
 
     #[test]
@@ -240,8 +271,17 @@ mod tests {
     #[test]
     fn fixed_map_delete_preserves_a_wrapped_collision_chain() {
         let mut map = FixedPrehashedMap::try_new(4).unwrap();
-        let hashes = [7_u64 << 32, 15_u64 << 32, 23_u64 << 32];
-        for (value, hash) in hashes.into_iter().enumerate() {
+        let mut hashes = Vec::new();
+        for fingerprint in 0_u32..1024 {
+            if fixed_map_fingerprint_start(fingerprint, map.slots.len()) == map.slots.len() - 1 {
+                hashes.push(u64::from(fingerprint.rotate_right(13)));
+                if hashes.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(hashes.len(), 3);
+        for (value, &hash) in hashes.iter().enumerate() {
             assert_eq!(map.insert(hash, value as u32), Some(None));
         }
 
@@ -257,8 +297,15 @@ mod tests {
     fn lifetime_key_turnover_restores_empty_directory_slots() {
         let mut map = FixedPrehashedMap::try_new(32).unwrap();
         let slot_count = map.slots.len();
-        for start in 0..slot_count {
-            let hash = (start as u64) << 32;
+        let mut hashes = vec![None; slot_count];
+        for fingerprint in 0..u32::try_from(slot_count * 64).unwrap() {
+            let start = fixed_map_fingerprint_start(fingerprint, slot_count);
+            hashes[start].get_or_insert_with(|| u64::from(fingerprint.rotate_right(13)));
+        }
+        assert!(hashes.iter().all(Option::is_some));
+
+        for (start, hash) in hashes.into_iter().enumerate() {
+            let hash = hash.unwrap();
             assert_eq!(fixed_map_start(hash, slot_count), start);
             assert_eq!(map.insert(hash, start as u32), Some(None));
             assert_eq!(map.remove(hash), Some(start as u32));
@@ -318,11 +365,41 @@ mod tests {
     }
 
     #[test]
+    fn production_sized_fixed_map_fills_within_the_probe_budget() {
+        const ENTRIES: usize = 40_960;
+        let mut map = FixedPrehashedMap::try_new(ENTRIES).unwrap();
+        let mut fingerprints = HashSet::with_capacity(ENTRIES);
+        let mut hashes = Vec::with_capacity(ENTRIES);
+        for ordinal in 0_u64..(ENTRIES as u64 * 2) {
+            let hash = splitmix64(ordinal);
+            if fingerprints.insert(fixed_map_fingerprint(hash)) {
+                let value = hashes.len() as u32;
+                assert_eq!(map.insert(hash, value), Some(None));
+                hashes.push(hash);
+                if hashes.len() == ENTRIES {
+                    break;
+                }
+            }
+        }
+        assert_eq!(hashes.len(), ENTRIES);
+        for (value, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(map.get(hash), Some(value as u32));
+        }
+    }
+
+    #[test]
     fn fast_route_preserves_modulo_assignment() {
         for buckets in 1..=65 {
             for hash in [0, 1, 31, 32, 63, 64, u32::MAX as u64, u64::MAX] {
                 assert_eq!(route_hash(hash, buckets), (hash % buckets as u64) as usize);
             }
         }
+    }
+
+    fn splitmix64(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
     }
 }
