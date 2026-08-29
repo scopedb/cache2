@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+use twox_hash::XxHash3_64;
 
 use crate::checksum::Crc32c;
 use crate::format::{MAX_KEY_SIZE, RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
@@ -229,7 +229,7 @@ fn encode_value_into_hashed_with_seqno(
 }
 
 pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
-    xxh3_64_with_seed(key, seed)
+    XxHash3_64::oneshot_with_seed(seed, key)
 }
 
 #[cfg(test)]
