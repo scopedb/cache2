@@ -2,7 +2,6 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
     paths-ignore:
       - "**/*.md"
 
@@ -11,7 +10,6 @@ permissions:
 
 jobs:
   quality:
-    if: github.event.pull_request.draft == false
     name: format and clippy
     runs-on: ubuntu-latest
     steps:
@@ -44,14 +42,8 @@ jobs:
         run: cargo deny --all-features check advisories licenses bans sources
 
   test:
-    if: github.event.pull_request.draft == false
-    name: ${{ matrix.os }} / ${{ matrix.features }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        features: [default, io-uring]
+    name: tests
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.98
@@ -59,26 +51,19 @@ jobs:
       - name: Select Rust 1.98
         run: rustup default 1.98.0
       - name: Check all targets
-        if: matrix.features == 'default'
         run: cargo check --all-targets
       - name: Check all targets with optional io_uring
-        if: matrix.features == 'io-uring'
         run: cargo check --all-targets --features io-uring
       - name: Run tests
-        if: matrix.features == 'default'
         run: cargo test
       - name: Run extended recovery tests
-        if: matrix.features == 'default'
         run: cargo test --lib -- --ignored
       - name: Run tests with optional io_uring
-        if: matrix.features == 'io-uring'
         run: cargo test --features io-uring
       - name: Run optimized tests with all features
-        if: matrix.features == 'io-uring'
         run: cargo test --release --all-features
 
   safety-checks:
-    if: github.event.pull_request.draft == false
     name: persistent fuzz, ASan, and TSan
     runs-on: ubuntu-latest
     steps:
