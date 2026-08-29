@@ -10,7 +10,7 @@
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::eviction::{
     DetachedPolicy, EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX, PolicySlot,
@@ -37,6 +37,9 @@ const NO_SLOT_INDEX: u32 = u32::MAX;
 /// with shard occupancy.
 const MAX_EVICTIONS_PER_INSERT: usize = 16;
 const MAX_BUDGET_CAS_ATTEMPTS: usize = 8;
+/// Bridge a concurrent lookup's short critical section without waiting behind
+/// mutation work; exhausted attempts still fall through to L2 immediately.
+const MAX_L1_LOOKUP_LOCK_ATTEMPTS: usize = 4;
 
 pub(crate) struct MemoryBudget {
     pub(crate) capacity_bytes: usize,
@@ -890,8 +893,18 @@ impl MemoryStore {
 
     pub(crate) fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
-        let Some(mut shard) = self.try_lock_shard(shard_id) else {
-            return MemoryLookup::Miss(MemoryReadToken { shard_id });
+        let mut attempts = 1;
+        let mut shard = loop {
+            match self.shards[shard_id].try_lock() {
+                Ok(shard) => break shard,
+                Err(TryLockError::WouldBlock) if attempts < MAX_L1_LOOKUP_LOCK_ATTEMPTS => {
+                    attempts += 1;
+                    std::hint::spin_loop();
+                }
+                Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                    return MemoryLookup::Miss(MemoryReadToken { shard_id });
+                }
+            }
         };
         let Some(index) = shard.find(hash, key) else {
             return MemoryLookup::Miss(MemoryReadToken { shard_id });
