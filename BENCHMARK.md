@@ -12,8 +12,8 @@ cargo +1.98.0 bench --locked --bench cache
 
 The benchmark measures accepted puts plus drain, resident L1 reads, warm close,
 and successful L2 reads with best-effort promotion. Values encode their key
-ordinal, so a wrong-key result fails the run. Harness retries of `WouldBlock`
-are workload setup, not library behavior.
+ordinal, so a wrong-key result fails the run. Harness retries of
+`ErrorKind::Overloaded` are workload setup, not library behavior.
 
 The main controls are grouped below. See `benches/cache.rs` for defaults and
 validation rules.

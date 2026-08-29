@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cache2::{CacheBuilder, IoEngine, IoMode, RuntimeConfig, StartupMode, StaticConfig};
+use cache2::{
+    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, RuntimeConfig, StartupMode,
+    StaticConfig,
+};
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -265,7 +268,7 @@ fn put_eventually(cache: &cache2::Cache, key: &[u8], value: &[u8]) -> io::Result
     loop {
         match cache.put(key, value) {
             Ok(_) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -274,7 +277,7 @@ fn put_eventually(cache: &cache2::Cache, key: &[u8], value: &[u8]) -> io::Result
                 }
                 thread::sleep(Duration::from_micros(50));
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
 }

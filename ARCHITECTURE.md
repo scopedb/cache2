@@ -62,9 +62,9 @@ descriptor use stays constant.
 6. The shard worker writes sealed batches and publishes their L2 mappings only
    after write completion.
 
-Full staging or short-path contention returns `WouldBlock`. Admission is
-shard-local. Success means accepted staging; `put_l2` becomes visible when
-publication completes.
+Full staging or short-path contention returns structured
+`ErrorKind::Overloaded`. Admission is shard-local. Success means accepted
+staging; `put_l2` becomes visible when publication completes.
 
 ### `get`
 
@@ -147,4 +147,6 @@ corrupt, stale, unsupported, or configuration-mismatched state is discarded.
 Stale data, overload, and cache loss are valid outcomes. Every returned value
 passes address, key, and checksum validation. Structural or device faults move
 the cache to miss-only when reads can fail open safely; mutations still report
-errors.
+errors. Public failures carry an `ErrorKind`, `ErrorOperation`, and the original
+`std::io::Error`; the complete policy is documented in [Error
+handling](ERRORS.md).

@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, IoEngine, IoMode, L1EvictionPolicy,
-    RuntimeConfig, StartupMode, StaticConfig,
+    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
+    IoMode, L1EvictionPolicy, RuntimeConfig, StartupMode, StaticConfig,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -584,12 +584,12 @@ fn open_cache(
     files: &SoakFiles,
     config: &SoakConfig,
 ) -> io::Result<Cache> {
-    runtime.block_on(async {
+    Ok(runtime.block_on(async {
         CacheBuilder::from_static(&files.data, config.static_config())
             .with_runtime_config(config.runtime_config())
             .open()
             .await
-    })
+    })?)
 }
 
 fn populate_for_warm_reopen(
@@ -619,10 +619,10 @@ fn populate_for_warm_reopen(
         loop {
             match cache.put(key, &value[..value_bytes]) {
                 Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
                     thread::sleep(OVERLOAD_DELAY);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -671,13 +671,13 @@ fn run_writer(
                 record_latency(&counters.max_put_ns, put_started.elapsed());
                 counters.writes.fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
                 record_latency(&counters.max_put_ns, put_started.elapsed());
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(OVERLOAD_DELAY);
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
 
         if announced.is_multiple_of(DELETE_INTERVAL) {
@@ -687,12 +687,12 @@ fn run_writer(
                     record_latency(&counters.max_delete_ns, delete_started.elapsed());
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
                     record_latency(&counters.max_delete_ns, delete_started.elapsed());
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
                     thread::sleep(OVERLOAD_DELAY);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
     }

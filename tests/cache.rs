@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
 use cache2::{
-    CacheBuilder, CacheHealth, CacheTier, IoEngine, L1EvictionPolicy, RuntimeConfig, StartupMode,
-    StaticConfig,
+    CacheBuilder, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy,
+    RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -109,12 +109,12 @@ fn rewrite_page_version(path: &std::path::Path, offset: u64, version: u16) {
     file.sync_all().unwrap();
 }
 
-fn eventually_admitted<T>(mut put: impl FnMut() -> std::io::Result<T>) -> T {
+fn eventually_admitted<T>(mut put: impl FnMut() -> cache2::Result<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match put() {
             Ok(value) => return value,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == ErrorKind::Overloaded => {
                 assert!(
                     Instant::now() < deadline,
                     "write buffer did not make progress"
@@ -211,6 +211,19 @@ async fn fast_close_always_reopens_empty() {
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
     reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_open_reports_structured_busy_error() {
+    let files = TestCache::new("concurrent-open");
+    let cache = files.config(1).open().await.unwrap();
+
+    let error = files.config(1).open().await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_eq!(error.operation(), ErrorOperation::Open);
+    assert_eq!(error.io_kind(), std::io::ErrorKind::WouldBlock);
+
+    cache.close_fast().await.unwrap();
 }
 
 #[tokio::test]
@@ -414,7 +427,9 @@ async fn unavailable_io_engine_is_rejected_before_file_creation() {
         .open()
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.operation(), ErrorOperation::Open);
+    assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
     files.assert_absent();
 }
 
@@ -437,7 +452,9 @@ async fn unavailable_direct_io_is_rejected_before_file_creation() {
         .open()
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.operation(), ErrorOperation::Open);
+    assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
     files.assert_absent();
 }
 
@@ -767,7 +784,9 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             .open()
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{case}");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{case}");
+        assert_eq!(error.operation(), ErrorOperation::Open, "{case}");
+        assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidInput, "{case}");
         files.assert_absent();
     }
 }
@@ -779,21 +798,22 @@ async fn public_key_and_record_size_limits_are_enforced() {
     let oversized_key = vec![0_u8; 4 * 1024 + 1];
     let oversized_value = vec![0_u8; 512 * 1024];
 
-    assert_eq!(
-        cache.put(&oversized_key, b"value").unwrap_err().kind(),
-        std::io::ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        cache
-            .put(b"too-large", &oversized_value)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        cache.delete(&oversized_key).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidInput
-    );
+    let error = cache.put(&oversized_key, b"value").unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.operation(), ErrorOperation::Put);
+    assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidInput);
+
+    let error = cache.put(b"too-large", &oversized_value).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.operation(), ErrorOperation::Put);
+
+    let error = cache.put_l2(&oversized_key, b"value").unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.operation(), ErrorOperation::PutL2);
+
+    let error = cache.delete(&oversized_key).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.operation(), ErrorOperation::Delete);
     assert!(cache.get(&oversized_key).await.unwrap().is_none());
     cache.close_fast().await.unwrap();
 }

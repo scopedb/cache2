@@ -24,7 +24,8 @@ async fn main() -> io::Result<()> {
     let cache = CacheBuilder::from_static(path, static_config)
         .open()
         .await?;
-    cache.close_warm().await
+    cache.close_warm().await?;
+    Ok(())
 }
 
 fn init_logforth() {
