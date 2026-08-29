@@ -9,23 +9,25 @@ const MAX_FIXED_MAP_PROBES: usize = 64;
 
 #[derive(Clone, Copy)]
 struct FixedMapSlot {
-    hash: u64,
+    fingerprint: u32,
     value: u32,
 }
 
 impl Default for FixedMapSlot {
     fn default() -> Self {
         Self {
-            hash: 0,
+            fingerprint: 0,
             value: EMPTY_VALUE,
         }
     }
 }
 
-/// Fixed-capacity map for cache hashes that are already seeded XXH3 results.
+/// Fixed-capacity directory for cache hashes that are already seeded XXH3 results.
 ///
-/// The table is allocated once during open. Point operations inspect a small
-/// constant number of slots and never allocate, resize, or rehash.
+/// Each slot stores a 32-bit fingerprint and a 32-bit owner index. Callers that
+/// require full-hash identity validate it in the owner slot. The table is
+/// allocated once during open; point operations inspect a small constant
+/// number of slots and never allocate, resize, or rehash.
 pub(crate) struct FixedPrehashedMap {
     slots: Box<[FixedMapSlot]>,
 }
@@ -57,13 +59,14 @@ impl FixedPrehashedMap {
         if slots.is_empty() {
             return None;
         }
+        let fingerprint = fixed_map_fingerprint(hash);
         let start = fixed_map_start(hash, slots.len());
         for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
             let slot = slots[(start + step) & (slots.len() - 1)];
             if slot.value == EMPTY_VALUE {
                 return None;
             }
-            if slot.value != DELETED_VALUE && slot.hash == hash {
+            if slot.value != DELETED_VALUE && slot.fingerprint == fingerprint {
                 return Some(slot.value);
             }
         }
@@ -77,7 +80,10 @@ impl FixedPrehashedMap {
     pub(crate) fn insert(&mut self, hash: u64, value: u32) -> Option<Option<u32>> {
         debug_assert!(value < DELETED_VALUE);
         let (slot_index, previous) = self.find_upsert_slot(hash)?;
-        self.slots[slot_index] = FixedMapSlot { hash, value };
+        self.slots[slot_index] = FixedMapSlot {
+            fingerprint: fixed_map_fingerprint(hash),
+            value,
+        };
         Some(previous)
     }
 
@@ -85,6 +91,7 @@ impl FixedPrehashedMap {
         if self.slots.is_empty() {
             return None;
         }
+        let fingerprint = fixed_map_fingerprint(hash);
         let start = fixed_map_start(hash, self.slots.len());
         for step in 0..self.slots.len().min(MAX_FIXED_MAP_PROBES) {
             let index = (start + step) & (self.slots.len() - 1);
@@ -92,7 +99,7 @@ impl FixedPrehashedMap {
             if slot.value == EMPTY_VALUE {
                 return None;
             }
-            if slot.value != DELETED_VALUE && slot.hash == hash {
+            if slot.value != DELETED_VALUE && slot.fingerprint == fingerprint {
                 let previous = slot.value;
                 self.slots[index].value = DELETED_VALUE;
                 self.compact_deleted(index);
@@ -119,7 +126,7 @@ impl FixedPrehashedMap {
                 return;
             }
             if candidate.value != DELETED_VALUE {
-                let home = fixed_map_start(candidate.hash, slot_count);
+                let home = fixed_map_fingerprint_start(candidate.fingerprint, slot_count);
                 if probe_distance(home, hole, mask) < probe_distance(home, cursor, mask) {
                     self.slots[hole] = candidate;
                     self.slots[cursor].value = DELETED_VALUE;
@@ -135,6 +142,7 @@ impl FixedPrehashedMap {
         if slots.is_empty() {
             return None;
         }
+        let fingerprint = fixed_map_fingerprint(hash);
         let start = fixed_map_start(hash, slots.len());
         let mut deleted = None;
         for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
@@ -145,7 +153,7 @@ impl FixedPrehashedMap {
             }
             if slot.value == DELETED_VALUE {
                 deleted.get_or_insert(index);
-            } else if slot.hash == hash {
+            } else if slot.fingerprint == fingerprint {
                 return Some((index, Some(slot.value)));
             }
         }
@@ -164,9 +172,17 @@ impl FixedPrehashedMap {
 }
 
 fn fixed_map_start(hash: u64, slots: usize) -> usize {
-    // L1 shard routing already consumes the low XXH3 bits. Rotate the same
-    // precomputed hash so one shard still gets the full directory start space.
-    route_hash(hash.rotate_left(32), slots)
+    fixed_map_fingerprint_start(fixed_map_fingerprint(hash), slots)
+}
+
+fn fixed_map_fingerprint(hash: u64) -> u32 {
+    (hash as u32).rotate_left(13) ^ (hash >> 32) as u32
+}
+
+fn fixed_map_fingerprint_start(fingerprint: u32, slots: usize) -> usize {
+    // Folding both halves retains entropy after shard routing has consumed a
+    // fixed subset of the original XXH3 low bits.
+    route_hash(u64::from(fingerprint), slots)
 }
 
 fn probe_distance(home: usize, index: usize, mask: usize) -> usize {
@@ -187,6 +203,24 @@ pub(crate) fn route_hash(hash: u64, buckets: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_map_slot_is_one_u64() {
+        assert_eq!(std::mem::size_of::<FixedMapSlot>(), 8);
+    }
+
+    #[test]
+    fn fixed_map_collapses_equal_fingerprints_for_owner_validation() {
+        let mut map = FixedPrehashedMap::try_new(2).unwrap();
+        let first = 1_u64;
+        let second = 1_u64 << 45;
+        assert_eq!(fixed_map_fingerprint(first), fixed_map_fingerprint(second));
+
+        assert_eq!(map.insert(first, 7), Some(None));
+        assert_eq!(map.insert(second, 9), Some(Some(7)));
+        assert_eq!(map.get(first), Some(9));
+        assert_eq!(map.get(second), Some(9));
+    }
 
     #[test]
     fn fixed_prehashed_map_reuses_deleted_slots_without_growing() {
@@ -244,7 +278,7 @@ mod tests {
                 assert_eq!(map.remove(hash), Some(value));
             }
 
-            let hash = (u64::from(ordinal & 7) << 32) | u64::from(ordinal);
+            let hash = u64::from(ordinal * 8) << 32;
             assert_eq!(map.insert(hash, ordinal), Some(None));
             expected.push((hash, ordinal));
 
@@ -257,7 +291,7 @@ mod tests {
                 for &(hash, value) in &expected {
                     assert_eq!(map.get(hash), Some(value));
                 }
-                let missing = u64::from(ordinal) | (1_u64 << 63);
+                let missing = u64::from(ordinal + 1_000_000) << 32;
                 assert_eq!(map.get(missing), None);
             }
         }

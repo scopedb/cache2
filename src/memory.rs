@@ -26,8 +26,8 @@ pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// complete retained entry, including its key and fixed ownership charge, must
 /// fit this bound before foreground publication or L2 promotion takes the lock.
 const MAX_L1_ENTRY_BYTES: usize = 256 * 1024;
-/// Full-key collision work must stay bounded even when callers supply many
-/// distinct keys with the same 64-bit cache hash.
+/// Full-key collision work stays bounded for entries sharing one directory
+/// fingerprint, including distinct keys with the same 64-bit cache hash.
 const MAX_SAME_HASH_ENTRIES: usize = 8;
 /// Hash chains use compact slot indices, matching the intrusive compressed
 /// links used by the rest of the cache rather than allocating a bucket vector.
@@ -346,7 +346,9 @@ impl MemoryShard {
         for _ in 0..MAX_SAME_HASH_ENTRIES {
             let index = usize::try_from(cursor).ok()?;
             let entry = self.slots.get(index).and_then(Option::as_ref)?;
-            if entry.value.key() == key {
+            if self.policy_slots.get(index).map(PolicySlot::hash) == Some(hash)
+                && entry.value.key() == key
+            {
                 return Some(index);
             }
             if entry.hash_next == NO_SLOT_INDEX {
@@ -1225,6 +1227,28 @@ mod tests {
             store.lookup(collision_hash, b"foreign"),
             MemoryLookup::Miss(_)
         ));
+    }
+
+    #[test]
+    fn fingerprint_chain_disambiguates_full_hash_before_key() {
+        let store = store(2048, 1);
+        let first = 1_u64;
+        let colliding = 1_u64 << 45;
+        assert!(store.publish(first, b"key", b"first", 1));
+        assert!(store.publish(colliding, b"key", b"second", 2));
+
+        assert!(matches!(
+            store.lookup(first, b"key"),
+            MemoryLookup::Hit(value) if value.as_ref() == b"first"
+        ));
+        assert!(matches!(
+            store.lookup(colliding, b"key"),
+            MemoryLookup::Hit(value) if value.as_ref() == b"second"
+        ));
+
+        assert!(store.delete(first, b"key", 3));
+        assert_miss(&store, first, b"key");
+        assert_hit(&store, colliding, b"key");
     }
 
     #[test]

@@ -729,9 +729,11 @@ impl GhostQueue {
             return false;
         };
         let index = usize::try_from(packed).expect("ghost slot index exceeds usize");
-        debug_assert_eq!(self.slots[index].hash, hash);
+        // Ghost history is optional: a fingerprint collision may discard one
+        // old hint, but it must never turn into a false ghost hit.
+        let matched = self.slots[index].hash == hash;
         self.unlink(index);
-        true
+        matched
     }
 
     fn insert(&mut self, hash: u64, weight: usize) {
@@ -1051,5 +1053,17 @@ mod tests {
         assert_eq!(ghost.directory.get(2), Some(1));
         assert_eq!(ghost.directory.get(3), Some(2));
         assert_eq!(ghost.directory.get(4), None);
+    }
+
+    #[test]
+    fn ghost_fingerprint_collision_is_not_a_false_hit() {
+        let mut ghost = GhostQueue::new(2, 100).unwrap();
+        let first = 1_u64;
+        let colliding = 1_u64 << 45;
+        ghost.insert(first, 10);
+
+        assert!(!ghost.take(colliding));
+        assert_eq!(ghost.bytes, 0);
+        assert!(!ghost.take(first));
     }
 }
