@@ -30,6 +30,12 @@ jobs:
         run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -D missing_docs
+        run: cargo doc --no-deps --locked
+      - name: Verify publishable package
+        run: cargo package --locked
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Check advisories, licenses, dependency policy, and sources
@@ -59,6 +65,9 @@ jobs:
       - name: Run tests
         if: matrix.features == 'default'
         run: cargo test
+      - name: Run extended recovery tests
+        if: matrix.features == 'default'
+        run: cargo test --lib -- --ignored
       - name: Run tests with optional io_uring
         if: matrix.features == 'io-uring'
         run: cargo test --features io-uring
