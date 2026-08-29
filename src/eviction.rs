@@ -37,6 +37,19 @@ pub(crate) struct PolicySlot {
 }
 
 impl PolicySlot {
+    pub(crate) const fn new_free(next: u32) -> Self {
+        Self {
+            hash: 0,
+            clock_position: next,
+            flags: 0,
+        }
+    }
+
+    pub(crate) fn free_next(&self) -> u32 {
+        debug_assert!(!self.is_resident());
+        self.clock_position
+    }
+
     fn new_clock(hash: u64, visited: bool, position: u32) -> Self {
         Self {
             hash,
@@ -667,7 +680,8 @@ impl Default for GhostSlot {
 struct GhostQueue {
     directory: FixedPrehashedMap,
     slots: Box<[GhostSlot]>,
-    free_slots: Vec<u32>,
+    free_head: u32,
+    free_count: usize,
     head: u32,
     tail: u32,
     bytes: usize,
@@ -685,22 +699,22 @@ impl GhostQueue {
             )
         })?;
         slots.resize(maximum_entries, GhostSlot::default());
-        let mut free_slots = Vec::new();
-        free_slots.try_reserve_exact(maximum_entries).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate S3-FIFO ghost free list",
-            )
-        })?;
-        free_slots.extend(
-            (0..maximum_entries).rev().map(|index| {
-                u32::try_from(index).expect("validated L1 entry capacity exceeds u32")
-            }),
-        );
+        for (index, slot) in slots.iter_mut().enumerate() {
+            slot.next = if index + 1 == maximum_entries {
+                NO_POLICY_SLOT
+            } else {
+                u32::try_from(index + 1).expect("validated L1 entry capacity exceeds u32")
+            };
+        }
         Ok(Self {
             directory,
             slots: slots.into_boxed_slice(),
-            free_slots,
+            free_head: if maximum_entries == 0 {
+                NO_POLICY_SLOT
+            } else {
+                0
+            },
+            free_count: maximum_entries,
             head: NO_POLICY_SLOT,
             tail: NO_POLICY_SLOT,
             bytes: 0,
@@ -711,11 +725,6 @@ impl GhostQueue {
     fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         let slots = maximum_entries
             .checked_mul(std::mem::size_of::<GhostSlot>())
-            .and_then(|bytes| {
-                maximum_entries
-                    .checked_mul(std::mem::size_of::<u32>())
-                    .and_then(|free| bytes.checked_add(free))
-            })
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large")
             })?;
@@ -747,7 +756,9 @@ impl GhostQueue {
         {
             return;
         }
-        if self.free_slots.is_empty() || self.bytes.saturating_add(weight) > self.capacity_bytes {
+        if self.free_head == NO_POLICY_SLOT
+            || self.bytes.saturating_add(weight) > self.capacity_bytes
+        {
             let Some(head) = self.head_index() else {
                 return;
             };
@@ -766,11 +777,12 @@ impl GhostQueue {
             let removed = self.remove_head();
             debug_assert!(removed);
         }
-        let packed = self
-            .free_slots
-            .pop()
-            .expect("ghost capacity preflight left one free slot");
+        let packed = self.free_head;
+        debug_assert_ne!(packed, NO_POLICY_SLOT);
         let index = usize::try_from(packed).expect("ghost slot index exceeds usize");
+        self.free_head = self.slots[index].next;
+        debug_assert_ne!(self.free_count, 0);
+        self.free_count -= 1;
         self.slots[index] = GhostSlot {
             hash,
             previous: self.tail,
@@ -829,8 +841,14 @@ impl GhostQueue {
             self.slots[next].previous = slot.previous;
         }
         self.bytes = self.bytes.saturating_sub(slot.weight as usize);
-        self.slots[index] = GhostSlot::default();
-        self.free_slots.push(packed);
+        let free = GhostSlot {
+            next: self.free_head,
+            ..GhostSlot::default()
+        };
+        self.slots[index] = free;
+        self.free_head = packed;
+        debug_assert!(self.free_count < self.slots.len());
+        self.free_count += 1;
     }
 }
 
@@ -1048,7 +1066,7 @@ mod tests {
         ghost.insert(4, 80);
 
         assert_eq!(ghost.bytes, 100);
-        assert!(ghost.free_slots.is_empty());
+        assert_eq!(ghost.free_count, 0);
         assert_eq!(ghost.directory.get(1), Some(0));
         assert_eq!(ghost.directory.get(2), Some(1));
         assert_eq!(ghost.directory.get(3), Some(2));
@@ -1065,5 +1083,18 @@ mod tests {
         assert!(!ghost.take(colliding));
         assert_eq!(ghost.bytes, 0);
         assert!(!ghost.take(first));
+    }
+
+    #[test]
+    fn ghost_reuses_an_unlinked_slot() {
+        let mut ghost = GhostQueue::new(2, 100).unwrap();
+        ghost.insert(1, 10);
+        ghost.insert(2, 10);
+        assert!(ghost.take(1));
+
+        ghost.insert(3, 10);
+
+        assert_eq!(ghost.free_count, 0);
+        assert_eq!(ghost.directory.get(3), Some(0));
     }
 }
