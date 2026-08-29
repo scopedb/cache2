@@ -2320,8 +2320,8 @@ mod tests {
             s3fifo.l1_eviction_policy,
         )
         .unwrap();
-        assert_eq!(s3fifo_metadata - metadata, 120 * 1024 * 1024);
-        assert_eq!(s3fifo_metadata, 250 * 1024 * 1024);
+        assert_eq!(s3fifo_metadata - metadata, 110 * 1024 * 1024);
+        assert_eq!(s3fifo_metadata, 240 * 1024 * 1024);
     }
 
     #[test]

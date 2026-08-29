@@ -658,28 +658,10 @@ impl S3FifoState {
     }
 }
 
-#[derive(Clone, Copy)]
-struct GhostSlot {
-    hash: u64,
-    previous: u32,
-    next: u32,
-    weight: u32,
-}
-
-impl Default for GhostSlot {
-    fn default() -> Self {
-        Self {
-            hash: 0,
-            previous: NO_POLICY_SLOT,
-            next: NO_POLICY_SLOT,
-            weight: 0,
-        }
-    }
-}
-
 struct GhostQueue {
     directory: FixedPrehashedMap,
-    slots: Box<[GhostSlot]>,
+    hashes: Box<[u64]>,
+    links: Box<[S3FifoLink]>,
     free_head: u32,
     free_count: usize,
     head: u32,
@@ -691,16 +673,24 @@ struct GhostQueue {
 impl GhostQueue {
     fn new(maximum_entries: usize, capacity_bytes: usize) -> io::Result<Self> {
         let directory = FixedPrehashedMap::try_new(maximum_entries)?;
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(maximum_entries).map_err(|_| {
+        let mut hashes = Vec::new();
+        hashes.try_reserve_exact(maximum_entries).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                "cannot allocate S3-FIFO ghost slots",
+                "cannot allocate S3-FIFO ghost hashes",
             )
         })?;
-        slots.resize(maximum_entries, GhostSlot::default());
-        for (index, slot) in slots.iter_mut().enumerate() {
-            slot.next = if index + 1 == maximum_entries {
+        hashes.resize(maximum_entries, 0);
+        let mut links = Vec::new();
+        links.try_reserve_exact(maximum_entries).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate S3-FIFO ghost links",
+            )
+        })?;
+        links.resize(maximum_entries, S3FifoLink::default());
+        for (index, link) in links.iter_mut().enumerate() {
+            link.next = if index + 1 == maximum_entries {
                 NO_POLICY_SLOT
             } else {
                 u32::try_from(index + 1).expect("validated L1 entry capacity exceeds u32")
@@ -708,7 +698,8 @@ impl GhostQueue {
         }
         Ok(Self {
             directory,
-            slots: slots.into_boxed_slice(),
+            hashes: hashes.into_boxed_slice(),
+            links: links.into_boxed_slice(),
             free_head: if maximum_entries == 0 {
                 NO_POLICY_SLOT
             } else {
@@ -723,13 +714,19 @@ impl GhostQueue {
     }
 
     fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
-        let slots = maximum_entries
-            .checked_mul(std::mem::size_of::<GhostSlot>())
+        let hashes = maximum_entries
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large")
+            })?;
+        let links = maximum_entries
+            .checked_mul(std::mem::size_of::<S3FifoLink>())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large")
             })?;
         FixedPrehashedMap::allocation_bytes(maximum_entries)?
-            .checked_add(slots)
+            .checked_add(hashes)
+            .and_then(|bytes| bytes.checked_add(links))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large"))
     }
 
@@ -740,7 +737,7 @@ impl GhostQueue {
         let index = usize::try_from(packed).expect("ghost slot index exceeds usize");
         // Ghost history is optional: a fingerprint collision may discard one
         // old hint, but it must never turn into a false ghost hit.
-        let matched = self.slots[index].hash == hash;
+        let matched = self.hashes[index] == hash;
         self.unlink(index);
         matched
     }
@@ -751,7 +748,7 @@ impl GhostQueue {
         };
         if packed_weight == 0
             || weight > self.capacity_bytes
-            || self.slots.is_empty()
+            || self.links.is_empty()
             || self.capacity_bytes == 0
         {
             return;
@@ -762,7 +759,7 @@ impl GhostQueue {
             let Some(head) = self.head_index() else {
                 return;
             };
-            let head_weight = self.slots[head].weight as usize;
+            let head_weight = self.links[head].weight as usize;
             if self
                 .bytes
                 .saturating_sub(head_weight)
@@ -780,11 +777,11 @@ impl GhostQueue {
         let packed = self.free_head;
         debug_assert_ne!(packed, NO_POLICY_SLOT);
         let index = usize::try_from(packed).expect("ghost slot index exceeds usize");
-        self.free_head = self.slots[index].next;
+        self.free_head = self.links[index].next;
         debug_assert_ne!(self.free_count, 0);
         self.free_count -= 1;
-        self.slots[index] = GhostSlot {
-            hash,
+        self.hashes[index] = hash;
+        self.links[index] = S3FifoLink {
             previous: self.tail,
             next: NO_POLICY_SLOT,
             weight: packed_weight,
@@ -793,7 +790,7 @@ impl GhostQueue {
             self.head = packed;
         } else {
             let tail = usize::try_from(self.tail).expect("ghost slot index exceeds usize");
-            self.slots[tail].next = packed;
+            self.links[tail].next = packed;
         }
         self.tail = packed;
         self.bytes = self.bytes.saturating_add(weight);
@@ -811,7 +808,7 @@ impl GhostQueue {
         let Some(index) = self.head_index() else {
             return false;
         };
-        let removed = self.directory.remove(self.slots[index].hash);
+        let removed = self.directory.remove(self.hashes[index]);
         debug_assert_eq!(removed, Some(self.head));
         self.unlink(index);
         true
@@ -824,30 +821,30 @@ impl GhostQueue {
 
     fn unlink(&mut self, index: usize) {
         let packed = u32::try_from(index).expect("ghost slot index exceeds u32");
-        let slot = self.slots[index];
-        debug_assert_ne!(slot.weight, 0);
-        if slot.previous == NO_POLICY_SLOT {
+        let link = self.links[index];
+        debug_assert_ne!(link.weight, 0);
+        if link.previous == NO_POLICY_SLOT {
             debug_assert_eq!(self.head, packed);
-            self.head = slot.next;
+            self.head = link.next;
         } else {
-            let previous = usize::try_from(slot.previous).expect("ghost slot index exceeds usize");
-            self.slots[previous].next = slot.next;
+            let previous = usize::try_from(link.previous).expect("ghost slot index exceeds usize");
+            self.links[previous].next = link.next;
         }
-        if slot.next == NO_POLICY_SLOT {
+        if link.next == NO_POLICY_SLOT {
             debug_assert_eq!(self.tail, packed);
-            self.tail = slot.previous;
+            self.tail = link.previous;
         } else {
-            let next = usize::try_from(slot.next).expect("ghost slot index exceeds usize");
-            self.slots[next].previous = slot.previous;
+            let next = usize::try_from(link.next).expect("ghost slot index exceeds usize");
+            self.links[next].previous = link.previous;
         }
-        self.bytes = self.bytes.saturating_sub(slot.weight as usize);
-        let free = GhostSlot {
+        self.bytes = self.bytes.saturating_sub(link.weight as usize);
+        self.hashes[index] = 0;
+        self.links[index] = S3FifoLink {
             next: self.free_head,
-            ..GhostSlot::default()
+            ..S3FifoLink::default()
         };
-        self.slots[index] = free;
         self.free_head = packed;
-        debug_assert!(self.free_count < self.slots.len());
+        debug_assert!(self.free_count < self.links.len());
         self.free_count += 1;
     }
 }
@@ -1071,6 +1068,17 @@ mod tests {
         assert_eq!(ghost.directory.get(2), Some(1));
         assert_eq!(ghost.directory.get(3), Some(2));
         assert_eq!(ghost.directory.get(4), None);
+    }
+
+    #[test]
+    fn ghost_storage_uses_twenty_bytes_per_entry() {
+        const ENTRIES: usize = 5;
+        assert_eq!(std::mem::size_of::<S3FifoLink>(), 12);
+        assert_eq!(
+            GhostQueue::allocation_bytes(ENTRIES).unwrap()
+                - FixedPrehashedMap::allocation_bytes(ENTRIES).unwrap(),
+            ENTRIES * 20
+        );
     }
 
     #[test]
