@@ -113,7 +113,8 @@ admission. Queue saturation, memory pressure, and timeout return explicit
 overload.
 
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
-mode. io_uring requires the `io-uring` feature and is experimental in 0.1.
+mode. io_uring requires the `io-uring` feature and remains experimental in
+0.2.
 
 ### Platform support
 
