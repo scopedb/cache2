@@ -1,8 +1,6 @@
 # C²
 
-[![CI](https://github.com/scopedb/cache2/actions/workflows/ci.yml/badge.svg)](https://github.com/scopedb/cache2/actions/workflows/ci.yml)
-
-**A bounded RAM + SSD cache for Tokio applications.**
+**A bounded RAM + SSD cache.**
 
 C² (`cache2`) provides bounded, disposable acceleration for large file chunks.
 It keeps request paths short and cache-owned resources fixed.
