@@ -650,7 +650,7 @@ impl MemoryShard {
         let previous = self.directory_upsert(hash, packed_index);
         debug_assert_eq!(previous, previous_head);
         MemoryInsertResult {
-            inserted: true,
+            slot: Some(packed_index),
             evictions,
         }
     }
@@ -668,23 +668,27 @@ enum ChargeResult {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MemoryInsertResult {
-    inserted: bool,
+    slot: Option<u32>,
     evictions: usize,
 }
 
 impl MemoryInsertResult {
     const fn bypassed() -> Self {
         Self {
-            inserted: false,
+            slot: None,
             evictions: 0,
         }
     }
 
     const fn rejected(evictions: usize) -> Self {
         Self {
-            inserted: false,
+            slot: None,
             evictions,
         }
+    }
+
+    const fn inserted(self) -> bool {
+        self.slot.is_some()
     }
 }
 
@@ -860,7 +864,7 @@ impl MemoryStore {
         let result = shard.insert(hash, key, value, seqno, charged_bytes, existing);
         drop(shard);
         self.record_insert(result);
-        result.inserted
+        result.inserted()
     }
 
     /// Best-effort exact-key cleanup for a sequenced delete. Contention
@@ -920,14 +924,25 @@ impl MemoryStore {
             return None;
         }
         let mut shard = self.try_lock_shard(token.shard_id)?;
-        if shard.find(hash, key).is_some() {
-            return None;
+        let existing = shard.find(hash, key);
+        if let Some(index) = existing
+            && shard.slots[index]
+                .as_ref()
+                .is_some_and(|entry| entry.seqno >= seqno)
+        {
+            let shard = &mut *shard;
+            shard.eviction.record_hit(&mut shard.policy_slots, index);
+            return Some(
+                shard.slots[index]
+                    .as_ref()
+                    .expect("memory directory points to a live slot")
+                    .value
+                    .clone(),
+            );
         }
-        let result = shard.insert(hash, key, value, seqno, charged_bytes, None);
-        let promoted = result.inserted.then(|| {
-            let index = shard
-                .find(hash, key)
-                .expect("a successful promotion installs the exact key");
+        let result = shard.insert(hash, key, value, seqno, charged_bytes, existing);
+        let promoted = result.slot.map(|packed_index| {
+            let index = usize::try_from(packed_index).expect("memory slot index exceeds usize");
             shard.slots[index]
                 .as_ref()
                 .expect("memory directory points to the promoted entry")
@@ -981,7 +996,7 @@ impl MemoryStore {
             u64::try_from(result.evictions).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        if !result.inserted {
+        if !result.inserted() {
             self.metrics.bypasses.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1232,13 +1247,34 @@ mod tests {
     }
 
     #[test]
-    fn existing_exact_key_blocks_disk_promotion() {
+    fn newer_exact_key_is_reused_for_a_delayed_older_promotion() {
         let store = store(1024, 1);
         let MemoryLookup::Miss(token) = store.lookup(9, b"key") else {
             panic!("empty memory tier must miss");
         };
         assert!(store.publish(9, b"key", b"new", 2));
-        assert!(store.promote(token, 9, b"key", b"old", 1).is_none());
+        assert!(matches!(
+            store.promote(token, 9, b"key", b"old", 1),
+            Some(value) if value.as_ref() == b"new"
+        ));
+        assert!(matches!(
+            store.lookup(9, b"key"),
+            MemoryLookup::Hit(value) if value.as_ref() == b"new"
+        ));
+    }
+
+    #[test]
+    fn newer_l2_promotion_replaces_an_older_concurrent_l1_value() {
+        let store = store(1024, 1);
+        let MemoryLookup::Miss(token) = store.lookup(9, b"key") else {
+            panic!("empty memory tier must miss");
+        };
+        assert!(store.publish(9, b"key", b"old", 1));
+
+        assert!(matches!(
+            store.promote(token, 9, b"key", b"new", 2),
+            Some(value) if value.as_ref() == b"new"
+        ));
         assert!(matches!(
             store.lookup(9, b"key"),
             MemoryLookup::Hit(value) if value.as_ref() == b"new"

@@ -566,6 +566,10 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             1,
         )?;
         cache.drain().await?;
+        let before = config
+            .statistics_enabled
+            .then(|| cache.snapshot())
+            .transpose()?;
         let resident = concurrent_reads(
             Arc::clone(&cache),
             0,
@@ -577,6 +581,16 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         )
         .await?;
         report("resident_l1", "resident L1 get", &resident.measurement);
+        if let Some(before) = before {
+            let after = cache.snapshot()?;
+            println!(
+                "result phase=resident_l1_outcomes l1_hits={} l1_misses={} l2_hits={} l2_misses={}",
+                after.l1_hits.saturating_sub(before.l1_hits),
+                after.l1_misses.saturating_sub(before.l1_misses),
+                after.l2_hits.saturating_sub(before.l2_hits),
+                after.l2_misses.saturating_sub(before.l2_misses),
+            );
+        }
         Arc::try_unwrap(cache)
             .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
             .close_fast()
