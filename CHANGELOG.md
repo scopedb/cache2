@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.2.1 (2026-08-30)
+
+This release keeps the version 1 on-disk format and requires no disk
+migration. It contains no source-breaking public API changes.
+
 ### Improvements
 
 - Static index sizing is no longer capped at 536,870,912 slots. Index capacity
@@ -9,6 +14,20 @@
   representable; runtime opening still enforces the configured managed-memory
   plan.
 - Managed-memory planning includes the index page-validation bitmap.
+
+### Benchmarking
+
+- Added deterministic mixed, reinsertion, and negative-lookup workload
+  profiles with throughput, sampled latency, overload, tier, reclaim,
+  reinsertion, I/O, and memory reporting.
+
+### Documentation
+
+- Added a configuration guide covering managed memory, coupled settings,
+  workload-oriented profiles, diagnostics, tuning order, and hard bounds.
+- Expanded the architecture and recovery documentation with the consistency
+  model, bounded request paths, persistent artifacts, open state machine, and
+  warm-close publication ordering.
 
 ## v0.2.0 (2026-08-29)
 
