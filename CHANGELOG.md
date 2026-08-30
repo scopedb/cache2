@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Improvements
+
+- Static index sizing is no longer capped at 536,870,912 slots. Index capacity
+  is accepted when its complete page, mapping, and recovery-image layout is
+  representable; runtime opening still enforces the configured managed-memory
+  plan.
+- Managed-memory planning includes the index page-validation bitmap.
+
 ## v0.2.0 (2026-08-29)
 
 This release keeps the version 1 on-disk format and requires no disk

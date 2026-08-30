@@ -698,8 +698,10 @@ mod tests {
 
     #[test]
     fn production_heat_bitmaps_are_exactly_two_bits_per_slot() {
+        const FOUR_TIB_INDEX_SLOTS: usize = 512 * 1024 * 1024;
+
         assert_eq!(
-            heat_memory_bytes(crate::index::MAX_INDEX_SLOTS),
+            heat_memory_bytes(FOUR_TIB_INDEX_SLOTS),
             Some(128 * 1024 * 1024)
         );
     }

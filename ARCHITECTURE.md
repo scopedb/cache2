@@ -117,7 +117,9 @@ checksums remain the correctness authority.
 The index image stores 504 slots plus a checksummed header in each 4 KiB page,
 or about 8.13 bytes per slot. Two volatile heat bits add 0.25 bytes per slot. A
 4 TiB cache averaging 16 KiB per entry therefore uses about 4.06 GiB for its
-536,870,912-slot index image and 128 MiB for heat.
+536,870,912-slot index image and 128 MiB for heat. That example is not a global
+slot cap; larger indexes are accepted when their complete mapping and recovery
+layout is representable and the managed-memory plan fits.
 
 ### Region store
 
