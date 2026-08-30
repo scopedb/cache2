@@ -132,8 +132,9 @@ The default index estimate is `capacity_bytes / 16 KiB`, followed by two slots
 per estimated entry. Override it when actual live values are materially
 smaller, key cardinality is known directly, or hit rate is more valuable than
 fixed memory. An aggressively oversized index consumes managed memory that
-could otherwise hold L1 entries or transient read buffers, and the global slot
-limit can make a large geometry invalid.
+could otherwise hold L1 entries or transient read buffers. Very large indexes
+must still fit the platform's addressable page and mapping layout, the checked
+recovery-image layout, and the configured managed-memory plan.
 
 Use `StaticConfig::peak_disk_bytes()` when planning the data file, state file,
 and two possible clean recovery images. Larger indexes increase both the
@@ -461,7 +462,7 @@ tests. For storage qualification, use a dataset larger than host RAM and follow
 | --- | --- |
 | Region size | Nonzero 4 KiB multiple, at most 32 MiB |
 | Capacity | Exact Region multiple with more Regions than append shards |
-| Index slots | 8 through 536,870,912; `with_expected_entries` requests two slots per entry |
+| Index slots | At least 8; the upper bound is derived from the addressable page, mapping, and recovery-image layout; `with_expected_entries` requests two slots per entry |
 | Append shards | 1 through 256 |
 | Reclaim workers | 1 through append-shard count |
 | POSIX read/write workers | 1 through 4,096 each |

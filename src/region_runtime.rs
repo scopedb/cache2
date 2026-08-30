@@ -48,9 +48,13 @@ use crate::snapshot::{
 };
 
 #[cfg(test)]
+use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
+#[cfg(test)]
 use crate::memory::MemoryMetricsSnapshot;
 #[cfg(test)]
 use crate::recovery::DataGeometry;
+#[cfg(test)]
+use crate::region::core::runtime_fixed_memory_bytes;
 #[cfg(test)]
 use crate::resources::ManagedMemorySnapshot;
 
@@ -2265,14 +2269,26 @@ mod tests {
     }
 
     #[test]
+    fn index_page_validation_state_is_fixed_memory_accounted() {
+        let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
+        let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
+
+        assert_eq!(
+            two_pages - one_page,
+            INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
+        );
+    }
+
+    #[test]
     fn four_tib_memory_plan_covers_the_complete_production_shape() {
         const GIB: usize = 1024 * 1024 * 1024;
+        const INDEX_SLOTS: usize = 512 * 1024 * 1024;
         let geometry = DataGeometry {
             data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 128 * 1024).unwrap(),
             region_size: 32 * 1024 * 1024,
             region_count: 128 * 1024,
         };
-        let index_slots = crate::index::MAX_INDEX_SLOTS;
+        let index_slots = INDEX_SLOTS;
         let base = RuntimeConfig::default()
             .with_l1_capacity_bytes(10 * GIB)
             .with_managed_memory_limit_bytes(15 * GIB)

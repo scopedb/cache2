@@ -622,6 +622,7 @@ fn fresh_metadata_assigns_four_active_shards_and_a_free_victim() {
 #[test]
 fn four_tib_region_metadata_round_trips_into_runtime_authority() {
     const CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+    const INDEX_SLOTS: usize = 512 * 1024 * 1024;
     const REGION_SIZE: u64 = 32 * 1024 * 1024;
     const REGION_COUNT: u32 = (CAPACITY_BYTES / REGION_SIZE) as u32;
 
@@ -629,8 +630,7 @@ fn four_tib_region_metadata_round_trips_into_runtime_authority() {
     data.geometry.region_size = REGION_SIZE;
     data.geometry.data_file_len =
         DataGeometry::expected_file_len(REGION_SIZE, REGION_COUNT).unwrap();
-    let metadata =
-        empty_region_metadata(data, crate::index::MAX_INDEX_SLOTS, REGION_SHARDS).unwrap();
+    let metadata = empty_region_metadata(data, INDEX_SLOTS, REGION_SHARDS).unwrap();
     let encoded = metadata.encode().unwrap();
     assert_eq!(encoded.len() as u64, metadata.encoded_len().unwrap());
 

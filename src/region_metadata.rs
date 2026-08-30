@@ -8,12 +8,10 @@
 //! lazy-validated; this section contains only O(regions + index partitions) state.
 
 use crate::checksum::Crc32c;
-use crate::index::{
-    MAX_INDEX_PARTITIONS, MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE,
-};
+use crate::index::{MAX_INDEX_PARTITIONS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::{
     INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE, IndexStorageError,
-    canonical_index_partition_ranges,
+    canonical_index_partition_ranges, validate_index_slot_count,
 };
 use crate::recovery::{DataSuperblock, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeader};
 use std::fmt;
@@ -558,15 +556,16 @@ fn pages_for_records(records: u64, per_page: u64) -> Result<u32> {
 }
 
 fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> Result<()> {
-    let expected_index_pages =
-        pages_for_records(root.index_slots, INDEX_IMAGE_SLOTS_PER_PAGE as u64)?;
-    let maximum_index_slots =
-        u64::try_from(MAX_INDEX_SLOTS).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
+    if root.index_slots < 8 {
+        return Err(RegionMetadataError::InvalidField("root"));
+    }
+    let index_slots =
+        usize::try_from(root.index_slots).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
+    validate_index_slot_count(index_slots).map_err(index_layout_metadata_error)?;
+    let expected_index_pages = root.index_slots.div_ceil(INDEX_IMAGE_SLOTS_PER_PAGE as u64);
     if root.data_superblock_generation == 0
         || root.image_generation == 0
-        || root.index_slots < 8
-        || root.index_slots > maximum_index_slots
-        || root.index_page_count != u64::from(expected_index_pages)
+        || root.index_page_count != expected_index_pages
         || root.region_size < RECOVERY_PAGE_SIZE as u64
         || root.region_size > MAX_PACKED_REGION_SIZE
         || !root.region_size.is_multiple_of(RECOVERY_PAGE_SIZE as u64)
@@ -669,13 +668,8 @@ fn validate_partitions(
 ) -> Result<()> {
     let index_slots =
         usize::try_from(root.index_slots).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-    let canonical = canonical_index_partition_ranges(index_slots).map_err(|error| match error {
-        IndexStorageError::SizeOverflow => RegionMetadataError::ArithmeticOverflow,
-        // The canonical helper performs no I/O. Its only I/O-shaped failure
-        // is the fallible allocation of this O(partitions) directory.
-        IndexStorageError::Io(_) => RegionMetadataError::Allocation,
-        _ => RegionMetadataError::InvalidField("canonical_partition_directory"),
-    })?;
+    let canonical =
+        canonical_index_partition_ranges(index_slots).map_err(index_layout_metadata_error)?;
     if canonical.len() != partitions.len() {
         return Err(RegionMetadataError::InvalidField(
             "canonical_partition_directory",
@@ -709,6 +703,16 @@ fn validate_partitions(
         }
     }
     Ok(())
+}
+
+fn index_layout_metadata_error(error: IndexStorageError) -> RegionMetadataError {
+    match error {
+        IndexStorageError::SizeOverflow => RegionMetadataError::ArithmeticOverflow,
+        // Canonical layout construction only allocates its O(partitions)
+        // directory; no index pages or slot storage are materialized here.
+        IndexStorageError::Io(_) => RegionMetadataError::Allocation,
+        _ => RegionMetadataError::InvalidField("canonical_partition_directory"),
+    }
 }
 
 fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool> {
@@ -1457,12 +1461,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_accepts_canonical_partial_tail_and_maximum_layouts() {
+    fn metadata_accepts_canonical_partial_tail_and_large_layouts() {
         for index_slots in [
             INDEX_IMAGE_SLOTS_PER_PAGE + 1,
             INDEX_IMAGE_SLOTS_PER_PAGE + 7,
             INDEX_IMAGE_SLOTS_PER_PAGE + 8,
-            MAX_INDEX_SLOTS,
+            1_usize << 32,
         ] {
             sample_with_index_slots(index_slots).validate().unwrap();
         }

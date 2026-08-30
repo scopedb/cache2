@@ -14,7 +14,7 @@
 
 use std::io;
 
-use crate::index::MAX_INDEX_SLOTS;
+use crate::index_storage::validate_index_slot_count;
 use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.
@@ -185,13 +185,14 @@ fn closed_error() -> io::Error {
 }
 
 fn validate_index_slots(index_slots: usize) -> io::Result<()> {
-    if !(8..=MAX_INDEX_SLOTS).contains(&index_slots) {
+    if index_slots < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RegionStore index slots must be in 8..=536870912",
+            "RegionStore requires at least 8 index slots",
         ));
     }
-    Ok(())
+    validate_index_slot_count(index_slots)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 #[cfg(test)]
@@ -322,7 +323,7 @@ mod tests {
 
     #[test]
     fn invalid_capacity_is_rejected_before_ownership_or_allocation() {
-        for index_slots in [0, 1, 7, MAX_INDEX_SLOTS + 1] {
+        for index_slots in [0, 1, 7, usize::MAX] {
             let (backend, events) = backend(Plan::Fresh, None);
             assert!(RegionStore::open(index_slots, backend).is_err());
             assert!(events.borrow().is_empty());

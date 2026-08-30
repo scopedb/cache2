@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, ErrorOperation, Result};
-use crate::index::{MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
-use crate::index_storage::{IndexStorageError, canonical_index_partition_ranges};
+use crate::index::{MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
+use crate::index_storage::{
+    IndexStorageError, canonical_index_partition_ranges, validate_index_slot_count,
+};
 use crate::recovery::{
     DataGeometry, DataSuperblock, KEY_HASH_ALGORITHM_XXH3_64, PersistentId,
     RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE, recovery_image_index_len,
@@ -54,9 +56,9 @@ impl StaticConfig {
     ///
     /// `capacity_bytes` is the total Region extent, excluding the data
     /// superblock, state, and clean-image files. The default Region size is
-    /// 32 MiB. A default plan above 4 TiB exceeds the supported index size and
-    /// fails validation; use [`Self::with_expected_entries`] when a larger
-    /// average entry permits a smaller explicit index. Use
+    /// 32 MiB. Index size grows with capacity and is accepted when its complete
+    /// page and mapping layout is representable. Use
+    /// [`Self::with_expected_entries`] when the live-key count is known, and use
     /// [`Self::peak_disk_bytes`] for the cache-owned logical disk bound.
     pub fn new(capacity_bytes: u64) -> Self {
         let expected_entries = capacity_bytes / DEFAULT_EXPECTED_ENTRY_BYTES;
@@ -183,9 +185,10 @@ impl StaticConfig {
         if region_count < 2 {
             return Err(invalid_config("cache requires at least two Regions"));
         }
-        if !(MIN_INDEX_SLOTS..=MAX_INDEX_SLOTS).contains(&self.index_slots) {
-            return Err(invalid_config("index slots must be in 8..=536870912"));
+        if self.index_slots < MIN_INDEX_SLOTS {
+            return Err(invalid_config("index slots must be at least 8"));
         }
+        validate_index_slot_count(self.index_slots).map_err(index_layout_error)?;
         let data_file_len = DataGeometry::expected_file_len(self.region_size_bytes, region_count)
             .ok_or_else(|| invalid_config("cache data length overflow"))?;
         let geometry = DataGeometry {
@@ -799,17 +802,22 @@ mod tests {
     }
 
     #[test]
-    fn default_index_sizing_does_not_silently_clamp_above_four_tib() {
-        let capacity = (4_u64 << 40) + DEFAULT_REGION_SIZE;
-        let implicit = StaticConfig::new(capacity);
+    fn maximum_capacity_default_index_remains_proportional_and_representable() {
+        let capacity = MAX_PACKED_REGION_SIZE * u64::from(MAX_PACKED_REGION_COUNT);
+        let config = StaticConfig::new(capacity);
 
-        assert!(implicit.index_slots() > MAX_INDEX_SLOTS);
-        assert!(implicit.validate().is_err());
+        assert_eq!(capacity, 32_u64 << 40);
+        assert_eq!(config.index_slots(), 1_usize << 32);
+        config.validate().unwrap();
+        assert!(config.peak_disk_bytes().unwrap() > capacity);
+    }
 
-        StaticConfig::new(capacity)
-            .with_expected_entries(MAX_INDEX_SLOTS / 2)
-            .validate()
-            .unwrap();
+    #[test]
+    fn unrepresentable_explicit_index_is_rejected_without_clamping() {
+        let config = StaticConfig::new(2 * DEFAULT_REGION_SIZE).with_expected_entries(usize::MAX);
+
+        assert_eq!(config.index_slots(), usize::MAX);
+        assert!(config.validate().is_err());
     }
 
     #[test]

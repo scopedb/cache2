@@ -54,6 +54,30 @@ const IMAGE_STATE_REJECTED: u8 = 1;
 
 const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES.is_multiple_of(INDEX_IMAGE_PAGE_SIZE));
 
+/// Validates one complete cache-index capacity without allocating its mapping
+/// or slot storage.
+pub(crate) fn validate_index_slot_count(slot_count: usize) -> Result<(), IndexStorageError> {
+    let ranges = canonical_index_partition_ranges(slot_count)?;
+    if ranges
+        .iter()
+        .any(|range| range.slot_count > u32::MAX as usize)
+    {
+        return Err(IndexStorageError::InvalidArgument(
+            "index partition exceeds the v1 recovery counter",
+        ));
+    }
+    Ok(())
+}
+
+fn validated_index_image_layout(slot_count: usize) -> Result<ImageLayout, IndexStorageError> {
+    if slot_count < INDEX_CANDIDATES {
+        return Err(IndexStorageError::InvalidArgument(
+            "partitioned index storage requires at least 4 buckets",
+        ));
+    }
+    ImageLayout::new(slot_count)
+}
+
 /// One canonical, page-aligned partition of Index Image .
 ///
 /// Ordinals are global to the complete image. Every physical 4 KiB page is
@@ -78,12 +102,7 @@ pub(crate) struct IndexPartitionRange {
 pub(crate) fn canonical_index_partition_ranges(
     slot_count: usize,
 ) -> Result<Box<[IndexPartitionRange]>, IndexStorageError> {
-    if slot_count < INDEX_CANDIDATES {
-        return Err(IndexStorageError::InvalidArgument(
-            "partitioned index storage requires at least 4 buckets",
-        ));
-    }
-    let layout = ImageLayout::new(slot_count)?;
+    let layout = validated_index_image_layout(slot_count)?;
     let maximum = layout.page_count.min(MAX_INDEX_PARTITIONS);
     let mut partition_count = greatest_power_of_two(maximum);
     while partition_count > 1
@@ -1912,6 +1931,31 @@ mod tests {
             assert_eq!(actual, expected, "slot_count={slot_count}");
             assert!(actual.iter().all(|range| range.3 >= INDEX_CANDIDATES));
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn index_slot_validation_honors_mapping_and_recovery_counter_bounds() {
+        let recoverable_partition_slots = u32::MAX as usize - INDEX_IMAGE_SLOTS_PER_PAGE + 1;
+        let recoverable_slot_count = recoverable_partition_slots
+            .checked_mul(MAX_INDEX_PARTITIONS)
+            .unwrap();
+        let oversized_partition_slots = (u32::MAX as usize + 1)
+            .checked_mul(MAX_INDEX_PARTITIONS)
+            .unwrap();
+
+        assert!(validate_index_slot_count(1_usize << 32).is_ok());
+        assert!(validate_index_slot_count(recoverable_slot_count).is_ok());
+        assert!(matches!(
+            validate_index_slot_count(oversized_partition_slots),
+            Err(IndexStorageError::InvalidArgument(
+                "index partition exceeds the v1 recovery counter"
+            ))
+        ));
+        assert!(matches!(
+            validate_index_slot_count(usize::MAX),
+            Err(IndexStorageError::SizeOverflow)
+        ));
     }
 
     #[test]

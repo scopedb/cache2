@@ -15,7 +15,8 @@ use crate::hashing::route_hash;
 use crate::index::IndexEntry;
 use crate::index::PackedLocation;
 use crate::index_storage::{
-    IndexStorageError, WARM_IMAGE_WRITE_BATCH_BYTES, canonical_index_partition_ranges,
+    INDEX_IMAGE_PAGE_SIZE, IndexStorageError, WARM_IMAGE_WRITE_BATCH_BYTES,
+    canonical_index_partition_ranges,
 };
 use crate::io_engine::{IoEngine, ReadSlot};
 #[cfg(test)]
@@ -1151,6 +1152,14 @@ pub(crate) fn runtime_fixed_memory_bytes(
                 "index memory does not fit the platform",
             )
         })?;
+    let index_page_state_bytes = (index_bytes / INDEX_IMAGE_PAGE_SIZE)
+        .checked_mul(std::mem::size_of::<AtomicU8>())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index page-state memory does not fit the platform",
+            )
+        })?;
     let region_count = usize::try_from(region_count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large"))?;
     // Manager, read-directory, shard gates, and FIFO nodes are all fixed by
@@ -1186,7 +1195,8 @@ pub(crate) fn runtime_fixed_memory_bytes(
         )
     })?;
     index_bytes
-        .checked_add(heat_bytes)
+        .checked_add(index_page_state_bytes)
+        .and_then(|bytes| bytes.checked_add(heat_bytes))
         .and_then(|bytes| bytes.checked_add(region_bytes))
         .and_then(|bytes| bytes.checked_add(recovery_scratch))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))

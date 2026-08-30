@@ -9,10 +9,9 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::index::{
-    IndexEntry, MAX_INDEX_PROBES, MAX_INDEX_SLOTS, MAX_PACKED_REGION_COUNT, MAX_REGION_OFFSET,
-    PackedLocation,
+    IndexEntry, MAX_INDEX_PROBES, MAX_PACKED_REGION_COUNT, MAX_REGION_OFFSET, PackedLocation,
 };
-use crate::index_storage::PartitionedIndexStorage;
+use crate::index_storage::{PartitionedIndexStorage, validate_index_slot_count};
 use crate::record_codec::hash_key;
 use crate::region_index::{
     BenchmarkProbeStats, RegionIndex, reset_benchmark_probe_stats, take_benchmark_probe_stats,
@@ -176,9 +175,8 @@ impl TurnoverPlan {
             .checked_mul(2)
             .ok_or_else(|| invalid("turnover index slot count overflow"))?
             .max(8);
-        if index_slots > MAX_INDEX_SLOTS {
-            return Err(invalid("turnover index exceeds the supported slot limit"));
-        }
+        validate_index_slot_count(index_slots)
+            .map_err(|_| invalid("turnover index layout is not representable"))?;
         let key_space_entries = physical_entries
             .checked_mul(config.key_space_multiplier)
             .ok_or_else(|| invalid("turnover key-space size overflow"))?;
