@@ -14,7 +14,7 @@
 
 [package]
 name = "cache2"
-version = "0.2.1"
+version = "0.2.2"
 description = "Performance-first bounded RAM and NVMe hybrid cache"
 documentation = "https://docs.rs/cache2"
 keywords = ["cache", "nvme", "storage"]
