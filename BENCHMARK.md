@@ -144,11 +144,11 @@ index scale:
 cargo +1.98.0 bench --locked --package benchmarks --bench recovery_scale
 ```
 
-Run the 10,000-case persistent-decoder and bounded-index property test:
+Run the 10,000-case property tests for persistent decoders, record round trips,
+and the two bounded index state machines:
 
 ```sh
-cargo test --package cache2 --lib \
-  property_tests::arbitrary_persistent_bytes_never_escape_bounds
+cargo test --package cache2 --lib property_tests::
 ```
 
 Treat any correctness failure, unexpected unbounded growth, missed required

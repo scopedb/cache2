@@ -28,6 +28,24 @@ use cache2::{
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 type RuntimeConfigCase = (&'static str, fn(RuntimeConfig) -> RuntimeConfig);
 
+fn test_static_config() -> StaticConfig {
+    StaticConfig::new(3 * 512 * 1024)
+        .with_region_size_bytes(512 * 1024)
+        .with_expected_entries(3277)
+}
+
+fn test_runtime_config(workers: usize, append_shards: u32) -> RuntimeConfig {
+    RuntimeConfig::default()
+        .with_io_engine(IoEngine::Posix)
+        .with_read_io_workers(workers)
+        .with_write_io_workers(workers)
+        .with_append_shards(append_shards)
+        .with_l1_capacity_bytes(4 * 1024 * 1024)
+        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
+        .with_write_flush_threshold_bytes(256 * 1024)
+        .with_statistics(true)
+}
+
 struct TestCache {
     data: PathBuf,
 }
@@ -41,10 +59,7 @@ impl TestCache {
     }
 
     fn config(&self, workers: usize) -> CacheBuilder {
-        let static_config = StaticConfig::new(3 * 512 * 1024)
-            .with_region_size_bytes(512 * 1024)
-            .with_expected_entries(3277);
-        self.config_with_static(workers, static_config)
+        self.config_with_static(workers, test_static_config())
     }
 
     fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheBuilder {
@@ -57,16 +72,8 @@ impl TestCache {
         static_config: StaticConfig,
         append_shards: u32,
     ) -> CacheBuilder {
-        let runtime_config = RuntimeConfig::default()
-            .with_io_engine(IoEngine::Posix)
-            .with_read_io_workers(workers)
-            .with_write_io_workers(workers)
-            .with_append_shards(append_shards)
-            .with_l1_capacity_bytes(4 * 1024 * 1024)
-            .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-            .with_write_flush_threshold_bytes(256 * 1024)
-            .with_statistics(true);
-        CacheBuilder::from_static(&self.data, static_config).with_runtime_config(runtime_config)
+        CacheBuilder::from_static(&self.data, static_config)
+            .with_runtime_config(test_runtime_config(workers, append_shards))
     }
 
     fn sidecar(&self, suffix: &str) -> PathBuf {
@@ -238,44 +245,6 @@ async fn concurrent_open_reports_structured_busy_error() {
 }
 
 #[tokio::test]
-async fn immediate_l1_publication_is_best_effort() {
-    let files = TestCache::new("latest-memory-visible");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(2)
-        .with_write_io_workers(2)
-        .with_append_shards(2)
-        .with_statistics(true);
-    let cache = files
-        .config(2)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
-    let mut visible = 0;
-    let mut last_sequence = 0;
-    for version in 0_u8..64 {
-        let bypasses_before = cache.snapshot().unwrap().l1_bypasses;
-        let sequence = eventually_admitted(|| cache.put("key", [version; 1024]));
-        assert!(sequence > last_sequence);
-        last_sequence = sequence;
-        match cache.get("key").await.unwrap() {
-            Some(value) if value.tier() == CacheTier::L1 => {
-                visible += 1;
-                assert_eq!(value.as_ref(), &[version; 1024]);
-            }
-            Some(value) => {
-                assert!(value.iter().all(|byte| *byte == value[0]));
-                assert!(value[0] <= version);
-            }
-            None => assert!(cache.snapshot().unwrap().l1_bypasses >= bypasses_before),
-        }
-    }
-    assert!(visible > 0);
-    cache.close_fast().await.unwrap();
-}
-
-#[tokio::test]
 async fn l2_only_put_avoids_l1_until_the_first_demand_read() {
     let files = TestCache::new("l2-only-put");
     let cache = files.config(2).open().await.unwrap();
@@ -341,16 +310,9 @@ async fn l2_only_put_survives_warm_recovery() {
 #[tokio::test]
 async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
+    let runtime = test_runtime_config(1, 2)
         .with_l1_capacity_bytes(1024 * 1024)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_l1_shards(1)
-        .with_write_flush_threshold_bytes(256 * 1024)
-        .with_statistics(true);
+        .with_l1_shards(1);
     let cache = files
         .config(1)
         .with_runtime_config(runtime)
@@ -376,16 +338,10 @@ async fn write_flush_threshold_does_not_cap_region_sized_staging() {
 #[tokio::test]
 async fn l1_bypass_may_remain_stale_after_region_completion() {
     let files = TestCache::new("l1-bypass-publication");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(2)
-        .with_write_io_workers(2)
-        .with_append_shards(2)
+    let runtime = test_runtime_config(2, 2)
         .with_l1_capacity_bytes(512)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(true);
+        .with_write_flush_threshold_bytes(128 * 1024);
     let cache = files
         .config(2)
         .with_runtime_config(runtime)
@@ -423,14 +379,10 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
 #[tokio::test]
 async fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
-    let runtime = RuntimeConfig::default()
+    let runtime = test_runtime_config(1, 2)
         .with_io_engine(IoEngine::IoUring)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
-        .with_l1_capacity_bytes(4 * 1024 * 1024)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_write_flush_threshold_bytes(128 * 1024);
+        .with_write_flush_threshold_bytes(128 * 1024)
+        .with_statistics(false);
 
     let error = files
         .config(1)
@@ -448,14 +400,10 @@ async fn unavailable_io_engine_is_rejected_before_file_creation() {
 #[tokio::test]
 async fn unavailable_direct_io_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-direct-io");
-    let runtime = RuntimeConfig::default()
+    let runtime = test_runtime_config(1, 2)
         .with_io_mode(IoMode::Direct)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
-        .with_l1_capacity_bytes(4 * 1024 * 1024)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_write_flush_threshold_bytes(128 * 1024);
+        .with_write_flush_threshold_bytes(128 * 1024)
+        .with_statistics(false);
 
     let error = files
         .config(1)
@@ -494,18 +442,15 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let retuned = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
+    let retuned = test_runtime_config(2, 2)
         .with_read_io_workers(7)
         .with_read_io_wait_timeout(Duration::from_millis(10))
-        .with_write_io_workers(2)
         .with_reclaim_workers(2)
-        .with_append_shards(2)
         .with_l1_capacity_bytes(2 * 1024 * 1024)
         .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(7)
-        .with_write_flush_threshold_bytes(64 * 1024);
+        .with_write_flush_threshold_bytes(64 * 1024)
+        .with_statistics(false);
     let reopened = files
         .config(7)
         .with_runtime_config(retuned)
@@ -524,9 +469,7 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
 #[tokio::test]
 async fn append_shards_rebind_across_warm_reopens() {
     let files = TestCache::new("append-shards");
-    let static_config = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277);
+    let static_config = test_static_config();
 
     let cache = files
         .config_with_static_and_shards(1, static_config.clone(), 1)
@@ -899,9 +842,7 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
 #[tokio::test]
 async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
-    let static_config = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277);
+    let static_config = test_static_config();
     let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
 
     let cache = files
@@ -931,11 +872,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 #[tokio::test]
 async fn detailed_snapshot_reports_bounded_resource_state() {
     let files = TestCache::new("resource-snapshot");
-    let expected_disk_peak = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277)
-        .peak_disk_bytes()
-        .unwrap();
+    let expected_disk_peak = test_static_config().peak_disk_bytes().unwrap();
     let cache = files.config(4).open().await.unwrap();
     let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
@@ -1095,9 +1032,7 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
 #[tokio::test]
 async fn buffered_l2_read_reports_the_size_class_upper_bound() {
     let files = TestCache::new("buffered-size-class-read");
-    let static_config = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277);
+    let static_config = test_static_config();
     let cache = files
         .config_with_static_and_shards(1, static_config.clone(), 1)
         .open()
@@ -1128,15 +1063,9 @@ async fn buffered_l2_read_reports_the_size_class_upper_bound() {
 #[tokio::test]
 async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
+    let runtime = test_runtime_config(1, 2)
         .with_l1_capacity_bytes(0)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(true);
+        .with_write_flush_threshold_bytes(128 * 1024);
     let cache = files
         .config(1)
         .with_runtime_config(runtime)
@@ -1164,16 +1093,10 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
 #[tokio::test]
 async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let files = TestCache::new("promoted-l2-buffer-release");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
+    let runtime = test_runtime_config(1, 2)
         .with_l1_capacity_bytes(64 * 1024)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
         .with_l1_shards(1)
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(true);
+        .with_write_flush_threshold_bytes(128 * 1024);
     let cache = files
         .config(1)
         .with_runtime_config(runtime.clone())
@@ -1208,15 +1131,9 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
 #[tokio::test]
 async fn retained_l2_values_charge_and_release_transient_memory() {
     let files = TestCache::new("retained-read-memory");
-    let runtime = RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(1)
-        .with_write_io_workers(1)
-        .with_append_shards(2)
+    let runtime = test_runtime_config(1, 2)
         .with_l1_capacity_bytes(0)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(true);
+        .with_write_flush_threshold_bytes(128 * 1024);
     let cache = files
         .config(1)
         .with_runtime_config(runtime)

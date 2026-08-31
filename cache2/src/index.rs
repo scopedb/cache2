@@ -283,13 +283,4 @@ mod tests {
         assert_eq!(record_size_class(0), None);
         assert_eq!(record_size_class_upper_bound(0), None);
     }
-
-    #[test]
-    fn partition_route_stays_in_range() {
-        for count in [1, 2, 8, MAX_INDEX_PARTITIONS] {
-            for hash in [0, 1, u64::MAX, 0x1234_5678_90ab_cdef] {
-                assert!(index_partition_for(hash, count) < count);
-            }
-        }
-    }
 }

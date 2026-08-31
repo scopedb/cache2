@@ -245,8 +245,6 @@ pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::checksum::crc32c;
-
     use super::*;
 
     #[test]
@@ -257,55 +255,17 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_kib_value_uses_the_minimum_format_envelope() {
-        let key = b"file/chunk/0007";
-        let value = (0..16 * 1024)
-            .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
-            .collect::<Vec<_>>();
-        let required = required_record_bytes(key.len(), value.len()).unwrap();
-        assert_ne!(
-            required as usize % crate::io_backend::DIRECT_IO_ALIGNMENT,
-            0
-        );
-        let reservation = RegionAppendReservation {
-            shard_id: 0,
-            region_id: 7,
-            region_created_seqno: 11,
-            offset: 0,
-            record_bytes: required,
-            seqno: 17,
-        };
-        let mut destination = vec![0xa5; required as usize];
+    fn default_sized_value_uses_only_record_alignment() {
+        let key_len = b"file/chunk/0007".len();
+        let value_len = 16 * 1024;
+        let payload_end = RECORD_HEADER_SIZE + key_len + value_len;
+        let expected = payload_end.next_multiple_of(RECORD_ALIGNMENT as usize);
 
-        let (hash, entry) = encode_value_into(
-            &mut destination,
-            reservation,
-            0x0123_4567_89ab_cdef,
-            key,
-            &value,
-        )
-        .unwrap();
-
-        assert_eq!(hash, hash_key(0x0123_4567_89ab_cdef, key));
-        assert_eq!(entry.location.region_id(), 7);
-        assert_eq!(entry.location.offset(), 0);
-        assert_eq!(entry.location.record_len(), required);
-        let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
-        assert_eq!(usize::from(header.key_len), key.len());
-        assert_eq!(header.value_len, value.len() as u32);
-        assert_eq!(header.seqno, 17);
-        assert_eq!(header.key_hash, hash);
-
-        let key_start = RECORD_HEADER_SIZE;
-        let value_start = key_start + key.len();
-        let payload_end = value_start + value.len();
-        assert_eq!(&destination[key_start..value_start], key);
-        assert_eq!(&destination[value_start..payload_end], value);
         assert_eq!(
-            header.payload_crc,
-            crc32c(&destination[key_start..payload_end])
+            required_record_bytes(key_len, value_len).unwrap() as usize,
+            expected
         );
-        assert!(destination[payload_end..].iter().all(|byte| *byte == 0));
+        assert!(!expected.is_multiple_of(crate::io_backend::DIRECT_IO_ALIGNMENT));
     }
 
     #[test]

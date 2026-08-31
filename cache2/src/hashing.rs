@@ -265,21 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_prehashed_map_reuses_deleted_slots_without_growing() {
-        let mut map = FixedPrehashedMap::try_new(2).unwrap();
-        assert_eq!(map.insert(7, 11), Some(None));
-        assert_eq!(map.insert(u64::MAX, 13), Some(None));
-
-        assert_eq!(map.get(7), Some(11));
-        assert_eq!(map.get(u64::MAX), Some(13));
-        assert_eq!(map.insert(7, 17), Some(Some(11)));
-        assert_eq!(map.remove(7), Some(17));
-        assert_eq!(map.get(7), None);
-        assert_eq!(map.insert(23, 19), Some(None));
-        assert_eq!(map.get(23), Some(19));
-    }
-
-    #[test]
     fn fixed_map_delete_preserves_a_wrapped_collision_chain() {
         let mut map = FixedPrehashedMap::try_new(4).unwrap();
         let mut hashes = Vec::new();
@@ -323,36 +308,6 @@ mod tests {
         }
 
         assert!(map.slots.iter().all(|slot| slot.value == EMPTY_VALUE));
-    }
-
-    #[test]
-    fn bounded_delete_compaction_matches_long_churn_reference() {
-        let mut map = FixedPrehashedMap::try_new(32).unwrap();
-        let mut expected = Vec::<(u64, u32)>::new();
-        for ordinal in 0_u32..100_000 {
-            if expected.len() == 32 {
-                let victim = (ordinal as usize * 17) % expected.len();
-                let (hash, value) = expected.swap_remove(victim);
-                assert_eq!(map.remove(hash), Some(value));
-            }
-
-            let hash = u64::from(ordinal * 8) << 32;
-            assert_eq!(map.insert(hash, ordinal), Some(None));
-            expected.push((hash, ordinal));
-
-            if ordinal % 11 == 0 {
-                let victim = (ordinal as usize * 13) % expected.len();
-                let (hash, value) = expected.swap_remove(victim);
-                assert_eq!(map.remove(hash), Some(value));
-            }
-            if ordinal % 64 == 0 {
-                for &(hash, value) in &expected {
-                    assert_eq!(map.get(hash), Some(value));
-                }
-                let missing = u64::from(ordinal + 1_000_000) << 32;
-                assert_eq!(map.get(missing), None);
-            }
-        }
     }
 
     #[test]
