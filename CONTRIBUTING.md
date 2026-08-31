@@ -14,7 +14,6 @@ The repository separates published code from development-only consumers:
 | `benchmarks/`        | Standalone benchmark targets and workload-specific harnesses.                                 |
 | `examples/`          | Runnable programs that demonstrate complete integrations.                                     |
 | `xtask/`             | The `cargo x` repository workflow entrypoint.                                                 |
-| `fuzz/`              | The isolated `cargo-fuzz` workspace and persistent-decoder target.                            |
 
 Keep unit tests beside the implementation when they need private access.
 Behavior visible to callers belongs in `tests-integration/tests`. Format
@@ -34,9 +33,9 @@ cargo x lint
 
 `cargo x check` verifies the workspace and each optional `cache2` feature.
 `cargo x test` runs workspace tests with all features and the ignored extended
-library tests. `cargo x lint` checks Rust and fuzz-target formatting, Clippy,
-public documentation, the publishable package, license headers, dependency
-licenses, advisories, and sources.
+library tests. `cargo x lint` checks Rust formatting, Clippy, public
+documentation, the publishable package, license headers, dependency licenses,
+advisories, and sources.
 
 The lint workflow expects the pinned CI tools to be available:
 
@@ -52,7 +51,7 @@ release-mode test pass used by CI is:
 cargo test --workspace --release --all-features
 ```
 
-## Benchmarks and fuzzing
+## Benchmarks and property tests
 
 Each benchmark is an explicit target in the `benchmarks` package. Run one
 target with:
@@ -61,11 +60,12 @@ target with:
 cargo x bench --bench cache
 ```
 
-See `BENCHMARK.md` for workload controls and qualification requirements. Run
-the persistent decoder and bounded-index fuzz target with:
+See `BENCHMARK.md` for workload controls and qualification requirements. The
+normal test workflow also runs 10,000 QuickCheck cases over persistent decoders
+and bounded-index probes with inputs up to 16 KiB. Isolate that test with:
 
 ```sh
-cargo fuzz run persistent_decoders -- -runs=10000 -max_len=16384
+cargo test --package cache2 --lib property_tests::arbitrary_persistent_bytes_never_escape_bounds
 ```
 
 ## Changelog

@@ -38,13 +38,13 @@ tokio = { workspace = true }
 twox-hash = { workspace = true }
 
 [dev-dependencies]
+quickcheck = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
 benchmarking = []
 io-uring = ["dep:io-uring"]
-fuzzing = []
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
 io-uring = { workspace = true, optional = true }

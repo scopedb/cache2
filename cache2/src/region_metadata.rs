@@ -313,7 +313,7 @@ impl RegionMetadata {
         Ok(output)
     }
 
-    #[cfg(any(test, feature = "fuzzing"))]
+    #[cfg(test)]
     pub(crate) fn decode(input: &[u8]) -> Result<Self> {
         let metadata = Self::decode_pages(input)?;
         metadata.validate()?;

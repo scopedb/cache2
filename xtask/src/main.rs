@@ -72,7 +72,7 @@ fn check() {
         "--all-targets",
         "--no-default-features",
     ]);
-    for feature in ["benchmarking", "fuzzing", "io-uring"] {
+    for feature in ["benchmarking", "io-uring"] {
         cargo_run([
             "check",
             "--package",
@@ -88,7 +88,6 @@ fn check() {
 
 fn lint() {
     cargo_run(["fmt", "--all", "--", "--check"]);
-    cargo_run(["fmt", "--manifest-path", "fuzz/Cargo.toml", "--", "--check"]);
     cargo_run([
         "clippy",
         "--workspace",

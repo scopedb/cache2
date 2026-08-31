@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Internal libFuzzer entry points. This module is available only with the
-//! `fuzzing` feature and is not part of the supported cache API.
+//! Property tests for persistent decoders and bounded index operations.
+
+use quickcheck::{Gen, QuickCheck};
 
 use crate::format::RecordHeader;
 use crate::index::{IndexEntry, PackedLocation};
@@ -22,10 +23,13 @@ use crate::recovery::{DataSuperblock, RecoveryImageHeader, StateRecord};
 use crate::region_index::RegionIndex;
 use crate::region_metadata::RegionMetadata;
 
+const MAX_PROPERTY_INPUT_BYTES: usize = 16 * 1024;
+const PROPERTY_CASES: u64 = 10_000;
+
 /// Exercises all persistent byte decoders and a bounded canonical index probe.
 /// No result is trusted: the invariant is that arbitrary bytes never panic,
 /// access memory out of bounds, or create an unbounded probe/allocation path.
-pub fn persistent_decoders_and_index_probe(input: &[u8]) {
+fn exercise_persistent_decoders_and_index_probe(input: &[u8]) {
     let _ = DataSuperblock::probe(input);
     let _ = RecoveryImageHeader::probe(input);
     let _ = StateRecord::decode(input);
@@ -39,10 +43,10 @@ pub fn persistent_decoders_and_index_probe(input: &[u8]) {
         let _ = IndexSlot::decode(encoded).runtime_state();
     }
 
-    fuzz_index_probe(input);
+    exercise_index_probe(input);
 }
 
-fn fuzz_index_probe(input: &[u8]) {
+fn exercise_index_probe(input: &[u8]) {
     let slot_count = 8_usize << input.first().copied().unwrap_or(0).min(4);
     let Ok(storage) = PartitionedIndexStorage::anonymous(slot_count) else {
         return;
@@ -58,9 +62,27 @@ fn fuzz_index_probe(input: &[u8]) {
         let region_id = (raw as u32) & 0x3ff;
         let offset = ((raw >> 32) as u32 & 0xffff) * crate::format::RECORD_ALIGNMENT;
         let location = PackedLocation::new(region_id, offset, 32)
-            .expect("bounded aligned fuzz location is representable");
+            .expect("bounded aligned property-test location is representable");
         let entry = IndexEntry { location };
         let _ = index.upsert(hash, entry);
         let _ = index.lookup_raw(hash);
     }
+}
+
+#[test]
+fn arbitrary_persistent_bytes_never_escape_bounds() {
+    fn property(input: Vec<u8>) -> bool {
+        exercise_persistent_decoders_and_index_probe(&input);
+        true
+    }
+
+    // QuickCheck generates lengths below the configured size, so cover the
+    // exact upper bound explicitly as well.
+    exercise_persistent_decoders_and_index_probe(&vec![u8::MAX; MAX_PROPERTY_INPUT_BYTES]);
+    QuickCheck::new()
+        .tests(PROPERTY_CASES)
+        .max_tests(PROPERTY_CASES)
+        .min_tests_passed(PROPERTY_CASES)
+        .rng(Gen::new(MAX_PROPERTY_INPUT_BYTES + 1))
+        .quickcheck(property as fn(Vec<u8>) -> bool);
 }

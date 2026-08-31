@@ -26,15 +26,14 @@ mod checksum;
 pub mod error;
 mod eviction;
 mod format;
-#[cfg(feature = "fuzzing")]
-#[doc(hidden)]
-pub mod fuzzing;
 mod hashing;
 mod index;
 mod index_storage;
 mod io_backend;
 mod io_engine;
 mod memory;
+#[cfg(test)]
+mod property_tests;
 mod record_codec;
 mod recovery;
 mod region;

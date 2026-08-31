@@ -58,7 +58,7 @@ jobs:
         run: cargo test --workspace --release --all-features
 
   safety-checks:
-    name: persistent fuzz, ASan, and TSan
+    name: ASan and TSan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,10 +66,6 @@ jobs:
         run: rustup toolchain install nightly-2026-06-26 --profile minimal --component rust-src
       - name: Select pinned Rust nightly
         run: rustup default nightly-2026-06-26
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - name: Fuzz persistent decoders and index probing
-        run: cargo fuzz run persistent_decoders -- -runs=10000 -max_len=16384
       - name: Check library with AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address

@@ -144,11 +144,11 @@ index scale:
 cargo +1.98.0 bench --locked --package benchmarks --bench recovery_scale
 ```
 
-Fuzz persistent decoders and bounded index probes:
+Run the 10,000-case persistent-decoder and bounded-index property test:
 
 ```sh
-cargo fuzz run persistent_decoders -- \
-  -runs=10000 -max_len=16384 -print_final_stats=1
+cargo test --package cache2 --lib \
+  property_tests::arbitrary_persistent_bytes_never_escape_bounds
 ```
 
 Treat any correctness failure, unexpected unbounded growth, missed required
