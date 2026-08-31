@@ -382,6 +382,12 @@ impl RegionManager {
                 < self.active_regions.len().max(1)
     }
 
+    /// Hot reinsertion remains best effort when foreground rotation has no
+    /// immediately reusable Region.
+    pub(crate) fn reclaim_can_reinsert(&self) -> bool {
+        !self.free_regions.is_empty()
+    }
+
     /// Allocates one process-local ordering version. Sequence exhaustion is a
     /// terminal condition for the current cache identity; `u64::MAX` is never
     /// issued because clean metadata reserves it as invalid.
@@ -1706,12 +1712,27 @@ mod tests {
     #[test]
     fn reclaim_always_selects_the_fifo_head() {
         let mut manager = RegionManager::from_metadata(sample_without_free_regions()).unwrap();
+        assert!(!manager.reclaim_can_reinsert());
         let reclaim = manager.begin_reclaim().unwrap().unwrap();
         assert_eq!(reclaim.region_id, 4);
         assert_eq!(
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
             [1, 5, 2]
         );
+    }
+
+    #[test]
+    fn reclaim_preserves_hot_records_while_one_free_region_remains() {
+        let mut manager = RegionManager::from_metadata(sample()).unwrap();
+        request_rotation(&mut manager, 0);
+        let rotation = manager
+            .begin_rotation(manager.plan_rotation(0).unwrap())
+            .unwrap();
+        manager.finish_rotation(rotation).unwrap();
+
+        assert_eq!(manager.free_regions().len(), 1);
+        assert!(manager.reclaim_can_reinsert());
+        assert!(manager.begin_reclaim().unwrap().is_some());
     }
 
     #[test]

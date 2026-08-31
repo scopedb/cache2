@@ -315,6 +315,10 @@ impl FileRegionCore {
         Ok(self.manager.lock()?.reclaim_needed())
     }
 
+    pub(crate) fn reclaim_can_reinsert(&self) -> io::Result<bool> {
+        Ok(self.manager.lock()?.reclaim_can_reinsert())
+    }
+
     pub(crate) fn reclaim_absolute(&self, receipt: RegionReclaimReceipt) -> io::Result<u64> {
         DATA_REGION_AREA_OFFSET
             .checked_add(

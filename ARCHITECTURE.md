@@ -190,7 +190,10 @@ The first L2 candidate access sets `seen`; a later access sets `hot`. Reclaim
 clears these volatile bits. Cold current mappings are removed. Hot current
 records may be rewritten through an existing append shard while preserving
 their logical sequence number. Reinsertion is capped at roughly one eighth of
-the reclaimed bytes; staging or budget pressure drops the remaining candidates.
+the reclaimed bytes and rotates successive source Regions across append shards.
+An empty Free queue disables reinsertion for that reclaim pass so foreground
+write capacity is restored first; staging or budget pressure drops the remaining
+candidates.
 
 The source Region stays pinned until accepted replacement writes finish.
 Conditional index replacement lets a newer foreground put or delete win over a
