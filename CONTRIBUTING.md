@@ -7,14 +7,14 @@ Cargo uses the complete workspace and the shared dependency and lint policy.
 
 The repository separates published code from development-only consumers:
 
-| Path | Purpose |
-| --- | --- |
-| `cache2/` | The publishable `cache2` crate, private implementation tests, and persistent-format fixtures. |
-| `tests-integration/` | End-to-end tests that exercise only the public `cache2` API. |
-| `benchmarks/` | Standalone benchmark targets and workload-specific harnesses. |
-| `examples/` | Runnable programs that demonstrate complete integrations. |
-| `xtask/` | The `cargo x` repository workflow entrypoint. |
-| `fuzz/` | The isolated `cargo-fuzz` workspace and persistent-decoder target. |
+| Path                 | Purpose                                                                                       |
+|----------------------|-----------------------------------------------------------------------------------------------|
+| `cache2/`            | The publishable `cache2` crate, private implementation tests, and persistent-format fixtures. |
+| `tests-integration/` | End-to-end tests that exercise only the public `cache2` API.                                  |
+| `benchmarks/`        | Standalone benchmark targets and workload-specific harnesses.                                 |
+| `examples/`          | Runnable programs that demonstrate complete integrations.                                     |
+| `xtask/`             | The `cargo x` repository workflow entrypoint.                                                 |
+| `fuzz/`              | The isolated `cargo-fuzz` workspace and persistent-decoder target.                            |
 
 Keep unit tests beside the implementation when they need private access.
 Behavior visible to callers belongs in `tests-integration/tests`. Format

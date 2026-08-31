@@ -17,11 +17,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-crc-fast.workspace = true
-log.workspace = true
-mea.workspace = true
-tokio.workspace = true
-twox-hash.workspace = true
+crc-fast = { workspace = true }
+log = { workspace = true }
+mea = { workspace = true }
+tokio = { workspace = true }
+twox-hash = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -36,7 +36,7 @@ fuzzing = []
 io-uring = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+libc = { workspace = true }
 
 [lints]
 workspace = true

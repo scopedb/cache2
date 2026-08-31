@@ -1,10 +1,9 @@
 [header]
-text = "Copyright 2026 ScopeDB\nSPDX-License-Identifier: Apache-2.0"
-keywords = ["SPDX-License-Identifier"]
+builtin = "Apache-2.0"
 
 [files]
-includes = ["**/*.rs", "**/*.sh"]
+includes = ["**/*.rs", "**/*.sh", "**/*.toml", "**/*.yml", "**/*.yaml"]
 
-[git]
-ignore = "auto"
-file_attrs = "disable"
+[props]
+copyright_owner = "tison <wander4096@gmail.com>"
+inception_year = 2025

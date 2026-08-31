@@ -15,11 +15,11 @@ cache2 = { path = "cache2", version = "0.2.1" }
 
 # Crates.io dependencies
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
-io-uring = "0.7.14"
-libc = "0.2.189"
+io-uring = { version = "0.7.14" }
+libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }
 logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
-mea = "0.6.5"
+mea = { version = "0.6.7" }
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 twox-hash = { version = "2.1.4", default-features = false, features = ["std", "xxhash3_64"] }
 

@@ -12,12 +12,12 @@ io-uring = ["cache2/io-uring"]
 
 [dev-dependencies]
 cache2 = { workspace = true, features = ["benchmarking"] }
-log.workspace = true
-logforth.workspace = true
+log = { workspace = true }
+logforth = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-libc.workspace = true
+libc = { workspace = true }
 
 [[bench]]
 name = "cache"

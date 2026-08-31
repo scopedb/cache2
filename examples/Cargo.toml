@@ -7,9 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cache2.workspace = true
-log.workspace = true
-logforth.workspace = true
+cache2 = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[example]]
