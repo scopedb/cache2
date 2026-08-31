@@ -25,7 +25,7 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 # Workspace crates
-cache2 = { path = "cache2", version = "0.2.1" }
+cache2 = { path = "cache2", version = "0.2.2" }
 
 # Crates.io dependencies
 cargo_metadata = { version = "0.23.1" }

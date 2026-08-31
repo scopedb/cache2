@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v0.2.2 (2026-09-01)
+
+This release keeps the version 1 on-disk format and requires no disk
+migration. It contains no source-breaking public API changes.
+
+### Performance
+
+- Reclaim workers rotate reinsertion across disjoint append-shard subsets,
+  avoiding sustained concentration on a single shard.
+- When no Free Region remains, reclaim skips hot-record reinsertion for that
+  pass and restores foreground write capacity first. In the saturated soak
+  workload, accepted writes increased by 20.2%, while the hit ratio remained
+  effectively flat and runtime errors remained at zero.
+
+### Testing and Tooling
+
+- The repository now uses a Cargo workspace that separates the publishable
+  library from integration tests, benchmarks, examples, and development tools.
+- Bounded property tests now cover persistent decoders, record encoding,
+  fixed-map operations, and Region-index operations across 10,000 generated
+  inputs per property.
+- Integration-test fixtures were consolidated and fragile timing assertions
+  were removed.
+
 ## v0.2.1 (2026-08-30)
 
 This release keeps the version 1 on-disk format and requires no disk
