@@ -28,6 +28,8 @@ rust-version = "1.98"
 cache2 = { path = "cache2", version = "0.2.1" }
 
 # Crates.io dependencies
+cargo_metadata = { version = "0.23.1" }
+clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }

@@ -13,150 +13,225 @@
 // limitations under the License.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::process::Command;
+use std::process::Command as StdCommand;
 
-const USAGE: &str = "\
-Repository workflows for C²
+use cargo_metadata::{Metadata, MetadataCommand};
+use clap::{Parser, Subcommand};
 
-Usage: cargo x <COMMAND> [ARGS]
-
-Commands:
-  bench [ARGS]  Run benchmarks, forwarding ARGS to `cargo bench`
-  check         Check the workspace and cache2 feature matrix
-  lint          Run formatting, lint, documentation, package, and policy checks
-  test          Run workspace tests and extended library tests
-";
+const PACKAGE_NAME: &str = "cache2";
 
 fn main() {
-    let mut args = env::args_os().skip(1);
-    let Some(command) = args.next() else {
-        print!("{USAGE}");
-        return;
-    };
-    let remaining = args.collect::<Vec<_>>();
+    Command::parse().run();
+}
 
-    match command.to_str() {
-        Some("bench") => bench(&remaining),
-        Some("check") => {
-            require_no_args("check", &remaining);
-            check();
+#[derive(Parser)]
+#[command(
+    name = "cargo x",
+    bin_name = "cargo x",
+    about = "Repository workflows for C²"
+)]
+struct Command {
+    #[command(subcommand)]
+    sub: SubCommand,
+}
+
+impl Command {
+    fn run(self) {
+        match self.sub {
+            SubCommand::Bench(command) => command.run(),
+            SubCommand::Check(command) => command.run(),
+            SubCommand::Lint(command) => command.run(),
+            SubCommand::Test(command) => command.run(),
         }
-        Some("lint") => {
-            require_no_args("lint", &remaining);
-            lint();
-        }
-        Some("test") => {
-            require_no_args("test", &remaining);
-            test();
-        }
-        Some("help" | "-h" | "--help") => print!("{USAGE}"),
-        Some(command) => fail(&format!("unknown command `{command}`\n\n{USAGE}")),
-        None => fail("command must be valid UTF-8"),
     }
 }
 
-fn bench(args: &[OsString]) {
-    let mut command = cargo();
-    command.args(["bench", "--package", "benchmarks"]);
-    command.args(args);
-    run(command);
+#[derive(Subcommand)]
+enum SubCommand {
+    #[command(about = "Run benchmarks, forwarding arguments to Cargo and the harness")]
+    Bench(CommandBench),
+    #[command(about = "Check the workspace and cache2 feature matrix")]
+    Check(CommandCheck),
+    #[command(about = "Run formatting, lint, documentation, package, and policy checks")]
+    Lint(CommandLint),
+    #[command(about = "Run workspace tests and extended library tests")]
+    Test(CommandTest),
 }
 
-fn check() {
-    cargo_run([
-        "check",
-        "--package",
-        "cache2",
-        "--all-targets",
-        "--no-default-features",
-    ]);
-    for feature in ["benchmarking", "io-uring"] {
+#[derive(Parser)]
+struct CommandBench {
+    #[arg(
+        value_name = "CARGO_ARGS",
+        allow_hyphen_values = true,
+        value_terminator = "--",
+        help = "Arguments passed to `cargo bench`"
+    )]
+    cargo_args: Vec<OsString>,
+    #[arg(
+        value_name = "HARNESS_ARGS",
+        allow_hyphen_values = true,
+        help = "Arguments after `--` passed to the benchmark harness"
+    )]
+    harness_args: Vec<OsString>,
+}
+
+impl CommandBench {
+    fn run(self) {
+        run(self.command());
+    }
+
+    fn command(self) -> StdCommand {
+        let mut command = cargo();
+        command.args(["bench", "--package", "benchmarks"]);
+        command.args(self.cargo_args);
+        if !self.harness_args.is_empty() {
+            command.arg("--").args(self.harness_args);
+        }
+        command
+    }
+}
+
+#[derive(Parser)]
+struct CommandCheck;
+
+impl CommandCheck {
+    fn run(self) {
         cargo_run([
             "check",
             "--package",
-            "cache2",
-            "--lib",
+            PACKAGE_NAME,
+            "--all-targets",
             "--no-default-features",
-            "--features",
-            feature,
+        ]);
+        for feature in cache2_features() {
+            let mut command = cargo();
+            command.args([
+                "check",
+                "--package",
+                PACKAGE_NAME,
+                "--lib",
+                "--no-default-features",
+                "--features",
+            ]);
+            command.arg(feature);
+            run(command);
+        }
+        cargo_run(["check", "--workspace", "--all-targets", "--all-features"]);
+    }
+}
+
+fn cache2_features() -> Vec<String> {
+    let manifest = Path::new(env!("CARGO_WORKSPACE_DIR")).join("Cargo.toml");
+    let Metadata { packages, .. } = MetadataCommand::new()
+        .manifest_path(manifest)
+        .no_deps()
+        .exec()
+        .expect("failed to get cargo metadata");
+    let package = packages
+        .into_iter()
+        .find(|package| package.name == PACKAGE_NAME)
+        .expect("failed to find cache2 package");
+
+    let mut features = package
+        .features
+        .into_keys()
+        .filter(|feature| feature != "default")
+        .collect::<Vec<_>>();
+    features.sort();
+    features
+}
+
+#[derive(Parser)]
+struct CommandLint;
+
+impl CommandLint {
+    fn run(self) {
+        cargo_run(["fmt", "--all", "--", "--check"]);
+        cargo_run([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ]);
+
+        let mut docs = cargo();
+        docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs");
+        docs.args(["doc", "--package", PACKAGE_NAME, "--no-deps", "--locked"]);
+        run(docs);
+
+        cargo_run([
+            "package",
+            "--package",
+            PACKAGE_NAME,
+            "--locked",
+            "--allow-dirty",
+        ]);
+        command_run("hawkeye", ["check"]);
+        cargo_run([
+            "deny",
+            "--all-features",
+            "check",
+            "advisories",
+            "licenses",
+            "bans",
+            "sources",
         ]);
     }
-    cargo_run(["check", "--workspace", "--all-targets", "--all-features"]);
 }
 
-fn lint() {
-    cargo_run(["fmt", "--all", "--", "--check"]);
-    cargo_run([
-        "clippy",
-        "--workspace",
-        "--all-targets",
-        "--all-features",
-        "--",
-        "-D",
-        "warnings",
-    ]);
+#[derive(Parser)]
+struct CommandTest;
 
-    let mut docs = cargo();
-    docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs");
-    docs.args(["doc", "--package", "cache2", "--no-deps", "--locked"]);
-    run(docs);
-
-    cargo_run([
-        "package",
-        "--package",
-        "cache2",
-        "--locked",
-        "--allow-dirty",
-    ]);
-    command_run("hawkeye", ["check"]);
-    cargo_run([
-        "deny",
-        "--all-features",
-        "check",
-        "advisories",
-        "licenses",
-        "bans",
-        "sources",
-    ]);
+impl CommandTest {
+    fn run(self) {
+        cargo_run(["test", "--workspace", "--all-features"]);
+        cargo_run([
+            "test",
+            "--package",
+            PACKAGE_NAME,
+            "--lib",
+            "--all-features",
+            "--",
+            "--ignored",
+        ]);
+    }
 }
 
-fn test() {
-    cargo_run(["test", "--workspace", "--all-features"]);
-    cargo_run([
-        "test",
-        "--package",
-        "cache2",
-        "--lib",
-        "--all-features",
-        "--",
-        "--ignored",
-    ]);
-}
-
-fn cargo() -> Command {
+fn cargo() -> StdCommand {
     let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(executable);
+    let mut command = StdCommand::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command
 }
 
-fn cargo_run<const N: usize>(args: [&str; N]) {
+fn cargo_run<I, S>(args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = cargo();
     command.args(args);
     run(command);
 }
 
-fn command_run<const N: usize>(executable: &str, args: [&str; N]) {
-    let mut command = Command::new(executable);
+fn command_run<I, S>(executable: &str, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = StdCommand::new(executable);
     command
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")))
         .args(args);
     run(command);
 }
 
-fn run(mut command: Command) {
+fn run(mut command: StdCommand) {
     println!("{command:?}");
     match command.status() {
         Ok(status) if status.success() => {}
@@ -165,13 +240,49 @@ fn run(mut command: Command) {
     }
 }
 
-fn require_no_args(command: &str, args: &[OsString]) {
-    if !args.is_empty() {
-        fail(&format!("`cargo x {command}` does not accept arguments"));
-    }
-}
-
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_keeps_cargo_and_harness_arguments_separate() {
+        let command = Command::try_parse_from([
+            "cargo x",
+            "bench",
+            "--bench",
+            "cache",
+            "--",
+            "--sample-size",
+            "20",
+        ])
+        .unwrap();
+        let SubCommand::Bench(command) = command.sub else {
+            panic!("expected bench command");
+        };
+
+        let args = command
+            .command()
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "bench",
+                "--package",
+                "benchmarks",
+                "--bench",
+                "cache",
+                "--",
+                "--sample-size",
+                "20",
+            ]
+            .map(OsString::from)
+        );
+    }
 }

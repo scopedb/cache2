@@ -20,5 +20,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+cargo_metadata = { workspace = true }
+clap = { workspace = true }
+
 [lints]
 workspace = true

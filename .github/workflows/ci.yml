@@ -22,22 +22,21 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.98.0
+
 jobs:
   quality:
     name: format and clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust 1.98
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
-      - name: Select Rust 1.98
-        run: rustup default 1.98.0
-      - name: Install Hawkeye
-        uses: taiki-e/install-action@v2
+      - name: Install lint tools
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
-          tool: hawkeye@7.0.0
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
+          tool: hawkeye@7.0.0,cargo-deny@0.20.2
       - name: Run repository quality checks
         run: cargo x lint
 
@@ -45,11 +44,9 @@ jobs:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust 1.98
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Select Rust 1.98
-        run: rustup default 1.98.0
       - name: Check workspace and feature matrix
         run: cargo x check
       - name: Run workspace and extended tests
@@ -60,12 +57,12 @@ jobs:
   safety-checks:
     name: ASan and TSan
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-06-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust nightly
         run: rustup toolchain install nightly-2026-06-26 --profile minimal --component rust-src
-      - name: Select pinned Rust nightly
-        run: rustup default nightly-2026-06-26
       - name: Check library with AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
