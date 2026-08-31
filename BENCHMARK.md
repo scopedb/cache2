@@ -18,14 +18,14 @@ ordinal, so a wrong-key result fails the run. Harness retries of
 The main controls are grouped below. See `benchmarks/cache/main.rs` for
 defaults and validation rules.
 
-| Purpose | Variables |
-| --- | --- |
-| Data shape | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES` |
-| Capacity | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB` |
-| Concurrency | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
-| I/O path | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR` |
-| Cache policy | `CACHE_BENCH_L1_EVICTION=clock|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL` |
-| Gates | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS` |
+| Purpose      | Variables                                                                                                                                                                     |
+|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Data shape   | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES`                                                                                              |
+| Capacity     | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                  |
+| Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
+| I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                             |
+| Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                          |
+| Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
 
 For device measurements, use a data set larger than host RAM and no larger than
 half of L2 capacity. Run baseline and candidate in alternating order at least
@@ -40,11 +40,11 @@ cargo +1.98.0 bench --locked --package benchmarks --bench mixed_workloads
 
 This harness runs three deterministic request profiles:
 
-| Scenario | Request semantics | Scaled default |
-| --- | --- | --- |
-| `mixed` | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2 |
-| `reinsertion` | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2 |
-| `negative-lookup` | Every lookup uses a new key that cannot already exist | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
+| Scenario          | Request semantics                                                                  | Scaled default                                                   |
+|-------------------|------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| `mixed`           | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes         | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2             |
+| `reinsertion`     | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2             |
+| `negative-lookup` | Every lookup uses a new key that cannot already exist                              | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
 
 Operation counts are per thread. The scaled `mixed` and `reinsertion` defaults
 use total-operation-to-key ratios of 3.2 and 40. Select one or several scenarios
@@ -54,13 +54,13 @@ comma-separated list; the default is `all`. The scaled Region size is 4 MiB for
 
 Use the following controls to scale a run:
 
-| Purpose | Variables |
-| --- | --- |
-| Request stream | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED` |
-| Capacity | `CACHE_WORKLOAD_L1_MIB`, `CACHE_WORKLOAD_L2_MIB`, `CACHE_WORKLOAD_REGION_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB` |
-| Concurrency | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_READ_IO_WORKERS`, `CACHE_WORKLOAD_WRITE_IO_WORKERS`, `CACHE_WORKLOAD_RECLAIM_WORKERS` |
-| I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR` |
-| Measurement | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` |
+| Purpose        | Variables                                                                                                                             |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------|
+| Request stream | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED`                               |
+| Capacity       | `CACHE_WORKLOAD_L1_MIB`, `CACHE_WORKLOAD_L2_MIB`, `CACHE_WORKLOAD_REGION_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB`              |
+| Concurrency    | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_READ_IO_WORKERS`, `CACHE_WORKLOAD_WRITE_IO_WORKERS`, `CACHE_WORKLOAD_RECLAIM_WORKERS` |
+| I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                              |
+| Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL`                                                                                              |
 
 The harness uses a fixed seed, truncated-normal popularity, and
 piecewise-constant key and value sizes. Keys are at least eight bytes so their
