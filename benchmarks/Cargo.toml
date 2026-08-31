@@ -1,0 +1,48 @@
+[package]
+name = "benchmarks"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+io-uring = ["cache2/io-uring"]
+
+[dev-dependencies]
+cache2 = { workspace = true, features = ["benchmarking"] }
+log.workspace = true
+logforth.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[[bench]]
+name = "cache"
+path = "cache/main.rs"
+harness = false
+
+[[bench]]
+name = "cache_soak"
+path = "cache_soak/main.rs"
+harness = false
+
+[[bench]]
+name = "mixed_workloads"
+path = "mixed_workloads/main.rs"
+harness = false
+
+[[bench]]
+name = "recovery_scale"
+path = "recovery_scale/main.rs"
+harness = false
+
+[[bench]]
+name = "region_index_turnover"
+path = "region_index_turnover/main.rs"
+harness = false
+
+[lints]
+workspace = true

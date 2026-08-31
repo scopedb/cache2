@@ -310,4 +310,4 @@ passes address, key, and checksum validation. Structural or device faults move
 the cache to miss-only when reads can fail open safely; mutations still report
 errors. Public failures carry an `ErrorKind`, `ErrorOperation`, and the original
 `std::io::Error`; the complete policy is documented in [Error
-handling](ERRORS.md).
+handling](cache2/ERRORS.md).

@@ -1,0 +1,25 @@
+[package]
+name = "tests-integration"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+io-uring = ["cache2/io-uring"]
+
+[dev-dependencies]
+cache2.workspace = true
+crc-fast.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lib]
+bench = false
+doc = false
+doctest = false
+test = false
+
+[lints]
+workspace = true

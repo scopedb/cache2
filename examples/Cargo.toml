@@ -1,0 +1,20 @@
+[package]
+name = "examples"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cache2.workspace = true
+log.workspace = true
+logforth.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "logforth"
+path = "src/logforth.rs"
+
+[lints]
+workspace = true

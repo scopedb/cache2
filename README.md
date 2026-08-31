@@ -52,7 +52,7 @@ bypass, and bounded overload are normal cache outcomes.
 
 Public failures are `cache2::Error` values with an actionable `ErrorKind`, the
 failed `ErrorOperation`, and the original `std::io::Error` source. See
-[Error handling](ERRORS.md) for the classification table, retry policy,
+[Error handling](cache2/ERRORS.md) for the classification table, retry policy,
 diagnostic fields, and migration from the former `io::Result` API.
 
 ### Operations
@@ -169,7 +169,7 @@ under `cache2::*`. Applications own the global logger. The included example
 uses logforth:
 
 ```sh
-RUST_LOG=cache2=info cargo run --example logforth -- /tmp/cache2.data
+RUST_LOG=cache2=info cargo run --package examples --example logforth -- /tmp/cache2.data
 ```
 
 `cache_opened` reports the index backing, mapping extent, validation mode, and
@@ -182,10 +182,14 @@ clean image was rejected or why private mapping fell back to a cold start.
 C² requires Rust 1.98.0.
 
 ```sh
-cargo +1.98.0 fmt --all -- --check
-cargo +1.98.0 test --all-features
-cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
+cargo x check
+cargo x test
+cargo x lint
 ```
+
+The root workspace keeps the publishable crate, integration tests, benchmarks,
+examples, and repository tooling in separate members. See
+[Contributing](CONTRIBUTING.md) for the layout and direct Cargo commands.
 
 ## Further reading
 
@@ -193,10 +197,12 @@ cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
   resource tradeoffs, goal-oriented profiles, and diagnostic tuning.
 - [Architecture](ARCHITECTURE.md) — data structures, request paths, reclaim,
   and recovery.
-- [Error handling](ERRORS.md) — structured classifications, operation context,
+- [Error handling](cache2/ERRORS.md) — structured classifications, operation context,
   overload policy, and standard I/O interoperability.
 - [Validation](BENCHMARK.md) — benchmarks, mixed turnover, and Linux NVMe
   qualification.
+- [Contributing](CONTRIBUTING.md) — workspace layout and development
+  workflows.
 
 ## License
 

@@ -8,7 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-cache2 = { path = "..", features = ["fuzzing"] }
+cache2 = { path = "../cache2", features = ["fuzzing"] }
 libfuzzer-sys = "0.4"
 
 [[bin]]

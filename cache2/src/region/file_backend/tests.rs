@@ -215,7 +215,7 @@ fn data_path_resources() -> ResourceController {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "extended recovery qualification; run with `cargo test --lib -- --ignored`"]
+#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib -- --ignored`"]
 fn external_process_kill_recovery_contract() {
     const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
     const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
@@ -1426,7 +1426,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
 }
 
 #[test]
-#[ignore = "extended recovery qualification; run with `cargo test --lib -- --ignored`"]
+#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib -- --ignored`"]
 fn every_prepublication_failure_leaves_no_selectable_clean_state() {
     let cases = [
         (

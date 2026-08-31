@@ -1,0 +1,42 @@
+[package]
+name = "cache2"
+version = "0.2.1"
+description = "Performance-first bounded RAM and NVMe hybrid cache"
+documentation = "https://docs.rs/cache2"
+keywords = ["cache", "nvme", "storage"]
+categories = ["caching", "data-structures"]
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+crc-fast.workspace = true
+log.workspace = true
+mea.workspace = true
+tokio.workspace = true
+twox-hash.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+benchmarking = []
+io-uring = ["dep:io-uring"]
+fuzzing = []
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

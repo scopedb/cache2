@@ -7,7 +7,7 @@ does not publish machine-specific historical numbers.
 ## Request-path benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --bench cache
+cargo +1.98.0 bench --locked --package benchmarks --bench cache
 ```
 
 The benchmark measures accepted puts plus drain, resident L1 reads, warm close,
@@ -15,8 +15,8 @@ and successful L2 reads with best-effort promotion. Values encode their key
 ordinal, so a wrong-key result fails the run. Harness retries of
 `ErrorKind::Overloaded` are workload setup, not library behavior.
 
-The main controls are grouped below. See `benches/cache.rs` for defaults and
-validation rules.
+The main controls are grouped below. See `benchmarks/cache/main.rs` for
+defaults and validation rules.
 
 | Purpose | Variables |
 | --- | --- |
@@ -35,7 +35,7 @@ replace correctness, overload, memory, or latency checks.
 ## Mixed workload benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --bench mixed_workloads
+cargo +1.98.0 bench --locked --package benchmarks --bench mixed_workloads
 ```
 
 This harness runs three deterministic request profiles:
@@ -78,7 +78,7 @@ counters.
 ## Mixed turnover
 
 ```sh
-cargo +1.98.0 bench --locked --bench cache_soak
+cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak
 ```
 
 The default short run mixes reads, writes, deletes, Region rotation, reclaim,
@@ -133,7 +133,7 @@ machine before running the script.
 Exercise a production-load-factor index without storage I/O:
 
 ```sh
-cargo +1.98.0 bench --locked --features benchmarking \
+cargo +1.98.0 bench --locked --package benchmarks \
   --bench region_index_turnover
 ```
 
@@ -141,7 +141,7 @@ Measure cold open, warm image publication, mmap recovery, and RSS at a chosen
 index scale:
 
 ```sh
-cargo +1.98.0 bench --locked --bench recovery_scale
+cargo +1.98.0 bench --locked --package benchmarks --bench recovery_scale
 ```
 
 Fuzz persistent decoders and bounded index probes:

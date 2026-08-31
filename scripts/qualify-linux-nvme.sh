@@ -317,13 +317,13 @@ run_benchmark_profile() {
     CACHE_BENCH_IO_MODE="$mode" \
     CACHE_BENCH_READ_IO_WORKERS="$read_workers" \
     CACHE_BENCH_WRITE_IO_WORKERS="$write_workers" \
-      cargo +1.98.0 bench --locked --bench cache --quiet 2>&1 | tee -a "$log"
+      cargo +1.98.0 bench --locked --package benchmarks --bench cache --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
 }
 
 echo "building release benchmark targets"
-cargo +1.98.0 build --locked --release --benches
+cargo +1.98.0 build --locked --release --package benchmarks --benches
 
 run_benchmark_profile posix-buffered posix buffered 4 4 "$benchmark_runs"
 run_benchmark_profile posix-direct posix direct 4 4 "$benchmark_runs"
@@ -342,7 +342,7 @@ CACHE_SOAK_FINAL_WARM_VERIFY=true \
 CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=buffered \
-  cargo +1.98.0 bench --locked --bench cache_soak --quiet 2>&1 \
+  cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak --quiet 2>&1 \
   | tee "$report_directory/soak-posix-buffered.log"
 
 if ! grep -q '^warm_verification .* errors=0$' \
