@@ -1434,12 +1434,13 @@ fn start_running(
             }
         }
     }
+    let reclaim_worker_count = config.reclaim_workers;
     for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
         let reclaim_shared = Arc::clone(&shared);
         match std::thread::Builder::new()
             .name(format!("cache2-reclaim-{worker_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
-            .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id))
+            .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id, reclaim_worker_count))
         {
             Ok(worker) => reclaim_workers.push(worker),
             Err(error) => {
@@ -1546,10 +1547,45 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     }
 }
 
-fn reclaim_worker(shared: Arc<RunningShared>, buffer: BufferLease, worker_id: usize) {
+struct ReinsertShardCursor {
+    first: usize,
+    stride: usize,
+    shard_count: usize,
+    next: usize,
+}
+
+impl ReinsertShardCursor {
+    fn new(worker_id: usize, worker_count: usize, shard_count: usize) -> Self {
+        debug_assert!(worker_count != 0);
+        debug_assert!(worker_id < worker_count);
+        debug_assert!(worker_count <= shard_count);
+        Self {
+            first: worker_id,
+            stride: worker_count,
+            shard_count,
+            next: worker_id,
+        }
+    }
+
+    fn take(&mut self) -> usize {
+        let shard = self.next;
+        self.next = shard
+            .checked_add(self.stride)
+            .filter(|next| *next < self.shard_count)
+            .unwrap_or(self.first);
+        shard
+    }
+}
+
+fn reclaim_worker(
+    shared: Arc<RunningShared>,
+    buffer: BufferLease,
+    worker_id: usize,
+    worker_count: usize,
+) {
     let mut buffer = Some(buffer);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        reclaim_worker_result(&shared, &mut buffer, worker_id)
+        reclaim_worker_result(&shared, &mut buffer, worker_id, worker_count)
     }));
     let error = match result {
         Ok(Ok(())) => return,
@@ -1580,6 +1616,7 @@ fn reclaim_worker_result(
     shared: &RunningShared,
     buffer: &mut Option<BufferLease>,
     worker_id: usize,
+    worker_count: usize,
 ) -> io::Result<()> {
     let engine_index = if shared.reclaim_engines.len() == 1 {
         0
@@ -1593,6 +1630,8 @@ fn reclaim_worker_result(
         )
     })?;
     let mut observed_generation = 0_u64;
+    let mut reinsert_shards =
+        ReinsertShardCursor::new(worker_id, worker_count, shared.shards.len());
     while shared.reclaim_control.wait(&mut observed_generation)? {
         loop {
             // Finish an already-started victim, but do not begin another once
@@ -1657,8 +1696,15 @@ fn reclaim_worker_result(
                         "reclaim buffer is not initialized",
                     )
                 })?;
-            let reinsert_shard = worker_id % shared.shards.len();
-            let reinsert_operation = shared.operations.try_enter();
+            // Keep one completion boundary per source Region while each
+            // reclaimer rotates through a disjoint subset of append shards.
+            let reinsert_shard = reinsert_shards.take();
+            let preserve_hot = shared.core.reclaim_can_reinsert()?;
+            let reinsert_operation = if preserve_hot {
+                shared.operations.try_enter()
+            } else {
+                None
+            };
             let mut accepting_reinserts = reinsert_operation.is_some();
             let mut staged_reinsert = false;
             let stats = shared.core.scan_reclaim(receipt, bytes, |record| {
@@ -1693,6 +1739,8 @@ fn reclaim_worker_result(
                 event = "cache_region_reclaimed",
                 worker_id,
                 region_id = receipt.region_id,
+                reinsert_shard,
+                preserve_hot,
                 bytes = stats.bytes_read,
                 records_scanned = stats.records_scanned,
                 records_removed = stats.records_removed,
@@ -2374,5 +2422,23 @@ mod tests {
                 + IO_QUEUE_ENTRY_RESERVATION_BYTES
                 + RUNTIME_CONTROL_RESERVATION_BYTES
         );
+    }
+
+    #[test]
+    fn reclaim_workers_rotate_over_disjoint_append_shards() {
+        for shard_count in 1..=8 {
+            for worker_count in 1..=shard_count {
+                let mut owners = vec![None; shard_count];
+                for worker_id in 0..worker_count {
+                    let mut cursor = ReinsertShardCursor::new(worker_id, worker_count, shard_count);
+                    for shard in (worker_id..shard_count).step_by(worker_count) {
+                        assert_eq!(cursor.take(), shard);
+                        assert_eq!(owners[shard].replace(worker_id), None);
+                    }
+                    assert_eq!(cursor.take(), worker_id);
+                }
+                assert!(owners.iter().all(Option::is_some));
+            }
+        }
     }
 }
