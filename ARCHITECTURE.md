@@ -81,9 +81,9 @@ an L1 copy.
 
 The eviction policies share those bounds but spend metadata differently:
 
-| Policy | Design |
-| --- | --- |
-| CLOCK | The default uses one visited bit and a bounded shard-local hand. It keeps policy metadata and hit work small. |
+| Policy  | Design                                                                                                                                                                                                                                                                                                              |
+|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| CLOCK   | The default uses one visited bit and a bounded shard-local hand. It keeps policy metadata and hit work small.                                                                                                                                                                                                       |
 | S3-FIFO | Uses small and main resident FIFOs, a metadata-only ghost FIFO, and a saturating two-bit frequency. Hits update frequency without moving queue nodes; repeated small-queue entries and ghost hits can enter the main queue. It spends additional fixed metadata to distinguish reused entries from one-hit traffic. |
 
 Evicted values may remain alive while a caller owns them. Admission never waits
@@ -167,7 +167,7 @@ writes and L2 publication, but does not issue the recovery durability syncs.
 5. Allocate one managed, alignment-rounded buffer and submit one record read.
 6. Validate the planned address, Region generation, size class, hash, full key,
    lengths, sequence structure, and checksums.
-7. Attempt bounded L1 promotion. Otherwise return a Region-backed value that
+7. Attempt bounded L1 promotion. Otherwise, return a Region-backed value that
    owns the read allocation until dropped.
 
 With read waiting enabled, a full wait queue, unavailable buffer, or expired
@@ -227,11 +227,11 @@ identity, and descriptor count stay independent of device topology.
 
 C² owns three distinct files in one directory:
 
-| File | Authority |
-| --- | --- |
-| Data | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and static-configuration fingerprint. It has no session-state bit. |
-| State | Two checksummed 4 KiB slots. The newest valid generation is the sole authority for `EMPTY`, `RUNNING`, or `CLEAN` and binds an exact data identity; `CLEAN` additionally binds an exact image identity, generation, and length. |
-| Clean image | An immutable 4 KiB header followed by checksummed L2 index pages and mandatory Region metadata. It is produced only by a successful warm close. |
+| File        | Authority                                                                                                                                                                                                                       |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Data        | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and static-configuration fingerprint. It has no session-state bit.             |
+| State       | Two checksummed 4 KiB slots. The newest valid generation is the sole authority for `EMPTY`, `RUNNING`, or `CLEAN` and binds an exact data identity; `CLEAN` additionally binds an exact image identity, generation, and length. |
+| Clean image | An immutable 4 KiB header followed by checksummed L2 index pages and mandatory Region metadata. It is produced only by a successful warm close.                                                                                 |
 
 The two state slots tolerate one torn page. Before serving requests, open writes
 fresh `RUNNING` generations into both slots and syncs them with one barrier.
@@ -251,14 +251,14 @@ Open first acquires exclusive ownership of the data and state files, then
 inspects the data superblock and the two state slots without scanning Region
 extents or the complete index:
 
-| Latest usable state | Open result |
-| --- | --- |
-| Fresh or `EMPTY` | Construct an empty index and Region topology. |
+| Latest usable state                         | Open result                                                                                  |
+|---------------------------------------------|----------------------------------------------------------------------------------------------|
+| Fresh or `EMPTY`                            | Construct an empty index and Region topology.                                                |
 | `RUNNING`, missing state, or rejected state | Discard prior cache contents and construct an empty runtime without scanning Region records. |
-| Matching `CLEAN` | Validate the image header and complete Region metadata, then attempt a warm index mapping. |
+| Matching `CLEAN`                            | Validate the image header and complete Region metadata, then attempt a warm index mapping.   |
 
 Before workers start or the cache becomes observable, every successful open
-publishes and syncs `RUNNING`. Consequently a crash, process kill, drop, or fast
+publishes and syncs `RUNNING`. Consequently, a crash, process kill, drop, or fast
 close leaves an unclean state whose next open is cold.
 
 For a warm open, the state, data superblock, image header, image length, index
@@ -295,12 +295,12 @@ nor writes an image or `CLEAN` state.
 
 The ordering makes crash outcomes unambiguous:
 
-| Interruption point | Next open |
-| --- | --- |
-| During normal operation, drop, or fast close | `RUNNING` remains authoritative; start cold. |
-| Before the temporary image is installed | Ignore/remove the temporary image; start cold. |
-| After image rename but before `CLEAN` sync | The image is not named by state and is ignored; start cold. |
-| After matching `CLEAN` sync | Warm recovery is eligible, subject to full identity and validation checks. |
+| Interruption point                           | Next open                                                                  |
+|----------------------------------------------|----------------------------------------------------------------------------|
+| During normal operation, drop, or fast close | `RUNNING` remains authoritative; start cold.                               |
+| Before the temporary image is installed      | Ignore/remove the temporary image; start cold.                             |
+| After image rename but before `CLEAN` sync   | The image is not named by state and is ignored; start cold.                |
+| After matching `CLEAN` sync                  | Warm recovery is eligible, subject to full identity and validation checks. |
 
 There is no in-place repair or Region scan after rejected recovery. Cache data
 is disposable, so cold fallback is safer and keeps startup work bounded.
@@ -310,4 +310,4 @@ passes address, key, and checksum validation. Structural or device faults move
 the cache to miss-only when reads can fail open safely; mutations still report
 errors. Public failures carry an `ErrorKind`, `ErrorOperation`, and the original
 `std::io::Error`; the complete policy is documented in [Error
-handling](ERRORS.md).
+handling](cache2/ERRORS.md).

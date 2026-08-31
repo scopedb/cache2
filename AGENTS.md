@@ -1,5 +1,12 @@
 # C² Engineering Constraints
 
+## Repository workflow
+
+Before planning or modifying this repository, read `CONTRIBUTING.md` and treat
+its workspace layout and validation guidance as repository requirements. Use
+`cargo x` as the source of truth for routine check, test, lint, and benchmark
+workflows.
+
 ## Priorities
 
 Use this order when correctness and performance goals compete:

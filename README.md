@@ -52,18 +52,18 @@ bypass, and bounded overload are normal cache outcomes.
 
 Public failures are `cache2::Error` values with an actionable `ErrorKind`, the
 failed `ErrorOperation`, and the original `std::io::Error` source. See
-[Error handling](ERRORS.md) for the classification table, retry policy,
+[Error handling](cache2/ERRORS.md) for the classification table, retry policy,
 diagnostic fields, and migration from the former `io::Result` API.
 
 ### Operations
 
-| Operation | Behavior |
-| --- | --- |
-| `put` | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission. |
-| `put_l2` | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes. |
-| `get` | Checks L1, then performs at most one bounded, locally validated L2 record read. |
-| `delete` | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work. |
-| `drain` | Waits for accepted Region writes and L2 index publication. |
+| Operation | Behavior                                                                                                        |
+|-----------|-----------------------------------------------------------------------------------------------------------------|
+| `put`     | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission.      |
+| `put_l2`  | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes. |
+| `get`     | Checks L1, then performs at most one bounded, locally validated L2 record read.                                 |
+| `delete`  | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work.                  |
+| `drain`   | Waits for accepted Region writes and L2 index publication.                                                      |
 
 ### Lifecycle
 
@@ -90,15 +90,15 @@ complete geometry and memory plan before creating cache files.
 
 ### Runtime tuning
 
-| Area | Controls | Default and behavior |
-| --- | --- | --- |
-| L1 | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy` | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| Reads | `with_read_io_workers`, `with_read_io_wait_timeout` | Four workers and immediate admission. |
-| Writes | `with_write_io_workers`, `with_append_shards`, `with_write_flush_threshold_bytes` | Four workers, four append shards, 4 MiB flush threshold. |
-| Reclaim | `with_reclaim_workers` | One worker with its own Region-sized scan buffer and read lane. |
-| Memory | `with_managed_memory_limit_bytes` | 1 GiB across cache-managed allocations. |
-| I/O | `with_io_engine`, `with_io_mode` | Buffered POSIX I/O. |
-| Metrics | `with_statistics` | Health and resource gauges enabled; cumulative activity counters opt in. |
+| Area    | Controls                                                                          | Default and behavior                                                                        |
+|---------|-----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| L1      | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy`             | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
+| Reads   | `with_read_io_workers`, `with_read_io_wait_timeout`                               | Four workers and immediate admission.                                                       |
+| Writes  | `with_write_io_workers`, `with_append_shards`, `with_write_flush_threshold_bytes` | Four workers, four append shards, 4 MiB flush threshold.                                    |
+| Reclaim | `with_reclaim_workers`                                                            | One worker with its own Region-sized scan buffer and read lane.                             |
+| Memory  | `with_managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                     |
+| I/O     | `with_io_engine`, `with_io_mode`                                                  | Buffered POSIX I/O.                                                                         |
+| Metrics | `with_statistics`                                                                 | Health and resource gauges enabled; cumulative activity counters opt in.                    |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm
 open. Growth uses available Free Regions; when there are not enough, the
@@ -169,7 +169,7 @@ under `cache2::*`. Applications own the global logger. The included example
 uses logforth:
 
 ```sh
-RUST_LOG=cache2=info cargo run --example logforth -- /tmp/cache2.data
+RUST_LOG=cache2=info cargo run --package examples --example logforth -- /tmp/cache2.data
 ```
 
 `cache_opened` reports the index backing, mapping extent, validation mode, and
@@ -182,10 +182,14 @@ clean image was rejected or why private mapping fell back to a cold start.
 C² requires Rust 1.98.0.
 
 ```sh
-cargo +1.98.0 fmt --all -- --check
-cargo +1.98.0 test --all-features
-cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
+cargo x check
+cargo x test
+cargo x lint
 ```
+
+The root workspace keeps the publishable crate, integration tests, benchmarks,
+examples, and repository tooling in separate members. See
+[Contributing](CONTRIBUTING.md) for the layout and direct Cargo commands.
 
 ## Further reading
 
@@ -193,10 +197,12 @@ cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
   resource tradeoffs, goal-oriented profiles, and diagnostic tuning.
 - [Architecture](ARCHITECTURE.md) — data structures, request paths, reclaim,
   and recovery.
-- [Error handling](ERRORS.md) — structured classifications, operation context,
+- [Error handling](cache2/ERRORS.md) — structured classifications, operation context,
   overload policy, and standard I/O interoperability.
 - [Validation](BENCHMARK.md) — benchmarks, mixed turnover, and Linux NVMe
   qualification.
+- [Contributing](CONTRIBUTING.md) — workspace layout and development
+  workflows.
 
 ## License
 

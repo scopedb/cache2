@@ -7,7 +7,7 @@ does not publish machine-specific historical numbers.
 ## Request-path benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --bench cache
+cargo +1.98.0 bench --locked --package benchmarks --bench cache
 ```
 
 The benchmark measures accepted puts plus drain, resident L1 reads, warm close,
@@ -15,17 +15,17 @@ and successful L2 reads with best-effort promotion. Values encode their key
 ordinal, so a wrong-key result fails the run. Harness retries of
 `ErrorKind::Overloaded` are workload setup, not library behavior.
 
-The main controls are grouped below. See `benches/cache.rs` for defaults and
-validation rules.
+The main controls are grouped below. See `benchmarks/cache/main.rs` for
+defaults and validation rules.
 
-| Purpose | Variables |
-| --- | --- |
-| Data shape | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES` |
-| Capacity | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB` |
-| Concurrency | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
-| I/O path | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR` |
-| Cache policy | `CACHE_BENCH_L1_EVICTION=clock|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL` |
-| Gates | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS` |
+| Purpose      | Variables                                                                                                                                                                     |
+|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Data shape   | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES`                                                                                              |
+| Capacity     | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                  |
+| Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
+| I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                             |
+| Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                          |
+| Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
 
 For device measurements, use a data set larger than host RAM and no larger than
 half of L2 capacity. Run baseline and candidate in alternating order at least
@@ -35,16 +35,16 @@ replace correctness, overload, memory, or latency checks.
 ## Mixed workload benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --bench mixed_workloads
+cargo +1.98.0 bench --locked --package benchmarks --bench mixed_workloads
 ```
 
 This harness runs three deterministic request profiles:
 
-| Scenario | Request semantics | Scaled default |
-| --- | --- | --- |
-| `mixed` | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2 |
-| `reinsertion` | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2 |
-| `negative-lookup` | Every lookup uses a new key that cannot already exist | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
+| Scenario          | Request semantics                                                                  | Scaled default                                                   |
+|-------------------|------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| `mixed`           | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes         | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2             |
+| `reinsertion`     | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2             |
+| `negative-lookup` | Every lookup uses a new key that cannot already exist                              | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
 
 Operation counts are per thread. The scaled `mixed` and `reinsertion` defaults
 use total-operation-to-key ratios of 3.2 and 40. Select one or several scenarios
@@ -54,13 +54,13 @@ comma-separated list; the default is `all`. The scaled Region size is 4 MiB for
 
 Use the following controls to scale a run:
 
-| Purpose | Variables |
-| --- | --- |
-| Request stream | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED` |
-| Capacity | `CACHE_WORKLOAD_L1_MIB`, `CACHE_WORKLOAD_L2_MIB`, `CACHE_WORKLOAD_REGION_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB` |
-| Concurrency | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_READ_IO_WORKERS`, `CACHE_WORKLOAD_WRITE_IO_WORKERS`, `CACHE_WORKLOAD_RECLAIM_WORKERS` |
-| I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR` |
-| Measurement | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` |
+| Purpose        | Variables                                                                                                                             |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------|
+| Request stream | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED`                               |
+| Capacity       | `CACHE_WORKLOAD_L1_MIB`, `CACHE_WORKLOAD_L2_MIB`, `CACHE_WORKLOAD_REGION_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB`              |
+| Concurrency    | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_READ_IO_WORKERS`, `CACHE_WORKLOAD_WRITE_IO_WORKERS`, `CACHE_WORKLOAD_RECLAIM_WORKERS` |
+| I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                              |
+| Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL`                                                                                              |
 
 The harness uses a fixed seed, truncated-normal popularity, and
 piecewise-constant key and value sizes. Keys are at least eight bytes so their
@@ -78,7 +78,7 @@ counters.
 ## Mixed turnover
 
 ```sh
-cargo +1.98.0 bench --locked --bench cache_soak
+cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak
 ```
 
 The default short run mixes reads, writes, deletes, Region rotation, reclaim,
@@ -133,7 +133,7 @@ machine before running the script.
 Exercise a production-load-factor index without storage I/O:
 
 ```sh
-cargo +1.98.0 bench --locked --features benchmarking \
+cargo +1.98.0 bench --locked --package benchmarks \
   --bench region_index_turnover
 ```
 
@@ -141,14 +141,14 @@ Measure cold open, warm image publication, mmap recovery, and RSS at a chosen
 index scale:
 
 ```sh
-cargo +1.98.0 bench --locked --bench recovery_scale
+cargo +1.98.0 bench --locked --package benchmarks --bench recovery_scale
 ```
 
-Fuzz persistent decoders and bounded index probes:
+Run the 10,000-case persistent-decoder and bounded-index property test:
 
 ```sh
-cargo fuzz run persistent_decoders -- \
-  -runs=10000 -max_len=16384 -print_final_stats=1
+cargo test --package cache2 --lib \
+  property_tests::arbitrary_persistent_bytes_never_escape_bounds
 ```
 
 Treat any correctness failure, unexpected unbounded growth, missed required

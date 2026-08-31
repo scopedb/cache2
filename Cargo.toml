@@ -1,67 +1,47 @@
-[package]
-name = "cache2"
-version = "0.2.1"
+# Copyright 2026 ScopeDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[workspace]
+members = ["benchmarks", "cache2", "examples", "tests-integration", "xtask"]
+resolver = "3"
+
+[workspace.package]
 edition = "2024"
-rust-version = "1.98"
-description = "Performance-first bounded RAM and NVMe hybrid cache"
 license = "Apache-2.0"
 readme = "README.md"
-documentation = "https://docs.rs/cache2"
 repository = "https://github.com/scopedb/cache2"
-keywords = ["cache", "nvme", "storage"]
-categories = ["caching", "data-structures"]
-exclude = ["fuzz/", ".github/", "AGENTS.md"]
+rust-version = "1.98"
 
-[lib]
-name = "cache2"
-path = "src/lib.rs"
+[workspace.dependencies]
+# Workspace crates
+cache2 = { path = "cache2", version = "0.2.1" }
 
-[[bench]]
-name = "cache"
-harness = false
-
-[[bench]]
-name = "cache_soak"
-harness = false
-
-[[bench]]
-name = "mixed_workloads"
-harness = false
-
-[[bench]]
-name = "recovery_scale"
-harness = false
-
-[[bench]]
-name = "region_index_turnover"
-harness = false
-required-features = ["benchmarking"]
-
-[dependencies]
+# Crates.io dependencies
+cargo_metadata = { version = "0.23.1" }
+clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+io-uring = { version = "0.7.14" }
+libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }
-mea = "0.6.5"
+logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
+mea = { version = "0.6.7" }
+quickcheck = { version = "1.1.0", default-features = false }
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 twox-hash = { version = "2.1.4", default-features = false, features = ["std", "xxhash3_64"] }
 
-[dev-dependencies]
-logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
-
-[features]
-default = []
-benchmarking = []
-io-uring = ["dep:io-uring"]
-fuzzing = []
-
-[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
-io-uring = { version = "0.7.14", optional = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = "warn"

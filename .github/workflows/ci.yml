@@ -1,3 +1,17 @@
+# Copyright 2026 ScopeDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: CI
 
 on:
@@ -8,79 +22,52 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.98.0
+
 jobs:
   quality:
     name: format and clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust 1.98
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
-      - name: Select Rust 1.98
-        run: rustup default 1.98.0
-      - name: Install Hawkeye
-        uses: taiki-e/install-action@v2
+      - name: Install lint tools
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
-          tool: hawkeye@7.0.0
-      - name: Check license headers
-        run: hawkeye check
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Check fuzz-target formatting
-        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Check public API documentation
-        env:
-          RUSTDOCFLAGS: -D warnings -D missing_docs
-        run: cargo doc --no-deps --locked
-      - name: Verify publishable package
-        run: cargo package --locked
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
-      - name: Check advisories, licenses, dependency policy, and sources
-        run: cargo deny --all-features check advisories licenses bans sources
+          tool: hawkeye@7.0.0,cargo-deny@0.20.2
+      - name: Run repository quality checks
+        run: cargo x lint
 
   test:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust 1.98
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Select Rust 1.98
-        run: rustup default 1.98.0
-      - name: Check all targets
-        run: cargo check --all-targets
-      - name: Check all targets with optional io_uring
-        run: cargo check --all-targets --features io-uring
-      - name: Run tests
-        run: cargo test
-      - name: Run extended recovery tests
-        run: cargo test --lib -- --ignored
-      - name: Run tests with optional io_uring
-        run: cargo test --features io-uring
+      - name: Check workspace and feature matrix
+        run: cargo x check
+      - name: Run workspace and extended tests
+        run: cargo x test
       - name: Run optimized tests with all features
-        run: cargo test --release --all-features
+        run: cargo test --workspace --release --all-features
 
   safety-checks:
-    name: persistent fuzz, ASan, and TSan
+    name: ASan and TSan
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-06-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust nightly
         run: rustup toolchain install nightly-2026-06-26 --profile minimal --component rust-src
-      - name: Select pinned Rust nightly
-        run: rustup default nightly-2026-06-26
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - name: Fuzz persistent decoders and index probing
-        run: cargo fuzz run persistent_decoders -- -runs=10000 -max_len=16384
       - name: Check library with AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
-        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- --test-threads=1
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --package cache2 --lib -- --test-threads=1
       - name: Check concurrency with ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread
-        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib -- --test-threads=1
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --package cache2 --lib -- --test-threads=1

@@ -1,0 +1,62 @@
+# Copyright 2026 ScopeDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "benchmarks"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+io-uring = ["cache2/io-uring"]
+
+[dev-dependencies]
+cache2 = { workspace = true, features = ["benchmarking"] }
+log = { workspace = true }
+logforth = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[[bench]]
+name = "cache"
+path = "cache/main.rs"
+harness = false
+
+[[bench]]
+name = "cache_soak"
+path = "cache_soak/main.rs"
+harness = false
+
+[[bench]]
+name = "mixed_workloads"
+path = "mixed_workloads/main.rs"
+harness = false
+
+[[bench]]
+name = "recovery_scale"
+path = "recovery_scale/main.rs"
+harness = false
+
+[[bench]]
+name = "region_index_turnover"
+path = "region_index_turnover/main.rs"
+harness = false
+
+[lints]
+workspace = true
