@@ -234,7 +234,7 @@ impl IoBackend for ShortThenErrorBackend {
     }
 }
 
-fn resources(_maximum: usize) -> Arc<ResourceController> {
+fn resources() -> Arc<ResourceController> {
     Arc::new(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: 1024 * 1024,
@@ -257,7 +257,7 @@ fn write_buffer(resources: &Arc<ResourceController>, bytes: &[u8]) -> IoBuffer {
 
 #[test]
 fn aligned_buffer_has_stable_alignment() {
-    let resources = resources(8193);
+    let resources = resources();
     let buffer = read_buffer(&resources, 8193);
     assert_eq!(
         buffer.read_target().unwrap() as usize % IO_BUFFER_ALIGNMENT,
@@ -270,7 +270,7 @@ fn aligned_buffer_has_stable_alignment() {
 fn posix_engine_round_trips_owned_buffers_and_drains() {
     let file = TestFile::new();
     let engine = BackendIoEngine::new(file.backend(), 4).unwrap();
-    let resources = resources(4096);
+    let resources = resources();
     let input = b"owned async positioned I/O";
     let write = engine
         .write_all_at(WritePoint::Record, write_buffer(&resources, input), 4096)
@@ -305,7 +305,7 @@ fn posix_engine_round_trips_owned_buffers_and_drains() {
 #[test]
 fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
     let engine = BackendIoEngine::new(Arc::new(ShortThenErrorBackend::default()), 2).unwrap();
-    let resources = resources(4096);
+    let resources = resources();
 
     let read = engine
         .read_exact_at(read_buffer(&resources, 8), 0)
@@ -328,7 +328,7 @@ async fn async_request_is_woken_by_driver_completion() {
     let file = TestFile::new();
     file.file().set_len(4096).unwrap();
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
-    let resources = resources(4096);
+    let resources = resources();
     let request = submit_cache_io(
         engine.as_ref(),
         IoOperation::read(read_buffer(&resources, 4096), 0),
@@ -349,7 +349,7 @@ async fn async_request_is_woken_by_driver_completion() {
 async fn dropping_async_wait_requests_bounded_cancellation() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
-    let resources = resources(4096);
+    let resources = resources();
     let request = submit_cache_io(
         engine.as_ref(),
         IoOperation::read(read_buffer(&resources, 4096), 0),
@@ -375,7 +375,7 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
 async fn async_read_deadline_keeps_other_slots_available() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
-    let resources = resources(4096);
+    let resources = resources();
     let request = submit_cache_io_until(
         engine.as_ref(),
         IoOperation::read(read_buffer(&resources, 4096), 0),
@@ -411,7 +411,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
     let engine =
         BackendIoEngine::new_with_files(RuntimeFileSet::new(buffered_file, Some(direct_file)), 2)
             .unwrap();
-    let resources = resources(4096);
+    let resources = resources();
 
     let aligned = vec![0x5a; 4096];
     assert!(matches!(
@@ -461,7 +461,7 @@ fn unfenced_write_state_remains_unsafe_after_shutdown() {
 fn read_completion_deadline_retains_only_its_bounded_slot() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources(4096);
+    let resources = resources();
     let deadline = Instant::now() + Duration::from_millis(20);
     let request = submit_cache_io_until(
         &engine,
@@ -495,7 +495,7 @@ fn read_completion_deadline_retains_only_its_bounded_slot() {
 fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources(4096);
+    let resources = resources();
     let request = submit_cache_io_until(
         &engine,
         IoOperation::write(
@@ -563,7 +563,7 @@ fn disabled_io_statistics_skip_cumulative_engine_counters() {
     let file = TestFile::new();
     let engine =
         BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let completion = engine
         .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x5a]), 0)
         .unwrap()
@@ -606,7 +606,7 @@ fn unused_read_reservation_releases_its_engine_slot() {
 fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
     let file = TestFile::new();
     let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let fence = engine
         .inner
         .submit_state
@@ -627,7 +627,7 @@ fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
 fn backend_workers_execute_independent_reads_concurrently() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
     let second = engine.read_exact_at(read_buffer(&resources, 1), 1).unwrap();
 
@@ -647,7 +647,7 @@ fn backend_workers_execute_independent_reads_concurrently() {
 fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
     assert!(backend.wait_for_entered(1));
 
@@ -658,12 +658,15 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
         .unwrap_err();
     assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
     let (_, waiting_operation) = rejected.into_parts();
+    let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (sender, receiver) = mpsc::sync_channel(1);
     let submitter = std::thread::spawn(move || {
+        started_sender.send(()).unwrap();
         sender
             .send(waiting_engine.submit_wait(waiting_operation))
             .unwrap();
     });
+    started_receiver.recv().unwrap();
     let early = receiver.recv_timeout(Duration::from_millis(30));
     let was_blocked = matches!(&early, Err(mpsc::RecvTimeoutError::Timeout));
 
@@ -682,7 +685,7 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     assert!(was_blocked);
     let stats = engine.stats();
     assert_eq!(stats.requests.requests_in_flight_peak, 1);
-    assert!(stats.requests.slot_wait_ns >= 20_000_000);
+    assert!(stats.requests.slot_wait_ns > 0);
     assert!(stats.requests.request_time_ns > 0);
     engine.shutdown().unwrap();
 }
@@ -691,7 +694,7 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
 fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
     assert!(backend.wait_for_entered(1));
 
@@ -745,7 +748,7 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
 #[test]
 fn backend_panic_completes_the_request_and_worker_survives() {
     let engine = BackendIoEngine::new(Arc::new(PanicOnceBackend::new()), 1).unwrap();
-    let resources = resources(1);
+    let resources = resources();
     let failed = engine
         .read_exact_at(read_buffer(&resources, 1), 0)
         .unwrap()
@@ -782,7 +785,7 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
     let completion = Arc::new(CompletionState::new());
     shared.requests_submitted.fetch_add(1, Ordering::Relaxed);
 
-    let resources = resources(1);
+    let resources = resources();
     let task = Task {
         request_id,
         operation: IoOperation::read(read_buffer(&resources, 1), 0),

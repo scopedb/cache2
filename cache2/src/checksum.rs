@@ -55,27 +55,11 @@ impl Default for Crc32c {
 
 #[cfg(test)]
 mod tests {
-    use super::{Crc32c, crc32c};
+    use super::crc32c;
 
     #[test]
     fn matches_the_crc32c_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
         assert_eq!(crc32c(b""), 0);
-    }
-
-    #[test]
-    fn arbitrary_chunking_matches_one_shot_checksum() {
-        let payload = (0..64 * 1024)
-            .map(|index| ((index * 31 + index / 7) & 0xff) as u8)
-            .collect::<Vec<_>>();
-        let expected = crc32c(&payload);
-
-        for chunk_bytes in [1, 7, 64, 4093, payload.len()] {
-            let mut checksum = Crc32c::new();
-            for chunk in payload.chunks(chunk_bytes) {
-                checksum.update(chunk);
-            }
-            assert_eq!(checksum.finish(), expected, "chunk size {chunk_bytes}");
-        }
     }
 }

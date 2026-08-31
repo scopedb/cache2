@@ -226,7 +226,7 @@ fn data_path_resources() -> ResourceController {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib -- --ignored`"]
+#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib --all-features -- --ignored`"]
 fn external_process_kill_recovery_contract() {
     const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
     const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
@@ -386,14 +386,17 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         .data_plane()
         .unwrap()
         .reserve_read_slot_for_test();
-    let cancelled = tokio_runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(1),
-            store.get_value_async(b"queued-read", tokio_runtime.handle()),
-        )
-        .await
+    tokio_runtime.block_on(async {
+        let mut cancelled = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+        std::future::poll_fn(|context| {
+            match std::future::Future::poll(cancelled.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(_) => panic!("saturated read must enter the wait queue"),
+            }
+        })
+        .await;
+        drop(cancelled);
     });
-    assert!(cancelled.is_err());
     let value = tokio_runtime.block_on(async {
         let mut waiting = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
         std::future::poll_fn(|context| {
@@ -1437,7 +1440,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
 }
 
 #[test]
-#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib -- --ignored`"]
+#[ignore = "extended recovery qualification; run with `cargo test --package cache2 --lib --all-features -- --ignored`"]
 fn every_prepublication_failure_leaves_no_selectable_clean_state() {
     let cases = [
         (

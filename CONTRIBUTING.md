@@ -61,11 +61,13 @@ cargo x bench --bench cache
 ```
 
 See `BENCHMARK.md` for workload controls and qualification requirements. The
-normal test workflow also runs 10,000 QuickCheck cases over persistent decoders
-and bounded-index probes with inputs up to 16 KiB. Isolate that test with:
+normal test workflow also runs 10,000 QuickCheck cases for each of four
+properties: persistent decoders, record round trips, the fixed-map state
+machine, and the Region-index state machine. Inputs are capped at 16 KiB. Run
+that group directly with:
 
 ```sh
-cargo test --package cache2 --lib property_tests::arbitrary_persistent_bytes_never_escape_bounds
+cargo test --package cache2 --lib property_tests::
 ```
 
 ## Changelog
