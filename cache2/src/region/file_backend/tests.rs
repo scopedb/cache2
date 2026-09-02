@@ -452,6 +452,66 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
 }
 
 #[test]
+fn queued_l2_read_does_not_pin_warm_close() {
+    let directory = TestDirectory::new();
+    let data = production_data_superblock(512 * 1024);
+    let runtime_config = RuntimeConfig::default()
+        .with_read_io_workers(1)
+        .with_read_io_wait_timeout(Duration::from_secs(1))
+        .with_l1_capacity_bytes(0);
+    let mut store = RegionStore::open(
+        4096,
+        FileRegionBackend::new_with_configs(
+            directory.files.clone(),
+            data,
+            REGION_SHARDS,
+            runtime_config.clone(),
+        ),
+    )
+    .unwrap();
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    eventually_admitted(|| store.put_value(b"queued-close", b"value"));
+    store.drain().unwrap();
+    let plane = store.data_plane_handle().unwrap();
+    let slot = plane.reserve_read_slot_for_test();
+
+    tokio_runtime.block_on(async {
+        let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle()));
+        std::future::poll_fn(|context| {
+            match std::future::Future::poll(waiting.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(_) => panic!("saturated read must enter the wait queue"),
+            }
+        })
+        .await;
+
+        store.close_warm().unwrap();
+        drop(slot);
+        let error = match waiting.await {
+            Ok(_) => panic!("queued read must stop after warm close"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    });
+
+    let mut reopened = RegionStore::open(
+        4096,
+        FileRegionBackend::new_with_configs(
+            directory.files.clone(),
+            data,
+            REGION_SHARDS,
+            runtime_config,
+        ),
+    )
+    .unwrap();
+    assert_eq!(reopened.startup(), StartupMode::Warm);
+    reopened.close_fast().unwrap();
+}
+
+#[test]
 fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);

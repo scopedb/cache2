@@ -281,10 +281,22 @@ moves safe reads to miss-only rather than returning unvalidated data.
 
 ### Warm close publication
 
+The public handle separates a shared data-plane view from the cache-internal
+lifecycle owner. `close_warm(&self)` therefore works while other `Arc<Cache>`
+handles remain alive. One acquire-load rejects calls after close starts. L1
+hits and all reads pay no operation-gate read-modify-write. A permanent
+mutation fence and the write engines provide the quiescence required by
+recovery. Read I/O owns no persistent state and cannot pin the snapshot. Calls
+admitted before close are in flight and may finish; queued but unsubmitted L2
+work also cannot pin close. Retained public handles keep only bounded in-memory
+data-plane resources alive until drop.
+
 `close_warm` establishes one recoverable snapshot in this order:
 
-1. Stop admission, fence accepted work, stop workers, and require a healthy,
-   fully quiescent runtime.
+1. Atomically stop public admission, permanently fence mutation admission,
+   finish accepted mutations and their submitted writes, stop the bounded I/O
+   engines and workers, and require a healthy, fully quiescent mutation
+   runtime.
 2. Freeze the index and Region metadata as one authority.
 3. Sync completed Region data.
 4. Write a new header, complete index, and Region metadata to a temporary image;

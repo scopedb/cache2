@@ -169,23 +169,6 @@ impl RegionManagerAuthority {
             }
         }
     }
-
-    pub(super) fn into_inner(self) -> io::Result<RegionManager> {
-        match self.inner.into_inner() {
-            Ok(manager) if self.health.is_healthy() => Ok(manager),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "RegionStore became miss-only while freezing Region authority",
-            )),
-            Err(_) => {
-                self.health.enter_miss_only();
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "RegionStore Region authority is poisoned",
-                ))
-            }
-        }
-    }
 }
 
 pub(crate) struct FileRegionCore {

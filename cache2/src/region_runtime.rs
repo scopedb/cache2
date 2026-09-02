@@ -75,31 +75,36 @@ const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
 const MUTATION_DRAINING: usize = 1_usize << (usize::BITS - 1);
-const MUTATION_COUNT_MASK: usize = !MUTATION_DRAINING;
+const MUTATION_CLOSED: usize = 1_usize << (usize::BITS - 2);
+const MUTATION_FENCED: usize = MUTATION_DRAINING | MUTATION_CLOSED;
+const MUTATION_COUNT_MASK: usize = !MUTATION_FENCED;
 const MUTATION_ENTER_ATTEMPTS: usize = 8;
 
 struct LifecycleDrainingGuard<'a> {
     lifecycle: &'a AtomicU8,
-    entered: bool,
+    operations: &'a MutationGate,
 }
 
 impl<'a> LifecycleDrainingGuard<'a> {
-    fn enter(lifecycle: &'a AtomicU8) -> Self {
-        let entered = lifecycle
+    fn enter(lifecycle: &'a AtomicU8, operations: &'a MutationGate) -> Option<Self> {
+        lifecycle
             .compare_exchange(
                 LIFECYCLE_RUNNING,
                 LIFECYCLE_DRAINING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok();
-        Self { lifecycle, entered }
+            .is_ok()
+            .then_some(Self {
+                lifecycle,
+                operations,
+            })
     }
 }
 
 impl Drop for LifecycleDrainingGuard<'_> {
     fn drop(&mut self) {
-        if self.entered {
+        if !self.operations.is_closed() {
             let _ = self.lifecycle.compare_exchange(
                 LIFECYCLE_DRAINING,
                 LIFECYCLE_RUNNING,
@@ -130,8 +135,7 @@ impl MutationGate {
     fn try_enter(&self) -> Option<MutationGuard<'_>> {
         let mut state = self.state.load(Ordering::Acquire);
         for _ in 0..MUTATION_ENTER_ATTEMPTS {
-            if state & MUTATION_DRAINING != 0 || state & MUTATION_COUNT_MASK == MUTATION_COUNT_MASK
-            {
+            if state & MUTATION_FENCED != 0 || state & MUTATION_COUNT_MASK == MUTATION_COUNT_MASK {
                 return None;
             }
             match self.state.compare_exchange_weak(
@@ -149,13 +153,21 @@ impl MutationGate {
 
     fn begin_drain(&self) -> io::Result<MutationDrainGuard<'_>> {
         let previous = self.state.fetch_or(MUTATION_DRAINING, Ordering::AcqRel);
-        if previous & MUTATION_DRAINING != 0 {
+        if previous & MUTATION_FENCED != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "cache drain is already in progress",
             ));
         }
         Ok(MutationDrainGuard { gate: self })
+    }
+
+    fn start_close(&self) {
+        self.state.fetch_or(MUTATION_CLOSED, Ordering::AcqRel);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & MUTATION_CLOSED != 0
     }
 
     fn active_mutations(&self) -> usize {
@@ -189,7 +201,7 @@ impl MutationGate {
     fn mutation_finished(&self) {
         let previous = self.state.fetch_sub(1, Ordering::Release);
         debug_assert_ne!(previous & MUTATION_COUNT_MASK, 0);
-        if previous == (MUTATION_DRAINING | 1) {
+        if previous & MUTATION_COUNT_MASK == 1 && previous & MUTATION_FENCED != 0 {
             let quiescent = self
                 .quiescent
                 .lock()
@@ -216,6 +228,7 @@ struct MutationDrainGuard<'a> {
 }
 
 impl MutationDrainGuard<'_> {
+    #[cfg(test)]
     fn wait(&self) -> io::Result<()> {
         self.gate.wait_quiescent()
     }
@@ -230,7 +243,7 @@ impl Drop for MutationDrainGuard<'_> {
         let previous = self
             .gate
             .state
-            .fetch_and(MUTATION_COUNT_MASK, Ordering::Release);
+            .fetch_and(!MUTATION_DRAINING, Ordering::Release);
         debug_assert_ne!(previous & MUTATION_DRAINING, 0);
     }
 }
@@ -360,12 +373,14 @@ impl HybridValueRead {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
-    running: RunningOwner,
+    shared: Arc<RunningShared>,
+    owner: Arc<Mutex<Option<RunningOwner>>>,
     // Fences write admission for drain, flush, and shutdown. Reads do not
     // participate because they cannot extend the set of records being fenced.
     operations: Arc<MutationGate>,
@@ -708,14 +723,20 @@ impl RegionDataPlane {
             Arc::clone(&metrics),
             Arc::clone(&operations),
         )?;
+        let shared = Arc::clone(&running.shared);
         Ok(Self {
             core,
             data,
             config,
             metrics,
-            running,
+            shared,
+            owner: Arc::new(Mutex::new(Some(running))),
             operations,
         })
+    }
+
+    pub(crate) fn start_close(&self) {
+        self.operations.start_close();
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
@@ -741,7 +762,7 @@ impl RegionDataPlane {
                 "encoded file-chunk entry exceeds one Region",
             ));
         }
-        let running = &self.running.shared;
+        let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let shard_id = self.core.append_shard(hash);
         let control = &running.shards[shard_id];
@@ -798,7 +819,7 @@ impl RegionDataPlane {
                 "file-chunk key exceeds the 4 KiB limit",
             ));
         }
-        let running = &self.running.shared;
+        let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
             .statistics
@@ -881,7 +902,7 @@ impl RegionDataPlane {
             read_token,
             hash,
         } = reserved;
-        let Some(buffer) = self.running.shared.resources.try_read_buffer(plan.read_len) else {
+        let Some(buffer) = self.shared.resources.try_read_buffer(plan.read_len) else {
             if self.config.statistics {
                 self.metrics.record_read_overload();
             }
@@ -923,7 +944,7 @@ impl RegionDataPlane {
             }
             return Ok(PreparedGet::Complete(None));
         }
-        let running = &self.running.shared;
+        let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
             .statistics
@@ -1076,7 +1097,7 @@ impl RegionDataPlane {
         completed: CompletedGet,
         key: &[u8],
     ) -> io::Result<Option<HybridValueRead>> {
-        let running = &self.running.shared;
+        let running = &self.shared;
         let CompletedGet {
             read,
             read_token,
@@ -1139,26 +1160,26 @@ impl RegionDataPlane {
     pub(crate) fn drain(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait()?;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
-        let running = &self.running.shared;
+        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        let running = &self.shared;
         drain_shards(running, false)
     }
 
     pub(crate) async fn drain_async(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait_async().await;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle);
-        let running = &self.running.shared;
+        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        let running = &self.shared;
         drain_shards_async(running, false).await
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
-        let running = &self.running.shared;
+        let running = &self.shared;
         Ok(self.snapshot_running(running))
     }
 
     pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
-        let running = &self.running.shared;
+        let running = &self.shared;
         Ok(DetailedCacheSnapshot {
             summary: self.snapshot_running(running),
             write_buffer_rejections: running
@@ -1189,29 +1210,28 @@ impl RegionDataPlane {
     /// Fences admission, drains all workers, and shuts down the I/O engine.
     /// The return value asks the backend to retain flock for process lifetime
     /// because an issued write or flush could not be fenced.
-    pub(crate) fn shutdown(self) -> io::Result<bool> {
-        let Self {
-            metrics,
-            running,
-            operations,
-            ..
-        } = self;
-        let _ = metrics.lifecycle.compare_exchange(
+    pub(crate) fn shutdown(&self) -> io::Result<bool> {
+        self.operations.start_close();
+        self.operations.wait_quiescent()?;
+        let _ = self.metrics.lifecycle.compare_exchange(
             LIFECYCLE_RUNNING,
             LIFECYCLE_DRAINING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let operations = operations.begin_drain()?;
-        operations.wait()?;
+        let running = self
+            .owner
+            .lock()
+            .map_err(|_| poisoned_runtime_error())?
+            .take()
+            .ok_or_else(closed_runtime_error)?;
         let retain_lock = stop_running(running)?;
         Ok(retain_lock)
     }
 
     #[cfg(test)]
     pub(crate) fn reserve_read_slot_for_test(&self) -> ReadSlot {
-        self.running
-            .shared
+        self.shared
             .try_reserve_read(0)
             .map(|(_, slot)| slot)
             .expect("test read slot is available")
@@ -1219,12 +1239,7 @@ impl RegionDataPlane {
 
     #[cfg(test)]
     pub(crate) fn poison_shard_for_test(&self, shard_id: usize) {
-        let shard = self
-            .running
-            .shared
-            .shards
-            .get(shard_id)
-            .expect("test shard exists");
+        let shard = self.shared.shards.get(shard_id).expect("test shard exists");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = shard.state.lock().unwrap();
             panic!("poison shard gate");
@@ -2152,6 +2167,45 @@ mod tests {
 
         drop(drain);
         assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn permanent_close_is_not_reopened_by_an_active_drain() {
+        let gate = Arc::new(MutationGate::new());
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+        let closing_gate = Arc::clone(&gate);
+        let close = std::thread::spawn(move || {
+            closing_gate.start_close();
+            closing_gate.wait_quiescent().unwrap();
+        });
+
+        while gate.state.load(Ordering::Acquire) & MUTATION_CLOSED == 0 {
+            std::thread::yield_now();
+        }
+        drop(mutation);
+        drain.wait().unwrap();
+        drop(drain);
+        close.join().unwrap();
+
+        assert!(gate.try_enter().is_none());
+        assert!(gate.begin_drain().is_err());
+    }
+
+    #[test]
+    fn closing_during_drain_does_not_restore_running_lifecycle() {
+        let lifecycle = AtomicU8::new(LIFECYCLE_RUNNING);
+        let operations = MutationGate::new();
+        let drain = operations.begin_drain().unwrap();
+        let lifecycle_drain = LifecycleDrainingGuard::enter(&lifecycle, &operations);
+
+        operations.start_close();
+        operations.wait_quiescent().unwrap();
+        drop(lifecycle_drain);
+        drop(drain);
+
+        assert_eq!(lifecycle.load(Ordering::Acquire), LIFECYCLE_DRAINING);
+        assert!(operations.try_enter().is_none());
     }
 
     #[tokio::test]

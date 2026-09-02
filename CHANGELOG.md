@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Improvements
+
+- `Cache::close_fast` and `Cache::close_warm` now accept shared ownership, so
+  caches held in `Arc` can close without `Arc::try_unwrap`. Close immediately
+  rejects new operations on every retained handle, and warm close fences
+  accepted mutations and their submitted writes before publishing `CLEAN`.
+
 ## v0.2.2 (2026-09-01)
 
 This release keeps the version 1 on-disk format and requires no disk

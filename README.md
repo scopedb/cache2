@@ -68,8 +68,13 @@ diagnostic fields, and migration from the former `io::Result` API.
 ### Lifecycle
 
 `close_fast`, drop, and an unclean exit make the next open a cold start.
-`close_warm` publishes a clean recovery image for a warm start. Prefer explicit
-async close because drop closes the cache synchronously.
+`close_warm` publishes a clean recovery image for a warm start. Both close
+methods work through `Arc<Cache>` without `Arc::try_unwrap`: the first close
+call immediately makes every shared handle inert, then fences accepted
+persistent work on Tokio's blocking pool. Prefer explicit async close because
+drop closes the cache synchronously. Retained handles may keep bounded
+in-memory resources allocated until they are dropped, but no longer admit
+public operations.
 
 ## Configuration
 

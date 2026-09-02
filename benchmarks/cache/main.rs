@@ -404,10 +404,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     );
 
     let started = Instant::now();
-    Arc::try_unwrap(cache)
-        .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
-        .close_warm()
-        .await?;
+    cache.close_warm().await?;
+    drop(cache);
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
@@ -558,10 +556,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             snapshot.logical_disk_peak_bytes,
         );
     }
-    Arc::try_unwrap(cache)
-        .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
-        .close_fast()
-        .await?;
+    cache.close_fast().await?;
+    drop(cache);
 
     let resident = if l1_entry_eligible {
         let cache = Arc::new(files.config(&config).open().await?);
@@ -602,10 +598,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
                 after.l2_misses.saturating_sub(before.l2_misses),
             );
         }
-        Arc::try_unwrap(cache)
-            .map_err(|_| io::Error::other("benchmark retained a cache reader"))?
-            .close_fast()
-            .await?;
+        cache.close_fast().await?;
+        drop(cache);
         Some(resident.measurement)
     } else {
         None
