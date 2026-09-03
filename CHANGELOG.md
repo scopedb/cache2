@@ -16,8 +16,9 @@
   configured independently. Queued reads receive FIFO priority within their
   selected engine, use its full physical depth, and cannot be bypassed by later
   immediate admissions.
-- io_uring exposes independent ring and aggregate in-flight bounds for read,
-  write, and reclaim pools, plus opt-in SQPOLL idle/CPU affinity.
+- The experimental io_uring engine exposes independent ring and aggregate
+  in-flight bounds for read, write, and reclaim pools, plus opt-in SQPOLL
+  idle/CPU affinity.
 
 ### Performance
 

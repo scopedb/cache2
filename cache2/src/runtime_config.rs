@@ -72,7 +72,8 @@ impl Default for PosixIoConfig {
     }
 }
 
-/// One io_uring pool's physical rings and aggregate execution bound.
+/// One pool's physical rings and aggregate execution bound for the
+/// experimental io_uring engine.
 ///
 /// `max_in_flight` is distributed as evenly as possible across `rings`. This
 /// keeps admission capacity independent from the number of driver threads.
@@ -122,7 +123,8 @@ impl Default for IoUringPoolConfig {
     }
 }
 
-/// Kernel submission queue polling parameters for an io_uring pool.
+/// Kernel submission queue polling parameters for the experimental io_uring
+/// engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringSqPollConfig {
     idle_millis: u32,
@@ -157,7 +159,8 @@ impl IoUringSqPollConfig {
     }
 }
 
-/// Independent io_uring topology for read, write, and reclaim traffic.
+/// Independent topology for the experimental io_uring engine's read, write,
+/// and reclaim traffic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringConfig {
     read: IoUringPoolConfig,
@@ -212,7 +215,11 @@ impl Default for IoUringConfig {
 pub enum IoEngine {
     /// Worker-backed POSIX positioned I/O with explicit thread counts.
     Posix(PosixIoConfig),
-    /// Linux io_uring with independent ring and in-flight bounds.
+    /// Experimental Linux io_uring engine with independent ring and in-flight
+    /// bounds.
+    ///
+    /// Its API, configuration, and runtime behavior may change between
+    /// releases.
     ///
     /// This variant is available only with the `io-uring` crate feature on a
     /// supported Linux target.

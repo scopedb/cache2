@@ -98,7 +98,7 @@ complete geometry and memory plan before creating cache files.
 | Area      | Controls                                                                              | Default and behavior                                                                        |
 |-----------|---------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
 | L1        | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy`                 | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| I/O pools | `with_io_engine(IoEngine::Posix(PosixIoConfig))` or `IoEngine::IoUring(IoUringConfig)` | Four POSIX read workers, four write workers, and one reclaimer.                             |
+| I/O pools | `with_io_engine(IoEngine::Posix(PosixIoConfig))` or `IoEngine::IoUring(IoUringConfig)` | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
 | Read wait | `with_read_io_wait_capacity`, `with_read_io_wait_timeout`                             | Immediate admission; wait capacity defaults to aggregate read capacity.                    |
 | Writes    | `with_append_shards`, `with_write_flush_threshold_bytes`                              | Four append shards and a 4 MiB flush threshold.                                             |
 | Memory    | `with_managed_memory_limit_bytes`                                                     | 1 GiB across cache-managed allocations.                                                     |
