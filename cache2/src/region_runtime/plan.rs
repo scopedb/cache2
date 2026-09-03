@@ -75,6 +75,12 @@ impl RuntimeConfig {
                 "read I/O wait timeout must not exceed five seconds",
             ));
         }
+        if !(1..=MAX_CONFIG_COUNT).contains(&self.read_io_wait_capacity()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read I/O wait capacity must be in 1..=65536",
+            ));
+        }
         if self.io_engine == crate::runtime_config::IoEngine::Posix
             && (self.read_io_workers > MAX_IO_REQUESTS_PER_ENGINE
                 || self.write_io_workers > MAX_IO_REQUESTS_PER_ENGINE)
@@ -246,7 +252,7 @@ pub(super) fn runtime_topology_memory_bytes(
     let read_wait_queue = if config.read_io_wait_timeout.is_zero() {
         0
     } else {
-        config.read_io_workers
+        config.read_io_wait_capacity()
     };
     let reclaim_queue =
         reclaim_engine_count.checked_mul(config.io_depth_per_engine(config.reclaim_workers))?;

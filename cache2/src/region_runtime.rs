@@ -42,7 +42,7 @@ use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
 use crate::io_engine::{
-    IoBuffer, IoEngine, IoOperation, ReadSlot, build_file_engine, submit_cache_io,
+    IoBuffer, IoEngine, IoOperation, ReadSlot, ReadSlotWaiter, build_file_engine, submit_cache_io,
 };
 use crate::memory::{MemoryLookup, MemoryReadToken, MemoryStore, MemoryValue};
 use crate::record_codec::{hash_key, required_record_bytes};
@@ -276,11 +276,11 @@ struct PendingGet {
 
 struct WaitingGet {
     engine: Arc<dyn IoEngine>,
-    slots: Arc<Semaphore>,
+    slot_waiter: ReadSlotWaiter,
     plan: ReadPlan,
     read_token: MemoryReadToken,
     hash: u64,
-    timeout: Duration,
+    deadline: Instant,
     waiter_permit: OwnedSemaphorePermit,
 }
 
@@ -333,22 +333,14 @@ impl WaitingGet {
     async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
         let Self {
             engine,
-            slots,
+            slot_waiter,
             plan,
             read_token,
             hash,
-            timeout,
+            deadline,
             waiter_permit,
         } = self;
-        let acquire = Arc::clone(&slots).acquire_owned(1);
-        let timed_acquire = {
-            let _entered = tokio_handle.enter();
-            tokio::time::timeout(timeout, acquire)
-        };
-        let slot_permit = timed_acquire.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired")
-        })?;
-        let slot = engine.try_reserve_read()?.with_async_permit(slot_permit);
+        let slot = slot_waiter.reserve_until(deadline, tokio_handle).await?;
         drop(waiter_permit);
         Ok(ReservedGet {
             engine,
@@ -395,7 +387,7 @@ struct RunningOwner {
 struct RunningShared {
     core: Arc<FileRegionCore>,
     read_engines: Box<[Arc<dyn IoEngine>]>,
-    read_admission: Option<ReadAdmission>,
+    read_waiters: Option<Arc<Semaphore>>,
     write_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
@@ -408,11 +400,6 @@ struct RunningShared {
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
     statistics: bool,
-}
-
-struct ReadAdmission {
-    slots: Box<[Arc<Semaphore>]>,
-    waiters: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -478,10 +465,7 @@ impl RunningShared {
     }
 
     fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-        match &self.read_admission {
-            Some(admission) => try_reserve_admitted_read_lane(&self.read_engines, admission, route),
-            None => try_reserve_read_lane(&self.read_engines, route),
-        }
+        try_reserve_read_lane(&self.read_engines, route)
     }
 
     fn try_queue_read(
@@ -491,23 +475,25 @@ impl RunningShared {
         read_token: MemoryReadToken,
         timeout: Duration,
     ) -> io::Result<WaitingGet> {
-        let admission = self
-            .read_admission
+        let waiters = self
+            .read_waiters
             .as_ref()
             .expect("non-zero read wait timeout creates a waiter bound");
-        let waiter_permit = Arc::clone(&admission.waiters)
-            .try_acquire_owned(1)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::WouldBlock, "L2 read wait queue is full")
-            })?;
-        let lane = route_hash(route, self.read_engines.len());
+        let waiter_permit = Arc::clone(waiters).try_acquire_owned(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "L2 read wait queue is full")
+        })?;
+        let engine = Arc::clone(&self.read_engines[route_hash(route, self.read_engines.len())]);
+        let slot_waiter = engine.read_slot_waiter();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         Ok(WaitingGet {
-            engine: Arc::clone(&self.read_engines[lane]),
-            slots: Arc::clone(&admission.slots[lane]),
+            engine,
+            slot_waiter,
             plan,
             read_token,
             hash: route,
-            timeout,
+            deadline,
             waiter_permit,
         })
     }
@@ -524,34 +510,11 @@ fn try_reserve_read_lane(
     engines: &[Arc<dyn IoEngine>],
     route: u64,
 ) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-    try_reserve_read_lane_with(engines.len(), route, |lane| {
+    let reserve = |lane: usize| -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
         let slot = engines[lane].try_reserve_read()?;
         Ok((Arc::clone(&engines[lane]), slot))
-    })
-}
-
-fn try_reserve_admitted_read_lane(
-    engines: &[Arc<dyn IoEngine>],
-    admission: &ReadAdmission,
-    route: u64,
-) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-    debug_assert_eq!(engines.len(), admission.slots.len());
-    try_reserve_read_lane_with(engines.len(), route, |lane| {
-        let permit = Arc::clone(&admission.slots[lane])
-            .try_acquire_owned(1)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::WouldBlock, "no L2 read slot is available")
-            })?;
-        let slot = engines[lane].try_reserve_read()?.with_async_permit(permit);
-        Ok((Arc::clone(&engines[lane]), slot))
-    })
-}
-
-fn try_reserve_read_lane_with(
-    lane_count: usize,
-    route: u64,
-    mut reserve: impl FnMut(usize) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)>,
-) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+    };
+    let lane_count = engines.len();
     debug_assert_ne!(lane_count, 0);
     let primary = route_hash(route, lane_count);
     match reserve(primary) {
@@ -1369,28 +1332,13 @@ fn start_running(
     }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
-    let read_engines = build_engine_pool(files, &config, config.read_io_workers)?;
-    let read_admission = if config.read_io_wait_timeout.is_zero() {
-        None
-    } else {
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(read_engines.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate L2 read admission lanes",
-            )
-        })?;
-        let engine_depth = config.io_depth_per_engine(config.read_io_workers);
-        slots.resize_with(read_engines.len(), || {
-            Arc::new(Semaphore::new(engine_depth))
-        });
-        Some(ReadAdmission {
-            slots: slots.into_boxed_slice(),
-            waiters: Arc::new(Semaphore::new(config.read_io_workers)),
-        })
-    };
-    let write_engines = build_engine_pool(write_files, &config, config.write_io_workers)?;
-    let reclaim_engines = build_engine_pool(reclaim_files, &config, config.reclaim_workers)?;
+    let read_wait_enabled = !config.read_io_wait_timeout.is_zero();
+    let read_engines =
+        build_engine_pool(files, &config, config.read_io_workers, read_wait_enabled)?;
+    let read_waiters =
+        read_wait_enabled.then(|| Arc::new(Semaphore::new(config.read_io_wait_capacity())));
+    let write_engines = build_engine_pool(write_files, &config, config.write_io_workers, false)?;
+    let reclaim_engines = build_engine_pool(reclaim_files, &config, config.reclaim_workers, false)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1399,7 +1347,7 @@ fn start_running(
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
-        read_admission,
+        read_waiters,
         write_engines,
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
@@ -1491,6 +1439,7 @@ fn build_engine_pool(
     files: RuntimeFileSet,
     config: &RuntimeConfig,
     workers: usize,
+    read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
     let engine_count = config.io_engine_count(workers);
@@ -1516,6 +1465,7 @@ fn build_engine_pool(
             posix_workers,
             config.io_engine(),
             config.statistics,
+            read_wait_enabled,
         )?);
     }
     Ok(engines.into_boxed_slice())
@@ -2370,7 +2320,9 @@ mod tests {
 
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
-        let base = RuntimeConfig::default().with_read_io_workers(7);
+        let base = RuntimeConfig::default()
+            .with_read_io_workers(7)
+            .with_read_io_wait_capacity(11);
         let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
         let with_wait = runtime_topology_memory_bytes(
             4,
@@ -2378,7 +2330,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(with_wait - no_wait, 7 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
+        assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
     }
 
     #[test]

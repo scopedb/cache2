@@ -22,9 +22,10 @@ defaults and validation rules.
 |--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Data shape   | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES`                                                                                              |
 | Capacity     | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_MEMORY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                  |
-| Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
+| Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
 | I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                             |
 | Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                          |
+| Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (zero disables sampled read-latency histograms)                                                                                     |
 | Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
 
 For device measurements, use a data set larger than host RAM and no larger than

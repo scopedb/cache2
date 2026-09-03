@@ -36,6 +36,7 @@ impl BackendIoEngine {
         max_in_flight: usize,
         worker_count: usize,
         statistics_enabled: bool,
+        read_wait_enabled: bool,
     ) -> io::Result<Self> {
         files.set_statistics_enabled(statistics_enabled);
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
@@ -44,6 +45,7 @@ impl BackendIoEngine {
             max_in_flight,
             worker_count,
             statistics_enabled,
+            read_wait_enabled,
         )
     }
 
@@ -53,12 +55,26 @@ impl BackendIoEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_with_read_wait(
+        backend: Arc<dyn IoBackend>,
+        max_in_flight: usize,
+    ) -> io::Result<Self> {
+        Self::new_with_workers_and_statistics(
+            backend,
+            max_in_flight,
+            max_in_flight.min(4),
+            true,
+            true,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_workers(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
     ) -> io::Result<Self> {
-        Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true)
+        Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true, false)
     }
 
     pub(super) fn new_with_workers_and_statistics(
@@ -66,6 +82,7 @@ impl BackendIoEngine {
         max_in_flight: usize,
         worker_count: usize,
         statistics_enabled: bool,
+        read_wait_enabled: bool,
     ) -> io::Result<Self> {
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
         if worker_count == 0 || worker_count > max_in_flight {
@@ -74,7 +91,11 @@ impl BackendIoEngine {
                 "POSIX I/O worker count must not exceed the request limit",
             ));
         }
-        let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
+        let shared = Arc::new(RuntimeShared::new(
+            max_in_flight,
+            statistics_enabled,
+            read_wait_enabled,
+        ));
         let command_capacity = max_in_flight
             .checked_mul(2)
             .and_then(|depth| depth.checked_add(1))
@@ -124,6 +145,10 @@ impl BackendIoEngine {
 impl IoEngine for BackendIoEngine {
     fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         self.inner.try_reserve_read()
+    }
+
+    fn read_slot_waiter(&self) -> ReadSlotWaiter {
+        self.inner.read_slot_waiter()
     }
 
     fn submit_reserved_read(

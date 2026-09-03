@@ -24,6 +24,44 @@ use crate::resources::{ResourceController, ResourceLimits, aligned_buffer_capaci
 
 static FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+async fn wait_for_registered_read_waiters(engine: &BackendIoEngine, expected: usize) {
+    for _ in 0..100 {
+        let actual = engine
+            .inner
+            .shared
+            .read_slot_admission
+            .as_ref()
+            .map_or(0, |admission| admission.waiters.load(Ordering::Acquire));
+        if actual == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("expected {expected} registered read waiters");
+}
+
+async fn spawn_registered_read_slot_waiter(
+    engine: &BackendIoEngine,
+    timeout: Duration,
+    expected_waiters: usize,
+) -> tokio::task::JoinHandle<io::Result<ReadSlot>> {
+    let slot_waiter = engine.read_slot_waiter();
+    let waiter = tokio::spawn(async move {
+        slot_waiter
+            .reserve_until(Instant::now() + timeout, &tokio::runtime::Handle::current())
+            .await
+    });
+    wait_for_registered_read_waiters(engine, expected_waiters).await;
+    waiter
+}
+
+async fn read_wait_error(waiter: tokio::task::JoinHandle<io::Result<ReadSlot>>) -> io::Error {
+    match waiter.await.unwrap() {
+        Ok(_) => panic!("read waiter unexpectedly reserved a slot"),
+        Err(error) => error,
+    }
+}
+
 struct TestFile {
     path: PathBuf,
 }
@@ -372,6 +410,174 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
 }
 
 #[tokio::test]
+async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine: Arc<dyn IoEngine> =
+        Arc::new(BackendIoEngine::new_with_read_wait(backend.clone(), 1).unwrap());
+    let resources = resources();
+    let slot = engine.try_reserve_read().unwrap();
+    let request = submit_cache_read(
+        engine.as_ref(),
+        slot,
+        IoOperation::read(read_buffer(&resources, 4096), 0),
+    )
+    .unwrap();
+    let request_engine = Arc::clone(&engine);
+    let request_waiter = tokio::spawn(async move {
+        request
+            .wait_async(request_engine, &tokio::runtime::Handle::current())
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(backend.wait_for_entered(1));
+
+    request_waiter.abort();
+    assert!(request_waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(engine.in_flight(), 1);
+
+    let slot_waiter = engine.read_slot_waiter();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let tokio_handle = tokio::runtime::Handle::current();
+    let mut reservation = Box::pin(slot_waiter.reserve_until(deadline, &tokio_handle));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), reservation.as_mut())
+            .await
+            .is_err(),
+        "caller cancellation must not publish physical capacity"
+    );
+
+    backend.release();
+    let slot = reservation.await.unwrap();
+    drop(slot);
+    engine.shutdown().unwrap();
+    assert_eq!(engine.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn read_slot_wait_is_woken_by_engine_shutdown() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let slot = engine.try_reserve_read().unwrap();
+    let mut waiters = Vec::new();
+    for expected in 1..=3 {
+        waiters.push(
+            spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), expected).await,
+        );
+    }
+
+    engine.stop_accepting_requests();
+    for waiter in waiters {
+        assert_eq!(
+            read_wait_error(waiter).await.kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+    drop(slot);
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_read_reservation_precedes_new_immediate_read() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let held = engine.try_reserve_read().unwrap();
+    let queued = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
+
+    drop(held);
+    let error = match engine.try_reserve_read() {
+        Ok(_) => panic!("a new immediate read must not bypass a queued read"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+    let slot = queued.await.unwrap().unwrap();
+    drop(slot);
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_read_reservations_are_fifo() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let held = engine.try_reserve_read().unwrap();
+
+    let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
+    let second = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 2).await;
+
+    drop(held);
+    let first_slot = first.await.unwrap().unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "the second waiter bypassed the first"
+    );
+
+    drop(first_slot);
+    let second_slot = second.await.unwrap().unwrap();
+    drop(second_slot);
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_reads_use_every_released_engine_slot() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 2).unwrap());
+    let held: Vec<_> = (0..2).map(|_| engine.try_reserve_read().unwrap()).collect();
+    let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
+    let second = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 2).await;
+
+    drop(held);
+    let first_slot = first.await.unwrap().unwrap();
+    let second_slot = tokio::time::timeout(Duration::from_millis(20), second)
+        .await
+        .expect("an idle second engine slot was blocked by the queue head")
+        .unwrap()
+        .unwrap();
+    drop((first_slot, second_slot));
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timed_out_queue_head_passes_priority_to_next_read() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let held = engine.try_reserve_read().unwrap();
+
+    let first = spawn_registered_read_slot_waiter(&engine, Duration::from_millis(20), 1).await;
+    let second = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 2).await;
+
+    assert_eq!(read_wait_error(first).await.kind(), io::ErrorKind::TimedOut);
+    wait_for_registered_read_waiters(&engine, 1).await;
+
+    drop(held);
+    let second_slot = second.await.unwrap().unwrap();
+    drop(second_slot);
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_queue_head_passes_priority_to_next_read() {
+    let file = TestFile::new();
+    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let held = engine.try_reserve_read().unwrap();
+
+    let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
+    let second = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 2).await;
+
+    first.abort();
+    match first.await {
+        Ok(_) => panic!("aborted queue head completed"),
+        Err(error) => assert!(error.is_cancelled()),
+    }
+    wait_for_registered_read_waiters(&engine, 1).await;
+
+    drop(held);
+    let second_slot = second.await.unwrap().unwrap();
+    drop(second_slot);
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn async_read_deadline_keeps_other_slots_available() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
@@ -546,7 +752,7 @@ fn engine_request_capacity_is_hard_bounded() {
 fn configured_posix_engine_shares_its_worker_capacity() {
     let file = TestFile::new();
     let files = RuntimeFileSet::new(file.file(), None);
-    let engine = build_file_engine(files, 4, 4, ConfiguredIoEngine::Posix, false).unwrap();
+    let engine = build_file_engine(files, 4, 4, ConfiguredIoEngine::Posix, false, false).unwrap();
 
     let reserved: Vec<_> = (0..4).map(|_| engine.try_reserve_read().unwrap()).collect();
     assert_eq!(
@@ -562,7 +768,8 @@ fn configured_posix_engine_shares_its_worker_capacity() {
 fn disabled_io_statistics_skip_cumulative_engine_counters() {
     let file = TestFile::new();
     let engine =
-        BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false).unwrap();
+        BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false, false)
+            .unwrap();
     let resources = resources();
     let completion = engine
         .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x5a]), 0)
@@ -575,7 +782,7 @@ fn disabled_io_statistics_skip_cumulative_engine_counters() {
 
 #[test]
 fn slot_state_tracks_full_write_capacity() {
-    let shared = Arc::new(RuntimeShared::new(2, true));
+    let shared = Arc::new(RuntimeShared::new(2, true, false));
     let first = shared.try_reserve_slot(true).unwrap();
     let second = shared.try_reserve_slot(true).unwrap();
     assert!(shared.try_reserve_slot(true).is_none());
@@ -779,7 +986,7 @@ fn backend_panic_completes_the_request_and_worker_survives() {
 
 #[test]
 fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
-    let shared = Arc::new(RuntimeShared::new(1, true));
+    let shared = Arc::new(RuntimeShared::new(1, true, false));
     let slot = shared.try_reserve_slot(false).unwrap();
     let request_id = RequestId(1);
     let completion = Arc::new(CompletionState::new());

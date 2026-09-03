@@ -51,6 +51,16 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
     }
 }
 
+async fn assert_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>, message: &str) {
+    std::future::poll_fn(
+        |context| match std::future::Future::poll(future.as_mut(), context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => panic!("{message}"),
+        },
+    )
+    .await;
+}
+
 struct TestDirectory {
     root: PathBuf,
     files: RegionFiles,
@@ -359,7 +369,8 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeConfig::default()
-        .with_read_io_workers(1)
+        .with_read_io_workers(2)
+        .with_read_io_wait_capacity(1)
         .with_read_io_wait_timeout(Duration::from_millis(30))
         .with_l1_capacity_bytes(0)
         .with_statistics(true);
@@ -380,55 +391,37 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         .unwrap();
     eventually_admitted(|| store.put_value(b"queued-read", b"local-value"));
     store.drain().unwrap();
-    let slot = store
-        .runtime()
-        .unwrap()
-        .data_plane()
-        .unwrap()
-        .reserve_read_slot_for_test();
+    let plane = store.data_plane_handle().unwrap();
+    let mut slots: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
     tokio_runtime.block_on(async {
         let mut cancelled = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
-        std::future::poll_fn(|context| {
-            match std::future::Future::poll(cancelled.as_mut(), context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(()),
-                std::task::Poll::Ready(_) => panic!("saturated read must enter the wait queue"),
-            }
-        })
+        assert_pending(
+            cancelled.as_mut(),
+            "saturated read must enter the wait queue",
+        )
         .await;
         drop(cancelled);
     });
     let value = tokio_runtime.block_on(async {
         let mut waiting = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
-        std::future::poll_fn(|context| {
-            match std::future::Future::poll(waiting.as_mut(), context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(()),
-                std::task::Poll::Ready(_) => {
-                    panic!("a cancelled read must release its wait-queue permit")
-                }
-            }
-        })
+        assert_pending(
+            waiting.as_mut(),
+            "a cancelled read must release its wait-queue permit",
+        )
         .await;
-        drop(slot);
+        drop(slots.pop().unwrap());
         waiting.await.unwrap().unwrap()
     });
+    drop(slots);
     assert_eq!(value.value(), b"local-value");
     drop(value);
-    let blocked = store
-        .runtime()
-        .unwrap()
-        .data_plane()
-        .unwrap()
-        .reserve_read_slot_for_test();
+    let blocked: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
     tokio_runtime.block_on(async {
         let mut waiting = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
-        std::future::poll_fn(|context| {
-            match std::future::Future::poll(waiting.as_mut(), context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(()),
-                std::task::Poll::Ready(_) => {
-                    panic!("saturated read must enter the bounded wait queue")
-                }
-            }
-        })
+        assert_pending(
+            waiting.as_mut(),
+            "saturated read must enter the bounded wait queue",
+        )
         .await;
         let queue_full = match store
             .get_value_async(b"queued-read", tokio_runtime.handle())
@@ -480,13 +473,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
 
     tokio_runtime.block_on(async {
         let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle()));
-        std::future::poll_fn(|context| {
-            match std::future::Future::poll(waiting.as_mut(), context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(()),
-                std::task::Poll::Ready(_) => panic!("saturated read must enter the wait queue"),
-            }
-        })
-        .await;
+        assert_pending(waiting.as_mut(), "saturated read must enter the wait queue").await;
 
         store.close_warm().unwrap();
         drop(slot);
