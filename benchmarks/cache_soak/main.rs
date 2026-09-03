@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use benchmarks::report::{
+    AtomicLatencyHistogram, JobReport, LatencyHistogram, RunReporter, emit_cache_report,
+};
 use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
     IoMode, IoUringConfig, IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig,
@@ -57,6 +60,7 @@ struct SoakConfig {
     writers: usize,
     readers: usize,
     operation_interval: Duration,
+    latency_sample_interval: usize,
     warm_reopen: bool,
     final_warm_verify: bool,
     require_path_coverage: bool,
@@ -112,6 +116,7 @@ impl SoakConfig {
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
         let operation_interval =
             Duration::from_micros(env_u64("CACHE_SOAK_OPERATION_INTERVAL_US", 0)?);
+        let latency_sample_interval = env_usize("CACHE_SOAK_LATENCY_SAMPLE_INTERVAL", 16)?;
         let warm_reopen = env_bool("CACHE_SOAK_WARM_REOPEN", false)?;
         let final_warm_verify = env_bool("CACHE_SOAK_FINAL_WARM_VERIFY", false)?;
         // A same-process reopen can leave the retired L1's freed allocations in
@@ -148,7 +153,7 @@ impl SoakConfig {
             || reclaim_workers > shard_count
             || read_io_workers == 0
             || write_io_workers == 0
-            || writers == 0
+            || (writers == 0 && !warm_reopen)
             || readers == 0
             || operation_interval > Duration::from_secs(1)
             || !directory.is_dir()
@@ -174,6 +179,7 @@ impl SoakConfig {
             writers,
             readers,
             operation_interval,
+            latency_sample_interval,
             warm_reopen,
             final_warm_verify,
             require_path_coverage,
@@ -274,12 +280,12 @@ struct SoakCounters {
     hits: AtomicU64,
     stale_hits: AtomicU64,
     misses: AtomicU64,
-    max_put_ns: AtomicU64,
-    max_delete_ns: AtomicU64,
-    max_get_ns: AtomicU64,
+    put_latency: AtomicLatencyHistogram,
+    delete_latency: AtomicLatencyHistogram,
+    get_latency: AtomicLatencyHistogram,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CounterSnapshot {
     writes: u64,
     deletes: u64,
@@ -288,9 +294,9 @@ struct CounterSnapshot {
     hits: u64,
     stale_hits: u64,
     misses: u64,
-    max_put_ns: u64,
-    max_delete_ns: u64,
-    max_get_ns: u64,
+    put_latency: LatencyHistogram,
+    delete_latency: LatencyHistogram,
+    get_latency: LatencyHistogram,
 }
 
 #[derive(Default)]
@@ -310,9 +316,9 @@ impl SoakCounters {
             hits: self.hits.load(Ordering::Relaxed),
             stale_hits: self.stale_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
-            max_put_ns: self.max_put_ns.load(Ordering::Relaxed),
-            max_delete_ns: self.max_delete_ns.load(Ordering::Relaxed),
-            max_get_ns: self.max_get_ns.load(Ordering::Relaxed),
+            put_latency: self.put_latency.snapshot(),
+            delete_latency: self.delete_latency.snapshot(),
+            get_latency: self.get_latency.snapshot(),
         }
     }
 }
@@ -325,6 +331,18 @@ struct ResourceSample {
 }
 
 fn main() -> io::Result<()> {
+    let reporter = RunReporter::start("cache_soak", None);
+    let result = run_benchmark();
+    reporter.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::fmt::Display),
+    );
+    result
+}
+
+fn run_benchmark() -> io::Result<()> {
     init_logforth()?;
     let config = SoakConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -371,7 +389,7 @@ fn main() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} latency_sample_interval={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.memory_bytes as f64 / MIB as f64,
@@ -390,6 +408,7 @@ fn main() -> io::Result<()> {
         config.writers,
         config.readers,
         config.operation_interval.as_micros(),
+        config.latency_sample_interval,
         config.warm_reopen,
         config.final_warm_verify,
         config.require_path_coverage,
@@ -476,9 +495,11 @@ fn main() -> io::Result<()> {
                         report_sample(
                             false,
                             started.elapsed(),
+                            Duration::ZERO,
                             counters.snapshot(),
                             &sample,
                             max_managed_memory,
+                            &config,
                         );
                     }
                     Err(error) => {
@@ -509,7 +530,10 @@ fn main() -> io::Result<()> {
         }
     })?;
 
+    let workload_elapsed = started.elapsed();
+    let drain_started = Instant::now();
     runtime.block_on(cache.drain())?;
+    let drain_elapsed = drain_started.elapsed();
     let sample = resource_sample(
         &cache,
         &files,
@@ -520,7 +544,7 @@ fn main() -> io::Result<()> {
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
     let final_counters = counters.snapshot();
     if config.require_path_coverage {
-        validate_measured_path_coverage(final_counters, &sample)?;
+        validate_measured_path_coverage(&final_counters, &sample)?;
     }
     if config.require_reinsert_coverage {
         validate_reinsert_coverage(&sample)?;
@@ -570,10 +594,12 @@ fn main() -> io::Result<()> {
     }
     report_sample(
         true,
-        started.elapsed(),
+        workload_elapsed,
+        drain_elapsed,
         final_counters,
         &sample,
         max_managed_memory,
+        &config,
     );
     files.mark_success();
     Ok(())
@@ -679,14 +705,14 @@ fn run_writer(
         // conservative; stale and missing values are permitted.
         expected[key_index].fetch_max(announced, Ordering::SeqCst);
         let key = soak_key(key_index as u64);
-        let put_started = Instant::now();
+        let put_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
         match cache.put(key, &value[..value_bytes]) {
             Ok(_) => {
-                record_latency(&counters.max_put_ns, put_started.elapsed());
+                record_latency(&counters.put_latency, put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) if error.kind() == CacheErrorKind::Overloaded => {
-                record_latency(&counters.max_put_ns, put_started.elapsed());
+                record_latency(&counters.put_latency, put_started);
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(OVERLOAD_DELAY);
                 continue;
@@ -695,14 +721,16 @@ fn run_writer(
         }
 
         if announced.is_multiple_of(DELETE_INTERVAL) {
-            let delete_started = Instant::now();
+            let delete_ordinal = announced / DELETE_INTERVAL;
+            let delete_started =
+                should_sample(delete_ordinal, config.latency_sample_interval).then(Instant::now);
             match cache.delete(key) {
                 Ok(_) => {
-                    record_latency(&counters.max_delete_ns, delete_started.elapsed());
+                    record_latency(&counters.delete_latency, delete_started);
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error) if error.kind() == CacheErrorKind::Overloaded => {
-                    record_latency(&counters.max_delete_ns, delete_started.elapsed());
+                    record_latency(&counters.delete_latency, delete_started);
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
                     thread::sleep(OVERLOAD_DELAY);
                 }
@@ -736,10 +764,10 @@ fn run_reader(
         let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
             .map_err(|_| invalid("soak sampled key exceeds usize"))?;
         let key = soak_key(sampled as u64);
-        let get_started = Instant::now();
+        let get_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
         match runtime.block_on(cache.get(&key))? {
             Some(observed) => {
-                record_latency(&counters.max_get_ns, get_started.elapsed());
+                record_latency(&counters.get_latency, get_started);
                 let latest = expected[sampled].load(Ordering::SeqCst);
                 let stale = validate_observed(
                     sampled,
@@ -754,7 +782,7 @@ fn run_reader(
                 }
             }
             None => {
-                record_latency(&counters.max_get_ns, get_started.elapsed());
+                record_latency(&counters.get_latency, get_started);
                 counters.misses.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -884,7 +912,7 @@ fn resource_sample(
 }
 
 fn validate_measured_path_coverage(
-    counters: CounterSnapshot,
+    counters: &CounterSnapshot,
     sample: &ResourceSample,
 ) -> io::Result<()> {
     let resources = sample.detailed.summary;
@@ -942,9 +970,11 @@ fn validate_reinsert_coverage(sample: &ResourceSample) -> io::Result<()> {
 fn report_sample(
     complete: bool,
     elapsed: Duration,
+    drain_elapsed: Duration,
     counters: CounterSnapshot,
     sample: &ResourceSample,
     max_managed_memory: usize,
+    config: &SoakConfig,
 ) {
     let prefix = if complete { "complete " } else { "" };
     let detailed = &sample.detailed;
@@ -962,6 +992,53 @@ fn report_sample(
         .saturating_add(io.write.requests_succeeded)
         .saturating_add(io.write.requests_cancelled)
         .saturating_add(io.write.requests_failed);
+    if complete {
+        if config.writers != 0 {
+            JobReport::new("cache_soak", None, "put", "write", elapsed, counters.writes)
+                .workers(config.writers)
+                .bytes(u128::from(resources.written_bytes))
+                .errors(counters.write_rejections)
+                .latency(&counters.put_latency, config.latency_sample_interval)
+                .emit();
+        }
+        JobReport::new(
+            "cache_soak",
+            None,
+            "get",
+            "read",
+            elapsed,
+            counters.hits.saturating_add(counters.misses),
+        )
+        .workers(config.readers)
+        .bytes(u128::from(resources.served_bytes))
+        .latency(&counters.get_latency, config.latency_sample_interval)
+        .emit();
+        if config.writers != 0 {
+            JobReport::new(
+                "cache_soak",
+                None,
+                "delete",
+                "trim",
+                elapsed,
+                counters.deletes,
+            )
+            .workers(config.writers)
+            .errors(counters.delete_rejections)
+            .latency(&counters.delete_latency, config.latency_sample_interval)
+            .emit();
+        }
+        JobReport::new("cache_soak", None, "drain", "control", drain_elapsed, 1).emit();
+        emit_cache_report(
+            "cache_soak",
+            None,
+            "workload",
+            elapsed.saturating_add(drain_elapsed),
+            detailed,
+        );
+    }
+    let put_latency = counters.put_latency.summary();
+    let delete_latency = counters.delete_latency.summary();
+    let get_latency = counters.get_latency.summary();
     println!(
         "{prefix}elapsed={:.1}s writes={} deletes={} write_rejections={} delete_rejections={} hits={} stale_hits={} misses={} errors={} cache_puts={} cache_deletes={} l1_hits={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} promotions={} l1_evictions={} l1_bypasses={} cache_write_rejections={} rotations={} reclaimed_regions={} reclaim_reinsert_records={} reclaim_reinsert_bytes={} reclaim_reinsert_skipped={} reclaim_reinsert_budget_skipped={} reclaim_bytes={} reclaim_records={} reclaim_index_removed={} l1_entries={} l1_entry_capacity={} l1_resident={} l1_retained={} l1_metadata={} index_values={} index_relocations={} index_overflow_evictions={} index_conditional_remove_misses={} index_conditional_replace_misses={} io_submitted={} io_completed={} io_errors={} io_in_flight_peak={} managed={} managed_peak={} managed_limit={} logical_disk={} current_rss={} rss_limit={} peak_rss={} max_put_us={} max_delete_us={} max_get_us={}",
         elapsed.as_secs_f64(),
@@ -1018,15 +1095,20 @@ fn report_sample(
         sample.current_rss,
         sample.rss_limit,
         peak_rss_bytes(),
-        counters.max_put_ns / 1_000,
-        counters.max_delete_ns / 1_000,
-        counters.max_get_ns / 1_000,
+        put_latency.maximum_ns / 1_000,
+        delete_latency.maximum_ns / 1_000,
+        get_latency.maximum_ns / 1_000,
     );
 }
 
-fn record_latency(counter: &AtomicU64, elapsed: Duration) {
-    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-    counter.fetch_max(nanos, Ordering::Relaxed);
+fn should_sample(ordinal: u64, interval: usize) -> bool {
+    interval != 0 && ordinal.is_multiple_of(interval as u64)
+}
+
+fn record_latency(histogram: &AtomicLatencyHistogram, started: Option<Instant>) {
+    if let Some(started) = started {
+        histogram.record(started.elapsed());
+    }
 }
 
 fn pace(interval: Duration) {

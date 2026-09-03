@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
     IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
@@ -84,7 +85,7 @@ impl BenchConfig {
                 .map_err(|_| invalid("read I/O wait timeout is too large"))?,
         );
         let read_latency_sample_interval =
-            env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 0)?;
+            env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 16)?;
         let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
         let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
@@ -364,70 +365,19 @@ struct ReadMeasurement {
     latency: LatencyHistogram,
 }
 
-const LATENCY_BUCKETS: usize = 65;
-
-struct LatencyHistogram {
-    buckets: [u64; LATENCY_BUCKETS],
-    samples: u64,
-    maximum_ns: u64,
-}
-
-impl Default for LatencyHistogram {
-    fn default() -> Self {
-        Self {
-            buckets: [0; LATENCY_BUCKETS],
-            samples: 0,
-            maximum_ns: 0,
-        }
-    }
-}
-
-impl LatencyHistogram {
-    fn record(&mut self, elapsed: Duration) {
-        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let bucket = if nanos <= 1 {
-            0
-        } else {
-            usize::try_from(u64::BITS - (nanos - 1).leading_zeros()).unwrap_or(64)
-        };
-        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
-        self.samples = self.samples.saturating_add(1);
-        self.maximum_ns = self.maximum_ns.max(nanos);
-    }
-
-    fn merge(&mut self, other: Self) {
-        for (target, value) in self.buckets.iter_mut().zip(other.buckets) {
-            *target = target.saturating_add(value);
-        }
-        self.samples = self.samples.saturating_add(other.samples);
-        self.maximum_ns = self.maximum_ns.max(other.maximum_ns);
-    }
-
-    fn percentile_upper_bound_ns(&self, numerator: u64, denominator: u64) -> u64 {
-        if self.samples == 0 {
-            return 0;
-        }
-        let target = self
-            .samples
-            .saturating_mul(numerator)
-            .saturating_add(denominator - 1)
-            / denominator;
-        let mut seen = 0_u64;
-        for (index, count) in self.buckets.iter().enumerate() {
-            seen = seen.saturating_add(*count);
-            if seen >= target {
-                return if index >= 64 {
-                    u64::MAX
-                } else {
-                    1_u64 << index
-                };
-            }
-        }
-        u64::MAX
-    }
-}
-
 fn main() -> io::Result<()> {
+    let reporter = RunReporter::start("cache", None);
+    let result = run_benchmark();
+    reporter.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::fmt::Display),
+    );
+    result
+}
+
+fn run_benchmark() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.clients.max(2))
@@ -495,7 +445,20 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let drain_started = Instant::now();
     cache.drain().await?;
     write.measurement.elapsed += drain_started.elapsed();
-    report("put_drain", "put + drain", &write.measurement);
+    let write_detailed = config
+        .statistics_enabled
+        .then(|| cache.detailed_snapshot())
+        .transpose()?;
+    report(
+        "put_drain",
+        "put + drain",
+        "write",
+        config.write_clients,
+        &write.measurement,
+        write.throttled_writes as u64,
+        None,
+        0,
+    );
     println!(
         "result phase=put_admission clients={} attempts={} retries={} throttled={}",
         config.write_clients,
@@ -503,6 +466,15 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         write.attempts.saturating_sub(config.entries),
         write.throttled_writes,
     );
+    if let Some(detailed) = &write_detailed {
+        emit_cache_report(
+            "cache",
+            None,
+            "put_drain",
+            write.measurement.elapsed,
+            detailed,
+        );
+    }
 
     let started = Instant::now();
     cache.close_warm().await?;
@@ -528,9 +500,27 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         )
         .await?;
         if l1_entry_eligible {
-            report("l2_promote", "L2 get + promote", &l2_read.measurement);
+            report(
+                "l2_promote",
+                "L2 get + promote",
+                "read",
+                config.l2_clients(),
+                &l2_read.measurement,
+                0,
+                Some(&l2_read.latency),
+                config.read_latency_sample_interval,
+            );
         } else {
-            report("l2_read", "L2 get", &l2_read.measurement);
+            report(
+                "l2_read",
+                "L2 get",
+                "read",
+                config.l2_clients(),
+                &l2_read.measurement,
+                0,
+                Some(&l2_read.latency),
+                config.read_latency_sample_interval,
+            );
         }
         report_tiers(
             "l2_outcomes",
@@ -572,7 +562,16 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             config.read_latency_sample_interval,
         )
         .await?;
-        report("l2_hot_scan", "L2 cold scan", &cold_scan.measurement);
+        report(
+            "l2_hot_scan",
+            "L2 cold scan",
+            "read",
+            config.l2_clients(),
+            &cold_scan.measurement,
+            0,
+            Some(&cold_scan.latency),
+            config.read_latency_sample_interval,
+        );
         report_tiers(
             "l2_scan_outcomes",
             "L2 scan outcomes",
@@ -613,6 +612,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     if config.statistics_enabled {
         let detailed = cache.detailed_snapshot()?;
         let snapshot = detailed.summary;
+        emit_cache_report("cache", None, "l2", l2_read.elapsed, &detailed);
         println!(
             "result phase=l1 policy={:?} evictions={} bypasses={} promotions={} l1_hits={} l1_misses={}",
             config.l1_eviction_policy,
@@ -690,7 +690,16 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             config.read_latency_sample_interval,
         )
         .await?;
-        report("resident_l1", "resident L1 get", &resident.measurement);
+        report(
+            "resident_l1",
+            "resident L1 get",
+            "read",
+            config.clients,
+            &resident.measurement,
+            0,
+            Some(&resident.latency),
+            config.read_latency_sample_interval,
+        );
         report_read_latency("resident_l1_latency", "L1 get latency", &resident.latency);
         if let Some(before) = before {
             let after = cache.snapshot()?;
@@ -996,17 +1005,35 @@ fn verify_value(ordinal: usize, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn report(phase: &str, name: &str, measurement: &Measurement) {
+#[allow(clippy::too_many_arguments)]
+fn report(
+    phase: &str,
+    _name: &str,
+    operation: &str,
+    workers: usize,
+    measurement: &Measurement,
+    errors: u64,
+    latency: Option<&LatencyHistogram>,
+    latency_sample_interval: usize,
+) {
     let seconds = measurement.elapsed.as_secs_f64();
     let operations_per_second = measurement.operations as f64 / seconds;
     let mib_per_second = measurement.bytes as f64 / MIB as f64 / seconds;
-    println!(
-        "{name:<20} {:>9.3} ms  {:>12.0} ops/s  {:>10.1} MiB/s  checksum={:016x}",
-        seconds * 1_000.0,
-        operations_per_second,
-        mib_per_second,
-        measurement.checksum,
-    );
+    let report = JobReport::new(
+        "cache",
+        None,
+        phase,
+        operation,
+        measurement.elapsed,
+        measurement.operations as u64,
+    )
+    .workers(workers)
+    .bytes(measurement.bytes)
+    .errors(errors);
+    match latency {
+        Some(latency) => report.latency(latency, latency_sample_interval).emit(),
+        None => report.emit(),
+    }
     println!(
         "result phase={phase} elapsed_ns={} operations={} bytes={} ops_per_sec={operations_per_second:.3} mib_per_sec={mib_per_second:.3} checksum={:016x}",
         measurement.elapsed.as_nanos(),
@@ -1049,28 +1076,31 @@ fn report_tiers(phase: &str, name: &str, elapsed: Duration, tiers: &TierCounts) 
     );
 }
 
-fn report_latency(phase: &str, name: &str, elapsed: Duration) {
-    println!("{name:<20} {:>9.3} ms", elapsed.as_secs_f64() * 1_000.0);
+fn report_latency(phase: &str, _name: &str, elapsed: Duration) {
+    JobReport::new("cache", None, phase, "control", elapsed, 1).emit();
     println!(
         "result phase={phase} elapsed_ns={} operations=0 bytes=0 ops_per_sec=0.000 mib_per_sec=0.000 checksum=0000000000000000",
         elapsed.as_nanos(),
     );
 }
 
-fn report_read_latency(phase: &str, name: &str, latency: &LatencyHistogram) {
-    if latency.samples == 0 {
+fn report_read_latency(phase: &str, _name: &str, latency: &LatencyHistogram) {
+    let summary = latency.summary();
+    if summary.samples == 0 {
         return;
     }
-    let p50 = latency.percentile_upper_bound_ns(50, 100);
-    let p99 = latency.percentile_upper_bound_ns(99, 100);
-    let p999 = latency.percentile_upper_bound_ns(999, 1_000);
     println!(
-        "{name:<20} samples={} p50<={p50} ns p99<={p99} ns p99.9<={p999} ns max={} ns",
-        latency.samples, latency.maximum_ns,
-    );
-    println!(
-        "result phase={phase} samples={} p50_upper_ns={p50} p99_upper_ns={p99} p999_upper_ns={p999} max_ns={}",
-        latency.samples, latency.maximum_ns,
+        "result phase={phase} samples={} min_ns={} mean_estimate_ns={:.3} stddev_estimate_ns={:.3} p50_upper_ns={} p90_upper_ns={} p95_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
+        summary.samples,
+        summary.minimum_ns,
+        summary.mean_ns,
+        summary.standard_deviation_ns,
+        summary.p50_upper_ns,
+        summary.p90_upper_ns,
+        summary.p95_upper_ns,
+        summary.p99_upper_ns,
+        summary.p999_upper_ns,
+        summary.maximum_ns,
     );
 }
 

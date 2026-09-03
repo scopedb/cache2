@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use benchmarks::report::{JobReport, RunReporter};
 use cache2::{
     CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig, RuntimeConfig,
     StartupMode, StaticConfig,
@@ -174,6 +175,18 @@ impl Drop for ScaleFiles {
 }
 
 fn main() -> io::Result<()> {
+    let reporter = RunReporter::start("recovery_scale", None);
+    let result = run_benchmark();
+    reporter.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::fmt::Display),
+    );
+    result
+}
+
+fn run_benchmark() -> io::Result<()> {
     let config = ScaleConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -200,7 +213,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
 
     let opened = Instant::now();
     let cache = files.config(&config).open().await?;
-    emit("fresh_open", opened.elapsed());
+    emit("fresh_open", "control", opened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Cold)?;
     let resources = cache.snapshot()?;
     println!(
@@ -218,33 +231,39 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
         put_eventually(&cache, key, &value)?;
     }
     cache.drain().await?;
-    emit("populate_and_drain", populated.elapsed());
+    emit(
+        "populate_and_drain",
+        "write",
+        populated.elapsed(),
+        keys.len() as u64,
+        keys.len() as u128 * config.value_bytes as u128,
+    );
 
     let closed = Instant::now();
     cache.close_warm().await?;
-    emit("initial_close_warm", closed.elapsed());
+    emit("initial_close_warm", "control", closed.elapsed(), 1, 0);
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
     let cache = files.config(&config).open().await?;
-    emit("warm_open", reopened.elapsed());
+    emit("warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;
 
     let closed = Instant::now();
     cache.close_warm().await?;
-    emit("recovered_close_warm", closed.elapsed());
+    emit("recovered_close_warm", "control", closed.elapsed(), 1, 0);
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
     let cache = files.config(&config).open().await?;
-    emit("second_warm_open", reopened.elapsed());
+    emit("second_warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;
 
     let closed = Instant::now();
     cache.close_fast().await?;
-    emit("close_fast", closed.elapsed());
+    emit("close_fast", "control", closed.elapsed(), 1, 0);
     files.mark_success();
     println!("complete status=pass");
     Ok(())
@@ -268,7 +287,13 @@ async fn verify_sentinels(
             return Err(io::Error::other("recovered sentinel value is incorrect"));
         }
     }
-    emit("verify_sentinels", started.elapsed());
+    emit(
+        "verify_sentinels",
+        "read",
+        started.elapsed(),
+        keys.len() as u64,
+        keys.len() as u128 * value_bytes as u128,
+    );
     Ok(())
 }
 
@@ -300,7 +325,17 @@ fn require_startup(observed: StartupMode, expected: StartupMode) -> io::Result<(
     Ok(())
 }
 
-fn emit(phase: &str, elapsed: Duration) {
+fn emit(phase: &str, operation: &str, elapsed: Duration, operations: u64, bytes: u128) {
+    JobReport::new(
+        "recovery_scale",
+        None,
+        phase,
+        operation,
+        elapsed,
+        operations,
+    )
+    .bytes(bytes)
+    .emit();
     println!(
         "result phase={phase} elapsed_ns={} elapsed_seconds={:.6} current_rss_bytes={} peak_rss_bytes={}",
         elapsed.as_nanos(),

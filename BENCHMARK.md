@@ -4,6 +4,46 @@ Compare revisions only on the same host, filesystem, device, toolchain, and
 workload. Keep raw output with the tested commit; this repository intentionally
 does not publish machine-specific historical numbers.
 
+## Unified report format
+
+All benchmark targets emit a common fio-style report in addition to their
+existing `result ...` records. The human-readable section groups work into jobs
+and reports completed-operation rate, attempts, payload bandwidth, bytes,
+runtime, worker count, errors or overloads, and sampled latency. Every run ends
+with process CPU time, context switches, page faults, peak RSS, and pass or
+error status.
+
+Lines beginning with `report version=1` are the stable machine-readable form.
+They are whitespace-separated `key=value` records with these types:
+
+| Type        | Contents                                                                                  |
+|-------------|-------------------------------------------------------------------------------------------|
+| `header`    | Benchmark identity, scenario, operating system, and architecture                          |
+| `job`       | IOPS, bandwidth, bytes, runtime, workers, errors, and latency distribution                 |
+| `io`        | Read/write submissions, completions, failures, cancellation, depth, timing, and I/O path |
+| `cache`     | Request outcomes, hits/misses, overload, promotion, rotation, and reclaim                 |
+| `resources` | Managed memory, peak RSS, logical disk use, and L1/index/Region occupancy                 |
+| `run`       | Overall status, runtime, CPU, scheduler, faults, and peak RSS                             |
+
+`mixed_workloads` and `cache_soak` emit the cache-specific records by default;
+`cache` emits them when `CACHE_BENCH_STATS=true`. The `phase` field
+distinguishes independently reset cache instances, such as the initial write
+and warm-reopened L2 phases. Existing `result ...` lines are kept for
+qualification scripts and compatibility.
+
+The `io` records count logical engine requests and positive runtime file
+operations. They distinguish buffered and direct paths, but they are not
+physical-device I/O counters; use OS or device telemetry when that distinction
+matters.
+
+Latency uses a fixed 65-bucket log2 histogram, so measurement memory is bounded
+and independent of operation count. Percentiles are bucket upper bounds;
+`avg~` and `stdev~` are estimates from bucket midpoints. The default sampling
+interval is 16 operations. Set the target's latency sampling interval to zero
+to disable it. Non-soak workers update thread-local histograms; soak workers use
+three relaxed atomic updates per sampled operation. Sampling otherwise adds one
+timer start and one elapsed-time read to each selected operation.
+
 ## Request-path benchmark
 
 ```sh
@@ -25,8 +65,11 @@ defaults and validation rules.
 | Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_READ_IO_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_WRITE_IO_WORKERS`, `CACHE_BENCH_RECLAIM_WORKERS` |
 | I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                             |
 | Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                          |
-| Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (zero disables sampled read-latency histograms)                                                                                     |
+| Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_STATS` (default false; true adds cache/I/O/resource records)                            |
 | Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
+
+`CACHE_BENCH_STATS=true` adds cache accounting on the measured request path.
+Use the same setting for baseline and candidate runs.
 
 For device measurements, use a data set larger than host RAM and no larger than
 half of L2 capacity. Run baseline and candidate in alternating order at least
@@ -61,7 +104,7 @@ Use the following controls to scale a run:
 | Capacity       | `CACHE_WORKLOAD_L1_MIB`, `CACHE_WORKLOAD_L2_MIB`, `CACHE_WORKLOAD_REGION_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB`              |
 | Concurrency    | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_READ_IO_WORKERS`, `CACHE_WORKLOAD_WRITE_IO_WORKERS`, `CACHE_WORKLOAD_RECLAIM_WORKERS` |
 | I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                              |
-| Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL`                                                                                              |
+| Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables)                                                                  |
 
 The harness uses a fixed seed, truncated-normal popularity, and
 piecewise-constant key and value sizes. Keys are at least eight bytes so their
@@ -93,12 +136,17 @@ memory, key count, mixed value sizes, client counts, worker topology, I/O path,
 and output directory. Important qualification switches are:
 
 - `CACHE_SOAK_WARM_REOPEN=true` to recover before measurement;
+- `CACHE_SOAK_WRITERS=0` with warm reopen to measure a pre-populated,
+  read-only mixed-size data set;
 - `CACHE_SOAK_FINAL_WARM_VERIFY=true` to scan every key after recovery and
   validate every hit;
 - `CACHE_SOAK_REQUIRE_PATH_COVERAGE=true` to require writes, deletes, L2 reads,
   rotation, reclaim, and warm recovery;
 - `CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true` for a focused read-heavy run that
   must both reinsert a hot record and exhaust the bounded reinsert budget.
+
+`CACHE_SOAK_LATENCY_SAMPLE_INTERVAL` controls put, get, and delete latency
+sampling. It defaults to 16; zero disables latency sampling.
 
 Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution.
 Use a short matrix rather than one oversized run: small-capacity turnover,

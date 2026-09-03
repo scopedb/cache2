@@ -15,11 +15,24 @@
 use std::env;
 use std::io;
 
+use benchmarks::report::{JobReport, RunReporter};
 use cache2::benchmarking::{
     RegionIndexTurnoverConfig, RegionIndexTurnoverPhase, run_region_index_turnover,
 };
 
 fn main() -> io::Result<()> {
+    let reporter = RunReporter::start("region_index_turnover", None);
+    let result = run_benchmark();
+    reporter.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::fmt::Display),
+    );
+    result
+}
+
+fn run_benchmark() -> io::Result<()> {
     let defaults = RegionIndexTurnoverConfig::default();
     let config = RegionIndexTurnoverConfig {
         region_count: env_usize("CACHE_INDEX_TURNOVER_REGIONS", defaults.region_count)?,
@@ -85,6 +98,16 @@ fn report_phase(turn: usize, phase: &str, measurement: RegionIndexTurnoverPhase)
     let probes_per_operation = measurement.probes as f64 / measurement.operations as f64;
     let full_window_percent =
         measurement.full_windows as f64 * 100.0 / measurement.operations as f64;
+    let job = format!("{phase}_turn_{turn}");
+    JobReport::new(
+        "region_index_turnover",
+        None,
+        &job,
+        if phase == "publish" { "write" } else { "read" },
+        measurement.elapsed,
+        measurement.operations as u64,
+    )
+    .emit();
     println!(
         "{phase:<16} turn={turn:<4} {:>9.3} ms {:>12.0} ops/s probes/op={probes_per_operation:>5.2} max_probe={:>2} full={full_window_percent:>6.2}% hits={} misses={} stale_slots={} checksum={:016x}",
         seconds * 1_000.0,

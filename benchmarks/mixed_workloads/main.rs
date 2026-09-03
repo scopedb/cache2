@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
     IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StaticConfig,
@@ -270,11 +271,10 @@ impl HarnessConfig {
             || write_io_workers == 0
             || reclaim_workers == 0
             || reclaim_workers > append_shards as usize
-            || latency_sample_interval == 0
             || !directory.is_dir()
         {
             return Err(invalid(
-                "invalid workload size, Region size, worker topology, sampling interval, or directory",
+                "invalid workload size, Region size, worker topology, or directory",
             ));
         }
 
@@ -524,69 +524,6 @@ impl WorkloadResult {
     }
 }
 
-const LATENCY_BUCKETS: usize = 65;
-
-struct LatencyHistogram {
-    buckets: [u64; LATENCY_BUCKETS],
-    samples: u64,
-    maximum_ns: u64,
-}
-
-impl Default for LatencyHistogram {
-    fn default() -> Self {
-        Self {
-            buckets: [0; LATENCY_BUCKETS],
-            samples: 0,
-            maximum_ns: 0,
-        }
-    }
-}
-
-impl LatencyHistogram {
-    fn record(&mut self, elapsed: Duration) {
-        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let bucket = if nanos <= 1 {
-            0
-        } else {
-            usize::try_from(u64::BITS - (nanos - 1).leading_zeros()).unwrap_or(64)
-        };
-        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
-        self.samples = self.samples.saturating_add(1);
-        self.maximum_ns = self.maximum_ns.max(nanos);
-    }
-
-    fn merge(&mut self, other: Self) {
-        for (target, value) in self.buckets.iter_mut().zip(other.buckets) {
-            *target = target.saturating_add(value);
-        }
-        self.samples = self.samples.saturating_add(other.samples);
-        self.maximum_ns = self.maximum_ns.max(other.maximum_ns);
-    }
-
-    fn percentile_upper_bound_ns(&self, numerator: u64, denominator: u64) -> u64 {
-        if self.samples == 0 {
-            return 0;
-        }
-        let target = self
-            .samples
-            .saturating_mul(numerator)
-            .saturating_add(denominator - 1)
-            / denominator;
-        let mut seen = 0_u64;
-        for (index, count) in self.buckets.iter().enumerate() {
-            seen = seen.saturating_add(*count);
-            if seen >= target {
-                return if index >= 64 {
-                    u64::MAX
-                } else {
-                    1_u64 << index
-                };
-            }
-        }
-        self.maximum_ns
-    }
-}
-
 struct DeterministicRng {
     state: u64,
 }
@@ -639,6 +576,18 @@ fn main() -> io::Result<()> {
 }
 
 async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
+    let reporter = RunReporter::start("mixed_workloads", Some(config.scenario.slug()));
+    let result = run_scenario_inner(config).await;
+    reporter.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::fmt::Display),
+    );
+    result
+}
+
+async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
     let scenario = config.scenario;
     println!("C² mixed workload: {}", scenario.slug());
     println!(
@@ -984,11 +933,12 @@ fn record_sample(histogram: &mut LatencyHistogram, started: Option<Instant>) {
 }
 
 fn should_sample(operation: Operation, result: &WorkloadResult, interval: usize) -> bool {
-    match operation {
-        Operation::Get => result.gets.is_multiple_of(interval as u64),
-        Operation::Set => result.sets.is_multiple_of(interval as u64),
-        Operation::Delete => result.deletes.is_multiple_of(interval as u64),
-    }
+    interval != 0
+        && match operation {
+            Operation::Get => result.gets.is_multiple_of(interval as u64),
+            Operation::Set => result.sets.is_multiple_of(interval as u64),
+            Operation::Delete => result.deletes.is_multiple_of(interval as u64),
+        }
 }
 
 fn validate_snapshot(result: &WorkloadResult, snapshot: &cache2::CacheSnapshot) -> io::Result<()> {
@@ -1035,6 +985,77 @@ fn report(
     } else {
         result.hits as f64 * 100.0 / result.gets as f64
     };
+    let scenario = config.scenario.slug();
+    JobReport::new(
+        "mixed_workloads",
+        Some(scenario),
+        "workload",
+        "mixed",
+        workload_elapsed,
+        result.non_overloaded_operations(),
+    )
+    .workers(config.threads)
+    .bytes(u128::from(
+        result
+            .accepted_value_bytes
+            .saturating_add(result.served_value_bytes),
+    ))
+    .errors(result.overloads())
+    .emit();
+    JobReport::new(
+        "mixed_workloads",
+        Some(scenario),
+        "get",
+        "read",
+        workload_elapsed,
+        result.hits.saturating_add(result.misses),
+    )
+    .workers(config.threads)
+    .bytes(u128::from(result.served_value_bytes))
+    .errors(result.get_overloaded)
+    .latency(&result.get_latency, config.latency_sample_interval)
+    .emit();
+    JobReport::new(
+        "mixed_workloads",
+        Some(scenario),
+        "set",
+        "write",
+        workload_elapsed,
+        result.set_accepted,
+    )
+    .workers(config.threads)
+    .bytes(u128::from(result.accepted_value_bytes))
+    .errors(result.set_overloaded)
+    .latency(&result.set_latency, config.latency_sample_interval)
+    .emit();
+    JobReport::new(
+        "mixed_workloads",
+        Some(scenario),
+        "delete",
+        "trim",
+        workload_elapsed,
+        result.delete_accepted,
+    )
+    .workers(config.threads)
+    .errors(result.delete_overloaded)
+    .latency(&result.delete_latency, config.latency_sample_interval)
+    .emit();
+    JobReport::new(
+        "mixed_workloads",
+        Some(scenario),
+        "drain",
+        "control",
+        drain_elapsed,
+        1,
+    )
+    .emit();
+    emit_cache_report(
+        "mixed_workloads",
+        Some(scenario),
+        "workload",
+        workload_elapsed.saturating_add(drain_elapsed),
+        detailed,
+    );
     println!(
         "{}: {:.3} ms, {:.0} attempted ops/s, {:.0} non-overloaded ops/s, overload={:.3}%, hit={:.3}%",
         config.scenario.slug(),
@@ -1107,15 +1128,21 @@ fn report(
 }
 
 fn report_latency(scenario: Scenario, operation: &str, latency: &LatencyHistogram) {
+    let summary = latency.summary();
     println!(
-        "result benchmark=mixed_workloads scenario={} phase=latency operation={} samples={} p50_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
+        "result benchmark=mixed_workloads scenario={} phase=latency operation={} samples={} min_ns={} mean_estimate_ns={:.3} stddev_estimate_ns={:.3} p50_upper_ns={} p90_upper_ns={} p95_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
         scenario.slug(),
         operation,
-        latency.samples,
-        latency.percentile_upper_bound_ns(50, 100),
-        latency.percentile_upper_bound_ns(99, 100),
-        latency.percentile_upper_bound_ns(999, 1_000),
-        latency.maximum_ns,
+        summary.samples,
+        summary.minimum_ns,
+        summary.mean_ns,
+        summary.standard_deviation_ns,
+        summary.p50_upper_ns,
+        summary.p90_upper_ns,
+        summary.p95_upper_ns,
+        summary.p99_upper_ns,
+        summary.p999_upper_ns,
+        summary.maximum_ns,
     );
 }
 
