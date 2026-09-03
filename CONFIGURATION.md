@@ -41,7 +41,7 @@ fixed index and heat metadata
 + L1 retained-byte capacity and fixed L1 metadata
 + runtime controls, queues, and 512 KiB cache-thread stacks
 + 2 * Region size * append shards
-+ Region size * reclaim workers
++ Region size * reclaim concurrency
 + one Region-sized foreground-read allowance
 ```
 
@@ -68,10 +68,10 @@ managed-memory gauges remain below their limit.
 | Increase `expected_entries`     | Lowers fixed-index load                              | Grows index mapping, heat bits, recovery images, and potentially L1 slot metadata; leaves less managed memory for L1 and reads              |
 | Increase Region size            | Holds larger records and more staged bytes per shard | Multiplies append/reclaim/read allowances, reduces Region count and rotation frequency, and makes reclaim coarser                           |
 | Increase append shards          | Adds mutation gates and staging paths                | Adds two Region buffers, one Active Region, one worker, controls, and minimum geometry per shard; raises the allowed reclaim-worker ceiling |
-| Increase read workers           | Admits more L2 reads                                 | Adds stacks/queues and increases possible transient-buffer demand; the meaning differs between POSIX and io_uring                           |
-| Enable or lengthen read waiting | Trades immediate misses for bounded wait             | Adds only one waiter per configured read worker; can raise p99 and returns overload when queue, memory, or deadline is exhausted            |
-| Increase write workers          | Adds write I/O concurrency                           | Adds stacks/queue pressure and device contention; does not add foreground staging space                                                     |
-| Increase reclaim workers        | Recycles more Regions concurrently                   | Adds one Region buffer and lane per worker and can compete for device and append-staging capacity                                           |
+| Increase read execution capacity | Admits more L2 reads                                | Adds queues and possible transient-buffer demand; POSIX also adds worker stacks, while io_uring ring count is independent                   |
+| Enable or lengthen read waiting  | Trades immediate misses for bounded wait            | Adds the configured wait capacity, can raise p99, and returns overload when queue, memory, or deadline is exhausted                         |
+| Increase write execution capacity | Adds write I/O concurrency                         | Adds queue pressure and device contention; POSIX also adds worker stacks and neither backend adds foreground staging space                 |
+| Increase reclaim concurrency     | Recycles more Regions concurrently                  | Adds one Region buffer and logical worker per request slot and can compete for device and append-staging capacity                          |
 | Increase L1 capacity            | Retains more reusable values                         | Reduces L2 demand but consumes retained bytes and fixed metadata from the same managed-memory limit                                         |
 | Increase L1 shards              | Reduces shard-local contention                       | Adds fixed metadata and controls; too many small shards reduce useful capacity efficiency                                                   |
 | Lower write flush threshold     | Requests earlier partial publication                 | Increases write operation count and reduces batching without increasing staging capacity                                                    |
@@ -158,7 +158,7 @@ contention under the intended capacity. A small L1 split into thousands of
 shards can have more metadata and less useful capacity without reducing
 meaningful contention.
 
-Increasing L1 capacity can be cheaper than increasing L2 read workers because
+Increasing L1 capacity can be cheaper than increasing L2 read capacity because
 it reduces the peak concurrent L2 demand. It can also release transient read
 buffers sooner when promotion succeeds. Conversely, an oversized L1 or an
 oversized fixed index can leave too little managed-memory headroom for L2 reads.
@@ -174,7 +174,7 @@ Start with CLOCK when metadata and minimal hit-path work matter. Try S3-FIFO
 when the workload has a stable reused set mixed with scans or one-hit entries.
 Compare hit rate and bypasses at the same L1 byte budget.
 
-### Read workers, waiting, and memory
+### Read execution, waiting, and memory
 
 The read path first selects an index candidate, then admits one bounded read.
 Three resources can reject that plan independently:
@@ -183,25 +183,27 @@ Three resources can reject that plan independently:
 2. the optional wait queue;
 3. managed memory for the aligned read buffer.
 
-`read_io_workers` adds execution capacity. With POSIX I/O it is both the number
-of worker threads and the maximum admitted reads; every additional worker adds
-a 512 KiB reserved cache-thread stack. With io_uring it selects independent
-fixed-depth rings, currently depth 64 each. Worker counts are therefore not
-portable between the two engines.
+Physical execution is backend-specific. `PosixIoConfig::read_workers` is both
+the number of blocking worker threads and the maximum admitted reads; every
+additional worker adds a 512 KiB reserved cache-thread stack.
+`IoUringPoolConfig` instead separates the number of rings/driver threads from
+the aggregate `max_in_flight` bound, which is distributed across those rings.
+The normal hash route stays stable; only a saturated primary lane probes one
+rotating alternate, so a hot route can use every ring without scanning them.
 
 `read_io_wait_timeout` changes pressure behavior, not physical capacity:
 
 | Setting  | When execution is full                   | Best fit                                             |
 |----------|------------------------------------------|------------------------------------------------------|
 | Zero     | Return a cache miss immediately          | Lowest bounded tail; authoritative fallback is cheap |
-| Positive | Queue at most one waiter per read worker | Preserve more hits within a short latency budget     |
+| Positive | Queue up to `read_io_wait_capacity`      | Preserve more hits within a short latency budget     |
 
 A full wait queue, memory pressure, or deadline expiry returns explicit
 `ErrorKind::Overloaded`. Making the timeout longer does not enlarge the queue
-and cannot compensate for a severely undersized worker pool. If busy misses or
-queue-full overloads dominate, add execution capacity or reduce L2 demand. If
-memory misses dominate, adding workers can make the problem worse; add managed
-headroom, reduce retained buffers, or improve L1 promotion instead.
+and cannot compensate for severely undersized execution capacity. If busy
+misses or queue-full overloads dominate, add execution capacity or reduce L2
+demand. If memory misses dominate, adding capacity can make the problem worse;
+add managed headroom, reduce retained buffers, or improve L1 promotion instead.
 
 Size POSIX workers from peak concurrent L2 reads, not total requests. For a
 strict-hit bias, provision close to that peak and use zero or a very short
@@ -213,7 +215,7 @@ or unaligned records therefore need more buffer and device bytes than their
 payload size suggests. Include that amplification when setting memory
 headroom and read concurrency.
 
-### Append shards, write workers, and flush threshold
+### Append shards, write execution, and flush threshold
 
 The write pipeline is:
 
@@ -228,7 +230,7 @@ The controls operate at different stages:
 | Control                       | Primary benefit                                                                    | Main cost                                                                       |
 |-------------------------------|------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
 | `append_shards`               | Reduces foreground mutation-gate contention and supplies independent staging paths | Two Region buffers, one Active Region, one worker, and fixed controls per shard |
-| `write_io_workers`            | Lets more completed batches reach the device concurrently                          | Worker stacks, queue capacity, and device contention                            |
+| Backend write pool           | Lets more completed batches reach the device concurrently                          | Queue capacity and device contention; POSIX workers also reserve stacks          |
 | `write_flush_threshold_bytes` | Controls when a partial buffer requests publication                                | Smaller values issue more, smaller writes; larger values favor batching         |
 | Region size                   | Changes per-shard burst reservoir and rotation frequency                           | Multiplies staging and reclaim memory and changes eviction granularity          |
 
@@ -238,10 +240,11 @@ data across additional partial buffers and Active Regions, consume memory, and
 can reduce useful capacity. Hash skew can still overload one shard even when
 aggregate buffers look empty.
 
-Start write workers near the append-shard count. Increase them only when write
-I/O in-flight peaks at the configured capacity or slot-wait time grows while
-the device still has headroom. More write workers cannot fix a foreground
-mutation-gate collision, a full shard-local staging pair, or a saturated SSD.
+Start write execution capacity near the append-shard count. Increase it only
+when write I/O in-flight peaks at the configured capacity or slot-wait time
+grows while the device still has headroom. More execution capacity cannot fix
+a foreground mutation-gate collision, a full shard-local staging pair, or a
+saturated SSD.
 
 The flush threshold is per append shard, 4 KiB-aligned, and ranges from 4 KiB
 through 4 MiB. Lower it when publication latency matters more than write
@@ -257,10 +260,13 @@ deadline, bypass the cache, or split bursts with completion barriers. A
 successful admission becomes visible after publication; `drain` is the barrier
 for accepted writes.
 
-### Reclaim workers
+### Reclaim concurrency
 
-Each reclaim worker owns one Region-sized scan buffer, one reclaim I/O lane,
-and worker resources. The count must be between one and the append-shard count.
+Each admitted reclaim owns one Region-sized scan buffer and one logical worker.
+For POSIX, `reclaim_workers` also sets the blocking I/O worker count. For
+io_uring, the reclaim pool's `max_in_flight` sets logical reclaim concurrency,
+while `rings` independently sets driver count. Reclaim concurrency must be
+between one and the append-shard count.
 
 Reclaim workers are a capacity-progress knob, not a direct hit-rate knob.
 Increase the count only when sealed Regions accumulate, Free Regions remain
@@ -280,7 +286,8 @@ Start with one worker. After increasing it, check all of these together:
 
 `reinsert_budget_skipped` identifies the fixed per-Region byte budget. A zero
 budget-skip count with nonzero `reinsert_skipped` points instead to validation
-or staging pressure; adding reclaim workers is unlikely to repair that cause.
+or staging pressure; adding reclaim concurrency is unlikely to repair that
+cause.
 
 ### Managed-memory limit
 
@@ -289,7 +296,7 @@ Raise `managed_memory_limit_bytes` whenever another knob adds fixed resources:
 - more index slots;
 - more L1 capacity or shards;
 - more append shards or a larger Region;
-- more read, write, or reclaim workers;
+- more POSIX workers or io_uring rings/in-flight capacity;
 - more reclaim buffers;
 - bounded read waiting and the desired concurrent read buffers.
 
@@ -312,12 +319,35 @@ goal is device behavior rather than page-cache behavior.
 
 Direct mode is Linux-only and requires `O_DIRECT` for aligned record I/O. It
 reduces page-cache duplication but can amplify small reads and exposes aligned
-I/O failures instead of silently falling back. Control, recovery, and
-necessarily unaligned remainder operations remain buffered.
+I/O failures instead of silently falling back. Control and recovery operations
+remain buffered. Necessarily unaligned runtime remainders use the buffered
+compatibility path.
 
-io_uring is feature-gated and experimental in 0.2. One configured worker means
-one fixed-depth ring, not one POSIX-equivalent request slot. Retune worker
-counts and managed memory rather than copying a POSIX configuration.
+io_uring is feature-gated and experimental in 0.2. Its three pools configure
+physical rings and aggregate execution bounds independently:
+
+```rust
+use cache2::{
+    IoEngine, IoMode, IoUringConfig, IoUringPoolConfig,
+    IoUringSqPollConfig, RuntimeConfig,
+};
+
+let read = IoUringPoolConfig::new(1, 128)
+    .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
+let runtime = RuntimeConfig::default()
+    .with_io_engine(IoEngine::IoUring(IoUringConfig::new(
+        read,
+        IoUringPoolConfig::new(1, 64),
+        IoUringPoolConfig::new(1, 1),
+    )))
+    .with_io_mode(IoMode::Direct);
+```
+
+`rings` controls driver-thread and kernel-ring count. `max_in_flight` is the
+aggregate admission bound and is divided as evenly as possible across those
+rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to
+each ring in that pool. SQPOLL defaults off; requested flags fail explicitly
+when the kernel cannot provide them.
 
 ### Statistics
 
@@ -334,8 +364,8 @@ latency-critical deployment.
 - Size the index from the measured live-key count with moderate headroom,
   commonly `E = 2N` before workload validation.
 - Keep Region size at 24 or 32 MiB unless objects or memory require otherwise.
-- Start with four append shards, four read workers, four write workers, and one
-  reclaimer.
+- With POSIX, start with four append shards, four read workers, four write
+  workers, and one reclaimer.
 - Use CLOCK and a nonzero L1 sized for the most valuable reusable working set.
 - Keep immediate reads until the application explicitly chooses overload and
   latency semantics for waiting.
@@ -349,13 +379,14 @@ latency-critical deployment.
   its overload semantics and p99 are acceptable.
 - Increase the managed-memory limit for both fixed index growth and concurrent
   read buffers.
-- Keep reclaim conservative; extra workers do not inherently preserve hot
+- Keep reclaim conservative; extra concurrency does not inherently preserve hot
   records.
 
 ### Lowest bounded read latency
 
 - Keep `read_io_wait_timeout` at zero.
-- Provision a modest worker pool and treat pressure misses as normal fallback.
+- Provision modest read execution capacity and treat pressure misses as normal
+  fallback.
 - Use L1 to remove repeatedly hot reads from L2 instead of building a long L2
   queue.
 - Prefer CLOCK when its hit rate is adequate.
@@ -366,7 +397,7 @@ latency-critical deployment.
 
 - Use `E = N` or `2N` and accept the corresponding bounded index-eviction risk.
 - Choose the smallest Region that holds the maximum record and keep append
-  shards and reclaim workers low.
+  shards and reclaim concurrency low.
 - Keep read waiting off and cap POSIX worker counts.
 - Allocate L1 only when its measured hit savings exceed the index or transient
   read headroom it displaces.
@@ -377,8 +408,8 @@ latency-critical deployment.
 
 - Match append shards to independently active writers; do not scale them from
   queued tasks alone.
-- Keep write workers high enough to drain those shards when the device has
-  spare concurrency.
+- Keep write execution capacity high enough to drain those shards when the
+  device has spare concurrency.
 - Consider a larger Region for more fixed burst reservoir, accounting for
   `2 * append_shards * Region size` staging.
 - Keep a larger flush threshold for batch throughput; lower it only when
@@ -415,18 +446,18 @@ Use `Cache::snapshot()` for regular telemetry and
 | Observation                                                         | Likely constraint                                 | Tuning direction                                                                             |
 |---------------------------------------------------------------------|---------------------------------------------------|----------------------------------------------------------------------------------------------|
 | Rising `index.overflow_evictions` or high slot occupancy            | Fixed index load                                  | Increase `expected_entries`; this is a static-layout change                                  |
-| `l2_read_busy_misses`                                               | Immediate read execution pressure                 | Increase read workers, improve L1, or deliberately enable bounded waiting                    |
+| `l2_read_busy_misses`                                               | Immediate read execution pressure                 | Increase read capacity, improve L1, or deliberately enable bounded waiting                   |
 | `l2_read_memory_misses`                                             | No managed buffer available                       | Add memory headroom, reduce retained values/fixed allocations, or reduce read concurrency    |
 | `l2_read_overloads` with low wait time                              | Queue saturation                                  | Add execution capacity or reduce L2 demand; a longer timeout alone may not help              |
 | `l2_read_overloads` with high wait time                             | Deadline or slow device                           | Raise the deadline only if p99 allows it; otherwise add capacity or reduce device work       |
 | Rising `write_buffer_rejections`                                    | Shard-local staging or mutation pressure          | Check shard count, hash skew, Region size, write progress, and application burst policy      |
-| Write in-flight peak equals configured capacity and slot wait rises | Write pool is limiting                            | Add write workers if the device has headroom                                                 |
+| Write in-flight peak equals configured capacity and slot wait rises | Write pool is limiting                            | Add write capacity if the device has headroom                                                |
 | Many partial buffers and low per-shard traffic                      | Too many append shards                            | Reduce append shards                                                                         |
-| Persistently low Free Regions with growing Sealed queue             | Reclaim cannot keep up                            | Add capacity or cautiously add reclaim workers                                               |
+| Persistently low Free Regions with growing Sealed queue             | Reclaim cannot keep up                            | Add capacity or cautiously add reclaim concurrency                                           |
 | `reinsert_skipped` rises while `reinsert_budget_skipped` is zero    | Reinsertion staging/validation pressure           | Reduce concurrent reclaim or foreground pressure; do not increase the byte budget indirectly |
 | `reinsert_budget_skipped` rises                                     | Hot live bytes exceed the fixed reclaim allowance | Treat retention as best effort; change capacity/workload geometry rather than worker count   |
 | High `l1_bypasses` with useful candidates                           | L1 contention, slots, or byte pressure            | Inspect L1 occupancy, retained bytes, shards, capacity, and oversized values                 |
-| Managed-memory peak approaches the limit                            | Fixed or transient memory pressure                | Rebalance index, L1, staging, workers, and read headroom                                     |
+| Managed-memory peak approaches the limit                            | Fixed or transient memory pressure                | Rebalance index, L1, staging, I/O topology, and read headroom                                |
 | Unexpected cold start after configuration change                    | Static identity or append-shard rebind failed     | Verify Region/index geometry and available Free Regions; cache loss is safe                  |
 
 Always correlate cache counters with device latency, physical IOPS, filesystem
@@ -442,12 +473,13 @@ can reward configurations that merely turn work into fast misses.
 4. Set a managed-memory limit that fits the fixed plan plus dynamic read and
    retained-value headroom.
 5. Tune L1 capacity, shards, and policy at fixed L2 geometry.
-6. Tune read workers and wait semantics using hit rate, overload, and p99.
-7. Tune append shards, write workers, and flush threshold using acceptance,
+6. Tune read execution and wait semantics using hit rate, overload, and p99.
+7. Tune append shards, write execution, and flush threshold using acceptance,
    publication, and device counters.
-8. Increase reclaim workers only if one worker cannot maintain Free Regions.
-9. Re-run after selecting Buffered versus Direct or POSIX versus io_uring; the
-   same worker counts are not equivalent.
+8. Increase reclaim concurrency only if one reclaimer cannot maintain Free
+   Regions.
+9. Re-run after selecting Buffered versus Direct or POSIX versus io_uring;
+   backend topology values are not interchangeable.
 10. Validate cold and warm opens, `drain`, overload behavior, managed-memory
     peak, and final value correctness before deployment.
 
@@ -464,8 +496,10 @@ tests. For storage qualification, use a dataset larger than host RAM and follow
 | Capacity                 | Exact Region multiple with more Regions than append shards                                                                                                 |
 | Index slots              | At least 8; the upper bound is derived from the addressable page, mapping, and recovery-image layout; `with_expected_entries` requests two slots per entry |
 | Append shards            | 1 through 256                                                                                                                                              |
-| Reclaim workers          | 1 through append-shard count                                                                                                                               |
-| POSIX read/write workers | 1 through 4,096 each                                                                                                                                       |
+| Reclaim concurrency      | 1 through append-shard count                                                                                                                               |
+| POSIX pool workers       | 1 through 4,096 for read, write, and reclaim                                                                                                               |
+| io_uring rings           | 1 through 65,536 per pool and no greater than that pool's aggregate in-flight limit                                                                        |
+| io_uring in-flight limit | 1 through 65,536 per pool, with at most 4,096 requests assigned to one ring                                                                                 |
 | Read wait timeout        | Zero through five seconds                                                                                                                                  |
 | L1 shards                | 1 through 65,536                                                                                                                                           |
 | Write flush threshold    | 4 KiB multiple from 4 KiB through 4 MiB                                                                                                                    |

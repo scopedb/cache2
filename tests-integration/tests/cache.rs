@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use cache2::IoMode;
 use cache2::{
     CacheBuilder, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy,
-    RuntimeConfig, StartupMode, StaticConfig,
+    PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -37,9 +37,7 @@ fn test_static_config() -> StaticConfig {
 
 fn test_runtime_config(workers: usize, append_shards: u32) -> RuntimeConfig {
     RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix)
-        .with_read_io_workers(workers)
-        .with_write_io_workers(workers)
+        .with_io_engine(IoEngine::Posix(PosixIoConfig::new(workers, workers, 1)))
         .with_append_shards(append_shards)
         .with_l1_capacity_bytes(4 * 1024 * 1024)
         .with_managed_memory_limit_bytes(32 * 1024 * 1024)
@@ -471,7 +469,7 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
 async fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = test_runtime_config(1, 2)
-        .with_io_engine(IoEngine::IoUring)
+        .with_io_engine(IoEngine::IoUring(cache2::IoUringConfig::default()))
         .with_write_flush_threshold_bytes(128 * 1024)
         .with_statistics(false);
 
@@ -534,9 +532,8 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
     cache.close_warm().await.unwrap();
 
     let retuned = test_runtime_config(2, 2)
-        .with_read_io_workers(7)
+        .with_io_engine(IoEngine::Posix(PosixIoConfig::new(7, 2, 2)))
         .with_read_io_wait_timeout(Duration::from_millis(10))
-        .with_reclaim_workers(2)
         .with_l1_capacity_bytes(2 * 1024 * 1024)
         .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
         .with_l1_shards(7)
@@ -780,17 +777,19 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             config.with_append_shards(257)
         }),
         ("zero-reclaim-workers", |config| {
-            config.with_reclaim_workers(0)
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 0)))
         }),
         ("too-many-reclaim-workers", |config| {
-            config.with_reclaim_workers(3)
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 3)))
         }),
-        ("zero-read-workers", |config| config.with_read_io_workers(0)),
+        ("zero-read-workers", |config| {
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(0, 1, 1)))
+        }),
         ("zero-write-workers", |config| {
-            config.with_write_io_workers(0)
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 0, 1)))
         }),
         ("too-many-read-workers", |config| {
-            config.with_read_io_workers(4097)
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(4097, 1, 1)))
         }),
         ("zero-read-wait-capacity", |config| {
             config.with_read_io_wait_capacity(0)
@@ -799,7 +798,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             config.with_read_io_wait_capacity(65_537)
         }),
         ("too-many-write-workers", |config| {
-            config.with_write_io_workers(4097)
+            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 4097, 1)))
         }),
         ("excessive-read-wait", |config| {
             config.with_read_io_wait_timeout(Duration::from_secs(5) + Duration::from_nanos(1))
@@ -811,9 +810,7 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         }),
         ("fixed-plan-exceeds-budget", |config| {
             config
-                .with_io_engine(IoEngine::Posix)
-                .with_read_io_workers(2)
-                .with_write_io_workers(2)
+                .with_io_engine(IoEngine::Posix(PosixIoConfig::new(2, 2, 1)))
                 .with_l1_capacity_bytes(0)
                 .with_managed_memory_limit_bytes(2 * 1024 * 1024)
                 .with_write_flush_threshold_bytes(128 * 1024)

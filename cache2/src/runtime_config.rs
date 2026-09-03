@@ -20,25 +20,223 @@ pub(crate) const MAX_WRITE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_READ_IO_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_APPEND_SHARDS: u32 = 4;
-const IO_URING_DEPTH_PER_WORKER: usize = 64;
+const DEFAULT_POSIX_IO_WORKERS: usize = 4;
+const DEFAULT_IO_URING_MAX_IN_FLIGHT: usize = 64;
+const DEFAULT_RECLAIM_IO_CONCURRENCY: usize = 1;
+
+/// Worker topology for POSIX positioned I/O.
+///
+/// Every admitted request occupies one worker until its blocking system call
+/// completes, so worker counts are also the per-pool in-flight limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixIoConfig {
+    read_workers: usize,
+    write_workers: usize,
+    reclaim_workers: usize,
+}
+
+impl PosixIoConfig {
+    /// Creates a POSIX topology with independent read, write, and reclaim
+    /// worker pools.
+    pub const fn new(read_workers: usize, write_workers: usize, reclaim_workers: usize) -> Self {
+        Self {
+            read_workers,
+            write_workers,
+            reclaim_workers,
+        }
+    }
+
+    /// Returns the number of read workers.
+    pub const fn read_workers(self) -> usize {
+        self.read_workers
+    }
+
+    /// Returns the number of write workers.
+    pub const fn write_workers(self) -> usize {
+        self.write_workers
+    }
+
+    /// Returns the number of reclaim workers.
+    pub const fn reclaim_workers(self) -> usize {
+        self.reclaim_workers
+    }
+}
+
+impl Default for PosixIoConfig {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_POSIX_IO_WORKERS,
+            DEFAULT_POSIX_IO_WORKERS,
+            DEFAULT_RECLAIM_IO_CONCURRENCY,
+        )
+    }
+}
+
+/// One pool's physical rings and aggregate execution bound for the
+/// experimental io_uring engine.
+///
+/// `max_in_flight` is distributed as evenly as possible across `rings`. This
+/// keeps admission capacity independent from the number of driver threads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringPoolConfig {
+    rings: usize,
+    max_in_flight: usize,
+    sq_poll: Option<IoUringSqPollConfig>,
+}
+
+impl IoUringPoolConfig {
+    /// Creates one io_uring pool.
+    pub const fn new(rings: usize, max_in_flight: usize) -> Self {
+        Self {
+            rings,
+            max_in_flight,
+            sq_poll: None,
+        }
+    }
+
+    /// Enables kernel-side submission queue polling for every ring in this
+    /// pool.
+    pub const fn with_sq_poll(mut self, sq_poll: IoUringSqPollConfig) -> Self {
+        self.sq_poll = Some(sq_poll);
+        self
+    }
+
+    /// Returns the number of independent rings and driver threads.
+    pub const fn rings(self) -> usize {
+        self.rings
+    }
+
+    /// Returns the aggregate maximum number of in-flight requests.
+    pub const fn max_in_flight(self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Returns the submission queue polling configuration.
+    pub const fn sq_poll(self) -> Option<IoUringSqPollConfig> {
+        self.sq_poll
+    }
+}
+
+impl Default for IoUringPoolConfig {
+    fn default() -> Self {
+        Self::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT)
+    }
+}
+
+/// Kernel submission queue polling parameters for the experimental io_uring
+/// engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringSqPollConfig {
+    idle_millis: u32,
+    cpu: Option<u32>,
+}
+
+impl IoUringSqPollConfig {
+    /// Enables submission polling and lets the kernel polling thread sleep
+    /// after `idle_millis` without new submissions.
+    pub const fn new(idle_millis: u32) -> Self {
+        Self {
+            idle_millis,
+            cpu: None,
+        }
+    }
+
+    /// Pins the kernel polling thread to one CPU.
+    /// For a multi-ring pool, every ring's polling thread uses this CPU.
+    pub const fn with_cpu(mut self, cpu: u32) -> Self {
+        self.cpu = Some(cpu);
+        self
+    }
+
+    /// Returns the idle time in milliseconds.
+    pub const fn idle_millis(self) -> u32 {
+        self.idle_millis
+    }
+
+    /// Returns the optional CPU affinity.
+    pub const fn cpu(self) -> Option<u32> {
+        self.cpu
+    }
+}
+
+/// Independent topology for the experimental io_uring engine's read, write,
+/// and reclaim traffic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringConfig {
+    read: IoUringPoolConfig,
+    write: IoUringPoolConfig,
+    reclaim: IoUringPoolConfig,
+}
+
+impl IoUringConfig {
+    /// Creates an io_uring topology from its three independent pools.
+    pub const fn new(
+        read: IoUringPoolConfig,
+        write: IoUringPoolConfig,
+        reclaim: IoUringPoolConfig,
+    ) -> Self {
+        Self {
+            read,
+            write,
+            reclaim,
+        }
+    }
+
+    /// Returns the read-pool topology.
+    pub const fn read(self) -> IoUringPoolConfig {
+        self.read
+    }
+
+    /// Returns the write-pool topology.
+    pub const fn write(self) -> IoUringPoolConfig {
+        self.write
+    }
+
+    /// Returns the reclaim-pool topology.
+    pub const fn reclaim(self) -> IoUringPoolConfig {
+        self.reclaim
+    }
+}
+
+impl Default for IoUringConfig {
+    fn default() -> Self {
+        Self::new(
+            IoUringPoolConfig::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
+            IoUringPoolConfig::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
+            IoUringPoolConfig::new(1, DEFAULT_RECLAIM_IO_CONCURRENCY),
+        )
+    }
+}
 
 /// Runtime implementation used by the independent read, write, and reclaim
 /// I/O pools.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoEngine {
-    /// Worker-backed POSIX positioned I/O.
-    #[default]
-    Posix,
-    /// Linux io_uring, available only with the `io-uring` crate feature.
-    IoUring,
+    /// Worker-backed POSIX positioned I/O with explicit thread counts.
+    Posix(PosixIoConfig),
+    /// Experimental Linux io_uring engine with independent ring and in-flight
+    /// bounds.
+    ///
+    /// Its API, configuration, and runtime behavior may change between
+    /// releases.
+    ///
+    /// This variant is available only with the `io-uring` crate feature on a
+    /// supported Linux target.
+    IoUring(IoUringConfig),
+}
+
+impl Default for IoEngine {
+    fn default() -> Self {
+        Self::Posix(PosixIoConfig::default())
+    }
 }
 
 impl IoEngine {
     pub(crate) const fn is_available(self) -> bool {
         match self {
-            Self::Posix => true,
-            Self::IoUring => cfg!(all(
+            Self::Posix(_) => true,
+            Self::IoUring(_) => cfg!(all(
                 feature = "io-uring",
                 target_os = "linux",
                 any(
@@ -50,6 +248,65 @@ impl IoEngine {
                 )
             )),
         }
+    }
+
+    pub(crate) const fn read_topology(self) -> IoPoolTopology {
+        match self {
+            Self::Posix(config) => IoPoolTopology::posix(config.read_workers),
+            Self::IoUring(config) => IoPoolTopology::io_uring(config.read),
+        }
+    }
+
+    pub(crate) const fn write_topology(self) -> IoPoolTopology {
+        match self {
+            Self::Posix(config) => IoPoolTopology::posix(config.write_workers),
+            Self::IoUring(config) => IoPoolTopology::io_uring(config.write),
+        }
+    }
+
+    pub(crate) const fn reclaim_topology(self) -> IoPoolTopology {
+        match self {
+            Self::Posix(config) => IoPoolTopology::posix(config.reclaim_workers),
+            Self::IoUring(config) => IoPoolTopology::io_uring(config.reclaim),
+        }
+    }
+
+    pub(crate) const fn is_posix(self) -> bool {
+        matches!(self, Self::Posix(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoPoolTopology {
+    pub(crate) engine_count: usize,
+    pub(crate) max_in_flight: usize,
+    pub(crate) worker_threads: usize,
+    pub(crate) io_uring: Option<IoUringPoolConfig>,
+}
+
+impl IoPoolTopology {
+    const fn posix(workers: usize) -> Self {
+        Self {
+            engine_count: 1,
+            max_in_flight: workers,
+            worker_threads: workers,
+            io_uring: None,
+        }
+    }
+
+    const fn io_uring(config: IoUringPoolConfig) -> Self {
+        Self {
+            engine_count: config.rings,
+            max_in_flight: config.max_in_flight,
+            worker_threads: config.rings,
+            io_uring: Some(config),
+        }
+    }
+
+    pub(crate) const fn depth_for_engine(self, engine: usize) -> usize {
+        let base = self.max_in_flight / self.engine_count;
+        let remainder = self.max_in_flight % self.engine_count;
+        base + if engine < remainder { 1 } else { 0 }
     }
 }
 
@@ -98,11 +355,8 @@ pub enum L1EvictionPolicy {
 pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
     pub(crate) io_mode: IoMode,
-    pub(crate) read_io_workers: usize,
     pub(crate) read_io_wait_capacity: Option<usize>,
     pub(crate) read_io_wait_timeout: Duration,
-    pub(crate) write_io_workers: usize,
-    pub(crate) reclaim_workers: usize,
     pub(crate) append_shards: u32,
     pub(crate) l1_capacity_bytes: usize,
     pub(crate) l1_eviction_policy: L1EvictionPolicy,
@@ -115,13 +369,10 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            io_engine: IoEngine::Posix,
+            io_engine: IoEngine::default(),
             io_mode: IoMode::Buffered,
-            read_io_workers: 4,
             read_io_wait_capacity: None,
             read_io_wait_timeout: Duration::ZERO,
-            write_io_workers: 4,
-            reclaim_workers: 1,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             l1_eviction_policy: L1EvictionPolicy::Clock,
@@ -136,8 +387,8 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     /// Selects the implementation used by the independent I/O pools.
     ///
-    /// POSIX worker-backed positioned I/O is the default. `IoUring` requires
-    /// the `io-uring` crate feature and a supported Linux target.
+    /// [`IoEngine::Posix`] is the default. Each engine variant carries only
+    /// the physical topology meaningful to that backend.
     pub fn with_io_engine(mut self, engine: IoEngine) -> Self {
         self.io_engine = engine;
         self
@@ -152,21 +403,11 @@ impl RuntimeConfig {
         self
     }
 
-    /// Sets read execution concurrency.
-    ///
-    /// With the POSIX engine this is both the number of worker threads and the
-    /// maximum number of admitted reads, in `1..=4096`. With `io_uring` it is
-    /// the number of independent fixed-depth rings.
-    pub fn with_read_io_workers(mut self, workers: usize) -> Self {
-        self.read_io_workers = workers;
-        self
-    }
-
     /// Sets the maximum number of reads waiting for execution capacity.
     ///
-    /// By default this follows the configured read worker count. Waiting is
-    /// active only when [`Self::with_read_io_wait_timeout`] is non-zero. Valid
-    /// capacities range from one through 65536.
+    /// By default this follows the configured aggregate read in-flight limit.
+    /// Waiting is active only when [`Self::with_read_io_wait_timeout`] is
+    /// non-zero. Valid capacities range from one through 65536.
     pub fn with_read_io_wait_capacity(mut self, capacity: usize) -> Self {
         self.read_io_wait_capacity = Some(capacity);
         self
@@ -180,26 +421,6 @@ impl RuntimeConfig {
     /// seconds.
     pub fn with_read_io_wait_timeout(mut self, timeout: Duration) -> Self {
         self.read_io_wait_timeout = timeout;
-        self
-    }
-
-    /// Sets write execution concurrency independently from reads.
-    ///
-    /// With the POSIX engine this is both the number of worker threads and the
-    /// maximum number of in-flight writes, in `1..=4096`. With `io_uring` it is
-    /// the number of independent fixed-depth rings.
-    pub fn with_write_io_workers(mut self, workers: usize) -> Self {
-        self.write_io_workers = workers;
-        self
-    }
-
-    /// Sets the number of concurrent Region reclaim workers.
-    ///
-    /// Each worker owns one Region-sized scan buffer and one reclaim I/O lane.
-    /// Valid counts range from one through the append-shard count; that range
-    /// matches the available per-shard clean reserve.
-    pub fn with_reclaim_workers(mut self, workers: usize) -> Self {
-        self.reclaim_workers = workers;
         self
     }
 
@@ -285,16 +506,16 @@ impl RuntimeConfig {
         self.io_mode
     }
 
-    /// Returns the configured read execution concurrency.
-    pub const fn read_io_workers(&self) -> usize {
-        self.read_io_workers
+    /// Returns the aggregate maximum number of in-flight reads.
+    pub const fn read_io_max_in_flight(&self) -> usize {
+        self.io_engine.read_topology().max_in_flight
     }
 
     /// Returns the maximum number of reads waiting for execution capacity.
     pub const fn read_io_wait_capacity(&self) -> usize {
         match self.read_io_wait_capacity {
             Some(capacity) => capacity,
-            None => self.read_io_workers,
+            None => self.read_io_max_in_flight(),
         }
     }
 
@@ -303,14 +524,14 @@ impl RuntimeConfig {
         self.read_io_wait_timeout
     }
 
-    /// Returns the configured write execution concurrency.
-    pub const fn write_io_workers(&self) -> usize {
-        self.write_io_workers
+    /// Returns the aggregate maximum number of in-flight writes.
+    pub const fn write_io_max_in_flight(&self) -> usize {
+        self.io_engine.write_topology().max_in_flight
     }
 
-    /// Returns the number of concurrent Region reclaim workers.
-    pub const fn reclaim_workers(&self) -> usize {
-        self.reclaim_workers
+    /// Returns the aggregate maximum number of concurrent Region reclaims.
+    pub const fn reclaim_io_max_in_flight(&self) -> usize {
+        self.io_engine.reclaim_topology().max_in_flight
     }
 
     /// Returns the number of hash-routed append shards.
@@ -348,18 +569,16 @@ impl RuntimeConfig {
         self.statistics
     }
 
-    pub(crate) const fn io_engine_count(&self, workers: usize) -> usize {
-        match self.io_engine {
-            IoEngine::Posix => 1,
-            IoEngine::IoUring => workers,
-        }
+    pub(crate) const fn read_io_topology(&self) -> IoPoolTopology {
+        self.io_engine.read_topology()
     }
 
-    pub(crate) const fn io_depth_per_engine(&self, workers: usize) -> usize {
-        match self.io_engine {
-            IoEngine::Posix => workers,
-            IoEngine::IoUring => IO_URING_DEPTH_PER_WORKER,
-        }
+    pub(crate) const fn write_io_topology(&self) -> IoPoolTopology {
+        self.io_engine.write_topology()
+    }
+
+    pub(crate) const fn reclaim_io_topology(&self) -> IoPoolTopology {
+        self.io_engine.reclaim_topology()
     }
 }
 
@@ -370,13 +589,13 @@ mod tests {
     #[test]
     fn runtime_defaults_are_stable() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.io_engine(), IoEngine::Posix);
+        assert_eq!(config.io_engine(), IoEngine::default());
         assert_eq!(config.io_mode(), IoMode::Buffered);
-        assert_eq!(config.read_io_workers(), 4);
+        assert_eq!(config.read_io_max_in_flight(), 4);
         assert_eq!(config.read_io_wait_capacity(), 4);
         assert_eq!(config.read_io_wait_timeout(), Duration::ZERO);
-        assert_eq!(config.write_io_workers(), 4);
-        assert_eq!(config.reclaim_workers(), 1);
+        assert_eq!(config.write_io_max_in_flight(), 4);
+        assert_eq!(config.reclaim_io_max_in_flight(), 1);
         assert_eq!(config.append_shards(), DEFAULT_APPEND_SHARDS);
         assert_eq!(config.l1_capacity_bytes(), DEFAULT_L1_CAPACITY_BYTES);
         assert_eq!(config.l1_eviction_policy(), L1EvictionPolicy::Clock);
@@ -390,23 +609,49 @@ mod tests {
     }
 
     #[test]
-    fn explicit_read_wait_capacity_is_independent_from_workers() {
+    fn explicit_read_wait_capacity_is_independent_from_execution() {
         let config = RuntimeConfig::default()
             .with_read_io_wait_capacity(11)
-            .with_read_io_workers(7);
+            .with_io_engine(IoEngine::Posix(PosixIoConfig::new(7, 4, 1)));
 
-        assert_eq!(config.read_io_workers(), 7);
+        assert_eq!(config.read_io_max_in_flight(), 7);
         assert_eq!(config.read_io_wait_capacity(), 11);
     }
 
     #[test]
-    fn io_engine_capacity_matches_backend_shape() {
-        let posix = RuntimeConfig::default();
-        assert_eq!(posix.io_engine_count(7), 1);
-        assert_eq!(posix.io_depth_per_engine(7), 7);
+    fn io_engine_topology_matches_backend_shape() {
+        let posix = IoEngine::Posix(PosixIoConfig::new(7, 5, 2));
+        assert_eq!(
+            posix.read_topology(),
+            IoPoolTopology {
+                engine_count: 1,
+                max_in_flight: 7,
+                worker_threads: 7,
+                io_uring: None,
+            }
+        );
 
-        let io_uring = posix.with_io_engine(IoEngine::IoUring);
-        assert_eq!(io_uring.io_engine_count(7), 7);
-        assert_eq!(io_uring.io_depth_per_engine(7), IO_URING_DEPTH_PER_WORKER);
+        let io_uring = IoEngine::IoUring(IoUringConfig::new(
+            IoUringPoolConfig::new(3, 8),
+            IoUringPoolConfig::new(2, 5),
+            IoUringPoolConfig::new(1, 2),
+        ));
+        let read = io_uring.read_topology();
+        assert_eq!(read.engine_count, 3);
+        assert_eq!(read.max_in_flight, 8);
+        assert_eq!(read.worker_threads, 3);
+        assert_eq!(read.depth_for_engine(0), 3);
+        assert_eq!(read.depth_for_engine(1), 3);
+        assert_eq!(read.depth_for_engine(2), 2);
+    }
+
+    #[test]
+    fn io_uring_pool_exposes_sq_poll_options() {
+        let sq_poll = IoUringSqPollConfig::new(2_000).with_cpu(3);
+        let pool = IoUringPoolConfig::new(2, 96).with_sq_poll(sq_poll);
+
+        assert_eq!(pool.rings(), 2);
+        assert_eq!(pool.max_in_flight(), 96);
+        assert_eq!(pool.sq_poll(), Some(sq_poll));
     }
 }

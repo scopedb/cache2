@@ -51,7 +51,10 @@ mod snapshot;
 
 pub use cache::{Cache, CacheBuilder, CacheTier, StaticConfig, Value};
 pub use error::{Error, ErrorKind, ErrorOperation, Result};
-pub use runtime_config::{IoEngine, IoMode, L1EvictionPolicy, RuntimeConfig};
+pub use runtime_config::{
+    IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
+    PosixIoConfig, RuntimeConfig,
+};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoDirectionSnapshot, CacheIoPathSnapshot,
     CacheIoSnapshot, CacheL1Snapshot, CacheReclaimSnapshot, CacheSnapshot, DetailedCacheSnapshot,

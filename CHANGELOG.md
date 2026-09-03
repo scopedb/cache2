@@ -2,12 +2,32 @@
 
 ## Unreleased
 
+### Breaking Changes
+
+- `IoEngine` now carries backend-specific topology. Configure POSIX worker
+  counts with `PosixIoConfig`; configure independent io_uring pools with
+  `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous
+  `with_read_io_workers`, `with_write_io_workers`, and
+  `with_reclaim_workers` methods were removed.
+
 ### Improvements
 
 - Read execution concurrency and bounded asynchronous wait capacity can now be
   configured independently. Queued reads receive FIFO priority within their
   selected engine, use its full physical depth, and cannot be bypassed by later
   immediate admissions.
+- The experimental io_uring engine exposes independent ring and aggregate
+  in-flight bounds for read, write, and reclaim pools, plus opt-in SQPOLL
+  idle/CPU affinity.
+
+### Performance
+
+- Hot read routes retain stable primary affinity but rotate their single
+  pressure-only fallback across all physical lanes.
+- Append workers are notified only for a new batch, a flush-threshold crossing,
+  or an urgent lifecycle event; repeated writes coalesce into the pending wake.
+- io_uring command wakeups coalesce while the driver has a pending socket
+  notification, avoiding one socket write per submitted request.
 
 ## v0.2.3 (2026-09-03)
 

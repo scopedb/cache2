@@ -369,7 +369,9 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeConfig::default()
-        .with_read_io_workers(2)
+        .with_io_engine(crate::runtime_config::IoEngine::Posix(
+            crate::runtime_config::PosixIoConfig::new(2, 4, 1),
+        ))
         .with_read_io_wait_capacity(1)
         .with_read_io_wait_timeout(Duration::from_millis(30))
         .with_l1_capacity_bytes(0)
@@ -449,7 +451,9 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeConfig::default()
-        .with_read_io_workers(1)
+        .with_io_engine(crate::runtime_config::IoEngine::Posix(
+            crate::runtime_config::PosixIoConfig::new(1, 4, 1),
+        ))
         .with_read_io_wait_timeout(Duration::from_secs(1))
         .with_l1_capacity_bytes(0);
     let mut store = RegionStore::open(
@@ -606,9 +610,9 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
         let runtime_config = RuntimeConfig::default()
-            .with_io_engine(crate::runtime_config::IoEngine::Posix)
-            .with_read_io_workers(1)
-            .with_write_io_workers(1)
+            .with_io_engine(crate::runtime_config::IoEngine::Posix(
+                crate::runtime_config::PosixIoConfig::new(1, 1, 1),
+            ))
             .with_l1_capacity_bytes(0)
             .with_managed_memory_limit_bytes(32 * 1024 * 1024)
             .with_write_flush_threshold_bytes(128 * 1024);
@@ -800,7 +804,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
             .try_stage_value(&staging, 0, hash, record_bytes, key.as_bytes(), &value)
             .unwrap()
         {
-            RegionStageValue::Staged(seqno) => {
+            RegionStageValue::Staged { seqno, .. } => {
                 if first.is_none() {
                     first = Some((key.clone(), hash, seqno));
                 }
@@ -955,7 +959,7 @@ fn same_hash_candidate_requires_full_key() {
     let value = b"owner-value-must-not-leak";
     let owner_hash = hash_key(data.hash_seed, owner_key);
     let owner_record_bytes = required_record_bytes(owner_key.len(), value.len()).unwrap();
-    let RegionStageValue::Staged(_) = runtime
+    let RegionStageValue::Staged { .. } = runtime
         .try_stage_value(
             &staging,
             0,
@@ -1094,7 +1098,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
-    let RegionStageValue::Staged(_) = runtime
+    let RegionStageValue::Staged { .. } = runtime
         .try_stage_value(&staging, 0, hash, record_bytes, b"key", &[7; 16 * 1024])
         .unwrap()
     else {

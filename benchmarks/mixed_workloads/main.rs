@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode,
-    L1EvictionPolicy, RuntimeConfig, StaticConfig,
+    Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StaticConfig,
 };
 use tokio::sync::Barrier;
 
@@ -219,8 +219,26 @@ impl HarnessConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix,
-            "io-uring" => IoEngine::IoUring,
+            "posix" => IoEngine::Posix(PosixIoConfig::new(
+                read_io_workers,
+                write_io_workers,
+                reclaim_workers,
+            )),
+            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+                IoUringPoolConfig::new(
+                    read_io_workers,
+                    read_io_workers
+                        .checked_mul(64)
+                        .ok_or_else(|| invalid("read io_uring depth is too large"))?,
+                ),
+                IoUringPoolConfig::new(
+                    write_io_workers,
+                    write_io_workers
+                        .checked_mul(64)
+                        .ok_or_else(|| invalid("write io_uring depth is too large"))?,
+                ),
+                IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
+            )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
@@ -393,9 +411,6 @@ impl EffectiveConfig {
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
-            .with_read_io_workers(self.read_io_workers)
-            .with_write_io_workers(self.write_io_workers)
-            .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.l1_bytes)
             .with_l1_eviction_policy(self.l1_eviction_policy)

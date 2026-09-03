@@ -21,7 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
-    IoMode, L1EvictionPolicy, RuntimeConfig, StartupMode, StaticConfig,
+    IoMode, IoUringConfig, IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig,
+    StartupMode, StaticConfig,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -124,7 +125,12 @@ impl SoakConfig {
         };
         let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
         let require_reinsert_coverage = env_bool("CACHE_SOAK_REQUIRE_REINSERT_COVERAGE", false)?;
-        let io_engine = parse_io_engine("CACHE_SOAK_IO_ENGINE")?;
+        let io_engine = parse_io_engine(
+            "CACHE_SOAK_IO_ENGINE",
+            read_io_workers,
+            write_io_workers,
+            reclaim_workers,
+        )?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -189,9 +195,6 @@ impl SoakConfig {
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
-            .with_read_io_workers(self.read_io_workers)
-            .with_write_io_workers(self.write_io_workers)
-            .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_l1_eviction_policy(self.l1_eviction_policy)
@@ -1122,13 +1125,36 @@ fn env_bool(name: &str, default: bool) -> io::Result<bool> {
     }
 }
 
-fn parse_io_engine(name: &str) -> io::Result<IoEngine> {
+fn parse_io_engine(
+    name: &str,
+    read_workers: usize,
+    write_workers: usize,
+    reclaim_workers: usize,
+) -> io::Result<IoEngine> {
     match env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
-        "posix" => Ok(IoEngine::Posix),
-        "io-uring" => Ok(IoEngine::IoUring),
+        "posix" => Ok(IoEngine::Posix(PosixIoConfig::new(
+            read_workers,
+            write_workers,
+            reclaim_workers,
+        ))),
+        "io-uring" => Ok(IoEngine::IoUring(IoUringConfig::new(
+            IoUringPoolConfig::new(
+                read_workers,
+                read_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("read io_uring depth is too large"))?,
+            ),
+            IoUringPoolConfig::new(
+                write_workers,
+                write_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("write io_uring depth is too large"))?,
+            ),
+            IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
+        ))),
         value => Err(invalid(format!("unsupported I/O engine: {value}"))),
     }
 }

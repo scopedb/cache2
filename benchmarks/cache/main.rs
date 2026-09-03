@@ -21,8 +21,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode,
-    L1EvictionPolicy, RuntimeConfig, StartupMode, StaticConfig, Value,
+    Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
+    Value,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -92,8 +93,26 @@ impl BenchConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix,
-            "io-uring" => IoEngine::IoUring,
+            "posix" => IoEngine::Posix(PosixIoConfig::new(
+                read_io_workers,
+                write_io_workers,
+                reclaim_workers,
+            )),
+            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+                IoUringPoolConfig::new(
+                    read_io_workers,
+                    read_io_workers
+                        .checked_mul(64)
+                        .ok_or_else(|| invalid("read io_uring depth is too large"))?,
+                ),
+                IoUringPoolConfig::new(
+                    write_io_workers,
+                    write_io_workers
+                        .checked_mul(64)
+                        .ok_or_else(|| invalid("write io_uring depth is too large"))?,
+                ),
+                IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
+            )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_BENCH_IO_MODE")
@@ -242,11 +261,8 @@ impl BenchConfig {
         RuntimeConfig::default()
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
-            .with_read_io_workers(self.read_io_workers)
             .with_read_io_wait_capacity(self.read_io_wait_capacity)
             .with_read_io_wait_timeout(self.read_io_wait_timeout)
-            .with_write_io_workers(self.write_io_workers)
-            .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_l1_eviction_policy(self.l1_eviction_policy)
@@ -258,7 +274,7 @@ impl BenchConfig {
         match (self.io_engine, self.read_io_wait_timeout.is_zero()) {
             // Keep the benchmark at the POSIX engine's exact admission depth.
             // Saturation misses belong in the soak, not the device-rate phase.
-            (IoEngine::Posix, true) => self.clients.min(self.read_io_workers),
+            (IoEngine::Posix(_), true) => self.clients.min(self.read_io_workers),
             _ => self.clients,
         }
     }

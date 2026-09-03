@@ -95,29 +95,30 @@ complete geometry and memory plan before creating cache files.
 
 ### Runtime tuning
 
-| Area    | Controls                                                                          | Default and behavior                                                                        |
-|---------|-----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
-| L1      | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy`             | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| Reads   | `with_read_io_workers`, `with_read_io_wait_capacity`, `with_read_io_wait_timeout` | Four workers and immediate admission; wait capacity defaults to the worker count.            |
-| Writes  | `with_write_io_workers`, `with_append_shards`, `with_write_flush_threshold_bytes` | Four workers, four append shards, 4 MiB flush threshold.                                    |
-| Reclaim | `with_reclaim_workers`                                                            | One worker with its own Region-sized scan buffer and read lane.                             |
-| Memory  | `with_managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                     |
-| I/O     | `with_io_engine`, `with_io_mode`                                                  | Buffered POSIX I/O.                                                                         |
-| Metrics | `with_statistics`                                                                 | Health and resource gauges enabled; cumulative activity counters opt in.                    |
+| Area      | Controls                                                                              | Default and behavior                                                                        |
+|-----------|---------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| L1        | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy`                 | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
+| I/O pools | `with_io_engine(IoEngine::Posix(PosixIoConfig))` or `IoEngine::IoUring(IoUringConfig)` | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
+| Read wait | `with_read_io_wait_capacity`, `with_read_io_wait_timeout`                             | Immediate admission; wait capacity defaults to aggregate read capacity.                    |
+| Writes    | `with_append_shards`, `with_write_flush_threshold_bytes`                              | Four append shards and a 4 MiB flush threshold.                                             |
+| Memory    | `with_managed_memory_limit_bytes`                                                     | 1 GiB across cache-managed allocations.                                                     |
+| I/O mode  | `with_io_mode`                                                                          | Buffered I/O.                                                                               |
+| Metrics   | `with_statistics`                                                                       | Health and resource gauges enabled; cumulative activity counters opt in.                    |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm
 open. Growth uses available Free Regions; when there are not enough, the
 disposable cache safely starts empty.
 
 The default read-wait timeout is zero, so read-engine or buffer pressure returns
-a miss. A positive timeout enables a short queue with at most one waiter per
-read worker. Queued requests retain their read plan and allocate a buffer after
+a miss. A positive timeout enables a queue bounded by the configured wait
+capacity. Queued requests retain their read plan and allocate a buffer after
 admission. Queue saturation, memory pressure, and timeout return explicit
 overload.
 
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
 mode. io_uring requires the `io-uring` feature and remains experimental in
-0.2.
+0.2; its ring count and aggregate in-flight limit are independent. SQPOLL is an
+explicit per-pool opt-in, with configurable idle time and optional CPU affinity.
 
 ### Platform support
 

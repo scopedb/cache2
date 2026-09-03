@@ -65,7 +65,7 @@ use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 use crate::io_backend::{RuntimeIoDirection, RuntimeIoPath};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
 #[cfg(unix)]
-use crate::runtime_config::IoEngine as ConfiguredIoEngine;
+use crate::runtime_config::{IoEngine as ConfiguredIoEngine, IoUringPoolConfig};
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
@@ -1916,11 +1916,12 @@ pub(crate) fn build_file_engine(
     max_in_flight: usize,
     posix_workers: usize,
     kind: ConfiguredIoEngine,
+    io_uring_config: Option<IoUringPoolConfig>,
     statistics_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        ConfiguredIoEngine::Posix => BackendIoEngine::new_with_files_and_workers(
+        ConfiguredIoEngine::Posix(_) => BackendIoEngine::new_with_files_and_workers(
             files,
             max_in_flight,
             posix_workers,
@@ -1928,7 +1929,7 @@ pub(crate) fn build_file_engine(
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        ConfiguredIoEngine::IoUring => {
+        ConfiguredIoEngine::IoUring(_) => {
             let _ = posix_workers;
             #[cfg(all(
                 feature = "io-uring",
@@ -1942,9 +1943,16 @@ pub(crate) fn build_file_engine(
                 )
             ))]
             {
+                let io_uring_config = io_uring_config.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "io_uring pool configuration is missing",
+                    )
+                })?;
                 UringIoEngine::new_with_files(
                     files,
                     max_in_flight,
+                    io_uring_config,
                     statistics_enabled,
                     read_wait_enabled,
                 )
@@ -1963,6 +1971,7 @@ pub(crate) fn build_file_engine(
             )))]
             {
                 let _ = files;
+                let _ = io_uring_config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "io_uring is unavailable on this build or platform",
