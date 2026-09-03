@@ -136,6 +136,8 @@ memory, key count, mixed value sizes, client counts, worker topology, I/O path,
 and output directory. Important qualification switches are:
 
 - `CACHE_SOAK_WARM_REOPEN=true` to recover before measurement;
+- `CACHE_SOAK_WRITERS=0` with warm reopen to measure a pre-populated,
+  read-only mixed-size data set;
 - `CACHE_SOAK_FINAL_WARM_VERIFY=true` to scan every key after recovery and
   validate every hit;
 - `CACHE_SOAK_REQUIRE_PATH_COVERAGE=true` to require writes, deletes, L2 reads,

@@ -153,7 +153,7 @@ impl SoakConfig {
             || reclaim_workers > shard_count
             || read_io_workers == 0
             || write_io_workers == 0
-            || writers == 0
+            || (writers == 0 && !warm_reopen)
             || readers == 0
             || operation_interval > Duration::from_secs(1)
             || !directory.is_dir()
@@ -993,12 +993,14 @@ fn report_sample(
         .saturating_add(io.write.requests_cancelled)
         .saturating_add(io.write.requests_failed);
     if complete {
-        JobReport::new("cache_soak", None, "put", "write", elapsed, counters.writes)
-            .workers(config.writers)
-            .bytes(u128::from(resources.written_bytes))
-            .errors(counters.write_rejections)
-            .latency(&counters.put_latency, config.latency_sample_interval)
-            .emit();
+        if config.writers != 0 {
+            JobReport::new("cache_soak", None, "put", "write", elapsed, counters.writes)
+                .workers(config.writers)
+                .bytes(u128::from(resources.written_bytes))
+                .errors(counters.write_rejections)
+                .latency(&counters.put_latency, config.latency_sample_interval)
+                .emit();
+        }
         JobReport::new(
             "cache_soak",
             None,
@@ -1011,18 +1013,20 @@ fn report_sample(
         .bytes(u128::from(resources.served_bytes))
         .latency(&counters.get_latency, config.latency_sample_interval)
         .emit();
-        JobReport::new(
-            "cache_soak",
-            None,
-            "delete",
-            "trim",
-            elapsed,
-            counters.deletes,
-        )
-        .workers(config.writers)
-        .errors(counters.delete_rejections)
-        .latency(&counters.delete_latency, config.latency_sample_interval)
-        .emit();
+        if config.writers != 0 {
+            JobReport::new(
+                "cache_soak",
+                None,
+                "delete",
+                "trim",
+                elapsed,
+                counters.deletes,
+            )
+            .workers(config.writers)
+            .errors(counters.delete_rejections)
+            .latency(&counters.delete_latency, config.latency_sample_interval)
+            .emit();
+        }
         JobReport::new("cache_soak", None, "drain", "control", drain_elapsed, 1).emit();
         emit_cache_report(
             "cache_soak",
