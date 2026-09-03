@@ -168,7 +168,6 @@ impl UringIoEngine {
                     ring,
                     wake_receiver,
                     wake_pending,
-                    config.io_poll(),
                     worker_shared,
                     worker_submit_state,
                     receiver,
@@ -318,7 +317,6 @@ fn uring_driver(
     mut ring: IoUring,
     wake_receiver: UnixStream,
     wake_pending: Arc<AtomicBool>,
-    io_poll: bool,
     shared: Arc<RuntimeShared>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
@@ -326,6 +324,7 @@ fn uring_driver(
     let max_in_flight = shared.max_in_flight;
     let submission_capacity = ring.submission().capacity();
     let completion_capacity = ring.completion().capacity();
+    let io_poll = ring.params().is_setup_iopoll();
     let mut driver = UringDriver {
         files: Some(files),
         ring: Some(ring),
@@ -958,36 +957,6 @@ fn cancelled_before_resubmit_status(flight: &Flight) -> CompletionStatus {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn socket_wake_coalesces_until_driver_clears_pending() {
-        let (sender, mut receiver) = UnixStream::pair().unwrap();
-        sender.set_nonblocking(true).unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let pending = Arc::new(AtomicBool::new(false));
-        let wake = SocketWake {
-            sender,
-            pending: Arc::clone(&pending),
-        };
-
-        wake.wake();
-        wake.wake();
-        let mut byte = [0_u8; 1];
-        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
-        assert_eq!(
-            receiver.read(&mut byte).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-
-        pending.store(false, Ordering::Release);
-        wake.wake();
-        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
-    }
-}
-
 fn build_target_entry(
     file_fd: i32,
     request_id: RequestId,
@@ -1021,5 +990,35 @@ fn build_target_entry(
                 .build()
                 .user_data(request_id.get()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_wake_coalesces_until_driver_clears_pending() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let pending = Arc::new(AtomicBool::new(false));
+        let wake = SocketWake {
+            sender,
+            pending: Arc::clone(&pending),
+        };
+
+        wake.wake();
+        wake.wake();
+        let mut byte = [0_u8; 1];
+        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
+        assert_eq!(
+            receiver.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        pending.store(false, Ordering::Release);
+        wake.wake();
+        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
     }
 }
