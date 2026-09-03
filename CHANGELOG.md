@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Improvements
+
+- Read execution concurrency and bounded asynchronous wait capacity can now be
+  configured independently. Queued reads receive FIFO priority within their
+  selected engine, use its full physical depth, and cannot be bypassed by later
+  immediate admissions.
+
 ## v0.2.3 (2026-09-03)
 
 This release keeps the version 1 on-disk format and requires no disk

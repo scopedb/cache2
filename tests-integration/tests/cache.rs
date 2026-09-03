@@ -774,7 +774,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
 
 #[tokio::test]
 async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 14] = [
+    let cases: [RuntimeConfigCase; 16] = [
         ("zero-append-shards", |config| config.with_append_shards(0)),
         ("too-many-append-shards", |config| {
             config.with_append_shards(257)
@@ -791,6 +791,12 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
         }),
         ("too-many-read-workers", |config| {
             config.with_read_io_workers(4097)
+        }),
+        ("zero-read-wait-capacity", |config| {
+            config.with_read_io_wait_capacity(0)
+        }),
+        ("too-large-read-wait-capacity", |config| {
+            config.with_read_io_wait_capacity(65_537)
         }),
         ("too-many-write-workers", |config| {
             config.with_write_io_workers(4097)

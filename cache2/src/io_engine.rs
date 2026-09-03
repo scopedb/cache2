@@ -29,7 +29,9 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mea::semaphore::OwnedSemaphorePermit;
+use tokio::sync::{
+    OwnedSemaphorePermit as TokioSemaphorePermit, Semaphore as TokioSemaphore, TryAcquireError,
+};
 
 #[cfg(all(
     feature = "io-uring",
@@ -896,6 +898,7 @@ fn submit_cache_io_until(
 
 pub(crate) trait IoEngine: Send + Sync {
     fn try_reserve_read(&self) -> io::Result<ReadSlot>;
+    fn read_slot_waiter(&self) -> ReadSlotWaiter;
     fn submit_reserved_read(
         &self,
         slot: ReadSlot,
@@ -951,9 +954,8 @@ pub(crate) trait IoEngine: Send + Sync {
 struct IoSlot {
     shared: Arc<RuntimeShared>,
     write: bool,
-    // The opt-in async admission permit drops only after the engine slot has
-    // been published as available by `IoSlot::drop`.
-    _read_permit: Option<OwnedSemaphorePermit>,
+    // This permit drops only after `IoSlot::drop` publishes physical capacity.
+    read_permit: Option<TokioSemaphorePermit>,
 }
 
 /// One read reservation against the engine's complete depth.
@@ -962,21 +964,123 @@ pub(crate) struct ReadSlot {
     slot: IoSlot,
 }
 
-impl ReadSlot {
-    pub(crate) fn with_async_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
-        debug_assert!(!self.slot.write);
-        self.slot._read_permit = Some(permit);
-        self
+/// An async reservation handle backed by the engine's physical slot state.
+pub(crate) struct ReadSlotWaiter {
+    shared: Arc<RuntimeShared>,
+}
+
+// The physical completion path must not allocate. Tokio's semaphore embeds
+// waiter nodes in acquisition futures and uses a fixed wake list; mea 0.6.x
+// allocates a temporary wake vector on every permit release. The outer bounded
+// read-wait capacity remains a mea semaphore in `region_runtime`.
+struct ReadSlotAdmission {
+    slots: Arc<TokioSemaphore>,
+    waiters: AtomicUsize,
+}
+
+impl ReadSlotAdmission {
+    fn new(max_in_flight: usize) -> Self {
+        Self {
+            slots: Arc::new(TokioSemaphore::new(max_in_flight)),
+            waiters: AtomicUsize::new(0),
+        }
+    }
+
+    fn register_waiter(&self) -> ReadWaiterGuard<'_> {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        ReadWaiterGuard { admission: self }
+    }
+
+    fn has_waiters(&self) -> bool {
+        self.waiters.load(Ordering::Acquire) != 0
+    }
+
+    fn try_acquire(&self) -> io::Result<TokioSemaphorePermit> {
+        if self.has_waiters() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a queued read has priority",
+            ));
+        }
+        let permit = Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                TryAcquireError::Closed => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
+                }
+                TryAcquireError::NoPermits => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
+                }
+            })?;
+        // Registration happens before an async acquire is polled. Rechecking
+        // closes the race with a waiter that arrived during the try-acquire.
+        if self.has_waiters() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a queued read has priority",
+            ));
+        }
+        Ok(permit)
+    }
+
+    async fn acquire_until(
+        &self,
+        deadline: Instant,
+        tokio_handle: &tokio::runtime::Handle,
+    ) -> io::Result<TokioSemaphorePermit> {
+        let acquire = Arc::clone(&self.slots).acquire_owned();
+        {
+            let _entered = tokio_handle.enter();
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
+        }
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"))
+    }
+
+    fn close(&self) {
+        self.slots.close();
+    }
+}
+
+struct ReadWaiterGuard<'a> {
+    admission: &'a ReadSlotAdmission,
+}
+
+impl Drop for ReadWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.admission.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ReadSlotWaiter {
+    pub(crate) async fn reserve_until(
+        self,
+        deadline: Instant,
+        tokio_handle: &tokio::runtime::Handle,
+    ) -> io::Result<ReadSlot> {
+        let admission = self
+            .shared
+            .read_slot_admission
+            .as_ref()
+            .ok_or_else(|| io::Error::other("async read admission is disabled"))?;
+        let _waiter = admission.register_waiter();
+        self.shared.ensure_accepting()?;
+        let permit = admission.acquire_until(deadline, tokio_handle).await?;
+        self.shared.try_reserve_read_slot(Some(permit))
     }
 }
 
 impl Drop for IoSlot {
     fn drop(&mut self) {
-        let _slot = lock_unpoisoned(&self.shared.slot_lock);
-        self.shared
-            .slot_state
-            .fetch_sub(slot_delta(self.write), Ordering::AcqRel);
-        self.shared.slot_available.notify_one();
+        {
+            let _slot = lock_unpoisoned(&self.shared.slot_lock);
+            self.shared
+                .slot_state
+                .fetch_sub(slot_delta(self.write), Ordering::AcqRel);
+            self.shared.slot_available.notify_one();
+        }
+        drop(self.read_permit.take());
     }
 }
 
@@ -1014,6 +1118,7 @@ struct RuntimeShared {
     unfenced_writes: AtomicBool,
     slot_lock: Mutex<()>,
     slot_available: Condvar,
+    read_slot_admission: Option<ReadSlotAdmission>,
     #[cfg(test)]
     quarantined_buffers: Mutex<Vec<IoBuffer>>,
 }
@@ -1025,7 +1130,7 @@ enum SlotWaitError {
 }
 
 impl RuntimeShared {
-    fn new(max_in_flight: usize, statistics_enabled: bool) -> Self {
+    fn new(max_in_flight: usize, statistics_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
             max_in_flight,
             statistics_enabled,
@@ -1042,6 +1147,7 @@ impl RuntimeShared {
             unfenced_writes: AtomicBool::new(false),
             slot_lock: Mutex::new(()),
             slot_available: Condvar::new(),
+            read_slot_admission: read_wait_enabled.then(|| ReadSlotAdmission::new(max_in_flight)),
             #[cfg(test)]
             quarantined_buffers: Mutex::new(Vec::new()),
         }
@@ -1053,6 +1159,17 @@ impl RuntimeShared {
 
     fn writes_in_flight(&self) -> usize {
         active_write_slots(self.slot_state.load(Ordering::Acquire))
+    }
+
+    fn ensure_accepting(&self) -> io::Result<()> {
+        if self.accepting.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "I/O engine is shut down",
+            ))
+        }
     }
 
     fn try_reserve_slot(self: &Arc<Self>, write: bool) -> Option<IoSlot> {
@@ -1077,13 +1194,36 @@ impl RuntimeShared {
                     return Some(IoSlot {
                         shared: Arc::clone(self),
                         write,
-                        _read_permit: None,
+                        read_permit: None,
                     });
                 }
                 Err(observed) => current = observed,
             }
         }
         None
+    }
+
+    fn try_reserve_read_slot(
+        self: &Arc<Self>,
+        permit: Option<TokioSemaphorePermit>,
+    ) -> io::Result<ReadSlot> {
+        self.ensure_accepting()?;
+        let mut slot = self
+            .try_reserve_slot(false)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))?;
+        slot.read_permit = permit;
+        Ok(ReadSlot { slot })
+    }
+
+    fn stop_accepting_slots(&self) {
+        {
+            let _slot = lock_unpoisoned(&self.slot_lock);
+            self.accepting.store(false, Ordering::Release);
+            self.slot_available.notify_all();
+        }
+        if let Some(admission) = &self.read_slot_admission {
+            admission.close();
+        }
     }
 
     #[cfg(test)]
@@ -1417,16 +1557,19 @@ impl RuntimeInner {
     }
 
     fn try_reserve_read(&self) -> io::Result<ReadSlot> {
-        if !self.shared.accepting.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "I/O engine is shut down",
-            ));
+        let permit = self
+            .shared
+            .read_slot_admission
+            .as_ref()
+            .map(ReadSlotAdmission::try_acquire)
+            .transpose()?;
+        self.shared.try_reserve_read_slot(permit)
+    }
+
+    fn read_slot_waiter(&self) -> ReadSlotWaiter {
+        ReadSlotWaiter {
+            shared: Arc::clone(&self.shared),
         }
-        self.shared
-            .try_reserve_slot(false)
-            .map(|slot| ReadSlot { slot })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))
     }
 
     fn submit_reserved_read(
@@ -1660,11 +1803,7 @@ impl RuntimeInner {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
-        {
-            let _slot = lock_unpoisoned(&self.shared.slot_lock);
-            self.shared.accepting.store(false, Ordering::Release);
-            self.shared.slot_available.notify_all();
-        }
+        self.shared.stop_accepting_slots();
         drop(submit_state);
         if let Some(wake) = &self.wake {
             wake.wake();
@@ -1702,11 +1841,7 @@ impl RuntimeInner {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
-            {
-                let _slot = lock_unpoisoned(&self.shared.slot_lock);
-                self.shared.accepting.store(false, Ordering::Release);
-                self.shared.slot_available.notify_all();
-            }
+            self.shared.stop_accepting_slots();
             let mut error = None;
             for _ in 0..worker_count {
                 if self.commands.send(DriverCommand::Shutdown).is_err() {
@@ -1782,6 +1917,7 @@ pub(crate) fn build_file_engine(
     posix_workers: usize,
     kind: ConfiguredIoEngine,
     statistics_enabled: bool,
+    read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
         ConfiguredIoEngine::Posix => BackendIoEngine::new_with_files_and_workers(
@@ -1789,6 +1925,7 @@ pub(crate) fn build_file_engine(
             max_in_flight,
             posix_workers,
             statistics_enabled,
+            read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
         ConfiguredIoEngine::IoUring => {
@@ -1805,8 +1942,13 @@ pub(crate) fn build_file_engine(
                 )
             ))]
             {
-                UringIoEngine::new_with_files(files, max_in_flight, statistics_enabled)
-                    .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+                UringIoEngine::new_with_files(
+                    files,
+                    max_in_flight,
+                    statistics_enabled,
+                    read_wait_enabled,
+                )
+                .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
             }
             #[cfg(not(all(
                 feature = "io-uring",

@@ -50,6 +50,9 @@ struct BenchConfig {
     managed_memory_limit_bytes: usize,
     append_shards: u32,
     read_io_workers: usize,
+    read_io_wait_capacity: usize,
+    read_io_wait_timeout: Duration,
+    read_latency_sample_interval: usize,
     write_io_workers: usize,
     reclaim_workers: usize,
     write_clients: usize,
@@ -72,6 +75,15 @@ impl BenchConfig {
         let memory_mib = env_usize("CACHE_BENCH_MEMORY_MIB", 256)?;
         let append_shards = env_u32("CACHE_BENCH_APPEND_SHARDS", 4)?;
         let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
+        let read_io_wait_capacity =
+            env_usize("CACHE_BENCH_READ_IO_WAIT_CAPACITY", read_io_workers)?;
+        let read_io_wait_timeout_us = env_usize("CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US", 0)?;
+        let read_io_wait_timeout = Duration::from_micros(
+            u64::try_from(read_io_wait_timeout_us)
+                .map_err(|_| invalid("read I/O wait timeout is too large"))?,
+        );
+        let read_latency_sample_interval =
+            env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 0)?;
         let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
         let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
@@ -110,6 +122,7 @@ impl BenchConfig {
         if entries == 0
             || read_ops == 0
             || read_io_workers == 0
+            || read_io_wait_capacity == 0
             || write_io_workers == 0
             || reclaim_workers == 0
             || reclaim_workers > append_shards as usize
@@ -201,6 +214,9 @@ impl BenchConfig {
             managed_memory_limit_bytes,
             append_shards,
             read_io_workers,
+            read_io_wait_capacity,
+            read_io_wait_timeout,
+            read_latency_sample_interval,
             write_io_workers,
             reclaim_workers,
             write_clients,
@@ -227,6 +243,8 @@ impl BenchConfig {
             .with_io_engine(self.io_engine)
             .with_io_mode(self.io_mode)
             .with_read_io_workers(self.read_io_workers)
+            .with_read_io_wait_capacity(self.read_io_wait_capacity)
+            .with_read_io_wait_timeout(self.read_io_wait_timeout)
             .with_write_io_workers(self.write_io_workers)
             .with_reclaim_workers(self.reclaim_workers)
             .with_append_shards(self.append_shards)
@@ -237,10 +255,10 @@ impl BenchConfig {
     }
 
     fn l2_clients(&self) -> usize {
-        match self.io_engine {
+        match (self.io_engine, self.read_io_wait_timeout.is_zero()) {
             // Keep the benchmark at the POSIX engine's exact admission depth.
             // Saturation misses belong in the soak, not the device-rate phase.
-            IoEngine::Posix => self.clients.min(self.read_io_workers),
+            (IoEngine::Posix, true) => self.clients.min(self.read_io_workers),
             _ => self.clients,
         }
     }
@@ -327,6 +345,70 @@ struct ReadMeasurement {
     measurement: Measurement,
     primary: TierCounts,
     sampled: TierCounts,
+    latency: LatencyHistogram,
+}
+
+const LATENCY_BUCKETS: usize = 65;
+
+struct LatencyHistogram {
+    buckets: [u64; LATENCY_BUCKETS],
+    samples: u64,
+    maximum_ns: u64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0; LATENCY_BUCKETS],
+            samples: 0,
+            maximum_ns: 0,
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn record(&mut self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let bucket = if nanos <= 1 {
+            0
+        } else {
+            usize::try_from(u64::BITS - (nanos - 1).leading_zeros()).unwrap_or(64)
+        };
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.samples = self.samples.saturating_add(1);
+        self.maximum_ns = self.maximum_ns.max(nanos);
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (target, value) in self.buckets.iter_mut().zip(other.buckets) {
+            *target = target.saturating_add(value);
+        }
+        self.samples = self.samples.saturating_add(other.samples);
+        self.maximum_ns = self.maximum_ns.max(other.maximum_ns);
+    }
+
+    fn percentile_upper_bound_ns(&self, numerator: u64, denominator: u64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let target = self
+            .samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let mut seen = 0_u64;
+        for (index, count) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= target {
+                return if index >= 64 {
+                    u64::MAX
+                } else {
+                    1_u64 << index
+                };
+            }
+        }
+        u64::MAX
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -352,7 +434,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -366,6 +448,9 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config.append_shards,
         config.read_io_workers,
+        config.read_io_wait_capacity,
+        config.read_io_wait_timeout.as_micros(),
+        config.read_latency_sample_interval,
         config.write_io_workers,
         config.reclaim_workers,
         config.write_clients,
@@ -418,12 +503,12 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let l2_read = if config.hot_entries == 0 {
         let l2_read = concurrent_reads(
             Arc::clone(&cache),
-            0,
-            config.entries,
+            0..config.entries,
             config.entries,
             config.l2_clients(),
             CacheTier::L2,
             None,
+            config.read_latency_sample_interval,
         )
         .await?;
         if l1_entry_eligible {
@@ -437,6 +522,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             l2_read.measurement.elapsed,
             &l2_read.primary,
         );
+        report_read_latency("l2_latency", "L2 get latency", &l2_read.latency);
         l2_read.measurement
     } else {
         let _ = concurrent_writes(
@@ -459,8 +545,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             .transpose()?;
         let cold_scan = concurrent_reads(
             Arc::clone(&cache),
-            config.hot_entries,
-            config.entries - config.hot_entries,
+            config.hot_entries..config.entries,
             config.entries - config.hot_entries,
             config.l2_clients(),
             CacheTier::L2,
@@ -468,6 +553,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
                 entries: config.hot_entries,
                 interval: config.hot_read_interval,
             }),
+            config.read_latency_sample_interval,
         )
         .await?;
         report("l2_hot_scan", "L2 cold scan", &cold_scan.measurement);
@@ -477,6 +563,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             cold_scan.measurement.elapsed,
             &cold_scan.primary,
         );
+        report_read_latency("l2_scan_latency", "L2 scan latency", &cold_scan.latency);
         report_tiers(
             "hot_during_scan",
             "hot during scan",
@@ -579,15 +666,16 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             .transpose()?;
         let resident = concurrent_reads(
             Arc::clone(&cache),
-            0,
-            config.resident_entries,
+            0..config.resident_entries,
             config.read_ops,
             config.clients,
             CacheTier::L1,
             None,
+            config.read_latency_sample_interval,
         )
         .await?;
         report("resident_l1", "resident L1 get", &resident.measurement);
+        report_read_latency("resident_l1_latency", "L1 get latency", &resident.latency);
         if let Some(before) = before {
             let after = cache.snapshot()?;
             println!(
@@ -669,13 +757,15 @@ fn concurrent_writes(
 
 async fn concurrent_reads(
     cache: Arc<Cache>,
-    first_key: usize,
-    key_count: usize,
+    key_range: std::ops::Range<usize>,
     operations: usize,
     clients: usize,
     expected_tier: CacheTier,
     hot_reads: Option<HotReadPlan>,
+    latency_sample_interval: usize,
 ) -> io::Result<ReadMeasurement> {
+    let first_key = key_range.start;
+    let key_count = key_range.len();
     let barrier = Arc::new(tokio::sync::Barrier::new(clients + 1));
     let mut handles = Vec::with_capacity(clients);
     for client in 0..clients {
@@ -685,13 +775,20 @@ async fn concurrent_reads(
             barrier.wait().await;
             let mut primary = TierCounts::default();
             let mut sampled = TierCounts::default();
+            let mut latency = LatencyHistogram::default();
             for ordinal in (client..operations).step_by(clients) {
                 let key_ordinal = first_key + ordinal % key_count;
+                let started = (latency_sample_interval != 0
+                    && ordinal.is_multiple_of(latency_sample_interval))
+                .then(Instant::now);
                 let value = if expected_tier == CacheTier::L2 {
                     read_l2_once(&cache, key_ordinal).await?
                 } else {
                     Some(read_l1_eventually(&cache, key_ordinal, client).await?)
                 };
+                if let Some(started) = started {
+                    latency.record(started.elapsed());
+                }
                 primary.operations += 1;
                 if let Some(value) = value {
                     primary.bytes += value.len() as u128;
@@ -714,19 +811,21 @@ async fn concurrent_reads(
                     sample_tier(&cache, hot_key, ordinal, &mut sampled).await?;
                 }
             }
-            Ok::<_, io::Error>((primary, sampled))
+            Ok::<_, io::Error>((primary, sampled, latency))
         }));
     }
     barrier.wait().await;
     let started = Instant::now();
     let mut primary = TierCounts::default();
     let mut sampled = TierCounts::default();
+    let mut latency = LatencyHistogram::default();
     for handle in handles {
-        let (task_primary, task_sampled) = handle
+        let (task_primary, task_sampled, task_latency) = handle
             .await
             .map_err(|_| io::Error::other("benchmark reader panicked"))??;
         merge_tiers(&mut primary, task_primary);
         merge_tiers(&mut sampled, task_sampled);
+        latency.merge(task_latency);
     }
     let successful_operations = match expected_tier {
         CacheTier::L1 => primary.l1_hits,
@@ -742,6 +841,7 @@ async fn concurrent_reads(
         },
         primary,
         sampled,
+        latency,
     })
 }
 
@@ -938,6 +1038,23 @@ fn report_latency(phase: &str, name: &str, elapsed: Duration) {
     println!(
         "result phase={phase} elapsed_ns={} operations=0 bytes=0 ops_per_sec=0.000 mib_per_sec=0.000 checksum=0000000000000000",
         elapsed.as_nanos(),
+    );
+}
+
+fn report_read_latency(phase: &str, name: &str, latency: &LatencyHistogram) {
+    if latency.samples == 0 {
+        return;
+    }
+    let p50 = latency.percentile_upper_bound_ns(50, 100);
+    let p99 = latency.percentile_upper_bound_ns(99, 100);
+    let p999 = latency.percentile_upper_bound_ns(999, 1_000);
+    println!(
+        "{name:<20} samples={} p50<={p50} ns p99<={p99} ns p99.9<={p999} ns max={} ns",
+        latency.samples, latency.maximum_ns,
+    );
+    println!(
+        "result phase={phase} samples={} p50_upper_ns={p50} p99_upper_ns={p99} p999_upper_ns={p999} max_ns={}",
+        latency.samples, latency.maximum_ns,
     );
 }
 

@@ -99,6 +99,7 @@ pub struct RuntimeConfig {
     pub(crate) io_engine: IoEngine,
     pub(crate) io_mode: IoMode,
     pub(crate) read_io_workers: usize,
+    pub(crate) read_io_wait_capacity: Option<usize>,
     pub(crate) read_io_wait_timeout: Duration,
     pub(crate) write_io_workers: usize,
     pub(crate) reclaim_workers: usize,
@@ -117,6 +118,7 @@ impl Default for RuntimeConfig {
             io_engine: IoEngine::Posix,
             io_mode: IoMode::Buffered,
             read_io_workers: 4,
+            read_io_wait_capacity: None,
             read_io_wait_timeout: Duration::ZERO,
             write_io_workers: 4,
             reclaim_workers: 1,
@@ -160,12 +162,22 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the maximum number of reads waiting for execution capacity.
+    ///
+    /// By default this follows the configured read worker count. Waiting is
+    /// active only when [`Self::with_read_io_wait_timeout`] is non-zero. Valid
+    /// capacities range from one through 65536.
+    pub fn with_read_io_wait_capacity(mut self, capacity: usize) -> Self {
+        self.read_io_wait_capacity = Some(capacity);
+        self
+    }
+
     /// Sets how long an L2 candidate may wait for read execution capacity.
     ///
     /// Zero, the default, makes read-pool pressure a miss. A non-zero timeout
-    /// allows at most one waiter per read worker. A full queue, memory pressure,
-    /// or timeout is an overload error. Valid timeouts range from zero through
-    /// five seconds.
+    /// enables the bounded wait capacity. A full queue, memory pressure, or
+    /// timeout is an overload error. Valid timeouts range from zero through five
+    /// seconds.
     pub fn with_read_io_wait_timeout(mut self, timeout: Duration) -> Self {
         self.read_io_wait_timeout = timeout;
         self
@@ -278,6 +290,14 @@ impl RuntimeConfig {
         self.read_io_workers
     }
 
+    /// Returns the maximum number of reads waiting for execution capacity.
+    pub const fn read_io_wait_capacity(&self) -> usize {
+        match self.read_io_wait_capacity {
+            Some(capacity) => capacity,
+            None => self.read_io_workers,
+        }
+    }
+
     /// Returns the maximum wait for L2 read execution capacity.
     pub const fn read_io_wait_timeout(&self) -> Duration {
         self.read_io_wait_timeout
@@ -353,6 +373,7 @@ mod tests {
         assert_eq!(config.io_engine(), IoEngine::Posix);
         assert_eq!(config.io_mode(), IoMode::Buffered);
         assert_eq!(config.read_io_workers(), 4);
+        assert_eq!(config.read_io_wait_capacity(), 4);
         assert_eq!(config.read_io_wait_timeout(), Duration::ZERO);
         assert_eq!(config.write_io_workers(), 4);
         assert_eq!(config.reclaim_workers(), 1);
@@ -366,6 +387,16 @@ mod tests {
             MAX_WRITE_FLUSH_THRESHOLD_BYTES
         );
         assert!(!config.statistics_enabled());
+    }
+
+    #[test]
+    fn explicit_read_wait_capacity_is_independent_from_workers() {
+        let config = RuntimeConfig::default()
+            .with_read_io_wait_capacity(11)
+            .with_read_io_workers(7);
+
+        assert_eq!(config.read_io_workers(), 7);
+        assert_eq!(config.read_io_wait_capacity(), 11);
     }
 
     #[test]

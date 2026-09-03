@@ -72,6 +72,7 @@ impl UringIoEngine {
         files: RuntimeFileSet,
         max_in_flight: usize,
         statistics_enabled: bool,
+        read_wait_enabled: bool,
     ) -> io::Result<Self> {
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
         files.set_statistics_enabled(statistics_enabled);
@@ -120,7 +121,11 @@ impl UringIoEngine {
         let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
             sender: wake_sender,
         });
-        let shared = Arc::new(RuntimeShared::new(max_in_flight, statistics_enabled));
+        let shared = Arc::new(RuntimeShared::new(
+            max_in_flight,
+            statistics_enabled,
+            read_wait_enabled,
+        ));
         let command_capacity = max_in_flight
             .checked_mul(2)
             .and_then(|depth| depth.checked_add(1))
@@ -163,6 +168,10 @@ impl UringIoEngine {
 impl IoEngine for UringIoEngine {
     fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         self.inner.try_reserve_read()
+    }
+
+    fn read_slot_waiter(&self) -> ReadSlotWaiter {
+        self.inner.read_slot_waiter()
     }
 
     fn submit_reserved_read(
@@ -708,11 +717,7 @@ impl UringDriver {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
-        {
-            let _slot = lock_unpoisoned(&self.shared.slot_lock);
-            self.shared.accepting.store(false, Ordering::Release);
-            self.shared.slot_available.notify_all();
-        }
+        self.shared.stop_accepting_slots();
         // The false state is permanent. Release the fence before waking
         // completion consumers so a custom waker may safely re-enter the
         // engine and receive BrokenPipe instead of deadlocking.
