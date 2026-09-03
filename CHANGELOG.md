@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.2.3 (2026-09-03)
+
+This release keeps the version 1 on-disk format and requires no disk
+migration. It contains no source-breaking public API changes.
+
 ### Improvements
 
 - `Cache::close_fast` and `Cache::close_warm` now accept shared ownership, so
