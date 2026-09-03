@@ -15,6 +15,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -228,6 +229,96 @@ async fn fast_close_always_reopens_empty() {
     let reopened = files.config(7).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
+    reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn warm_close_with_retained_arc_fences_operations_and_recovers() {
+    let files = TestCache::new("warm-close-retained-arc");
+    let cache = Arc::new(files.config(2).open().await.unwrap());
+    let retained = Arc::clone(&cache);
+
+    cache.put("key", "value").unwrap();
+    cache.close_warm().await.unwrap();
+
+    assert!(cache.get("key").await.unwrap().is_none());
+    assert!(retained.get("key").await.unwrap().is_none());
+    for error in [
+        retained.put("key", "replacement").unwrap_err(),
+        retained.put_l2("key", "replacement").unwrap_err(),
+        retained.delete("key").unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+    }
+    assert_eq!(
+        retained.drain().await.unwrap_err().kind(),
+        ErrorKind::Unavailable
+    );
+    assert_eq!(
+        retained.snapshot().unwrap_err().kind(),
+        ErrorKind::Unavailable
+    );
+    assert_eq!(
+        retained.detailed_snapshot().unwrap_err().kind(),
+        ErrorKind::Unavailable
+    );
+    assert_eq!(
+        retained.close_fast().await.unwrap_err().kind(),
+        ErrorKind::Unavailable
+    );
+
+    let reopened = files.config(2).open().await.unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    assert_eq!(
+        reopened.get("key").await.unwrap().unwrap().as_ref(),
+        b"value"
+    );
+    reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn warm_close_fences_concurrent_arc_mutations() {
+    let files = TestCache::new("warm-close-concurrent-mutations");
+    let cache = Arc::new(files.config(2).open().await.unwrap());
+    let writer_cache = Arc::clone(&cache);
+    let ready = Arc::new(Barrier::new(2));
+    let writer_ready = Arc::clone(&ready);
+    let writer = thread::spawn(move || {
+        writer_ready.wait();
+        let mut accepted = Vec::new();
+        for ordinal in 0_u64..256 {
+            loop {
+                match writer_cache.put(ordinal.to_le_bytes(), ordinal.to_le_bytes()) {
+                    Ok(_) => {
+                        accepted.push(ordinal);
+                        break;
+                    }
+                    Err(error) if error.kind() == ErrorKind::Overloaded => thread::yield_now(),
+                    Err(error) if error.kind() == ErrorKind::Unavailable => return accepted,
+                    Err(error) => panic!("concurrent cache write failed: {error}"),
+                }
+            }
+        }
+        accepted
+    });
+
+    ready.wait();
+    cache.close_warm().await.unwrap();
+    let accepted = writer.join().unwrap();
+
+    let reopened = files.config(2).open().await.unwrap();
+    assert_eq!(reopened.startup_mode(), StartupMode::Warm);
+    for ordinal in accepted {
+        assert_eq!(
+            reopened
+                .get(ordinal.to_le_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            ordinal.to_le_bytes()
+        );
+    }
     reopened.close_fast().await.unwrap();
 }
 

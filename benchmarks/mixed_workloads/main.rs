@@ -712,10 +712,8 @@ async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
 
     drop(expected);
     drop(config);
-    Arc::try_unwrap(cache)
-        .map_err(|_| io::Error::other("benchmark retained a cache worker"))?
-        .close_fast()
-        .await?;
+    cache.close_fast().await?;
+    drop(cache);
     Ok(())
 }
 

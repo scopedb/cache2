@@ -46,13 +46,16 @@ use crate::region_metadata::{
 };
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
 use crate::runtime_config::{IoMode, RuntimeConfig};
+#[cfg(test)]
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
 
 use super::core::{
     FileRegionCore, RegionAccessState, RegionHealthLatch, RegionManagerAuthority, RegionShard,
     guarded_index_result, index_storage_io_error, region_metadata_io_error,
 };
-use crate::region_runtime::{HybridValueRead, RegionDataPlane};
+#[cfg(test)]
+use crate::region_runtime::HybridValueRead;
+use crate::region_runtime::RegionDataPlane;
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -79,8 +82,6 @@ impl RegionFiles {
         }
     }
 }
-/// Unique steady-state owner. Workers share only `core`; runtime resources and
-/// their join handles are attached here after RUNNING is durable.
 pub(crate) struct FileRegionRuntime {
     core: Arc<FileRegionCore>,
     data_plane: Option<RegionDataPlane>,
@@ -94,9 +95,8 @@ impl Deref for FileRegionRuntime {
     }
 }
 pub(crate) struct FrozenFileRegionView {
-    index: RegionIndex,
+    core: Arc<FileRegionCore>,
     metadata: RegionMetadata,
-    health: RegionHealthLatch,
 }
 
 pub(crate) struct CleanFileRegionImage {
@@ -203,26 +203,16 @@ impl FileRegionRuntime {
             )
         })
     }
-
-    fn into_core(self) -> io::Result<FileRegionCore> {
-        let Self { core, data_plane } = self;
-        if data_plane.is_some() {
-            return Err(io::Error::other(
-                "data plane must stop before freezing its core",
-            ));
-        }
-        Arc::try_unwrap(core)
-            .map_err(|_| io::Error::other("runtime still has live data-plane references"))
-    }
 }
 
 impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
-    pub(crate) fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.put(key, value)
+    pub(crate) fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
+        Ok(self.runtime()?.data_plane()?.clone())
     }
 
-    pub(crate) fn put_value_l2(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.put_l2(key, value)
+    #[cfg(test)]
+    pub(crate) fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.put(key, value)
     }
 
     #[cfg(test)]
@@ -230,6 +220,7 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
         self.runtime()?.data_plane()?.get(key)
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_value_async(
         &self,
         key: &[u8],
@@ -241,23 +232,17 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
             .await
     }
 
-    pub(crate) fn delete_value(&self, key: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.delete(key)
-    }
-
     #[cfg(test)]
     pub(crate) fn drain(&self) -> io::Result<()> {
         self.runtime()?.data_plane()?.drain()
     }
 
-    pub(crate) async fn drain_async(&self) -> io::Result<()> {
-        self.runtime()?.data_plane()?.drain_async().await
-    }
-
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
         self.runtime()?.data_plane()?.snapshot()
     }
 
+    #[cfg(test)]
     pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         self.runtime()?.data_plane()?.detailed_snapshot()
     }
@@ -919,43 +904,36 @@ where
             }
         }
         runtime.health.require_healthy()?;
-        let FileRegionCore {
-            index,
-            manager,
-            shards,
-            region_access: _,
-            rotation,
-            health,
-        } = runtime.into_core()?;
-        if shards.iter().any(|shard| shard.mutation.is_poisoned()) || rotation.is_poisoned() {
-            health.enter_miss_only();
+        let core = runtime.core;
+        if core.shards.iter().any(|shard| shard.mutation.is_poisoned())
+            || core.rotation.is_poisoned()
+        {
+            core.health.enter_miss_only();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "data shard gate is poisoned",
             ));
         }
-        let manager = manager.into_inner()?;
-        let partitions = index_partition_metadata(index.storage(), &health)?;
-        let metadata = manager
+        let partitions = index_partition_metadata(core.index.storage(), &core.health)?;
+        let metadata = core
+            .manager
+            .lock()?
             .freeze_metadata(partitions)
             .map_err(region_metadata_io_error)?;
-        health.require_healthy()?;
-        Ok(FrozenFileRegionView {
-            index,
-            metadata,
-            health,
-        })
+        core.health.require_healthy()?;
+        Ok(FrozenFileRegionView { core, metadata })
     }
 
     fn persist_frozen(&mut self, view: &Self::FrozenView) -> io::Result<Self::PreparedClean> {
-        view.health.require_healthy()?;
+        let health = &view.core.health;
+        health.require_healthy()?;
         let source_metadata = &view.metadata;
         source_metadata
             .validate()
             .map_err(region_metadata_io_error)?;
-        let storage = view.index.storage();
-        let physical_stats = guarded_index_result(&view.health, storage.physical_stats())?;
-        let partition_stats = guarded_index_result(&view.health, storage.partition_stats())?;
+        let storage = view.core.index.storage();
+        let physical_stats = guarded_index_result(health, storage.physical_stats())?;
+        let partition_stats = guarded_index_result(health, storage.partition_stats())?;
         if source_metadata.root.index_slots
             != u64::try_from(storage.slot_count()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
@@ -1038,7 +1016,7 @@ where
                 RECOVERY_IMAGE_INDEX_OFFSET,
             );
             let written = guarded_index_result(
-                &view.health,
+                health,
                 storage.write_warm_image(&mut writer, index_image_binding(header)),
             )?;
             if written.bytes_written != index_len
@@ -1056,10 +1034,10 @@ where
                 region_table_offset,
             )?;
             image.sync(SyncPoint::RecoveryImage, SyncMode::Data)?;
-            view.health.require_healthy()?;
+            health.require_healthy()?;
             self.file_system.rename(&temporary, &self.files.image)?;
             self.file_system.sync_parent(&self.files.image)?;
-            view.health.require_healthy()
+            health.require_healthy()
         })();
         if persisted.is_err() {
             let _ = self.file_system.remove_file(&temporary);
@@ -1068,7 +1046,7 @@ where
         self.prepared_clean = Some((clean_state.slot, clean_state.record));
         Ok(PreparedFileRegionClean {
             state: clean_state,
-            health: view.health.clone(),
+            health: health.clone(),
         })
     }
 
