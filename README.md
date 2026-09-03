@@ -117,9 +117,8 @@ overload.
 
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
 mode. io_uring requires the `io-uring` feature and remains experimental in
-0.2; its ring count and aggregate in-flight limit are independent. SQPOLL and
-IOPOLL are explicit per-pool opt-ins, and IOPOLL requires Direct mode plus
-filesystem and device polling support.
+0.2; its ring count and aggregate in-flight limit are independent. SQPOLL is an
+explicit per-pool opt-in, with configurable idle time and optional CPU affinity.
 
 ### Platform support
 

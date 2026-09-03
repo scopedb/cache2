@@ -101,9 +101,6 @@ impl UringIoEngine {
         })?;
         let mut builder = IoUring::builder();
         builder.setup_cqsize(completion_entries).dontfork();
-        if config.io_poll() {
-            builder.setup_iopoll();
-        }
         if let Some(sq_poll) = config.sq_poll() {
             builder.setup_sqpoll(sq_poll.idle_millis());
             if let Some(cpu) = sq_poll.cpu() {
@@ -308,7 +305,6 @@ struct UringDriver {
     pending_entries: Vec<PendingEntry>,
     submission_entries: Vec<squeue::Entry>,
     completion_events: Vec<(u64, i32)>,
-    io_poll: bool,
     shutting_down: bool,
 }
 
@@ -324,7 +320,6 @@ fn uring_driver(
     let max_in_flight = shared.max_in_flight;
     let submission_capacity = ring.submission().capacity();
     let completion_capacity = ring.completion().capacity();
-    let io_poll = ring.params().is_setup_iopoll();
     let mut driver = UringDriver {
         files: Some(files),
         ring: Some(ring),
@@ -343,7 +338,6 @@ fn uring_driver(
         pending_entries: Vec::with_capacity(submission_capacity),
         submission_entries: Vec::with_capacity(submission_capacity),
         completion_events: Vec::with_capacity(completion_capacity),
-        io_poll,
         shutting_down: false,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run()))
@@ -552,12 +546,6 @@ impl UringDriver {
                         flight.transferred,
                     )?
                 };
-                if self.io_poll && path != RuntimeIoPath::Direct {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "io_uring IOPOLL operation is not direct-I/O aligned",
-                    ));
-                }
                 let file_fd = self
                     .files
                     .as_ref()

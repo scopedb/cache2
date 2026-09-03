@@ -81,7 +81,6 @@ pub struct IoUringPoolConfig {
     rings: usize,
     max_in_flight: usize,
     sq_poll: Option<IoUringSqPollConfig>,
-    io_poll: bool,
 }
 
 impl IoUringPoolConfig {
@@ -91,7 +90,6 @@ impl IoUringPoolConfig {
             rings,
             max_in_flight,
             sq_poll: None,
-            io_poll: false,
         }
     }
 
@@ -99,15 +97,6 @@ impl IoUringPoolConfig {
     /// pool.
     pub const fn with_sq_poll(mut self, sq_poll: IoUringSqPollConfig) -> Self {
         self.sq_poll = Some(sq_poll);
-        self
-    }
-
-    /// Enables or disables completion polling for every ring in this pool.
-    ///
-    /// I/O polling consumes CPU while waiting and requires direct I/O on a
-    /// filesystem and block device that support polling.
-    pub const fn with_io_poll(mut self, enabled: bool) -> Self {
-        self.io_poll = enabled;
         self
     }
 
@@ -124,11 +113,6 @@ impl IoUringPoolConfig {
     /// Returns the submission queue polling configuration.
     pub const fn sq_poll(self) -> Option<IoUringSqPollConfig> {
         self.sq_poll
-    }
-
-    /// Returns whether completion polling is enabled.
-    pub const fn io_poll(self) -> bool {
-        self.io_poll
     }
 }
 
@@ -332,8 +316,7 @@ pub enum IoMode {
     /// Require Linux `O_DIRECT` support for aligned record I/O.
     ///
     /// Aligned direct-I/O errors are returned instead of falling back. A
-    /// necessarily unaligned remainder still uses the buffered descriptor
-    /// unless io_uring IOPOLL is enabled, in which case it is rejected.
+    /// necessarily unaligned remainder still uses the buffered descriptor.
     Direct,
 }
 
@@ -656,15 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn io_uring_pool_exposes_polling_options() {
+    fn io_uring_pool_exposes_sq_poll_options() {
         let sq_poll = IoUringSqPollConfig::new(2_000).with_cpu(3);
-        let pool = IoUringPoolConfig::new(2, 96)
-            .with_sq_poll(sq_poll)
-            .with_io_poll(true);
+        let pool = IoUringPoolConfig::new(2, 96).with_sq_poll(sq_poll);
 
         assert_eq!(pool.rings(), 2);
         assert_eq!(pool.max_in_flight(), 96);
         assert_eq!(pool.sq_poll(), Some(sq_poll));
-        assert!(pool.io_poll());
     }
 }

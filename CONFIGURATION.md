@@ -320,8 +320,8 @@ goal is device behavior rather than page-cache behavior.
 Direct mode is Linux-only and requires `O_DIRECT` for aligned record I/O. It
 reduces page-cache duplication but can amplify small reads and exposes aligned
 I/O failures instead of silently falling back. Control and recovery operations
-remain buffered. Without IOPOLL, necessarily unaligned runtime remainders use
-the buffered compatibility path.
+remain buffered. Necessarily unaligned runtime remainders use the buffered
+compatibility path.
 
 io_uring is feature-gated and experimental in 0.2. Its three pools configure
 physical rings and aggregate execution bounds independently:
@@ -333,8 +333,7 @@ use cache2::{
 };
 
 let read = IoUringPoolConfig::new(1, 128)
-    .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4))
-    .with_io_poll(true);
+    .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
 let runtime = RuntimeConfig::default()
     .with_io_engine(IoEngine::IoUring(IoUringConfig::new(
         read,
@@ -347,10 +346,8 @@ let runtime = RuntimeConfig::default()
 `rings` controls driver-thread and kernel-ring count. `max_in_flight` is the
 aggregate admission bound and is divided as evenly as possible across those
 rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to
-each ring in that pool. IOPOLL busy-polls completions, requires Direct mode and
-device/filesystem polling support, and rejects any runtime operation that
-would need the buffered compatibility path. SQPOLL and IOPOLL default off;
-requested flags fail explicitly when the kernel or device cannot provide them.
+each ring in that pool. SQPOLL defaults off; requested flags fail explicitly
+when the kernel cannot provide them.
 
 ### Statistics
 
