@@ -53,7 +53,7 @@ use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     BufferLease, CACHE_THREAD_STACK_BYTES, ResourceBuildError, ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{IoMode, RuntimeConfig};
+use crate::runtime_config::{IoMode, IoPoolTopology, RuntimeConfig};
 use crate::snapshot::{
     CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
 };
@@ -387,6 +387,7 @@ struct RunningOwner {
 struct RunningShared {
     core: Arc<FileRegionCore>,
     read_engines: Box<[Arc<dyn IoEngine>]>,
+    read_lane_cursor: AtomicUsize,
     read_waiters: Option<Arc<Semaphore>>,
     write_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
@@ -465,7 +466,7 @@ impl RunningShared {
     }
 
     fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-        try_reserve_read_lane(&self.read_engines, route)
+        try_reserve_read_lane(&self.read_engines, route, &self.read_lane_cursor)
     }
 
     fn try_queue_read(
@@ -509,6 +510,7 @@ impl RunningShared {
 fn try_reserve_read_lane(
     engines: &[Arc<dyn IoEngine>],
     route: u64,
+    pressure_cursor: &AtomicUsize,
 ) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
     let reserve = |lane: usize| -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
         let slot = engines[lane].try_reserve_read()?;
@@ -521,7 +523,9 @@ fn try_reserve_read_lane(
         Ok(reservation) => Ok(reservation),
         Err(error) if lane_count == 1 || !is_read_pressure(error.kind()) => Err(error),
         Err(primary_error) => {
-            let offset = 1 + route_hash(route.rotate_right(32), lane_count - 1);
+            // Keep the uncontended route stable, but rotate the one bounded
+            // fallback so a hot route can use every physical lane over time.
+            let offset = 1 + pressure_cursor.fetch_add(1, Ordering::Relaxed) % (lane_count - 1);
             let alternate = (primary + offset) % lane_count;
             match reserve(alternate) {
                 Ok(reservation) => Ok(reservation),
@@ -530,6 +534,10 @@ fn try_reserve_read_lane(
             }
         }
     }
+}
+
+fn should_wake_write(previous_bytes: usize, current_bytes: usize, threshold: usize) -> bool {
+    previous_bytes == 0 || (previous_bytes < threshold && current_bytes >= threshold)
 }
 
 #[derive(Clone)]
@@ -583,8 +591,11 @@ impl ShardControl {
         if state.stop {
             return Err(closed_runtime_error());
         }
+        let was_idle = state.wake_flags == 0;
         state.wake_flags |= flags;
-        self.changed.notify_one();
+        if was_idle {
+            self.changed.notify_one();
+        }
         Ok(())
     }
 
@@ -596,8 +607,11 @@ impl ShardControl {
         if state.stop {
             return Ok(());
         }
+        let was_idle = state.wake_flags == 0;
         state.wake_flags |= flags;
-        self.changed.notify_one();
+        if was_idle {
+            self.changed.notify_one();
+        }
         Ok(())
     }
 
@@ -674,7 +688,7 @@ impl RegionDataPlane {
         files: RuntimeFileSet,
         config: RuntimeConfig,
     ) -> io::Result<Self> {
-        core.configure_reclaim_workers(config.reclaim_workers)?;
+        core.configure_reclaim_workers(config.reclaim_io_max_in_flight())?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
         let operations = Arc::new(MutationGate::new());
@@ -750,7 +764,11 @@ impl RegionDataPlane {
             value,
         )?;
         match staged {
-            RegionStageValue::Staged(seqno) => {
+            RegionStageValue::Staged {
+                seqno,
+                previous_bytes,
+                current_bytes,
+            } => {
                 if ADMIT_L1 {
                     let _published = running.memory.publish(hash, key, value, seqno);
                 } else {
@@ -759,7 +777,13 @@ impl RegionDataPlane {
                     // valid best-effort stale outcome.
                     let _removed = running.memory.delete(hash, key, seqno);
                 }
-                control.notify(WAKE_DATA)?;
+                if should_wake_write(
+                    previous_bytes,
+                    current_bytes,
+                    running.write_flush_threshold_bytes,
+                ) {
+                    control.notify(WAKE_DATA)?;
+                }
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.puts);
                     RuntimeMetrics::add(&activity.written_bytes, value.len());
@@ -1313,16 +1337,17 @@ fn start_running(
         config.l1_eviction_policy,
         config.statistics,
     )?);
+    let reclaim_worker_count = config.reclaim_io_max_in_flight();
     let mut reclaim_buffers = Vec::new();
     reclaim_buffers
-        .try_reserve_exact(config.reclaim_workers)
+        .try_reserve_exact(reclaim_worker_count)
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "cannot allocate Region reclaim buffer owners",
             )
         })?;
-    for _ in 0..config.reclaim_workers {
+    for _ in 0..reclaim_worker_count {
         reclaim_buffers.push(resources.try_read_buffer(usable_region).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
@@ -1334,11 +1359,12 @@ fn start_running(
     let write_files = files.try_clone()?;
     let read_wait_enabled = !config.read_io_wait_timeout.is_zero();
     let read_engines =
-        build_engine_pool(files, &config, config.read_io_workers, read_wait_enabled)?;
+        build_engine_pool(files, &config, config.read_io_topology(), read_wait_enabled)?;
     let read_waiters =
         read_wait_enabled.then(|| Arc::new(Semaphore::new(config.read_io_wait_capacity())));
-    let write_engines = build_engine_pool(write_files, &config, config.write_io_workers, false)?;
-    let reclaim_engines = build_engine_pool(reclaim_files, &config, config.reclaim_workers, false)?;
+    let write_engines = build_engine_pool(write_files, &config, config.write_io_topology(), false)?;
+    let reclaim_engines =
+        build_engine_pool(reclaim_files, &config, config.reclaim_io_topology(), false)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1347,6 +1373,7 @@ fn start_running(
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
+        read_lane_cursor: AtomicUsize::new(0),
         read_waiters,
         write_engines,
         reclaim_engines,
@@ -1366,7 +1393,7 @@ fn start_running(
     let reclaim_on_start = shared.core.reclaim_needed()?;
     let mut reclaim_workers = Vec::new();
     reclaim_workers
-        .try_reserve_exact(config.reclaim_workers)
+        .try_reserve_exact(reclaim_worker_count)
         .map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate worker handles")
         })?;
@@ -1397,7 +1424,6 @@ fn start_running(
             }
         }
     }
-    let reclaim_worker_count = config.reclaim_workers;
     for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
         let reclaim_shared = Arc::clone(&shared);
         match std::thread::Builder::new()
@@ -1438,18 +1464,17 @@ fn start_running(
 fn build_engine_pool(
     files: RuntimeFileSet,
     config: &RuntimeConfig,
-    workers: usize,
+    topology: IoPoolTopology,
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
-    let engine_count = config.io_engine_count(workers);
+    let engine_count = topology.engine_count;
     let mut engines = Vec::new();
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let engine_depth = config.io_depth_per_engine(workers);
-    let posix_workers = if config.io_engine() == crate::runtime_config::IoEngine::Posix {
-        workers
+    let posix_workers = if config.io_engine().is_posix() {
+        topology.max_in_flight
     } else {
         1
     };
@@ -1461,9 +1486,10 @@ fn build_engine_pool(
         };
         engines.push(build_file_engine(
             worker_files,
-            engine_depth,
+            topology.depth_for_engine(engine),
             posix_workers,
             config.io_engine(),
+            topology.io_uring,
             config.statistics,
             read_wait_enabled,
         )?);
@@ -1583,11 +1609,7 @@ fn reclaim_worker_result(
     worker_id: usize,
     worker_count: usize,
 ) -> io::Result<()> {
-    let engine_index = if shared.reclaim_engines.len() == 1 {
-        0
-    } else {
-        worker_id
-    };
+    let engine_index = route_hash(worker_id as u64, shared.reclaim_engines.len());
     let engine = shared.reclaim_engines.get(engine_index).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1680,7 +1702,7 @@ fn reclaim_worker_result(
                     .core
                     .try_stage_reinsert(&shared.staging, reinsert_shard, record)?
                 {
-                    RegionStageValue::Staged(_) => {
+                    RegionStageValue::Staged { .. } => {
                         staged_reinsert = true;
                         Ok(true)
                     }
@@ -2076,11 +2098,12 @@ mod tests {
             Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
         ]
         .into_boxed_slice();
+        let pressure_cursor = AtomicUsize::new(0);
         let primary = engines[0].try_reserve_read().unwrap();
 
-        let (selected, alternate) = try_reserve_read_lane(&engines, 0).unwrap();
+        let (selected, alternate) = try_reserve_read_lane(&engines, 0, &pressure_cursor).unwrap();
         assert!(Arc::ptr_eq(&selected, &engines[1]));
-        let error = match try_reserve_read_lane(&engines, 0) {
+        let error = match try_reserve_read_lane(&engines, 0, &pressure_cursor) {
             Ok(_) => panic!("both read lanes are already reserved"),
             Err(error) => error,
         };
@@ -2091,7 +2114,7 @@ mod tests {
         drop(selected);
 
         engines[0].stop_accepting_requests();
-        let (selected, alternate) = try_reserve_read_lane(&engines, 0).unwrap();
+        let (selected, alternate) = try_reserve_read_lane(&engines, 0, &pressure_cursor).unwrap();
         assert!(Arc::ptr_eq(&selected, &engines[1]));
         drop(alternate);
         drop(selected);
@@ -2102,6 +2125,48 @@ mod tests {
         drop(engines);
         drop(backend);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
+        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cache2-read-lane-rotation-{}-{id}.cache",
+            std::process::id()
+        ));
+        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
+        let engines: Box<[Arc<dyn IoEngine>]> = (0..4)
+            .map(|_| {
+                Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap())
+                    as Arc<dyn IoEngine>
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let pressure_cursor = AtomicUsize::new(0);
+        let primary = engines[0].try_reserve_read().unwrap();
+
+        for expected in 1..4 {
+            let (selected, slot) = try_reserve_read_lane(&engines, 0, &pressure_cursor).unwrap();
+            assert!(Arc::ptr_eq(&selected, &engines[expected]));
+            drop(slot);
+            drop(selected);
+        }
+
+        drop(primary);
+        for engine in &engines {
+            engine.shutdown().unwrap();
+        }
+        drop(engines);
+        drop(backend);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn write_wake_is_only_needed_for_new_batches_and_threshold_crossings() {
+        assert!(should_wake_write(0, 64, 4096));
+        assert!(!should_wake_write(64, 128, 4096));
+        assert!(should_wake_write(4032, 4096, 4096));
+        assert!(!should_wake_write(4096, 4160, 4096));
     }
 
     #[test]
@@ -2321,7 +2386,9 @@ mod tests {
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
         let base = RuntimeConfig::default()
-            .with_read_io_workers(7)
+            .with_io_engine(crate::runtime_config::IoEngine::Posix(
+                crate::runtime_config::PosixIoConfig::new(7, 4, 1),
+            ))
             .with_read_io_wait_capacity(11);
         let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
         let with_wait = runtime_topology_memory_bytes(
@@ -2357,7 +2424,9 @@ mod tests {
         let base = RuntimeConfig::default()
             .with_l1_capacity_bytes(10 * GIB)
             .with_managed_memory_limit_bytes(15 * GIB)
-            .with_reclaim_workers(2)
+            .with_io_engine(crate::runtime_config::IoEngine::Posix(
+                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
+            ))
             .with_l1_shards(64);
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
@@ -2417,7 +2486,9 @@ mod tests {
             .with_l1_capacity_bytes(0);
         let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
         let (_, parallel_minimum) = base
-            .with_reclaim_workers(2)
+            .with_io_engine(crate::runtime_config::IoEngine::Posix(
+                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
+            ))
             .memory_plan_bytes(geometry, 4, 0)
             .unwrap();
 

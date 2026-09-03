@@ -19,8 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cache2::{
-    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, RuntimeConfig, StartupMode,
-    StaticConfig,
+    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig, RuntimeConfig,
+    StartupMode, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -78,10 +78,8 @@ impl ScaleConfig {
 
     fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig::default()
-            .with_io_engine(IoEngine::Posix)
+            .with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 1)))
             .with_io_mode(IoMode::Buffered)
-            .with_read_io_workers(1)
-            .with_write_io_workers(1)
             .with_append_shards(4)
             .with_l1_capacity_bytes(self.memory_bytes)
             .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)

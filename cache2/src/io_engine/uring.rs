@@ -36,10 +36,14 @@ const MAX_WAKE_ATTEMPTS: usize = 4;
 
 struct SocketWake {
     sender: UnixStream,
+    pending: Arc<AtomicBool>,
 }
 
 impl DriverWake for SocketWake {
     fn wake(&self) {
+        if self.pending.load(Ordering::Acquire) || self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let mut sender = &self.sender;
         for _ in 0..MAX_WAKE_ATTEMPTS {
             match sender.write(&[1]) {
@@ -52,10 +56,12 @@ impl DriverWake for SocketWake {
                     // Closing or failing the socket also completes the
                     // driver's outstanding read, so it will observe the
                     // command channel instead of treating this as success.
+                    self.pending.store(false, Ordering::Release);
                     return;
                 }
             }
         }
+        self.pending.store(false, Ordering::Release);
     }
 }
 
@@ -71,6 +77,7 @@ impl UringIoEngine {
     pub(crate) fn new_with_files(
         files: RuntimeFileSet,
         max_in_flight: usize,
+        config: crate::runtime_config::IoUringPoolConfig,
         statistics_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
@@ -94,11 +101,26 @@ impl UringIoEngine {
         })?;
         let mut builder = IoUring::builder();
         builder.setup_cqsize(completion_entries).dontfork();
+        if config.io_poll() {
+            builder.setup_iopoll();
+        }
+        if let Some(sq_poll) = config.sq_poll() {
+            builder.setup_sqpoll(sq_poll.idle_millis());
+            if let Some(cpu) = sq_poll.cpu() {
+                builder.setup_sqpoll_cpu(cpu);
+            }
+        }
         let ring = builder.build(ring_entries)?;
         if !ring.params().is_feature_nodrop() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "kernel io_uring can drop completion entries",
+            ));
+        }
+        if config.sq_poll().is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel io_uring SQPOLL requires registered files",
             ));
         }
         let mut probe = Probe::new();
@@ -118,8 +140,11 @@ impl UringIoEngine {
 
         let (wake_sender, wake_receiver) = UnixStream::pair()?;
         wake_sender.set_nonblocking(true)?;
+        wake_receiver.set_nonblocking(true)?;
+        let wake_pending = Arc::new(AtomicBool::new(false));
         let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
             sender: wake_sender,
+            pending: Arc::clone(&wake_pending),
         });
         let shared = Arc::new(RuntimeShared::new(
             max_in_flight,
@@ -142,6 +167,8 @@ impl UringIoEngine {
                     files,
                     ring,
                     wake_receiver,
+                    wake_pending,
+                    config.io_poll(),
                     worker_shared,
                     worker_submit_state,
                     receiver,
@@ -268,6 +295,7 @@ struct UringDriver {
     files: Option<RuntimeFileSet>,
     ring: Option<IoUring>,
     wake_receiver: UnixStream,
+    wake_pending: Arc<AtomicBool>,
     wake_active: bool,
     wake_cancel_submitted: bool,
     wake_cancel_completed: bool,
@@ -281,6 +309,7 @@ struct UringDriver {
     pending_entries: Vec<PendingEntry>,
     submission_entries: Vec<squeue::Entry>,
     completion_events: Vec<(u64, i32)>,
+    io_poll: bool,
     shutting_down: bool,
 }
 
@@ -288,6 +317,8 @@ fn uring_driver(
     files: RuntimeFileSet,
     mut ring: IoUring,
     wake_receiver: UnixStream,
+    wake_pending: Arc<AtomicBool>,
+    io_poll: bool,
     shared: Arc<RuntimeShared>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
@@ -299,6 +330,7 @@ fn uring_driver(
         files: Some(files),
         ring: Some(ring),
         wake_receiver,
+        wake_pending,
         wake_active: false,
         wake_cancel_submitted: false,
         wake_cancel_completed: false,
@@ -312,6 +344,7 @@ fn uring_driver(
         pending_entries: Vec::with_capacity(submission_capacity),
         submission_entries: Vec::with_capacity(submission_capacity),
         completion_events: Vec::with_capacity(completion_capacity),
+        io_poll,
         shutting_down: false,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run()))
@@ -329,8 +362,16 @@ impl UringDriver {
 
     fn run(&mut self) -> io::Result<()> {
         loop {
-            self.drain_completions();
+            let woke = self.drain_completions()?;
             self.drain_commands();
+            if woke {
+                // Producers may skip the socket write while `pending` is set.
+                // Clear only after one command drain, then drain once more to
+                // close the enqueue-before-clear race. Enqueues after the
+                // clear emit a fresh wake byte.
+                self.wake_pending.store(false, Ordering::Release);
+                self.drain_commands();
+            }
             self.queue_requested_cancels();
 
             if self.shutting_down && self.flights.is_empty() {
@@ -512,6 +553,12 @@ impl UringDriver {
                         flight.transferred,
                     )?
                 };
+                if self.io_poll && path != RuntimeIoPath::Direct {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "io_uring IOPOLL operation is not direct-I/O aligned",
+                    ));
+                }
                 let file_fd = self
                     .files
                     .as_ref()
@@ -573,7 +620,9 @@ impl UringDriver {
         retry_interrupted(|| self.ring_mut().submit_and_wait(1)).map(|_| ())
     }
 
-    fn drain_completions(&mut self) {
+    fn drain_completions(&mut self) -> io::Result<bool> {
+        let mut woke = false;
+        let mut wake_error = None;
         self.completion_events.clear();
         {
             let UringDriver {
@@ -590,9 +639,14 @@ impl UringDriver {
         for index in 0..self.completion_events.len() {
             let (user_data, result) = self.completion_events[index];
             if user_data == WAKE_REQUEST_ID {
+                woke = true;
                 self.wake_active = false;
-                if !self.shutting_down && result >= 0 {
-                    self.drain_wake_bytes();
+                if !self.shutting_down {
+                    if result >= 0 {
+                        self.drain_wake_bytes();
+                    } else {
+                        wake_error = Some(io::Error::from_raw_os_error(result.saturating_neg()));
+                    }
                 }
             } else if user_data == WAKE_CANCEL_ID {
                 self.wake_cancel_completed = true;
@@ -603,12 +657,10 @@ impl UringDriver {
                 self.complete_target(RequestId(user_data), result);
             }
         }
+        wake_error.map_or(Ok(woke), Err)
     }
 
     fn drain_wake_bytes(&mut self) {
-        if self.wake_receiver.set_nonblocking(true).is_err() {
-            return;
-        }
         let mut wake_buffer = [0_u8; 64];
         loop {
             match retry_interrupted(|| self.wake_receiver.read(&mut wake_buffer)) {
@@ -618,7 +670,6 @@ impl UringDriver {
                 Err(_) => break,
             }
         }
-        let _ = self.wake_receiver.set_nonblocking(false);
     }
 
     fn complete_target(&mut self, request_id: RequestId, result: i32) {
@@ -904,6 +955,36 @@ fn cancelled_before_resubmit_status(flight: &Flight) -> CompletionStatus {
             io::ErrorKind::Interrupted,
             "write cancellation raced with a partial completion",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_wake_coalesces_until_driver_clears_pending() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let pending = Arc::new(AtomicBool::new(false));
+        let wake = SocketWake {
+            sender,
+            pending: Arc::clone(&pending),
+        };
+
+        wake.wake();
+        wake.wake();
+        let mut byte = [0_u8; 1];
+        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
+        assert_eq!(
+            receiver.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        pending.store(false, Ordering::Release);
+        wake.wake();
+        assert_eq!(receiver.read(&mut byte).unwrap(), 1);
     }
 }
 

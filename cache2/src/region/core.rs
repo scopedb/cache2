@@ -214,7 +214,11 @@ pub(super) struct RegionShard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionStageValue {
-    Staged(u64),
+    Staged {
+        seqno: u64,
+        previous_bytes: usize,
+        current_bytes: usize,
+    },
     NeedsProgress,
     NeedsRotation,
 }
@@ -766,7 +770,7 @@ impl FileRegionCore {
         }
         let _shard_mutation = self.lock_shard_mutation(shard_id)?;
         match staging.preflight_append(shard_id, record_bytes) {
-            Ok(StageAppend::Appended) => {}
+            Ok(StageAppend::Appended { .. }) => {}
             Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),
             Err(StagingError::WouldBlock) => {
                 return Ok(RegionStageValue::NeedsProgress);
@@ -828,7 +832,14 @@ impl FileRegionCore {
             })
         });
         match staged {
-            Ok(StageAppend::Appended) => Ok(RegionStageValue::Staged(receipt.seqno)),
+            Ok(StageAppend::Appended {
+                previous_bytes,
+                current_bytes,
+            }) => Ok(RegionStageValue::Staged {
+                seqno: receipt.seqno,
+                previous_bytes,
+                current_bytes,
+            }),
             Ok(StageAppend::NeedsSeal) => self.fail_preflighted_stage(
                 staging,
                 "staging capacity changed after successful preflight",

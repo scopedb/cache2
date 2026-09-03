@@ -752,7 +752,16 @@ fn engine_request_capacity_is_hard_bounded() {
 fn configured_posix_engine_shares_its_worker_capacity() {
     let file = TestFile::new();
     let files = RuntimeFileSet::new(file.file(), None);
-    let engine = build_file_engine(files, 4, 4, ConfiguredIoEngine::Posix, false, false).unwrap();
+    let engine = build_file_engine(
+        files,
+        4,
+        4,
+        ConfiguredIoEngine::Posix(crate::runtime_config::PosixIoConfig::new(4, 4, 1)),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
 
     let reserved: Vec<_> = (0..4).map(|_| engine.try_reserve_read().unwrap()).collect();
     assert_eq!(

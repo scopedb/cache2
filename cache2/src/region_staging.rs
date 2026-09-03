@@ -35,7 +35,10 @@ const UPSERT_PUBLICATION: u64 = 1_u64 << (u64::BITS - 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StageAppend {
-    Appended,
+    Appended {
+        previous_bytes: usize,
+        current_bytes: usize,
+    },
     NeedsSeal,
 }
 
@@ -365,7 +368,10 @@ impl RegionStaging {
         {
             return Ok(StageAppend::NeedsSeal);
         }
-        Ok(StageAppend::Appended)
+        Ok(StageAppend::Appended {
+            previous_bytes: used,
+            current_bytes: used + record_bytes,
+        })
     }
 
     /// Returns the currently sealable fill prefix without waiting for an
@@ -510,7 +516,10 @@ impl RegionStaging {
         state.fill.records.push(record);
         state.fill.buffer = Some(buffer);
         state.encoding = None;
-        Ok(StageAppend::Appended)
+        Ok(StageAppend::Appended {
+            previous_bytes: start,
+            current_bytes: end,
+        })
     }
 
     /// Applies one exact manager-issued tail-padding receipt in place.
@@ -981,7 +990,10 @@ mod tests {
                     Ok::<StagedRecord, ()>(first_record)
                 })
                 .unwrap(),
-            StageAppend::Appended
+            StageAppend::Appended {
+                previous_bytes: 0,
+                current_bytes: 64,
+            }
         );
         assert_eq!(first_pointer % BUFFER_ALIGNMENT, 0);
         let first_span = span(0, 64, 1, 11);
@@ -1106,7 +1118,10 @@ mod tests {
             Err(StagingError::WouldBlock)
         );
         release_tx.send(()).unwrap();
-        assert_eq!(encoder.join().unwrap().unwrap(), StageAppend::Appended);
+        assert!(matches!(
+            encoder.join().unwrap().unwrap(),
+            StageAppend::Appended { .. }
+        ));
         assert_eq!(
             staging.shard_fill_snapshot(0).unwrap(),
             Some(ShardFillSnapshot {
@@ -1202,15 +1217,15 @@ mod tests {
         let mut offset = 0;
         for index in 0..MAX_STAGING_RECORDS {
             let (receipt, record) = reservation(offset, RECORD_ALIGNMENT, index as u64 + 1);
-            assert_eq!(
+            assert!(matches!(
                 staging
                     .encode_reserved(receipt, |target| {
                         target.fill(index as u8);
                         Ok::<StagedRecord, ()>(record)
                     })
                     .unwrap(),
-                StageAppend::Appended
-            );
+                StageAppend::Appended { .. }
+            ));
             offset += RECORD_ALIGNMENT;
         }
         let (overflow, overflow_record) = reservation(offset, RECORD_ALIGNMENT, 4097);
