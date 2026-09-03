@@ -24,14 +24,16 @@ rust-version.workspace = true
 default = []
 io-uring = ["cache2/io-uring"]
 
-[dev-dependencies]
+[dependencies]
 cache2 = { workspace = true, features = ["benchmarking"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
 log = { workspace = true }
 logforth = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
 
 [[bench]]
 name = "cache"
