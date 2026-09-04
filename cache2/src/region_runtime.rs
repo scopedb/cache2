@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
+use asyncband::watch;
 
 mod metrics;
 mod plan;
@@ -119,16 +120,17 @@ struct MutationGate {
     state: AtomicUsize,
     quiescent: Mutex<()>,
     quiescent_changed: Condvar,
-    async_changed: tokio::sync::Notify,
+    async_changed: watch::Sender<()>,
 }
 
 impl MutationGate {
     fn new() -> Self {
+        let (async_changed, _) = watch::channel(());
         Self {
             state: AtomicUsize::new(0),
             quiescent: Mutex::new(()),
             quiescent_changed: Condvar::new(),
-            async_changed: tokio::sync::Notify::new(),
+            async_changed,
         }
     }
 
@@ -189,12 +191,14 @@ impl MutationGate {
     }
 
     async fn wait_quiescent_async(&self) {
+        // Subscribe before inspecting the predicate so a transition racing the check advances the
+        // receiver version and cannot be missed.
+        let mut changed = self.async_changed.subscribe();
         while self.active_mutations() != 0 {
-            let notified = self.async_changed.notified();
-            if self.active_mutations() == 0 {
-                return;
-            }
-            notified.await;
+            changed
+                .changed()
+                .await
+                .expect("the mutation gate retains its watch sender");
         }
     }
 
@@ -208,7 +212,7 @@ impl MutationGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.quiescent_changed.notify_all();
             drop(quiescent);
-            self.async_changed.notify_one();
+            self.async_changed.send_replace(());
         }
     }
 }
@@ -571,15 +575,16 @@ struct ShardControlState {
 struct ShardControl {
     state: Mutex<ShardControlState>,
     changed: Condvar,
-    async_changed: tokio::sync::Notify,
+    async_changed: watch::Sender<()>,
 }
 
 impl ShardControl {
     fn new() -> Self {
+        let (async_changed, _) = watch::channel(());
         Self {
             state: Mutex::new(ShardControlState::default()),
             changed: Condvar::new(),
-            async_changed: tokio::sync::Notify::new(),
+            async_changed,
         }
     }
 
@@ -649,8 +654,10 @@ impl ShardControl {
     }
 
     async fn wait_for_drain_async(&self, generation: u64) -> io::Result<()> {
+        // Subscribe before inspecting the predicate so a completion racing the check advances the
+        // receiver version and cannot be missed.
+        let mut changed = self.async_changed.subscribe();
         loop {
-            let notified = self.async_changed.notified();
             {
                 let state = self.lock()?;
                 if let Some(failure) = &state.failure {
@@ -660,7 +667,10 @@ impl ShardControl {
                     return Ok(());
                 }
             }
-            notified.await;
+            changed
+                .changed()
+                .await
+                .expect("the shard control retains its watch sender");
         }
     }
 
@@ -673,7 +683,7 @@ impl ShardControl {
             .failure
             .get_or_insert_with(|| ShardFailure::from_error(error));
         self.changed.notify_all();
-        self.async_changed.notify_one();
+        self.async_changed.send_replace(());
     }
 
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, ShardControlState>> {
@@ -1880,7 +1890,7 @@ fn complete_shard_drain(control: &ShardControl, generation: u64) -> io::Result<(
     state.drain_completed = state.drain_completed.max(generation);
     control.changed.notify_all();
     drop(state);
-    control.async_changed.notify_one();
+    control.async_changed.send_replace(());
     Ok(())
 }
 

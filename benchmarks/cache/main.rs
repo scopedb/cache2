@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
@@ -791,7 +792,11 @@ async fn concurrent_reads(
 ) -> io::Result<ReadMeasurement> {
     let first_key = key_range.start;
     let key_count = key_range.len();
-    let barrier = Arc::new(tokio::sync::Barrier::new(clients + 1));
+    let participants = clients
+        .checked_add(1)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| io::Error::other("benchmark client count exceeds async barrier capacity"))?;
+    let barrier = Arc::new(Barrier::new(participants));
     let mut handles = Vec::with_capacity(clients);
     for client in 0..clients {
         let cache = Arc::clone(&cache);
