@@ -682,6 +682,7 @@ impl ShardControl {
         state
             .failure
             .get_or_insert_with(|| ShardFailure::from_error(error));
+        drop(state);
         self.changed.notify_all();
         self.async_changed.send_replace(());
     }
@@ -2091,9 +2092,22 @@ mod tests {
     use crate::io_backend::{FileBackend, IoBackend};
     use crate::io_engine::BackendIoEngine;
     use std::sync::Barrier;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::task::{Context, Wake, Waker};
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct ShardStateLockProbe {
+        control: Arc<ShardControl>,
+        observed_unlocked: AtomicBool,
+    }
+
+    impl Wake for ShardStateLockProbe {
+        fn wake(self: Arc<Self>) {
+            self.observed_unlocked
+                .store(self.control.state.try_lock().is_ok(), Ordering::Release);
+        }
+    }
 
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
@@ -2266,6 +2280,23 @@ mod tests {
         assert!(drain.await.unwrap_err().is_cancelled());
         assert!(gate.try_enter().is_some());
         drop(mutation);
+    }
+
+    #[test]
+    fn shard_failure_wakes_async_waiters_after_releasing_state_lock() {
+        let control = Arc::new(ShardControl::new());
+        let probe = Arc::new(ShardStateLockProbe {
+            control: Arc::clone(&control),
+            observed_unlocked: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut context = Context::from_waker(&waker);
+        let mut wait = Box::pin(control.wait_for_drain_async(1));
+
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        control.fail(&io::Error::other("test shard failure"));
+
+        assert!(probe.observed_unlocked.load(Ordering::Acquire));
     }
 
     #[test]
