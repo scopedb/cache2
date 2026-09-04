@@ -4,6 +4,11 @@
 
 ### Bug Fixes
 
+- Read completion timeouts now report overload when bounded read waiting is
+  enabled, and update overload counters instead of busy-miss counters.
+- io_uring command processing has a per-pass budget so cancelled request
+  refills cannot starve I/O submission or completion processing. Pending
+  commands prevent the driver from parking after exhausting the budget.
 - A drain racing with close now rejects requests to stopped append workers
   instead of waiting indefinitely for an unreachable completion generation.
 - Managed-memory planning now reserves io_uring flight tables, rounded SQ/CQ
@@ -38,7 +43,8 @@
 ### Performance
 
 - Foreground appends compute payload checksums before taking the shard mutation
-  gate, shortening the critical section while waiting for competing shard mutations.
+  gate, shortening the critical section. Contended shard admission now rejects
+  with overload instead of blocking the caller on competing mutations.
 - Hot read routes retain stable primary affinity but rotate their single
   pressure-only fallback across all physical lanes.
 - Append workers are notified only for a new batch, a flush-threshold crossing,

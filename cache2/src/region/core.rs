@@ -769,7 +769,17 @@ impl FileRegionCore {
             ));
         }
         let payload = RecordPayload::new(key, value);
-        let _shard_mutation = self.lock_shard_mutation(shard_id)?;
+        let _shard_mutation = match self.shard(shard_id)?.mutation.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
+            Err(TryLockError::Poisoned(_)) => {
+                self.health.enter_miss_only();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data shard gate is poisoned",
+                ));
+            }
+        };
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended { .. }) => {}
             Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),

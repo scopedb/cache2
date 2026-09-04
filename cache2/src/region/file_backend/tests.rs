@@ -745,7 +745,7 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
 }
 
 #[test]
-fn foreground_stage_waits_for_busy_shard_then_stages_once() {
+fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let (data, runtime, staging) = foreground_stage_fixture();
     let next_seqno = runtime.manager.inner.lock().unwrap().next_seqno();
     let mutation = runtime.core.shards[0].mutation.lock().unwrap();
@@ -754,22 +754,27 @@ fn foreground_stage_waits_for_busy_shard_then_stages_once() {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let core = Arc::clone(&runtime.core);
     let writer = std::thread::spawn(move || {
-        sender
-            .send(core.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value"))
-            .unwrap();
+        let result = core.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
+        sender.send((result, staging)).unwrap();
     });
 
     let early = receiver.recv_timeout(Duration::from_secs(1));
-    let waited = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
     drop(mutation);
     writer.join().unwrap();
-    assert!(
-        waited,
-        "a busy shard must wait rather than reject the append"
+    let (result, staging) = early.expect("a busy shard must reject without waiting for its lock");
+    assert!(matches!(result.unwrap(), RegionStageValue::NeedsProgress));
+    assert_eq!(
+        runtime.manager.inner.lock().unwrap().next_seqno(),
+        next_seqno
     );
-    let staged = receiver.recv_timeout(Duration::from_secs(1));
+    assert!(staging.shard_fill_snapshot(0).unwrap().is_none());
+
+    let staged = runtime
+        .core
+        .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
+        .unwrap();
     assert!(matches!(
-        staged.unwrap().unwrap(),
+        staged,
         RegionStageValue::Staged { seqno, .. } if seqno == next_seqno
     ));
     assert_eq!(
