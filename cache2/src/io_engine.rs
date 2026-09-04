@@ -29,9 +29,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{
-    OwnedSemaphorePermit as TokioSemaphorePermit, Semaphore as TokioSemaphore, TryAcquireError,
-};
+use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(all(
     feature = "io-uring",
@@ -955,7 +953,7 @@ struct IoSlot {
     shared: Arc<RuntimeShared>,
     write: bool,
     // This permit drops only after `IoSlot::drop` publishes physical capacity.
-    read_permit: Option<TokioSemaphorePermit>,
+    read_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// One read reservation against the engine's complete depth.
@@ -969,20 +967,24 @@ pub(crate) struct ReadSlotWaiter {
     shared: Arc<RuntimeShared>,
 }
 
-// The physical completion path must not allocate. Both Tokio and asyncband 0.7
-// keep waiter nodes in acquisition futures and wake from fixed-size batches,
-// but Tokio also provides the close operation used to wake pending reads during
-// engine shutdown. The outer bounded read-wait capacity uses asyncband in
-// `region_runtime`.
+// The physical completion path must not allocate. Asyncband keeps waiter nodes
+// in acquisition futures and wakes from fixed-size batches. Its semaphore does
+// not have a close operation, so shutdown releases one capacity cohort; each
+// awakened waiter observes `closed` and returns its permit, cascading the wake
+// through the remaining queue.
 struct ReadSlotAdmission {
-    slots: Arc<TokioSemaphore>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+    closed: AtomicBool,
     waiters: AtomicUsize,
 }
 
 impl ReadSlotAdmission {
     fn new(max_in_flight: usize) -> Self {
         Self {
-            slots: Arc::new(TokioSemaphore::new(max_in_flight)),
+            slots: Arc::new(Semaphore::new(max_in_flight)),
+            capacity: max_in_flight,
+            closed: AtomicBool::new(false),
             waiters: AtomicUsize::new(0),
         }
     }
@@ -996,7 +998,19 @@ impl ReadSlotAdmission {
         self.waiters.load(Ordering::Acquire) != 0
     }
 
-    fn try_acquire(&self) -> io::Result<TokioSemaphorePermit> {
+    fn ensure_open(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "I/O engine is shut down",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_acquire(&self) -> io::Result<OwnedSemaphorePermit> {
+        self.ensure_open()?;
         if self.has_waiters() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1004,15 +1018,9 @@ impl ReadSlotAdmission {
             ));
         }
         let permit = Arc::clone(&self.slots)
-            .try_acquire_owned()
-            .map_err(|error| match error {
-                TryAcquireError::Closed => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
-                }
-                TryAcquireError::NoPermits => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
-                }
-            })?;
+            .try_acquire_owned(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))?;
+        self.ensure_open()?;
         // Registration happens before an async acquire is polled. Rechecking
         // closes the race with a waiter that arrived during the try-acquire.
         if self.has_waiters() {
@@ -1028,19 +1036,25 @@ impl ReadSlotAdmission {
         &self,
         deadline: Instant,
         tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<TokioSemaphorePermit> {
-        let acquire = Arc::clone(&self.slots).acquire_owned();
+    ) -> io::Result<OwnedSemaphorePermit> {
+        self.ensure_open()?;
+        let acquire = Arc::clone(&self.slots).acquire_owned(1);
         {
             let _entered = tokio_handle.enter();
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
         }
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))?
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))
+        .and_then(|permit| {
+            self.ensure_open()?;
+            Ok(permit)
+        })
     }
 
     fn close(&self) {
-        self.slots.close();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.slots.release(self.capacity);
+        }
     }
 }
 
@@ -1206,7 +1220,7 @@ impl RuntimeShared {
 
     fn try_reserve_read_slot(
         self: &Arc<Self>,
-        permit: Option<TokioSemaphorePermit>,
+        permit: Option<OwnedSemaphorePermit>,
     ) -> io::Result<ReadSlot> {
         self.ensure_accepting()?;
         let mut slot = self

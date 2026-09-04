@@ -20,12 +20,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
     IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StaticConfig,
 };
-use tokio::sync::Barrier;
 
 const MIB: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64;
@@ -625,8 +625,13 @@ async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
         .collect::<Vec<_>>()
         .into();
     let config = Arc::new(config);
-    let ready = Arc::new(Barrier::new(config.threads + 1));
-    let start = Arc::new(Barrier::new(config.threads + 1));
+    let participants = config
+        .threads
+        .checked_add(1)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| invalid("workload thread count exceeds async barrier capacity"))?;
+    let ready = Arc::new(Barrier::new(participants));
+    let start = Arc::new(Barrier::new(participants));
     let mut workers = Vec::with_capacity(config.threads);
     for worker_id in 0..config.threads {
         let cache = Arc::clone(&cache);

@@ -26,6 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use asyncband::event::ManualResetEvent;
 use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 
 mod metrics;
@@ -119,7 +120,7 @@ struct MutationGate {
     state: AtomicUsize,
     quiescent: Mutex<()>,
     quiescent_changed: Condvar,
-    async_changed: tokio::sync::Notify,
+    async_changed: ManualResetEvent,
 }
 
 impl MutationGate {
@@ -128,7 +129,7 @@ impl MutationGate {
             state: AtomicUsize::new(0),
             quiescent: Mutex::new(()),
             quiescent_changed: Condvar::new(),
-            async_changed: tokio::sync::Notify::new(),
+            async_changed: ManualResetEvent::new(),
         }
     }
 
@@ -189,12 +190,12 @@ impl MutationGate {
     }
 
     async fn wait_quiescent_async(&self) {
-        while self.active_mutations() != 0 {
-            let notified = self.async_changed.notified();
+        loop {
+            self.async_changed.reset();
             if self.active_mutations() == 0 {
                 return;
             }
-            notified.await;
+            self.async_changed.wait().await;
         }
     }
 
@@ -208,7 +209,7 @@ impl MutationGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.quiescent_changed.notify_all();
             drop(quiescent);
-            self.async_changed.notify_one();
+            self.async_changed.set();
         }
     }
 }
@@ -571,7 +572,7 @@ struct ShardControlState {
 struct ShardControl {
     state: Mutex<ShardControlState>,
     changed: Condvar,
-    async_changed: tokio::sync::Notify,
+    async_changed: ManualResetEvent,
 }
 
 impl ShardControl {
@@ -579,7 +580,7 @@ impl ShardControl {
         Self {
             state: Mutex::new(ShardControlState::default()),
             changed: Condvar::new(),
-            async_changed: tokio::sync::Notify::new(),
+            async_changed: ManualResetEvent::new(),
         }
     }
 
@@ -650,7 +651,7 @@ impl ShardControl {
 
     async fn wait_for_drain_async(&self, generation: u64) -> io::Result<()> {
         loop {
-            let notified = self.async_changed.notified();
+            self.async_changed.reset();
             {
                 let state = self.lock()?;
                 if let Some(failure) = &state.failure {
@@ -660,7 +661,7 @@ impl ShardControl {
                     return Ok(());
                 }
             }
-            notified.await;
+            self.async_changed.wait().await;
         }
     }
 
@@ -673,7 +674,7 @@ impl ShardControl {
             .failure
             .get_or_insert_with(|| ShardFailure::from_error(error));
         self.changed.notify_all();
-        self.async_changed.notify_one();
+        self.async_changed.set();
     }
 
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, ShardControlState>> {
@@ -1880,7 +1881,7 @@ fn complete_shard_drain(control: &ShardControl, generation: u64) -> io::Result<(
     state.drain_completed = state.drain_completed.max(generation);
     control.changed.notify_all();
     drop(state);
-    control.async_changed.notify_one();
+    control.async_changed.set();
     Ok(())
 }
 
