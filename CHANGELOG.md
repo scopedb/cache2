@@ -20,6 +20,14 @@
   in-flight bounds for read, write, and reclaim pools, plus opt-in SQPOLL
   idle/CPU affinity.
 
+- The experimental io_uring engine's per-pool IOPOLL completion polling is
+  available again through `IoUringPoolConfig::with_io_poll`. The driver parks
+  on the wake socket while idle and reaps polled completions through
+  enter-with-GETEVENTS instead of relying on wake or cancel requests that
+  IOPOLL rings cannot carry. IOPOLL requires direct I/O mode and a
+  polling-capable filesystem and block device; cancellation remains advisory
+  until the polled operation completes.
+
 ### Performance
 
 - Hot read routes retain stable primary affinity but rotate their single

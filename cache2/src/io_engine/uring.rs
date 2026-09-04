@@ -101,6 +101,9 @@ impl UringIoEngine {
         })?;
         let mut builder = IoUring::builder();
         builder.setup_cqsize(completion_entries).dontfork();
+        if config.io_poll() {
+            builder.setup_iopoll();
+        }
         if let Some(sq_poll) = config.sq_poll() {
             builder.setup_sqpoll(sq_poll.idle_millis());
             if let Some(cpu) = sq_poll.cpu() {
@@ -305,6 +308,7 @@ struct UringDriver {
     pending_entries: Vec<PendingEntry>,
     submission_entries: Vec<squeue::Entry>,
     completion_events: Vec<(u64, i32)>,
+    io_poll: bool,
     shutting_down: bool,
 }
 
@@ -320,6 +324,7 @@ fn uring_driver(
     let max_in_flight = shared.max_in_flight;
     let submission_capacity = ring.submission().capacity();
     let completion_capacity = ring.completion().capacity();
+    let io_poll = ring.params().is_setup_iopoll();
     let mut driver = UringDriver {
         files: Some(files),
         ring: Some(ring),
@@ -338,6 +343,7 @@ fn uring_driver(
         pending_entries: Vec::with_capacity(submission_capacity),
         submission_entries: Vec::with_capacity(submission_capacity),
         completion_events: Vec::with_capacity(completion_capacity),
+        io_poll,
         shutting_down: false,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run()))
@@ -357,11 +363,13 @@ impl UringDriver {
         loop {
             let woke = self.drain_completions()?;
             self.drain_commands();
-            if woke {
+            if woke || self.io_poll {
                 // Producers may skip the socket write while `pending` is set.
                 // Clear only after one command drain, then drain once more to
                 // close the enqueue-before-clear race. Enqueues after the
-                // clear emit a fresh wake byte.
+                // clear emit a fresh wake byte. IOPOLL rings cannot arm the
+                // in-ring wake poll, so every iteration clears and drains
+                // twice instead of synchronizing on a wake CQE.
                 self.wake_pending.store(false, Ordering::Release);
                 self.drain_commands();
             }
@@ -456,7 +464,12 @@ impl UringDriver {
         };
         if flight.active && !flight.cancel_submitted {
             flight.cancel_submitted = true;
-            self.pending_cancels.push_back(request_id);
+            if !self.io_poll {
+                // IOPOLL rings cannot cancel with an in-ring async-cancel
+                // request; the polled device completes quickly and
+                // `complete_target` treats `cancel_requested` as advisory.
+                self.pending_cancels.push_back(request_id);
+            }
         }
     }
 
@@ -469,7 +482,9 @@ impl UringDriver {
             return self.submit_ring();
         }
         self.pending_entries.clear();
-        if !self.shutting_down && !self.wake_active {
+        if !self.shutting_down && !self.wake_active && !self.io_poll {
+            // IOPOLL rings cannot carry a poll-on-wake-fd request; the driver
+            // instead blocks in userspace `poll` while the ring is idle.
             self.pending_entries.push(PendingEntry::Wake);
         }
         while self.pending_entries.len() < available {
@@ -546,6 +561,12 @@ impl UringDriver {
                         flight.transferred,
                     )?
                 };
+                if self.io_poll && path != RuntimeIoPath::Direct {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "io_uring IOPOLL operation is not direct-I/O aligned",
+                    ));
+                }
                 let file_fd = self
                     .files
                     .as_ref()
@@ -600,11 +621,62 @@ impl UringDriver {
     }
 
     fn wait_for_completion(&mut self) -> io::Result<()> {
+        if self.io_poll {
+            return self.wait_for_polled_completion();
+        }
         let wake_cancel_pending = self.wake_cancel_submitted && !self.wake_cancel_completed;
         if !self.wake_active && self.flights.is_empty() && !wake_cancel_pending {
             return Ok(());
         }
         retry_interrupted(|| self.ring_mut().submit_and_wait(1)).map(|_| ())
+    }
+
+    /// IOPOLL completion reaping. Polled rings publish completions only while
+    /// the kernel busy-polls inside an enter-with-GETEVENTS call, so an idle
+    /// ring must never reach `submit_and_wait` and an active ring reaps there.
+    fn wait_for_polled_completion(&mut self) -> io::Result<()> {
+        if self.flights.is_empty() {
+            self.block_on_wake();
+            return Ok(());
+        }
+        retry_interrupted(|| self.ring_mut().submit_and_wait(1)).map(|_| ())
+    }
+
+    /// Blocks the driver on the wake socket instead of an in-ring poll.
+    ///
+    /// Producers write one byte per submission burst (coalesced through
+    /// `wake_pending`), and shutdown always writes a final byte after its
+    /// `DriverCommand::Shutdown`. The socket is never drained before parking:
+    /// a byte whose commands have not been drained yet must keep `poll`
+    /// from blocking, so the driver first waits for readability and only then
+    /// drains bytes and lets the main loop drain commands. A byte left over
+    /// from an already-drained burst costs one extra loop iteration, never a
+    /// lost wake. The bounded timeout additionally re-scans the command
+    /// channel, which also covers a producer-channel disconnect.
+    fn block_on_wake(&mut self) {
+        let wake_fd = self.wake_receiver.as_raw_fd();
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return;
+                }
+                continue;
+            }
+            if ready == 0 {
+                return;
+            }
+            if pollfd.revents & libc::POLLIN != 0 {
+                self.drain_wake_bytes();
+                return;
+            }
+        }
     }
 
     fn drain_completions(&mut self) -> io::Result<bool> {

@@ -20,8 +20,8 @@ use crate::recovery::DataGeometry;
 use crate::region_staging::RegionStaging;
 use crate::resources::{CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT};
 use crate::runtime_config::{
-    IoEngine, IoPoolTopology, IoUringPoolConfig, MAX_APPEND_SHARDS, MAX_READ_IO_WAIT_TIMEOUT,
-    MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig,
+    IoEngine, IoMode, IoPoolTopology, IoUringPoolConfig, MAX_APPEND_SHARDS,
+    MAX_READ_IO_WAIT_TIMEOUT, MAX_WRITE_FLUSH_THRESHOLD_BYTES, RuntimeConfig,
 };
 
 use super::metrics::ActivityMetrics;
@@ -71,6 +71,16 @@ impl RuntimeConfig {
                 validate_io_uring_pool("read", config.read())?;
                 validate_io_uring_pool("write", config.write())?;
                 validate_io_uring_pool("reclaim", config.reclaim())?;
+                if self.io_mode != IoMode::Direct
+                    && (config.read().io_poll()
+                        || config.write().io_poll()
+                        || config.reclaim().io_poll())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "io_uring IOPOLL requires direct I/O mode",
+                    ));
+                }
             }
         }
         if reclaim_topology.max_in_flight > self.append_shards as usize {
@@ -340,5 +350,33 @@ mod tests {
             IoUringPoolConfig::new(2, 8).with_sq_poll(IoUringSqPollConfig::new(1_000).with_cpu(4));
         validate_io_uring_pool("read", config).unwrap();
         assert_eq!(config.sq_poll().and_then(|sq_poll| sq_poll.cpu()), Some(4));
+    }
+
+    #[cfg(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        )
+    ))]
+    #[test]
+    fn io_poll_requires_direct_mode() {
+        let pool = IoUringPoolConfig::default().with_io_poll(true);
+        let config = RuntimeConfig::default().with_io_engine(IoEngine::IoUring(
+            crate::runtime_config::IoUringConfig::new(
+                pool,
+                IoUringPoolConfig::default(),
+                IoUringPoolConfig::new(1, 1),
+            ),
+        ));
+
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

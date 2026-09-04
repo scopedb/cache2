@@ -148,6 +148,19 @@ and output directory. Important qualification switches are:
 `CACHE_SOAK_LATENCY_SAMPLE_INTERVAL` controls put, get, and delete latency
 sampling. It defaults to 16; zero disables latency sampling.
 
+With `CACHE_SOAK_IO_ENGINE=io-uring`, `CACHE_SOAK_READ_IO_WORKERS` and
+`CACHE_SOAK_WRITE_IO_WORKERS` keep their legacy meaning of one ring per worker
+with 64 in-flight slots per ring. To sweep ring counts and aggregate in-flight
+depth independently, override `CACHE_SOAK_IO_URING_READ_RINGS` /
+`CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` (writes:
+`CACHE_SOAK_IO_URING_WRITE_RINGS` / `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT`);
+ring count must not exceed max in-flight. `CACHE_SOAK_IO_URING_READ_IOPOLL=true`
+enables kernel completion polling for the read pool (requires
+`CACHE_SOAK_IO_MODE=direct`). `CACHE_SOAK_IO_URING_READ_SQPOLL_MS`
+opts the read pool into kernel submission polling with that idle time, and
+`CACHE_SOAK_IO_URING_READ_SQPOLL_CPU` optionally pins every polling thread to
+one CPU.
+
 Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution.
 Use a short matrix rather than one oversized run: small-capacity turnover,
 high-cardinality mixed sizes, read-heavy reinsertion, and CLOCK/S3-FIFO A/B.
