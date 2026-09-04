@@ -24,8 +24,8 @@ use benchmarks::report::{
 };
 use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
-    IoMode, IoUringConfig, IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig,
-    StartupMode, StaticConfig,
+    IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy, PosixIoConfig,
+    RuntimeConfig, StartupMode, StaticConfig,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -1197,6 +1197,17 @@ fn env_u32(name: &str, default: u32) -> io::Result<u32> {
         .and_then(|value| u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds u32"))))
 }
 
+fn env_optional_u32(name: &str) -> io::Result<Option<u32>> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
     match env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
@@ -1223,22 +1234,65 @@ fn parse_io_engine(
             reclaim_workers,
         ))),
         "io-uring" => Ok(IoEngine::IoUring(IoUringConfig::new(
-            IoUringPoolConfig::new(
-                read_workers,
-                read_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("read io_uring depth is too large"))?,
-            ),
-            IoUringPoolConfig::new(
-                write_workers,
-                write_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("write io_uring depth is too large"))?,
-            ),
+            io_uring_read_pool(read_workers)?,
+            io_uring_write_pool(write_workers)?,
             IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
         ))),
         value => Err(invalid(format!("unsupported I/O engine: {value}"))),
     }
+}
+
+/// Builds the io_uring read pool from the benchmark-only topology knobs.
+///
+/// `CACHE_SOAK_IO_URING_READ_RINGS` and
+/// `CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` default to the legacy mapping
+/// (one ring per worker with 64 in-flight slots per ring). Setting
+/// `CACHE_SOAK_IO_URING_READ_SQPOLL_MS` opts the pool into kernel submission
+/// polling with the given idle time; `CACHE_SOAK_IO_URING_READ_SQPOLL_CPU`
+/// optionally pins the polling threads.
+fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolConfig> {
+    let rings = env_usize("CACHE_SOAK_IO_URING_READ_RINGS", read_workers)?;
+    let max_in_flight = env_usize(
+        "CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT",
+        read_workers
+            .checked_mul(64)
+            .ok_or_else(|| invalid("read io_uring depth is too large"))?,
+    )?;
+    if rings == 0 || max_in_flight == 0 || max_in_flight < rings {
+        return Err(invalid(
+            "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
+        ));
+    }
+    let mut pool = IoUringPoolConfig::new(rings, max_in_flight);
+    if let Some(idle_millis) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_MS")? {
+        let mut sq_poll = IoUringSqPollConfig::new(idle_millis);
+        if let Some(cpu) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_CPU")? {
+            sq_poll = sq_poll.with_cpu(cpu);
+        }
+        pool = pool.with_sq_poll(sq_poll);
+    }
+    Ok(pool)
+}
+
+/// Builds the io_uring write pool from the benchmark-only topology knobs.
+///
+/// `CACHE_SOAK_IO_URING_WRITE_RINGS` and
+/// `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT` default to the legacy mapping
+/// (one ring per worker with 64 in-flight slots per ring).
+fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolConfig> {
+    let rings = env_usize("CACHE_SOAK_IO_URING_WRITE_RINGS", write_workers)?;
+    let max_in_flight = env_usize(
+        "CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT",
+        write_workers
+            .checked_mul(64)
+            .ok_or_else(|| invalid("write io_uring depth is too large"))?,
+    )?;
+    if rings == 0 || max_in_flight == 0 || max_in_flight < rings {
+        return Err(invalid(
+            "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
+        ));
+    }
+    Ok(IoUringPoolConfig::new(rings, max_in_flight))
 }
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {
