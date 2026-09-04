@@ -969,10 +969,11 @@ pub(crate) struct ReadSlotWaiter {
     shared: Arc<RuntimeShared>,
 }
 
-// The physical completion path must not allocate. Tokio's semaphore embeds
-// waiter nodes in acquisition futures and uses a fixed wake list; mea 0.6.x
-// allocates a temporary wake vector on every permit release. The outer bounded
-// read-wait capacity remains a mea semaphore in `region_runtime`.
+// The physical completion path must not allocate. Both Tokio and asyncband 0.7
+// keep waiter nodes in acquisition futures and wake from fixed-size batches,
+// but Tokio also provides the close operation used to wake pending reads during
+// engine shutdown. The outer bounded read-wait capacity uses asyncband in
+// `region_runtime`.
 struct ReadSlotAdmission {
     slots: Arc<TokioSemaphore>,
     waiters: AtomicUsize,

@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mea::semaphore::{OwnedSemaphorePermit, Semaphore};
+use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 
 mod metrics;
 mod plan;
