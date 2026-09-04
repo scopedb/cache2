@@ -24,7 +24,7 @@ use crate::hashing::FixedPrehashedMap;
 use crate::index::{IndexEntry, PackedLocation, record_size_class_upper_bound};
 use crate::index_storage::{INDEX_IMAGE_SLOT_SIZE, IndexSlot, PartitionedIndexStorage};
 use crate::record_codec::{
-    encode_reinsert_into_hashed, encode_value_into_hashed, required_record_bytes,
+    RecordPayload, encode_reinsert_into_hashed, encode_value_into_hashed, required_record_bytes,
 };
 use crate::recovery::{DataSuperblock, RECOVERY_PAGE_SIZE, RecoveryImageHeader, StateRecord};
 use crate::region_index::{ReclaimIndexAction, RegionIndex};
@@ -97,6 +97,7 @@ fn exercise_record_roundtrip(input: &[u8]) {
     let reinsert = control[31] & 1 != 0;
     let expected_seqno = if reinsert { logical_seqno } else { seqno };
     let mut destination = vec![0xa5; record_bytes as usize];
+    let record_payload = RecordPayload::new(key, value);
 
     let entry = if reinsert {
         encode_reinsert_into_hashed(
@@ -104,8 +105,7 @@ fn exercise_record_roundtrip(input: &[u8]) {
             reservation,
             hash,
             record_bytes,
-            key,
-            value,
+            &record_payload,
             logical_seqno,
         )
     } else {
@@ -114,8 +114,7 @@ fn exercise_record_roundtrip(input: &[u8]) {
             reservation,
             hash,
             record_bytes,
-            key,
-            value,
+            &record_payload,
         )
     }
     .unwrap();

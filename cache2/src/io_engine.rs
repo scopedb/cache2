@@ -68,6 +68,19 @@ use crate::snapshot::CacheIoDirectionSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
+// Common bounded command, completion, and request bookkeeping. Payload
+// buffers are charged by ResourceController separately.
+pub(crate) const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
+
+pub(crate) fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option<usize> {
+    // Together with the common 512 bytes, reserve 2 KiB per operation for the
+    // flight table, rounded SQ/CQ buffers and failure cleanup. Another 256 KiB
+    // per ring covers mapping headers and rounding on 64 KiB-page kernels.
+    max_in_flight
+        .checked_mul(1536)?
+        .checked_add(rings.checked_mul(256 * 1024)?)
+}
+
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
 /// than a durability knob: cache contents are disposable.

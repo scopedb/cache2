@@ -709,8 +709,7 @@ fn four_tib_region_metadata_round_trips_into_runtime_authority() {
     assert_eq!(manager.next_seqno(), u64::from(REGION_SHARDS) + 1);
 }
 
-#[test]
-fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
+fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, RegionStaging) {
     let data = data_path_superblock();
     let runtime = FileRegionRuntime::install(
         PartitionedIndexStorage::anonymous(64).unwrap(),
@@ -725,6 +724,12 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
         &resources,
     )
     .unwrap();
+    (data, runtime, staging)
+}
+
+#[test]
+fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
+    let (data, runtime, staging) = foreground_stage_fixture();
     let manager = runtime.manager.inner.lock().unwrap();
     let next_seqno = manager.next_seqno();
     let hash = hash_key(data.hash_seed, b"key");
@@ -737,6 +742,40 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
         RegionStageValue::NeedsProgress
     );
     assert_eq!(manager.next_seqno(), next_seqno);
+}
+
+#[test]
+fn foreground_stage_waits_for_busy_shard_then_stages_once() {
+    let (data, runtime, staging) = foreground_stage_fixture();
+    let next_seqno = runtime.manager.inner.lock().unwrap().next_seqno();
+    let mutation = runtime.core.shards[0].mutation.lock().unwrap();
+    let hash = hash_key(data.hash_seed, b"key");
+    let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let core = Arc::clone(&runtime.core);
+    let writer = std::thread::spawn(move || {
+        sender
+            .send(core.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value"))
+            .unwrap();
+    });
+
+    let early = receiver.recv_timeout(Duration::from_secs(1));
+    let waited = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    drop(mutation);
+    writer.join().unwrap();
+    assert!(
+        waited,
+        "a busy shard must wait rather than reject the append"
+    );
+    let staged = receiver.recv_timeout(Duration::from_secs(1));
+    assert!(matches!(
+        staged.unwrap().unwrap(),
+        RegionStageValue::Staged { seqno, .. } if seqno == next_seqno
+    ));
+    assert_eq!(
+        runtime.manager.inner.lock().unwrap().next_seqno(),
+        next_seqno + 1
+    );
 }
 
 #[test]

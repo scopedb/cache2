@@ -625,6 +625,9 @@ impl ShardControl {
             Ok(state) => (state, false),
             Err(error) => (error.into_inner(), true),
         };
+        if state.stop {
+            return Err(closed_runtime_error());
+        }
         state.drain_requested = state
             .drain_requested
             .checked_add(1)
@@ -2329,6 +2332,24 @@ mod tests {
             control.notify(WAKE_ROTATE).unwrap_err().kind(),
             io::ErrorKind::NotConnected
         );
+    }
+
+    #[tokio::test]
+    async fn stopped_shard_rejects_new_drains_and_completes_accepted_drains() {
+        let control = ShardControl::new();
+        let first = control.request_drain(false).unwrap();
+        let stop = control.request_drain(true).unwrap();
+
+        for stopping in [false, true] {
+            assert_eq!(
+                control.request_drain(stopping).unwrap_err().kind(),
+                io::ErrorKind::NotConnected
+            );
+        }
+        assert_eq!(control.lock().unwrap().drain_requested, stop);
+
+        complete_shard_drain(&control, stop).unwrap();
+        control.wait_for_drain_async(first).await.unwrap();
     }
 
     #[test]
