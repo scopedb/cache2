@@ -28,6 +28,7 @@ rust-version = "1.98"
 cache2 = { path = "cache2", version = "0.2.3" }
 
 # Crates.io dependencies
+asyncband = { version = "0.7.1", features = ["semaphore"] }
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
@@ -35,7 +36,6 @@ io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }
 logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
-mea = { version = "0.6.7" }
 quickcheck = { version = "1.1.0", default-features = false }
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 twox-hash = { version = "2.1.4", default-features = false, features = ["std", "xxhash3_64"] }
