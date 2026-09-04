@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- A drain racing with close now rejects requests to stopped append workers
+  instead of waiting indefinitely for an unreachable completion generation.
+- Managed-memory planning now reserves io_uring flight tables, rounded SQ/CQ
+  buffers, ring mappings, and failure cleanup scratch for every configured ring.
+
 ### Breaking Changes
 
 - `IoEngine` now carries backend-specific topology. Configure POSIX worker
@@ -30,6 +37,8 @@
 
 ### Performance
 
+- Foreground appends compute payload checksums before taking the shard mutation
+  gate, shortening the critical section while waiting for competing shard mutations.
 - Hot read routes retain stable primary affinity but rotate their single
   pressure-only fallback across all physical lanes.
 - Append workers are notified only for a new batch, a flush-threshold crossing,

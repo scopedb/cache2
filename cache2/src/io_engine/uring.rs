@@ -1058,6 +1058,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn io_uring_memory_reservation_covers_allocations() {
+        // Include both SQ and hash-table growth boundaries, including the
+        // largest admitted depth. This needs no kernel io_uring support.
+        let maximum = MAX_IO_REQUESTS_PER_ENGINE;
+        for depth in [1, 28, 29, 2046, 2047, maximum - 2, maximum] {
+            let sq = (depth + 2).next_power_of_two();
+            let cq = sq * 2;
+            let flights = HashMap::<RequestId, Flight, BuildHasherDefault<XxHash3_64>>::
+                with_capacity_and_hasher(depth, BuildHasherDefault::default());
+            // HashMap capacity excludes its unused buckets; include those
+            // buckets, control bytes, and the trailing SIMD control group.
+            let buckets = flights.capacity().next_power_of_two();
+            let flight_bytes = buckets * (size_of::<(RequestId, Flight)>() + 1) + 16;
+            // Each bounded channel slot also carries an atomic stamp, and
+            // completion state is held in a separately allocated Arc.
+            let commands = (2 * depth + 1) * (size_of::<DriverCommand>() + size_of::<usize>());
+            let completions = depth * (size_of::<CompletionState>() + 2 * size_of::<usize>());
+            let request_ids = 3 * depth * size_of::<RequestId>();
+            let batches = sq * (size_of::<PendingEntry>() + size_of::<squeue::Entry>())
+                + cq * size_of::<(u64, i32)>();
+            let fatal_drain = (depth + 1) * (size_of::<(u64, u64)>() + size_of::<squeue::Entry>())
+                + cq * size_of::<u64>();
+            // SQ indices, SQEs and CQEs, with one 64 KiB page of header /
+            // alignment allowance for each of the three possible mappings.
+            let mappings = sq * (size_of::<u32>() + size_of::<squeue::Entry>())
+                + cq * size_of::<io_uring::cqueue::Entry>()
+                + 3 * 64 * 1024;
+            let required = flight_bytes
+                + commands
+                + completions
+                + request_ids
+                + batches
+                + fatal_drain
+                + mappings;
+            let reserved = depth * IO_QUEUE_ENTRY_RESERVATION_BYTES
+                + io_uring_extra_memory_bytes(depth, 1).unwrap();
+            assert!(
+                reserved >= required,
+                "depth {depth}: {reserved} < {required}"
+            );
+        }
+    }
+
+    #[test]
     fn socket_wake_coalesces_until_driver_clears_pending() {
         let (sender, mut receiver) = UnixStream::pair().unwrap();
         sender.set_nonblocking(true).unwrap();

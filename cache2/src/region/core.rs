@@ -33,7 +33,7 @@ use crate::io_engine::{IoEngine, ReadSlot};
 #[cfg(test)]
 use crate::record_codec::hash_key;
 use crate::record_codec::{
-    RecordEncodeError, encode_reinsert_into_hashed, encode_value_into_hashed,
+    RecordEncodeError, RecordPayload, encode_reinsert_into_hashed, encode_value_into_hashed,
 };
 use crate::recovery::{DATA_REGION_AREA_OFFSET, recovery_image_index_len};
 use crate::region_appender::submit_span;
@@ -717,10 +717,10 @@ impl FileRegionCore {
     }
 
     /// Preflights, reserves, and encodes one value directly into a shard's
-    /// aligned fill buffer. Region reservation and open-span accounting share
-    /// one manager try-lock; the shard mutation gate then protects encoding
-    /// without retaining global authority. This method performs no device I/O
-    /// and never publishes an index entry.
+    /// aligned fill buffer. Payload checksums are computed before the shard
+    /// mutation gate; the gate protects reservation, copying and fill commit.
+    /// Region reservation and open-span accounting share one manager try-lock.
+    /// This method performs no device I/O and never publishes an index entry.
     pub(crate) fn try_stage_value(
         &self,
         staging: &RegionStaging,
@@ -768,6 +768,7 @@ impl FileRegionCore {
                 "value exceeds one Region staging buffer",
             ));
         }
+        let payload = RecordPayload::new(key, value);
         let _shard_mutation = self.lock_shard_mutation(shard_id)?;
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended { .. }) => {}
@@ -816,12 +817,11 @@ impl FileRegionCore {
                     receipt,
                     hash,
                     record_bytes,
-                    key,
-                    value,
+                    &payload,
                     logical_seqno,
                 )?,
                 None => {
-                    encode_value_into_hashed(destination, receipt, hash, record_bytes, key, value)?
+                    encode_value_into_hashed(destination, receipt, hash, record_bytes, &payload)?
                 }
             };
             Ok::<StagedRecord, RecordEncodeError>(match reinsert {

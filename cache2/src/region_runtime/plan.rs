@@ -14,7 +14,8 @@
 
 use std::io;
 
-use crate::io_engine::MAX_IO_REQUESTS_PER_ENGINE;
+pub(super) use crate::io_engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
+use crate::io_engine::{MAX_IO_REQUESTS_PER_ENGINE, io_uring_extra_memory_bytes};
 use crate::memory::MemoryStore;
 use crate::recovery::DataGeometry;
 use crate::region_staging::RegionStaging;
@@ -26,10 +27,6 @@ use crate::runtime_config::{
 
 use super::metrics::ActivityMetrics;
 
-// Covers the bounded engine registry, command channel, and driver-side
-// bookkeeping for one admitted I/O operation. Payload buffers are charged by
-// ResourceController separately.
-pub(super) const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 // Covers worker/shard controls and handles whose size does not scale with the
 // payload or engine depth.
 pub(super) const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
@@ -268,6 +265,15 @@ pub(super) fn runtime_topology_memory_bytes(
         .checked_add(read_wait_queue)?
         .checked_add(reclaim.max_in_flight)?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
+    let uring = [read, write, reclaim]
+        .into_iter()
+        .filter(|pool| pool.io_uring.is_some())
+        .try_fold(0_usize, |bytes, pool| {
+            bytes.checked_add(io_uring_extra_memory_bytes(
+                pool.max_in_flight,
+                pool.engine_count,
+            )?)
+        })?;
     let controls = engine_count
         .checked_add(shard_count)?
         .checked_add(config.l1_shards)?
@@ -276,6 +282,7 @@ pub(super) fn runtime_topology_memory_bytes(
     let metrics = shard_count.checked_mul(std::mem::size_of::<ActivityMetrics>())?;
     stacks
         .checked_add(queue)?
+        .checked_add(uring)?
         .checked_add(controls)?
         .checked_add(metrics)
 }
@@ -325,7 +332,24 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_config::IoUringSqPollConfig;
+    use crate::runtime_config::{IoUringConfig, IoUringSqPollConfig};
+
+    #[test]
+    fn io_uring_depth_reserves_more_than_common_request_bookkeeping() {
+        let pool = IoUringPoolConfig::new(1, 1);
+        let shallow = RuntimeConfig::default()
+            .with_io_engine(IoEngine::IoUring(IoUringConfig::new(pool, pool, pool)));
+        let deep = shallow
+            .clone()
+            .with_io_engine(IoEngine::IoUring(IoUringConfig::new(
+                IoUringPoolConfig::new(1, MAX_IO_REQUESTS_PER_ENGINE),
+                pool,
+                pool,
+            )));
+        let growth = runtime_topology_memory_bytes(4, &deep).unwrap()
+            - runtime_topology_memory_bytes(4, &shallow).unwrap();
+        assert!(growth > (MAX_IO_REQUESTS_PER_ENGINE - 1) * IO_QUEUE_ENTRY_RESERVATION_BYTES);
+    }
 
     #[test]
     fn io_uring_pool_validation_bounds_rings_and_depth() {

@@ -16,8 +16,8 @@
 //!
 //! The encoder uses the stable record envelope while keeping batch padding and
 //! physical location authority in the append reservation. The encoder performs
-//! no allocation and computes the payload CRC incrementally from the key and
-//! value.
+//! no allocation. Payload preparation computes the CRC before the append
+//! transaction copies the borrowed key and value into staging.
 
 use std::fmt;
 
@@ -77,6 +77,26 @@ impl std::error::Error for RecordEncodeError {
     }
 }
 
+/// Borrowed payload with its checksum ready before entering the append gate.
+pub(crate) struct RecordPayload<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    crc: u32,
+}
+
+impl<'a> RecordPayload<'a> {
+    pub(crate) fn new(key: &'a [u8], value: &'a [u8]) -> Self {
+        let mut crc = Crc32c::new();
+        crc.update(key);
+        crc.update(value);
+        Self {
+            key,
+            value,
+            crc: crc.finish(),
+        }
+    }
+}
+
 /// Returns the minimum 32-byte-aligned envelope for one logical value.
 pub(crate) fn required_record_bytes(
     key_len: usize,
@@ -112,7 +132,8 @@ pub(crate) fn encode_value_into(
 ) -> Result<(u64, IndexEntry), RecordEncodeError> {
     let required = required_record_bytes(key.len(), value.len())?;
     let hash = hash_key(hash_seed, key);
-    let entry = encode_value_into_hashed(destination, reservation, hash, required, key, value)?;
+    let payload = RecordPayload::new(key, value);
+    let entry = encode_value_into_hashed(destination, reservation, hash, required, &payload)?;
     Ok((hash, entry))
 }
 
@@ -122,16 +143,14 @@ pub(crate) fn encode_value_into_hashed(
     reservation: RegionAppendReservation,
     hash: u64,
     required: u32,
-    key: &[u8],
-    value: &[u8],
+    payload: &RecordPayload<'_>,
 ) -> Result<IndexEntry, RecordEncodeError> {
     encode_value_into_hashed_with_seqno(
         destination,
         reservation,
         hash,
         required,
-        key,
-        value,
+        payload,
         reservation.seqno,
     )
 }
@@ -143,8 +162,7 @@ pub(crate) fn encode_reinsert_into_hashed(
     reservation: RegionAppendReservation,
     hash: u64,
     required: u32,
-    key: &[u8],
-    value: &[u8],
+    payload: &RecordPayload<'_>,
     logical_seqno: u64,
 ) -> Result<IndexEntry, RecordEncodeError> {
     if logical_seqno == 0 {
@@ -155,8 +173,7 @@ pub(crate) fn encode_reinsert_into_hashed(
         reservation,
         hash,
         required,
-        key,
-        value,
+        payload,
         logical_seqno,
     )
 }
@@ -166,10 +183,11 @@ fn encode_value_into_hashed_with_seqno(
     reservation: RegionAppendReservation,
     hash: u64,
     required: u32,
-    key: &[u8],
-    value: &[u8],
+    payload: &RecordPayload<'_>,
     logical_seqno: u64,
 ) -> Result<IndexEntry, RecordEncodeError> {
+    let key = payload.key;
+    let value = payload.value;
     let destination_len = destination.len();
     let reserved_len =
         usize::try_from(reservation.record_bytes).map_err(|_| RecordEncodeError::LengthOverflow)?;
@@ -211,10 +229,6 @@ fn encode_value_into_hashed_with_seqno(
         });
     }
 
-    let mut payload_crc = Crc32c::new();
-    payload_crc.update(key);
-    payload_crc.update(value);
-
     // Header, key, and value bytes are overwritten below. Clear only the
     // alignment tail so a reused staging span cannot leak old padding.
     destination[payload_end..].fill(0);
@@ -230,7 +244,7 @@ fn encode_value_into_hashed_with_seqno(
         value_len,
         seqno: logical_seqno,
         key_hash: hash,
-        payload_crc: payload_crc.finish(),
+        payload_crc: payload.crc,
         region_generation: reservation.region_created_seqno,
         record_len: reservation.record_bytes,
     };
@@ -283,7 +297,8 @@ mod tests {
         };
         let mut destination = vec![0_u8; required as usize];
 
-        encode_reinsert_into_hashed(&mut destination, reservation, 7, required, key, value, 11)
+        let payload = RecordPayload::new(key, value);
+        encode_reinsert_into_hashed(&mut destination, reservation, 7, required, &payload, 11)
             .unwrap();
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(header.seqno, 11);
