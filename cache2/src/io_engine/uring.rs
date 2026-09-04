@@ -33,6 +33,7 @@ const LINUX_POLLIN: u32 = 0x0001;
 const FATAL_DRAIN_ROUNDS: usize = 64;
 const MAX_INTERRUPTED_RETRIES: usize = 4;
 const MAX_WAKE_ATTEMPTS: usize = 4;
+const MAX_COMMANDS_PER_DRAIN: usize = 64;
 
 struct SocketWake {
     sender: UnixStream,
@@ -362,7 +363,7 @@ impl UringDriver {
     fn run(&mut self) -> io::Result<()> {
         loop {
             let woke = self.drain_completions()?;
-            self.drain_commands();
+            let mut commands_pending = self.drain_commands();
             if woke || self.io_poll {
                 // Producers may skip the socket write while `pending` is set.
                 // Clear only after one command drain, then drain once more to
@@ -371,7 +372,7 @@ impl UringDriver {
                 // in-ring wake poll, so every iteration clears and drains
                 // twice instead of synchronizing on a wake CQE.
                 self.wake_pending.store(false, Ordering::Release);
-                self.drain_commands();
+                commands_pending = self.drain_commands();
             }
             self.queue_requested_cancels();
 
@@ -394,14 +395,16 @@ impl UringDriver {
             {
                 return Ok(());
             }
-            if submitted == 0 {
+            if submitted == 0 && !commands_pending {
                 self.wait_for_completion()?;
             }
         }
     }
 
-    fn drain_commands(&mut self) {
-        loop {
+    /// Returns true when the budget is exhausted: commands may remain without
+    /// another socket wake, so the driver must make another pass before parking.
+    fn drain_commands(&mut self) -> bool {
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match self.receiver.try_recv() {
                 Ok(DriverCommand::Submit(task)) => {
                     if task.completion.cancel_requested.load(Ordering::Acquire) {
@@ -427,13 +430,14 @@ impl UringDriver {
                     self.queue_cancel_if_active(request_id);
                 }
                 Ok(DriverCommand::Shutdown) => self.shutting_down = true,
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.shutting_down = true;
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
 
     fn queue_requested_cancels(&mut self) {
@@ -1056,6 +1060,103 @@ fn build_target_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::{ResourceController, ResourceLimits};
+    use std::task::{Wake, Waker};
+
+    struct CancelledCommandProducer {
+        shared: Arc<RuntimeShared>,
+        commands: mpsc::SyncSender<DriverCommand>,
+        resources: ResourceController,
+        next: AtomicU64,
+        completed: AtomicUsize,
+    }
+
+    impl CancelledCommandProducer {
+        fn enqueue(self: &Arc<Self>, cancelled: bool) {
+            let completion = Arc::new(CompletionState::new());
+            completion
+                .cancel_requested
+                .store(cancelled, Ordering::Release);
+            if cancelled {
+                completion.cell.lock().unwrap().waker = Some(Waker::from(Arc::clone(self)));
+            }
+            let buffer =
+                IoBuffer::for_read(self.resources.try_read_buffer(4096).unwrap(), 1).unwrap();
+            let task = Task {
+                request_id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
+                operation: IoOperation::read(buffer, 0),
+                completion,
+                slot: self.shared.try_reserve_slot(false).unwrap(),
+                submitted_at: None,
+            };
+            assert!(self.commands.try_send(DriverCommand::Submit(task)).is_ok());
+        }
+    }
+
+    impl Wake for CancelledCommandProducer {
+        fn wake(self: Arc<Self>) {
+            if self.completed.fetch_add(1, Ordering::Relaxed) + 1 < 100 {
+                self.enqueue(true);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_command_refills_leave_room_for_io_progress() {
+        let depth = 2;
+        let shared = Arc::new(RuntimeShared::new(depth, false, false));
+        let (commands, receiver) = mpsc::sync_channel(depth * 2 + 1);
+        let (_wake_sender, wake_receiver) = UnixStream::pair().unwrap();
+        let producer = Arc::new(CancelledCommandProducer {
+            shared: Arc::clone(&shared),
+            commands,
+            resources: ResourceController::try_new(ResourceLimits {
+                memory_limit_bytes: 16 * 1024,
+                reserved_memory_bytes: 0,
+            })
+            .unwrap(),
+            next: AtomicU64::new(1),
+            completed: AtomicUsize::new(0),
+        });
+        // Command processing needs neither a kernel ring nor file descriptors.
+        let mut driver = UringDriver {
+            files: None,
+            ring: None,
+            wake_receiver,
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            wake_active: false,
+            wake_cancel_submitted: false,
+            wake_cancel_completed: false,
+            shared,
+            submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
+            receiver,
+            flights: HashMap::with_capacity_and_hasher(depth, BuildHasherDefault::default()),
+            pending_targets: VecDeque::with_capacity(depth),
+            pending_cancels: VecDeque::with_capacity(depth),
+            requested_cancels: Vec::with_capacity(depth),
+            pending_entries: Vec::new(),
+            submission_entries: Vec::new(),
+            completion_events: Vec::new(),
+            io_poll: false,
+            shutting_down: false,
+        };
+        producer.enqueue(false);
+        producer.enqueue(true);
+
+        assert!(
+            driver.drain_commands(),
+            "remaining commands must prevent parking"
+        );
+        assert_eq!(driver.pending_targets.len(), 1);
+        assert!(producer.completed.load(Ordering::Relaxed) < 100);
+
+        assert!(
+            !driver.drain_commands(),
+            "an empty queue allows parking again"
+        );
+        assert_eq!(producer.completed.load(Ordering::Relaxed), 100);
+        assert_eq!(driver.pending_targets.len(), 1);
+    }
 
     #[test]
     fn io_uring_memory_reservation_covers_allocations() {

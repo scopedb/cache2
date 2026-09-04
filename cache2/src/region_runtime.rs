@@ -1140,6 +1140,10 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
+                if !self.config.read_io_wait_timeout.is_zero() {
+                    self.record_read_wait_error(&error);
+                    return Err(error);
+                }
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l2_misses);
                     RuntimeMetrics::increment(&activity.l2_read_busy_misses);
@@ -2387,6 +2391,90 @@ mod tests {
             assert!(is_read_pressure(kind));
         }
         assert!(!is_read_pressure(io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn completion_timeouts_follow_read_wait_mode() {
+        use crate::index::{IndexEntry, PackedLocation};
+        use crate::recovery::{DATA_REGION_AREA_OFFSET, PersistentId};
+        use crate::region::{FileRegionBackend, RegionFiles};
+        use crate::region_store::RegionStore;
+        use crate::runtime_config::{IoEngine, PosixIoConfig};
+
+        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cache2-completion-timeout-{}-{id}",
+            std::process::id()
+        ));
+        let files = RegionFiles::new(
+            path.with_extension("cache"),
+            path.with_extension("state"),
+            path.with_extension("image"),
+        );
+        let data = DataSuperblock {
+            generation: 1,
+            cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
+            data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
+            geometry: DataGeometry {
+                data_file_len: DataGeometry::expected_file_len(4096, 2).unwrap(),
+                region_size: 4096,
+                region_count: 2,
+            },
+            hash_seed: 3,
+            config_fingerprint: 4,
+        };
+        for wait in [Duration::ZERO, Duration::from_millis(1)] {
+            let config = RuntimeConfig::default()
+                .with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 1)))
+                .with_append_shards(1)
+                .with_l1_capacity_bytes(0)
+                .with_read_io_wait_timeout(wait)
+                .with_statistics(true);
+            let mut store = RegionStore::open(
+                8,
+                FileRegionBackend::new_with_configs(files.clone(), data, 1, config),
+            )
+            .unwrap();
+            let plane = store.data_plane_handle().unwrap();
+            let MemoryLookup::Miss(read_token) = plane.shared.memory.lookup(7, b"key") else {
+                panic!("empty L1 must miss");
+            };
+            let result = plane.finish_get(
+                CompletedGet {
+                    read: ReadCompletion {
+                        plan: ReadPlan {
+                            hash: 7,
+                            entry: IndexEntry {
+                                location: PackedLocation::new(0, 0, 64).unwrap(),
+                            },
+                            region_generation: 1,
+                            absolute: DATA_REGION_AREA_OFFSET,
+                            read_len: 64,
+                            record_range: 0..64,
+                        },
+                        result: Err(io::Error::from(io::ErrorKind::TimedOut)),
+                        buffer: None,
+                    },
+                    read_token,
+                    hash: 7,
+                },
+                b"key",
+            );
+            let snapshot = plane.snapshot().unwrap();
+            assert!(plane.core.is_healthy());
+            store.close_fast().unwrap();
+            if wait.is_zero() {
+                assert!(matches!(result, Ok(None)));
+                assert_eq!(snapshot.l2_read_busy_misses, 1);
+                assert_eq!(snapshot.l2_read_overloads, 0);
+            } else {
+                assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+                assert_eq!(snapshot.l2_read_busy_misses, 0);
+                assert_eq!(snapshot.l2_read_overloads, 1);
+            }
+        }
+        std::fs::remove_file(files.data).unwrap();
+        std::fs::remove_file(files.state).unwrap();
     }
 
     #[test]
