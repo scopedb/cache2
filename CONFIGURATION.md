@@ -349,6 +349,13 @@ rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to
 each ring in that pool. SQPOLL defaults off; requested flags fail explicitly
 when the kernel cannot provide them.
 
+IOPOLL is an additional explicit per-pool opt-in through
+`IoUringPoolConfig::with_io_poll(true)`. It requires `IoMode::Direct` and a
+filesystem and block device that support polling. While requests are
+outstanding the driver busy-polls the device and consumes CPU, and a
+cancellation stays advisory until the polled operation completes, so profile
+IOPOLL on the target host before adopting it.
+
 ### Statistics
 
 Health and managed-resource gauges are always available. Enable
