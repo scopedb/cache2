@@ -4,6 +4,8 @@
 
 ### Bug Fixes
 
+- Close fences I/O submission before checking for idle engines, preventing a
+  concurrent read from forcing shutdown to wait indefinitely on device I/O.
 - Read completion timeouts now report overload when bounded read waiting is
   enabled, and update overload counters instead of busy-miss counters.
 - io_uring command processing has a per-pass budget so cancelled request

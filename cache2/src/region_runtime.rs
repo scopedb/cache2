@@ -1969,6 +1969,12 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         }
     }
     owner.shared.staging.close();
+    // Fence submission before observing idle engines. A read that already
+    // passed the public close check must not appear between this snapshot
+    // and a synchronous engine shutdown.
+    for engine in owner.shared.engines() {
+        engine.stop_accepting_requests();
+    }
     let in_flight = owner
         .shared
         .engines()
@@ -2669,3 +2675,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests;
