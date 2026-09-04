@@ -25,7 +25,7 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 # Workspace crates
-cache2 = { path = "cache2", version = "0.2.3" }
+cache2 = { path = "cache2", version = "0.3.0" }
 
 # Crates.io dependencies
 asyncband = { version = "0.7.1", features = ["barrier", "semaphore", "watch"] }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.3.0 (2026-09-04)
+
+This release keeps the version 1 on-disk format and requires no disk
+migration. It contains source-breaking public API changes described below.
+
 ### Bug Fixes
 
 - Close fences I/O submission before checking for idle engines, preventing a
