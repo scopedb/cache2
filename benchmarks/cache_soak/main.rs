@@ -1247,6 +1247,8 @@ fn parse_io_engine(
 /// `CACHE_SOAK_IO_URING_READ_RINGS` and
 /// `CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` default to the legacy mapping
 /// (one ring per worker with 64 in-flight slots per ring). Setting
+/// `CACHE_SOAK_IO_URING_READ_IOPOLL=true` enables kernel completion polling
+/// and requires `CACHE_SOAK_IO_MODE=direct`. Setting
 /// `CACHE_SOAK_IO_URING_READ_SQPOLL_MS` opts the pool into kernel submission
 /// polling with the given idle time; `CACHE_SOAK_IO_URING_READ_SQPOLL_CPU`
 /// optionally pins the polling threads.
@@ -1264,6 +1266,9 @@ fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolConfig> {
         ));
     }
     let mut pool = IoUringPoolConfig::new(rings, max_in_flight);
+    if env_bool("CACHE_SOAK_IO_URING_READ_IOPOLL", false)? {
+        pool = pool.with_io_poll(true);
+    }
     if let Some(idle_millis) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_MS")? {
         let mut sq_poll = IoUringSqPollConfig::new(idle_millis);
         if let Some(cpu) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_CPU")? {
