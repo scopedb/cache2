@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use twox_hash::XxHash3_64;
+use hashcrew::xxhash::xxh3_64_with_seed;
 
 use crate::checksum::Crc32c;
 use crate::format::{MAX_KEY_SIZE, RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
@@ -254,7 +254,7 @@ fn encode_value_into_hashed_with_seqno(
 }
 
 pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
-    XxHash3_64::oneshot_with_seed(seed, key)
+    xxh3_64_with_seed(key, seed)
 }
 
 #[cfg(test)]
@@ -266,6 +266,25 @@ mod tests {
         let seed = 0x6a09_e667_f3bc_c909;
         let actual = [hash_key(seed, b""), hash_key(seed, b"cache2\0key")];
         assert_eq!(actual, [0x4e79_f242_1392_7a65, 0xd168_c107_36e1_695c,]);
+
+        // Digests from twox-hash 2.1.4 pin the persisted hash contract across
+        // XXH3 input-size boundaries and the maximum supported key length.
+        let key = (0..4096)
+            .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        for (length, expected) in [
+            (17, [0xc941_bd3a_fcc1_dde6, 0x7c4f_f470_c665_724d]),
+            (128, [0xf2e0_bda2_8217_733d, 0x3cb7_ae15_895a_24ad]),
+            (129, [0x1317_3987_cd70_3b99, 0xd88a_7ac4_c75e_9413]),
+            (240, [0x172a_b708_d5be_4619, 0x46c0_b308_8509_604e]),
+            (241, [0x32fe_e601_d243_0747, 0xc98a_c273_fd5f_d41a]),
+            (1024, [0x8c8f_31e5_7d4a_a58c, 0x2e24_86ac_39f8_9d6a]),
+            (1025, [0x769a_d4b4_4613_261a, 0xe965_733c_5fb9_ca62]),
+            (4096, [0x6d68_4012_8c18_9b6b, 0x6a15_bc71_0ad2_9e01]),
+        ] {
+            let actual = [0, seed].map(|seed| hash_key(seed, &key[..length]));
+            assert_eq!(actual, expected, "key length {length}");
+        }
     }
 
     #[test]

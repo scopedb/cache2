@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::BuildHasherDefault;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
+use hashcrew::xxhash::Xxh3_64Builder;
 use io_uring::{IoUring, Probe, opcode, squeue, types};
-use twox_hash::XxHash3_64;
 
 use super::*;
 
@@ -302,7 +301,7 @@ struct UringDriver {
     shared: Arc<RuntimeShared>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
-    flights: HashMap<RequestId, Flight, BuildHasherDefault<XxHash3_64>>,
+    flights: HashMap<RequestId, Flight, Xxh3_64Builder>,
     pending_targets: VecDeque<RequestId>,
     pending_cancels: VecDeque<RequestId>,
     requested_cancels: Vec<RequestId>,
@@ -337,7 +336,7 @@ fn uring_driver(
         shared,
         submit_state,
         receiver,
-        flights: HashMap::with_capacity_and_hasher(max_in_flight, BuildHasherDefault::default()),
+        flights: HashMap::with_capacity_and_hasher(max_in_flight, Xxh3_64Builder::default()),
         pending_targets: VecDeque::with_capacity(max_in_flight),
         pending_cancels: VecDeque::with_capacity(max_in_flight),
         requested_cancels: Vec::with_capacity(max_in_flight),
@@ -1130,7 +1129,7 @@ mod tests {
             shared,
             submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
             receiver,
-            flights: HashMap::with_capacity_and_hasher(depth, BuildHasherDefault::default()),
+            flights: HashMap::with_capacity_and_hasher(depth, Xxh3_64Builder::default()),
             pending_targets: VecDeque::with_capacity(depth),
             pending_cancels: VecDeque::with_capacity(depth),
             requested_cancels: Vec::with_capacity(depth),
@@ -1166,8 +1165,10 @@ mod tests {
         for depth in [1, 28, 29, 2046, 2047, maximum - 2, maximum] {
             let sq = (depth + 2).next_power_of_two();
             let cq = sq * 2;
-            let flights = HashMap::<RequestId, Flight, BuildHasherDefault<XxHash3_64>>::
-                with_capacity_and_hasher(depth, BuildHasherDefault::default());
+            let flights = HashMap::<RequestId, Flight, Xxh3_64Builder>::with_capacity_and_hasher(
+                depth,
+                Xxh3_64Builder::default(),
+            );
             // HashMap capacity excludes its unused buckets; include those
             // buckets, control bytes, and the trailing SIMD control group.
             let buckets = flights.capacity().next_power_of_two();
