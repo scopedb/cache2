@@ -33,9 +33,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 asyncband = { workspace = true }
 crc-fast = { workspace = true }
+hashcrew = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
-twox-hash = { workspace = true }
 
 [dev-dependencies]
 quickcheck = { workspace = true }

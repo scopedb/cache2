@@ -94,12 +94,12 @@ version = "0.3.0"
 dependencies = [
  "asyncband",
  "crc-fast",
+ "hashcrew",
  "io-uring",
  "libc",
  "log",
  "quickcheck",
  "tokio",
- "twox-hash",
 ]
 
 [[package]]
@@ -278,6 +278,12 @@ dependencies = [
  "r-efi",
  "rand_core",
 ]
+
+[[package]]
+name = "hashcrew"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c419c998757fb3140b57e1eb6f836d9be0a9a6895632b01224c69cc408155e8"
 
 [[package]]
 name = "heck"
@@ -644,12 +650,6 @@ dependencies = [
  "quote",
  "syn 3.0.4",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "typenum"
