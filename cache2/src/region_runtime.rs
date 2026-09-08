@@ -35,6 +35,7 @@ mod metrics;
 
 pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
+use crate::config::CacheConfig;
 
 use crate::config::{IoMode, IoPoolTopology, RuntimeOptions};
 use crate::format::MAX_KEY_SIZE;
@@ -697,8 +698,22 @@ impl RegionDataPlane {
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RuntimeOptions,
+        configuration: CacheConfig,
     ) -> io::Result<Self> {
+        // Recovery supplies independently validated metadata. It must still
+        // match the configuration selected for this open.
+        let storage = configuration.storage();
+        if data.geometry != storage.geometry()
+            || core.region_count()? != storage.region_count() as usize
+            || core.index_slot_count() != storage.index_slots()
+            || core.shard_count() != configuration.runtime().append_shards as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recovered layout does not match the cache configuration",
+            ));
+        }
+        let config = configuration.runtime().clone();
         core.configure_reclaim_workers(config.reclaim_io_max_in_flight())?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
@@ -707,7 +722,7 @@ impl RegionDataPlane {
             Arc::clone(&core),
             data,
             files,
-            config.clone(),
+            configuration,
             Arc::clone(&metrics),
             Arc::clone(&operations),
         )?;
@@ -1307,29 +1322,18 @@ fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     files: RuntimeFileSet,
-    config: RuntimeOptions,
+    configuration: CacheConfig,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
-    let l1_entry_capacity = config.l1_entry_capacity(data.geometry, core.index_slot_count())?;
-    let l1_metadata_bytes = MemoryStore::allocation_bytes(
-        config.l1_capacity_bytes,
-        l1_entry_capacity,
-        config.l1_shards,
-        config.l1_eviction_policy,
-    )?;
-    let fixed_memory = core
-        .runtime_reserved_memory_bytes()?
-        .checked_add(l1_metadata_bytes)
-        .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
-    let reserved_memory =
-        config.validated_reserved_memory_bytes(data.geometry, shard_count, fixed_memory)?;
+    let config = configuration.runtime();
+    let l1_entry_capacity = configuration.l1_entry_capacity();
     let memory_limit = config.managed_memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: memory_limit,
-            reserved_memory_bytes: reserved_memory,
+            reserved_memory_bytes: configuration.reserved_memory_bytes(),
         })
         .map_err(resource_build_io_error)?,
     );
@@ -1374,12 +1378,12 @@ fn start_running(
     let write_files = files.try_clone()?;
     let read_wait_enabled = !config.read_io_wait_timeout().is_zero();
     let read_engines =
-        build_engine_pool(files, &config, config.read_io_topology(), read_wait_enabled)?;
+        build_engine_pool(files, config, config.read_io_topology(), read_wait_enabled)?;
     let read_waiters =
         read_wait_enabled.then(|| Arc::new(Semaphore::new(config.read_io_wait_capacity())));
-    let write_engines = build_engine_pool(write_files, &config, config.write_io_topology(), false)?;
+    let write_engines = build_engine_pool(write_files, config, config.write_io_topology(), false)?;
     let reclaim_engines =
-        build_engine_pool(reclaim_files, &config, config.reclaim_io_topology(), false)?;
+        build_engine_pool(reclaim_files, config, config.reclaim_io_topology(), false)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -2444,7 +2448,7 @@ mod tests {
             };
             let mut store = RegionStore::open(
                 8,
-                FileRegionBackend::new_with_configs(files.clone(), data, 1, config),
+                FileRegionBackend::for_test_with_options(files.clone(), data, 8, config),
             )
             .unwrap();
             let plane = store.data_plane_handle().unwrap();

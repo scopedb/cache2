@@ -448,11 +448,9 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    /// Returns the aggregate maximum number of in-flight reads.
-    pub const fn read_io_max_in_flight(&self) -> usize {
+    pub(crate) const fn read_io_max_in_flight(&self) -> usize {
         self.io_engine.read_topology().max_in_flight
     }
-
     pub(crate) const fn read_io_wait_capacity(&self) -> usize {
         match self.read_admission {
             ReadAdmission::Immediate => 0,
@@ -470,8 +468,7 @@ impl RuntimeOptions {
         }
     }
 
-    /// Returns the aggregate maximum number of concurrent Region reclaims.
-    pub const fn reclaim_io_max_in_flight(&self) -> usize {
+    pub(crate) const fn reclaim_io_max_in_flight(&self) -> usize {
         self.io_engine.reclaim_topology().max_in_flight
     }
 
@@ -490,14 +487,14 @@ impl RuntimeOptions {
 
 // Covers worker/shard controls and handles whose size does not scale with the
 // payload or engine depth.
-pub(crate) const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
+const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
 // Keep the fixed L1 directory useful when the configured L2 has deliberate
 // headroom. Smaller entries may still bypass before the byte budget fills;
 // this avoids sizing metadata for the theoretical 64-byte minimum.
-const PLANNED_MIN_L1_ENTRY_BYTES: usize = 4 * 1024;
+const MIN_L1_SIZING_ENTRY_BYTES: usize = 4 * 1024;
 
 impl RuntimeOptions {
-    pub(crate) fn validate(&self) -> io::Result<()> {
+    pub(super) fn resolve(&mut self) -> io::Result<()> {
         if !self.io_engine.is_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -550,7 +547,7 @@ impl RuntimeOptions {
         if let ReadAdmission::Wait {
             timeout,
             max_waiters,
-        } = &self.read_admission
+        } = &mut self.read_admission
         {
             if timeout.is_zero() || *timeout > MAX_READ_IO_WAIT_TIMEOUT {
                 return Err(invalid_runtime_config(
@@ -563,6 +560,7 @@ impl RuntimeOptions {
                     "maximum read waiters must be in 1..=65536",
                 ));
             }
+            *max_waiters = Some(capacity);
         }
         if self.managed_memory_limit_bytes == 0 {
             return Err(io::Error::new(
@@ -596,7 +594,7 @@ impl RuntimeOptions {
         Ok(())
     }
 
-    pub(crate) fn l1_entry_capacity(
+    pub(super) fn l1_entry_capacity(
         &self,
         geometry: DataGeometry,
         index_slots: usize,
@@ -607,7 +605,7 @@ impl RuntimeOptions {
         let l2_capacity = u128::from(geometry.region_size)
             .checked_mul(u128::from(geometry.region_count))
             .filter(|capacity| *capacity != 0)
-            .ok_or_else(|| invalid_runtime_config("L2 capacity does not fit the L1 plan"))?;
+            .ok_or_else(|| invalid_runtime_config("L2 capacity does not fit the L1 sizing"))?;
         let expected_entries = index_slots.div_ceil(2).max(1);
         let proportional = (expected_entries as u128)
             .checked_mul(self.l1_capacity_bytes as u128)
@@ -615,7 +613,7 @@ impl RuntimeOptions {
             .map(|entries| entries / l2_capacity)
             .and_then(|entries| usize::try_from(entries).ok())
             .ok_or_else(|| invalid_runtime_config("L1 entry capacity does not fit usize"))?;
-        let four_kib_density = self.l1_capacity_bytes.div_ceil(PLANNED_MIN_L1_ENTRY_BYTES);
+        let four_kib_density = self.l1_capacity_bytes.div_ceil(MIN_L1_SIZING_ENTRY_BYTES);
         let maximum = MemoryStore::maximum_entry_capacity(self.l1_capacity_bytes, self.l1_shards);
         let minimum = self.l1_shards.min(maximum);
         Ok(proportional
@@ -625,63 +623,43 @@ impl RuntimeOptions {
             .min(maximum))
     }
 
-    pub(crate) fn validated_reserved_memory_bytes(
+    pub(super) fn memory_requirements(
         &self,
         geometry: DataGeometry,
-        shard_count: usize,
-        fixed_bytes: usize,
-    ) -> io::Result<usize> {
-        let (reserved_memory, minimum) =
-            self.memory_plan_bytes(geometry, shard_count, fixed_bytes)?;
-        if minimum > self.managed_memory_limit_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "managed memory limit cannot hold the fixed cache memory plan: requires {minimum} bytes, configured {} bytes",
-                    self.managed_memory_limit_bytes
-                ),
-            ));
-        }
-        Ok(reserved_memory)
-    }
-
-    pub(crate) fn memory_plan_bytes(
-        &self,
-        geometry: DataGeometry,
-        shard_count: usize,
         fixed_bytes: usize,
     ) -> io::Result<(usize, usize)> {
-        self.validate()?;
-        let topology_bytes = runtime_topology_memory_bytes(shard_count, self)
-            .ok_or_else(|| invalid_runtime_config("runtime topology memory plan overflow"))?;
-        let usable_region = usize::try_from(geometry.region_size)
-            .map_err(|_| invalid_runtime_config("Region size does not fit the memory plan"))?;
+        let shard_count = self.append_shards as usize;
+        let topology_bytes = runtime_topology_memory_bytes(self).ok_or_else(|| {
+            invalid_runtime_config("runtime topology memory requirements overflow")
+        })?;
+        let usable_region = usize::try_from(geometry.region_size).map_err(|_| {
+            invalid_runtime_config("Region size does not fit the memory requirements")
+        })?;
         let chunk_bytes = usable_region;
-        let write_buffer_reservation =
-            RegionStaging::reservation_bytes(shard_count, chunk_bytes)
-                .ok_or_else(|| invalid_runtime_config("write buffer memory plan overflow"))?;
+        let write_buffer_reservation = RegionStaging::reservation_bytes(shard_count, chunk_bytes)
+            .ok_or_else(|| {
+            invalid_runtime_config("write buffer memory requirements overflow")
+        })?;
         let reserved_memory = fixed_bytes
             .checked_add(self.l1_capacity_bytes)
             .and_then(|bytes| bytes.checked_add(topology_bytes))
-            .ok_or_else(|| invalid_runtime_config("reserved memory plan overflow"))?;
+            .ok_or_else(|| invalid_runtime_config("reserved memory requirements overflow"))?;
         let reclaim_buffers = usable_region
             .checked_mul(self.reclaim_io_max_in_flight())
-            .ok_or_else(|| invalid_runtime_config("reclaim buffer memory plan overflow"))?;
+            .ok_or_else(|| invalid_runtime_config("reclaim buffer memory requirements overflow"))?;
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
             // Every reclaimer permanently owns one Region-sized buffer. Keep
             // one additional maximum-size bounded read for the foreground.
             .and_then(|bytes| bytes.checked_add(reclaim_buffers))
             .and_then(|bytes| bytes.checked_add(usable_region))
-            .ok_or_else(|| invalid_runtime_config("minimum memory plan overflow"))?;
+            .ok_or_else(|| invalid_runtime_config("minimum memory requirements overflow"))?;
         Ok((reserved_memory, minimum))
     }
 }
 
-pub(crate) fn runtime_topology_memory_bytes(
-    shard_count: usize,
-    config: &RuntimeOptions,
-) -> Option<usize> {
+fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
+    let shard_count = config.append_shards as usize;
     // Reserve one stack per physical I/O thread, one possible shutdown reaper
     // per engine, and every append/reclaim worker.
     let read = config.read_io_topology();
@@ -699,11 +677,7 @@ pub(crate) fn runtime_topology_memory_bytes(
         .checked_add(shard_count)?
         .checked_add(reclaim.max_in_flight)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let read_wait_queue = if config.read_io_wait_timeout().is_zero() {
-        0
-    } else {
-        config.read_io_wait_capacity()
-    };
+    let read_wait_queue = config.read_io_wait_capacity();
     let queue = write
         .max_in_flight
         .checked_add(read.max_in_flight)?
@@ -779,6 +753,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_read_wait_queue_is_memory_accounted() {
+        let base = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(7, 4, 1)),
+            ..RuntimeOptions::default()
+        };
+        let no_wait = runtime_topology_memory_bytes(&base).unwrap();
+        let with_wait = runtime_topology_memory_bytes(&RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(11),
+            },
+            ..base
+        })
+        .unwrap();
+
+        assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
+    }
+
+    #[test]
+    fn each_additional_reclaimer_is_fully_memory_accounted() {
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
+            region_size: 512 * 1024,
+            region_count: 10,
+        };
+        let base = RuntimeOptions {
+            append_shards: 4,
+            l1_capacity_bytes: 0,
+            ..RuntimeOptions::default()
+        };
+        let (_, base_minimum) = base.memory_requirements(geometry, 0).unwrap();
+        let (_, parallel_minimum) = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
+            ..base
+        }
+        .memory_requirements(geometry, 0)
+        .unwrap();
+
+        assert_eq!(
+            parallel_minimum - base_minimum,
+            geometry.region_size as usize
+                + 2 * CACHE_THREAD_STACK_BYTES
+                + IO_QUEUE_ENTRY_RESERVATION_BYTES
+                + RUNTIME_CONTROL_RESERVATION_BYTES
+        );
+    }
+
+    #[test]
     fn io_engine_topology_matches_backend_shape() {
         let posix = IoEngine::Posix(PosixIoConfig::new(7, 5, 2));
         assert_eq!(
@@ -806,57 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_read_wait_queue_is_memory_accounted() {
-        let base = RuntimeOptions {
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(7, 4, 1)),
-            ..RuntimeOptions::default()
-        };
-        let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
-        let with_wait = runtime_topology_memory_bytes(
-            4,
-            &RuntimeOptions {
-                read_admission: ReadAdmission::Wait {
-                    timeout: Duration::from_millis(1),
-                    max_waiters: Some(11),
-                },
-                ..base
-            },
-        )
-        .unwrap();
-
-        assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
-    }
-
-    #[test]
-    fn each_additional_reclaimer_is_fully_memory_accounted() {
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
-            region_size: 512 * 1024,
-            region_count: 10,
-        };
-        let base = RuntimeOptions {
-            append_shards: 4,
-            l1_capacity_bytes: 0,
-            ..RuntimeOptions::default()
-        };
-        let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
-        let (_, parallel_minimum) = RuntimeOptions {
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
-            ..base
-        }
-        .memory_plan_bytes(geometry, 4, 0)
-        .unwrap();
-
-        assert_eq!(
-            parallel_minimum - base_minimum,
-            geometry.region_size as usize
-                + 2 * CACHE_THREAD_STACK_BYTES
-                + IO_QUEUE_ENTRY_RESERVATION_BYTES
-                + RUNTIME_CONTROL_RESERVATION_BYTES
-        );
-    }
-
-    #[test]
     fn io_uring_depth_reserves_more_than_common_request_bookkeeping() {
         let pool = IoUringPoolConfig::new(1, 1);
         let shallow = RuntimeOptions {
@@ -871,8 +842,8 @@ mod tests {
             )),
             ..shallow.clone()
         };
-        let growth = runtime_topology_memory_bytes(4, &deep).unwrap()
-            - runtime_topology_memory_bytes(4, &shallow).unwrap();
+        let growth = runtime_topology_memory_bytes(&deep).unwrap()
+            - runtime_topology_memory_bytes(&shallow).unwrap();
         assert!(growth > (MAX_IO_REQUESTS_PER_ENGINE - 1) * IO_QUEUE_ENTRY_RESERVATION_BYTES);
     }
 
@@ -907,7 +878,7 @@ mod tests {
     #[test]
     fn io_poll_requires_direct_mode() {
         let pool = IoUringPoolConfig::default().with_io_poll(true);
-        let config = RuntimeOptions {
+        let mut config = RuntimeOptions {
             io_engine: IoEngine::IoUring(crate::config::IoUringConfig::new(
                 pool,
                 IoUringPoolConfig::default(),
@@ -917,7 +888,7 @@ mod tests {
         };
 
         assert_eq!(
-            config.validate().unwrap_err().kind(),
+            config.resolve().unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }

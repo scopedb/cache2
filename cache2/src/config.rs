@@ -18,6 +18,8 @@ use std::io;
 
 use crate::error::{Error, ErrorOperation, Result};
 use crate::memory::MemoryStore;
+#[cfg(test)]
+use crate::recovery::DataGeometry;
 
 mod runtime;
 mod storage;
@@ -43,6 +45,8 @@ pub use storage::{StorageLayout, StorageOptions};
 pub struct CacheConfig {
     storage: StorageLayout,
     runtime: RuntimeOptions,
+    l1_entry_capacity: usize,
+    reserved_memory_bytes: usize,
     minimum_memory_bytes: usize,
 }
 
@@ -71,17 +75,7 @@ impl CacheConfig {
         let build = || -> io::Result<Self> {
             let geometry = storage.geometry;
             let index_slots = storage.index_slots;
-            runtime.validate()?;
-            if let ReadAdmission::Wait {
-                timeout,
-                max_waiters: None,
-            } = runtime.read_admission
-            {
-                runtime.read_admission = ReadAdmission::Wait {
-                    timeout,
-                    max_waiters: Some(runtime.read_io_max_in_flight()),
-                };
-            }
+            runtime.resolve()?;
             if geometry.region_count <= runtime.append_shards {
                 return Err(invalid_config(
                     "append shards require valid geometry with one Active Region each plus one spare Region",
@@ -100,8 +94,8 @@ impl CacheConfig {
             )?
             .checked_add(l1_metadata_bytes)
             .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
-            let (_, minimum_memory_bytes) =
-                runtime.memory_plan_bytes(geometry, runtime.append_shards as usize, fixed_bytes)?;
+            let (reserved_memory_bytes, minimum_memory_bytes) =
+                runtime.memory_requirements(geometry, fixed_bytes)?;
             if minimum_memory_bytes > runtime.managed_memory_limit_bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -114,6 +108,8 @@ impl CacheConfig {
             Ok(Self {
                 storage,
                 runtime,
+                l1_entry_capacity,
+                reserved_memory_bytes,
                 minimum_memory_bytes,
             })
         };
@@ -137,6 +133,28 @@ impl CacheConfig {
     /// need additional headroom. This is not an RSS bound.
     pub const fn minimum_memory_bytes(&self) -> usize {
         self.minimum_memory_bytes
+    }
+
+    pub(crate) const fn l1_entry_capacity(&self) -> usize {
+        self.l1_entry_capacity
+    }
+    pub(crate) const fn reserved_memory_bytes(&self) -> usize {
+        self.reserved_memory_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        geometry: DataGeometry,
+        index_slots: usize,
+        runtime: RuntimeOptions,
+    ) -> Self {
+        let storage = StorageLayout::new(
+            geometry.region_size * u64::from(geometry.region_count),
+            geometry.region_size,
+            index_slots,
+        )
+        .expect("test storage layout must be valid");
+        Self::new(storage, runtime).expect("test configuration must be valid")
     }
 }
 

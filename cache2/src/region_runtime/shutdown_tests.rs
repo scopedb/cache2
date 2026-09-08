@@ -225,7 +225,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     };
     let mut store = RegionStore::open(
         8,
-        FileRegionBackend::new_with_configs(files, data, 1, config),
+        FileRegionBackend::for_test_with_options(files, data, 8, config),
     )
     .unwrap();
     let mut plane = store.data_plane_handle().unwrap();

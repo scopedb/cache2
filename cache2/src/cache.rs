@@ -225,12 +225,7 @@ impl Cache {
         );
         let index_slots = config.storage().index_slots();
         let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
-        let backend = FileRegionBackend::new_with_configs(
-            files,
-            format_data,
-            config.runtime().append_shards,
-            config.runtime().clone(),
-        );
+        let backend = FileRegionBackend::new(files, format_data, config);
         let store = RegionStore::open(index_slots, backend)?;
         let startup = store.startup();
         let data_plane = store.data_plane_handle()?;
