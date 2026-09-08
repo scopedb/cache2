@@ -6,10 +6,85 @@ appears to the caller: an L1 bypass, cache miss, explicit overload, or bounded
 eviction. There is no configuration that maximizes hit rate, minimizes tail
 latency, absorbs every write burst, and uses the least memory at the same time.
 
-This guide explains the interactions between `StaticConfig` and
-`RuntimeConfig`, then gives tuning directions for common operating goals. The
+This guide explains the interactions between `StorageLayout` and
+`RuntimeOptions`, then gives tuning directions for common operating goals. The
 profiles are starting points. Validate them with the production key count,
 value-size distribution, concurrency, device, and hit-cost model.
+
+## Configuration lifecycle
+
+Fill in `StorageOptions` and `RuntimeOptions` using their public fields.
+`StorageOptions::build()` returns an immutable `StorageLayout` with checked
+geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the
+complete combination and retains the resolved runtime choices and memory
+requirements. Neither step opens files, starts workers, or needs Tokio.
+
+```rust
+use cache2::{Cache, CacheConfig, L1EvictionPolicy, RuntimeOptions, StorageOptions};
+
+let storage = StorageOptions {
+    expected_entries: Some(1_000_000),
+    ..StorageOptions::new(8 * 1024 * 1024 * 1024)
+}.build()?;
+let runtime = RuntimeOptions {
+    l1_capacity_bytes: 256 * 1024 * 1024,
+    l1_eviction_policy: L1EvictionPolicy::S3Fifo,
+    managed_memory_limit_bytes: 1024 * 1024 * 1024,
+    statistics: true,
+    ..RuntimeOptions::default()
+};
+let config = CacheConfig::new(storage, runtime)?;
+let disk_peak = config.storage().peak_disk_bytes();
+let memory_floor = config.minimum_memory_bytes();
+let cache = Cache::open("cache.data", config.clone()).await?;
+```
+
+The two resource queries cannot fail or repeat configuration checks. When
+choosing capacity to fit a disk budget, build and compare candidate
+`StorageLayout` values first. Keep the selected layout and pass it directly to
+`CacheConfig::new` after choosing runtime parameters. Storage sizing does not
+depend on a file path, I/O worker count, or managed-memory limit.
+
+`CacheConfig::runtime()` reports the selected options with dependent defaults
+resolved. Both result types have private fields and can be cloned. Changing
+options constructs a new result; there is no validation flag to invalidate.
+Cloning `config.runtime()` preserves the resolved waiter bound. Set
+`max_waiters` back to `None` if it should follow a newly selected I/O pool.
+For example, reuse the same layout when changing L1:
+
+```rust
+let adjusted = CacheConfig::new(config.storage().clone(), RuntimeOptions {
+    l1_capacity_bytes: 128 * 1024 * 1024,
+    ..config.runtime().clone()
+})?;
+```
+
+`Cache::open` consumes one configuration and uses the current Tokio runtime
+when first polled. Use `Cache::open_with_handle(path, config, handle)` for an
+explicit runtime, which must have time enabled and outlive the cache. Clone the
+configuration before opening when it will be reused. Each open locks files and
+acquires its own resources; constructing a configuration reserves none of them.
+
+| Stage | Error operation | What can fail |
+|-------|-----------------|---------------|
+| Build storage | `BuildStorage` | Invalid or unrepresentable geometry/index, disk-accounting overflow, bounded layout allocation |
+| Build complete configuration | `BuildConfig` | Runtime limits, Region/shard compatibility, build/platform support, insufficient managed memory |
+| Open cache | `Open` | File locks, filesystem/device capabilities, recovery, actual allocation, runtime binding, worker startup |
+
+Recovery still validates persisted metadata against the selected layout, and
+reads still validate records. Configuration construction cannot establish the
+contents of files or guarantee that external resources remain available.
+
+### Migrating from the builder API
+
+Replace `StaticConfig` with `StorageOptions` and call `build()` once to obtain
+the layout. Replace `RuntimeConfig` setters with `RuntimeOptions` fields, then
+construct `CacheConfig::new(layout, options)`. Replace `CacheBuilder::open()`
+with `Cache::open(path, config)`, passing any explicit Tokio handle through
+`Cache::open_with_handle`. The standalone `validate()` method is removed;
+disk-usage queries now belong to `StorageLayout` and return `u64` directly.
+Use `ReadAdmission::Immediate` for the former zero timeout, or
+`ReadAdmission::Wait { timeout, max_waiters }` for bounded waiting.
 
 ## Measure the workload envelope first
 
@@ -28,7 +103,7 @@ Collect these quantities before choosing values:
 
 Tune persistent geometry before runtime topology. Region size and index size
 are part of the on-disk identity; changing either makes existing cache contents
-ineligible for warm recovery. Most `RuntimeConfig` values may be changed at
+ineligible for warm recovery. Most `RuntimeOptions` values may be changed at
 each open, although append-shard growth can also cause a cold start when the
 recovered topology has too few Free Regions.
 
@@ -51,8 +126,8 @@ Region-backed value retains the buffer until the caller drops it. Evicted L1
 values can also remain charged while callers own them. Leave dynamic headroom
 for the desired read concurrency and returned-value lifetime.
 
-`open` rejects a configuration whose fixed plan cannot fit the managed-memory
-limit. A configuration that only barely opens can still produce read-memory
+`CacheConfig::new` rejects a combination whose fixed footprint cannot fit the
+managed-memory limit. A configuration that only barely opens can still produce read-memory
 misses or overload once concurrent transient buffers consume the remaining
 budget.
 
@@ -80,10 +155,10 @@ managed-memory gauges remain below their limit.
 
 ### Capacity and Region size
 
-`StaticConfig::new(capacity_bytes)` defaults to 32 MiB Regions. Capacity must
+`StorageOptions::new(capacity_bytes)` defaults to 32 MiB Regions. Capacity must
 be an exact multiple of the Region size. The geometry needs one Active Region
 per append shard and at least one additional Region, so runtime topology can
-make an otherwise valid static layout fail at open.
+make an otherwise valid storage layout fail at `CacheConfig::new`.
 
 Every encoded key/value record must fit in one Region. Region size also scales
 several resources and policies at once:
@@ -99,7 +174,7 @@ several resources and policies at once:
 For `A` append shards and `R`-byte Regions, append staging alone is `2 * A * R`.
 Changing from 24 MiB to 32 MiB with four append shards, for example, adds
 64 MiB of fixed staging. Each reclaim worker adds another `R`-byte scan buffer,
-and the memory plan keeps one additional `R`-byte read allowance.
+and the memory requirements keeps one additional `R`-byte read allowance.
 
 Choose the smallest Region that safely holds the largest cacheable record,
 then increase it only when fewer rotations or more burst absorption justifies
@@ -108,7 +183,7 @@ the memory and reclaim granularity. The valid range is 4 KiB-aligned through
 
 ### Expected entries and index load
 
-`with_expected_entries(E)` creates approximately `2 * E` physical index
+`expected_entries: Some(E)` creates approximately `2 * E` physical index
 slots. The input is the expected simultaneously live key count, not a byte
 capacity and not the number of mutations between restarts.
 
@@ -134,9 +209,9 @@ smaller, key cardinality is known directly, or hit rate is more valuable than
 fixed memory. An aggressively oversized index consumes managed memory that
 could otherwise hold L1 entries or transient read buffers. Very large indexes
 must still fit the platform's addressable page and mapping layout, the checked
-recovery-image layout, and the configured managed-memory plan.
+recovery-image layout, and the configured managed-memory requirements.
 
-Use `StaticConfig::peak_disk_bytes()` when planning the data file, state file,
+Use `StorageLayout::peak_disk_bytes()` when planning the data file, state file,
 and two possible clean recovery images. Larger indexes increase both the
 mapping extent and recovery-image space.
 
@@ -162,9 +237,9 @@ Increasing L1 capacity can be cheaper than increasing L2 read capacity because
 it reduces the peak concurrent L2 demand. It can also release transient read
 buffers sooner when promotion succeeds. Conversely, an oversized L1 or an
 oversized fixed index can leave too little managed-memory headroom for L2 reads.
-Index sizing also feeds the fixed L1 slot plan: at the same L1 byte budget, a
+Index sizing also feeds the fixed L1 slot sizing: at the same L1 byte budget, a
 larger expected-entry count can allocate more L1 slot metadata up to the
-planner's density bounds. Recheck `l1.metadata_bytes` after changing the index.
+density bounds. Recheck `l1.metadata_bytes` after changing the index.
 
 Entries whose complete L1 charge exceeds 256 KiB bypass L1 regardless of the
 configured byte capacity. Large-object workloads must therefore plan their
@@ -191,12 +266,29 @@ the aggregate `max_in_flight` bound, which is distributed across those rings.
 The normal hash route stays stable; only a saturated primary lane probes one
 rotating alternate, so a hot route can use every ring without scanning them.
 
-`read_io_wait_timeout` changes pressure behavior, not physical capacity:
+`read_admission` chooses pressure behavior independently of physical capacity:
 
-| Setting  | When execution is full                   | Best fit                                             |
-|----------|------------------------------------------|------------------------------------------------------|
-| Zero     | Return a cache miss immediately          | Lowest bounded tail; authoritative fallback is cheap |
-| Positive | Queue up to `read_io_wait_capacity`      | Preserve more hits within a short latency budget     |
+| Setting | When execution is full | Best fit |
+|---------|------------------------|----------|
+| `ReadAdmission::Immediate` | Return a cache miss immediately | Lowest bounded tail; authoritative fallback is cheap |
+| `ReadAdmission::Wait { timeout, max_waiters }` | Queue within a positive deadline | Preserve more hits within a short latency budget |
+
+`Wait` requires a timeout greater than zero and no longer than five seconds.
+`max_waiters: None` follows the aggregate read in-flight limit at configuration
+construction; `Some(n)` sets an independent queue bound. For example:
+
+```rust
+use std::time::Duration;
+use cache2::{ReadAdmission, RuntimeOptions};
+
+let runtime = RuntimeOptions {
+    read_admission: ReadAdmission::Wait {
+        timeout: Duration::from_millis(2),
+        max_waiters: Some(16),
+    },
+    ..RuntimeOptions::default()
+};
+```
 
 A full wait queue, memory pressure, or deadline expiry returns explicit
 `ErrorKind::Overloaded`. Making the timeout longer does not enlarge the queue
@@ -206,7 +298,7 @@ demand. If memory misses dominate, adding capacity can make the problem worse;
 add managed headroom, reduce retained buffers, or improve L1 promotion instead.
 
 Size POSIX workers from peak concurrent L2 reads, not total requests. For a
-strict-hit bias, provision close to that peak and use zero or a very short
+strict-hit bias, provision close to that peak and use immediate admission or a very short
 wait. For a memory/thread bias, use fewer workers plus a short deadline and
 accept explicit overload. Validate p99 as well as hit rate.
 
@@ -307,7 +399,7 @@ index; a bursty writer may prefer Region staging. These allocations compete
 inside the same hard limit.
 
 During tuning, compare `managed_memory_peak_bytes` with the configured limit.
-If the peak approaches the limit, distinguish fixed-plan growth from transient
+If the peak approaches the limit, distinguish fixed-footprint growth from transient
 read or retained-value pressure before choosing the next knob.
 
 ### I/O engine and mode
@@ -323,24 +415,26 @@ I/O failures instead of silently falling back. Control and recovery operations
 remain buffered. Necessarily unaligned runtime remainders use the buffered
 compatibility path.
 
-io_uring is feature-gated and experimental in 0.2. Its three pools configure
+io_uring is feature-gated and experimental. Its three pools configure
 physical rings and aggregate execution bounds independently:
 
 ```rust
 use cache2::{
     IoEngine, IoMode, IoUringConfig, IoUringPoolConfig,
-    IoUringSqPollConfig, RuntimeConfig,
+    IoUringSqPollConfig, RuntimeOptions,
 };
 
 let read = IoUringPoolConfig::new(1, 128)
     .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
-let runtime = RuntimeConfig::default()
-    .with_io_engine(IoEngine::IoUring(IoUringConfig::new(
+let runtime = RuntimeOptions {
+    io_engine: IoEngine::IoUring(IoUringConfig::new(
         read,
         IoUringPoolConfig::new(1, 64),
         IoUringPoolConfig::new(1, 1),
-    )))
-    .with_io_mode(IoMode::Direct);
+    )),
+    io_mode: IoMode::Direct,
+    ..RuntimeOptions::default()
+};
 ```
 
 `rings` controls driver-thread and kernel-ring count. `max_in_flight` is the
@@ -359,7 +453,7 @@ IOPOLL on the target host before adopting it.
 ### Statistics
 
 Health and managed-resource gauges are always available. Enable
-`with_statistics(true)` while tuning to obtain cumulative request, index, L1,
+`RuntimeOptions::statistics` while tuning to obtain cumulative request, index, L1,
 and I/O counters. Enabled counters add relaxed atomic work on active paths, so
 measure the overhead before leaving all activity statistics enabled in a
 latency-critical deployment.
@@ -391,7 +485,7 @@ latency-critical deployment.
 
 ### Lowest bounded read latency
 
-- Keep `read_io_wait_timeout` at zero.
+- Keep `read_admission: ReadAdmission::Immediate`.
 - Provision modest read execution capacity and treat pressure misses as normal
   fallback.
 - Use L1 to remove repeatedly hot reads from L2 instead of building a long L2
@@ -477,7 +571,7 @@ can reward configurations that merely turn work into fast misses.
 2. Select Region size from maximum record size, memory, and desired eviction
    granularity.
 3. Size the index from maximum live keys and an explicit hit-rate/memory bias.
-4. Set a managed-memory limit that fits the fixed plan plus dynamic read and
+4. Set a managed-memory limit that fits the fixed footprint plus dynamic read and
    retained-value headroom.
 5. Tune L1 capacity, shards, and policy at fixed L2 geometry.
 6. Tune read execution and wait semantics using hit rate, overload, and p99.
@@ -501,16 +595,17 @@ tests. For storage qualification, use a dataset larger than host RAM and follow
 |--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Region size              | Nonzero 4 KiB multiple, at most 32 MiB                                                                                                                     |
 | Capacity                 | Exact Region multiple with more Regions than append shards                                                                                                 |
-| Index slots              | At least 8; the upper bound is derived from the addressable page, mapping, and recovery-image layout; `with_expected_entries` requests two slots per entry |
+| Index slots              | At least 8; the upper bound is derived from the addressable page, mapping, and recovery-image layout; `expected_entries` requests two slots per entry |
 | Append shards            | 1 through 256                                                                                                                                              |
 | Reclaim concurrency      | 1 through append-shard count                                                                                                                               |
 | POSIX pool workers       | 1 through 4,096 for read, write, and reclaim                                                                                                               |
 | io_uring rings           | 1 through 65,536 per pool and no greater than that pool's aggregate in-flight limit                                                                        |
 | io_uring in-flight limit | 1 through 65,536 per pool, with at most 4,096 requests assigned to one ring                                                                                 |
-| Read wait timeout        | Zero through five seconds                                                                                                                                  |
+| Read wait timeout        | Greater than zero through five seconds in `Wait`; `Immediate` disables waiting                                                                                                                                  |
+| Maximum waiting reads    | 1 through 65,536 in `Wait`; defaults to the read execution capacity |
 | L1 shards                | 1 through 65,536                                                                                                                                           |
 | Write flush threshold    | 4 KiB multiple from 4 KiB through 4 MiB                                                                                                                    |
-| Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed plan                                                                               |
+| Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed footprint                                                                               |
 
-Open validates the exact geometry, platform capabilities, and memory plan and
-returns a structured configuration error before the cache becomes observable.
+Storage and configuration construction enforce these bounds before file access.
+Open checks the selected filesystem, device, and runtime environment.
