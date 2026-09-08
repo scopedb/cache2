@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::runtime_config::IoMode;
+use crate::config::IoMode;
 use crate::snapshot::CacheIoPathSnapshot;
 
 #[cfg(unix)]

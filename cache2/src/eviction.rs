@@ -19,8 +19,8 @@
 
 use std::io;
 
+use crate::config::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;
-use crate::runtime_config::L1EvictionPolicy;
 
 /// Maximum policy metadata inspected by one complete foreground admission.
 /// Exhausting this budget means L1 bypass; it never expands with cache size or

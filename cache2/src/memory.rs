@@ -23,11 +23,11 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
+use crate::config::L1EvictionPolicy;
 use crate::eviction::{
     DetachedPolicy, EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX, PolicySlot,
 };
 use crate::hashing::{FixedPrehashedMap, route_hash};
-use crate::runtime_config::L1EvictionPolicy;
 use crate::snapshot::CacheL1Snapshot;
 
 /// Charged retained-value ownership. Fixed entry, policy, and directory

@@ -30,15 +30,11 @@ use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 use asyncband::watch;
 
 mod metrics;
-mod plan;
 
+pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
-#[cfg(test)]
-use self::plan::{
-    IO_QUEUE_ENTRY_RESERVATION_BYTES, RUNTIME_CONTROL_RESERVATION_BYTES,
-    runtime_topology_memory_bytes,
-};
 
+use crate::config::{IoMode, IoPoolTopology, RuntimeConfig};
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
@@ -54,7 +50,6 @@ use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     BufferLease, CACHE_THREAD_STACK_BYTES, ResourceBuildError, ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{IoMode, IoPoolTopology, RuntimeConfig};
 use crate::snapshot::{
     CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
 };
@@ -2401,11 +2396,11 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
+        use crate::config::{IoEngine, PosixIoConfig};
         use crate::index::{IndexEntry, PackedLocation};
         use crate::recovery::{DATA_REGION_AREA_OFFSET, PersistentId};
         use crate::region::{FileRegionBackend, RegionFiles};
         use crate::region_store::RegionStore;
-        use crate::runtime_config::{IoEngine, PosixIoConfig};
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -2540,23 +2535,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_read_wait_queue_is_memory_accounted() {
-        let base = RuntimeConfig::default()
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(7, 4, 1),
-            ))
-            .with_read_io_wait_capacity(11);
-        let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
-        let with_wait = runtime_topology_memory_bytes(
-            4,
-            &base.with_read_io_wait_timeout(Duration::from_millis(1)),
-        )
-        .unwrap();
-
-        assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
-    }
-
-    #[test]
     fn index_page_validation_state_is_fixed_memory_accounted() {
         let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
         let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
@@ -2564,96 +2542,6 @@ mod tests {
         assert_eq!(
             two_pages - one_page,
             INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
-        );
-    }
-
-    #[test]
-    fn four_tib_memory_plan_covers_the_complete_production_shape() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        const INDEX_SLOTS: usize = 512 * 1024 * 1024;
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 128 * 1024).unwrap(),
-            region_size: 32 * 1024 * 1024,
-            region_count: 128 * 1024,
-        };
-        let index_slots = INDEX_SLOTS;
-        let base = RuntimeConfig::default()
-            .with_l1_capacity_bytes(10 * GIB)
-            .with_managed_memory_limit_bytes(15 * GIB)
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .with_l1_shards(64);
-        let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
-        assert_eq!(entry_capacity, 2_621_440);
-        base.validate_memory_plan(geometry, index_slots, 4).unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
-        assert_eq!(
-            too_small
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-
-        let metadata = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            base.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(metadata, 130 * 1024 * 1024);
-
-        let s3fifo = base
-            .clone()
-            .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo);
-        s3fifo
-            .validate_memory_plan(geometry, index_slots, 4)
-            .unwrap();
-        assert_eq!(
-            too_small
-                .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        let s3fifo_metadata = MemoryStore::allocation_bytes(
-            s3fifo.l1_capacity_bytes,
-            entry_capacity,
-            s3fifo.l1_shards,
-            s3fifo.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(s3fifo_metadata - metadata, 110 * 1024 * 1024);
-        assert_eq!(s3fifo_metadata, 240 * 1024 * 1024);
-    }
-
-    #[test]
-    fn each_additional_reclaimer_is_fully_memory_accounted() {
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
-            region_size: 512 * 1024,
-            region_count: 10,
-        };
-        let base = RuntimeConfig::default()
-            .with_append_shards(4)
-            .with_l1_capacity_bytes(0);
-        let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
-        let (_, parallel_minimum) = base
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .memory_plan_bytes(geometry, 4, 0)
-            .unwrap();
-
-        assert_eq!(
-            parallel_minimum - base_minimum,
-            geometry.region_size as usize
-                + 2 * CACHE_THREAD_STACK_BYTES
-                + IO_QUEUE_ENTRY_RESERVATION_BYTES
-                + RUNTIME_CONTROL_RESERVATION_BYTES
         );
     }
 

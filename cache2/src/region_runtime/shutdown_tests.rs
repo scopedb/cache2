@@ -195,10 +195,10 @@ fn submitted_read_must_not_pin_close() {
 }
 
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
+    use crate::config::PosixIoConfig;
     use crate::recovery::PersistentId;
     use crate::region::{FileRegionBackend, RegionFiles};
     use crate::region_store::RegionStore;
-    use crate::runtime_config::PosixIoConfig;
     let root = std::env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
         std::process::id()
@@ -220,9 +220,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let config = RuntimeConfig::default()
         .with_append_shards(1)
         .with_l1_capacity_bytes(0)
-        .with_io_engine(crate::runtime_config::IoEngine::Posix(PosixIoConfig::new(
-            1, 1, 1,
-        )));
+        .with_io_engine(crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)));
     let mut store = RegionStore::open(
         8,
         FileRegionBackend::new_with_configs(files, data, 1, config),

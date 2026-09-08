@@ -23,6 +23,7 @@
 pub mod benchmarking;
 mod cache;
 mod checksum;
+mod config;
 pub mod error;
 mod eviction;
 mod format;
@@ -46,15 +47,15 @@ mod region_runtime;
 mod region_staging;
 mod region_store;
 mod resources;
-mod runtime_config;
 mod snapshot;
 
-pub use cache::{Cache, CacheBuilder, CacheTier, StaticConfig, Value};
-pub use error::{Error, ErrorKind, ErrorOperation, Result};
-pub use runtime_config::{
+pub use cache::{Cache, CacheBuilder, CacheTier, Value};
+pub use config::StaticConfig;
+pub use config::{
     IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
     PosixIoConfig, RuntimeConfig,
 };
+pub use error::{Error, ErrorKind, ErrorOperation, Result};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoDirectionSnapshot, CacheIoPathSnapshot,
     CacheIoSnapshot, CacheL1Snapshot, CacheReclaimSnapshot, CacheSnapshot, DetailedCacheSnapshot,

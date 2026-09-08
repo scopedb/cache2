@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use crate::config::{IoMode, RuntimeConfig};
 use crate::index::MAX_INDEX_PARTITIONS;
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, PartitionedIndexStorage,
@@ -45,7 +46,6 @@ use crate::region_metadata::{
     RegionMetadataRoot, RegionMetadataState,
 };
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
-use crate::runtime_config::{IoMode, RuntimeConfig};
 #[cfg(test)]
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
 
