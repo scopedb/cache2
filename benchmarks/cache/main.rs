@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use cache2::ReadAdmission;
 use std::env;
 use std::hint::black_box;
 use std::io;
@@ -263,13 +264,19 @@ impl BenchConfig {
         RuntimeOptions {
             io_engine: self.io_engine,
             io_mode: self.io_mode,
-            read_io_wait_capacity: Some(self.read_io_wait_capacity),
-            read_io_wait_timeout: self.read_io_wait_timeout,
             append_shards: self.append_shards,
             l1_capacity_bytes: self.memory_bytes,
             l1_eviction_policy: self.l1_eviction_policy,
             managed_memory_limit_bytes: self.managed_memory_limit_bytes,
             statistics: self.statistics_enabled,
+            read_admission: if self.read_io_wait_timeout.is_zero() {
+                ReadAdmission::Immediate
+            } else {
+                ReadAdmission::Wait {
+                    timeout: self.read_io_wait_timeout,
+                    max_waiters: Some(self.read_io_wait_capacity),
+                }
+            },
             ..RuntimeOptions::default()
         }
     }

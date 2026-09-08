@@ -22,7 +22,7 @@ pub(crate) use runtime::IoPoolTopology;
 pub(crate) use runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 pub use runtime::{
     IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
-    PosixIoConfig, RuntimeOptions,
+    PosixIoConfig, ReadAdmission, RuntimeOptions,
 };
 pub(crate) use storage::KEY_HASH_SEED;
 pub use storage::StaticConfig;

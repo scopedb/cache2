@@ -372,6 +372,23 @@ pub enum L1EvictionPolicy {
     S3Fifo,
 }
 
+/// Admission after an L2 index candidate has been selected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReadAdmission {
+    /// Return a miss when execution or read-memory capacity is unavailable.
+    #[default]
+    Immediate,
+    /// Wait for execution capacity within a bounded queue and deadline.
+    /// Queue saturation, read-memory pressure, and timeout return overload.
+    Wait {
+        /// Maximum wait, greater than zero and no longer than five seconds.
+        timeout: Duration,
+        /// Maximum queued readers, from one through 65536. `None` follows the
+        /// aggregate read in-flight limit when [`crate::CacheBuilder`] opens the cache.
+        max_waiters: Option<usize>,
+    },
+}
+
 /// Process-local cache topology and resource tuning validated during open.
 ///
 /// These values may change across opens. Warm recovery rebinds append shards
@@ -383,10 +400,8 @@ pub struct RuntimeOptions {
     pub io_engine: IoEngine,
     /// Record I/O mode. Defaults to buffered; direct I/O requires supported Linux storage.
     pub io_mode: IoMode,
-    /// Maximum queued readers; unset follows the selected read pool.
-    pub read_io_wait_capacity: Option<usize>,
-    /// Maximum execution wait; zero returns a miss immediately on pressure.
-    pub read_io_wait_timeout: Duration,
+    /// Admission policy after an L2 candidate has been selected.
+    pub read_admission: ReadAdmission,
     /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
     /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
     /// spare Region.
@@ -418,8 +433,7 @@ impl Default for RuntimeOptions {
         Self {
             io_engine: IoEngine::default(),
             io_mode: IoMode::Buffered,
-            read_io_wait_capacity: None,
-            read_io_wait_timeout: Duration::ZERO,
+            read_admission: ReadAdmission::Immediate,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             l1_eviction_policy: L1EvictionPolicy::Clock,
@@ -437,17 +451,21 @@ impl RuntimeOptions {
         self.io_engine.read_topology().max_in_flight
     }
 
-    /// Returns the maximum number of reads waiting for execution capacity.
-    pub const fn read_io_wait_capacity(&self) -> usize {
-        match self.read_io_wait_capacity {
-            Some(capacity) => capacity,
-            None => self.read_io_max_in_flight(),
+    pub(crate) const fn read_io_wait_capacity(&self) -> usize {
+        match self.read_admission {
+            ReadAdmission::Immediate => 0,
+            ReadAdmission::Wait { max_waiters, .. } => match max_waiters {
+                Some(capacity) => capacity,
+                None => self.read_io_max_in_flight(),
+            },
         }
     }
 
-    /// Returns the maximum wait for L2 read execution capacity.
-    pub const fn read_io_wait_timeout(&self) -> Duration {
-        self.read_io_wait_timeout
+    pub(crate) const fn read_io_wait_timeout(&self) -> Duration {
+        match self.read_admission {
+            ReadAdmission::Immediate => Duration::ZERO,
+            ReadAdmission::Wait { timeout, .. } => timeout,
+        }
     }
 
     /// Returns the aggregate maximum number of concurrent Region reclaims.
@@ -527,17 +545,22 @@ impl RuntimeOptions {
                 "reclaim I/O concurrency must be no greater than append shards",
             ));
         }
-        if self.read_io_wait_timeout > MAX_READ_IO_WAIT_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read I/O wait timeout must not exceed five seconds",
-            ));
-        }
-        if !(1..=MAX_CONFIG_COUNT).contains(&self.read_io_wait_capacity()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "read I/O wait capacity must be in 1..=65536",
-            ));
+        if let ReadAdmission::Wait {
+            timeout,
+            max_waiters,
+        } = &self.read_admission
+        {
+            if timeout.is_zero() || *timeout > MAX_READ_IO_WAIT_TIMEOUT {
+                return Err(invalid_runtime_config(
+                    "read wait timeout must be greater than zero and at most five seconds",
+                ));
+            }
+            let capacity = max_waiters.unwrap_or(read_topology.max_in_flight);
+            if !(1..=MAX_CONFIG_COUNT).contains(&capacity) {
+                return Err(invalid_runtime_config(
+                    "maximum read waiters must be in 1..=65536",
+                ));
+            }
         }
         if self.managed_memory_limit_bytes == 0 {
             return Err(io::Error::new(
@@ -695,7 +718,7 @@ pub(crate) fn runtime_topology_memory_bytes(
         .checked_add(shard_count)?
         .checked_add(reclaim.max_in_flight)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let read_wait_queue = if config.read_io_wait_timeout.is_zero() {
+    let read_wait_queue = if config.read_io_wait_timeout().is_zero() {
         0
     } else {
         config.read_io_wait_capacity()
@@ -775,18 +798,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_read_wait_capacity_is_independent_from_execution() {
-        let config = RuntimeOptions {
-            read_io_wait_capacity: Some(11),
-            io_engine: IoEngine::Posix(PosixIoConfig::new(7, 4, 1)),
-            ..RuntimeOptions::default()
-        };
-
-        assert_eq!(config.read_io_max_in_flight(), 7);
-        assert_eq!(config.read_io_wait_capacity(), 11);
-    }
-
-    #[test]
     fn io_engine_topology_matches_backend_shape() {
         let posix = IoEngine::Posix(PosixIoConfig::new(7, 5, 2));
         assert_eq!(
@@ -817,14 +828,16 @@ mod tests {
     fn optional_read_wait_queue_is_memory_accounted() {
         let base = RuntimeOptions {
             io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(7, 4, 1)),
-            read_io_wait_capacity: Some(11),
             ..RuntimeOptions::default()
         };
         let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
         let with_wait = runtime_topology_memory_bytes(
             4,
             &RuntimeOptions {
-                read_io_wait_timeout: Duration::from_millis(1),
+                read_admission: ReadAdmission::Wait {
+                    timeout: Duration::from_millis(1),
+                    max_waiters: Some(11),
+                },
                 ..base
             },
         )

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use cache2::ReadAdmission;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -543,12 +544,15 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
 
     let retuned = RuntimeOptions {
         io_engine: IoEngine::Posix(PosixIoConfig::new(7, 2, 2)),
-        read_io_wait_timeout: Duration::from_millis(10),
         l1_capacity_bytes: 2 * 1024 * 1024,
         l1_eviction_policy: L1EvictionPolicy::S3Fifo,
         l1_shards: 7,
         write_flush_threshold_bytes: 64 * 1024,
         statistics: false,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_millis(10),
+            max_waiters: None,
+        },
         ..test_runtime_config(2, 2)
     };
     let reopened = files
@@ -813,11 +817,17 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             ..config
         }),
         ("zero-read-wait-capacity", |config| RuntimeOptions {
-            read_io_wait_capacity: Some(0),
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(0),
+            },
             ..config
         }),
         ("too-large-read-wait-capacity", |config| RuntimeOptions {
-            read_io_wait_capacity: Some(65_537),
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(65_537),
+            },
             ..config
         }),
         ("too-many-write-workers", |config| RuntimeOptions {
@@ -825,7 +835,10 @@ async fn invalid_runtime_config_is_rejected_before_file_creation() {
             ..config
         }),
         ("excessive-read-wait", |config| RuntimeOptions {
-            read_io_wait_timeout: Duration::from_secs(5) + Duration::from_nanos(1),
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_secs(5) + Duration::from_nanos(1),
+                max_waiters: None,
+            },
             ..config
         }),
         ("l1-exceeds-budget", |config| RuntimeOptions {

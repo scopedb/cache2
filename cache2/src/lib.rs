@@ -53,7 +53,7 @@ pub use cache::{Cache, CacheBuilder, CacheTier, Value};
 pub use config::StaticConfig;
 pub use config::{
     IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
-    PosixIoConfig, RuntimeOptions,
+    PosixIoConfig, ReadAdmission, RuntimeOptions,
 };
 pub use error::{Error, ErrorKind, ErrorOperation, Result};
 pub use snapshot::{

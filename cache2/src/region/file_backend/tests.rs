@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::ReadAdmission;
 use crate::index::{IndexEntry, PackedLocation};
 use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, IndexSlot};
 use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
@@ -370,10 +371,12 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
         io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(2, 4, 1)),
-        read_io_wait_capacity: Some(1),
-        read_io_wait_timeout: Duration::from_millis(30),
         l1_capacity_bytes: 0,
         statistics: true,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_millis(30),
+            max_waiters: Some(1),
+        },
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(
@@ -452,8 +455,11 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
         io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 4, 1)),
-        read_io_wait_timeout: Duration::from_secs(1),
         l1_capacity_bytes: 0,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_secs(1),
+            max_waiters: None,
+        },
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(

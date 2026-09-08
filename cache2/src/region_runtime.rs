@@ -20,6 +20,8 @@
 //! device path. A fixed age deadline publishes partial batches without adding
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
+#[cfg(test)]
+use crate::config::ReadAdmission;
 use std::io;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -999,10 +1001,10 @@ impl RegionDataPlane {
             Ok(reservation) => reservation,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    && !self.config.read_io_wait_timeout.is_zero() =>
+                    && !self.config.read_io_wait_timeout().is_zero() =>
             {
                 let waiting = running
-                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout)
+                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout())
                     .inspect_err(|_| {
                         if running.statistics {
                             running.metrics.record_read_overload();
@@ -1030,7 +1032,7 @@ impl RegionDataPlane {
             }
         };
         let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
-            if !self.config.read_io_wait_timeout.is_zero() {
+            if !self.config.read_io_wait_timeout().is_zero() {
                 if running.statistics {
                     running.metrics.record_read_overload();
                 }
@@ -1067,7 +1069,7 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout.is_zero() {
+                if !self.config.read_io_wait_timeout().is_zero() {
                     if running.statistics {
                         running.metrics.record_read_overload();
                     }
@@ -1135,7 +1137,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout.is_zero() {
+                if !self.config.read_io_wait_timeout().is_zero() {
                     self.record_read_wait_error(&error);
                     return Err(error);
                 }
@@ -1370,7 +1372,7 @@ fn start_running(
     }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
-    let read_wait_enabled = !config.read_io_wait_timeout.is_zero();
+    let read_wait_enabled = !config.read_io_wait_timeout().is_zero();
     let read_engines =
         build_engine_pool(files, &config, config.read_io_topology(), read_wait_enabled)?;
     let read_waiters =
@@ -2429,8 +2431,15 @@ mod tests {
                 io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
-                read_io_wait_timeout: wait,
                 statistics: true,
+                read_admission: if wait.is_zero() {
+                    ReadAdmission::Immediate
+                } else {
+                    ReadAdmission::Wait {
+                        timeout: wait,
+                        max_waiters: None,
+                    }
+                },
                 ..RuntimeOptions::default()
             };
             let mut store = RegionStore::open(
