@@ -384,15 +384,17 @@ pub enum ReadAdmission {
         /// Maximum wait, greater than zero and no longer than five seconds.
         timeout: Duration,
         /// Maximum queued readers, from one through 65536. `None` follows the
-        /// aggregate read in-flight limit when [`crate::CacheBuilder`] opens the cache.
+        /// aggregate read in-flight limit when [`super::CacheConfig`] is built.
         max_waiters: Option<usize>,
     },
 }
 
-/// Process-local cache topology and resource tuning validated during open.
+/// Process-local resource choices, checked together by [`super::CacheConfig::new`].
 ///
 /// These values may change across opens. Warm recovery rebinds append shards
 /// from recovered Active and Free Regions when the requested topology fits.
+/// Fields are unchecked inputs. Configuration construction resolves defaults and
+/// checks the complete combination before any files are opened.
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
     /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
@@ -591,27 +593,6 @@ impl RuntimeOptions {
                 "write flush threshold must be 4 KiB aligned and within 4 KiB..=4 MiB",
             ));
         }
-        Ok(())
-    }
-
-    pub(crate) fn validate_memory_plan(
-        &self,
-        geometry: DataGeometry,
-        index_slots: usize,
-        shard_count: usize,
-    ) -> io::Result<()> {
-        let l1_entry_capacity = self.l1_entry_capacity(geometry, index_slots)?;
-        let l1_metadata_bytes = MemoryStore::allocation_bytes(
-            self.l1_capacity_bytes,
-            l1_entry_capacity,
-            self.l1_shards,
-            self.l1_eviction_policy,
-        )?;
-        let fixed_bytes =
-            crate::region::core::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
-                .checked_add(l1_metadata_bytes)
-                .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
-        self.validated_reserved_memory_bytes(geometry, shard_count, fixed_bytes)?;
         Ok(())
     }
 
@@ -844,75 +825,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
-    }
-
-    #[test]
-    fn four_tib_memory_plan_covers_the_complete_production_shape() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        const INDEX_SLOTS: usize = 512 * 1024 * 1024;
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 128 * 1024).unwrap(),
-            region_size: 32 * 1024 * 1024,
-            region_count: 128 * 1024,
-        };
-        let index_slots = INDEX_SLOTS;
-        let base = RuntimeOptions {
-            l1_capacity_bytes: 10 * GIB,
-            managed_memory_limit_bytes: 15 * GIB,
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
-            l1_shards: 64,
-            ..RuntimeOptions::default()
-        };
-        let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
-        assert_eq!(entry_capacity, 2_621_440);
-        base.validate_memory_plan(geometry, index_slots, 4).unwrap();
-        let too_small = RuntimeOptions {
-            managed_memory_limit_bytes: 14 * GIB,
-            ..base.clone()
-        };
-        assert_eq!(
-            too_small
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-
-        let metadata = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            base.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(metadata, 130 * 1024 * 1024);
-
-        let s3fifo = RuntimeOptions {
-            l1_eviction_policy: crate::config::L1EvictionPolicy::S3Fifo,
-            ..base.clone()
-        };
-        s3fifo
-            .validate_memory_plan(geometry, index_slots, 4)
-            .unwrap();
-        assert_eq!(
-            RuntimeOptions {
-                l1_eviction_policy: crate::config::L1EvictionPolicy::S3Fifo,
-                ..too_small
-            }
-            .validate_memory_plan(geometry, index_slots, 4)
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        let s3fifo_metadata = MemoryStore::allocation_bytes(
-            s3fifo.l1_capacity_bytes,
-            entry_capacity,
-            s3fifo.l1_shards,
-            s3fifo.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(s3fifo_metadata - metadata, 110 * 1024 * 1024);
-        assert_eq!(s3fifo_metadata, 240 * 1024 * 1024);
     }
 
     #[test]

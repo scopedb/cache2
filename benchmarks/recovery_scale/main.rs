@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use benchmarks::report::{JobReport, RunReporter};
 use cache2::{
-    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig, RuntimeOptions,
-    StartupMode, StorageOptions,
+    Cache, CacheConfig, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig,
+    RuntimeOptions, StartupMode, StorageOptions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -79,7 +79,7 @@ impl ScaleConfig {
         }
     }
 
-    fn runtime_config(&self) -> RuntimeOptions {
+    fn runtime_options(&self) -> RuntimeOptions {
         RuntimeOptions {
             io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
             io_mode: IoMode::Buffered,
@@ -114,13 +114,6 @@ impl ScaleFiles {
 
     fn mark_success(&mut self) {
         self.cleanup_on_drop = true;
-    }
-
-    fn config(&self, config: &ScaleConfig) -> cache2::Result<CacheBuilder> {
-        Ok(
-            CacheBuilder::from_static(&self.data, config.storage_options().build()?)
-                .with_runtime_config(config.runtime_config()),
-        )
     }
 
     fn logical_bytes(&self) -> io::Result<u64> {
@@ -202,12 +195,13 @@ fn run_benchmark() -> io::Result<()> {
 
 async fn run(config: ScaleConfig) -> io::Result<()> {
     let mut files = ScaleFiles::new(&config.directory);
-    let static_config = config.storage_options().build()?;
-    let peak_disk_bytes = static_config.peak_disk_bytes();
+    let storage = config.storage_options().build()?;
+    let cache_config = CacheConfig::new(storage.clone(), config.runtime_options())?;
+    let peak_disk_bytes = storage.peak_disk_bytes();
     println!(
         "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} managed_memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
         config.expected_entries,
-        static_config.index_slots(),
+        storage.index_slots(),
         config.capacity_bytes,
         config.memory_bytes,
         config.managed_memory_limit_bytes,
@@ -218,7 +212,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     );
 
     let opened = Instant::now();
-    let cache = files.config(&config)?.open().await?;
+    let cache = Cache::open(&files.data, cache_config.clone()).await?;
     emit("fresh_open", "control", opened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Cold)?;
     let resources = cache.snapshot()?;
@@ -251,7 +245,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = files.config(&config)?.open().await?;
+    let cache = Cache::open(&files.data, cache_config.clone()).await?;
     emit("warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;
@@ -262,7 +256,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = files.config(&config)?.open().await?;
+    let cache = Cache::open(&files.data, cache_config.clone()).await?;
     emit("second_warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;

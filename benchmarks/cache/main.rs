@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
-    Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    Cache, CacheConfig, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
     IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StartupMode,
     StorageOptions, Value,
 };
@@ -259,7 +259,7 @@ impl BenchConfig {
         }
     }
 
-    fn runtime_config(&self) -> RuntimeOptions {
+    fn runtime_options(&self) -> RuntimeOptions {
         RuntimeOptions {
             io_engine: self.io_engine,
             io_mode: self.io_mode,
@@ -306,24 +306,6 @@ impl BenchFiles {
                 std::process::id()
             )),
         }
-    }
-
-    fn config(&self, config: &BenchConfig) -> cache2::Result<CacheBuilder> {
-        self.config_with_l1_capacity(config, config.memory_bytes)
-    }
-
-    fn config_with_l1_capacity(
-        &self,
-        config: &BenchConfig,
-        l1_capacity_bytes: usize,
-    ) -> cache2::Result<CacheBuilder> {
-        Ok(
-            CacheBuilder::from_static(&self.data, config.storage_options().build()?)
-                .with_runtime_config(RuntimeOptions {
-                    l1_capacity_bytes: l1_capacity_bytes,
-                    ..config.runtime_config()
-                }),
-        )
     }
 }
 
@@ -401,7 +383,9 @@ fn run_benchmark() -> io::Result<()> {
 async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
-    let index_slots = config.storage_options().build()?.index_slots();
+    let cache_config =
+        CacheConfig::new(config.storage_options().build()?, config.runtime_options())?;
+    let index_slots = cache_config.storage().index_slots();
     let index_load = config.entries as f64 * 100.0 / index_slots as f64;
     let initial_l1_bytes = if config.hot_entries == 0 {
         config.memory_bytes
@@ -442,10 +426,21 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("file={}", files.data.display());
 
     let cache = Arc::new(
-        files
-            .config_with_l1_capacity(&config, initial_l1_bytes)?
-            .open()
-            .await?,
+        Cache::open(
+            &files.data,
+            if initial_l1_bytes == config.memory_bytes {
+                cache_config.clone()
+            } else {
+                CacheConfig::new(
+                    cache_config.storage().clone(),
+                    RuntimeOptions {
+                        l1_capacity_bytes: initial_l1_bytes,
+                        ..cache_config.runtime().clone()
+                    },
+                )?
+            },
+        )
+        .await?,
     );
     let mut write = concurrent_writes(
         Arc::clone(&cache),
@@ -493,7 +488,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
-    let cache = Arc::new(files.config(&config)?.open().await?);
+    let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
     if cache.startup_mode() != StartupMode::Warm {
         return Err(io::Error::other(
             "benchmark did not reopen from a clean image",
@@ -674,7 +669,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     drop(cache);
 
     let resident = if l1_entry_eligible {
-        let cache = Arc::new(files.config(&config)?.open().await?);
+        let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
         if cache.startup_mode() != StartupMode::Cold {
             return Err(io::Error::other(
                 "fast-closed benchmark did not reopen empty",

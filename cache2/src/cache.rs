@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{KEY_HASH_SEED, RuntimeOptions, StorageLayout};
+use crate::config::{CacheConfig, KEY_HASH_SEED};
 use crate::error::{Error, ErrorOperation, Result};
 use crate::recovery::{
     DataSuperblock, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET, recovery_image_index_len,
@@ -35,169 +35,6 @@ use crate::region::{FileRegionBackend, RegionFiles, SystemRegionFileSystem};
 use crate::region_runtime::{HybridValueRead, RegionDataPlane};
 use crate::region_store::RegionStore;
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
-
-/// Builder that combines a cache path, static geometry, runtime tuning, and a
-/// Tokio runtime binding before opening a [`Cache`].
-#[derive(Clone, Debug)]
-pub struct CacheBuilder {
-    path: PathBuf,
-    static_config: StorageLayout,
-    runtime_config: RuntimeOptions,
-    tokio_handle: Option<tokio::runtime::Handle>,
-}
-
-impl CacheBuilder {
-    /// Creates a cache builder from a complete static configuration.
-    pub fn from_static(path: impl AsRef<Path>, static_config: StorageLayout) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-            static_config,
-            runtime_config: RuntimeOptions::default(),
-            tokio_handle: None,
-        }
-    }
-
-    /// Replaces the process-local runtime tuning used by [`Self::open`].
-    pub fn with_runtime_config(mut self, config: RuntimeOptions) -> Self {
-        self.runtime_config = config;
-        self
-    }
-
-    /// Uses a specific Tokio runtime for blocking lifecycle work and L2 read
-    /// deadlines. The runtime must have time enabled and outlive the cache.
-    pub fn with_tokio_handle(mut self, handle: tokio::runtime::Handle) -> Self {
-        self.tokio_handle = Some(handle);
-        self
-    }
-
-    /// Opens the cache on Tokio's blocking pool because recovery and file setup
-    /// use blocking filesystem operations. The default captures the current
-    /// Tokio runtime when the future is first polled.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured [`crate::Error`] with
-    /// [`crate::ErrorOperation::Open`]. Invalid or unsupported configuration is
-    /// rejected before file creation; [`crate::ErrorKind::Busy`] means another
-    /// owner holds the cache files. Allocation, filesystem, device, and worker
-    /// startup failures retain their underlying [`io::Error`].
-    pub async fn open(self) -> Result<Cache> {
-        let tokio_handle = match self.tokio_handle.clone() {
-            Some(handle) => handle,
-            None => tokio::runtime::Handle::try_current().map_err(|error| {
-                Error::from_io(
-                    ErrorOperation::Open,
-                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
-                )
-            })?,
-        };
-        let cache_handle = tokio_handle.clone();
-        let started = Instant::now();
-        let result = tokio_handle
-            .spawn_blocking(move || self.open_blocking(cache_handle, started))
-            .await
-            .map_err(|error| {
-                Error::from_io(
-                    ErrorOperation::Open,
-                    blocking_task_error("cache open", error),
-                )
-            })?;
-        public_result(ErrorOperation::Open, result)
-    }
-
-    fn open_blocking(
-        self,
-        tokio_handle: tokio::runtime::Handle,
-        started: Instant,
-    ) -> io::Result<Cache> {
-        let path = self.path.clone();
-        let capacity_bytes = self.static_config.capacity_bytes();
-        let index_slots = self.static_config.index_slots();
-        let index_bytes = u64::try_from(index_slots)
-            .ok()
-            .and_then(recovery_image_index_len)
-            .unwrap_or(0);
-        let result = self.open_blocking_inner(tokio_handle);
-        match &result {
-            Ok(cache) => {
-                let startup = cache.startup_mode();
-                log::info!(
-                    target: "cache2::lifecycle",
-                    event = "cache_opened",
-                    path:% = path.display(),
-                    startup = startup_name(startup),
-                    index_backing = index_backing_name(startup),
-                    index_validation = index_validation_name(startup),
-                    index_copy_on_write = matches!(startup, StartupMode::Warm),
-                    capacity_bytes,
-                    index_slots,
-                    index_mapping_bytes = index_mapping_bytes(startup, index_bytes),
-                    elapsed_us = elapsed_micros(started.elapsed());
-                    "cache opened"
-                );
-            }
-            Err(error) => log::error!(
-                target: "cache2::lifecycle",
-                event = "cache_open_failed",
-                path:% = path.display(),
-                capacity_bytes,
-                index_slots,
-                elapsed_us = elapsed_micros(started.elapsed()),
-                error:% = error;
-                "cache open failed"
-            ),
-        }
-        result
-    }
-
-    fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> io::Result<Cache> {
-        let geometry = self.static_config.geometry();
-        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes();
-        let runtime_config = self.runtime_config;
-        runtime_config.validate()?;
-        if geometry.region_count <= runtime_config.append_shards {
-            return Err(invalid_config(
-                "append shards require one Active Region each plus one spare Region",
-            ));
-        }
-        runtime_config.validate_memory_plan(
-            geometry,
-            self.static_config.index_slots(),
-            runtime_config.append_shards as usize,
-        )?;
-        let format_data = DataSuperblock {
-            generation: 1,
-            cache_uuid: next_persistent_id(),
-            data_identity: next_persistent_id(),
-            geometry,
-            hash_seed: KEY_HASH_SEED,
-            config_fingerprint: self.static_config.fingerprint(),
-        };
-        let files = RegionFiles::new(
-            &self.path,
-            sidecar_path(&self.path, ".state"),
-            sidecar_path(&self.path, ".image"),
-        );
-        let backend = FileRegionBackend::new_with_configs(
-            files,
-            format_data,
-            runtime_config.append_shards,
-            runtime_config,
-        );
-        let store = RegionStore::open(self.static_config.index_slots(), backend)?;
-        let startup = store.startup();
-        let data_plane = store.data_plane_handle()?;
-        Ok(Cache {
-            closed: AtomicBool::new(false),
-            data_plane,
-            owner: Arc::new(Mutex::new(store)),
-            startup,
-            path: self.path,
-            logical_disk_peak_bytes,
-            tokio_handle,
-        })
-    }
-}
 
 /// Storage tier that backs a returned [`Value`].
 ///
@@ -277,6 +114,136 @@ impl fmt::Debug for Cache {
 }
 
 impl Cache {
+    /// Opens a configured cache using the current Tokio runtime at first poll.
+    /// The runtime must have time enabled and outlive the cache. File setup and
+    /// recovery run on its blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorOperation::Open`] for file locking, recovery, allocation,
+    /// device support, runtime binding, or worker startup failures. Configuration
+    /// has already been checked by [`CacheConfig::new`].
+    pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+            Error::from_io(
+                ErrorOperation::Open,
+                io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
+            )
+        })?;
+        Self::open_with_handle(path, config, handle).await
+    }
+
+    /// Opens on an explicit Tokio runtime, including from a caller without an
+    /// active runtime. The selected runtime must have time enabled and outlive
+    /// the cache. Each open independently locks files and acquires resources.
+    ///
+    /// # Errors
+    ///
+    /// Uses the same [`ErrorOperation::Open`] failures as [`Self::open`].
+    pub async fn open_with_handle(
+        path: impl AsRef<Path>,
+        config: CacheConfig,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let cache_handle = tokio_handle.clone();
+        let started = Instant::now();
+        let result = tokio_handle
+            .spawn_blocking(move || Self::open_blocking(path, config, cache_handle, started))
+            .await
+            .map_err(|error| {
+                Error::from_io(
+                    ErrorOperation::Open,
+                    blocking_task_error("cache open", error),
+                )
+            })?;
+        public_result(ErrorOperation::Open, result)
+    }
+
+    fn open_blocking(
+        path: PathBuf,
+        config: CacheConfig,
+        tokio_handle: tokio::runtime::Handle,
+        started: Instant,
+    ) -> io::Result<Cache> {
+        let capacity_bytes = config.storage().capacity_bytes();
+        let index_slots = config.storage().index_slots();
+        let index_bytes = u64::try_from(index_slots)
+            .ok()
+            .and_then(recovery_image_index_len)
+            .unwrap_or(0);
+        let result = Self::open_blocking_inner(path.clone(), config, tokio_handle);
+        match &result {
+            Ok(cache) => {
+                let startup = cache.startup_mode();
+                log::info!(
+                    target: "cache2::lifecycle",
+                    event = "cache_opened",
+                    path:% = path.display(),
+                    startup = startup_name(startup),
+                    index_backing = index_backing_name(startup),
+                    index_validation = index_validation_name(startup),
+                    index_copy_on_write = matches!(startup, StartupMode::Warm),
+                    capacity_bytes,
+                    index_slots,
+                    index_mapping_bytes = index_mapping_bytes(startup, index_bytes),
+                    elapsed_us = elapsed_micros(started.elapsed());
+                    "cache opened"
+                );
+            }
+            Err(error) => log::error!(
+                target: "cache2::lifecycle",
+                event = "cache_open_failed",
+                path:% = path.display(),
+                capacity_bytes,
+                index_slots,
+                elapsed_us = elapsed_micros(started.elapsed()),
+                error:% = error;
+                "cache open failed"
+            ),
+        }
+        result
+    }
+
+    fn open_blocking_inner(
+        path: PathBuf,
+        config: CacheConfig,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> io::Result<Cache> {
+        let format_data = DataSuperblock {
+            generation: 1,
+            cache_uuid: next_persistent_id(),
+            data_identity: next_persistent_id(),
+            geometry: config.storage().geometry(),
+            hash_seed: KEY_HASH_SEED,
+            config_fingerprint: config.storage().fingerprint(),
+        };
+        let files = RegionFiles::new(
+            &path,
+            sidecar_path(&path, ".state"),
+            sidecar_path(&path, ".image"),
+        );
+        let index_slots = config.storage().index_slots();
+        let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
+        let backend = FileRegionBackend::new_with_configs(
+            files,
+            format_data,
+            config.runtime().append_shards,
+            config.runtime().clone(),
+        );
+        let store = RegionStore::open(index_slots, backend)?;
+        let startup = store.startup();
+        let data_plane = store.data_plane_handle()?;
+        Ok(Cache {
+            closed: AtomicBool::new(false),
+            data_plane,
+            owner: Arc::new(Mutex::new(store)),
+            startup,
+            path,
+            logical_disk_peak_bytes,
+            tokio_handle,
+        })
+    }
     /// Reports whether this open started empty or mapped a clean recovery image.
     pub const fn startup_mode(&self) -> StartupMode {
         self.startup
@@ -582,10 +549,6 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(suffix);
     PathBuf::from(value)
-}
-
-fn invalid_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 fn public_result<T>(operation: ErrorOperation, result: io::Result<T>) -> Result<T> {

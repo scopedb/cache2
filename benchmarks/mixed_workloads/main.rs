@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    Cache, CacheConfig, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
     IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StorageOptions,
 };
 
@@ -409,7 +409,7 @@ impl EffectiveConfig {
         }
     }
 
-    fn runtime_config(&self) -> RuntimeOptions {
+    fn runtime_options(&self) -> RuntimeOptions {
         RuntimeOptions {
             io_engine: self.io_engine,
             io_mode: self.io_mode,
@@ -616,13 +616,9 @@ async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
     );
 
     let files = BenchFiles::new(&config.directory, scenario);
-    let static_config = config.storage_options().build()?;
-    let cache = Arc::new(
-        CacheBuilder::from_static(&files.data, static_config)
-            .with_runtime_config(config.runtime_config())
-            .open()
-            .await?,
-    );
+    let storage = config.storage_options().build()?;
+    let cache_config = CacheConfig::new(storage, config.runtime_options())?;
+    let cache = Arc::new(Cache::open(&files.data, cache_config).await?);
     let expected: Arc<[AtomicU64]> = (0..config.key_count)
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>()

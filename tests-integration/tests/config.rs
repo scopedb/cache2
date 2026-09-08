@@ -12,7 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache2::{ErrorKind, ErrorOperation, StorageOptions};
+use std::time::Duration;
+
+use cache2::{
+    CacheConfig, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy, PosixIoConfig,
+    ReadAdmission, RuntimeOptions, StorageLayout, StorageOptions,
+};
+
+type RuntimeOptionsCase = (&'static str, fn(RuntimeOptions) -> RuntimeOptions);
+
+fn test_storage() -> StorageLayout {
+    StorageOptions {
+        region_size_bytes: 512 * 1024,
+        ..StorageOptions::new(3 * 512 * 1024)
+    }
+    .build()
+    .unwrap()
+}
 
 #[test]
 fn storage_rejects_unrepresentable_inputs() {
@@ -67,5 +83,198 @@ fn storage_rejects_unrepresentable_inputs() {
         let error = options.build().unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert_eq!(error.operation(), ErrorOperation::BuildStorage);
+    }
+}
+
+#[test]
+fn large_layout_memory_floor_includes_each_l1_policy() {
+    const GIB: usize = 1024 * 1024 * 1024;
+    let storage = StorageOptions::new(4_u64 << 40).build().unwrap();
+    for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
+        let runtime = RuntimeOptions {
+            l1_capacity_bytes: 10 * GIB,
+            managed_memory_limit_bytes: 15 * GIB,
+            io_engine: IoEngine::Posix(PosixIoConfig::new(4, 4, 2)),
+            l1_shards: 64,
+            l1_eviction_policy: policy,
+            ..RuntimeOptions::default()
+        };
+        let config = CacheConfig::new(storage.clone(), runtime.clone()).unwrap();
+        let floor = config.minimum_memory_bytes();
+        assert!(floor > 14 * GIB);
+        CacheConfig::new(
+            storage.clone(),
+            RuntimeOptions {
+                managed_memory_limit_bytes: floor,
+                ..runtime.clone()
+            },
+        )
+        .unwrap();
+        let error = CacheConfig::new(
+            storage.clone(),
+            RuntimeOptions {
+                managed_memory_limit_bytes: floor - 1,
+                ..runtime
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.operation(), ErrorOperation::BuildConfig);
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn automatic_wait_capacity_uses_the_selected_engine() {
+    let storage = test_storage();
+    let options = RuntimeOptions {
+        append_shards: 2,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_millis(1),
+            max_waiters: None,
+        },
+        ..RuntimeOptions::default()
+    };
+    for workers in [1, 7] {
+        let config = CacheConfig::new(
+            storage.clone(),
+            RuntimeOptions {
+                io_engine: IoEngine::Posix(PosixIoConfig::new(workers, 1, 1)),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.runtime().read_admission,
+            ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(workers)
+            }
+        );
+    }
+    let config = CacheConfig::new(
+        storage,
+        RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(11),
+            },
+            ..options
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        config.runtime().read_admission,
+        ReadAdmission::Wait {
+            timeout: Duration::from_millis(1),
+            max_waiters: Some(11)
+        }
+    );
+}
+
+#[test]
+fn invalid_runtime_options_are_rejected_when_building_configuration() {
+    let cases: [RuntimeOptionsCase; 19] = [
+        ("zero-memory-budget", |config| RuntimeOptions {
+            managed_memory_limit_bytes: 0,
+            ..config
+        }),
+        ("zero-wait-timeout", |config| RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::ZERO,
+                max_waiters: None,
+            },
+            ..config
+        }),
+        ("zero-append-shards", |config| RuntimeOptions {
+            append_shards: 0,
+            ..config
+        }),
+        ("insufficient-regions", |config| RuntimeOptions {
+            append_shards: 3,
+            ..config
+        }),
+        ("too-many-append-shards", |config| RuntimeOptions {
+            append_shards: 257,
+            ..config
+        }),
+        ("zero-reclaim-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 0)),
+            ..config
+        }),
+        ("too-many-reclaim-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 3)),
+            ..config
+        }),
+        ("zero-read-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(0, 1, 1)),
+            ..config
+        }),
+        ("zero-write-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 0, 1)),
+            ..config
+        }),
+        ("too-many-read-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(4097, 1, 1)),
+            ..config
+        }),
+        ("zero-read-wait-capacity", |config| RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(0),
+            },
+            ..config
+        }),
+        ("too-large-read-wait-capacity", |config| RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_millis(1),
+                max_waiters: Some(65_537),
+            },
+            ..config
+        }),
+        ("too-many-write-workers", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 4097, 1)),
+            ..config
+        }),
+        ("excessive-read-wait", |config| RuntimeOptions {
+            read_admission: ReadAdmission::Wait {
+                timeout: Duration::from_secs(5) + Duration::from_nanos(1),
+                max_waiters: None,
+            },
+            ..config
+        }),
+        ("l1-exceeds-budget", |config| RuntimeOptions {
+            l1_capacity_bytes: 64 * 1024 * 1024,
+            managed_memory_limit_bytes: 32 * 1024 * 1024,
+            ..config
+        }),
+        ("fixed-footprint-exceeds-budget", |config| RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(2, 2, 1)),
+            l1_capacity_bytes: 0,
+            managed_memory_limit_bytes: 2 * 1024 * 1024,
+            write_flush_threshold_bytes: 128 * 1024,
+            ..config
+        }),
+        ("zero-l1-shards", |config| RuntimeOptions {
+            l1_shards: 0,
+            ..config
+        }),
+        ("unaligned-write-flush-threshold", |config| RuntimeOptions {
+            write_flush_threshold_bytes: 4097,
+            ..config
+        }),
+        ("oversized-write-flush-threshold", |config| RuntimeOptions {
+            write_flush_threshold_bytes: 4 * 1024 * 1024 + 4096,
+            ..config
+        }),
+    ];
+
+    for (case, configure) in cases {
+        let options = configure(RuntimeOptions {
+            append_shards: 2,
+            ..RuntimeOptions::default()
+        });
+        let error = CacheConfig::new(test_storage(), options).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{case}");
+        assert_eq!(error.operation(), ErrorOperation::BuildConfig, "{case}");
     }
 }

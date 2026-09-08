@@ -29,7 +29,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorKind {
-    /// A static configuration, runtime configuration, key, or value is invalid.
+    /// A storage option, runtime option, key, or value is invalid.
     InvalidInput,
     /// The selected engine, I/O mode, or platform capability is unsupported.
     Unsupported,
@@ -37,7 +37,7 @@ pub enum ErrorKind {
     Busy,
     /// A bounded request-path resource is temporarily saturated.
     Overloaded,
-    /// A required allocation or fixed resource plan cannot be satisfied.
+    /// A required allocation or fixed resource requirement cannot be satisfied.
     ResourceExhausted,
     /// The cache runtime or one of its required services is no longer available.
     Unavailable,
@@ -76,9 +76,11 @@ impl fmt::Display for ErrorKind {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorOperation {
+    /// [`crate::CacheConfig::new`].
+    BuildConfig,
     /// [`crate::StorageOptions::build`].
     BuildStorage,
-    /// [`crate::CacheBuilder::open`].
+    /// [`crate::Cache::open`] or [`crate::Cache::open_with_handle`].
     Open,
     /// [`crate::Cache::put`].
     Put,
@@ -104,6 +106,7 @@ impl ErrorOperation {
     /// Returns the stable snake-case label used in logs and metrics.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::BuildConfig => "build_config",
             Self::BuildStorage => "build_storage",
             Self::Open => "open",
             Self::Put => "put",
@@ -245,7 +248,8 @@ fn classify(operation: ErrorOperation, source: &io::Error) -> ErrorKind {
 const fn accepts_caller_input(operation: ErrorOperation) -> bool {
     matches!(
         operation,
-        ErrorOperation::BuildStorage
+        ErrorOperation::BuildConfig
+            | ErrorOperation::BuildStorage
             | ErrorOperation::Open
             | ErrorOperation::Put
             | ErrorOperation::PutL2

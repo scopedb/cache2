@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Storage configuration and process-local runtime tuning.
+//! Configuration construction, independent of file paths and runtime handles.
+
+use std::io;
+
+use crate::error::{Error, ErrorOperation, Result};
+use crate::memory::MemoryStore;
 
 mod runtime;
 mod storage;
@@ -26,3 +31,115 @@ pub use runtime::{
 };
 pub(crate) use storage::KEY_HASH_SEED;
 pub use storage::{StorageLayout, StorageOptions};
+
+/// Complete, immutable configuration for opening a [`crate::Cache`].
+///
+/// Construction checks runtime settings against the storage layout and managed
+/// memory limit. It performs bounded calculations without opening files, starting
+/// workers, or requiring Tokio. Resource queries reuse the computed results.
+/// Clone a configuration to reuse it across paths or successive opens; each open
+/// acquires its own resources and can still fail on I/O or allocation.
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    storage: StorageLayout,
+    runtime: RuntimeOptions,
+    minimum_memory_bytes: usize,
+}
+
+impl CacheConfig {
+    /// Checks the complete combination and resolves dependent runtime defaults.
+    ///
+    /// ```no_run
+    /// # async fn example() -> cache2::Result<()> {
+    /// use cache2::{Cache, CacheConfig, RuntimeOptions, StorageOptions};
+    /// let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
+    /// let config = CacheConfig::new(storage, RuntimeOptions::default())?;
+    /// let disk_peak = config.storage().peak_disk_bytes();
+    /// let memory_floor = config.minimum_memory_bytes();
+    /// let cache = Cache::open("cache.data", config).await?;
+    /// # cache.close_fast().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
+    /// counts, invalid runtime settings, unavailable build/platform features,
+    /// or insufficient managed memory. Device capabilities are checked at open.
+    pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self> {
+        let build = || -> io::Result<Self> {
+            let geometry = storage.geometry;
+            let index_slots = storage.index_slots;
+            runtime.validate()?;
+            if let ReadAdmission::Wait {
+                timeout,
+                max_waiters: None,
+            } = runtime.read_admission
+            {
+                runtime.read_admission = ReadAdmission::Wait {
+                    timeout,
+                    max_waiters: Some(runtime.read_io_max_in_flight()),
+                };
+            }
+            if geometry.region_count <= runtime.append_shards {
+                return Err(invalid_config(
+                    "append shards require valid geometry with one Active Region each plus one spare Region",
+                ));
+            }
+            let l1_entry_capacity = runtime.l1_entry_capacity(geometry, index_slots)?;
+            let l1_metadata_bytes = MemoryStore::allocation_bytes(
+                runtime.l1_capacity_bytes,
+                l1_entry_capacity,
+                runtime.l1_shards,
+                runtime.l1_eviction_policy,
+            )?;
+            let fixed_bytes = crate::region::core::runtime_fixed_memory_bytes(
+                index_slots,
+                geometry.region_count,
+            )?
+            .checked_add(l1_metadata_bytes)
+            .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
+            let (_, minimum_memory_bytes) =
+                runtime.memory_plan_bytes(geometry, runtime.append_shards as usize, fixed_bytes)?;
+            if minimum_memory_bytes > runtime.managed_memory_limit_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "managed memory limit cannot hold the cache memory requirements: requires {minimum_memory_bytes} bytes, configured {} bytes",
+                        runtime.managed_memory_limit_bytes
+                    ),
+                ));
+            }
+            Ok(Self {
+                storage,
+                runtime,
+                minimum_memory_bytes,
+            })
+        };
+        build().map_err(|error| Error::from_io(ErrorOperation::BuildConfig, error))
+    }
+
+    /// Returns the immutable persistent layout and its disk bound.
+    pub const fn storage(&self) -> &StorageLayout {
+        &self.storage
+    }
+
+    /// Returns the selected runtime options with dependent defaults resolved.
+    /// Clone these inputs to construct a new configuration with different tuning.
+    pub const fn runtime(&self) -> &RuntimeOptions {
+        &self.runtime
+    }
+
+    /// Returns the minimum managed-memory budget required by this configuration.
+    /// Includes metadata, L1 capacity, workers, queues, append/reclaim buffers,
+    /// and one Region-sized read allowance. Concurrent reads and retained values
+    /// need additional headroom. This is not an RSS bound.
+    pub const fn minimum_memory_bytes(&self) -> usize {
+        self.minimum_memory_bytes
+    }
+}
+
+fn invalid_config(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
