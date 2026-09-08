@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use benchmarks::report::{JobReport, RunReporter};
 use cache2::{
-    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig, RuntimeConfig,
+    CacheBuilder, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig, RuntimeOptions,
     StartupMode, StaticConfig,
 };
 
@@ -77,14 +77,16 @@ impl ScaleConfig {
             .with_expected_entries(self.expected_entries)
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 1)))
-            .with_io_mode(IoMode::Buffered)
-            .with_append_shards(4)
-            .with_l1_capacity_bytes(self.memory_bytes)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(false)
+    fn runtime_config(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+            io_mode: IoMode::Buffered,
+            append_shards: 4,
+            l1_capacity_bytes: self.memory_bytes,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: false,
+            ..RuntimeOptions::default()
+        }
     }
 }
 

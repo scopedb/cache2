@@ -24,7 +24,7 @@ use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StartupMode, StaticConfig,
     Value,
 };
 
@@ -259,17 +259,19 @@ impl BenchConfig {
             .with_expected_entries(self.entries.saturating_mul(4))
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_read_io_wait_capacity(self.read_io_wait_capacity)
-            .with_read_io_wait_timeout(self.read_io_wait_timeout)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.memory_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(self.statistics_enabled)
+    fn runtime_config(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            read_io_wait_capacity: Some(self.read_io_wait_capacity),
+            read_io_wait_timeout: self.read_io_wait_timeout,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.memory_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: self.statistics_enabled,
+            ..RuntimeOptions::default()
+        }
     }
 
     fn l2_clients(&self) -> usize {
@@ -310,9 +312,10 @@ impl BenchFiles {
         l1_capacity_bytes: usize,
     ) -> CacheBuilder {
         CacheBuilder::from_static(&self.data, config.static_config()).with_runtime_config(
-            config
-                .runtime_config()
-                .with_l1_capacity_bytes(l1_capacity_bytes),
+            RuntimeOptions {
+                l1_capacity_bytes: l1_capacity_bytes,
+                ..config.runtime_config()
+            },
         )
     }
 }

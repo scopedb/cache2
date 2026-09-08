@@ -24,7 +24,7 @@ use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StaticConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StaticConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -407,15 +407,17 @@ impl EffectiveConfig {
             .with_expected_entries(self.key_count)
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.l1_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(true)
+    fn runtime_config(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.l1_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: true,
+            ..RuntimeOptions::default()
+        }
     }
 }
 

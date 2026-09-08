@@ -217,10 +217,12 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         hash_seed: 3,
         config_fingerprint: 4,
     };
-    let config = RuntimeConfig::default()
-        .with_append_shards(1)
-        .with_l1_capacity_bytes(0)
-        .with_io_engine(crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)));
+    let config = RuntimeOptions {
+        append_shards: 1,
+        l1_capacity_bytes: 0,
+        io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+        ..RuntimeOptions::default()
+    };
     let mut store = RegionStore::open(
         8,
         FileRegionBackend::new_with_configs(files, data, 1, config),

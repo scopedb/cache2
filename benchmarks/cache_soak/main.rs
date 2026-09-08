@@ -25,7 +25,7 @@ use benchmarks::report::{
 use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
     IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy, PosixIoConfig,
-    RuntimeConfig, StartupMode, StaticConfig,
+    RuntimeOptions, StartupMode, StaticConfig,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -197,15 +197,17 @@ impl SoakConfig {
             .with_expected_entries(self.key_count)
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.memory_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(true)
+    fn runtime_config(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.memory_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: true,
+            ..RuntimeOptions::default()
+        }
     }
 }
 

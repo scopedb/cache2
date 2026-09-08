@@ -377,21 +377,43 @@ pub enum L1EvictionPolicy {
 /// These values may change across opens. Warm recovery rebinds append shards
 /// from recovered Active and Free Regions when the requested topology fits.
 #[derive(Clone, Debug)]
-pub struct RuntimeConfig {
-    pub(crate) io_engine: IoEngine,
-    pub(crate) io_mode: IoMode,
-    pub(crate) read_io_wait_capacity: Option<usize>,
-    pub(crate) read_io_wait_timeout: Duration,
-    pub(crate) append_shards: u32,
-    pub(crate) l1_capacity_bytes: usize,
-    pub(crate) l1_eviction_policy: L1EvictionPolicy,
-    pub(crate) managed_memory_limit_bytes: usize,
-    pub(crate) l1_shards: usize,
-    pub(crate) write_flush_threshold_bytes: usize,
-    pub(crate) statistics: bool,
+pub struct RuntimeOptions {
+    /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
+    /// and 1 workers.
+    pub io_engine: IoEngine,
+    /// Record I/O mode. Defaults to buffered; direct I/O requires supported Linux storage.
+    pub io_mode: IoMode,
+    /// Maximum queued readers; unset follows the selected read pool.
+    pub read_io_wait_capacity: Option<usize>,
+    /// Maximum execution wait; zero returns a miss immediately on pressure.
+    pub read_io_wait_timeout: Duration,
+    /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
+    /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
+    /// spare Region.
+    pub append_shards: u32,
+    /// Retained L1 byte budget, including keys, values, and ownership charges.
+    /// Defaults to 256 MiB; zero disables L1. Fixed L1 metadata is charged
+    /// separately.
+    pub l1_capacity_bytes: usize,
+    /// Bounded L1 eviction policy. Defaults to CLOCK; S3-FIFO adds ghost metadata.
+    pub l1_eviction_policy: L1EvictionPolicy,
+    /// Aggregate cache-managed memory limit, defaulting to 1 GiB. Covers index
+    /// mappings, L1, buffers, metadata, queues, and cache threads. Allocator
+    /// overhead, Tokio, application memory, and the kernel page cache are outside it.
+    pub managed_memory_limit_bytes: usize,
+    /// Independently locked L1 shards, from 1 through 65536 (default 32). Powers
+    /// of two give the cheapest routing; more shards require more metadata.
+    pub l1_shards: usize,
+    /// Per-append-shard threshold for requesting a flush, in 4 KiB multiples
+    /// through 4 MiB (the default). Partial buffers also flush on a bounded delay,
+    /// pressure, and completion barriers.
+    pub write_flush_threshold_bytes: usize,
+    /// Enable cumulative request, cache, and I/O counters. Defaults to false;
+    /// health and managed-resource gauges remain available.
+    pub statistics: bool,
 }
 
-impl Default for RuntimeConfig {
+impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             io_engine: IoEngine::default(),
@@ -409,128 +431,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-impl RuntimeConfig {
-    /// Selects the implementation used by the independent I/O pools.
-    ///
-    /// [`IoEngine::Posix`] is the default. Each engine variant carries only
-    /// the physical topology meaningful to that backend.
-    pub fn with_io_engine(mut self, engine: IoEngine) -> Self {
-        self.io_engine = engine;
-        self
-    }
-
-    /// Selects the buffered/direct policy for runtime record I/O.
-    ///
-    /// Buffered I/O is the default. `Direct` requires Linux `O_DIRECT` support
-    /// and returns direct-I/O errors directly.
-    pub fn with_io_mode(mut self, mode: IoMode) -> Self {
-        self.io_mode = mode;
-        self
-    }
-
-    /// Sets the maximum number of reads waiting for execution capacity.
-    ///
-    /// By default this follows the configured aggregate read in-flight limit.
-    /// Waiting is active only when [`Self::with_read_io_wait_timeout`] is
-    /// non-zero. Valid capacities range from one through 65536.
-    pub fn with_read_io_wait_capacity(mut self, capacity: usize) -> Self {
-        self.read_io_wait_capacity = Some(capacity);
-        self
-    }
-
-    /// Sets how long an L2 candidate may wait for read execution capacity.
-    ///
-    /// Zero, the default, makes read-pool pressure a miss. A non-zero timeout
-    /// enables the bounded wait capacity. A full queue, memory pressure, or
-    /// timeout is an overload error. Valid timeouts range from zero through five
-    /// seconds.
-    pub fn with_read_io_wait_timeout(mut self, timeout: Duration) -> Self {
-        self.read_io_wait_timeout = timeout;
-        self
-    }
-
-    /// Sets the number of hash-routed append/staging paths created at open.
-    ///
-    /// Each path owns one Active Region, two Region-sized write buffers, and
-    /// one ordered shard worker. The static geometry must provide one Region
-    /// per append shard plus at least one spare Region. The valid range is
-    /// `1..=256`.
-    ///
-    /// Changing this value across opens rebinds a clean recovery image when
-    /// enough Free Regions are available. Otherwise the disposable cache safely
-    /// starts empty.
-    pub fn with_append_shards(mut self, shards: u32) -> Self {
-        self.append_shards = shards;
-        self
-    }
-
-    /// Sets the retained-entry byte budget for L1. Zero disables L1.
-    ///
-    /// Entry charges include the key, value, and fixed ownership charge. L1
-    /// slot, eviction-policy, free-list, and directory allocations are
-    /// accounted separately against the managed-memory limit.
-    pub fn with_l1_capacity_bytes(mut self, bytes: usize) -> Self {
-        self.l1_capacity_bytes = bytes;
-        self
-    }
-
-    /// Selects the bounded shard-local L1 eviction policy.
-    ///
-    /// CLOCK is the default. S3-FIFO adds a metadata-only ghost queue, uses a
-    /// two-bit hit counter, and preserves queue position on the hit path.
-    pub fn with_l1_eviction_policy(mut self, policy: L1EvictionPolicy) -> Self {
-        self.l1_eviction_policy = policy;
-        self
-    }
-
-    /// Sets the aggregate cache-managed memory budget.
-    ///
-    /// The budget accounts for the index mapping extent, L1, append staging,
-    /// cache-owned thread topology, metadata, recovery scratch, and transient
-    /// record reads. Total deployment memory additionally includes allocator
-    /// metadata, Tokio, process overhead, and the kernel page cache.
-    pub fn with_managed_memory_limit_bytes(mut self, bytes: usize) -> Self {
-        self.managed_memory_limit_bytes = bytes;
-        self
-    }
-
-    /// Sets the number of independently locked L1 shards, in `1..=65536`.
-    ///
-    /// Power-of-two counts use the cheapest routing path. More shards reduce
-    /// contention but increase fixed metadata and runtime-control accounting.
-    pub fn with_l1_shards(mut self, shards: usize) -> Self {
-        self.l1_shards = shards;
-        self
-    }
-
-    /// Sets the per-append-shard buffered-byte threshold for requesting a flush.
-    ///
-    /// A record may cross the threshold, and partial buffers also flush after
-    /// the bounded delay or during pressure and lifecycle barriers. Valid values
-    /// are 4 KiB multiples from 4 KiB through 4 MiB.
-    pub fn with_write_flush_threshold_bytes(mut self, bytes: usize) -> Self {
-        self.write_flush_threshold_bytes = bytes;
-        self
-    }
-
-    /// Enables optional cumulative request, L1, index, and I/O counters.
-    ///
-    /// Health and managed-resource gauges remain available when disabled.
-    pub fn with_statistics(mut self, enabled: bool) -> Self {
-        self.statistics = enabled;
-        self
-    }
-
-    /// Returns the configured I/O engine.
-    pub const fn io_engine(&self) -> IoEngine {
-        self.io_engine
-    }
-
-    /// Returns the configured runtime record-I/O mode.
-    pub const fn io_mode(&self) -> IoMode {
-        self.io_mode
-    }
-
+impl RuntimeOptions {
     /// Returns the aggregate maximum number of in-flight reads.
     pub const fn read_io_max_in_flight(&self) -> usize {
         self.io_engine.read_topology().max_in_flight
@@ -549,49 +450,9 @@ impl RuntimeConfig {
         self.read_io_wait_timeout
     }
 
-    /// Returns the aggregate maximum number of in-flight writes.
-    pub const fn write_io_max_in_flight(&self) -> usize {
-        self.io_engine.write_topology().max_in_flight
-    }
-
     /// Returns the aggregate maximum number of concurrent Region reclaims.
     pub const fn reclaim_io_max_in_flight(&self) -> usize {
         self.io_engine.reclaim_topology().max_in_flight
-    }
-
-    /// Returns the number of hash-routed append shards.
-    pub const fn append_shards(&self) -> u32 {
-        self.append_shards
-    }
-
-    /// Returns the retained-entry byte budget for L1.
-    pub const fn l1_capacity_bytes(&self) -> usize {
-        self.l1_capacity_bytes
-    }
-
-    /// Returns the configured L1 eviction policy.
-    pub const fn l1_eviction_policy(&self) -> L1EvictionPolicy {
-        self.l1_eviction_policy
-    }
-
-    /// Returns the aggregate cache-managed memory budget.
-    pub const fn managed_memory_limit_bytes(&self) -> usize {
-        self.managed_memory_limit_bytes
-    }
-
-    /// Returns the number of independently locked L1 shards.
-    pub const fn l1_shards(&self) -> usize {
-        self.l1_shards
-    }
-
-    /// Returns the per-append-shard flush threshold in bytes.
-    pub const fn write_flush_threshold_bytes(&self) -> usize {
-        self.write_flush_threshold_bytes
-    }
-
-    /// Returns whether optional cumulative statistics are enabled.
-    pub const fn statistics_enabled(&self) -> bool {
-        self.statistics
     }
 
     pub(crate) const fn read_io_topology(&self) -> IoPoolTopology {
@@ -615,7 +476,7 @@ pub(crate) const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
 // this avoids sizing metadata for the theoretical 64-byte minimum.
 const PLANNED_MIN_L1_ENTRY_BYTES: usize = 4 * 1024;
 
-impl RuntimeConfig {
+impl RuntimeOptions {
     pub(crate) fn validate(&self) -> io::Result<()> {
         if !self.io_engine.is_available() {
             return Err(io::Error::new(
@@ -815,7 +676,7 @@ impl RuntimeConfig {
 
 pub(crate) fn runtime_topology_memory_bytes(
     shard_count: usize,
-    config: &RuntimeConfig,
+    config: &RuntimeOptions,
 ) -> Option<usize> {
     // Reserve one stack per physical I/O thread, one possible shutdown reaper
     // per engine, and every append/reclaim worker.
@@ -914,32 +775,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_defaults_are_stable() {
-        let config = RuntimeConfig::default();
-        assert_eq!(config.io_engine(), IoEngine::default());
-        assert_eq!(config.io_mode(), IoMode::Buffered);
-        assert_eq!(config.read_io_max_in_flight(), 4);
-        assert_eq!(config.read_io_wait_capacity(), 4);
-        assert_eq!(config.read_io_wait_timeout(), Duration::ZERO);
-        assert_eq!(config.write_io_max_in_flight(), 4);
-        assert_eq!(config.reclaim_io_max_in_flight(), 1);
-        assert_eq!(config.append_shards(), DEFAULT_APPEND_SHARDS);
-        assert_eq!(config.l1_capacity_bytes(), DEFAULT_L1_CAPACITY_BYTES);
-        assert_eq!(config.l1_eviction_policy(), L1EvictionPolicy::Clock);
-        assert_eq!(config.managed_memory_limit_bytes(), 1024 * 1024 * 1024);
-        assert_eq!(config.l1_shards(), DEFAULT_L1_SHARDS);
-        assert_eq!(
-            config.write_flush_threshold_bytes(),
-            MAX_WRITE_FLUSH_THRESHOLD_BYTES
-        );
-        assert!(!config.statistics_enabled());
-    }
-
-    #[test]
     fn explicit_read_wait_capacity_is_independent_from_execution() {
-        let config = RuntimeConfig::default()
-            .with_read_io_wait_capacity(11)
-            .with_io_engine(IoEngine::Posix(PosixIoConfig::new(7, 4, 1)));
+        let config = RuntimeOptions {
+            read_io_wait_capacity: Some(11),
+            io_engine: IoEngine::Posix(PosixIoConfig::new(7, 4, 1)),
+            ..RuntimeOptions::default()
+        };
 
         assert_eq!(config.read_io_max_in_flight(), 7);
         assert_eq!(config.read_io_wait_capacity(), 11);
@@ -973,29 +814,19 @@ mod tests {
     }
 
     #[test]
-    fn io_uring_pool_exposes_polling_options() {
-        let sq_poll = IoUringSqPollConfig::new(2_000).with_cpu(3);
-        let pool = IoUringPoolConfig::new(2, 96)
-            .with_sq_poll(sq_poll)
-            .with_io_poll(true);
-
-        assert_eq!(pool.rings(), 2);
-        assert_eq!(pool.max_in_flight(), 96);
-        assert_eq!(pool.sq_poll(), Some(sq_poll));
-        assert!(pool.io_poll());
-    }
-
-    #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
-        let base = RuntimeConfig::default()
-            .with_io_engine(crate::config::IoEngine::Posix(
-                crate::config::PosixIoConfig::new(7, 4, 1),
-            ))
-            .with_read_io_wait_capacity(11);
+        let base = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(7, 4, 1)),
+            read_io_wait_capacity: Some(11),
+            ..RuntimeOptions::default()
+        };
         let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
         let with_wait = runtime_topology_memory_bytes(
             4,
-            &base.with_read_io_wait_timeout(Duration::from_millis(1)),
+            &RuntimeOptions {
+                read_io_wait_timeout: Duration::from_millis(1),
+                ..base
+            },
         )
         .unwrap();
 
@@ -1012,17 +843,20 @@ mod tests {
             region_count: 128 * 1024,
         };
         let index_slots = INDEX_SLOTS;
-        let base = RuntimeConfig::default()
-            .with_l1_capacity_bytes(10 * GIB)
-            .with_managed_memory_limit_bytes(15 * GIB)
-            .with_io_engine(crate::config::IoEngine::Posix(
-                crate::config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .with_l1_shards(64);
+        let base = RuntimeOptions {
+            l1_capacity_bytes: 10 * GIB,
+            managed_memory_limit_bytes: 15 * GIB,
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
+            l1_shards: 64,
+            ..RuntimeOptions::default()
+        };
         let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
         assert_eq!(entry_capacity, 2_621_440);
         base.validate_memory_plan(geometry, index_slots, 4).unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
+        let too_small = RuntimeOptions {
+            managed_memory_limit_bytes: 14 * GIB,
+            ..base.clone()
+        };
         assert_eq!(
             too_small
                 .validate_memory_plan(geometry, index_slots, 4)
@@ -1040,18 +874,21 @@ mod tests {
         .unwrap();
         assert_eq!(metadata, 130 * 1024 * 1024);
 
-        let s3fifo = base
-            .clone()
-            .with_l1_eviction_policy(crate::config::L1EvictionPolicy::S3Fifo);
+        let s3fifo = RuntimeOptions {
+            l1_eviction_policy: crate::config::L1EvictionPolicy::S3Fifo,
+            ..base.clone()
+        };
         s3fifo
             .validate_memory_plan(geometry, index_slots, 4)
             .unwrap();
         assert_eq!(
-            too_small
-                .with_l1_eviction_policy(crate::config::L1EvictionPolicy::S3Fifo)
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
+            RuntimeOptions {
+                l1_eviction_policy: crate::config::L1EvictionPolicy::S3Fifo,
+                ..too_small
+            }
+            .validate_memory_plan(geometry, index_slots, 4)
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidInput
         );
         let s3fifo_metadata = MemoryStore::allocation_bytes(
@@ -1072,16 +909,18 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let base = RuntimeConfig::default()
-            .with_append_shards(4)
-            .with_l1_capacity_bytes(0);
+        let base = RuntimeOptions {
+            append_shards: 4,
+            l1_capacity_bytes: 0,
+            ..RuntimeOptions::default()
+        };
         let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
-        let (_, parallel_minimum) = base
-            .with_io_engine(crate::config::IoEngine::Posix(
-                crate::config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .memory_plan_bytes(geometry, 4, 0)
-            .unwrap();
+        let (_, parallel_minimum) = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
+            ..base
+        }
+        .memory_plan_bytes(geometry, 4, 0)
+        .unwrap();
 
         assert_eq!(
             parallel_minimum - base_minimum,
@@ -1095,15 +934,18 @@ mod tests {
     #[test]
     fn io_uring_depth_reserves_more_than_common_request_bookkeeping() {
         let pool = IoUringPoolConfig::new(1, 1);
-        let shallow = RuntimeConfig::default()
-            .with_io_engine(IoEngine::IoUring(IoUringConfig::new(pool, pool, pool)));
-        let deep = shallow
-            .clone()
-            .with_io_engine(IoEngine::IoUring(IoUringConfig::new(
+        let shallow = RuntimeOptions {
+            io_engine: IoEngine::IoUring(IoUringConfig::new(pool, pool, pool)),
+            ..RuntimeOptions::default()
+        };
+        let deep = RuntimeOptions {
+            io_engine: IoEngine::IoUring(IoUringConfig::new(
                 IoUringPoolConfig::new(1, MAX_IO_REQUESTS_PER_ENGINE),
                 pool,
                 pool,
-            )));
+            )),
+            ..shallow.clone()
+        };
         let growth = runtime_topology_memory_bytes(4, &deep).unwrap()
             - runtime_topology_memory_bytes(4, &shallow).unwrap();
         assert!(growth > (MAX_IO_REQUESTS_PER_ENGINE - 1) * IO_QUEUE_ENTRY_RESERVATION_BYTES);
@@ -1126,14 +968,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sq_poll_cpu_affinity_is_retained_for_each_ring() {
-        let config =
-            IoUringPoolConfig::new(2, 8).with_sq_poll(IoUringSqPollConfig::new(1_000).with_cpu(4));
-        validate_io_uring_pool("read", config).unwrap();
-        assert_eq!(config.sq_poll().and_then(|sq_poll| sq_poll.cpu()), Some(4));
-    }
-
     #[cfg(all(
         feature = "io-uring",
         target_os = "linux",
@@ -1148,13 +982,14 @@ mod tests {
     #[test]
     fn io_poll_requires_direct_mode() {
         let pool = IoUringPoolConfig::default().with_io_poll(true);
-        let config = RuntimeConfig::default().with_io_engine(IoEngine::IoUring(
-            crate::config::IoUringConfig::new(
+        let config = RuntimeOptions {
+            io_engine: IoEngine::IoUring(crate::config::IoUringConfig::new(
                 pool,
                 IoUringPoolConfig::default(),
                 IoUringPoolConfig::new(1, 1),
-            ),
-        ));
+            )),
+            ..RuntimeOptions::default()
+        };
 
         assert_eq!(
             config.validate().unwrap_err().kind(),

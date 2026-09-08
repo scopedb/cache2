@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{KEY_HASH_SEED, RuntimeConfig, StaticConfig};
+use crate::config::{KEY_HASH_SEED, RuntimeOptions, StaticConfig};
 use crate::error::{Error, ErrorOperation, Result};
 use crate::recovery::{
     DataSuperblock, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET, recovery_image_index_len,
@@ -42,7 +42,7 @@ use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 pub struct CacheBuilder {
     path: PathBuf,
     static_config: StaticConfig,
-    runtime_config: RuntimeConfig,
+    runtime_config: RuntimeOptions,
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -60,13 +60,13 @@ impl CacheBuilder {
         Self {
             path: path.as_ref().to_path_buf(),
             static_config,
-            runtime_config: RuntimeConfig::default(),
+            runtime_config: RuntimeOptions::default(),
             tokio_handle: None,
         }
     }
 
     /// Replaces the process-local runtime tuning used by [`Self::open`].
-    pub fn with_runtime_config(mut self, config: RuntimeConfig) -> Self {
+    pub fn with_runtime_config(mut self, config: RuntimeOptions) -> Self {
         self.runtime_config = config;
         self
     }

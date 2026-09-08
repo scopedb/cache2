@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-use crate::config::{IoMode, RuntimeConfig};
+use crate::config::{IoMode, RuntimeOptions};
 use crate::index::MAX_INDEX_PARTITIONS;
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, PartitionedIndexStorage,
@@ -171,7 +171,7 @@ impl FileRegionRuntime {
         &mut self,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RuntimeConfig,
+        config: RuntimeOptions,
     ) -> io::Result<()> {
         if self.data_plane.is_some() {
             return Err(io::Error::new(
@@ -330,7 +330,7 @@ where
     /// configuration fingerprint.
     format_data: DataSuperblock,
     shard_count: u32,
-    runtime_config: RuntimeConfig,
+    runtime_config: RuntimeOptions,
     file_system: F,
     data_file: Option<F::File>,
     state_file: Option<F::File>,
@@ -345,14 +345,14 @@ where
 impl FileRegionBackend<SystemRegionFileSystem> {
     #[cfg(test)]
     pub(crate) fn new(files: RegionFiles, format_data: DataSuperblock) -> Self {
-        Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeConfig::default())
+        Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeOptions::default())
     }
 
     pub(crate) fn new_with_configs(
         files: RegionFiles,
         format_data: DataSuperblock,
         shards: u32,
-        runtime_config: RuntimeConfig,
+        runtime_config: RuntimeOptions,
     ) -> Self {
         Self::new_with_file_system_and_configs(
             files,
@@ -379,7 +379,7 @@ where
             format_data,
             file_system,
             REGION_SHARDS,
-            RuntimeConfig::default(),
+            RuntimeOptions::default(),
         )
     }
 
@@ -388,7 +388,7 @@ where
         format_data: DataSuperblock,
         file_system: F,
         shard_count: u32,
-        runtime_config: RuntimeConfig,
+        runtime_config: RuntimeOptions,
     ) -> Self {
         Self {
             files,
@@ -529,7 +529,7 @@ where
         }
         let data =
             self.file_system
-                .open_data(&self.files.data, true, self.runtime_config.io_mode())?;
+                .open_data(&self.files.data, true, self.runtime_config.io_mode)?;
         data.try_lock_exclusive()?;
         let state = match self.file_system.open(&self.files.state, true) {
             Ok(state) => state,

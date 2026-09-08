@@ -368,14 +368,14 @@ fn key_for_shard(data: DataSuperblock, shard: u64, ordinal: u64) -> Vec<u8> {
 fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig::default()
-        .with_io_engine(crate::config::IoEngine::Posix(
-            crate::config::PosixIoConfig::new(2, 4, 1),
-        ))
-        .with_read_io_wait_capacity(1)
-        .with_read_io_wait_timeout(Duration::from_millis(30))
-        .with_l1_capacity_bytes(0)
-        .with_statistics(true);
+    let runtime_config = RuntimeOptions {
+        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(2, 4, 1)),
+        read_io_wait_capacity: Some(1),
+        read_io_wait_timeout: Duration::from_millis(30),
+        l1_capacity_bytes: 0,
+        statistics: true,
+        ..RuntimeOptions::default()
+    };
     let mut store = RegionStore::open(
         4096,
         FileRegionBackend::new_with_configs(
@@ -450,12 +450,12 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
 fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig::default()
-        .with_io_engine(crate::config::IoEngine::Posix(
-            crate::config::PosixIoConfig::new(1, 4, 1),
-        ))
-        .with_read_io_wait_timeout(Duration::from_secs(1))
-        .with_l1_capacity_bytes(0);
+    let runtime_config = RuntimeOptions {
+        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 4, 1)),
+        read_io_wait_timeout: Duration::from_secs(1),
+        l1_capacity_bytes: 0,
+        ..RuntimeOptions::default()
+    };
     let mut store = RegionStore::open(
         4096,
         FileRegionBackend::new_with_configs(
@@ -506,10 +506,10 @@ fn queued_l2_read_does_not_pin_warm_close() {
 fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig {
+    let runtime_config = RuntimeOptions {
         l1_capacity_bytes: 0,
         statistics: true,
-        ..RuntimeConfig::default()
+        ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(
         4096,
@@ -609,13 +609,13 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
     for case in ["shard", "index"] {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
-        let runtime_config = RuntimeConfig::default()
-            .with_io_engine(crate::config::IoEngine::Posix(
-                crate::config::PosixIoConfig::new(1, 1, 1),
-            ))
-            .with_l1_capacity_bytes(0)
-            .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-            .with_write_flush_threshold_bytes(128 * 1024);
+        let runtime_config = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 1, 1)),
+            l1_capacity_bytes: 0,
+            managed_memory_limit_bytes: 32 * 1024 * 1024,
+            write_flush_threshold_bytes: 128 * 1024,
+            ..RuntimeOptions::default()
+        };
         let mut store = RegionStore::open(
             4096,
             FileRegionBackend::new_with_configs(
@@ -1241,7 +1241,10 @@ fn publish_custom_clean_image(
     metadata: RegionMetadata,
 ) {
     let shard_count = metadata.root.shard_count;
-    let runtime_config = RuntimeConfig::default().with_append_shards(shard_count);
+    let runtime_config = RuntimeOptions {
+        append_shards: shard_count,
+        ..RuntimeOptions::default()
+    };
     let mut backend = FileRegionBackend::new_with_configs(
         directory.files.clone(),
         data,

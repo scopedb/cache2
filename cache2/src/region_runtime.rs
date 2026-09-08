@@ -34,7 +34,7 @@ mod metrics;
 pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
 
-use crate::config::{IoMode, IoPoolTopology, RuntimeConfig};
+use crate::config::{IoMode, IoPoolTopology, RuntimeOptions};
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
@@ -368,7 +368,7 @@ impl HybridValueRead {
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    config: RuntimeConfig,
+    config: RuntimeOptions,
     metrics: Arc<RuntimeMetrics>,
     shared: Arc<RunningShared>,
     owner: Arc<Mutex<Option<RunningOwner>>>,
@@ -695,7 +695,7 @@ impl RegionDataPlane {
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RuntimeConfig,
+        config: RuntimeOptions,
     ) -> io::Result<Self> {
         core.configure_reclaim_workers(config.reclaim_io_max_in_flight())?;
         core.set_index_statistics_enabled(config.statistics);
@@ -1305,7 +1305,7 @@ fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     files: RuntimeFileSet,
-    config: RuntimeConfig,
+    config: RuntimeOptions,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
 ) -> io::Result<RunningOwner> {
@@ -1476,7 +1476,7 @@ fn start_running(
 
 fn build_engine_pool(
     files: RuntimeFileSet,
-    config: &RuntimeConfig,
+    config: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
@@ -1486,7 +1486,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if config.io_engine().is_posix() {
+    let posix_workers = if config.io_engine.is_posix() {
         topology.max_in_flight
     } else {
         1
@@ -1501,7 +1501,7 @@ fn build_engine_pool(
             worker_files,
             topology.depth_for_engine(engine),
             posix_workers,
-            config.io_engine(),
+            config.io_engine,
             topology.io_uring,
             config.statistics,
             read_wait_enabled,
@@ -2425,12 +2425,14 @@ mod tests {
             config_fingerprint: 4,
         };
         for wait in [Duration::ZERO, Duration::from_millis(1)] {
-            let config = RuntimeConfig::default()
-                .with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 1)))
-                .with_append_shards(1)
-                .with_l1_capacity_bytes(0)
-                .with_read_io_wait_timeout(wait)
-                .with_statistics(true);
+            let config = RuntimeOptions {
+                io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+                append_shards: 1,
+                l1_capacity_bytes: 0,
+                read_io_wait_timeout: wait,
+                statistics: true,
+                ..RuntimeOptions::default()
+            };
             let mut store = RegionStore::open(
                 8,
                 FileRegionBackend::new_with_configs(files.clone(), data, 1, config),
