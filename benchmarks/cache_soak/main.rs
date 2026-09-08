@@ -25,7 +25,7 @@ use benchmarks::report::{
 use cache2::{
     Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
     IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy, PosixIoConfig,
-    RuntimeOptions, StartupMode, StaticConfig,
+    RuntimeOptions, StartupMode, StorageOptions,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -191,10 +191,12 @@ impl SoakConfig {
         })
     }
 
-    fn static_config(&self) -> StaticConfig {
-        StaticConfig::new(self.capacity_bytes)
-            .with_region_size_bytes(REGION_BYTES as u64)
-            .with_expected_entries(self.key_count)
+    fn storage_options(&self) -> StorageOptions {
+        StorageOptions {
+            region_size_bytes: REGION_BYTES as u64,
+            expected_entries: Some(self.key_count),
+            ..StorageOptions::new(self.capacity_bytes)
+        }
     }
 
     fn runtime_config(&self) -> RuntimeOptions {
@@ -353,8 +355,8 @@ fn run_benchmark() -> io::Result<()> {
         .enable_time()
         .build()?;
     let files = SoakFiles::new(&config.directory);
-    let static_config = config.static_config();
-    let peak_disk_bytes = static_config.peak_disk_bytes()?;
+    let static_config = config.storage_options().build()?;
+    let peak_disk_bytes = static_config.peak_disk_bytes();
     let mut cache = open_cache(&runtime, &files, &config)?;
     let key_count =
         u64::try_from(config.key_count).map_err(|_| invalid("soak key count exceeds u64"))?;
@@ -627,7 +629,7 @@ fn open_cache(
     config: &SoakConfig,
 ) -> io::Result<Cache> {
     Ok(runtime.block_on(async {
-        CacheBuilder::from_static(&files.data, config.static_config())
+        CacheBuilder::from_static(&files.data, config.storage_options().build()?)
             .with_runtime_config(config.runtime_config())
             .open()
             .await

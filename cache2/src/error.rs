@@ -76,10 +76,8 @@ impl fmt::Display for ErrorKind {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorOperation {
-    /// [`crate::StaticConfig::validate`].
-    ValidateConfig,
-    /// [`crate::StaticConfig::peak_disk_bytes`].
-    PeakDiskBytes,
+    /// [`crate::StorageOptions::build`].
+    BuildStorage,
     /// [`crate::CacheBuilder::open`].
     Open,
     /// [`crate::Cache::put`].
@@ -106,8 +104,7 @@ impl ErrorOperation {
     /// Returns the stable snake-case label used in logs and metrics.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ValidateConfig => "validate_config",
-            Self::PeakDiskBytes => "peak_disk_bytes",
+            Self::BuildStorage => "build_storage",
             Self::Open => "open",
             Self::Put => "put",
             Self::PutL2 => "put_l2",
@@ -248,8 +245,7 @@ fn classify(operation: ErrorOperation, source: &io::Error) -> ErrorKind {
 const fn accepts_caller_input(operation: ErrorOperation) -> bool {
     matches!(
         operation,
-        ErrorOperation::ValidateConfig
-            | ErrorOperation::PeakDiskBytes
+        ErrorOperation::BuildStorage
             | ErrorOperation::Open
             | ErrorOperation::Put
             | ErrorOperation::PutL2

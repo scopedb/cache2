@@ -25,4 +25,4 @@ pub use runtime::{
     PosixIoConfig, ReadAdmission, RuntimeOptions,
 };
 pub(crate) use storage::KEY_HASH_SEED;
-pub use storage::StaticConfig;
+pub use storage::{StorageLayout, StorageOptions};

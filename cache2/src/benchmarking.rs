@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use crate::index::{
     IndexEntry, MAX_INDEX_PROBES, MAX_PACKED_REGION_COUNT, MAX_REGION_OFFSET, PackedLocation,
 };
-use crate::index_storage::{PartitionedIndexStorage, validate_index_slot_count};
+use crate::index_storage::{PartitionedIndexStorage, validated_index_partition_ranges};
 use crate::record_codec::hash_key;
 use crate::region_index::{
     BenchmarkProbeStats, RegionIndex, reset_benchmark_probe_stats, take_benchmark_probe_stats,
@@ -186,7 +186,7 @@ impl TurnoverPlan {
             .checked_mul(2)
             .ok_or_else(|| invalid("turnover index slot count overflow"))?
             .max(8);
-        validate_index_slot_count(index_slots)
+        validated_index_partition_ranges(index_slots)
             .map_err(|_| invalid("turnover index layout is not representable"))?;
         let key_space_entries = physical_entries
             .checked_mul(config.key_space_multiplier)

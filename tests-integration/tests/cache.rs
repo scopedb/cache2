@@ -24,16 +24,20 @@ use std::time::{Duration, Instant};
 use cache2::IoMode;
 use cache2::{
     CacheBuilder, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy,
-    PosixIoConfig, RuntimeOptions, StartupMode, StaticConfig,
+    PosixIoConfig, RuntimeOptions, StartupMode, StorageLayout, StorageOptions,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 type RuntimeOptionsCase = (&'static str, fn(RuntimeOptions) -> RuntimeOptions);
 
-fn test_static_config() -> StaticConfig {
-    StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277)
+fn test_static_config() -> StorageLayout {
+    StorageOptions {
+        region_size_bytes: 512 * 1024,
+        expected_entries: Some(3277),
+        ..StorageOptions::new(3 * 512 * 1024)
+    }
+    .build()
+    .unwrap()
 }
 
 fn test_runtime_config(workers: usize, append_shards: u32) -> RuntimeOptions {
@@ -64,14 +68,14 @@ impl TestCache {
         self.config_with_static(workers, test_static_config())
     }
 
-    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheBuilder {
+    fn config_with_static(&self, workers: usize, static_config: StorageLayout) -> CacheBuilder {
         self.config_with_static_and_shards(workers, static_config, 2)
     }
 
     fn config_with_static_and_shards(
         &self,
         workers: usize,
-        static_config: StaticConfig,
+        static_config: StorageLayout,
         append_shards: u32,
     ) -> CacheBuilder {
         CacheBuilder::from_static(&self.data, static_config)
@@ -953,9 +957,13 @@ async fn cold_start_removes_stale_recovery_files() {
 #[tokio::test]
 async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
-    let static_config = StaticConfig::new(2 * 4096)
-        .with_region_size_bytes(4096)
-        .with_expected_entries(51);
+    let static_config = StorageOptions {
+        region_size_bytes: 4096,
+        expected_entries: Some(51),
+        ..StorageOptions::new(2 * 4096)
+    }
+    .build()
+    .unwrap();
     let value = vec![0x5a; 128];
 
     let cache = files
@@ -983,7 +991,7 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
 async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
     let static_config = test_static_config();
-    let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
+    let peak_disk_bytes = static_config.peak_disk_bytes();
 
     let cache = files
         .config_with_static(2, static_config)
@@ -1012,7 +1020,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 #[tokio::test]
 async fn detailed_snapshot_reports_bounded_resource_state() {
     let files = TestCache::new("resource-snapshot");
-    let expected_disk_peak = test_static_config().peak_disk_bytes().unwrap();
+    let expected_disk_peak = test_static_config().peak_disk_bytes();
     let cache = files.config(4).open().await.unwrap();
     let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
@@ -1314,9 +1322,13 @@ async fn static_config_change_discards_the_old_image() {
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let changed = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(6553);
+    let changed = StorageOptions {
+        region_size_bytes: 512 * 1024,
+        expected_entries: Some(6553),
+        ..StorageOptions::new(3 * 512 * 1024)
+    }
+    .build()
+    .unwrap();
     let reopened = files.config_with_static(5, changed).open().await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());

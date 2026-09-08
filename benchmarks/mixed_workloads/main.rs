@@ -24,7 +24,7 @@ use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
     Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StaticConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StorageOptions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -401,10 +401,12 @@ struct EffectiveConfig {
 }
 
 impl EffectiveConfig {
-    fn static_config(&self) -> StaticConfig {
-        StaticConfig::new(self.capacity_bytes)
-            .with_region_size_bytes(self.region_bytes as u64)
-            .with_expected_entries(self.key_count)
+    fn storage_options(&self) -> StorageOptions {
+        StorageOptions {
+            region_size_bytes: self.region_bytes as u64,
+            expected_entries: Some(self.key_count),
+            ..StorageOptions::new(self.capacity_bytes)
+        }
     }
 
     fn runtime_config(&self) -> RuntimeOptions {
@@ -614,8 +616,7 @@ async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
     );
 
     let files = BenchFiles::new(&config.directory, scenario);
-    let static_config = config.static_config();
-    static_config.validate()?;
+    let static_config = config.storage_options().build()?;
     let cache = Arc::new(
         CacheBuilder::from_static(&files.data, static_config)
             .with_runtime_config(config.runtime_config())

@@ -15,7 +15,7 @@
 use std::env;
 use std::io;
 
-use cache2::{CacheBuilder, StaticConfig};
+use cache2::{CacheBuilder, StorageOptions};
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
@@ -31,7 +31,11 @@ async fn main() -> io::Result<()> {
             "usage: logforth <cache-data-path>",
         )
     })?;
-    let static_config = StaticConfig::new(5 * 4096).with_region_size_bytes(4096);
+    let static_config = StorageOptions {
+        region_size_bytes: 4096,
+        ..StorageOptions::new(5 * 4096)
+    }
+    .build()?;
     let cache = CacheBuilder::from_static(path, static_config)
         .open()
         .await?;

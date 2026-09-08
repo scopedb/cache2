@@ -50,11 +50,11 @@ mod resources;
 mod snapshot;
 
 pub use cache::{Cache, CacheBuilder, CacheTier, Value};
-pub use config::StaticConfig;
 pub use config::{
     IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
     PosixIoConfig, ReadAdmission, RuntimeOptions,
 };
+pub use config::{StorageLayout, StorageOptions};
 pub use error::{Error, ErrorKind, ErrorOperation, Result};
 pub use snapshot::{
     CacheHealth, CacheIndexSnapshot, CacheIoDirectionSnapshot, CacheIoPathSnapshot,

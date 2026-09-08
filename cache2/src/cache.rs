@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{KEY_HASH_SEED, RuntimeOptions, StaticConfig};
+use crate::config::{KEY_HASH_SEED, RuntimeOptions, StorageLayout};
 use crate::error::{Error, ErrorOperation, Result};
 use crate::recovery::{
     DataSuperblock, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET, recovery_image_index_len,
@@ -41,22 +41,14 @@ use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot, StartupMode};
 #[derive(Clone, Debug)]
 pub struct CacheBuilder {
     path: PathBuf,
-    static_config: StaticConfig,
+    static_config: StorageLayout,
     runtime_config: RuntimeOptions,
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl CacheBuilder {
-    /// Creates a builder using default static and runtime tuning.
-    ///
-    /// The L2 index is sized for 16 KiB live entries. Use
-    /// [`Self::from_static`] when Region or index geometry must be explicit.
-    pub fn new(path: impl AsRef<Path>, capacity_bytes: u64) -> Self {
-        Self::from_static(path, StaticConfig::new(capacity_bytes))
-    }
-
     /// Creates a cache builder from a complete static configuration.
-    pub fn from_static(path: impl AsRef<Path>, static_config: StaticConfig) -> Self {
+    pub fn from_static(path: impl AsRef<Path>, static_config: StorageLayout) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             static_config,
@@ -119,8 +111,8 @@ impl CacheBuilder {
         started: Instant,
     ) -> io::Result<Cache> {
         let path = self.path.clone();
-        let capacity_bytes = self.static_config.capacity_bytes;
-        let index_slots = self.static_config.index_slots;
+        let capacity_bytes = self.static_config.capacity_bytes();
+        let index_slots = self.static_config.index_slots();
         let index_bytes = u64::try_from(index_slots)
             .ok()
             .and_then(recovery_image_index_len)
@@ -159,8 +151,8 @@ impl CacheBuilder {
     }
 
     fn open_blocking_inner(self, tokio_handle: tokio::runtime::Handle) -> io::Result<Cache> {
-        let geometry = self.static_config.geometry()?;
-        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes_inner()?;
+        let geometry = self.static_config.geometry();
+        let logical_disk_peak_bytes = self.static_config.peak_disk_bytes();
         let runtime_config = self.runtime_config;
         runtime_config.validate()?;
         if geometry.region_count <= runtime_config.append_shards {
@@ -170,7 +162,7 @@ impl CacheBuilder {
         }
         runtime_config.validate_memory_plan(
             geometry,
-            self.static_config.index_slots,
+            self.static_config.index_slots(),
             runtime_config.append_shards as usize,
         )?;
         let format_data = DataSuperblock {
@@ -179,7 +171,7 @@ impl CacheBuilder {
             data_identity: next_persistent_id(),
             geometry,
             hash_seed: KEY_HASH_SEED,
-            config_fingerprint: self.static_config.fingerprint(geometry),
+            config_fingerprint: self.static_config.fingerprint(),
         };
         let files = RegionFiles::new(
             &self.path,
@@ -192,7 +184,7 @@ impl CacheBuilder {
             runtime_config.append_shards,
             runtime_config,
         );
-        let store = RegionStore::open(self.static_config.index_slots, backend)?;
+        let store = RegionStore::open(self.static_config.index_slots(), backend)?;
         let startup = store.startup();
         let data_plane = store.data_plane_handle()?;
         Ok(Cache {

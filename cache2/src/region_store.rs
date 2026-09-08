@@ -25,7 +25,7 @@
 
 use std::io;
 
-use crate::index_storage::validate_index_slot_count;
+use crate::index_storage::validated_index_partition_ranges;
 use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.
@@ -202,7 +202,8 @@ fn validate_index_slots(index_slots: usize) -> io::Result<()> {
             "RegionStore requires at least 8 index slots",
         ));
     }
-    validate_index_slot_count(index_slots)
+    validated_index_partition_ranges(index_slots)
+        .map(|_| ())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
