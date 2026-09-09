@@ -221,10 +221,7 @@ mod tests {
         let mut encoded = vec![0_u8; record_len as usize];
         encoded[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
         encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()].copy_from_slice(&payload);
-        let golden = assert_golden(
-            &encoded,
-            include_str!("../../fixtures/format_v1/value_record.golden"),
-        );
+        let golden = assert_golden(&encoded, include_str!("format_v1/value_record.golden"));
         assert_eq!(
             RecordHeader::decode(&golden[..RECORD_HEADER_SIZE]),
             Some(header)

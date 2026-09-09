@@ -1353,10 +1353,7 @@ mod tests {
     fn complete_metadata_matches_committed_golden_bytes() {
         let expected = sample();
         let encoded = expected.encode().unwrap();
-        let golden = assert_golden(
-            &encoded,
-            include_str!("../../fixtures/format_v1/region_metadata.golden"),
-        );
+        let golden = assert_golden(&encoded, include_str!("format_v1/region_metadata.golden"));
         assert_eq!(RegionMetadata::decode(&golden).unwrap(), expected);
     }
 

@@ -16,6 +16,8 @@ The repository separates published code from development-only consumers:
 
 Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`.
 
+Keep versioned format fixtures beside the module that owns their encoding and decoding. Share only the fixture parsing and assertion helpers.
+
 ## Repository workflows
 
 The `.cargo/config.toml` alias maps `cargo x` to the `x` package in `xtask/`. Use these commands before opening a pull request:

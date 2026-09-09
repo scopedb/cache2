@@ -1020,7 +1020,7 @@ mod tests {
         let data = data_superblock();
         let data_golden = assert_golden(
             &data.encode().unwrap(),
-            include_str!("../../fixtures/format_v1/data_superblock.golden"),
+            include_str!("format_v1/data_superblock.golden"),
         );
         assert_eq!(
             DataSuperblock::probe(&data_golden),
@@ -1033,7 +1033,7 @@ mod tests {
         let clean = record(19, RecoveryState::Clean);
         let clean_golden = assert_golden(
             &clean.encode().unwrap(),
-            include_str!("../../fixtures/format_v1/clean_state.golden"),
+            include_str!("format_v1/clean_state.golden"),
         );
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
     }
@@ -1044,7 +1044,7 @@ mod tests {
         let header = image_header();
         let image_golden = assert_golden(
             &header.encode().unwrap(),
-            include_str!("../../fixtures/format_v1/recovery_image_header.golden"),
+            include_str!("format_v1/recovery_image_header.golden"),
         );
         assert_eq!(
             RecoveryImageHeader::probe(&image_golden),

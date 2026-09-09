@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Versioned byte fixtures for private persistent-format tests.
+//! Shared byte assertions for module-local persistent-format fixtures.
+//!
+//! Golden fixtures pin versioned on-disk bytes. Changes require an explicit format-version
+//! decision; tests never regenerate them. Each fixture lives beside the module that owns its
+//! format.
+//!
+//! The sparse representation starts with the complete byte length. Each following line contains a
+//! hexadecimal offset and hexadecimal bytes; unspecified bytes are zero.
 
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.

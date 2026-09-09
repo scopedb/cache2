@@ -2287,10 +2287,7 @@ mod tests {
         source
             .write_warm_image(&mut encoded, binding(0x1122_3344_5566_7788))
             .unwrap();
-        assert_golden(
-            &encoded,
-            include_str!("../../../fixtures/format_v1/index_page.golden"),
-        );
+        assert_golden(&encoded, include_str!("format_v1/index_page.golden"));
     }
 
     #[test]
