@@ -14,7 +14,9 @@
 
 use std::error::Error as _;
 
-use cache2::{ErrorKind, ErrorOperation, StorageOptions};
+use cache2::ErrorKind;
+use cache2::ErrorOperation;
+use cache2::StorageOptions;
 
 #[test]
 fn storage_construction_errors_expose_structured_context() {

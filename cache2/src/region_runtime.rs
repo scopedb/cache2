@@ -20,53 +20,79 @@
 //! device path. A fixed age deadline publishes partial batches without adding
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
+use std::io;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
+
+use asyncband::semaphore::OwnedSemaphorePermit;
+use asyncband::semaphore::Semaphore;
+use asyncband::watch;
+
 #[cfg(test)]
 use crate::config::ReadAdmission;
-use std::io;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
-use asyncband::watch;
 
 mod metrics;
 
 pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
 use crate::config::CacheConfig;
-
-use crate::config::{IoMode, IoPoolTopology, RuntimeOptions};
+use crate::config::IoMode;
+use crate::config::IoPoolTopology;
+use crate::config::RuntimeOptions;
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
-use crate::io_backend::RuntimeFileSet;
-use crate::io_engine::{
-    IoBuffer, IoEngine, IoOperation, ReadSlot, ReadSlotWaiter, build_file_engine, submit_cache_io,
-};
-use crate::memory::{MemoryLookup, MemoryReadToken, MemoryStore, MemoryValue};
-use crate::record_codec::{hash_key, required_record_bytes};
-use crate::recovery::DataSuperblock;
-use crate::region::core::{FileRegionCore, RegionStageValue, RegionValueRead};
-use crate::region_reader::{PendingRead, ReadCompletion, ReadPlan, plan_read};
-use crate::region_staging::{RegionStaging, StagingError};
-use crate::resources::{
-    BufferLease, CACHE_THREAD_STACK_BYTES, ResourceBuildError, ResourceController, ResourceLimits,
-};
-use crate::snapshot::{
-    CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
-};
-
 #[cfg(test)]
-use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
+use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
+#[cfg(test)]
+use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::io_backend::RuntimeFileSet;
+use crate::io_engine::IoBuffer;
+use crate::io_engine::IoEngine;
+use crate::io_engine::IoOperation;
+use crate::io_engine::ReadSlot;
+use crate::io_engine::ReadSlotWaiter;
+use crate::io_engine::build_file_engine;
+use crate::io_engine::submit_cache_io;
+use crate::memory::MemoryLookup;
 #[cfg(test)]
 use crate::memory::MemoryMetricsSnapshot;
+use crate::memory::MemoryReadToken;
+use crate::memory::MemoryStore;
+use crate::memory::MemoryValue;
+use crate::record_codec::hash_key;
+use crate::record_codec::required_record_bytes;
 #[cfg(test)]
 use crate::recovery::DataGeometry;
+use crate::recovery::DataSuperblock;
+use crate::region::core::FileRegionCore;
+use crate::region::core::RegionStageValue;
+use crate::region::core::RegionValueRead;
 #[cfg(test)]
 use crate::region::core::runtime_fixed_memory_bytes;
+use crate::region_reader::PendingRead;
+use crate::region_reader::ReadCompletion;
+use crate::region_reader::ReadPlan;
+use crate::region_reader::plan_read;
+use crate::region_staging::RegionStaging;
+use crate::region_staging::StagingError;
+use crate::resources::BufferLease;
+use crate::resources::CACHE_THREAD_STACK_BYTES;
 #[cfg(test)]
 use crate::resources::ManagedMemorySnapshot;
+use crate::resources::ResourceBuildError;
+use crate::resources::ResourceController;
+use crate::resources::ResourceLimits;
+use crate::snapshot::CacheIoDirectionSnapshot;
+use crate::snapshot::CacheIoSnapshot;
+use crate::snapshot::CacheSnapshot;
+use crate::snapshot::DetailedCacheSnapshot;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
@@ -2102,12 +2128,17 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::io_backend::{FileBackend, IoBackend};
-    use crate::io_engine::BackendIoEngine;
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::task::{Context, Wake, Waker};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::task::Context;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use super::*;
+    use crate::io_backend::FileBackend;
+    use crate::io_backend::IoBackend;
+    use crate::io_engine::BackendIoEngine;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2402,10 +2433,14 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
-        use crate::config::{IoEngine, PosixIoConfig};
-        use crate::index::{IndexEntry, PackedLocation};
-        use crate::recovery::{DATA_REGION_AREA_OFFSET, PersistentId};
-        use crate::region::{FileRegionBackend, RegionFiles};
+        use crate::config::IoEngine;
+        use crate::config::PosixIoConfig;
+        use crate::index::IndexEntry;
+        use crate::index::PackedLocation;
+        use crate::recovery::DATA_REGION_AREA_OFFSET;
+        use crate::recovery::PersistentId;
+        use crate::region::FileRegionBackend;
+        use crate::region::RegionFiles;
         use crate::region_store::RegionStore;
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);

@@ -14,20 +14,35 @@
 
 //! Property tests for persistent decoders, record encoding, and bounded indexes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use quickcheck::{Gen, QuickCheck};
+use quickcheck::Gen;
+use quickcheck::QuickCheck;
 
-use crate::checksum::{Crc32c, crc32c};
-use crate::format::{MAX_KEY_SIZE, RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
+use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
+use crate::format::MAX_KEY_SIZE;
+use crate::format::RECORD_ALIGNMENT;
+use crate::format::RECORD_HEADER_SIZE;
+use crate::format::RecordHeader;
 use crate::hashing::FixedPrehashedMap;
-use crate::index::{IndexEntry, PackedLocation, record_size_class_upper_bound};
-use crate::index_storage::{INDEX_IMAGE_SLOT_SIZE, IndexSlot, PartitionedIndexStorage};
-use crate::record_codec::{
-    RecordPayload, encode_reinsert_into_hashed, encode_value_into_hashed, required_record_bytes,
-};
-use crate::recovery::{DataSuperblock, RECOVERY_PAGE_SIZE, RecoveryImageHeader, StateRecord};
-use crate::region_index::{ReclaimIndexAction, RegionIndex};
+use crate::index::IndexEntry;
+use crate::index::PackedLocation;
+use crate::index::record_size_class_upper_bound;
+use crate::index_storage::INDEX_IMAGE_SLOT_SIZE;
+use crate::index_storage::IndexSlot;
+use crate::index_storage::PartitionedIndexStorage;
+use crate::record_codec::RecordPayload;
+use crate::record_codec::encode_reinsert_into_hashed;
+use crate::record_codec::encode_value_into_hashed;
+use crate::record_codec::required_record_bytes;
+use crate::recovery::DataSuperblock;
+use crate::recovery::RECOVERY_PAGE_SIZE;
+use crate::recovery::RecoveryImageHeader;
+use crate::recovery::StateRecord;
+use crate::region_index::ReclaimIndexAction;
+use crate::region_index::RegionIndex;
 use crate::region_manager::RegionAppendReservation;
 use crate::region_metadata::RegionMetadata;
 

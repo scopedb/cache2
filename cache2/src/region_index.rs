@@ -21,17 +21,21 @@
 //! There are no probe chains,
 //! tombstones, generation tables, retries, or request-time allocations.
 
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
 #[cfg(feature = "benchmarking")]
 use std::cell::Cell;
+use std::io;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::hashing::route_hash;
-use crate::index::{INDEX_CANDIDATES, IndexEntry, PackedLocation};
-use crate::index_storage::{
-    IndexPartitionWriteGuard, IndexSlotState, IndexStorageError, PartitionedIndexStorage,
-};
+use crate::index::INDEX_CANDIDATES;
+use crate::index::IndexEntry;
+use crate::index::PackedLocation;
+use crate::index_storage::IndexPartitionWriteGuard;
+use crate::index_storage::IndexSlotState;
+use crate::index_storage::IndexStorageError;
+use crate::index_storage::PartitionedIndexStorage;
 use crate::snapshot::CacheIndexSnapshot;
 
 const CANDIDATE_OFFSETS: [usize; INDEX_CANDIDATES] = [0, 23, 61, 97];

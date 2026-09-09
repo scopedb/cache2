@@ -16,41 +16,63 @@
 
 use std::io;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::TryLockError;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::checksum::crc32c;
-use crate::format::{RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
+use crate::format::RECORD_ALIGNMENT;
+use crate::format::RECORD_HEADER_SIZE;
+use crate::format::RecordHeader;
 use crate::hashing::route_hash;
 #[cfg(test)]
 use crate::index::IndexEntry;
 use crate::index::PackedLocation;
-use crate::index_storage::{
-    INDEX_IMAGE_PAGE_SIZE, IndexStorageError, WARM_IMAGE_WRITE_BATCH_BYTES,
-    canonical_index_partition_ranges,
-};
-use crate::io_engine::{IoEngine, ReadSlot};
+use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::index_storage::IndexStorageError;
+use crate::index_storage::WARM_IMAGE_WRITE_BATCH_BYTES;
+use crate::index_storage::canonical_index_partition_ranges;
+use crate::io_engine::IoEngine;
+use crate::io_engine::ReadSlot;
+use crate::record_codec::RecordEncodeError;
+use crate::record_codec::RecordPayload;
+use crate::record_codec::encode_reinsert_into_hashed;
+use crate::record_codec::encode_value_into_hashed;
 #[cfg(test)]
 use crate::record_codec::hash_key;
-use crate::record_codec::{
-    RecordEncodeError, RecordPayload, encode_reinsert_into_hashed, encode_value_into_hashed,
-};
-use crate::recovery::{DATA_REGION_AREA_OFFSET, recovery_image_index_len};
+use crate::recovery::DATA_REGION_AREA_OFFSET;
+use crate::recovery::recovery_image_index_len;
 use crate::region_appender::submit_span;
-use crate::region_index::{ReclaimIndexAction, RegionIndex, heat_memory_bytes};
-use crate::region_manager::{RegionManager, RegionMutationError, RegionReclaimReceipt};
-use crate::region_metadata::{
-    REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
-    REGION_METADATA_REGIONS_PER_PAGE, RegionMetadataError,
-};
+use crate::region_index::ReclaimIndexAction;
+use crate::region_index::RegionIndex;
+use crate::region_index::heat_memory_bytes;
+use crate::region_manager::RegionManager;
+use crate::region_manager::RegionMutationError;
+use crate::region_manager::RegionReclaimReceipt;
+use crate::region_metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region_metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region_metadata::RegionMetadataError;
+use crate::region_reader::PendingRead;
+use crate::region_reader::ReadCandidate;
+use crate::region_reader::ReadCompletion;
+use crate::region_reader::ReadPlan;
 #[cfg(test)]
 use crate::region_reader::plan_read;
-use crate::region_reader::{PendingRead, ReadCandidate, ReadCompletion, ReadPlan, submit_read};
-use crate::region_staging::{
-    RegionStaging, StageAppend, StagedRecord, StagedWrite, StagingEncodeError, StagingError,
-};
+use crate::region_reader::submit_read;
+use crate::region_staging::RegionStaging;
+use crate::region_staging::StageAppend;
+use crate::region_staging::StagedRecord;
+use crate::region_staging::StagedWrite;
+use crate::region_staging::StagingEncodeError;
+use crate::region_staging::StagingError;
 use crate::resources::BufferLease;
-use crate::snapshot::{CacheIndexSnapshot, RegionSnapshot};
+use crate::snapshot::CacheIndexSnapshot;
+use crate::snapshot::RegionSnapshot;
 
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;

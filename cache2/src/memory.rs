@@ -20,14 +20,22 @@
 
 use std::io;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::TryLockError;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use crate::config::L1EvictionPolicy;
-use crate::eviction::{
-    DetachedPolicy, EvictionState, MAX_POLICY_SCAN_STEPS, MAX_POLICY_SLOT_INDEX, PolicySlot,
-};
-use crate::hashing::{FixedPrehashedMap, route_hash};
+use crate::eviction::DetachedPolicy;
+use crate::eviction::EvictionState;
+use crate::eviction::MAX_POLICY_SCAN_STEPS;
+use crate::eviction::MAX_POLICY_SLOT_INDEX;
+use crate::eviction::PolicySlot;
+use crate::hashing::FixedPrehashedMap;
+use crate::hashing::route_hash;
 use crate::snapshot::CacheL1Snapshot;
 
 /// Charged retained-value ownership. Fixed entry, policy, and directory

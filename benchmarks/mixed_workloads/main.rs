@@ -15,17 +15,33 @@
 use std::env;
 use std::hint::black_box;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use asyncband::barrier::Barrier;
-use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
-use cache2::{
-    Cache, CacheConfig, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StorageOptions,
-};
+use benchmarks::report::JobReport;
+use benchmarks::report::LatencyHistogram;
+use benchmarks::report::RunReporter;
+use benchmarks::report::emit_cache_report;
+use cache2::Cache;
+use cache2::CacheConfig;
+use cache2::CacheHealth;
+use cache2::ErrorKind as CacheErrorKind;
+use cache2::IoEngine;
+use cache2::IoMode;
+use cache2::IoUringConfig;
+use cache2::IoUringPoolConfig;
+use cache2::L1EvictionPolicy;
+use cache2::PosixIoConfig;
+use cache2::RuntimeOptions;
+use cache2::StorageOptions;
 
 const MIB: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64;

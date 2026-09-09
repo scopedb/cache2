@@ -17,7 +17,8 @@
 //! These types are deliberately encoded field-by-field. Their Rust layout is
 //! not part of the disk format.
 
-use crate::checksum::{Crc32c, crc32c};
+use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
 
 pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
 

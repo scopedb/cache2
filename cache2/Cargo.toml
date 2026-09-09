@@ -13,12 +13,12 @@
 # limitations under the License.
 
 [package]
-name = "cache2"
-version = "0.3.0"
+categories = ["caching", "data-structures"]
 description = "Performance-first bounded RAM and NVMe hybrid cache"
 documentation = "https://docs.rs/cache2"
 keywords = ["cache", "nvme", "storage"]
-categories = ["caching", "data-structures"]
+name = "cache2"
+version = "0.3.0"
 
 edition.workspace = true
 license.workspace = true
@@ -42,8 +42,8 @@ quickcheck = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = []
 benchmarking = []
+default = []
 io-uring = ["dep:io-uring"]
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]

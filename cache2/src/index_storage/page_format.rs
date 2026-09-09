@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::CorruptPageReason;
+use super::IndexImageBinding;
+use super::IndexStorageError;
 use crate::checksum::Crc32c;
-
-use super::{CorruptPageReason, IndexImageBinding, IndexStorageError};
 
 pub(crate) const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub(crate) const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;

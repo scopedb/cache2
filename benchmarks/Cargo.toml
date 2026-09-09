@@ -37,29 +37,29 @@ logforth = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
+harness = false
 name = "cache"
 path = "cache/main.rs"
-harness = false
 
 [[bench]]
+harness = false
 name = "cache_soak"
 path = "cache_soak/main.rs"
-harness = false
 
 [[bench]]
+harness = false
 name = "mixed_workloads"
 path = "mixed_workloads/main.rs"
-harness = false
 
 [[bench]]
+harness = false
 name = "recovery_scale"
 path = "recovery_scale/main.rs"
-harness = false
 
 [[bench]]
+harness = false
 name = "region_index_turnover"
 path = "region_index_turnover/main.rs"
-harness = false
 
 [lints]
 workspace = true

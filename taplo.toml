@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-[advisories]
-yanked = "deny"
+exclude = ["target/**"]
+include = ["Cargo.toml", "**/*.toml"]
 
-[licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
-confidence-threshold = 0.93
-
-[bans]
-wildcards = "deny"
-
-[sources]
-unknown-git = "deny"
-unknown-registry = "deny"
+[formatting]
+align_entries = false
+allowed_blank_lines = 1
+array_auto_collapse = true
+array_auto_expand = true
+array_trailing_comma = true
+column_width = 80
+compact_arrays = true
+compact_inline_tables = false
+crlf = false
+indent_string = "  "
+indent_tables = false
+reorder_keys = true
+trailing_newline = true

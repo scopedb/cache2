@@ -20,33 +20,44 @@
 //! mapped writable with `MAP_PRIVATE`: reads initially use the clean image and
 //! runtime mutations become private copy-on-write pages.
 
-use crate::index::{
-    INDEX_CANDIDATES, IndexEntry, MAX_INDEX_PARTITIONS, PackedLocation, PackedLocationError,
-    index_partition_for, record_size_class_upper_bound,
-};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
-use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
-
+use std::io::Write;
+use std::io::{self};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+use std::ptr;
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
+use std::sync::RwLockWriteGuard;
+use std::sync::TryLockError;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+
+use crate::index::INDEX_CANDIDATES;
+use crate::index::IndexEntry;
+use crate::index::MAX_INDEX_PARTITIONS;
+use crate::index::PackedLocation;
+use crate::index::PackedLocationError;
+use crate::index::index_partition_for;
+use crate::index::record_size_class_upper_bound;
 
 mod page_format;
 
+pub(crate) use self::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
+pub(crate) use self::page_format::INDEX_IMAGE_PAGE_SIZE;
+pub(crate) use self::page_format::INDEX_IMAGE_SLOT_SIZE;
+pub(crate) use self::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use self::page_format::PAGE_CHECKSUM_OFFSET;
+use self::page_format::encode_page_header;
+use self::page_format::page_checksum;
+use self::page_format::put_u32;
 #[cfg(test)]
 use self::page_format::put_u64;
-pub(crate) use self::page_format::{
-    INDEX_IMAGE_PAGE_HEADER_SIZE, INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOT_SIZE,
-    INDEX_IMAGE_SLOTS_PER_PAGE,
-};
-use self::page_format::{
-    PAGE_CHECKSUM_OFFSET, encode_page_header, page_checksum, put_u32, read_u64,
-    validate_page_header,
-};
+use self::page_format::read_u64;
+use self::page_format::validate_page_header;
 
 /// Upper bound for one underlying warm-image write.
 ///
@@ -1832,12 +1843,16 @@ unsafe impl Sync for Mapping {}
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::format::sparse_golden;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 

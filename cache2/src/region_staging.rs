@@ -17,18 +17,27 @@
 //! Region manager receipts are the only span authority.
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use crate::format::RECORD_ALIGNMENT;
-use crate::format::{RECORD_HEADER_SIZE, RecordHeader};
-use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation};
+use crate::format::RECORD_HEADER_SIZE;
+use crate::format::RecordHeader;
+use crate::index::IndexEntry;
+use crate::index::MAX_RECORD_LEN;
+use crate::index::PackedLocation;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::io_engine::IoBuffer;
-use crate::recovery::{DATA_REGION_AREA_OFFSET, RECOVERY_PAGE_SIZE};
-use crate::region_manager::{RegionAppendReservation, RegionPaddingReceipt, RegionWriteSpan};
-use crate::resources::{
-    BUFFER_ALIGNMENT, BufferLease, ResourceBuildError, ResourceController, RuntimeMemoryReservation,
-};
+use crate::recovery::DATA_REGION_AREA_OFFSET;
+use crate::recovery::RECOVERY_PAGE_SIZE;
+use crate::region_manager::RegionAppendReservation;
+use crate::region_manager::RegionPaddingReceipt;
+use crate::region_manager::RegionWriteSpan;
+use crate::resources::BUFFER_ALIGNMENT;
+use crate::resources::BufferLease;
+use crate::resources::ResourceBuildError;
+use crate::resources::ResourceController;
+use crate::resources::RuntimeMemoryReservation;
 
 pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
 const UPSERT_PUBLICATION: u64 = 1_u64 << (u64::BITS - 1);
@@ -896,7 +905,8 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use super::*;

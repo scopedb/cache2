@@ -21,11 +21,17 @@
 use std::fmt;
 use std::io;
 
-use crate::io_backend::{DIRECT_IO_ALIGNMENT, WritePoint};
-use crate::io_engine::{
-    BoundedIoRequest, IoBuffer, IoEngine, IoOperation, OperationKind, RequestId, submit_cache_io,
-};
-use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
+use crate::io_backend::DIRECT_IO_ALIGNMENT;
+use crate::io_backend::WritePoint;
+use crate::io_engine::BoundedIoRequest;
+use crate::io_engine::IoBuffer;
+use crate::io_engine::IoEngine;
+use crate::io_engine::IoOperation;
+use crate::io_engine::OperationKind;
+use crate::io_engine::RequestId;
+use crate::io_engine::submit_cache_io;
+use crate::recovery::DATA_REGION_AREA_OFFSET;
+use crate::recovery::DataGeometry;
 use crate::region_manager::RegionWriteSpan;
 
 pub(crate) struct RegionSpanSubmitError {
@@ -232,10 +238,13 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use super::*;
-    use crate::io_backend::{IoBackend, SyncMode, SyncPoint};
+    use crate::io_backend::IoBackend;
+    use crate::io_backend::SyncMode;
+    use crate::io_backend::SyncPoint;
     use crate::io_engine::BackendIoEngine;
     use crate::resources::BufferLease;
 

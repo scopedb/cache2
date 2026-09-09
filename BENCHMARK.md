@@ -1,20 +1,12 @@
 # C² validation
 
-Compare revisions only on the same host, filesystem, device, toolchain, and
-workload. Keep raw output with the tested commit; this repository intentionally
-does not publish machine-specific historical numbers.
+Compare revisions only on the same host, filesystem, device, toolchain, and workload. Keep raw output with the tested commit; this repository intentionally does not publish machine-specific historical numbers.
 
 ## Unified report format
 
-All benchmark targets emit a common fio-style report in addition to their
-existing `result ...` records. The human-readable section groups work into jobs
-and reports completed-operation rate, attempts, payload bandwidth, bytes,
-runtime, worker count, errors or overloads, and sampled latency. Every run ends
-with process CPU time, context switches, page faults, peak RSS, and pass or
-error status.
+All benchmark targets emit a common fio-style report in addition to their existing `result ...` records. The human-readable section groups work into jobs and reports completed-operation rate, attempts, payload bandwidth, bytes, runtime, worker count, errors or overloads, and sampled latency. Every run ends with process CPU time, context switches, page faults, peak RSS, and pass or error status.
 
-Lines beginning with `report version=1` are the stable machine-readable form.
-They are whitespace-separated `key=value` records with these types:
+Lines beginning with `report version=1` are the stable machine-readable form. They are whitespace-separated `key=value` records with these types:
 
 | Type        | Contents                                                                                  |
 |-------------|-------------------------------------------------------------------------------------------|
@@ -25,38 +17,21 @@ They are whitespace-separated `key=value` records with these types:
 | `resources` | Managed memory, peak RSS, logical disk use, and L1/index/Region occupancy                 |
 | `run`       | Overall status, runtime, CPU, scheduler, faults, and peak RSS                             |
 
-`mixed_workloads` and `cache_soak` emit the cache-specific records by default;
-`cache` emits them when `CACHE_BENCH_STATS=true`. The `phase` field
-distinguishes independently reset cache instances, such as the initial write
-and warm-reopened L2 phases. Existing `result ...` lines are kept for
-qualification scripts and compatibility.
+`mixed_workloads` and `cache_soak` emit the cache-specific records by default; `cache` emits them when `CACHE_BENCH_STATS=true`. The `phase` field distinguishes independently reset cache instances, such as the initial write and warm-reopened L2 phases. Existing `result ...` lines are kept for qualification scripts and compatibility.
 
-The `io` records count logical engine requests and positive runtime file
-operations. They distinguish buffered and direct paths, but they are not
-physical-device I/O counters; use OS or device telemetry when that distinction
-matters.
+The `io` records count logical engine requests and positive runtime file operations. They distinguish buffered and direct paths, but they are not physical-device I/O counters; use OS or device telemetry when that distinction matters.
 
-Latency uses a fixed 65-bucket log2 histogram, so measurement memory is bounded
-and independent of operation count. Percentiles are bucket upper bounds;
-`avg~` and `stdev~` are estimates from bucket midpoints. The default sampling
-interval is 16 operations. Set the target's latency sampling interval to zero
-to disable it. Non-soak workers update thread-local histograms; soak workers use
-three relaxed atomic updates per sampled operation. Sampling otherwise adds one
-timer start and one elapsed-time read to each selected operation.
+Latency uses a fixed 65-bucket log2 histogram, so measurement memory is bounded and independent of operation count. Percentiles are bucket upper bounds; `avg~` and `stdev~` are estimates from bucket midpoints. The default sampling interval is 16 operations. Set the target's latency sampling interval to zero to disable it. Non-soak workers update thread-local histograms; soak workers use three relaxed atomic updates per sampled operation. Sampling otherwise adds one timer start and one elapsed-time read to each selected operation.
 
 ## Request-path benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --package benchmarks --bench cache
+cargo +1.98.0 x bench --locked --bench cache
 ```
 
-The benchmark measures accepted puts plus drain, resident L1 reads, warm close,
-and successful L2 reads with best-effort promotion. Values encode their key
-ordinal, so a wrong-key result fails the run. Harness retries of
-`ErrorKind::Overloaded` are workload setup, not library behavior.
+The benchmark measures accepted puts plus drain, resident L1 reads, warm close, and successful L2 reads with best-effort promotion. Values encode their key ordinal, so a wrong-key result fails the run. Harness retries of `ErrorKind::Overloaded` are workload setup, not library behavior.
 
-The main controls are grouped below. See `benchmarks/cache/main.rs` for
-defaults and validation rules.
+The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults and validation rules.
 
 | Purpose      | Variables                                                                                                                                                                     |
 |--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -68,18 +43,14 @@ defaults and validation rules.
 | Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_STATS` (default false; true adds cache/I/O/resource records)                            |
 | Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
 
-`CACHE_BENCH_STATS=true` adds cache accounting on the measured request path.
-Use the same setting for baseline and candidate runs.
+`CACHE_BENCH_STATS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs.
 
-For device measurements, use a data set larger than host RAM and no larger than
-half of L2 capacity. Run baseline and candidate in alternating order at least
-five times, compare medians, and retain every sample. Throughput does not
-replace correctness, overload, memory, or latency checks.
+For device measurements, use a data set larger than host RAM and no larger than half of L2 capacity. Run baseline and candidate in alternating order at least five times, compare medians, and retain every sample. Throughput does not replace correctness, overload, memory, or latency checks.
 
 ## Mixed workload benchmark
 
 ```sh
-cargo +1.98.0 bench --locked --package benchmarks --bench mixed_workloads
+cargo +1.98.0 x bench --locked --bench mixed_workloads
 ```
 
 This harness runs three deterministic request profiles:
@@ -90,11 +61,7 @@ This harness runs three deterministic request profiles:
 | `reinsertion`     | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2             |
 | `negative-lookup` | Every lookup uses a new key that cannot already exist                              | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
 
-Operation counts are per thread. The scaled `mixed` and `reinsertion` defaults
-use total-operation-to-key ratios of 3.2 and 40. Select one or several scenarios
-with `CACHE_WORKLOAD_SCENARIO=mixed`, `reinsertion`, `negative-lookup`, or a
-comma-separated list; the default is `all`. The scaled Region size is 4 MiB for
-`mixed` and 1 MiB for the other scenarios.
+Operation counts are per thread. The scaled `mixed` and `reinsertion` defaults use total-operation-to-key ratios of 3.2 and 40. Select one or several scenarios with `CACHE_WORKLOAD_SCENARIO=mixed`, `reinsertion`, `negative-lookup`, or a comma-separated list; the default is `all`. The scaled Region size is 4 MiB for `mixed` and 1 MiB for the other scenarios.
 
 Use the following controls to scale a run:
 
@@ -106,65 +73,31 @@ Use the following controls to scale a run:
 | I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                              |
 | Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables)                                                                  |
 
-The harness uses a fixed seed, truncated-normal popularity, and
-piecewise-constant key and value sizes. Keys are at least eight bytes so their
-identity is verifiable. Values are at least 24 bytes so every hit can be checked
-for key, length, version, and payload. `negative-lookup` uses the fixed seed and
-operation ordinal for guaranteed-unique deterministic keys.
+The harness uses a fixed seed, truncated-normal popularity, and piecewise-constant key and value sizes. Keys are at least eight bytes so their identity is verifiable. Values are at least 24 bytes so every hit can be checked for key, length, version, and payload. `negative-lookup` uses the fixed seed and operation ordinal for guaranteed-unique deterministic keys.
 
-Request throughput includes generation, value population, cache calls, and hit
-validation. Sampled latency covers only the public cache call and is reported
-as bounded log2 histogram quantiles. Foreground overload is counted as an
-outcome and is never retried. Drain time is reported separately, followed by
-C² L1/L2, Region rotation, reclaim, reinsertion, I/O, and managed-memory
-counters.
+Request throughput includes generation, value population, cache calls, and hit validation. Sampled latency covers only the public cache call and is reported as bounded log2 histogram quantiles. Foreground overload is counted as an outcome and is never retried. Drain time is reported separately, followed by C² L1/L2, Region rotation, reclaim, reinsertion, I/O, and managed-memory counters.
 
 ## Mixed turnover
 
 ```sh
-cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak
+cargo +1.98.0 x bench --locked --bench cache_soak
 ```
 
-The default short run mixes reads, writes, deletes, Region rotation, reclaim,
-and 256 B, 4 KiB, 16 KiB, and 256 KiB values. Each hit is checked for key,
-version, length, and payload. Older valid values are counted as stale; future,
-wrong-key, malformed, I/O-error, or managed-memory/RSS bound violations fail
-the run.
+The default short run mixes reads, writes, deletes, Region rotation, reclaim, and 256 B, 4 KiB, 16 KiB, and 256 KiB values. Each hit is checked for key, version, length, and payload. Older valid values are counted as stale; future, wrong-key, malformed, I/O-error, or managed-memory/RSS bound violations fail the run.
 
-Use `CACHE_SOAK_*` to select duration, sample interval, capacity, L1 and managed
-memory, key count, mixed value sizes, client counts, worker topology, I/O path,
-and output directory. Important qualification switches are:
+Use `CACHE_SOAK_*` to select duration, sample interval, capacity, L1 and managed memory, key count, mixed value sizes, client counts, worker topology, I/O path, and output directory. Important qualification switches are:
 
 - `CACHE_SOAK_WARM_REOPEN=true` to recover before measurement;
-- `CACHE_SOAK_WRITERS=0` with warm reopen to measure a pre-populated,
-  read-only mixed-size data set;
-- `CACHE_SOAK_FINAL_WARM_VERIFY=true` to scan every key after recovery and
-  validate every hit;
-- `CACHE_SOAK_REQUIRE_PATH_COVERAGE=true` to require writes, deletes, L2 reads,
-  rotation, reclaim, and warm recovery;
-- `CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true` for a focused read-heavy run that
-  must both reinsert a hot record and exhaust the bounded reinsert budget.
+- `CACHE_SOAK_WRITERS=0` with warm reopen to measure a pre-populated, read-only mixed-size data set;
+- `CACHE_SOAK_FINAL_WARM_VERIFY=true` to scan every key after recovery and validate every hit;
+- `CACHE_SOAK_REQUIRE_PATH_COVERAGE=true` to require writes, deletes, L2 reads, rotation, reclaim, and warm recovery;
+- `CACHE_SOAK_REQUIRE_REINSERT_COVERAGE=true` for a focused read-heavy run that must both reinsert a hot record and exhaust the bounded reinsert budget.
 
-`CACHE_SOAK_LATENCY_SAMPLE_INTERVAL` controls put, get, and delete latency
-sampling. It defaults to 16; zero disables latency sampling.
+`CACHE_SOAK_LATENCY_SAMPLE_INTERVAL` controls put, get, and delete latency sampling. It defaults to 16; zero disables latency sampling.
 
-With `CACHE_SOAK_IO_ENGINE=io-uring`, `CACHE_SOAK_READ_IO_WORKERS` and
-`CACHE_SOAK_WRITE_IO_WORKERS` keep their legacy meaning of one ring per worker
-with 64 in-flight slots per ring. To sweep ring counts and aggregate in-flight
-depth independently, override `CACHE_SOAK_IO_URING_READ_RINGS` /
-`CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` (writes:
-`CACHE_SOAK_IO_URING_WRITE_RINGS` / `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT`);
-ring count must not exceed max in-flight. `CACHE_SOAK_IO_URING_READ_IOPOLL=true`
-enables kernel completion polling for the read pool (requires
-`CACHE_SOAK_IO_MODE=direct`). `CACHE_SOAK_IO_URING_READ_SQPOLL_MS`
-opts the read pool into kernel submission polling with that idle time, and
-`CACHE_SOAK_IO_URING_READ_SQPOLL_CPU` optionally pins every polling thread to
-one CPU.
+With `CACHE_SOAK_IO_ENGINE=io-uring`, `CACHE_SOAK_READ_IO_WORKERS` and `CACHE_SOAK_WRITE_IO_WORKERS` keep their legacy meaning of one ring per worker with 64 in-flight slots per ring. To sweep ring counts and aggregate in-flight depth independently, override `CACHE_SOAK_IO_URING_READ_RINGS` / `CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` (writes: `CACHE_SOAK_IO_URING_WRITE_RINGS` / `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT`); ring count must not exceed max in-flight. `CACHE_SOAK_IO_URING_READ_IOPOLL=true` enables kernel completion polling for the read pool (requires `CACHE_SOAK_IO_MODE=direct`). `CACHE_SOAK_IO_URING_READ_SQPOLL_MS` opts the read pool into kernel submission polling with that idle time, and `CACHE_SOAK_IO_URING_READ_SQPOLL_CPU` optionally pins every polling thread to one CPU.
 
-Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution.
-Use a short matrix rather than one oversized run: small-capacity turnover,
-high-cardinality mixed sizes, read-heavy reinsertion, and CLOCK/S3-FIFO A/B.
-Longer soaks are optional follow-up evidence, not a default gate.
+Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution. Use a short matrix rather than one oversized run: small-capacity turnover, high-cardinality mixed sizes, read-heavy reinsertion, and CLOCK/S3-FIFO A/B. Longer soaks are optional follow-up evidence, not a default gate.
 
 ## Linux NVMe qualification
 
@@ -174,9 +107,7 @@ Longer soaks are optional follow-up evidence, not a default gate.
   /var/tmp/cache2-qualification
 ```
 
-The runner records the revision, machine, filesystem, block device, complete
-configuration, raw logs, medians, and checksums. It exercises buffered and
-direct POSIX I/O, a worker-count sweep, mixed turnover, and final warm recovery.
+The runner records the revision, machine, filesystem, block device, complete configuration, raw logs, medians, and checksums. It exercises buffered and direct POSIX I/O, a worker-count sweep, mixed turnover, and final warm recovery.
 
 A release pass requires:
 
@@ -186,32 +117,26 @@ A release pass requires:
 - all four performance gates configured;
 - five benchmark samples and at least a 30-minute turnover run.
 
-Relaxing hardware, worktree, sample, or duration checks produces preflight
-evidence only. Set the `CACHE_BENCH_*` shape and gate variables for the target
-machine before running the script.
+Relaxing hardware, worktree, sample, or duration checks produces preflight evidence only. Set the `CACHE_BENCH_*` shape and gate variables for the target machine before running the script.
 
 ## Focused checks
 
 Exercise a production-load-factor index without storage I/O:
 
 ```sh
-cargo +1.98.0 bench --locked --package benchmarks \
-  --bench region_index_turnover
+cargo +1.98.0 x bench --locked --bench region_index_turnover
 ```
 
-Measure cold open, warm image publication, mmap recovery, and RSS at a chosen
-index scale:
+Measure cold open, warm image publication, mmap recovery, and RSS at a chosen index scale:
 
 ```sh
-cargo +1.98.0 bench --locked --package benchmarks --bench recovery_scale
+cargo +1.98.0 x bench --locked --bench recovery_scale
 ```
 
-Run the 10,000-case property tests for persistent decoders, record round trips,
-and the two bounded index state machines:
+Run the 10,000-case property tests for persistent decoders, record round trips, and the two bounded index state machines:
 
 ```sh
 cargo test --package cache2 --lib property_tests::
 ```
 
-Treat any correctness failure, unexpected unbounded growth, missed required
-path, or recovery mismatch as a failed result regardless of throughput.
+Treat any correctness failure, unexpected unbounded growth, missed required path, or recovery mismatch as a failed result regardless of throughput.

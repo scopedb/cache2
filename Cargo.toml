@@ -32,16 +32,23 @@ asyncband = { version = "0.7.1", features = ["barrier", "semaphore", "watch"] }
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
-hashcrew = { version = "0.1.2" }
+hashcrew = { version = "0.2.0", features = ["std", "xxhash"] }
 io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }
-logforth = { version = "0.30.1", default-features = false, features = ["bridge-log", "filter-rustlog", "layout-json"] }
+logforth = { version = "0.30.1", default-features = false, features = [
+  "bridge-log",
+  "filter-rustlog",
+  "layout-json",
+] }
 quickcheck = { version = "1.1.0", default-features = false }
 tokio = { version = "1.53.1", features = ["rt", "time"] }
 
 [workspace.lints.rust]
+unknown_lints = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"

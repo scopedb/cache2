@@ -14,19 +14,37 @@
 
 use std::env;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use benchmarks::report::{
-    AtomicLatencyHistogram, JobReport, LatencyHistogram, RunReporter, emit_cache_report,
-};
-use cache2::{
-    Cache, CacheConfig, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
-    IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy, PosixIoConfig,
-    RuntimeOptions, StartupMode, StorageOptions,
-};
+use benchmarks::report::AtomicLatencyHistogram;
+use benchmarks::report::JobReport;
+use benchmarks::report::LatencyHistogram;
+use benchmarks::report::RunReporter;
+use benchmarks::report::emit_cache_report;
+use cache2::Cache;
+use cache2::CacheConfig;
+use cache2::CacheHealth;
+use cache2::DetailedCacheSnapshot;
+use cache2::ErrorKind as CacheErrorKind;
+use cache2::IoEngine;
+use cache2::IoMode;
+use cache2::IoUringConfig;
+use cache2::IoUringPoolConfig;
+use cache2::IoUringSqPollConfig;
+use cache2::L1EvictionPolicy;
+use cache2::PosixIoConfig;
+use cache2::RuntimeOptions;
+use cache2::StartupMode;
+use cache2::StorageOptions;
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;

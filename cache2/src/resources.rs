@@ -18,11 +18,14 @@
 //! size-class-bounded planned range after an L2 index hit. Write waiting uses
 //! a separate request gate.
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::Layout;
+use std::alloc::alloc;
+use std::alloc::dealloc;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 pub(crate) const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured

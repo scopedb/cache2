@@ -12,20 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache2::ReadAdmission;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
+use cache2::Cache;
+use cache2::CacheConfig;
+use cache2::CacheHealth;
+use cache2::CacheTier;
+use cache2::ErrorKind;
+use cache2::ErrorOperation;
+use cache2::IoEngine;
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
-use cache2::{
-    Cache, CacheConfig, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine,
-    L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StartupMode, StorageLayout, StorageOptions,
-};
+use cache2::L1EvictionPolicy;
+use cache2::PosixIoConfig;
+use cache2::ReadAdmission;
+use cache2::RuntimeOptions;
+use cache2::StartupMode;
+use cache2::StorageLayout;
+use cache2::StorageOptions;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 

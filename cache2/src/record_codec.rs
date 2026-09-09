@@ -24,8 +24,14 @@ use std::fmt;
 use hashcrew::xxhash::xxh3_64_with_seed;
 
 use crate::checksum::Crc32c;
-use crate::format::{MAX_KEY_SIZE, RECORD_ALIGNMENT, RECORD_HEADER_SIZE, RecordHeader};
-use crate::index::{IndexEntry, MAX_RECORD_LEN, PackedLocation, PackedLocationError};
+use crate::format::MAX_KEY_SIZE;
+use crate::format::RECORD_ALIGNMENT;
+use crate::format::RECORD_HEADER_SIZE;
+use crate::format::RecordHeader;
+use crate::index::IndexEntry;
+use crate::index::MAX_RECORD_LEN;
+use crate::index::PackedLocation;
+use crate::index::PackedLocationError;
 use crate::region_manager::RegionAppendReservation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

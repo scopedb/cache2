@@ -15,7 +15,10 @@
 use std::env;
 use std::io;
 
-use cache2::{Cache, CacheConfig, RuntimeOptions, StorageOptions};
+use cache2::Cache;
+use cache2::CacheConfig;
+use cache2::RuntimeOptions;
+use cache2::StorageOptions;
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
