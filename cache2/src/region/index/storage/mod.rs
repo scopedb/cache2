@@ -21,23 +21,12 @@
 //! runtime mutations become private copy-on-write pages.
 
 use std::cell::UnsafeCell;
-#[cfg(test)]
-use std::env;
-use std::error::Error as StdError;
 use std::fmt;
-#[cfg(test)]
-use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
-#[cfg(test)]
-use std::panic;
-#[cfg(test)]
-use std::panic::AssertUnwindSafe;
-#[cfg(test)]
-use std::process;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
@@ -572,8 +561,8 @@ impl fmt::Display for IndexStorageError {
     }
 }
 
-impl StdError for IndexStorageError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for IndexStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::InvalidArgument(_)
@@ -1561,7 +1550,7 @@ impl PartitionedIndexStorage {
     #[cfg(test)]
     pub fn poison_hash_partition_for_test(&self, hash: u64) {
         let partition = index_partition_for(hash, self.partitions.len());
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = self.partitions[partition].write().unwrap();
             panic!("poison index partition for test");
         }));
@@ -1871,8 +1860,10 @@ mod tests {
     impl TestFile {
         fn create() -> Self {
             let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path =
-                env::temp_dir().join(format!("cache2-index-image-{}-{id}.tmp", process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "cache2-index-image-{}-{id}.tmp",
+                std::process::id()
+            ));
             let file = OpenOptions::new()
                 .create_new(true)
                 .read(true)
@@ -1885,7 +1876,7 @@ mod tests {
 
     impl Drop for TestFile {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 

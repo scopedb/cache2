@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::f64::consts::TAU;
 use std::fmt;
 use std::fs;
@@ -20,7 +19,6 @@ use std::hint::black_box;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -39,7 +37,6 @@ use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
-use cache2::ErrorKind as CacheErrorKind;
 use cache2::IoEngine;
 use cache2::IoMode;
 use cache2::IoUringConfig;
@@ -48,7 +45,6 @@ use cache2::L1EvictionPolicy;
 use cache2::PosixIoConfig;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 const MIB: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64;
@@ -239,7 +235,7 @@ impl HarnessConfig {
         let reclaim_workers = env_usize("CACHE_WORKLOAD_RECLAIM_WORKERS", 1)?;
         let latency_sample_interval = env_usize("CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL", 16)?;
         let seed = env_u64("CACHE_WORKLOAD_SEED", DEFAULT_SEED)?;
-        let io_engine = match env::var("CACHE_WORKLOAD_IO_ENGINE")
+        let io_engine = match std::env::var("CACHE_WORKLOAD_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
@@ -265,7 +261,7 @@ impl HarnessConfig {
             )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
-        let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
+        let io_mode = match std::env::var("CACHE_WORKLOAD_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
         {
@@ -273,7 +269,7 @@ impl HarnessConfig {
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
-        let l1_eviction_policy = match env::var("CACHE_WORKLOAD_L1_EVICTION")
+        let l1_eviction_policy = match std::env::var("CACHE_WORKLOAD_L1_EVICTION")
             .unwrap_or_else(|_| "clock".to_owned())
             .as_str()
         {
@@ -281,9 +277,9 @@ impl HarnessConfig {
             "s3-fifo" => L1EvictionPolicy::S3Fifo,
             value => return Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
         };
-        let directory = env::var_os("CACHE_WORKLOAD_DIR")
+        let directory = std::env::var_os("CACHE_WORKLOAD_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(std::env::temp_dir);
 
         if operations_per_thread == Some(0)
             || threads == Some(0)
@@ -460,7 +456,7 @@ impl BenchFiles {
             data: directory.join(format!(
                 "cache2-mixed-workload-{}-{}-{timestamp}.cache",
                 scenario.slug(),
-                process::id()
+                std::process::id()
             )),
         }
     }
@@ -589,7 +585,7 @@ fn main() -> io::Result<()> {
         .max()
         .unwrap_or(2)
         .max(2);
-    let runtime = TokioRuntimeBuilder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_threads)
         .thread_name("cache2-mixed-workload")
         .enable_time()
@@ -751,7 +747,7 @@ async fn run_worker(
                     ));
                 }
                 Ok(None) => result.misses = result.misses.saturating_add(1),
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                     result.get_overloaded = result.get_overloaded.saturating_add(1);
                 }
                 Err(error) => return Err(error.into()),
@@ -788,7 +784,7 @@ async fn run_worker(
                         ));
                     }
                     Ok(None) => result.misses = result.misses.saturating_add(1),
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.get_overloaded = result.get_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -815,7 +811,7 @@ async fn run_worker(
                             .accepted_value_bytes
                             .saturating_add(value_size as u64);
                     }
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.set_overloaded = result.set_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -830,7 +826,7 @@ async fn run_worker(
                     Ok(_) => {
                         result.delete_accepted = result.delete_accepted.saturating_add(1);
                     }
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.delete_overloaded = result.delete_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -1174,7 +1170,7 @@ fn report_latency(scenario: Scenario, operation: &str, latency: &LatencyHistogra
 }
 
 fn parse_scenarios() -> io::Result<Box<[Scenario]>> {
-    let value = env::var("CACHE_WORKLOAD_SCENARIO").unwrap_or_else(|_| "all".to_owned());
+    let value = std::env::var("CACHE_WORKLOAD_SCENARIO").unwrap_or_else(|_| "all".to_owned());
     if value == "all" {
         return Ok(Scenario::ALL.into());
     }
@@ -1239,22 +1235,22 @@ fn mixed(mut value: u64) -> u64 {
 }
 
 fn env_optional_usize(name: &str) -> io::Result<Option<usize>> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse::<usize>()
             .map(Some)
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

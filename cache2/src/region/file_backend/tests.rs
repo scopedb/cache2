@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::fs;
 use std::future::Future;
 use std::future::poll_fn;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
-use std::process;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
@@ -30,14 +28,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::task::Poll;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-
 use super::*;
-use crate::config::IoEngine as ConfiguredIoEngine;
 use crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::PosixIoConfig;
 use crate::config::ReadAdmission;
@@ -83,7 +77,7 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
                     Instant::now() < deadline,
                     "write buffer did not make progress"
                 );
-                thread::yield_now();
+                std::thread::yield_now();
             }
             Err(error) => panic!("cache write failed: {error}"),
         }
@@ -106,7 +100,8 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", process::id()));
+        let root =
+            std::env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let files = RegionFiles::new(
@@ -277,8 +272,8 @@ fn external_process_kill_recovery_contract() {
     const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
     const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
 
-    if let Ok(case) = env::var(CHILD_CASE) {
-        let root = PathBuf::from(env::var_os(CHILD_ROOT).expect("child root is set"));
+    if let Ok(case) = std::env::var(CHILD_CASE) {
+        let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child root is set"));
         let files = RegionFiles::new(
             root.join("data"),
             root.join("state"),
@@ -306,7 +301,7 @@ fn external_process_kill_recovery_contract() {
         initial.drain().unwrap();
         initial.close_warm().unwrap();
 
-        let status = Command::new(env::current_exe().unwrap())
+        let status = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("region::file_backend::tests::external_process_kill_recovery_contract")
             .arg("--ignored")
@@ -413,7 +408,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: ConfiguredIoEngine::Posix(PosixIoConfig::new(2, 4, 1)),
+        io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(2, 4, 1)),
         l1_capacity_bytes: 0,
         statistics: true,
         read_admission: ReadAdmission::Wait {
@@ -432,7 +427,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         ),
     )
     .unwrap();
-    let tokio_runtime = TokioRuntimeBuilder::new_multi_thread()
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
         .build()
@@ -497,7 +492,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: ConfiguredIoEngine::Posix(PosixIoConfig::new(1, 4, 1)),
+        io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(1, 4, 1)),
         l1_capacity_bytes: 0,
         read_admission: ReadAdmission::Wait {
             timeout: Duration::from_secs(1),
@@ -515,7 +510,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
         ),
     )
     .unwrap();
-    let tokio_runtime = TokioRuntimeBuilder::new_current_thread()
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
@@ -662,7 +657,7 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
         let runtime_config = RuntimeOptions {
-            io_engine: ConfiguredIoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+            io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
             l1_capacity_bytes: 0,
             managed_memory_limit_bytes: 32 * 1024 * 1024,
             write_flush_threshold_bytes: 128 * 1024,
@@ -805,7 +800,7 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
     let core = Arc::clone(&runtime.core);
-    let writer = thread::spawn(move || {
+    let writer = std::thread::spawn(move || {
         let result = core.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
         sender.send((result, staging)).unwrap();
     });
@@ -854,7 +849,7 @@ fn completed_record_publication_does_not_enter_region_manager() {
     );
     let (sender, receiver) = mpsc::sync_channel(1);
     let publisher_core = Arc::clone(&core);
-    let publisher = thread::spawn(move || {
+    let publisher = std::thread::spawn(move || {
         sender
             .send(publisher_core.publish_completed_records(&[record]))
             .unwrap();

@@ -21,8 +21,6 @@ use std::mem;
 use std::mem::size_of;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-#[cfg(test)]
-use std::thread;
 
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
@@ -1111,7 +1109,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let encoder_staging = Arc::clone(&staging);
-        let encoder = thread::spawn(move || {
+        let encoder = std::thread::spawn(move || {
             encoder_staging.encode_reserved(receipt, |target| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

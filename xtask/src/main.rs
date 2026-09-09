@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::iter;
 use std::path::Path;
-use std::process;
-use std::process::Command as StdCommand;
 
 use cargo_metadata::Metadata;
 use cargo_metadata::MetadataCommand;
@@ -89,7 +85,7 @@ impl CommandBench {
         run(self.command());
     }
 
-    fn command(self) -> StdCommand {
+    fn command(self) -> std::process::Command {
         let mut command = cargo();
         command.args(["bench", "--package", "benchmarks"]);
         command.args(self.cargo_args);
@@ -184,7 +180,7 @@ impl CommandLint {
             command_run("taplo", ["format", "--check"]);
             command_run("hawkeye", ["check"]);
         }
-        command_run("typos", iter::empty::<&str>());
+        command_run("typos", std::iter::empty::<&str>());
 
         let mut docs = nightly_cargo();
         docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs --cfg docsrs");
@@ -235,15 +231,15 @@ impl CommandTest {
     }
 }
 
-fn cargo() -> StdCommand {
-    let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = StdCommand::new(executable);
+fn cargo() -> std::process::Command {
+    let executable = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut command = std::process::Command::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command
 }
 
-fn nightly_cargo() -> StdCommand {
-    let mut command = StdCommand::new("rustup");
+fn nightly_cargo() -> std::process::Command {
+    let mut command = std::process::Command::new("rustup");
     command
         .args(["run", "nightly", "cargo"])
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
@@ -265,25 +261,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = StdCommand::new(executable);
+    let mut command = std::process::Command::new(executable);
     command
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")))
         .args(args);
     run(command);
 }
 
-fn run(mut command: StdCommand) {
+fn run(mut command: std::process::Command) {
     println!("{command:?}");
     match command.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => process::exit(status.code().unwrap_or(1)),
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => fail(&format!("failed to run {command:?}: {error}")),
     }
 }
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
-    process::exit(2)
+    std::process::exit(2)
 }
 
 #[cfg(test)]

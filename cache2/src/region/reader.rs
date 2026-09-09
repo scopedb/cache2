@@ -24,8 +24,6 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
-use tokio::runtime::Handle as TokioHandle;
-
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -103,7 +101,7 @@ impl PendingRead {
     pub async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> ReadCompletion {
         let Self {
             plan,

@@ -21,8 +21,6 @@
 //! The sparse representation starts with the complete byte length. Each following line contains a
 //! hexadecimal offset and hexadecimal bytes; unspecified bytes are zero.
 
-use std::str;
-
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.
 #[track_caller]
@@ -61,7 +59,7 @@ fn sparse_golden(input: &str) -> Vec<u8> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|pair| u8::from_str_radix(str::from_utf8(pair).unwrap(), 16).unwrap())
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>();
         let output = output.as_mut().expect("golden length must come first");
         output[offset..offset + bytes.len()].copy_from_slice(&bytes);

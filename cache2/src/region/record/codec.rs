@@ -19,7 +19,6 @@
 //! no allocation. Payload preparation computes the CRC before the append
 //! transaction copies the borrowed key and value into staging.
 
-use std::error::Error as StdError;
 use std::fmt;
 
 use hashcrew::xxhash::xxh3_64_with_seed;
@@ -77,8 +76,8 @@ impl fmt::Display for RecordEncodeError {
     }
 }
 
-impl StdError for RecordEncodeError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for RecordEncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidLocation(error) => Some(error),
             _ => None,

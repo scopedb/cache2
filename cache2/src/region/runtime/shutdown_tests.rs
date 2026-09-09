@@ -208,11 +208,11 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::region::RegionFiles;
     use crate::region::recovery::PersistentId;
     use crate::region::store::RegionStore;
-    let root = env::temp_dir().join(format!(
+    let root = std::env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
-        process::id()
+        std::process::id()
     ));
-    fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
     let files = RegionFiles::new(root.join("data"), root.join("state"), root.join("image"));
     let data = DataSuperblock {
         generation: 1,
@@ -229,7 +229,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let config = RuntimeOptions {
         append_shards: 1,
         l1_capacity_bytes: 0,
-        io_engine: ConfiguredIoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+        io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(
@@ -259,7 +259,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     shared.shards = Box::new([]);
     let shared = Arc::clone(&plane.shared);
     let (tx, rx) = mpsc::channel();
-    let thread = thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let result = stop_running(RunningOwner {
             shared,
             shard_workers: vec![],
@@ -272,7 +272,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     thread.join().unwrap();
     engine.shutdown().unwrap();
     assert!(!engine.inject.load(Ordering::Acquire));
-    fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
     assert!(
         matches!(result, Ok(Ok(false))),
         "close synchronously joined a blocked read"

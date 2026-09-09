@@ -24,7 +24,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::thread;
 use std::time::Instant;
 
 use crate::io::backend::IoBackend;
@@ -139,7 +138,7 @@ impl BackendIoEngine {
             let worker_backend = Arc::clone(&backend);
             let worker_shared = Arc::clone(&shared);
             let worker_receiver = Arc::clone(&receiver);
-            let spawn_result = thread::Builder::new()
+            let spawn_result = std::thread::Builder::new()
                 .name(format!("cache2-sync-io-{worker_index}"))
                 .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver));

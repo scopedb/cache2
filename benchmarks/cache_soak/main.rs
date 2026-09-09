@@ -13,18 +13,15 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -39,7 +36,6 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
-use cache2::ErrorKind as CacheErrorKind;
 use cache2::IoEngine;
 use cache2::IoMode;
 use cache2::IoUringConfig;
@@ -54,9 +50,6 @@ use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tokio::runtime::Handle as TokioHandle;
-use tokio::runtime::Runtime as TokioRuntime;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
@@ -164,9 +157,9 @@ impl SoakConfig {
         )?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
-        let directory = env::var_os("CACHE_SOAK_DIR")
+        let directory = std::env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(std::env::temp_dir);
         if duration.is_zero()
             || sample_period.is_zero()
             || value_bytes.is_empty()
@@ -251,7 +244,10 @@ impl SoakFiles {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            data: directory.join(format!("cache2-soak-{}-{timestamp}.cache", process::id())),
+            data: directory.join(format!(
+                "cache2-soak-{}-{timestamp}.cache",
+                std::process::id()
+            )),
             cleanup_on_drop: AtomicBool::new(false),
         }
     }
@@ -372,7 +368,7 @@ fn main() -> io::Result<()> {
 fn run_benchmark() -> io::Result<()> {
     init_logforth()?;
     let config = SoakConfig::from_env()?;
-    let runtime = TokioRuntimeBuilder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.readers.max(2))
         .thread_name("cache2-soak")
         .enable_time()
@@ -451,7 +447,7 @@ fn run_benchmark() -> io::Result<()> {
         files.data.display(),
     );
 
-    thread::scope(|scope| -> io::Result<()> {
+    std::thread::scope(|scope| -> io::Result<()> {
         let mut workers = Vec::with_capacity(client_count);
         for _ in 0..config.writers {
             workers.push(scope.spawn(|| {
@@ -506,7 +502,7 @@ fn run_benchmark() -> io::Result<()> {
         while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
             let wake_at = min(next_sample, deadline);
             if let Some(remaining) = wake_at.checked_duration_since(Instant::now()) {
-                thread::sleep(remaining);
+                std::thread::sleep(remaining);
             }
             let now = Instant::now();
             if now >= next_sample && now < deadline {
@@ -648,7 +644,7 @@ fn init_logforth() -> io::Result<()> {
 }
 
 fn open_cache(
-    runtime: &TokioRuntime,
+    runtime: &tokio::runtime::Runtime,
     files: &SoakFiles,
     config: &CacheConfig,
 ) -> io::Result<Cache> {
@@ -682,8 +678,8 @@ fn populate_for_warm_reopen(
         loop {
             match cache.put(key, &value[..value_bytes]) {
                 Ok(_) => break,
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
-                    thread::sleep(OVERLOAD_DELAY);
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                    std::thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -734,10 +730,10 @@ fn run_writer(
                 record_latency(&counters.put_latency, put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 record_latency(&counters.put_latency, put_started);
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(OVERLOAD_DELAY);
+                std::thread::sleep(OVERLOAD_DELAY);
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -752,10 +748,10 @@ fn run_writer(
                     record_latency(&counters.delete_latency, delete_started);
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                     record_latency(&counters.delete_latency, delete_started);
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
-                    thread::sleep(OVERLOAD_DELAY);
+                    std::thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -775,7 +771,7 @@ fn run_reader(
     next_read: &AtomicU64,
     stop: &AtomicBool,
     counters: &SoakCounters,
-    runtime: &TokioHandle,
+    runtime: &tokio::runtime::Handle,
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
     while !stop.load(Ordering::Acquire) {
@@ -814,7 +810,7 @@ fn run_reader(
 }
 
 fn verify_warm_reopen(
-    runtime: &TokioRuntime,
+    runtime: &tokio::runtime::Runtime,
     cache: &Cache,
     expected: &[AtomicU64],
     value_size_count: u64,
@@ -1136,7 +1132,7 @@ fn record_latency(histogram: &AtomicLatencyHistogram, started: Option<Instant>) 
 
 fn pace(interval: Duration) {
     if !interval.is_zero() {
-        thread::sleep(interval);
+        std::thread::sleep(interval);
     }
 }
 
@@ -1185,11 +1181,11 @@ fn peak_rss_bytes() -> u64 {
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1201,7 +1197,7 @@ fn env_usize(name: &str, default: usize) -> io::Result<usize> {
 }
 
 fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .split(',')
             .map(|item| {
@@ -1210,7 +1206,7 @@ fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
             })
             .collect::<io::Result<Vec<_>>>()
             .map(Vec::into_boxed_slice),
-        Err(env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1221,22 +1217,22 @@ fn env_u32(name: &str, default: u32) -> io::Result<u32> {
 }
 
 fn env_optional_u32(name: &str) -> io::Result<Option<u32>> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse::<u32>()
             .map(Some)
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
         Ok(value) if value == "false" || value == "0" => Ok(false),
         Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1247,7 +1243,7 @@ fn parse_io_engine(
     write_workers: usize,
     reclaim_workers: usize,
 ) -> io::Result<IoEngine> {
-    match env::var(name)
+    match std::env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
@@ -1324,7 +1320,7 @@ fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolConfig> {
 }
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {
-    match env::var(name)
+    match std::env::var(name)
         .unwrap_or_else(|_| "buffered".to_owned())
         .as_str()
     {
@@ -1335,7 +1331,7 @@ fn parse_io_mode(name: &str) -> io::Result<IoMode> {
 }
 
 fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
-    match env::var(name)
+    match std::env::var(name)
         .unwrap_or_else(|_| "clock".to_owned())
         .as_str()
     {

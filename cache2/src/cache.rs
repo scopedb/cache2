@@ -23,7 +23,6 @@ use std::io;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -34,7 +33,6 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use tokio::runtime::Handle as TokioHandle;
 use tokio::task::JoinError;
 
 use crate::config::CacheConfig;
@@ -123,7 +121,7 @@ pub struct Cache {
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
-    tokio_handle: TokioHandle,
+    tokio_handle: tokio::runtime::Handle,
 }
 
 impl fmt::Debug for Cache {
@@ -146,7 +144,7 @@ impl Cache {
     /// device support, runtime binding, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self> {
-        let handle = TokioHandle::try_current().map_err(|error| {
+        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
             from_io(
                 ErrorOperation::Open,
                 io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
@@ -165,7 +163,7 @@ impl Cache {
     pub async fn open_with_handle(
         path: impl AsRef<Path>,
         config: CacheConfig,
-        tokio_handle: TokioHandle,
+        tokio_handle: tokio::runtime::Handle,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let cache_handle = tokio_handle.clone();
@@ -185,7 +183,7 @@ impl Cache {
     fn open_blocking(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: TokioHandle,
+        tokio_handle: tokio::runtime::Handle,
         started: Instant,
     ) -> io::Result<Cache> {
         let capacity_bytes = config.storage().capacity_bytes();
@@ -230,7 +228,7 @@ impl Cache {
     fn open_blocking_inner(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: TokioHandle,
+        tokio_handle: tokio::runtime::Handle,
     ) -> io::Result<Cache> {
         let format_data = DataSuperblock {
             generation: 1,
@@ -273,10 +271,10 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key or
-    /// record and [`crate::ErrorKind::Overloaded`] when bounded mutation
-    /// admission is busy. Returns [`crate::ErrorKind::Unavailable`] after close
-    /// starts. Runtime and device failures use their corresponding structured
+    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) for an oversized key or
+    /// record and [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) when bounded mutation
+    /// admission is busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after
+    /// close starts. Runtime and device failures use their corresponding structured
     /// classifications.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.ensure_open(ErrorOperation::Put)?;
@@ -297,7 +295,7 @@ impl Cache {
     ///
     /// Uses the same input, overload, runtime, and device classifications as
     /// [`Self::put`], including unavailable after close starts, with
-    /// [`crate::ErrorOperation::PutL2`] as its context.
+    /// [`ErrorOperation::PutL2`](crate::ErrorOperation::PutL2) as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
         self.ensure_open(ErrorOperation::PutL2)?;
         public_result(
@@ -313,9 +311,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key and
-    /// [`crate::ErrorKind::Overloaded`] when bounded mutation admission is
-    /// busy. Returns [`crate::ErrorKind::Unavailable`] after close starts.
+    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) for an oversized key and
+    /// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) when bounded mutation admission is
+    /// busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
     /// Runtime and device failures remain explicit.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
         self.ensure_open(ErrorOperation::Delete)?;
@@ -333,8 +331,8 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Overloaded`] for explicit read pressure when
-    /// waiting is enabled. Cache data and device failures that can safely fail
+    /// Returns [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) for explicit read pressure
+    /// when waiting is enabled. Cache data and device failures that can safely fail
     /// open transition reads to misses instead of surfacing an application
     /// error.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
@@ -356,9 +354,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Overloaded`] if another drain is active, or
-    /// [`crate::ErrorKind::Unavailable`] after close starts. Accepted work that
-    /// cannot complete returns a structured runtime/device failure.
+    /// Returns [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) if another drain is active,
+    /// or [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
+    /// Accepted work that cannot complete returns a structured runtime/device failure.
     pub async fn drain(&self) -> Result<()> {
         self.ensure_open(ErrorOperation::Drain)?;
         public_result(ErrorOperation::Drain, self.data_plane.drain_async().await)
@@ -370,7 +368,7 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] after close starts, or a
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts, or a
     /// structured runtime failure if the snapshot cannot be read.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
         self.ensure_open(ErrorOperation::Snapshot)?;
@@ -386,7 +384,7 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] after close starts, or a
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts, or a
     /// structured runtime failure if any diagnostic partition cannot be
     /// sampled.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
@@ -406,9 +404,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] if close already started, or a
-    /// structured runtime, worker, or filesystem failure with
-    /// [`crate::ErrorOperation::CloseFast`].
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
+    /// or a structured runtime, worker, or filesystem failure with
+    /// [`ErrorOperation::CloseFast`](crate::ErrorOperation::CloseFast).
     pub fn close_fast(&self) -> impl Future<Output = Result<()>> + Send + 'static {
         self.close(false)
     }
@@ -421,10 +419,10 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] if close already started, or a
-    /// structured runtime, worker, filesystem, or device failure with
-    /// [`crate::ErrorOperation::CloseWarm`]. A failed warm close does not
-    /// publish a recoverable image.
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
+    /// or a structured runtime, worker, filesystem, or device failure with
+    /// [`ErrorOperation::CloseWarm`](crate::ErrorOperation::CloseWarm). A failed warm close does
+    /// not publish a recoverable image.
     pub fn close_warm(&self) -> impl Future<Output = Result<()>> + Send + 'static {
         self.close(true)
     }
@@ -580,7 +578,7 @@ fn next_persistent_id() -> PersistentId {
         .unwrap_or_default()
         .as_nanos();
     let mut bytes = now.to_le_bytes();
-    let mix = counter ^ u64::from(process::id()).rotate_left(32);
+    let mix = counter ^ u64::from(std::process::id()).rotate_left(32);
     for (target, source) in bytes[8..].iter_mut().zip(mix.to_le_bytes()) {
         *target ^= source;
     }

@@ -38,7 +38,7 @@ pub use self::storage::StorageOptions;
 #[cfg(test)]
 pub use self::storage::cache_config;
 
-/// Complete, immutable configuration for opening a [`crate::Cache`].
+/// Complete, immutable configuration for opening a [`Cache`](crate::Cache).
 ///
 /// Construction checks runtime settings against the storage layout and managed
 /// memory limit. It performs bounded calculations without opening files, starting

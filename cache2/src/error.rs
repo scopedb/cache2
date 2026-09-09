@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::result;
@@ -75,29 +74,30 @@ impl fmt::Display for ErrorKind {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorOperation {
-    /// [`crate::CacheConfig::new`].
+    /// [`CacheConfig::new`](crate::CacheConfig::new).
     BuildConfig,
-    /// [`crate::StorageOptions::build`].
+    /// [`StorageOptions::build`](crate::StorageOptions::build).
     BuildStorage,
-    /// [`crate::Cache::open`] or [`crate::Cache::open_with_handle`].
+    /// [`Cache::open`](crate::Cache::open) or
+    /// [`Cache::open_with_handle`](crate::Cache::open_with_handle).
     Open,
-    /// [`crate::Cache::put`].
+    /// [`Cache::put`](crate::Cache::put).
     Put,
-    /// [`crate::Cache::put_l2`].
+    /// [`Cache::put_l2`](crate::Cache::put_l2).
     PutL2,
-    /// [`crate::Cache::delete`].
+    /// [`Cache::delete`](crate::Cache::delete).
     Delete,
-    /// [`crate::Cache::get`].
+    /// [`Cache::get`](crate::Cache::get).
     Get,
-    /// [`crate::Cache::drain`].
+    /// [`Cache::drain`](crate::Cache::drain).
     Drain,
-    /// [`crate::Cache::snapshot`].
+    /// [`Cache::snapshot`](crate::Cache::snapshot).
     Snapshot,
-    /// [`crate::Cache::detailed_snapshot`].
+    /// [`Cache::detailed_snapshot`](crate::Cache::detailed_snapshot).
     DetailedSnapshot,
-    /// [`crate::Cache::close_fast`].
+    /// [`Cache::close_fast`](crate::Cache::close_fast).
     CloseFast,
-    /// [`crate::Cache::close_warm`].
+    /// [`Cache::close_warm`](crate::Cache::close_warm).
     CloseWarm,
 }
 
@@ -131,7 +131,7 @@ impl fmt::Display for ErrorOperation {
 ///
 /// The classification and operation are stable programmatic fields. The
 /// wrapped [`io::Error`] retains the detailed cause, its raw OS error when one
-/// exists, and the complete [`StdError::source`] chain.
+/// exists, and the complete [`Error::source`](std::error::Error::source) chain.
 #[doc = include_str!("../ERRORS.md")]
 #[derive(Debug)]
 pub struct Error {
@@ -200,8 +200,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl StdError for Error {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
 }
@@ -221,26 +221,28 @@ pub fn from_io(operation: ErrorOperation, source: io::Error) -> Error {
 }
 
 fn classify(operation: ErrorOperation, source: &io::Error) -> ErrorKind {
-    use io::ErrorKind as IoKind;
-
     match source.kind() {
-        IoKind::InvalidInput if source.raw_os_error().is_some() => ErrorKind::Io,
-        IoKind::InvalidInput if accepts_caller_input(operation) => ErrorKind::InvalidInput,
-        IoKind::InvalidInput => ErrorKind::Internal,
-        IoKind::Unsupported => ErrorKind::Unsupported,
-        IoKind::WouldBlock | IoKind::AlreadyExists if operation == ErrorOperation::Open => {
+        io::ErrorKind::InvalidInput if source.raw_os_error().is_some() => ErrorKind::Io,
+        io::ErrorKind::InvalidInput if accepts_caller_input(operation) => ErrorKind::InvalidInput,
+        io::ErrorKind::InvalidInput => ErrorKind::Internal,
+        io::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists
+            if operation == ErrorOperation::Open =>
+        {
             ErrorKind::Busy
         }
-        IoKind::WouldBlock if source.raw_os_error().is_some() => ErrorKind::Io,
-        IoKind::WouldBlock if has_bounded_admission(operation) => ErrorKind::Overloaded,
-        IoKind::WouldBlock | IoKind::AlreadyExists => ErrorKind::Internal,
-        IoKind::TimedOut if operation == ErrorOperation::Get => ErrorKind::Overloaded,
-        IoKind::TimedOut => ErrorKind::Io,
-        IoKind::OutOfMemory if operation == ErrorOperation::Get => ErrorKind::Overloaded,
-        IoKind::OutOfMemory => ErrorKind::ResourceExhausted,
-        IoKind::BrokenPipe | IoKind::NotConnected | IoKind::Interrupted => ErrorKind::Unavailable,
-        IoKind::InvalidData | IoKind::UnexpectedEof => ErrorKind::CorruptData,
-        IoKind::Other if source.raw_os_error().is_none() => ErrorKind::Internal,
+        io::ErrorKind::WouldBlock if source.raw_os_error().is_some() => ErrorKind::Io,
+        io::ErrorKind::WouldBlock if has_bounded_admission(operation) => ErrorKind::Overloaded,
+        io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists => ErrorKind::Internal,
+        io::ErrorKind::TimedOut if operation == ErrorOperation::Get => ErrorKind::Overloaded,
+        io::ErrorKind::TimedOut => ErrorKind::Io,
+        io::ErrorKind::OutOfMemory if operation == ErrorOperation::Get => ErrorKind::Overloaded,
+        io::ErrorKind::OutOfMemory => ErrorKind::ResourceExhausted,
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected | io::ErrorKind::Interrupted => {
+            ErrorKind::Unavailable
+        }
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ErrorKind::CorruptData,
+        io::ErrorKind::Other if source.raw_os_error().is_none() => ErrorKind::Internal,
         _ => ErrorKind::Io,
     }
 }

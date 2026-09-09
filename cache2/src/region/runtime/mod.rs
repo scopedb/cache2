@@ -20,16 +20,10 @@
 //! device path. A fixed age deadline publishes partial batches without adding
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
-#[cfg(test)]
-use std::env;
-#[cfg(test)]
-use std::fs;
 use std::io;
 use std::mem;
 use std::panic;
 use std::panic::AssertUnwindSafe;
-#[cfg(test)]
-use std::process;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -37,7 +31,6 @@ use std::sync::MutexGuard;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -45,13 +38,9 @@ use std::time::Instant;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 use asyncband::watch;
-use tokio::runtime::Handle as TokioHandle;
-#[cfg(test)]
-use tokio::task;
 
 use self::metrics::RuntimeMetrics;
 use crate::config::CacheConfig;
-use crate::config::IoEngine as ConfiguredIoEngine;
 use crate::config::IoMode;
 use crate::config::IoPoolTopology;
 #[cfg(test)]
@@ -369,7 +358,7 @@ impl PendingGet {
         }
     }
 
-    async fn wait_async(self, tokio_handle: &TokioHandle) -> CompletedGet {
+    async fn wait_async(self, tokio_handle: &tokio::runtime::Handle) -> CompletedGet {
         let Self {
             engine,
             read,
@@ -385,7 +374,7 @@ impl PendingGet {
 }
 
 impl WaitingGet {
-    async fn reserve_async(self, tokio_handle: &TokioHandle) -> io::Result<ReservedGet> {
+    async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
         let Self {
             engine,
             slot_waiter,
@@ -927,7 +916,7 @@ impl RegionDataPlane {
     pub async fn get_async(
         &self,
         key: &[u8],
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
         match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
@@ -1488,7 +1477,7 @@ fn start_running(
     })?;
     for shard_id in 0..shard_count {
         let worker_shared = Arc::clone(&shared);
-        match thread::Builder::new()
+        match std::thread::Builder::new()
             .name(format!("cache2-shard-{shard_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || shard_worker(worker_shared, shard_id))
@@ -1511,7 +1500,7 @@ fn start_running(
     }
     for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
         let reclaim_shared = Arc::clone(&shared);
-        match thread::Builder::new()
+        match std::thread::Builder::new()
             .name(format!("cache2-reclaim-{worker_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id, reclaim_worker_count))
@@ -1558,7 +1547,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if matches!(config.io_engine, ConfiguredIoEngine::Posix(_)) {
+    let posix_workers = if matches!(config.io_engine, crate::config::IoEngine::Posix(_)) {
         topology.max_in_flight
     } else {
         1
@@ -2110,7 +2099,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
 
 fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
     let reaper_engine = Arc::clone(engine);
-    let spawn = thread::Builder::new()
+    let spawn = std::thread::Builder::new()
         .name("cache2-io-reaper".to_owned())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
@@ -2197,7 +2186,10 @@ mod tests {
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!("cache2-read-lane-{}-{id}.cache", process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "cache2-read-lane-{}-{id}.cache",
+            std::process::id()
+        ));
         let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
         let engines: Box<[Arc<dyn IoEngine>]> = vec![
             Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
@@ -2230,15 +2222,15 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        fs::remove_file(path).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "cache2-read-lane-rotation-{}-{id}.cache",
-            process::id()
+            std::process::id()
         ));
         let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
         let engines: Box<[Arc<dyn IoEngine>]> = (0..4)
@@ -2264,7 +2256,7 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        fs::remove_file(path).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2296,13 +2288,13 @@ mod tests {
         let mutation = gate.try_enter().unwrap();
         let drain = gate.begin_drain().unwrap();
         let closing_gate = Arc::clone(&gate);
-        let close = thread::spawn(move || {
+        let close = std::thread::spawn(move || {
             closing_gate.start_close();
             closing_gate.wait_quiescent().unwrap();
         });
 
         while gate.state.load(Ordering::Acquire) & MUTATION_CLOSED == 0 {
-            thread::yield_now();
+            std::thread::yield_now();
         }
         drop(mutation);
         drain.wait().unwrap();
@@ -2338,7 +2330,7 @@ mod tests {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
         });
-        task::yield_now().await;
+        tokio::task::yield_now().await;
         assert!(gate.try_enter().is_none());
 
         drop(mutation);
@@ -2355,7 +2347,7 @@ mod tests {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
         });
-        task::yield_now().await;
+        tokio::task::yield_now().await;
         assert!(gate.try_enter().is_none());
 
         drain.abort();
@@ -2439,7 +2431,7 @@ mod tests {
         for _ in 0..2 {
             let control = Arc::clone(&control);
             let ready = Arc::clone(&ready);
-            workers.push(thread::spawn(move || {
+            workers.push(std::thread::spawn(move || {
                 let mut observed_generation = 0;
                 ready.wait();
                 let notified = control.wait(&mut observed_generation).unwrap();
@@ -2481,8 +2473,10 @@ mod tests {
         use crate::region::store::RegionStore;
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            env::temp_dir().join(format!("cache2-completion-timeout-{}-{id}", process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "cache2-completion-timeout-{}-{id}",
+            std::process::id()
+        ));
         let files = RegionFiles::new(
             path.with_extension("cache"),
             path.with_extension("state"),
@@ -2559,8 +2553,8 @@ mod tests {
                 assert_eq!(snapshot.l2_read_overloads, 1);
             }
         }
-        fs::remove_file(files.data).unwrap();
-        fs::remove_file(files.state).unwrap();
+        std::fs::remove_file(files.data).unwrap();
+        std::fs::remove_file(files.state).unwrap();
     }
 
     #[test]

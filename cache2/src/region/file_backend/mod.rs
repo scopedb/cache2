@@ -26,9 +26,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-#[cfg(test)]
-use tokio::runtime::Handle as TokioHandle;
-
 use crate::config::CacheConfig;
 use crate::config::IoMode;
 #[cfg(test)]
@@ -268,7 +265,7 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
     async fn get_value_async(
         &self,
         key: &[u8],
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?
             .data_plane()?

@@ -70,7 +70,7 @@ impl StorageOptions {
 
     /// Checks the inputs and computes an immutable layout without opening files.
     /// Use [`StorageLayout::peak_disk_bytes`] to compare a candidate with a disk
-    /// budget, then pass the chosen layout to [`crate::CacheConfig::new`].
+    /// budget, then pass the chosen layout to [`CacheConfig::new`](crate::CacheConfig::new).
     ///
     /// # Errors
     ///

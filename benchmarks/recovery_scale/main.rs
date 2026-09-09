@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -30,14 +27,12 @@ use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
 use cache2::Cache;
 use cache2::CacheConfig;
-use cache2::ErrorKind as CacheErrorKind;
 use cache2::IoEngine;
 use cache2::IoMode;
 use cache2::PosixIoConfig;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,9 +62,9 @@ impl ScaleConfig {
                 .ok_or_else(|| invalid("recovery benchmark managed memory limit is too large"))?;
         let sentinel_count = env_usize("CACHE_RECOVERY_SENTINELS", 1_024)?;
         let value_bytes = env_usize("CACHE_RECOVERY_VALUE_BYTES", 1_024)?;
-        let directory = env::var_os("CACHE_RECOVERY_DIR")
+        let directory = std::env::var_os("CACHE_RECOVERY_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(std::env::temp_dir);
         if expected_entries == 0 || sentinel_count == 0 || value_bytes < 8 || !directory.is_dir() {
             return Err(invalid(
                 "expected entries and sentinels must be positive, values must be at least 8 bytes, and the benchmark directory must exist",
@@ -121,7 +116,7 @@ impl ScaleFiles {
         Self {
             data: directory.join(format!(
                 "cache2-recovery-scale-{}-{timestamp}.cache",
-                process::id()
+                std::process::id()
             )),
             cleanup_on_drop: false,
         }
@@ -202,7 +197,7 @@ fn main() -> io::Result<()> {
 
 fn run_benchmark() -> io::Result<()> {
     let config = ScaleConfig::from_env()?;
-    let runtime = TokioRuntimeBuilder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
     runtime.block_on(run(config))
@@ -313,14 +308,14 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
     loop {
         match cache.put(key, value) {
             Ok(_) => return Ok(()),
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "recovery benchmark write did not enter bounded staging",
                     ));
                 }
-                thread::sleep(Duration::from_micros(50));
+                std::thread::sleep(Duration::from_micros(50));
             }
             Err(error) => return Err(error.into()),
         }
@@ -423,11 +418,11 @@ fn sentinel_key(ordinal: usize) -> [u8; 16] {
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -22,14 +21,12 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -54,8 +51,6 @@ use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageLayout;
 use cache2::StorageOptions;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tokio::runtime::Handle as TokioHandle;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -104,7 +99,8 @@ struct TestCache {
 impl TestCache {
     fn new(name: &str) -> Self {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-        let data = env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", process::id()));
+        let data =
+            std::env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
         Self { data }
     }
 
@@ -169,7 +165,7 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> Result<T>) -> T {
                     Instant::now() < deadline,
                     "write buffer did not make progress"
                 );
-                thread::yield_now();
+                std::thread::yield_now();
             }
             Err(error) => panic!("cache write failed: {error}"),
         }
@@ -205,19 +201,21 @@ async fn completed_reclaim_snapshot(cache: &Cache) -> DetailedCacheSnapshot {
             return detailed;
         }
         assert!(Instant::now() < deadline, "reclaim did not make progress");
-        thread::yield_now();
+        std::thread::yield_now();
     }
 }
 
 #[test]
 fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
     let files = TestCache::new("explicit-tokio-handle");
-    let cache_runtime = TokioRuntimeBuilder::new_multi_thread()
+    let cache_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
         .build()
         .unwrap();
-    let caller_runtime = TokioRuntimeBuilder::new_current_thread().build().unwrap();
+    let caller_runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let config = test_config(1);
     let minimum_memory_bytes = config.minimum_memory_bytes();
     let config = CacheConfig::new(
@@ -322,7 +320,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
     let writer_cache = Arc::clone(&cache);
     let ready = Arc::new(Barrier::new(2));
     let writer_ready = Arc::clone(&ready);
-    let writer = thread::spawn(move || {
+    let writer = std::thread::spawn(move || {
         writer_ready.wait();
         let mut accepted = Vec::new();
         for ordinal in 0_u64..256 {
@@ -332,7 +330,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
                         accepted.push(ordinal);
                         break;
                     }
-                    Err(error) if error.kind() == ErrorKind::Overloaded => thread::yield_now(),
+                    Err(error) if error.kind() == ErrorKind::Overloaded => std::thread::yield_now(),
                     Err(error) if error.kind() == ErrorKind::Unavailable => return accepted,
                     Err(error) => panic!("concurrent cache write failed: {error}"),
                 }
@@ -730,9 +728,9 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     let writers_left = AtomicUsize::new(WRITERS);
     let start = AtomicBool::new(false);
     let hits = AtomicU64::new(0);
-    let runtime = TokioHandle::current();
+    let runtime = tokio::runtime::Handle::current();
 
-    thread::scope(|scope| {
+    std::thread::scope(|scope| {
         for writer in 0..WRITERS {
             let cache = &cache;
             let keys = &keys;
@@ -741,7 +739,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let start = &start;
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 }
                 let mut value = vec![0_u8; *VALUE_SIZES.iter().max().unwrap()];
                 for ordinal in 0..WRITES_PER_CLIENT {
@@ -776,7 +774,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let runtime = runtime.clone();
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 }
                 let mut ordinal = reader;
                 while writers_left.load(Ordering::Acquire) != 0 {

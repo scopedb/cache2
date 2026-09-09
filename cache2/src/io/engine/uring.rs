@@ -33,7 +33,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::thread;
 use std::time::Instant;
 
 use hashcrew::xxhash::Xxh3_64Builder;
@@ -213,7 +212,7 @@ impl UringIoEngine {
         let submit_state = Arc::new(RwLock::new(SubmitState { accepting: true }));
         let worker_shared = Arc::clone(&shared);
         let worker_submit_state = Arc::clone(&submit_state);
-        let worker = thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("cache2-uring-io".into())
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || {
@@ -994,7 +993,7 @@ impl UringDriver {
             if !self.has_active_target() {
                 return;
             }
-            thread::yield_now();
+            std::thread::yield_now();
         }
     }
 

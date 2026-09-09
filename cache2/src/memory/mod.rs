@@ -31,8 +31,6 @@ use std::sync::TryLockError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::thread;
 
 use self::eviction::DetachedPolicy;
 use self::eviction::EvictionState;
@@ -1451,7 +1449,7 @@ mod tests {
 
         assert!(!store.publish(22, b"b", &[2; 300], 2));
         let barrier = Arc::new(Barrier::new(clones.len() + 1));
-        thread::scope(|scope| {
+        std::thread::scope(|scope| {
             for value in clones {
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {

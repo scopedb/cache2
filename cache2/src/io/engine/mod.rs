@@ -18,7 +18,6 @@
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -44,12 +43,7 @@ use std::time::Instant;
 
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
-use tokio::runtime::Handle as TokioHandle;
-use tokio::time;
-use tokio::time::Instant as TokioInstant;
 
-#[cfg(unix)]
-use crate::config::IoEngine as ConfiguredIoEngine;
 #[cfg(unix)]
 use crate::config::IoUringPoolConfig;
 use crate::io::backend::IoBackend;
@@ -310,8 +304,8 @@ impl fmt::Display for IoBufferError {
     }
 }
 
-impl StdError for IoBufferError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for IoBufferError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -567,8 +561,8 @@ impl fmt::Display for SubmitError {
     }
 }
 
-impl StdError for SubmitError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for SubmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -805,13 +799,13 @@ impl BoundedIoRequest {
     pub async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
-        let deadline = TokioInstant::from_std(self.deadline);
+        let deadline = tokio::time::Instant::from_std(self.deadline);
         let completion = {
             let _entered = tokio_handle.enter();
-            time::timeout_at(deadline, request.request_mut())
+            tokio::time::timeout_at(deadline, request.request_mut())
         }
         .await;
         if let Ok(completion) = completion {
@@ -822,7 +816,7 @@ impl BoundedIoRequest {
         let cancel_error = request.cancel().err();
         let completion = {
             let _entered = tokio_handle.enter();
-            time::timeout(self.cancel_grace, request.request_mut())
+            tokio::time::timeout(self.cancel_grace, request.request_mut())
         }
         .await;
         match completion {
@@ -1101,13 +1095,13 @@ impl ReadSlotAdmission {
     async fn acquire_until(
         &self,
         deadline: Instant,
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<OwnedSemaphorePermit> {
         self.ensure_open()?;
         let acquire = Arc::clone(&self.slots).acquire_owned(1);
         {
             let _entered = tokio_handle.enter();
-            time::timeout_at(TokioInstant::from_std(deadline), acquire)
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
         }
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))
@@ -1138,7 +1132,7 @@ impl ReadSlotWaiter {
     pub async fn reserve_until(
         self,
         deadline: Instant,
-        tokio_handle: &TokioHandle,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<ReadSlot> {
         let admission = self
             .shared
@@ -1440,9 +1434,6 @@ impl RuntimeShared {
         )
     ))]
     fn finish_quarantined(&self, task: Task, status: CompletionStatus, bytes_transferred: usize) {
-        #[cfg(not(test))]
-        use std::mem::forget;
-
         let Task {
             request_id,
             operation,
@@ -1457,7 +1448,7 @@ impl RuntimeShared {
             // intentional LeakSanitizer finding.
             lock_unpoisoned(&self.quarantined_buffers).push(buffer);
             #[cfg(not(test))]
-            forget(buffer);
+            std::mem::forget(buffer);
         }
         self.publish_completion(
             request_id,
@@ -1970,13 +1961,13 @@ pub fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
     posix_workers: usize,
-    kind: ConfiguredIoEngine,
+    kind: crate::config::IoEngine,
     io_uring_config: Option<IoUringPoolConfig>,
     statistics_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        ConfiguredIoEngine::Posix(_) => BackendIoEngine::new_with_files_and_workers(
+        crate::config::IoEngine::Posix(_) => BackendIoEngine::new_with_files_and_workers(
             files,
             max_in_flight,
             posix_workers,
@@ -1984,7 +1975,7 @@ pub fn build_file_engine(
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        ConfiguredIoEngine::IoUring(_) => {
+        crate::config::IoEngine::IoUring(_) => {
             let _ = posix_workers;
             #[cfg(all(
                 feature = "io-uring",

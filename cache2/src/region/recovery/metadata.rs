@@ -18,7 +18,6 @@
 //! manager or index mapping becomes visible. Index slots remain independently
 //! lazy-validated; this section contains only O(regions + index partitions) state.
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::mem;
 use std::result;
@@ -233,7 +232,7 @@ impl fmt::Display for RegionMetadataError {
     }
 }
 
-impl StdError for RegionMetadataError {}
+impl std::error::Error for RegionMetadataError {}
 
 type Result<T> = result::Result<T, RegionMetadataError>;
 

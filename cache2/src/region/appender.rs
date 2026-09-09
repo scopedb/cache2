@@ -18,7 +18,6 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
@@ -58,8 +57,8 @@ impl fmt::Display for RegionSpanSubmitError {
     }
 }
 
-impl StdError for RegionSpanSubmitError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl std::error::Error for RegionSpanSubmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }

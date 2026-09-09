@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::fmt;
 use std::fs;
 use std::hint::black_box;
@@ -20,10 +19,7 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
-use std::sync::Barrier as ThreadBarrier;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -37,7 +33,6 @@ use benchmarks::report::emit_cache_report;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheTier;
-use cache2::ErrorKind as CacheErrorKind;
 use cache2::IoEngine;
 use cache2::IoMode;
 use cache2::IoUringConfig;
@@ -49,8 +44,6 @@ use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
 use cache2::Value;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tokio::time;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
@@ -115,7 +108,7 @@ impl BenchConfig {
         let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
-        let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
+        let io_engine = match std::env::var("CACHE_BENCH_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
@@ -141,7 +134,7 @@ impl BenchConfig {
             )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
-        let io_mode = match env::var("CACHE_BENCH_IO_MODE")
+        let io_mode = match std::env::var("CACHE_BENCH_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
         {
@@ -149,7 +142,7 @@ impl BenchConfig {
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
-        let l1_eviction_policy = match env::var("CACHE_BENCH_L1_EVICTION")
+        let l1_eviction_policy = match std::env::var("CACHE_BENCH_L1_EVICTION")
             .unwrap_or_else(|_| "clock".to_owned())
             .as_str()
         {
@@ -160,9 +153,9 @@ impl BenchConfig {
             }
         };
         let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
-        let directory = env::var_os("CACHE_BENCH_DIR")
+        let directory = std::env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(std::env::temp_dir);
 
         if entries == 0
             || read_ops == 0
@@ -324,7 +317,10 @@ impl BenchFiles {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            data: directory.join(format!("cache2-bench-{}-{timestamp}.cache", process::id())),
+            data: directory.join(format!(
+                "cache2-bench-{}-{timestamp}.cache",
+                std::process::id()
+            )),
         }
     }
 }
@@ -392,7 +388,7 @@ fn main() -> io::Result<()> {
 
 fn run_benchmark() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
-    let runtime = TokioRuntimeBuilder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.clients.max(2))
         .thread_name("cache2-benchmark")
         .enable_time()
@@ -755,8 +751,8 @@ fn concurrent_writes(
     value_bytes: usize,
     clients: usize,
 ) -> io::Result<WriteAdmission> {
-    let barrier = Arc::new(ThreadBarrier::new(clients + 1));
-    thread::scope(|scope| {
+    let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
+    std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(clients);
         for client in 0..clients {
             let cache = Arc::clone(&cache);
@@ -978,7 +974,7 @@ async fn read_l1_eventually(cache: &Cache, key_ordinal: usize, client: usize) ->
             )));
         }
         attempts += 1;
-        time::sleep(RETRY_DELAY).await;
+        tokio::time::sleep(RETRY_DELAY).await;
     }
 }
 
@@ -989,7 +985,7 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
         attempts = attempts.saturating_add(1);
         match cache.put(key, value) {
             Ok(receipt) => return Ok((receipt, attempts)),
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -997,9 +993,9 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
                     ));
                 }
                 if attempts <= WRITE_YIELD_RETRIES {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 } else {
-                    thread::sleep(RETRY_DELAY);
+                    std::thread::sleep(RETRY_DELAY);
                 }
             }
             Err(error) => return Err(error.into()),
@@ -1169,7 +1165,7 @@ fn require_minimum_rate(name: &str, measurement: &Measurement) -> io::Result<()>
 }
 
 fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => {
             let parsed = value
                 .parse::<f64>()
@@ -1181,37 +1177,37 @@ fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
             }
             Ok(Some(parsed))
         }
-        Err(env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_u32(name: &str, default: u32) -> io::Result<u32> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match env::var(name) {
+    match std::env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
         Ok(value) if value == "false" || value == "0" => Ok(false),
         Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
