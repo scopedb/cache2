@@ -1,6 +1,6 @@
-# C² Engineering Constraints
+# C² Engineering Guidelines
 
-## Repository workflow
+## Repository Workflow
 
 Before planning or modifying this repository, read `CONTRIBUTING.md` and treat
 its workspace layout and validation guidance as repository requirements. Use

@@ -51,6 +51,14 @@ release-mode test pass used by CI is:
 cargo test --workspace --release --all-features
 ```
 
+## Rust Style
+
+Declare restricted visibility at the module boundary and use `pub` for items in that module's API.
+
+## Documentation
+
+Keep each Markdown prose paragraph and list item on one source line.
+
 ## Benchmarks and property tests
 
 Each benchmark is an explicit target in the `benchmarks` package. Run one
