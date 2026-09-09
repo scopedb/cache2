@@ -11,9 +11,9 @@ C² (`cache2`) provides bounded, disposable acceleration for large file chunks. 
 ## Quick start
 
 ```rust
-use cache2::{Cache, CacheConfig, ErrorKind, Result, RuntimeOptions, StorageOptions};
+use cache2::{Cache, CacheConfig, Error, ErrorKind, RuntimeOptions, StorageOptions};
 
-async fn run() -> Result<()> {
+async fn run() -> Result<(), Error> {
     let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
     let config = CacheConfig::new(storage, RuntimeOptions::default())?;
     let cache = Cache::open("/var/tmp/cache2.data", config).await?;

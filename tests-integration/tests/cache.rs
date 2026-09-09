@@ -36,6 +36,7 @@ use cache2::CacheHealth;
 use cache2::CacheIoSnapshot;
 use cache2::CacheTier;
 use cache2::DetailedCacheSnapshot;
+use cache2::Error;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
 use cache2::IoEngine;
@@ -46,7 +47,6 @@ use cache2::IoUringConfig;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoConfig;
 use cache2::ReadAdmission;
-use cache2::Result;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageLayout;
@@ -155,7 +155,7 @@ fn rewrite_page_version(path: &Path, offset: u64, version: u16) {
     file.sync_all().unwrap();
 }
 
-fn eventually_admitted<T>(mut put: impl FnMut() -> Result<T>) -> T {
+fn eventually_admitted<T>(mut put: impl FnMut() -> Result<T, Error>) -> T {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match put() {

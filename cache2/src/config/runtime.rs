@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
+use crate::error::Error;
 use crate::error::ErrorOperation;
-use crate::error::Result;
 use crate::error::from_io;
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
@@ -482,7 +482,8 @@ impl CacheConfig {
     /// Checks the complete combination and resolves dependent runtime defaults.
     ///
     /// ```no_run
-    /// # async fn example() -> cache2::Result<()> {
+    /// # use cache2::Error;
+    /// # async fn example() -> Result<(), Error> {
     /// use cache2::Cache;
     /// use cache2::CacheConfig;
     /// use cache2::RuntimeOptions;
@@ -502,7 +503,7 @@ impl CacheConfig {
     /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
     /// counts, invalid runtime settings, unavailable build/platform features,
     /// or insufficient managed memory. Device capabilities are checked at open.
-    pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self> {
+    pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self, Error> {
         let build = || -> io::Result<Self> {
             let geometry = storage.geometry;
             let index_slots = storage.index_slots;

@@ -1,6 +1,6 @@
 # Error handling
 
-C² separates normal cache outcomes from failures. A miss, stale hit, L1 bypass, eviction, rejected recovery image, or transition to read miss-only mode is not an error. Public operations return `cache2::Result<T>`, whose error type is `cache2::Error`.
+C² separates normal cache outcomes from failures. A miss, stale hit, L1 bypass, eviction, rejected recovery image, or transition to read miss-only mode is not an error. Public operations return `Result<T, Error>`, where `Error` is the C² error type.
 
 An error has three independent pieces of information:
 
@@ -15,9 +15,9 @@ Display text is intended for people and logs. Do not parse it or use it as a met
 `Overloaded` is an expected result of bounded admission. A lookaside-cache caller should normally continue through its authoritative data path or perform a bounded retry rather than fail the application request.
 
 ```rust
-use cache2::{Cache, ErrorKind, Result};
+use cache2::{Cache, Error, ErrorKind};
 
-fn cache_value(cache: &Cache, key: &[u8], value: &[u8]) -> Result<()> {
+fn cache_value(cache: &Cache, key: &[u8], value: &[u8]) -> Result<(), Error> {
     match cache.put(key, value) {
         Ok(_sequence) => Ok(()),
         Err(error) if error.kind() == ErrorKind::Overloaded => {

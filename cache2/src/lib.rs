@@ -26,7 +26,6 @@ mod error;
 pub use self::error::Error;
 pub use self::error::ErrorKind;
 pub use self::error::ErrorOperation;
-pub use self::error::Result;
 
 mod cache;
 pub use self::cache::Cache;

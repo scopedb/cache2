@@ -20,7 +20,6 @@
 
 use std::fmt;
 use std::mem;
-use std::result;
 
 use crate::checksum::Crc32c;
 use crate::region::index::MAX_INDEX_PARTITIONS;
@@ -234,10 +233,8 @@ impl fmt::Display for RegionMetadataError {
 
 impl std::error::Error for RegionMetadataError {}
 
-type Result<T> = result::Result<T, RegionMetadataError>;
-
 impl RegionMetadata {
-    pub fn encoded_len(&self) -> Result<u64> {
+    pub fn encoded_len(&self) -> Result<u64, RegionMetadataError> {
         encoded_len_for_counts(self.root.region_count, self.root.partition_count)
     }
 
@@ -264,7 +261,7 @@ impl RegionMetadata {
             && encoded_len == image.region_table_len
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> Result<Vec<u8>, RegionMetadataError> {
         self.validate()?;
         let layout = MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
         let encoded_len = usize::try_from(layout.encoded_len)
@@ -323,7 +320,7 @@ impl RegionMetadata {
     }
 
     #[cfg(test)]
-    pub fn decode(input: &[u8]) -> Result<Self> {
+    pub fn decode(input: &[u8]) -> Result<Self, RegionMetadataError> {
         let metadata = Self::decode_pages(input)?;
         metadata.validate()?;
         Ok(metadata)
@@ -331,14 +328,14 @@ impl RegionMetadata {
 
     /// Decodes an owned image and releases its encoded pages before allocating
     /// the queue-validation workspaces used by [`Self::validate`].
-    pub fn decode_owned(input: Vec<u8>) -> Result<Self> {
+    pub fn decode_owned(input: Vec<u8>) -> Result<Self, RegionMetadataError> {
         let metadata = Self::decode_pages(&input)?;
         drop(input);
         metadata.validate()?;
         Ok(metadata)
     }
 
-    fn decode_pages(input: &[u8]) -> Result<Self> {
+    fn decode_pages(input: &[u8]) -> Result<Self, RegionMetadataError> {
         if input.len() < REGION_METADATA_PAGE_SIZE
             || !input.len().is_multiple_of(REGION_METADATA_PAGE_SIZE)
         {
@@ -430,7 +427,7 @@ impl RegionMetadata {
         })
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), RegionMetadataError> {
         let layout = MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
         validate_root_directory(self.root, layout)?;
         if self.regions.len() != self.root.region_count as usize {
@@ -450,7 +447,7 @@ impl RegionMetadata {
     /// Shrinking seals excess Active Regions at the back of the sealed FIFO.
     /// Growing activates Regions from the back of the free FIFO so its existing
     /// rotation order remains stable. No index or Region data needs rewriting.
-    pub fn rebind_append_shards(&mut self, shard_count: u32) -> Result<()> {
+    pub fn rebind_append_shards(&mut self, shard_count: u32) -> Result<(), RegionMetadataError> {
         let old_shard_count = self.root.shard_count;
         if shard_count == old_shard_count {
             return Ok(());
@@ -531,7 +528,7 @@ struct MetadataLayout {
 }
 
 impl MetadataLayout {
-    fn new(region_count: u32, partition_count: u32) -> Result<Self> {
+    fn new(region_count: u32, partition_count: u32) -> Result<Self, RegionMetadataError> {
         if region_count == 0 || partition_count == 0 {
             return Err(RegionMetadataError::InvalidField("record_count"));
         }
@@ -563,11 +560,14 @@ impl MetadataLayout {
     }
 }
 
-fn encoded_len_for_counts(region_count: u32, partition_count: u32) -> Result<u64> {
+fn encoded_len_for_counts(
+    region_count: u32,
+    partition_count: u32,
+) -> Result<u64, RegionMetadataError> {
     Ok(MetadataLayout::new(region_count, partition_count)?.encoded_len)
 }
 
-fn pages_for_records(records: u64, per_page: u64) -> Result<u32> {
+fn pages_for_records(records: u64, per_page: u64) -> Result<u32, RegionMetadataError> {
     let pages = records
         .checked_add(per_page - 1)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?
@@ -575,7 +575,10 @@ fn pages_for_records(records: u64, per_page: u64) -> Result<u32> {
     u32::try_from(pages).map_err(|_| RegionMetadataError::ArithmeticOverflow)
 }
 
-fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> Result<()> {
+fn validate_root_directory(
+    root: RegionMetadataRoot,
+    layout: MetadataLayout,
+) -> Result<(), RegionMetadataError> {
     if root.index_slots < 8 {
         return Err(RegionMetadataError::InvalidField("root"));
     }
@@ -620,7 +623,10 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
     Ok(())
 }
 
-fn validate_encoded_root_directory(input: &[u8], layout: MetadataLayout) -> Result<()> {
+fn validate_encoded_root_directory(
+    input: &[u8],
+    layout: MetadataLayout,
+) -> Result<(), RegionMetadataError> {
     if get_u32(input, ROOT_REGION_FIRST_PAGE_OFFSET)? != layout.region_first_page
         || get_u32(input, ROOT_REGION_PAGE_COUNT_OFFSET)? != layout.region_page_count
         || get_u32(input, ROOT_PARTITION_FIRST_PAGE_OFFSET)? != layout.partition_first_page
@@ -631,7 +637,10 @@ fn validate_encoded_root_directory(input: &[u8], layout: MetadataLayout) -> Resu
     Ok(())
 }
 
-fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) -> Result<()> {
+fn validate_regions(
+    root: RegionMetadataRoot,
+    regions: &[RegionMetadataRecord],
+) -> Result<(), RegionMetadataError> {
     let mut free_seen = zeroed_bytes(root.free_region_count as usize)?;
     let mut active_seen = zeroed_bytes(root.active_region_count as usize)?;
     let mut sealed_seen = zeroed_bytes(root.sealed_region_count as usize)?;
@@ -685,7 +694,7 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
 fn validate_partitions(
     root: RegionMetadataRoot,
     partitions: &[PartitionMetadataRecord],
-) -> Result<()> {
+) -> Result<(), RegionMetadataError> {
     let index_slots =
         usize::try_from(root.index_slots).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
     let canonical =
@@ -735,14 +744,14 @@ fn index_layout_metadata_error(error: IndexStorageError) -> RegionMetadataError 
     }
 }
 
-fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool> {
+fn minimum_bytes_fit(count: u64, bytes: u64) -> Result<bool, RegionMetadataError> {
     Ok(count
         .checked_mul(MIN_ENCODED_RECORD_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?
         <= bytes)
 }
 
-fn zeroed_bytes(len: usize) -> Result<Vec<u8>> {
+fn zeroed_bytes(len: usize) -> Result<Vec<u8>, RegionMetadataError> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(len)
@@ -787,7 +796,7 @@ fn encode_page_envelope(page: &mut [u8], envelope: PageEnvelope) {
     put_u32(page, PAGE_RESERVED_OFFSET, 0);
 }
 
-fn decode_page_envelope(page: &[u8]) -> Result<PageEnvelope> {
+fn decode_page_envelope(page: &[u8]) -> Result<PageEnvelope, RegionMetadataError> {
     if page.len() != REGION_METADATA_PAGE_SIZE {
         return Err(RegionMetadataError::InvalidLength);
     }
@@ -833,7 +842,7 @@ fn validate_envelope_shape(
     page_index: u32,
     first_record: u32,
     record_count: u32,
-) -> Result<()> {
+) -> Result<(), RegionMetadataError> {
     if envelope.kind != kind
         || usize::from(envelope.record_size) != record_size
         || envelope.image_generation == 0
@@ -871,7 +880,7 @@ fn encode_record_pages<T>(
     image_generation: u64,
     records: &[T],
     encode_record: fn(&T, &mut [u8]),
-) -> Result<()> {
+) -> Result<(), RegionMetadataError> {
     for (page_in_section, records) in records.chunks(records_per_page).enumerate() {
         let first_record = page_in_section
             .checked_mul(records_per_page)
@@ -915,8 +924,8 @@ fn decode_record_pages<T>(
     image_identity: PersistentId,
     image_generation: u64,
     record_count: usize,
-    decode_record: fn(&[u8]) -> Result<T>,
-) -> Result<Vec<T>> {
+    decode_record: fn(&[u8]) -> Result<T, RegionMetadataError>,
+) -> Result<Vec<T>, RegionMetadataError> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(record_count)
@@ -951,7 +960,7 @@ fn decode_record_pages<T>(
     Ok(output)
 }
 
-fn require_zero_padding(page: &[u8], payload_len: usize) -> Result<()> {
+fn require_zero_padding(page: &[u8], payload_len: usize) -> Result<(), RegionMetadataError> {
     let end = REGION_METADATA_PAGE_HEADER_SIZE
         .checked_add(payload_len)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -1026,7 +1035,7 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
     put_u32(output, ROOT_RESERVED_OFFSET, 0);
 }
 
-fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot> {
+fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot, RegionMetadataError> {
     if input.len() != REGION_METADATA_ROOT_SIZE
         || get_u32(input, ROOT_RESERVED32_OFFSET)? != 0
         || get_u64(input, ROOT_RESERVED_EPOCH_OFFSET)? != 0
@@ -1073,7 +1082,7 @@ fn encode_region(region: &RegionMetadataRecord, output: &mut [u8]) {
     output[REGION_STATE_OFFSET] = region.state as u8;
 }
 
-fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord> {
+fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord, RegionMetadataError> {
     if input.len() != REGION_METADATA_REGION_SIZE {
         return Err(RegionMetadataError::InvalidField("region_encoding"));
     }
@@ -1106,7 +1115,7 @@ fn encode_partition(partition: &PartitionMetadataRecord, output: &mut [u8]) {
     put_u32(output, PARTITION_RESERVED_OFFSET, 0);
 }
 
-fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters> {
+fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters, RegionMetadataError> {
     if input.len() != REGION_METADATA_PARTITION_SIZE
         || get_u32(input, PARTITION_RESERVED_OFFSET)? != 0
     {
@@ -1119,7 +1128,7 @@ fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters> {
     })
 }
 
-fn page(input: &[u8], page_index: usize) -> Result<&[u8]> {
+fn page(input: &[u8], page_index: usize) -> Result<&[u8], RegionMetadataError> {
     let start = page_index
         .checked_mul(REGION_METADATA_PAGE_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -1131,7 +1140,7 @@ fn page(input: &[u8], page_index: usize) -> Result<&[u8]> {
         .ok_or(RegionMetadataError::InvalidLength)
 }
 
-fn page_mut(input: &mut [u8], page_index: usize) -> Result<&mut [u8]> {
+fn page_mut(input: &mut [u8], page_index: usize) -> Result<&mut [u8], RegionMetadataError> {
     let start = page_index
         .checked_mul(REGION_METADATA_PAGE_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -1153,7 +1162,7 @@ fn page_payload_mut(page: &mut [u8], record: usize, record_size: usize) -> &mut 
     &mut page[start..start + record_size]
 }
 
-fn get_id(input: &[u8], offset: usize) -> Result<PersistentId> {
+fn get_id(input: &[u8], offset: usize) -> Result<PersistentId, RegionMetadataError> {
     let bytes: [u8; 16] = input
         .get(offset..offset + 16)
         .ok_or(RegionMetadataError::InvalidLength)?
@@ -1166,7 +1175,7 @@ fn put_id(output: &mut [u8], offset: usize, id: PersistentId) {
     output[offset..offset + 16].copy_from_slice(&id.to_bytes());
 }
 
-fn get_u16(input: &[u8], offset: usize) -> Result<u16> {
+fn get_u16(input: &[u8], offset: usize) -> Result<u16, RegionMetadataError> {
     let bytes = input
         .get(offset..offset + 2)
         .ok_or(RegionMetadataError::InvalidLength)?
@@ -1175,7 +1184,7 @@ fn get_u16(input: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn get_u32(input: &[u8], offset: usize) -> Result<u32> {
+fn get_u32(input: &[u8], offset: usize) -> Result<u32, RegionMetadataError> {
     let bytes = input
         .get(offset..offset + 4)
         .ok_or(RegionMetadataError::InvalidLength)?
@@ -1184,7 +1193,7 @@ fn get_u32(input: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn get_u64(input: &[u8], offset: usize) -> Result<u64> {
+fn get_u64(input: &[u8], offset: usize) -> Result<u64, RegionMetadataError> {
     let bytes = input
         .get(offset..offset + 8)
         .ok_or(RegionMetadataError::InvalidLength)?

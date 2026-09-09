@@ -4,7 +4,8 @@
 
 ### Breaking Changes
 
-- Error types are exported only from the crate root. Replace imports from `cache2::error` with `cache2::{Error, ErrorKind, ErrorOperation, Result}`.
+- Error types are exported only from the crate root. Replace imports from `cache2::error` with `cache2::{Error, ErrorKind, ErrorOperation}`.
+- The `cache2::Result` alias is removed. Use the standard `Result<T, Error>` with `Error` imported from `cache2`; public operation error types are unchanged.
 - Configuration now separates editable `StorageOptions` / `RuntimeOptions` from immutable `StorageLayout` / `CacheConfig`. Build the layout, construct `CacheConfig::new(layout, options)`, and call `Cache::open(path, config)` or `Cache::open_with_handle(path, config, handle)`. `StaticConfig`, `RuntimeConfig`, `CacheBuilder`, and the standalone `validate` method are removed.
 - `ReadAdmission::Immediate` and `ReadAdmission::Wait { timeout, max_waiters }` replace the separate read-wait setters. Waiting requires a positive timeout; an omitted waiter bound follows the selected read execution capacity.
 - Configuration errors identify `ErrorOperation::BuildStorage` or `BuildConfig`. `StorageLayout::peak_disk_bytes()` is now an infallible query.

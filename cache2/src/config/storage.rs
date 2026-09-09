@@ -21,8 +21,8 @@ use crate::config::CacheConfig;
 #[cfg(test)]
 use crate::config::RuntimeOptions;
 use crate::config::StorageLayout;
+use crate::error::Error;
 use crate::error::ErrorOperation;
-use crate::error::Result;
 use crate::error::from_io;
 use crate::region::index::MAX_PACKED_REGION_COUNT;
 use crate::region::index::MAX_PACKED_REGION_SIZE;
@@ -77,7 +77,7 @@ impl StorageOptions {
     /// Returns [`ErrorOperation::BuildStorage`] if the geometry or index cannot
     /// be represented, disk accounting overflows, or bounded layout allocation
     /// fails.
-    pub fn build(self) -> Result<StorageLayout> {
+    pub fn build(self) -> Result<StorageLayout, Error> {
         let build = || {
             let entries = match self.expected_entries {
                 Some(entries) => entries,
