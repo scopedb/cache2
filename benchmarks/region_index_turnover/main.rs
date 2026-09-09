@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
 use std::io;
 
 use benchmarks::report::JobReport;
@@ -28,7 +29,7 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }

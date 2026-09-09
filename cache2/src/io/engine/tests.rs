@@ -12,13 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::process;
 use std::sync::atomic::AtomicU64;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
+use tokio::runtime::Handle as TokioHandle;
+use tokio::task;
+use tokio::task::JoinHandle as TokioJoinHandle;
+use tokio::time;
+
 use super::*;
+use crate::config::PosixIoConfig;
 use crate::io::backend::FileBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
@@ -39,7 +50,7 @@ async fn wait_for_registered_read_waiters(engine: &BackendIoEngine, expected: us
         if actual == expected {
             return;
         }
-        tokio::task::yield_now().await;
+        task::yield_now().await;
     }
     panic!("expected {expected} registered read waiters");
 }
@@ -48,18 +59,18 @@ async fn spawn_registered_read_slot_waiter(
     engine: &BackendIoEngine,
     timeout: Duration,
     expected_waiters: usize,
-) -> tokio::task::JoinHandle<io::Result<ReadSlot>> {
+) -> TokioJoinHandle<io::Result<ReadSlot>> {
     let slot_waiter = engine.read_slot_waiter();
     let waiter = tokio::spawn(async move {
         slot_waiter
-            .reserve_until(Instant::now() + timeout, &tokio::runtime::Handle::current())
+            .reserve_until(Instant::now() + timeout, &TokioHandle::current())
             .await
     });
     wait_for_registered_read_waiters(engine, expected_waiters).await;
     waiter
 }
 
-async fn read_wait_error(waiter: tokio::task::JoinHandle<io::Result<ReadSlot>>) -> io::Error {
+async fn read_wait_error(waiter: TokioJoinHandle<io::Result<ReadSlot>>) -> io::Error {
     match waiter.await.unwrap() {
         Ok(_) => panic!("read waiter unexpectedly reserved a slot"),
         Err(error) => error,
@@ -73,8 +84,7 @@ struct TestFile {
 impl TestFile {
     fn new() -> Self {
         let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("cache2-io-engine-{}-{id}.bin", std::process::id()));
+        let path = env::temp_dir().join(format!("cache2-io-engine-{}-{id}.bin", process::id()));
         Self { path }
     }
 
@@ -95,7 +105,7 @@ impl TestFile {
 
 impl Drop for TestFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -378,7 +388,7 @@ async fn async_request_is_woken_by_driver_completion() {
     .unwrap();
 
     let completion = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+        .wait_async(Arc::clone(&engine), &TokioHandle::current())
         .await
         .unwrap();
 
@@ -400,10 +410,10 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
     let waiter_engine = Arc::clone(&engine);
     let waiter = tokio::spawn(async move {
         request
-            .wait_async(waiter_engine, &tokio::runtime::Handle::current())
+            .wait_async(waiter_engine, &TokioHandle::current())
             .await
     });
-    tokio::task::yield_now().await;
+    task::yield_now().await;
     assert!(backend.wait_for_entered(1));
 
     waiter.abort();
@@ -429,10 +439,10 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
     let request_engine = Arc::clone(&engine);
     let request_waiter = tokio::spawn(async move {
         request
-            .wait_async(request_engine, &tokio::runtime::Handle::current())
+            .wait_async(request_engine, &TokioHandle::current())
             .await
     });
-    tokio::task::yield_now().await;
+    task::yield_now().await;
     assert!(backend.wait_for_entered(1));
 
     request_waiter.abort();
@@ -441,10 +451,10 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
 
     let slot_waiter = engine.read_slot_waiter();
     let deadline = Instant::now() + Duration::from_secs(1);
-    let tokio_handle = tokio::runtime::Handle::current();
+    let tokio_handle = TokioHandle::current();
     let mut reservation = Box::pin(slot_waiter.reserve_until(deadline, &tokio_handle));
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), reservation.as_mut())
+        time::timeout(Duration::from_millis(20), reservation.as_mut())
             .await
             .is_err(),
         "caller cancellation must not publish physical capacity"
@@ -510,7 +520,7 @@ async fn queued_read_reservations_are_fifo() {
 
     drop(held);
     let first_slot = first.await.unwrap().unwrap();
-    tokio::task::yield_now().await;
+    task::yield_now().await;
     assert!(
         !second.is_finished(),
         "the second waiter bypassed the first"
@@ -532,7 +542,7 @@ async fn queued_reads_use_every_released_engine_slot() {
 
     drop(held);
     let first_slot = first.await.unwrap().unwrap();
-    let second_slot = tokio::time::timeout(Duration::from_millis(20), second)
+    let second_slot = time::timeout(Duration::from_millis(20), second)
         .await
         .expect("an idle second engine slot was blocked by the queue head")
         .unwrap()
@@ -596,7 +606,7 @@ async fn async_read_deadline_keeps_other_slots_available() {
     assert!(backend.wait_for_entered(1));
 
     let timeout = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+        .wait_async(Arc::clone(&engine), &TokioHandle::current())
         .await
         .unwrap_err();
     let (error, buffer) = timeout.into_buffer();
@@ -760,7 +770,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
         files,
         4,
         4,
-        ConfiguredIoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 1)),
+        ConfiguredIoEngine::Posix(PosixIoConfig::new(4, 4, 1)),
         None,
         false,
         false,
@@ -880,7 +890,7 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     let (_, waiting_operation) = rejected.into_parts();
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (sender, receiver) = mpsc::sync_channel(1);
-    let submitter = std::thread::spawn(move || {
+    let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         sender
             .send(waiting_engine.submit_wait(waiting_operation))
@@ -924,7 +934,7 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let waiting_operation = IoOperation::read(read_buffer(&resources, 1), 1);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
-    let submitter = std::thread::spawn(move || {
+    let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         result_sender
             .send(waiting_engine.submit_wait_controlled(

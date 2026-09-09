@@ -18,15 +18,21 @@
 //! immediately, may be discarded at any time, and use a small bounded eviction
 //! policy.
 
+use std::hint::spin_loop;
 use std::io;
+use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::TryLockError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::thread;
 
 use self::eviction::DetachedPolicy;
 use self::eviction::EvictionState;
@@ -49,7 +55,7 @@ const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 const MAX_L1_ENTRY_BYTES: usize = 256 * 1024;
 /// A sequence trailer uses the spare tail of the fixed entry-overhead charge
 /// so compact resident slots do not enlarge the hot Arc allocation.
-const MEMORY_VALUE_SEQNO_BYTES: usize = std::mem::size_of::<u64>();
+const MEMORY_VALUE_SEQNO_BYTES: usize = size_of::<u64>();
 /// Full-key collision work stays bounded for entries sharing one directory
 /// fingerprint, including distinct keys with the same 64-bit cache hash.
 const MAX_SAME_HASH_ENTRIES: usize = 8;
@@ -861,10 +867,10 @@ impl MemoryStore {
                 .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
                 .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
             let fixed_slots = shard_entries
-                .checked_mul(std::mem::size_of::<Option<MemoryEntry>>())
+                .checked_mul(size_of::<Option<MemoryEntry>>())
                 .and_then(|bytes| {
                     shard_entries
-                        .checked_mul(std::mem::size_of::<PolicySlot>())
+                        .checked_mul(size_of::<PolicySlot>())
                         .and_then(|policy| bytes.checked_add(policy))
                 })
                 .ok_or_else(|| invalid_memory_plan("L1 slot memory plan overflow"))?;
@@ -940,7 +946,7 @@ impl MemoryStore {
                 Ok(shard) => break shard,
                 Err(TryLockError::WouldBlock) if attempts < MAX_L1_LOOKUP_LOCK_ATTEMPTS => {
                     attempts += 1;
-                    std::hint::spin_loop();
+                    spin_loop();
                 }
                 Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
                     return MemoryLookup::Miss(MemoryReadToken { shard_id });
@@ -1111,9 +1117,9 @@ mod tests {
 
     #[test]
     fn memory_entry_slot_uses_two_machine_words() {
-        let expected = 2 * std::mem::size_of::<usize>();
-        assert_eq!(std::mem::size_of::<MemoryEntry>(), expected);
-        assert_eq!(std::mem::size_of::<Option<MemoryEntry>>(), expected);
+        let expected = 2 * size_of::<usize>();
+        assert_eq!(size_of::<MemoryEntry>(), expected);
+        assert_eq!(size_of::<Option<MemoryEntry>>(), expected);
     }
 
     #[test]
@@ -1444,8 +1450,8 @@ mod tests {
         let clones = (0..8).map(|_| retained.clone()).collect::<Vec<_>>();
 
         assert!(!store.publish(22, b"b", &[2; 300], 2));
-        let barrier = Arc::new(std::sync::Barrier::new(clones.len() + 1));
-        std::thread::scope(|scope| {
+        let barrier = Arc::new(Barrier::new(clones.len() + 1));
+        thread::scope(|scope| {
             for value in clones {
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {

@@ -18,6 +18,7 @@
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
+use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -32,10 +33,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::TrySendError;
-use std::sync::mpsc::{self};
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -45,58 +44,44 @@ use std::time::Instant;
 
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
+use tokio::runtime::Handle as TokioHandle;
+use tokio::time;
+use tokio::time::Instant as TokioInstant;
 
-use super::backend::IoBackend;
-#[cfg(unix)]
-use super::backend::RuntimeFileBackend;
-#[cfg(unix)]
-use super::backend::RuntimeFileSet;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-use super::backend::RuntimeIoDirection;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-use super::backend::RuntimeIoPath;
-use super::backend::RuntimeIoStats;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-use super::backend::RuntimeIoStatsHandle;
-use super::backend::WritePoint;
-use super::backend::read_exact_at_uninit_with_progress;
-use super::backend::write_all_at_with_progress;
 #[cfg(unix)]
 use crate::config::IoEngine as ConfiguredIoEngine;
 #[cfg(unix)]
 use crate::config::IoUringPoolConfig;
+use crate::io::backend::IoBackend;
+#[cfg(unix)]
+use crate::io::backend::RuntimeFileSet;
+#[cfg(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+use crate::io::backend::RuntimeIoDirection;
+#[cfg(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+use crate::io::backend::RuntimeIoPath;
+use crate::io::backend::RuntimeIoStats;
+use crate::io::backend::WritePoint;
 use crate::resources::BufferLease;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
@@ -325,8 +310,8 @@ impl fmt::Display for IoBufferError {
     }
 }
 
-impl std::error::Error for IoBufferError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for IoBufferError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(&self.error)
     }
 }
@@ -582,8 +567,8 @@ impl fmt::Display for SubmitError {
     }
 }
 
-impl std::error::Error for SubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for SubmitError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(&self.error)
     }
 }
@@ -820,13 +805,13 @@ impl BoundedIoRequest {
     pub async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &TokioHandle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
-        let deadline = tokio::time::Instant::from_std(self.deadline);
+        let deadline = TokioInstant::from_std(self.deadline);
         let completion = {
             let _entered = tokio_handle.enter();
-            tokio::time::timeout_at(deadline, request.request_mut())
+            time::timeout_at(deadline, request.request_mut())
         }
         .await;
         if let Ok(completion) = completion {
@@ -837,7 +822,7 @@ impl BoundedIoRequest {
         let cancel_error = request.cancel().err();
         let completion = {
             let _entered = tokio_handle.enter();
-            tokio::time::timeout(self.cancel_grace, request.request_mut())
+            time::timeout(self.cancel_grace, request.request_mut())
         }
         .await;
         match completion {
@@ -1116,13 +1101,13 @@ impl ReadSlotAdmission {
     async fn acquire_until(
         &self,
         deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &TokioHandle,
     ) -> io::Result<OwnedSemaphorePermit> {
         self.ensure_open()?;
         let acquire = Arc::clone(&self.slots).acquire_owned(1);
         {
             let _entered = tokio_handle.enter();
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
+            time::timeout_at(TokioInstant::from_std(deadline), acquire)
         }
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))
@@ -1153,7 +1138,7 @@ impl ReadSlotWaiter {
     pub async fn reserve_until(
         self,
         deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &TokioHandle,
     ) -> io::Result<ReadSlot> {
         let admission = self
             .shared
@@ -1455,6 +1440,9 @@ impl RuntimeShared {
         )
     ))]
     fn finish_quarantined(&self, task: Task, status: CompletionStatus, bytes_transferred: usize) {
+        #[cfg(not(test))]
+        use std::mem::forget;
+
         let Task {
             request_id,
             operation,
@@ -1469,7 +1457,7 @@ impl RuntimeShared {
             // intentional LeakSanitizer finding.
             lock_unpoisoned(&self.quarantined_buffers).push(buffer);
             #[cfg(not(test))]
-            std::mem::forget(buffer);
+            forget(buffer);
         }
         self.publish_completion(
             request_id,
@@ -2052,7 +2040,7 @@ fn update_peak(peak: &AtomicUsize, value: usize) {
     peak.fetch_max(value, Ordering::Relaxed);
 }
 
-fn add_duration_ns(counter: &AtomicU64, duration: std::time::Duration) {
+fn add_duration_ns(counter: &AtomicU64, duration: Duration) {
     const MAX_DURATION_CAS_ATTEMPTS: usize = 8;
     let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
     let mut current = counter.load(Ordering::Relaxed);

@@ -20,14 +20,14 @@
 //! `CLEAN`. This module performs no I/O; callers must write the returned page
 //! to the selected slot and provide the required `fdatasync` barrier.
 
-use super::index::MAX_PACKED_REGION_COUNT;
-use super::index::MAX_PACKED_REGION_SIZE;
-use super::index::storage::INDEX_IMAGE_PAGE_SIZE;
-use super::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use super::record::RECORD_ALIGNMENT;
-use super::record::RECORD_FORMAT_VERSION;
 use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
+use crate::region::index::MAX_PACKED_REGION_COUNT;
+use crate::region::index::MAX_PACKED_REGION_SIZE;
+use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::RECORD_FORMAT_VERSION;
 
 mod metadata;
 pub use self::metadata::PartitionMetadataRecord;

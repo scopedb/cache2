@@ -25,7 +25,7 @@
 
 use std::io;
 
-use super::index::storage::validated_index_partition_ranges;
+use crate::region::index::storage::validated_index_partition_ranges;
 use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.

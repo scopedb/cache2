@@ -17,10 +17,10 @@
 use std::io;
 
 #[cfg(test)]
-use super::CacheConfig;
+use crate::config::CacheConfig;
 #[cfg(test)]
-use super::RuntimeOptions;
-use super::StorageLayout;
+use crate::config::RuntimeOptions;
+use crate::config::StorageLayout;
 use crate::error::ErrorOperation;
 use crate::error::Result;
 use crate::error::from_io;
@@ -70,7 +70,7 @@ impl StorageOptions {
 
     /// Checks the inputs and computes an immutable layout without opening files.
     /// Use [`StorageLayout::peak_disk_bytes`] to compare a candidate with a disk
-    /// budget, then pass the chosen layout to [`super::CacheConfig::new`].
+    /// budget, then pass the chosen layout to [`crate::CacheConfig::new`].
     ///
     /// # Errors
     ///

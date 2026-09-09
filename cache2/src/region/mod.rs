@@ -14,7 +14,9 @@
 
 //! Steady-state Region authority and bounded request-path operations.
 
+use std::fmt;
 use std::io;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -67,8 +69,13 @@ use self::staging::StagingEncodeError;
 use self::staging::StagingError;
 use crate::checksum::crc32c;
 use crate::hashing::route_hash;
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
+use crate::region::appender::RegionSpanCompletion;
+use crate::region::manager::RegionWriteSpan;
+use crate::region::recovery::DataGeometry;
 use crate::resources::BufferLease;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
@@ -129,7 +136,7 @@ impl RegionHealthLatch {
         }
     }
 
-    fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl std::fmt::Display) {
+    fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl fmt::Display) {
         if self.transition_to_miss_only() {
             log::warn!(
                 target: "cache2::health",
@@ -381,8 +388,7 @@ impl FileRegionCore {
             ..RegionReclaimStats::default()
         };
         let alignment = u64::from(RECORD_ALIGNMENT);
-        let raw_budget = (receipt.used_offset / 8)
-            .saturating_sub(crate::io::backend::DIRECT_IO_ALIGNMENT as u64);
+        let raw_budget = (receipt.used_offset / 8).saturating_sub(DIRECT_IO_ALIGNMENT as u64);
         let mut reinsert_budget = raw_budget - raw_budget % alignment;
         while offset < bytes.len() {
             let header_end = offset.checked_add(RECORD_HEADER_SIZE).ok_or_else(|| {
@@ -536,7 +542,7 @@ impl FileRegionCore {
         self.health.enter_miss_only();
     }
 
-    pub fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl std::fmt::Display) {
+    pub fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl fmt::Display) {
         self.health.enter_miss_only_with_error(reason, error);
     }
 
@@ -621,7 +627,7 @@ impl FileRegionCore {
     fn read_value(
         &self,
         engine: &dyn IoEngine,
-        geometry: crate::region::recovery::DataGeometry,
+        geometry: DataGeometry,
         buffer: BufferLease,
         hash_seed: u64,
         key: &[u8],
@@ -956,22 +962,21 @@ impl FileRegionCore {
         staging: &RegionStaging,
         engine: &dyn IoEngine,
         shard_id: usize,
-    ) -> io::Result<Option<crate::region::manager::RegionWriteSpan>> {
+    ) -> io::Result<Option<RegionWriteSpan>> {
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
                 self.health.enter_miss_only();
                 io::Error::new(io::ErrorKind::InvalidData, "Region count is too large")
             })?;
-            let data_file_len = crate::region::recovery::DataGeometry::expected_file_len(
-                manager.region_size(),
-                region_count,
-            )
-            .ok_or_else(|| {
-                self.health.enter_miss_only();
-                io::Error::new(io::ErrorKind::InvalidData, "data geometry overflow")
-            })?;
-            Ok::<_, io::Error>(crate::region::recovery::DataGeometry {
+            let data_file_len =
+                DataGeometry::expected_file_len(manager.region_size(), region_count).ok_or_else(
+                    || {
+                        self.health.enter_miss_only();
+                        io::Error::new(io::ErrorKind::InvalidData, "data geometry overflow")
+                    },
+                )?;
+            Ok::<_, io::Error>(DataGeometry {
                 data_file_len,
                 region_size: manager.region_size(),
                 region_count,
@@ -1061,7 +1066,7 @@ impl FileRegionCore {
             }
         };
         let completion = flight.wait(engine);
-        let crate::region::appender::RegionSpanCompletion {
+        let RegionSpanCompletion {
             span,
             result,
             buffer,
@@ -1175,8 +1180,8 @@ impl FileRegionCore {
     fn fail_staged_span(
         &self,
         staging: &RegionStaging,
-        span: crate::region::manager::RegionWriteSpan,
-        buffer: Option<crate::io::engine::IoBuffer>,
+        span: RegionWriteSpan,
+        buffer: Option<IoBuffer>,
         records: Vec<StagedRecord>,
     ) {
         self.health.enter_miss_only();
@@ -1207,7 +1212,7 @@ pub fn runtime_fixed_memory_bytes(index_slots: usize, region_count: u32) -> io::
             )
         })?;
     let index_page_state_bytes = (index_bytes / INDEX_IMAGE_PAGE_SIZE)
-        .checked_mul(std::mem::size_of::<AtomicU8>())
+        .checked_mul(size_of::<AtomicU8>())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -23,6 +23,7 @@ use std::alloc::alloc;
 use std::alloc::dealloc;
 use std::fmt;
 use std::ptr::NonNull;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -207,7 +208,7 @@ impl BufferLease {
         }
         // SAFETY: the allocation holds `initialized` initialized bytes and the
         // returned shared slice cannot mutate the exclusively leased buffer.
-        Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), length) })
+        Ok(unsafe { slice::from_raw_parts(buffer.ptr.as_ptr(), length) })
     }
 
     pub fn prepared_mut(&mut self, length: usize) -> Result<&mut [u8], ()> {
@@ -306,7 +307,7 @@ impl AlignedBuffer {
         debug_assert!(length <= self.initialized);
         // SAFETY: the allocation holds `initialized` initialized bytes, this
         // mutable borrow is exclusive, and `length <= initialized`.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), length) }
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), length) }
     }
 
     fn deallocate(&mut self) {

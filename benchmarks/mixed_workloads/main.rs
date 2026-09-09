@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use std::env;
+use std::f64::consts::TAU;
+use std::fmt;
+use std::fs;
 use std::hint::black_box;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -33,6 +37,8 @@ use benchmarks::report::emit_cache_report;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
+use cache2::CacheSnapshot;
+use cache2::DetailedCacheSnapshot;
 use cache2::ErrorKind as CacheErrorKind;
 use cache2::IoEngine;
 use cache2::IoMode;
@@ -42,6 +48,7 @@ use cache2::L1EvictionPolicy;
 use cache2::PosixIoConfig;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 const MIB: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64;
@@ -453,7 +460,7 @@ impl BenchFiles {
             data: directory.join(format!(
                 "cache2-mixed-workload-{}-{}-{timestamp}.cache",
                 scenario.slug(),
-                std::process::id()
+                process::id()
             )),
         }
     }
@@ -467,7 +474,7 @@ impl Drop for BenchFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(file);
+            let _ = fs::remove_file(file);
         }
     }
 }
@@ -582,7 +589,7 @@ fn main() -> io::Result<()> {
         .max()
         .unwrap_or(2)
         .max(2);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
         .worker_threads(runtime_threads)
         .thread_name("cache2-mixed-workload")
         .enable_time()
@@ -602,7 +609,7 @@ async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -854,7 +861,7 @@ fn sample_normal_key(left: usize, right: usize, rng: &mut DeterministicRng) -> u
     let standard_deviation = (right - left) as f64 * 0.25;
     for _ in 0..NORMAL_SAMPLE_ATTEMPTS {
         let radius = (-2.0 * rng.open_unit_f64().ln()).sqrt();
-        let angle = std::f64::consts::TAU * rng.open_unit_f64();
+        let angle = TAU * rng.open_unit_f64();
         let sampled = (mean + standard_deviation * radius * angle.cos()).round();
         if sampled >= left as f64 && sampled <= right as f64 {
             return sampled as usize;
@@ -961,7 +968,7 @@ fn should_sample(operation: Operation, result: &WorkloadResult, interval: usize)
         }
 }
 
-fn validate_snapshot(result: &WorkloadResult, snapshot: &cache2::CacheSnapshot) -> io::Result<()> {
+fn validate_snapshot(result: &WorkloadResult, snapshot: &CacheSnapshot) -> io::Result<()> {
     let cache_hits = snapshot.l1_hits.saturating_add(snapshot.l2_hits);
     if snapshot.health != CacheHealth::Running || snapshot.io_failures != 0 {
         return Err(io::Error::other(
@@ -993,7 +1000,7 @@ fn report(
     result: &WorkloadResult,
     workload_elapsed: Duration,
     drain_elapsed: Duration,
-    detailed: &cache2::DetailedCacheSnapshot,
+    detailed: &DetailedCacheSnapshot,
 ) {
     let snapshot = detailed.summary;
     let seconds = workload_elapsed.as_secs_f64();

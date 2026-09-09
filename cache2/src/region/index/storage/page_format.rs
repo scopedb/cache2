@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::CorruptPageReason;
-use super::IndexImageBinding;
-use super::IndexStorageError;
+use std::mem::size_of;
+
 use crate::checksum::Crc32c;
+use crate::region::index::storage::CorruptPageReason;
+use crate::region::index::storage::IndexImageBinding;
+use crate::region::index::storage::IndexStorageError;
 
 pub const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
@@ -197,8 +199,8 @@ pub fn validate_page_header(
 pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
     let mut checksum = Crc32c::new();
     checksum.update(&page[..PAGE_CHECKSUM_OFFSET]);
-    checksum.update(&[0_u8; std::mem::size_of::<u32>()]);
-    checksum.update(&page[PAGE_CHECKSUM_OFFSET + std::mem::size_of::<u32>()..]);
+    checksum.update(&[0_u8; size_of::<u32>()]);
+    checksum.update(&page[PAGE_CHECKSUM_OFFSET + size_of::<u32>()..]);
     checksum.finish()
 }
 

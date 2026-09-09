@@ -12,7 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use std::io;
+use std::panic;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::thread;
+use std::time::Instant;
+
+use crate::io::backend::IoBackend;
+#[cfg(unix)]
+use crate::io::backend::RuntimeFileBackend;
+#[cfg(unix)]
+use crate::io::backend::RuntimeFileSet;
+use crate::io::backend::read_exact_at_uninit_with_progress;
+use crate::io::backend::write_all_at_with_progress;
+use crate::io::engine::BackendIoEngine;
+use crate::io::engine::CompletionState;
+use crate::io::engine::CompletionStatus;
+use crate::io::engine::DriverCommand;
+use crate::io::engine::EngineIoSnapshot;
+use crate::io::engine::IoEngine;
+use crate::io::engine::IoOperation;
+use crate::io::engine::IoRequest;
+use crate::io::engine::ReadSlot;
+use crate::io::engine::ReadSlotWaiter;
+use crate::io::engine::RequestId;
+use crate::io::engine::RuntimeInner;
+use crate::io::engine::RuntimeShared;
+use crate::io::engine::ShutdownPhase;
+use crate::io::engine::ShutdownState;
+use crate::io::engine::SubmitError;
+use crate::io::engine::SubmitState;
+use crate::io::engine::lock_unpoisoned;
+use crate::resources::CACHE_THREAD_STACK_BYTES;
 
 impl BackendIoEngine {
     #[cfg(unix)]
@@ -99,7 +139,7 @@ impl BackendIoEngine {
             let worker_backend = Arc::clone(&backend);
             let worker_shared = Arc::clone(&shared);
             let worker_receiver = Arc::clone(&receiver);
-            let spawn_result = std::thread::Builder::new()
+            let spawn_result = thread::Builder::new()
                 .name(format!("cache2-sync-io-{worker_index}"))
                 .stack_size(CACHE_THREAD_STACK_BYTES)
                 .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver));
@@ -233,16 +273,15 @@ fn backend_driver(
                     shared.finish(task, CompletionStatus::Cancelled, 0);
                     continue;
                 }
-                let (status, transferred) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_backend(backend.as_ref(), &mut task.operation)
-                    }))
-                    .unwrap_or_else(|_| {
-                        (
-                            CompletionStatus::Failed(io::Error::other("I/O backend panicked")),
-                            0,
-                        )
-                    });
+                let (status, transferred) = panic::catch_unwind(AssertUnwindSafe(|| {
+                    execute_backend(backend.as_ref(), &mut task.operation)
+                }))
+                .unwrap_or_else(|_| {
+                    (
+                        CompletionStatus::Failed(io::Error::other("I/O backend panicked")),
+                        0,
+                    )
+                });
                 shared.finish(task, status, transferred);
             }
             DriverCommand::Cancel(request_id) => {

@@ -14,7 +14,11 @@
 
 //! Bounded benchmark measurements and fio-style reporting.
 
+use std::array;
+use std::env::consts::ARCH;
+use std::env::consts::OS;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -142,7 +146,7 @@ pub struct AtomicLatencyHistogram {
 impl Default for AtomicLatencyHistogram {
     fn default() -> Self {
         Self {
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            buckets: array::from_fn(|_| AtomicU64::new(0)),
             minimum_ns: AtomicU64::new(u64::MAX),
             maximum_ns: AtomicU64::new(0),
         }
@@ -160,7 +164,7 @@ impl AtomicLatencyHistogram {
 
     /// Takes a non-transactional snapshot suitable for periodic reporting.
     pub fn snapshot(&self) -> LatencyHistogram {
-        let buckets = std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed));
+        let buckets = array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed));
         let samples = buckets.iter().copied().sum();
         LatencyHistogram {
             buckets,
@@ -359,15 +363,11 @@ impl RunReporter {
         println!("C² benchmark report");
         println!(
             "  benchmark={}, scenario={}, os={}, arch={}",
-            benchmark,
-            scenario,
-            std::env::consts::OS,
-            std::env::consts::ARCH,
+            benchmark, scenario, OS, ARCH,
         );
         println!(
             "report version=1 type=header benchmark={benchmark} scenario={scenario} os={} arch={}",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
+            OS, ARCH,
         );
         Self {
             benchmark,
@@ -594,7 +594,7 @@ struct ProcessUsage {
 impl ProcessUsage {
     #[cfg(unix)]
     fn capture() -> Self {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let mut usage = MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: `usage` points to writable storage for one `rusage` value.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
             return Self::default();

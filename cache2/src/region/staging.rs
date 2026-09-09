@@ -17,22 +17,26 @@
 //! Region manager receipts are the only span authority.
 
 use std::fmt;
+use std::mem;
+use std::mem::size_of;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+#[cfg(test)]
+use std::thread;
 
-use super::index::IndexEntry;
-use super::index::MAX_RECORD_LEN;
-use super::index::PackedLocation;
-use super::manager::RegionAppendReservation;
-use super::manager::RegionPaddingReceipt;
-use super::manager::RegionWriteSpan;
-use super::record::RECORD_ALIGNMENT;
-use super::record::RECORD_HEADER_SIZE;
-use super::record::RecordHeader;
-use super::recovery::DATA_REGION_AREA_OFFSET;
-use super::recovery::RECOVERY_PAGE_SIZE;
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
+use crate::region::index::IndexEntry;
+use crate::region::index::MAX_RECORD_LEN;
+use crate::region::index::PackedLocation;
+use crate::region::manager::RegionAppendReservation;
+use crate::region::manager::RegionPaddingReceipt;
+use crate::region::manager::RegionWriteSpan;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::RECORD_HEADER_SIZE;
+use crate::region::record::RecordHeader;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+use crate::region::recovery::RECOVERY_PAGE_SIZE;
 use crate::resources::BUFFER_ALIGNMENT;
 use crate::resources::BufferLease;
 use crate::resources::ResourceBuildError;
@@ -259,7 +263,7 @@ impl RegionStaging {
     pub fn reservation_bytes(shard_count: usize, chunk_bytes: usize) -> Option<usize> {
         let buffers_per_shard = chunk_bytes.checked_mul(2)?;
         let records_per_shard = MAX_STAGING_RECORDS
-            .checked_mul(std::mem::size_of::<StagedRecord>())?
+            .checked_mul(size_of::<StagedRecord>())?
             .checked_mul(2)?;
         buffers_per_shard
             .checked_add(records_per_shard)?
@@ -713,7 +717,7 @@ impl RegionStaging {
             state.failed = true;
             StagingError::Invariant("staging lost its second record vector")
         })?;
-        let records = std::mem::replace(&mut state.fill.records, replacement_records);
+        let records = mem::replace(&mut state.fill.records, replacement_records);
         state.fill.reset(replacement_buffer);
         state.submitted = Some(span);
         drop(state);
@@ -975,13 +979,13 @@ mod tests {
 
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
-        assert_eq!(std::mem::size_of::<StagedRecord>(), 32);
+        assert_eq!(size_of::<StagedRecord>(), 32);
         let resources = resources(4 * 1024 * 1024);
         let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
             resources.managed_memory_snapshot().current_bytes,
-            2 * 4096 + 2 * MAX_STAGING_RECORDS * std::mem::size_of::<StagedRecord>()
+            2 * 4096 + 2 * MAX_STAGING_RECORDS * size_of::<StagedRecord>()
         );
 
         let (first, first_record) = reservation(0, 64, 11);
@@ -1107,7 +1111,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let encoder_staging = Arc::clone(&staging);
-        let encoder = std::thread::spawn(move || {
+        let encoder = thread::spawn(move || {
             encoder_staging.encode_reserved(receipt, |target| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

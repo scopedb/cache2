@@ -15,9 +15,10 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::result;
 
 /// A result returned by a public C² operation.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = result::Result<T, Error>;
 
 /// Stable, actionable classification for a C² failure.
 ///

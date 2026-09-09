@@ -22,11 +22,10 @@
 
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 
-use super::index::IndexEntry;
-use super::record::RECORD_ALIGNMENT;
-use super::recovery::DATA_REGION_AREA_OFFSET;
-use super::recovery::DataGeometry;
+use tokio::runtime::Handle as TokioHandle;
+
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -37,6 +36,10 @@ use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
+use crate::region::index::IndexEntry;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+use crate::region::recovery::DataGeometry;
 use crate::resources::BufferLease;
 
 const _READ_ALIGNMENT: usize = 4096;
@@ -99,8 +102,8 @@ impl PendingRead {
 
     pub async fn wait_async(
         self,
-        engine: std::sync::Arc<dyn IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
+        engine: Arc<dyn IoEngine>,
+        tokio_handle: &TokioHandle,
     ) -> ReadCompletion {
         let Self {
             plan,
@@ -380,7 +383,7 @@ mod tests {
         }
     }
 
-    fn entry(location: crate::region::index::PackedLocation) -> IndexEntry {
+    fn entry(location: PackedLocation) -> IndexEntry {
         IndexEntry { location }
     }
 

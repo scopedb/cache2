@@ -21,13 +21,25 @@
 //! runtime mutations become private copy-on-write pages.
 
 use std::cell::UnsafeCell;
+#[cfg(test)]
+use std::env;
+use std::error::Error as StdError;
 use std::fmt;
+#[cfg(test)]
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(test)]
+use std::panic;
+#[cfg(test)]
+use std::panic::AssertUnwindSafe;
+#[cfg(test)]
+use std::process;
 use std::ptr;
+use std::slice;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
@@ -44,13 +56,14 @@ use self::page_format::put_u32;
 use self::page_format::put_u64;
 use self::page_format::read_u64;
 use self::page_format::validate_page_header;
-use super::INDEX_CANDIDATES;
-use super::IndexEntry;
-use super::MAX_INDEX_PARTITIONS;
-use super::PackedLocation;
-use super::PackedLocationError;
-use super::index_partition_for;
-use super::record_size_class_upper_bound;
+use crate::region::index::INDEX_CANDIDATES;
+use crate::region::index::IndexEntry;
+use crate::region::index::MAX_INDEX_PARTITIONS;
+use crate::region::index::PackedLocation;
+use crate::region::index::PackedLocationError;
+use crate::region::index::index_partition_for;
+use crate::region::index::record_size_class_upper_bound;
+use crate::region::record::RECORD_ALIGNMENT;
 
 mod page_format;
 pub use self::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
@@ -278,8 +291,7 @@ impl IndexSlot {
                 entry,
             } => {
                 let location = entry.location;
-                let offset_units =
-                    u64::from(location.offset() / crate::region::record::RECORD_ALIGNMENT);
+                let offset_units = u64::from(location.offset() / RECORD_ALIGNMENT);
                 Self {
                     encoded: u64::from(location.region_id())
                         | (offset_units << SLOT_OFFSET_SHIFT)
@@ -312,7 +324,7 @@ impl IndexSlot {
             .ok_or(IndexSlotSemanticError::NonCanonicalMarker)?;
         let region_id = ((self.encoded >> SLOT_REGION_SHIFT) & SLOT_REGION_MASK) as u32;
         let offset_units = ((self.encoded >> SLOT_OFFSET_SHIFT) & SLOT_OFFSET_MASK) as u32;
-        let offset = offset_units * crate::region::record::RECORD_ALIGNMENT;
+        let offset = offset_units * RECORD_ALIGNMENT;
         let location = PackedLocation::new(region_id, offset, record_len)
             .map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
@@ -560,8 +572,8 @@ impl fmt::Display for IndexStorageError {
     }
 }
 
-impl std::error::Error for IndexStorageError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for IndexStorageError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::InvalidArgument(_)
@@ -1058,9 +1070,8 @@ impl IndexStorageCore {
             .ok_or(IndexStorageError::SizeOverflow)?;
         // SAFETY: `offset` and the fixed page length are inside `image_len` by
         // construction, and the mapping remains alive for this borrow.
-        let page = unsafe {
-            std::slice::from_raw_parts(self.data_ptr().add(offset), INDEX_IMAGE_PAGE_SIZE)
-        };
+        let page =
+            unsafe { slice::from_raw_parts(self.data_ptr().add(offset), INDEX_IMAGE_PAGE_SIZE) };
         let page: &[u8; INDEX_IMAGE_PAGE_SIZE] = page
             .try_into()
             .expect("fixed mapped page has the Index Image page size");
@@ -1550,7 +1561,7 @@ impl PartitionedIndexStorage {
     #[cfg(test)]
     pub fn poison_hash_partition_for_test(&self, hash: u64) {
         let partition = index_partition_for(hash, self.partitions.len());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = self.partitions[partition].write().unwrap();
             panic!("poison index partition for test");
         }));
@@ -1860,10 +1871,8 @@ mod tests {
     impl TestFile {
         fn create() -> Self {
             let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "cache2-index-image-{}-{id}.tmp",
-                std::process::id()
-            ));
+            let path =
+                env::temp_dir().join(format!("cache2-index-image-{}-{id}.tmp", process::id()));
             let file = OpenOptions::new()
                 .create_new(true)
                 .read(true)
@@ -1876,14 +1885,14 @@ mod tests {
 
     impl Drop for TestFile {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.path);
         }
     }
 
     fn sample_slot(seed: u64) -> IndexSlot {
         let location = PackedLocation::new(
             (seed % 64) as u32,
-            ((seed % 128) * u64::from(crate::region::record::RECORD_ALIGNMENT)) as u32,
+            ((seed % 128) * u64::from(RECORD_ALIGNMENT)) as u32,
             32,
         )
         .unwrap();

@@ -57,7 +57,7 @@ impl Default for Crc32c {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32c;
+    use crate::checksum::crc32c;
 
     #[test]
     fn matches_the_crc32c_check_value() {

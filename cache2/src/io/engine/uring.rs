@@ -14,10 +14,27 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::mem;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::panic;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::thread;
+use std::time::Instant;
 
 use hashcrew::xxhash::Xxh3_64Builder;
 use io_uring::IoUring;
@@ -26,7 +43,38 @@ use io_uring::opcode;
 use io_uring::squeue;
 use io_uring::types;
 
-use super::*;
+use crate::config::IoUringPoolConfig;
+use crate::io::backend::RuntimeFileSet;
+use crate::io::backend::RuntimeIoPath;
+use crate::io::backend::RuntimeIoStatsHandle;
+use crate::io::engine::CompletionState;
+use crate::io::engine::CompletionStatus;
+use crate::io::engine::DriverCommand;
+use crate::io::engine::DriverWake;
+use crate::io::engine::EngineIoSnapshot;
+#[cfg(test)]
+use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
+#[cfg(test)]
+use crate::io::engine::IoBuffer;
+use crate::io::engine::IoEngine;
+use crate::io::engine::IoOperation;
+use crate::io::engine::IoRequest;
+#[cfg(test)]
+use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
+use crate::io::engine::OperationKind;
+use crate::io::engine::ReadSlot;
+use crate::io::engine::ReadSlotWaiter;
+use crate::io::engine::RequestId;
+use crate::io::engine::RuntimeInner;
+use crate::io::engine::RuntimeShared;
+use crate::io::engine::ShutdownPhase;
+use crate::io::engine::ShutdownState;
+use crate::io::engine::SubmitError;
+use crate::io::engine::SubmitState;
+use crate::io::engine::Task;
+#[cfg(test)]
+use crate::io::engine::io_uring_extra_memory_bytes;
+use crate::resources::CACHE_THREAD_STACK_BYTES;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
@@ -83,7 +131,7 @@ impl UringIoEngine {
     pub fn new_with_files(
         files: RuntimeFileSet,
         max_in_flight: usize,
-        config: crate::config::IoUringPoolConfig,
+        config: IoUringPoolConfig,
         statistics_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
@@ -165,7 +213,7 @@ impl UringIoEngine {
         let submit_state = Arc::new(RwLock::new(SubmitState { accepting: true }));
         let worker_shared = Arc::clone(&shared);
         let worker_submit_state = Arc::clone(&submit_state);
-        let worker = std::thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("cache2-uring-io".into())
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || {
@@ -352,7 +400,7 @@ fn uring_driver(
         io_poll,
         shutting_down: false,
     };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run()))
+    let result = panic::catch_unwind(AssertUnwindSafe(|| driver.run()))
         .unwrap_or_else(|_| Err(io::Error::other("io_uring driver panicked")));
     if let Err(error) = &result {
         driver.stop_accepting_and_fail_all(error);
@@ -860,7 +908,7 @@ impl UringDriver {
             // and never issue LOCK_UN on another duplicate.
             self.shared.mark_unfenced_writes();
             if let Some(files) = self.files.take() {
-                std::mem::forget(files);
+                mem::forget(files);
             }
         }
 
@@ -946,7 +994,7 @@ impl UringDriver {
             if !self.has_active_target() {
                 return;
             }
-            std::thread::yield_now();
+            thread::yield_now();
         }
     }
 

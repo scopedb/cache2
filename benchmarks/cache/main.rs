@@ -13,11 +13,16 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
+use std::fs;
 use std::hint::black_box;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
+use std::sync::Barrier as ThreadBarrier;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -44,6 +49,8 @@ use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
 use cache2::Value;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::time;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
@@ -317,10 +324,7 @@ impl BenchFiles {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            data: directory.join(format!(
-                "cache2-bench-{}-{timestamp}.cache",
-                std::process::id()
-            )),
+            data: directory.join(format!("cache2-bench-{}-{timestamp}.cache", process::id())),
         }
     }
 }
@@ -333,7 +337,7 @@ impl Drop for BenchFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -381,14 +385,14 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
 
 fn run_benchmark() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
         .worker_threads(config.clients.max(2))
         .thread_name("cache2-benchmark")
         .enable_time()
@@ -751,7 +755,7 @@ fn concurrent_writes(
     value_bytes: usize,
     clients: usize,
 ) -> io::Result<WriteAdmission> {
-    let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
+    let barrier = Arc::new(ThreadBarrier::new(clients + 1));
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(clients);
         for client in 0..clients {
@@ -804,7 +808,7 @@ fn concurrent_writes(
 
 async fn concurrent_reads(
     cache: Arc<Cache>,
-    key_range: std::ops::Range<usize>,
+    key_range: Range<usize>,
     operations: usize,
     clients: usize,
     expected_tier: CacheTier,
@@ -974,7 +978,7 @@ async fn read_l1_eventually(cache: &Cache, key_ordinal: usize, client: usize) ->
             )));
         }
         attempts += 1;
-        tokio::time::sleep(RETRY_DELAY).await;
+        time::sleep(RETRY_DELAY).await;
     }
 }
 

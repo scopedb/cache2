@@ -21,9 +21,11 @@
 //! There are no probe chains,
 //! tombstones, generation tables, retries, or request-time allocations.
 
+use std::array;
 #[cfg(feature = "benchmarking")]
 use std::cell::Cell;
 use std::io;
+use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -60,7 +62,7 @@ const REFERENCE_WORD_BITS: usize = u64::BITS as usize;
 pub fn heat_memory_bytes(slot_count: usize) -> Option<usize> {
     let bitmap_bytes = slot_count
         .div_ceil(REFERENCE_WORD_BITS)
-        .checked_mul(std::mem::size_of::<AtomicU64>())?;
+        .checked_mul(size_of::<AtomicU64>())?;
     bitmap_bytes.checked_mul(2)
 }
 
@@ -670,7 +672,7 @@ fn fingerprint(hash: u64) -> u16 {
 
 fn candidate_slots(hash: u64, slot_count: usize) -> [usize; INDEX_CANDIDATES] {
     let home = route_hash(hash.rotate_left(32), slot_count);
-    std::array::from_fn(|displacement| slot_from_home(home, displacement, slot_count))
+    array::from_fn(|displacement| slot_from_home(home, displacement, slot_count))
 }
 
 fn slot_from_home(home: usize, displacement: usize, slot_count: usize) -> usize {

@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use std::io;
+use std::mem::size_of;
 use std::time::Duration;
 
-use super::CacheConfig;
-use super::StorageLayout;
+use crate::config::CacheConfig;
+use crate::config::StorageLayout;
 use crate::error::ErrorOperation;
 use crate::error::Result;
 use crate::error::from_io;
@@ -27,6 +28,8 @@ use crate::memory::MemoryStore;
 use crate::region::ActivityMetrics;
 use crate::region::RegionStaging;
 use crate::region::recovery::DataGeometry;
+use crate::region::runtime_fixed_memory_bytes;
+use crate::resources::BUFFER_ALIGNMENT;
 use crate::resources::CACHE_THREAD_STACK_BYTES;
 use crate::resources::MAX_CONFIG_COUNT;
 
@@ -387,12 +390,12 @@ pub enum ReadAdmission {
         /// Maximum wait, greater than zero and no longer than five seconds.
         timeout: Duration,
         /// Maximum queued readers, from one through 65536. `None` follows the
-        /// aggregate read in-flight limit when [`super::CacheConfig`] is built.
+        /// aggregate read in-flight limit when [`CacheConfig`] is built.
         max_waiters: Option<usize>,
     },
 }
 
-/// Process-local resource choices, checked together by [`super::CacheConfig::new`].
+/// Process-local resource choices, checked together by [`CacheConfig::new`].
 ///
 /// These values may change across opens. Warm recovery rebinds append shards
 /// from recovered Active and Free Regions when the requested topology fits.
@@ -516,10 +519,9 @@ impl CacheConfig {
                 runtime.l1_shards,
                 runtime.l1_eviction_policy,
             )?;
-            let fixed_bytes =
-                crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
-                    .checked_add(l1_metadata_bytes)
-                    .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
+            let fixed_bytes = runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
+                .checked_add(l1_metadata_bytes)
+                .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
             let (reserved_memory_bytes, minimum_memory_bytes) =
                 runtime.memory_requirements(geometry, fixed_bytes)?;
             if minimum_memory_bytes > runtime.managed_memory_limit_bytes {
@@ -638,7 +640,7 @@ impl RuntimeOptions {
             || self.write_flush_threshold_bytes > MAX_WRITE_FLUSH_THRESHOLD_BYTES
             || !self
                 .write_flush_threshold_bytes
-                .is_multiple_of(crate::resources::BUFFER_ALIGNMENT)
+                .is_multiple_of(BUFFER_ALIGNMENT)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -748,7 +750,7 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
         .checked_add(config.l1_shards)?
         .checked_add(reclaim.max_in_flight)?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
-    let metrics = shard_count.checked_mul(std::mem::size_of::<ActivityMetrics>())?;
+    let metrics = shard_count.checked_mul(size_of::<ActivityMetrics>())?;
     stacks
         .checked_add(queue)?
         .checked_add(uring)?
@@ -805,7 +807,7 @@ mod tests {
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
         let base = RuntimeOptions {
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(7, 4, 1)),
+            io_engine: IoEngine::Posix(PosixIoConfig::new(7, 4, 1)),
             ..RuntimeOptions::default()
         };
         let no_wait = runtime_topology_memory_bytes(&base).unwrap();
@@ -835,7 +837,7 @@ mod tests {
         };
         let (_, base_minimum) = base.memory_requirements(geometry, 0).unwrap();
         let (_, parallel_minimum) = RuntimeOptions {
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(4, 4, 2)),
+            io_engine: IoEngine::Posix(PosixIoConfig::new(4, 4, 2)),
             ..base
         }
         .memory_requirements(geometry, 0)
@@ -929,7 +931,7 @@ mod tests {
     fn io_poll_requires_direct_mode() {
         let pool = IoUringPoolConfig::default().with_io_poll(true);
         let mut config = RuntimeOptions {
-            io_engine: IoEngine::IoUring(crate::config::IoUringConfig::new(
+            io_engine: IoEngine::IoUring(IoUringConfig::new(
                 pool,
                 IoUringPoolConfig::default(),
                 IoUringPoolConfig::new(1, 1),

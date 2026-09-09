@@ -23,6 +23,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -32,6 +33,9 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+
+use tokio::runtime::Handle as TokioHandle;
+use tokio::task::JoinError;
 
 use crate::config::CacheConfig;
 use crate::config::KEY_HASH_SEED;
@@ -119,7 +123,7 @@ pub struct Cache {
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
-    tokio_handle: tokio::runtime::Handle,
+    tokio_handle: TokioHandle,
 }
 
 impl fmt::Debug for Cache {
@@ -142,7 +146,7 @@ impl Cache {
     /// device support, runtime binding, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+        let handle = TokioHandle::try_current().map_err(|error| {
             from_io(
                 ErrorOperation::Open,
                 io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
@@ -161,7 +165,7 @@ impl Cache {
     pub async fn open_with_handle(
         path: impl AsRef<Path>,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: TokioHandle,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let cache_handle = tokio_handle.clone();
@@ -181,7 +185,7 @@ impl Cache {
     fn open_blocking(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: TokioHandle,
         started: Instant,
     ) -> io::Result<Cache> {
         let capacity_bytes = config.storage().capacity_bytes();
@@ -226,7 +230,7 @@ impl Cache {
     fn open_blocking_inner(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: TokioHandle,
     ) -> io::Result<Cache> {
         let format_data = DataSuperblock {
             generation: 1,
@@ -554,7 +558,7 @@ fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &
     }
 }
 
-fn blocking_task_error(operation: &'static str, error: tokio::task::JoinError) -> io::Error {
+fn blocking_task_error(operation: &'static str, error: JoinError) -> io::Error {
     io::Error::other(format!("{operation} task failed: {error}"))
 }
 
@@ -576,7 +580,7 @@ fn next_persistent_id() -> PersistentId {
         .unwrap_or_default()
         .as_nanos();
     let mut bytes = now.to_le_bytes();
-    let mix = counter ^ u64::from(std::process::id()).rotate_left(32);
+    let mix = counter ^ u64::from(process::id()).rotate_left(32);
     for (target, source) in bytes[8..].iter_mut().zip(mix.to_le_bytes()) {
         *target ^= source;
     }

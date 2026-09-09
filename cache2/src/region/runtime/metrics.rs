@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use std::io;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::LIFECYCLE_DRAINING;
-use super::LIFECYCLE_FAILED;
 use crate::hashing::route_hash;
 use crate::memory::MemoryMetricsSnapshot;
+use crate::region::RegionReclaimStats;
+use crate::region::runtime::LIFECYCLE_DRAINING;
+use crate::region::runtime::LIFECYCLE_FAILED;
+use crate::region::runtime::LIFECYCLE_RUNNING;
 use crate::resources::ManagedMemorySnapshot;
 use crate::snapshot::CacheHealth;
 use crate::snapshot::CacheIoSnapshot;
@@ -31,7 +34,7 @@ static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct RuntimeMetrics {
     metrics_epoch: u64,
-    pub lifecycle: std::sync::atomic::AtomicU8,
+    pub lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
     l2_read_overloads: AtomicU64,
     l2_read_wait_ns: AtomicU64,
@@ -94,7 +97,7 @@ impl RuntimeMetrics {
         activity.resize_with(shard_count, ActivityMetrics::new);
         Ok(Self {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
-            lifecycle: std::sync::atomic::AtomicU8::new(super::LIFECYCLE_RUNNING),
+            lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
             l2_read_overloads: AtomicU64::new(0),
             l2_read_wait_ns: AtomicU64::new(0),
@@ -143,7 +146,7 @@ impl RuntimeMetrics {
         self.l2_read_wait_ns.fetch_add(nanos, Ordering::Relaxed);
     }
 
-    pub fn record_reclaim(&self, stats: crate::region::RegionReclaimStats) {
+    pub fn record_reclaim(&self, stats: RegionReclaimStats) {
         Self::increment(&self.reclaimed_regions);
         self.reclaimed_bytes
             .fetch_add(stats.bytes_read, Ordering::Relaxed);

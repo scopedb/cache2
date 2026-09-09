@@ -18,6 +18,7 @@
 //! the optional CLOCK or S3-FIFO metadata and chooses bounded victims.
 
 use std::io;
+use std::mem::size_of;
 
 use crate::config::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;
@@ -329,7 +330,7 @@ impl ClockState {
 
     fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         maximum_entries
-            .checked_mul(std::mem::size_of::<u32>())
+            .checked_mul(size_of::<u32>())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CLOCK is too large"))
     }
 
@@ -529,7 +530,7 @@ impl S3FifoState {
 
     fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         let links = maximum_entries
-            .checked_mul(std::mem::size_of::<S3FifoLink>())
+            .checked_mul(size_of::<S3FifoLink>())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "S3-FIFO is too large"))?;
         links
             .checked_add(GhostQueue::allocation_bytes(maximum_entries)?)
@@ -717,12 +718,12 @@ impl GhostQueue {
 
     fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         let hashes = maximum_entries
-            .checked_mul(std::mem::size_of::<u64>())
+            .checked_mul(size_of::<u64>())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large")
             })?;
         let links = maximum_entries
-            .checked_mul(std::mem::size_of::<S3FifoLink>())
+            .checked_mul(size_of::<S3FifoLink>())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "ghost queue is too large")
             })?;
@@ -1075,7 +1076,7 @@ mod tests {
     #[test]
     fn ghost_storage_uses_twenty_bytes_per_entry() {
         const ENTRIES: usize = 5;
-        assert_eq!(std::mem::size_of::<S3FifoLink>(), 12);
+        assert_eq!(size_of::<S3FifoLink>(), 12);
         assert_eq!(
             GhostQueue::allocation_bytes(ENTRIES).unwrap()
                 - FixedPrehashedMap::allocation_bytes(ENTRIES).unwrap(),

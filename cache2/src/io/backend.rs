@@ -19,9 +19,15 @@
 //! record, superblock, or barrier operation without changing the cache
 //! algorithm.
 
+#[cfg(test)]
+use std::env;
+#[cfg(test)]
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+#[cfg(test)]
+use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -31,10 +37,15 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+#[cfg(test)]
+use std::process;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::thread;
 
 use crate::config::IoMode;
 use crate::snapshot::CacheIoPathSnapshot;
@@ -346,7 +357,7 @@ pub trait IoBackend: Send + Sync {
         // before constructing the mutable slice required by `read_at`.
         unsafe {
             buffer.write_bytes(0, length);
-            self.read_at(std::slice::from_raw_parts_mut(buffer, length), offset)
+            self.read_at(slice::from_raw_parts_mut(buffer, length), offset)
         }
     }
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize>;
@@ -979,10 +990,7 @@ mod tests {
     impl TestFile {
         fn new(label: &str) -> Self {
             let nonce = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
-                "cache2-{label}-{}-{nonce}.cache",
-                std::process::id()
-            )))
+            Self(env::temp_dir().join(format!("cache2-{label}-{}-{nonce}.cache", process::id())))
         }
 
         fn open(&self) -> File {
@@ -998,7 +1006,7 @@ mod tests {
 
     impl Drop for TestFile {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = fs::remove_file(&self.0);
         }
     }
 
@@ -1060,7 +1068,7 @@ mod tests {
             MAX_INTERRUPTED_RETRIES + 1
         );
 
-        let mut uninitialized = std::mem::MaybeUninit::<u8>::uninit();
+        let mut uninitialized = MaybeUninit::<u8>::uninit();
         let backend = InterruptedBackend::default();
         let (result, transferred) =
             read_exact_at_uninit_with_progress(&backend, uninitialized.as_mut_ptr(), 1, 0);
@@ -1269,7 +1277,7 @@ mod tests {
         let alias = TestFile::new("control-alias");
         let other = TestFile::new("control-other");
         drop(primary.open());
-        std::fs::hard_link(&primary.0, &alias.0).unwrap();
+        fs::hard_link(&primary.0, &alias.0).unwrap();
 
         let primary = FileBackend::open(&primary.0).unwrap();
         let alias = FileBackend::open(&alias.0).unwrap();
@@ -1302,10 +1310,10 @@ mod tests {
 
     #[test]
     fn one_fault_handle_controls_multiple_recovery_files() {
-        use super::testing::FaultAction;
-        use super::testing::FaultBackend;
-        use super::testing::FaultEvent;
-        use super::testing::FaultHandle;
+        use crate::io::backend::testing::FaultAction;
+        use crate::io::backend::testing::FaultBackend;
+        use crate::io::backend::testing::FaultEvent;
+        use crate::io::backend::testing::FaultHandle;
 
         let state = TestFile::new("shared-fault-state");
         let image = TestFile::new("shared-fault-image");
@@ -1348,10 +1356,12 @@ mod tests {
 
     #[test]
     fn cache_open_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
         let target = TestFile::new("symlink-target");
         let link = TestFile::new("symlink-link");
         drop(target.open());
-        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
+        symlink(&target.0, &link.0).unwrap();
 
         assert!(FileBackend::open(&link.0).is_err());
     }
@@ -1589,10 +1599,10 @@ pub mod testing {
         // run user code in the target process.
         if unsafe { kill(getpid(), SIGKILL) } == 0 {
             loop {
-                std::thread::park();
+                thread::park();
             }
         }
-        std::process::abort()
+        process::abort()
     }
 
     #[cfg(unix)]

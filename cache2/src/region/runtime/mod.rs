@@ -20,13 +20,24 @@
 //! device path. A fixed age deadline publishes partial batches without adding
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
+#[cfg(test)]
+use std::env;
+#[cfg(test)]
+use std::fs;
 use std::io;
+use std::mem;
+use std::panic;
+use std::panic::AssertUnwindSafe;
+#[cfg(test)]
+use std::process;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -34,30 +45,13 @@ use std::time::Instant;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 use asyncband::watch;
+use tokio::runtime::Handle as TokioHandle;
+#[cfg(test)]
+use tokio::task;
 
 use self::metrics::RuntimeMetrics;
-use super::FileRegionCore;
-use super::RegionStageValue;
-use super::RegionValueRead;
-#[cfg(test)]
-use super::index::storage::INDEX_IMAGE_PAGE_SIZE;
-#[cfg(test)]
-use super::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use super::reader::PendingRead;
-use super::reader::ReadCompletion;
-use super::reader::ReadPlan;
-use super::reader::plan_read;
-use super::record::MAX_KEY_SIZE;
-use super::record::hash_key;
-use super::record::required_record_bytes;
-#[cfg(test)]
-use super::recovery::DataGeometry;
-use super::recovery::DataSuperblock;
-#[cfg(test)]
-use super::runtime_fixed_memory_bytes;
-use super::staging::RegionStaging;
-use super::staging::StagingError;
 use crate::config::CacheConfig;
+use crate::config::IoEngine as ConfiguredIoEngine;
 use crate::config::IoMode;
 use crate::config::IoPoolTopology;
 #[cfg(test)]
@@ -83,6 +77,35 @@ use crate::memory::MemoryMetricsSnapshot;
 use crate::memory::MemoryReadToken;
 use crate::memory::MemoryStore;
 use crate::memory::MemoryValue;
+use crate::region::FileRegionCore;
+use crate::region::RegionStageValue;
+use crate::region::RegionValueRead;
+#[cfg(test)]
+use crate::region::index::IndexEntry;
+#[cfg(test)]
+use crate::region::index::PackedLocation;
+#[cfg(test)]
+use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
+#[cfg(test)]
+use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::reader::PendingRead;
+#[cfg(test)]
+use crate::region::reader::ReadCandidate;
+use crate::region::reader::ReadCompletion;
+use crate::region::reader::ReadPlan;
+use crate::region::reader::plan_read;
+use crate::region::record::MAX_KEY_SIZE;
+#[cfg(test)]
+use crate::region::record::RECORD_HEADER_SIZE;
+use crate::region::record::hash_key;
+use crate::region::record::required_record_bytes;
+#[cfg(test)]
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::DataSuperblock;
+#[cfg(test)]
+use crate::region::runtime_fixed_memory_bytes;
+use crate::region::staging::RegionStaging;
+use crate::region::staging::StagingError;
 use crate::resources::BufferLease;
 use crate::resources::CACHE_THREAD_STACK_BYTES;
 #[cfg(test)]
@@ -346,7 +369,7 @@ impl PendingGet {
         }
     }
 
-    async fn wait_async(self, tokio_handle: &tokio::runtime::Handle) -> CompletedGet {
+    async fn wait_async(self, tokio_handle: &TokioHandle) -> CompletedGet {
         let Self {
             engine,
             read,
@@ -362,7 +385,7 @@ impl PendingGet {
 }
 
 impl WaitingGet {
-    async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
+    async fn reserve_async(self, tokio_handle: &TokioHandle) -> io::Result<ReservedGet> {
         let Self {
             engine,
             slot_waiter,
@@ -718,7 +741,7 @@ impl ShardControl {
         self.async_changed.send_replace(());
     }
 
-    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, ShardControlState>> {
+    fn lock(&self) -> io::Result<MutexGuard<'_, ShardControlState>> {
         self.state.lock().map_err(|_| poisoned_runtime_error())
     }
 }
@@ -904,7 +927,7 @@ impl RegionDataPlane {
     pub async fn get_async(
         &self,
         key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &TokioHandle,
     ) -> io::Result<Option<HybridValueRead>> {
         match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
@@ -1287,7 +1310,7 @@ impl RegionDataPlane {
     #[cfg(test)]
     pub fn poison_shard_for_test(&self, shard_id: usize) {
         let shard = self.shared.shards.get(shard_id).expect("test shard exists");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _state = shard.state.lock().unwrap();
             panic!("poison shard gate");
         }));
@@ -1465,7 +1488,7 @@ fn start_running(
     })?;
     for shard_id in 0..shard_count {
         let worker_shared = Arc::clone(&shared);
-        match std::thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("cache2-shard-{shard_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || shard_worker(worker_shared, shard_id))
@@ -1488,7 +1511,7 @@ fn start_running(
     }
     for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
         let reclaim_shared = Arc::clone(&shared);
-        match std::thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("cache2-reclaim-{worker_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id, reclaim_worker_count))
@@ -1535,7 +1558,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if matches!(config.io_engine, crate::config::IoEngine::Posix(_)) {
+    let posix_workers = if matches!(config.io_engine, ConfiguredIoEngine::Posix(_)) {
         topology.max_in_flight
     } else {
         1
@@ -1561,7 +1584,7 @@ fn build_engine_pool(
 
 fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
     let control = Arc::clone(&shared.shards[shard_id]);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
         shard_worker_result(&shared, shard_id, &control)
     }));
     let error = match result {
@@ -1637,7 +1660,7 @@ fn reclaim_worker(
     worker_count: usize,
 ) {
     let mut buffer = Some(buffer);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
         reclaim_worker_result(&shared, &mut buffer, worker_id, worker_count)
     }));
     let error = match result {
@@ -1913,7 +1936,7 @@ fn wait_for_shard_work(
     if let Some(failure) = &state.failure {
         return Err(failure.to_error());
     }
-    let flags = std::mem::take(&mut state.wake_flags);
+    let flags = mem::take(&mut state.wake_flags);
     let drain_generation = if state.drain_requested > state.drain_completed {
         state.drain_requested
     } else {
@@ -2065,7 +2088,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         // has no trustworthy future fence and remains process-lifetime state.
         if unfenced {
             for engine in owner.shared.engines() {
-                std::mem::forget(Arc::clone(engine));
+                mem::forget(Arc::clone(engine));
             }
         } else {
             for engine in owner.shared.engines() {
@@ -2087,7 +2110,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
 
 fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
     let reaper_engine = Arc::clone(engine);
-    let spawn = std::thread::Builder::new()
+    let spawn = thread::Builder::new()
         .name("cache2-io-reaper".to_owned())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
@@ -2097,7 +2120,7 @@ fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
         // The original owner is still alive while this fallback clone is
         // created, so a failed thread spawn cannot synchronously run the
         // engine's blocking Drop path.
-        std::mem::forget(Arc::clone(engine));
+        mem::forget(Arc::clone(engine));
     }
 }
 
@@ -2174,10 +2197,7 @@ mod tests {
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "cache2-read-lane-{}-{id}.cache",
-            std::process::id()
-        ));
+        let path = env::temp_dir().join(format!("cache2-read-lane-{}-{id}.cache", process::id()));
         let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
         let engines: Box<[Arc<dyn IoEngine>]> = vec![
             Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
@@ -2210,15 +2230,15 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "cache2-read-lane-rotation-{}-{id}.cache",
-            std::process::id()
+            process::id()
         ));
         let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
         let engines: Box<[Arc<dyn IoEngine>]> = (0..4)
@@ -2244,7 +2264,7 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2276,13 +2296,13 @@ mod tests {
         let mutation = gate.try_enter().unwrap();
         let drain = gate.begin_drain().unwrap();
         let closing_gate = Arc::clone(&gate);
-        let close = std::thread::spawn(move || {
+        let close = thread::spawn(move || {
             closing_gate.start_close();
             closing_gate.wait_quiescent().unwrap();
         });
 
         while gate.state.load(Ordering::Acquire) & MUTATION_CLOSED == 0 {
-            std::thread::yield_now();
+            thread::yield_now();
         }
         drop(mutation);
         drain.wait().unwrap();
@@ -2318,7 +2338,7 @@ mod tests {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
         });
-        tokio::task::yield_now().await;
+        task::yield_now().await;
         assert!(gate.try_enter().is_none());
 
         drop(mutation);
@@ -2335,7 +2355,7 @@ mod tests {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
         });
-        tokio::task::yield_now().await;
+        task::yield_now().await;
         assert!(gate.try_enter().is_none());
 
         drain.abort();
@@ -2419,7 +2439,7 @@ mod tests {
         for _ in 0..2 {
             let control = Arc::clone(&control);
             let ready = Arc::clone(&ready);
-            workers.push(std::thread::spawn(move || {
+            workers.push(thread::spawn(move || {
                 let mut observed_generation = 0;
                 ready.wait();
                 let notified = control.wait(&mut observed_generation).unwrap();
@@ -2461,10 +2481,8 @@ mod tests {
         use crate::region::store::RegionStore;
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "cache2-completion-timeout-{}-{id}",
-            std::process::id()
-        ));
+        let path =
+            env::temp_dir().join(format!("cache2-completion-timeout-{}-{id}", process::id()));
         let files = RegionFiles::new(
             path.with_extension("cache"),
             path.with_extension("state"),
@@ -2541,8 +2559,8 @@ mod tests {
                 assert_eq!(snapshot.l2_read_overloads, 1);
             }
         }
-        std::fs::remove_file(files.data).unwrap();
-        std::fs::remove_file(files.state).unwrap();
+        fs::remove_file(files.data).unwrap();
+        fs::remove_file(files.state).unwrap();
     }
 
     #[test]
@@ -2552,17 +2570,17 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let value_len = geometry.region_size as usize - crate::region::record::RECORD_HEADER_SIZE;
+        let value_len = geometry.region_size as usize - RECORD_HEADER_SIZE;
         let record_len = required_record_bytes(0, value_len).unwrap();
         assert_eq!(u64::from(record_len), geometry.region_size);
-        let entry = crate::region::index::IndexEntry {
-            location: crate::region::index::PackedLocation::new(0, 0, record_len).unwrap(),
+        let entry = IndexEntry {
+            location: PackedLocation::new(0, 0, record_len).unwrap(),
         };
         assert_eq!(
             plan_read(
                 geometry,
                 1,
-                crate::region::reader::ReadCandidate {
+                ReadCandidate {
                     entry,
                     region_generation: 1,
                 },

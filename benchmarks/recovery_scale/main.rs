@@ -13,9 +13,13 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
+use std::fs;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -33,6 +37,7 @@ use cache2::PosixIoConfig;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,7 +121,7 @@ impl ScaleFiles {
         Self {
             data: directory.join(format!(
                 "cache2-recovery-scale-{}-{timestamp}.cache",
-                std::process::id()
+                process::id()
             )),
             cleanup_on_drop: false,
         }
@@ -129,7 +134,7 @@ impl ScaleFiles {
     fn logical_bytes(&self) -> io::Result<u64> {
         self.paths()
             .into_iter()
-            .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+            .try_fold(0_u64, |total, path| match fs::metadata(path) {
                 Ok(metadata) => total
                     .checked_add(metadata.len())
                     .ok_or_else(|| invalid("logical file size overflow")),
@@ -144,7 +149,7 @@ impl ScaleFiles {
 
         self.paths()
             .into_iter()
-            .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+            .try_fold(0_u64, |total, path| match fs::metadata(path) {
                 Ok(metadata) => total
                     .checked_add(metadata.blocks().saturating_mul(512))
                     .ok_or_else(|| invalid("allocated file size overflow")),
@@ -178,7 +183,7 @@ impl Drop for ScaleFiles {
             return;
         }
         for path in self.paths() {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -190,14 +195,14 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
 
 fn run_benchmark() -> io::Result<()> {
     let config = ScaleConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_time()
         .build()?;
     runtime.block_on(run(config))
@@ -279,11 +284,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     Ok(())
 }
 
-async fn verify_sentinels(
-    cache: &cache2::Cache,
-    keys: &[[u8; 16]],
-    value_bytes: usize,
-) -> io::Result<()> {
+async fn verify_sentinels(cache: &Cache, keys: &[[u8; 16]], value_bytes: usize) -> io::Result<()> {
     let started = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         let observed = cache
@@ -307,7 +308,7 @@ async fn verify_sentinels(
     Ok(())
 }
 
-fn put_eventually(cache: &cache2::Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
+fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
     loop {
         match cache.put(key, value) {
@@ -357,7 +358,7 @@ fn emit(phase: &str, operation: &str, elapsed: Duration, operations: u64, bytes:
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for one `rusage` value.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return 0;
@@ -383,7 +384,7 @@ fn peak_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
+    fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
             status.lines().find_map(|line| {

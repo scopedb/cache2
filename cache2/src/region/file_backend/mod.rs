@@ -14,6 +14,8 @@
 
 //! File ownership, recovery, and lifecycle adapter for the Region core.
 
+use std::fmt;
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self};
@@ -24,57 +26,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-use super::FileRegionCore;
-use super::RegionAccessState;
-use super::RegionHealthLatch;
-use super::RegionManagerAuthority;
-use super::RegionShard;
-use super::guarded_index_result;
-use super::index::MAX_INDEX_PARTITIONS;
-use super::index::RegionIndex;
-use super::index::storage::IndexImageBinding;
-use super::index::storage::IndexPartitionRange;
-use super::index::storage::IndexPhysicalStats;
-use super::index::storage::PartitionedIndexStorage;
-use super::index::storage::canonical_index_partition_ranges;
-use super::index_storage_io_error;
-use super::manager::RegionManager;
-use super::recovery::DataSuperblock;
-use super::recovery::DataSuperblockProbe;
-use super::recovery::PartitionMetadataRecord;
-use super::recovery::PersistentId;
-use super::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
-use super::recovery::RECOVERY_PAGE_SIZE;
-use super::recovery::REGION_METADATA_PAGE_SIZE;
-use super::recovery::REGION_METADATA_PARTITIONS_PER_PAGE;
-use super::recovery::REGION_METADATA_REGIONS_PER_PAGE;
-use super::recovery::RecoveryImageHeader;
-use super::recovery::RecoveryImageHeaderProbe;
-use super::recovery::RecoveryState;
-use super::recovery::RegionMetadata;
-use super::recovery::RegionMetadataError;
-use super::recovery::RegionMetadataRecord;
-use super::recovery::RegionMetadataRoot;
-use super::recovery::RegionMetadataState;
-use super::recovery::STATE_FILE_SIZE;
-use super::recovery::STATE_SLOT_COUNT;
-use super::recovery::SelectedState;
-use super::recovery::StateBinding;
-use super::recovery::StatePageWrite;
-use super::recovery::StateRecord;
-use super::recovery::StateSelectionError;
-use super::recovery::clean_image_matches;
-use super::recovery::latest_state;
-use super::recovery::prepare_next_state;
-use super::recovery::prepare_running_barrier;
-use super::recovery::recovery_image_index_len;
-use super::region_metadata_io_error;
 #[cfg(test)]
-use super::runtime::HybridValueRead;
-use super::runtime::RegionDataPlane;
-use super::store::RecoveryPlan;
-use super::store::RegionBackend;
-use super::store::RegionStore;
+use tokio::runtime::Handle as TokioHandle;
+
 use crate::config::CacheConfig;
 use crate::config::IoMode;
 #[cfg(test)]
@@ -91,6 +45,57 @@ use crate::io::backend::WritePoint;
 use crate::io::backend::read_at_bounded;
 use crate::io::backend::read_exact_at;
 use crate::io::backend::write_all_at;
+use crate::region::FileRegionCore;
+use crate::region::RegionAccessState;
+use crate::region::RegionHealthLatch;
+use crate::region::RegionManagerAuthority;
+use crate::region::RegionShard;
+use crate::region::guarded_index_result;
+use crate::region::index::MAX_INDEX_PARTITIONS;
+use crate::region::index::RegionIndex;
+use crate::region::index::storage::IndexImageBinding;
+use crate::region::index::storage::IndexPartitionRange;
+use crate::region::index::storage::IndexPhysicalStats;
+use crate::region::index::storage::PartitionedIndexStorage;
+use crate::region::index::storage::canonical_index_partition_ranges;
+use crate::region::index_storage_io_error;
+use crate::region::manager::RegionManager;
+use crate::region::recovery::DataSuperblock;
+use crate::region::recovery::DataSuperblockProbe;
+use crate::region::recovery::PartitionMetadataRecord;
+use crate::region::recovery::PersistentId;
+use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::region::recovery::RECOVERY_PAGE_SIZE;
+use crate::region::recovery::REGION_METADATA_PAGE_SIZE;
+use crate::region::recovery::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region::recovery::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::RecoveryImageHeader;
+use crate::region::recovery::RecoveryImageHeaderProbe;
+use crate::region::recovery::RecoveryState;
+use crate::region::recovery::RegionMetadata;
+use crate::region::recovery::RegionMetadataError;
+use crate::region::recovery::RegionMetadataRecord;
+use crate::region::recovery::RegionMetadataRoot;
+use crate::region::recovery::RegionMetadataState;
+use crate::region::recovery::STATE_FILE_SIZE;
+use crate::region::recovery::STATE_SLOT_COUNT;
+use crate::region::recovery::SelectedState;
+use crate::region::recovery::StateBinding;
+use crate::region::recovery::StatePageWrite;
+use crate::region::recovery::StateRecord;
+use crate::region::recovery::StateSelectionError;
+use crate::region::recovery::clean_image_matches;
+use crate::region::recovery::latest_state;
+use crate::region::recovery::prepare_next_state;
+use crate::region::recovery::prepare_running_barrier;
+use crate::region::recovery::recovery_image_index_len;
+use crate::region::region_metadata_io_error;
+#[cfg(test)]
+use crate::region::runtime::HybridValueRead;
+use crate::region::runtime::RegionDataPlane;
+use crate::region::store::RecoveryPlan;
+use crate::region::store::RegionBackend;
+use crate::region::store::RegionStore;
 #[cfg(test)]
 use crate::snapshot::CacheSnapshot;
 #[cfg(test)]
@@ -263,7 +268,7 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
     async fn get_value_async(
         &self,
         key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &TokioHandle,
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?
             .data_plane()?
@@ -339,7 +344,7 @@ impl RegionFileSystem for SystemRegionFileSystem {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        match std::fs::remove_file(path) {
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -347,7 +352,7 @@ impl RegionFileSystem for SystemRegionFileSystem {
     }
 
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
-        std::fs::rename(source, destination)
+        fs::rename(source, destination)
     }
 
     fn sync_parent(&self, path: &Path) -> io::Result<()> {
@@ -470,7 +475,7 @@ where
         reason: &'static str,
         index_slots: usize,
         index_mapping_bytes: u64,
-        error: &impl std::fmt::Display,
+        error: &impl fmt::Display,
     ) {
         log::warn!(
             target: "cache2::recovery",

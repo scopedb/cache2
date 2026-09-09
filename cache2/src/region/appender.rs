@@ -18,12 +18,10 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
+use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
-use super::manager::RegionWriteSpan;
-use super::recovery::DATA_REGION_AREA_OFFSET;
-use super::recovery::DataGeometry;
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::backend::WritePoint;
 use crate::io::engine::BoundedIoRequest;
@@ -33,6 +31,9 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_io;
+use crate::region::manager::RegionWriteSpan;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+use crate::region::recovery::DataGeometry;
 
 pub struct RegionSpanSubmitError {
     pub error: io::Error,
@@ -57,8 +58,8 @@ impl fmt::Display for RegionSpanSubmitError {
     }
 }
 
-impl std::error::Error for RegionSpanSubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for RegionSpanSubmitError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(&self.error)
     }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::io;
+use std::mem::size_of;
 
 const EMPTY_VALUE: u32 = u32::MAX;
 const DELETED_VALUE: u32 = u32::MAX - 1;
@@ -61,7 +62,7 @@ impl FixedPrehashedMap {
 
     pub fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         Self::slot_count(maximum_entries)?
-            .checked_mul(std::mem::size_of::<FixedMapSlot>())
+            .checked_mul(size_of::<FixedMapSlot>())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fixed map is too large"))
     }
 
@@ -237,7 +238,7 @@ mod tests {
 
     #[test]
     fn fixed_map_slot_is_one_u64() {
-        assert_eq!(std::mem::size_of::<FixedMapSlot>(), 8);
+        assert_eq!(size_of::<FixedMapSlot>(), 8);
     }
 
     #[test]
@@ -247,7 +248,7 @@ mod tests {
         assert_eq!(FixedPrehashedMap::slot_count(40_960).unwrap(), 81_920);
         assert_eq!(
             FixedPrehashedMap::allocation_bytes(40_960).unwrap(),
-            40_960 * 2 * std::mem::size_of::<FixedMapSlot>()
+            40_960 * 2 * size_of::<FixedMapSlot>()
         );
     }
 

@@ -18,12 +18,11 @@
 //! manager or index mapping becomes visible. Index slots remain independently
 //! lazy-validated; this section contains only O(regions + index partitions) state.
 
+use std::error::Error as StdError;
 use std::fmt;
+use std::mem;
+use std::result;
 
-use super::DataSuperblock;
-use super::PersistentId;
-use super::RECOVERY_PAGE_SIZE;
-use super::RecoveryImageHeader;
 use crate::checksum::Crc32c;
 use crate::region::index::MAX_INDEX_PARTITIONS;
 use crate::region::index::MAX_PACKED_REGION_COUNT;
@@ -33,6 +32,10 @@ use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::index::storage::IndexStorageError;
 use crate::region::index::storage::canonical_index_partition_ranges;
 use crate::region::index::storage::validated_index_partition_ranges;
+use crate::region::recovery::DataSuperblock;
+use crate::region::recovery::PersistentId;
+use crate::region::recovery::RECOVERY_PAGE_SIZE;
+use crate::region::recovery::RecoveryImageHeader;
 
 pub const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
@@ -230,9 +233,9 @@ impl fmt::Display for RegionMetadataError {
     }
 }
 
-impl std::error::Error for RegionMetadataError {}
+impl StdError for RegionMetadataError {}
 
-type Result<T> = std::result::Result<T, RegionMetadataError>;
+type Result<T> = result::Result<T, RegionMetadataError>;
 
 impl RegionMetadata {
     pub fn encoded_len(&self) -> Result<u64> {
@@ -643,7 +646,7 @@ fn validate_regions(root: RegionMetadataRoot, regions: &[RegionMetadataRecord]) 
             RegionMetadataState::Sealed => (&mut sealed_seen, root.sealed_region_count),
         };
         if region.queue_ordinal >= state_count
-            || std::mem::replace(&mut seen[region.queue_ordinal as usize], 1) != 0
+            || mem::replace(&mut seen[region.queue_ordinal as usize], 1) != 0
         {
             return Err(RegionMetadataError::InvalidField("region_queue_ordinal"));
         }

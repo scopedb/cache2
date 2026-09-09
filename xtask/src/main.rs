@@ -15,7 +15,9 @@
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::iter;
 use std::path::Path;
+use std::process;
 use std::process::Command as StdCommand;
 
 use cargo_metadata::Metadata;
@@ -182,7 +184,7 @@ impl CommandLint {
             command_run("taplo", ["format", "--check"]);
             command_run("hawkeye", ["check"]);
         }
-        command_run("typos", std::iter::empty::<&str>());
+        command_run("typos", iter::empty::<&str>());
 
         let mut docs = nightly_cargo();
         docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs --cfg docsrs");
@@ -274,14 +276,14 @@ fn run(mut command: StdCommand) {
     println!("{command:?}");
     match command.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Ok(status) => process::exit(status.code().unwrap_or(1)),
         Err(error) => fail(&format!("failed to run {command:?}: {error}")),
     }
 }
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
-    std::process::exit(2)
+    process::exit(2)
 }
 
 #[cfg(test)]

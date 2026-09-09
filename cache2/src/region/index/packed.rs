@@ -14,6 +14,7 @@
 
 //! Shared packed-location and index-entry primitives for the index.
 
+use std::error::Error as StdError;
 use std::fmt;
 
 const REGION_BITS: u32 = 20;
@@ -208,7 +209,7 @@ impl fmt::Display for PackedLocationError {
     }
 }
 
-impl std::error::Error for PackedLocationError {}
+impl StdError for PackedLocationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexEntry {

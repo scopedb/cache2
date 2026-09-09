@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::env;
+use std::fmt;
+use std::fs;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -49,6 +54,9 @@ use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::runtime::Handle as TokioHandle;
+use tokio::runtime::Runtime as TokioRuntime;
 
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
@@ -243,10 +251,7 @@ impl SoakFiles {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            data: directory.join(format!(
-                "cache2-soak-{}-{timestamp}.cache",
-                std::process::id()
-            )),
+            data: directory.join(format!("cache2-soak-{}-{timestamp}.cache", process::id())),
             cleanup_on_drop: AtomicBool::new(false),
         }
     }
@@ -263,7 +268,7 @@ impl SoakFiles {
             sidecar(&self.data, ".image.next"),
         ]
         .into_iter()
-        .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+        .try_fold(0_u64, |total, path| match fs::metadata(path) {
             Ok(metadata) => total
                 .checked_add(metadata.len())
                 .ok_or_else(|| invalid("logical disk byte count overflow")),
@@ -288,7 +293,7 @@ impl Drop for SoakFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -359,7 +364,7 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -367,7 +372,7 @@ fn main() -> io::Result<()> {
 fn run_benchmark() -> io::Result<()> {
     init_logforth()?;
     let config = SoakConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
         .worker_threads(config.readers.max(2))
         .thread_name("cache2-soak")
         .enable_time()
@@ -499,7 +504,7 @@ fn run_benchmark() -> io::Result<()> {
             .ok_or_else(|| invalid("soak sample deadline is too far in the future"))?;
         let mut sample_error = None;
         while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
-            let wake_at = std::cmp::min(next_sample, deadline);
+            let wake_at = min(next_sample, deadline);
             if let Some(remaining) = wake_at.checked_duration_since(Instant::now()) {
                 thread::sleep(remaining);
             }
@@ -643,7 +648,7 @@ fn init_logforth() -> io::Result<()> {
 }
 
 fn open_cache(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &TokioRuntime,
     files: &SoakFiles,
     config: &CacheConfig,
 ) -> io::Result<Cache> {
@@ -770,7 +775,7 @@ fn run_reader(
     next_read: &AtomicU64,
     stop: &AtomicBool,
     counters: &SoakCounters,
-    runtime: &tokio::runtime::Handle,
+    runtime: &TokioHandle,
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
     while !stop.load(Ordering::Acquire) {
@@ -809,7 +814,7 @@ fn run_reader(
 }
 
 fn verify_warm_reopen(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &TokioRuntime,
     cache: &Cache,
     expected: &[AtomicU64],
     value_size_count: u64,
@@ -1137,7 +1142,7 @@ fn pace(interval: Duration) {
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for one `rusage` value.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return 0;
@@ -1158,7 +1163,7 @@ fn peak_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> io::Result<u64> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
+    let status = fs::read_to_string("/proc/self/status")?;
     let kib = status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))

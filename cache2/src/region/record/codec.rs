@@ -19,20 +19,23 @@
 //! no allocation. Payload preparation computes the CRC before the append
 //! transaction copies the borrowed key and value into staging.
 
+use std::error::Error as StdError;
 use std::fmt;
 
 use hashcrew::xxhash::xxh3_64_with_seed;
 
-use super::MAX_KEY_SIZE;
-use super::RECORD_ALIGNMENT;
-use super::RECORD_HEADER_SIZE;
-use super::RecordHeader;
 use crate::checksum::Crc32c;
+#[cfg(test)]
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::region::index::IndexEntry;
 use crate::region::index::MAX_RECORD_LEN;
 use crate::region::index::PackedLocation;
 use crate::region::index::PackedLocationError;
 use crate::region::manager::RegionAppendReservation;
+use crate::region::record::MAX_KEY_SIZE;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::RECORD_HEADER_SIZE;
+use crate::region::record::RecordHeader;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordEncodeError {
@@ -74,8 +77,8 @@ impl fmt::Display for RecordEncodeError {
     }
 }
 
-impl std::error::Error for RecordEncodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for RecordEncodeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::InvalidLocation(error) => Some(error),
             _ => None,
@@ -301,7 +304,7 @@ mod tests {
             required_record_bytes(key_len, value_len).unwrap() as usize,
             expected
         );
-        assert!(!expected.is_multiple_of(crate::io::backend::DIRECT_IO_ALIGNMENT));
+        assert!(!expected.is_multiple_of(DIRECT_IO_ALIGNMENT));
     }
 
     #[test]

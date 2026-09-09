@@ -21,15 +21,15 @@
 
 use std::collections::VecDeque;
 
-use super::record::RECORD_ALIGNMENT;
-use super::recovery::PartitionMetadataRecord;
-use super::recovery::PersistentId;
-use super::recovery::RegionMetadata;
-use super::recovery::RegionMetadataError;
-use super::recovery::RegionMetadataRecord;
-use super::recovery::RegionMetadataRoot;
-use super::recovery::RegionMetadataState;
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::recovery::PartitionMetadataRecord;
+use crate::region::recovery::PersistentId;
+use crate::region::recovery::RegionMetadata;
+use crate::region::recovery::RegionMetadataError;
+use crate::region::recovery::RegionMetadataRecord;
+use crate::region::recovery::RegionMetadataRoot;
+use crate::region::recovery::RegionMetadataState;
 use crate::snapshot::RegionSnapshot;
 
 const UNASSIGNED_REGION: u32 = u32::MAX;

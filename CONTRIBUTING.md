@@ -56,6 +56,10 @@ Use `module/mod.rs` for modules with child files; keep leaf modules in a single 
 
 Declare restricted visibility at the module boundary and use `pub` for items in that module's API.
 
+Use imports for referenced symbols. Keep a short module qualifier or use an explicit alias when a bare name would obscure its origin or conflict with another symbol, such as `io::Error` or `ConfiguredIoEngine`.
+
+Start intra-crate imports at `crate`; reserve `use super::*` for test modules.
+
 ## Documentation
 
 Keep each Markdown prose paragraph and list item on one source line.
