@@ -936,6 +936,7 @@ fn page_crc_matches(page: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::assert_golden;
 
     const TEST_INDEX_SLOTS: u64 = RECOVERY_IMAGE_SLOTS_PER_PAGE * 16;
     const TEST_INDEX_LEN: u64 = RECOVERY_PAGE_SIZE as u64 * 16;
@@ -945,37 +946,6 @@ mod tests {
 
     fn id(byte: u8) -> PersistentId {
         PersistentId::from_bytes([byte; 16]).unwrap()
-    }
-
-    fn sparse_golden(input: &str) -> Vec<u8> {
-        let mut output: Option<Vec<u8>> = None;
-        for raw_line in input.lines() {
-            let line = raw_line.split('#').next().unwrap().trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut fields = line.split_whitespace();
-            let first = fields.next().unwrap();
-            if first == "length" {
-                let length = fields.next().unwrap().parse::<usize>().unwrap();
-                assert!(output.replace(vec![0_u8; length]).is_none());
-                continue;
-            }
-            let offset = usize::from_str_radix(first, 16).unwrap();
-            let encoded = fields.next().unwrap();
-            assert_eq!(encoded.len() % 2, 0);
-            let bytes = encoded
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect::<Vec<_>>();
-            let output = output.as_mut().expect("golden length must come first");
-            output[offset..offset + bytes.len()].copy_from_slice(&bytes);
-            assert!(fields.next().is_none());
-        }
-        output.expect("golden fixture must declare its length")
     }
 
     fn data_superblock() -> DataSuperblock {
@@ -1037,11 +1007,10 @@ mod tests {
     #[test]
     fn data_superblock_matches_committed_golden_bytes() {
         let data = data_superblock();
-        let data_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/data_superblock.golden"
-        ));
-
-        assert_eq!(data.encode().unwrap().as_slice(), data_golden);
+        let data_golden = assert_golden(
+            &data.encode().unwrap(),
+            include_str!("fixtures/format_v1/data_superblock.golden"),
+        );
         assert_eq!(
             DataSuperblock::probe(&data_golden),
             DataSuperblockProbe::Valid(data)
@@ -1051,11 +1020,10 @@ mod tests {
     #[test]
     fn clean_state_matches_committed_golden_bytes() {
         let clean = record(19, RecoveryState::Clean);
-        let clean_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/clean_state.golden"
-        ));
-
-        assert_eq!(clean.encode().unwrap().as_slice(), clean_golden);
+        let clean_golden = assert_golden(
+            &clean.encode().unwrap(),
+            include_str!("fixtures/format_v1/clean_state.golden"),
+        );
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
     }
 
@@ -1063,11 +1031,10 @@ mod tests {
     fn recovery_image_header_matches_committed_golden_bytes() {
         let data = data_superblock();
         let header = image_header();
-        let image_golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/recovery_image_header.golden"
-        ));
-
-        assert_eq!(header.encode().unwrap().as_slice(), image_golden);
+        let image_golden = assert_golden(
+            &header.encode().unwrap(),
+            include_str!("fixtures/format_v1/recovery_image_header.golden"),
+        );
         assert_eq!(
             RecoveryImageHeader::probe(&image_golden),
             RecoveryImageHeaderProbe::Valid(header)

@@ -21,33 +21,7 @@
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]
 pub mod benchmarking;
-mod cache;
-mod checksum;
-mod config;
 pub mod error;
-mod eviction;
-mod format;
-mod hashing;
-mod index;
-mod index_storage;
-mod io_backend;
-mod io_engine;
-mod memory;
-#[cfg(test)]
-mod property_tests;
-mod record_codec;
-mod recovery;
-mod region;
-mod region_appender;
-mod region_index;
-mod region_manager;
-mod region_metadata;
-mod region_reader;
-mod region_runtime;
-mod region_staging;
-mod region_store;
-mod resources;
-mod snapshot;
 
 pub use cache::Cache;
 pub use cache::CacheTier;
@@ -79,3 +53,33 @@ pub use snapshot::CacheSnapshot;
 pub use snapshot::DetailedCacheSnapshot;
 pub use snapshot::RegionSnapshot;
 pub use snapshot::StartupMode;
+
+mod cache;
+mod checksum;
+mod config;
+mod eviction;
+mod format;
+mod hashing;
+mod index;
+mod index_storage;
+mod io_backend;
+mod io_engine;
+mod memory;
+mod record_codec;
+mod recovery;
+mod region;
+mod region_appender;
+mod region_index;
+mod region_manager;
+mod region_metadata;
+mod region_reader;
+mod region_runtime;
+mod region_staging;
+mod region_store;
+mod resources;
+mod snapshot;
+
+#[cfg(test)]
+mod fixtures;
+#[cfg(test)]
+mod property_tests;
