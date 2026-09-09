@@ -270,14 +270,14 @@ io_uring is feature-gated and experimental. Its three pools configure physical r
 
 ```rust
 use cache2::{
-    IoEngine, IoMode, IoUringConfig, IoUringPoolConfig,
+    IoEngineConfig, IoMode, IoUringConfig, IoUringPoolConfig,
     IoUringSqPollConfig, RuntimeOptions,
 };
 
 let read = IoUringPoolConfig::new(1, 128)
     .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
 let runtime = RuntimeOptions {
-    io_engine: IoEngine::IoUring(IoUringConfig::new(
+    io_engine: IoEngineConfig::IoUring(IoUringConfig::new(
         read,
         IoUringPoolConfig::new(1, 64),
         IoUringPoolConfig::new(1, 1),
