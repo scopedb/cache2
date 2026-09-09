@@ -21,42 +21,46 @@
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]
 pub mod benchmarking;
-pub mod error;
 
-pub use cache::Cache;
-pub use cache::CacheTier;
-pub use cache::Value;
-pub use config::CacheConfig;
-pub use config::IoEngine;
-pub use config::IoMode;
-pub use config::IoUringConfig;
-pub use config::IoUringPoolConfig;
-pub use config::IoUringSqPollConfig;
-pub use config::L1EvictionPolicy;
-pub use config::PosixIoConfig;
-pub use config::ReadAdmission;
-pub use config::RuntimeOptions;
-pub use config::StorageLayout;
-pub use config::StorageOptions;
-pub use error::Error;
-pub use error::ErrorKind;
-pub use error::ErrorOperation;
-pub use error::Result;
-pub use snapshot::CacheHealth;
-pub use snapshot::CacheIndexSnapshot;
-pub use snapshot::CacheIoDirectionSnapshot;
-pub use snapshot::CacheIoPathSnapshot;
-pub use snapshot::CacheIoSnapshot;
-pub use snapshot::CacheL1Snapshot;
-pub use snapshot::CacheReclaimSnapshot;
-pub use snapshot::CacheSnapshot;
-pub use snapshot::DetailedCacheSnapshot;
-pub use snapshot::RegionSnapshot;
-pub use snapshot::StartupMode;
+pub mod error;
+pub use self::error::Error;
+pub use self::error::ErrorKind;
+pub use self::error::ErrorOperation;
+pub use self::error::Result;
 
 mod cache;
-mod checksum;
+pub use self::cache::Cache;
+pub use self::cache::CacheTier;
+pub use self::cache::Value;
+
 mod config;
+pub use self::config::CacheConfig;
+pub use self::config::IoEngine;
+pub use self::config::IoMode;
+pub use self::config::IoUringConfig;
+pub use self::config::IoUringPoolConfig;
+pub use self::config::IoUringSqPollConfig;
+pub use self::config::L1EvictionPolicy;
+pub use self::config::PosixIoConfig;
+pub use self::config::ReadAdmission;
+pub use self::config::RuntimeOptions;
+pub use self::config::StorageLayout;
+pub use self::config::StorageOptions;
+
+mod snapshot;
+pub use self::snapshot::CacheHealth;
+pub use self::snapshot::CacheIndexSnapshot;
+pub use self::snapshot::CacheIoDirectionSnapshot;
+pub use self::snapshot::CacheIoPathSnapshot;
+pub use self::snapshot::CacheIoSnapshot;
+pub use self::snapshot::CacheL1Snapshot;
+pub use self::snapshot::CacheReclaimSnapshot;
+pub use self::snapshot::CacheSnapshot;
+pub use self::snapshot::DetailedCacheSnapshot;
+pub use self::snapshot::RegionSnapshot;
+pub use self::snapshot::StartupMode;
+
+mod checksum;
 mod eviction;
 mod format;
 mod hashing;
@@ -77,7 +81,6 @@ mod region_runtime;
 mod region_staging;
 mod region_store;
 mod resources;
-mod snapshot;
 
 #[cfg(test)]
 mod fixtures;

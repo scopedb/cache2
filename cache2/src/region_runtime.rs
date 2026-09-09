@@ -35,16 +35,12 @@ use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 use asyncband::watch;
 
-#[cfg(test)]
-use crate::config::ReadAdmission;
-
-mod metrics;
-
-pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
 use crate::config::CacheConfig;
 use crate::config::IoMode;
 use crate::config::IoPoolTopology;
+#[cfg(test)]
+use crate::config::ReadAdmission;
 use crate::config::RuntimeOptions;
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
@@ -93,6 +89,9 @@ use crate::snapshot::CacheIoDirectionSnapshot;
 use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
+
+mod metrics;
+pub(crate) use self::metrics::ActivityMetrics;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);

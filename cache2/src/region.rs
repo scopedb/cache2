@@ -19,8 +19,8 @@
 //! backend-independent shutdown state machine remains in `region_store`.
 
 pub(crate) mod core;
-mod file_backend;
 
-pub(crate) use file_backend::FileRegionBackend;
-pub(crate) use file_backend::RegionFiles;
-pub(crate) use file_backend::SystemRegionFileSystem;
+mod file_backend;
+pub(crate) use self::file_backend::FileRegionBackend;
+pub(crate) use self::file_backend::RegionFiles;
+pub(crate) use self::file_backend::SystemRegionFileSystem;
