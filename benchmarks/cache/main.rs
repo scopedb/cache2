@@ -34,7 +34,7 @@ use benchmarks::report::emit_cache_report;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheTier;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -78,7 +78,7 @@ struct BenchConfig {
     reclaim_workers: usize,
     write_clients: usize,
     clients: usize,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     statistics_enabled: bool,
@@ -113,12 +113,12 @@ impl BenchConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix(PosixIoConfig::new(
+            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
                 read_io_workers,
                 write_io_workers,
                 reclaim_workers,
             )),
-            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
                 IoUringPoolConfig::new(
                     read_io_workers,
                     read_io_workers
@@ -301,7 +301,7 @@ impl BenchConfig {
         match (self.io_engine, self.read_io_wait_timeout.is_zero()) {
             // Keep the benchmark at the POSIX engine's exact admission depth.
             // Saturation misses belong in the soak, not the device-rate phase.
-            (IoEngine::Posix(_), true) => self.clients.min(self.read_io_workers),
+            (IoEngineConfig::Posix(_), true) => self.clients.min(self.read_io_workers),
             _ => self.clients,
         }
     }

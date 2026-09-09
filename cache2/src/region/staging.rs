@@ -18,7 +18,6 @@
 
 use std::fmt;
 use std::mem;
-use std::mem::size_of;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 

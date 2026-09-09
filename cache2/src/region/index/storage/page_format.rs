@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem::size_of;
 
 use crate::checksum::Crc32c;
 use crate::region::index::storage::CorruptPageReason;

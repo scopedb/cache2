@@ -38,7 +38,7 @@ use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -213,7 +213,7 @@ struct HarnessConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -240,12 +240,12 @@ impl HarnessConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix(PosixIoConfig::new(
+            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
                 read_io_workers,
                 write_io_workers,
                 reclaim_workers,
             )),
-            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
                 IoUringPoolConfig::new(
                     read_io_workers,
                     read_io_workers
@@ -414,7 +414,7 @@ struct EffectiveConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,

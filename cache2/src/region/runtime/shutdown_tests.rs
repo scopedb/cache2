@@ -28,6 +28,7 @@ use crate::io::engine::IoRequest;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::RequestId;
 use crate::io::engine::SubmitError;
+use crate::IoEngineConfig;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -230,7 +231,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let config = RuntimeOptions {
         append_shards: 1,
         l1_capacity_bytes: 0,
-        io_engine: crate::config::IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(

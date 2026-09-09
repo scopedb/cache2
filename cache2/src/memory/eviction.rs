@@ -18,7 +18,6 @@
 //! the optional CLOCK or S3-FIFO metadata and chooses bounded victims.
 
 use std::io;
-use std::mem::size_of;
 
 use crate::config::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;

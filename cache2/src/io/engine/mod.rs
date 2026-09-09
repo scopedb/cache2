@@ -44,6 +44,7 @@ use std::time::Instant;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 
+use crate::IoEngineConfig;
 #[cfg(unix)]
 use crate::config::IoUringPoolConfig;
 use crate::io::backend::IoBackend;
@@ -1961,13 +1962,13 @@ pub fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
     posix_workers: usize,
-    kind: crate::config::IoEngine,
+    kind: IoEngineConfig,
     io_uring_config: Option<IoUringPoolConfig>,
     statistics_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match kind {
-        crate::config::IoEngine::Posix(_) => BackendIoEngine::new_with_files_and_workers(
+        IoEngineConfig::Posix(_) => BackendIoEngine::new_with_files_and_workers(
             files,
             max_in_flight,
             posix_workers,
@@ -1975,7 +1976,7 @@ pub fn build_file_engine(
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        crate::config::IoEngine::IoUring(_) => {
+        IoEngineConfig::IoUring(_) => {
             let _ = posix_workers;
             #[cfg(all(
                 feature = "io-uring",

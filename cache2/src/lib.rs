@@ -34,7 +34,7 @@ pub use self::cache::Value;
 
 mod config;
 pub use self::config::CacheConfig;
-pub use self::config::IoEngine;
+pub use self::config::IoEngineConfig;
 pub use self::config::IoMode;
 pub use self::config::IoUringConfig;
 pub use self::config::IoUringPoolConfig;

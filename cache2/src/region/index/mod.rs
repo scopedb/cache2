@@ -25,7 +25,6 @@ use std::array;
 #[cfg(feature = "benchmarking")]
 use std::cell::Cell;
 use std::io;
-use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;

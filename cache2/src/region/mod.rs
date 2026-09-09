@@ -16,7 +16,6 @@
 
 use std::fmt;
 use std::io;
-use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;

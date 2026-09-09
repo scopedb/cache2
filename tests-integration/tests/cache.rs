@@ -40,7 +40,7 @@ use cache2::DetailedCacheSnapshot;
 use cache2::Error;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
 #[cfg(not(target_os = "linux"))]
@@ -67,7 +67,7 @@ fn test_storage() -> StorageLayout {
 
 fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
     RuntimeOptions {
-        io_engine: IoEngine::Posix(PosixIoConfig::new(workers, workers, 1)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(workers, workers, 1)),
         append_shards,
         l1_capacity_bytes: 4 * 1024 * 1024,
         managed_memory_limit_bytes: 32 * 1024 * 1024,
@@ -512,7 +512,7 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
 fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeOptions {
-        io_engine: IoEngine::IoUring(IoUringConfig::default()),
+        io_engine: IoEngineConfig::IoUring(IoUringConfig::default()),
         write_flush_threshold_bytes: 128 * 1024,
         statistics: false,
         ..test_runtime_options(1, 2)
@@ -569,7 +569,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     cache.close_warm().await.unwrap();
 
     let retuned = RuntimeOptions {
-        io_engine: IoEngine::Posix(PosixIoConfig::new(7, 2, 2)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(7, 2, 2)),
         l1_capacity_bytes: 2 * 1024 * 1024,
         l1_eviction_policy: L1EvictionPolicy::S3Fifo,
         l1_shards: 7,

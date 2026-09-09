@@ -28,7 +28,7 @@ This release keeps the version 1 on-disk format and requires no disk migration. 
 
 ### Breaking Changes
 
-- `IoEngine` now carries backend-specific topology. Configure POSIX worker counts with `PosixIoConfig`; configure independent io_uring pools with `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods were removed.
+- `IoEngineConfig` now carries backend-specific topology. Configure POSIX worker counts with `PosixIoConfig`; configure independent io_uring pools with `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods were removed.
 
 ### Improvements
 

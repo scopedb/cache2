@@ -764,7 +764,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
         files,
         4,
         4,
-        crate::config::IoEngine::Posix(PosixIoConfig::new(4, 4, 1)),
+        IoEngineConfig::Posix(PosixIoConfig::new(4, 4, 1)),
         None,
         false,
         false,

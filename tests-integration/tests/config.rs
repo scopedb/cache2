@@ -17,7 +17,7 @@ use std::time::Duration;
 use cache2::CacheConfig;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoConfig;
 use cache2::ReadAdmission;
@@ -100,7 +100,7 @@ fn large_layout_memory_floor_includes_each_l1_policy() {
         let runtime = RuntimeOptions {
             l1_capacity_bytes: 10 * GIB,
             managed_memory_limit_bytes: 15 * GIB,
-            io_engine: IoEngine::Posix(PosixIoConfig::new(4, 4, 2)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(4, 4, 2)),
             l1_shards: 64,
             l1_eviction_policy: policy,
             ..RuntimeOptions::default()
@@ -144,7 +144,7 @@ fn automatic_wait_capacity_uses_the_selected_engine() {
         let config = CacheConfig::new(
             storage.clone(),
             RuntimeOptions {
-                io_engine: IoEngine::Posix(PosixIoConfig::new(workers, 1, 1)),
+                io_engine: IoEngineConfig::Posix(PosixIoConfig::new(workers, 1, 1)),
                 ..options.clone()
             },
         )
@@ -204,23 +204,23 @@ fn invalid_runtime_options_are_rejected_when_building_configuration() {
             ..config
         }),
         ("zero-reclaim-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 0)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 0)),
             ..config
         }),
         ("too-many-reclaim-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 3)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 3)),
             ..config
         }),
         ("zero-read-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(0, 1, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(0, 1, 1)),
             ..config
         }),
         ("zero-write-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 0, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 0, 1)),
             ..config
         }),
         ("too-many-read-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(4097, 1, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(4097, 1, 1)),
             ..config
         }),
         ("zero-read-wait-capacity", |config| RuntimeOptions {
@@ -238,7 +238,7 @@ fn invalid_runtime_options_are_rejected_when_building_configuration() {
             ..config
         }),
         ("too-many-write-workers", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 4097, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 4097, 1)),
             ..config
         }),
         ("excessive-read-wait", |config| RuntimeOptions {
@@ -254,7 +254,7 @@ fn invalid_runtime_options_are_rejected_when_building_configuration() {
             ..config
         }),
         ("fixed-footprint-exceeds-budget", |config| RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(2, 2, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(2, 2, 1)),
             l1_capacity_bytes: 0,
             managed_memory_limit_bytes: 2 * 1024 * 1024,
             write_flush_threshold_bytes: 128 * 1024,

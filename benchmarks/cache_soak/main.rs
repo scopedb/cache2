@@ -37,7 +37,7 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -85,7 +85,7 @@ struct SoakConfig {
     final_warm_verify: bool,
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -1243,17 +1243,17 @@ fn parse_io_engine(
     read_workers: usize,
     write_workers: usize,
     reclaim_workers: usize,
-) -> io::Result<IoEngine> {
+) -> io::Result<IoEngineConfig> {
     match env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
-        "posix" => Ok(IoEngine::Posix(PosixIoConfig::new(
+        "posix" => Ok(IoEngineConfig::Posix(PosixIoConfig::new(
             read_workers,
             write_workers,
             reclaim_workers,
         ))),
-        "io-uring" => Ok(IoEngine::IoUring(IoUringConfig::new(
+        "io-uring" => Ok(IoEngineConfig::IoUring(IoUringConfig::new(
             io_uring_read_pool(read_workers)?,
             io_uring_write_pool(write_workers)?,
             IoUringPoolConfig::new(reclaim_workers, reclaim_workers),

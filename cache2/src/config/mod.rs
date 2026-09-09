@@ -17,7 +17,7 @@
 use crate::region::recovery::DataGeometry;
 
 mod runtime;
-pub use self::runtime::IoEngine;
+pub use self::runtime::IoEngineConfig;
 pub use self::runtime::IoMode;
 pub use self::runtime::IoPoolTopology;
 pub use self::runtime::IoUringConfig;

@@ -20,7 +20,6 @@
 
 use std::hint::spin_loop;
 use std::io;
-use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
 #[cfg(test)]

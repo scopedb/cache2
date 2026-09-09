@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::io;
-use std::mem::size_of;
 
 const EMPTY_VALUE: u32 = u32::MAX;
 const DELETED_VALUE: u32 = u32::MAX - 1;
