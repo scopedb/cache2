@@ -936,7 +936,7 @@ fn page_crc_matches(page: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format_fixtures::assert_golden;
+    use crate::fixtures::assert_golden;
 
     const TEST_INDEX_SLOTS: u64 = RECOVERY_IMAGE_SLOTS_PER_PAGE * 16;
     const TEST_INDEX_LEN: u64 = RECOVERY_PAGE_SIZE as u64 * 16;
@@ -1009,7 +1009,7 @@ mod tests {
         let data = data_superblock();
         let data_golden = assert_golden(
             &data.encode().unwrap(),
-            include_str!("format_fixtures/format_v1/data_superblock.golden"),
+            include_str!("fixtures/format_v1/data_superblock.golden"),
         );
         assert_eq!(
             DataSuperblock::probe(&data_golden),
@@ -1022,7 +1022,7 @@ mod tests {
         let clean = record(19, RecoveryState::Clean);
         let clean_golden = assert_golden(
             &clean.encode().unwrap(),
-            include_str!("format_fixtures/format_v1/clean_state.golden"),
+            include_str!("fixtures/format_v1/clean_state.golden"),
         );
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
     }
@@ -1033,7 +1033,7 @@ mod tests {
         let header = image_header();
         let image_golden = assert_golden(
             &header.encode().unwrap(),
-            include_str!("format_fixtures/format_v1/recovery_image_header.golden"),
+            include_str!("fixtures/format_v1/recovery_image_header.golden"),
         );
         assert_eq!(
             RecoveryImageHeader::probe(&image_golden),

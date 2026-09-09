@@ -8,15 +8,13 @@ The repository separates published code from development-only consumers:
 
 | Path                 | Purpose                                                                                       |
 |----------------------|-----------------------------------------------------------------------------------------------|
-| `cache2/`            | The publishable `cache2` crate, private implementation tests, and persistent-format fixtures. |
+| `cache2/`            | The publishable `cache2` crate and private implementation tests.                              |
 | `tests-integration/` | End-to-end tests that exercise only the public `cache2` API.                                  |
 | `benchmarks/`        | Standalone benchmark targets and workload-specific harnesses.                                 |
 | `examples/`          | Runnable programs that demonstrate complete integrations.                                     |
 | `xtask/`             | The `cargo x` repository workflow entrypoint.                                                 |
 
-Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`. Persistent-format tests use private codecs and remain library unit tests; their shared assertion helper and versioned byte fixtures live in `cache2/src/format_fixtures`.
-
-Format fixtures preserve exact encoded bytes, including checksums and zero padding, and provide independent inputs to decoder compatibility tests. Keep their sparse hexadecimal representation reviewable in Git. An intentional byte change requires a format-version decision; these fixtures are not regenerated as routine snapshot updates. See the [format fixture notes](cache2/src/format_fixtures/format_v1/README.md) for their contents and a focused test command.
+Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`.
 
 ## Repository workflows
 

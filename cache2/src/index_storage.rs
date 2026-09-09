@@ -1852,7 +1852,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::format_fixtures::assert_golden;
+    use crate::fixtures::assert_golden;
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -2300,7 +2300,7 @@ mod tests {
             .unwrap();
         assert_golden(
             &encoded,
-            include_str!("format_fixtures/format_v1/index_page.golden"),
+            include_str!("fixtures/format_v1/index_page.golden"),
         );
     }
 

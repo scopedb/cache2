@@ -1206,7 +1206,7 @@ fn put_u64(output: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format_fixtures::assert_golden;
+    use crate::fixtures::assert_golden;
 
     fn id(byte: u8) -> PersistentId {
         PersistentId::from_bytes([byte; 16]).unwrap()
@@ -1355,7 +1355,7 @@ mod tests {
         let encoded = expected.encode().unwrap();
         let golden = assert_golden(
             &encoded,
-            include_str!("format_fixtures/format_v1/region_metadata.golden"),
+            include_str!("fixtures/format_v1/region_metadata.golden"),
         );
         assert_eq!(RegionMetadata::decode(&golden).unwrap(), expected);
     }

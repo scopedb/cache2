@@ -192,7 +192,7 @@ fn put_u64(output: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format_fixtures::assert_golden;
+    use crate::fixtures::assert_golden;
 
     #[test]
     fn value_record_matches_committed_golden_bytes() {
@@ -215,7 +215,7 @@ mod tests {
         encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()].copy_from_slice(&payload);
         let golden = assert_golden(
             &encoded,
-            include_str!("format_fixtures/format_v1/value_record.golden"),
+            include_str!("fixtures/format_v1/value_record.golden"),
         );
         assert_eq!(
             RecordHeader::decode(&golden[..RECORD_HEADER_SIZE]),
