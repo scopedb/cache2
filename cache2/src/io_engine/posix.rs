@@ -14,24 +14,16 @@
 
 use super::*;
 
-/// Reference engine: a small fixed worker pool executes exact operations
-/// through the existing fault-injectable positioned-I/O backend.
-#[derive(Clone)]
-pub(crate) struct BackendIoEngine {
-    pub(super) inner: Arc<RuntimeInner>,
-    backend: Arc<dyn IoBackend>,
-}
-
 impl BackendIoEngine {
     #[cfg(unix)]
     #[cfg(test)]
-    pub(crate) fn new_with_files(files: RuntimeFileSet, max_in_flight: usize) -> io::Result<Self> {
+    pub fn new_with_files(files: RuntimeFileSet, max_in_flight: usize) -> io::Result<Self> {
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
         Self::new(backend, max_in_flight)
     }
 
     #[cfg(unix)]
-    pub(crate) fn new_with_files_and_workers(
+    pub fn new_with_files_and_workers(
         files: RuntimeFileSet,
         max_in_flight: usize,
         worker_count: usize,
@@ -50,12 +42,12 @@ impl BackendIoEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
+    pub fn new(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
         Self::new_with_workers(backend, max_in_flight, max_in_flight.min(4))
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_read_wait(
+    pub fn new_with_read_wait(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
     ) -> io::Result<Self> {
@@ -69,7 +61,7 @@ impl BackendIoEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_workers(
+    fn new_with_workers(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
@@ -77,7 +69,7 @@ impl BackendIoEngine {
         Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true, false)
     }
 
-    pub(super) fn new_with_workers_and_statistics(
+    pub fn new_with_workers_and_statistics(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,

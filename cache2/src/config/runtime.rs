@@ -15,6 +15,11 @@
 use std::io;
 use std::time::Duration;
 
+use super::CacheConfig;
+use super::StorageLayout;
+use crate::error::ErrorOperation;
+use crate::error::Result;
+use crate::error::from_io;
 use crate::io_engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 use crate::io_engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io_engine::io_uring_extra_memory_bytes;
@@ -26,9 +31,9 @@ use crate::resources::CACHE_THREAD_STACK_BYTES;
 use crate::resources::MAX_CONFIG_COUNT;
 
 const DEFAULT_L1_SHARDS: usize = 32;
-pub(crate) const MAX_APPEND_SHARDS: u32 = 256;
-pub(crate) const MAX_WRITE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_READ_IO_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_APPEND_SHARDS: u32 = 256;
+pub const MAX_WRITE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_READ_IO_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_L1_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_APPEND_SHARDS: u32 = 4;
 const DEFAULT_POSIX_IO_WORKERS: usize = 4;
@@ -260,7 +265,7 @@ impl Default for IoEngine {
 }
 
 impl IoEngine {
-    pub(crate) const fn is_available(self) -> bool {
+    const fn is_available(self) -> bool {
         match self {
             Self::Posix(_) => true,
             Self::IoUring(_) => cfg!(all(
@@ -276,42 +281,38 @@ impl IoEngine {
             )),
         }
     }
-
-    pub(crate) const fn read_topology(self) -> IoPoolTopology {
-        match self {
-            Self::Posix(config) => IoPoolTopology::posix(config.read_workers),
-            Self::IoUring(config) => IoPoolTopology::io_uring(config.read),
-        }
-    }
-
-    pub(crate) const fn write_topology(self) -> IoPoolTopology {
-        match self {
-            Self::Posix(config) => IoPoolTopology::posix(config.write_workers),
-            Self::IoUring(config) => IoPoolTopology::io_uring(config.write),
-        }
-    }
-
-    pub(crate) const fn reclaim_topology(self) -> IoPoolTopology {
-        match self {
-            Self::Posix(config) => IoPoolTopology::posix(config.reclaim_workers),
-            Self::IoUring(config) => IoPoolTopology::io_uring(config.reclaim),
-        }
-    }
-
-    pub(crate) const fn is_posix(self) -> bool {
-        matches!(self, Self::Posix(_))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IoPoolTopology {
-    pub(crate) engine_count: usize,
-    pub(crate) max_in_flight: usize,
-    pub(crate) worker_threads: usize,
-    pub(crate) io_uring: Option<IoUringPoolConfig>,
+pub struct IoPoolTopology {
+    pub engine_count: usize,
+    pub max_in_flight: usize,
+    pub worker_threads: usize,
+    pub io_uring: Option<IoUringPoolConfig>,
 }
 
 impl IoPoolTopology {
+    pub const fn read(engine: IoEngine) -> Self {
+        match engine {
+            IoEngine::Posix(config) => Self::posix(config.read_workers),
+            IoEngine::IoUring(config) => Self::io_uring(config.read),
+        }
+    }
+
+    pub const fn write(engine: IoEngine) -> Self {
+        match engine {
+            IoEngine::Posix(config) => Self::posix(config.write_workers),
+            IoEngine::IoUring(config) => Self::io_uring(config.write),
+        }
+    }
+
+    pub const fn reclaim(engine: IoEngine) -> Self {
+        match engine {
+            IoEngine::Posix(config) => Self::posix(config.reclaim_workers),
+            IoEngine::IoUring(config) => Self::io_uring(config.reclaim),
+        }
+    }
+
     const fn posix(workers: usize) -> Self {
         Self {
             engine_count: 1,
@@ -330,7 +331,7 @@ impl IoPoolTopology {
         }
     }
 
-    pub(crate) const fn depth_for_engine(self, engine: usize) -> usize {
+    pub const fn depth_for_engine(self, engine: usize) -> usize {
         let base = self.max_in_flight / self.engine_count;
         let remainder = self.max_in_flight % self.engine_count;
         base + if engine < remainder { 1 } else { 0 }
@@ -355,7 +356,7 @@ pub enum IoMode {
 }
 
 impl IoMode {
-    pub(crate) const fn is_available(self) -> bool {
+    const fn is_available(self) -> bool {
         match self {
             Self::Buffered => true,
             Self::Direct => cfg!(target_os = "linux"),
@@ -449,41 +450,20 @@ impl Default for RuntimeOptions {
     }
 }
 
-impl RuntimeOptions {
-    pub(crate) const fn read_io_max_in_flight(&self) -> usize {
-        self.io_engine.read_topology().max_in_flight
+pub const fn read_io_wait_capacity(config: &RuntimeOptions) -> usize {
+    match config.read_admission {
+        ReadAdmission::Immediate => 0,
+        ReadAdmission::Wait { max_waiters, .. } => match max_waiters {
+            Some(capacity) => capacity,
+            None => IoPoolTopology::read(config.io_engine).max_in_flight,
+        },
     }
-    pub(crate) const fn read_io_wait_capacity(&self) -> usize {
-        match self.read_admission {
-            ReadAdmission::Immediate => 0,
-            ReadAdmission::Wait { max_waiters, .. } => match max_waiters {
-                Some(capacity) => capacity,
-                None => self.read_io_max_in_flight(),
-            },
-        }
-    }
+}
 
-    pub(crate) const fn read_io_wait_timeout(&self) -> Duration {
-        match self.read_admission {
-            ReadAdmission::Immediate => Duration::ZERO,
-            ReadAdmission::Wait { timeout, .. } => timeout,
-        }
-    }
-
-    pub(crate) const fn reclaim_io_max_in_flight(&self) -> usize {
-        self.io_engine.reclaim_topology().max_in_flight
-    }
-
-    pub(crate) const fn read_io_topology(&self) -> IoPoolTopology {
-        self.io_engine.read_topology()
-    }
-
-    pub(crate) const fn write_io_topology(&self) -> IoPoolTopology {
-        self.io_engine.write_topology()
-    }
-
-    pub(crate) const fn reclaim_io_topology(&self) -> IoPoolTopology {
-        self.io_engine.reclaim_topology()
+pub const fn read_io_wait_timeout(config: &RuntimeOptions) -> Duration {
+    match config.read_admission {
+        ReadAdmission::Immediate => Duration::ZERO,
+        ReadAdmission::Wait { timeout, .. } => timeout,
     }
 }
 
@@ -495,8 +475,80 @@ const RUNTIME_CONTROL_RESERVATION_BYTES: usize = 4096;
 // this avoids sizing metadata for the theoretical 64-byte minimum.
 const MIN_L1_SIZING_ENTRY_BYTES: usize = 4 * 1024;
 
+impl CacheConfig {
+    /// Checks the complete combination and resolves dependent runtime defaults.
+    ///
+    /// ```no_run
+    /// # async fn example() -> cache2::Result<()> {
+    /// use cache2::Cache;
+    /// use cache2::CacheConfig;
+    /// use cache2::RuntimeOptions;
+    /// use cache2::StorageOptions;
+    /// let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
+    /// let config = CacheConfig::new(storage, RuntimeOptions::default())?;
+    /// let disk_peak = config.storage().peak_disk_bytes();
+    /// let memory_floor = config.minimum_memory_bytes();
+    /// let cache = Cache::open("cache.data", config).await?;
+    /// # cache.close_fast().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
+    /// counts, invalid runtime settings, unavailable build/platform features,
+    /// or insufficient managed memory. Device capabilities are checked at open.
+    pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self> {
+        let build = || -> io::Result<Self> {
+            let geometry = storage.geometry;
+            let index_slots = storage.index_slots;
+            runtime.resolve()?;
+            if geometry.region_count <= runtime.append_shards {
+                return Err(invalid_config(
+                    "append shards require valid geometry with one Active Region each plus one spare Region",
+                ));
+            }
+            let l1_entry_capacity = runtime.l1_entry_capacity(geometry, index_slots)?;
+            let l1_metadata_bytes = MemoryStore::allocation_bytes(
+                runtime.l1_capacity_bytes,
+                l1_entry_capacity,
+                runtime.l1_shards,
+                runtime.l1_eviction_policy,
+            )?;
+            let fixed_bytes =
+                crate::region::runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
+                    .checked_add(l1_metadata_bytes)
+                    .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
+            let (reserved_memory_bytes, minimum_memory_bytes) =
+                runtime.memory_requirements(geometry, fixed_bytes)?;
+            if minimum_memory_bytes > runtime.managed_memory_limit_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "managed memory limit cannot hold the cache memory requirements: requires {minimum_memory_bytes} bytes, configured {} bytes",
+                        runtime.managed_memory_limit_bytes
+                    ),
+                ));
+            }
+            Ok(Self {
+                storage,
+                runtime,
+                l1_entry_capacity,
+                reserved_memory_bytes,
+                minimum_memory_bytes,
+            })
+        };
+        build().map_err(|error| from_io(ErrorOperation::BuildConfig, error))
+    }
+}
+
+fn invalid_config(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
 impl RuntimeOptions {
-    pub(super) fn resolve(&mut self) -> io::Result<()> {
+    fn resolve(&mut self) -> io::Result<()> {
         if !self.io_engine.is_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -515,9 +567,9 @@ impl RuntimeOptions {
                 "append shards must be in 1..=256",
             ));
         }
-        let read_topology = self.read_io_topology();
-        let write_topology = self.write_io_topology();
-        let reclaim_topology = self.reclaim_io_topology();
+        let read_topology = IoPoolTopology::read(self.io_engine);
+        let write_topology = IoPoolTopology::write(self.io_engine);
+        let reclaim_topology = IoPoolTopology::reclaim(self.io_engine);
         match self.io_engine {
             IoEngine::Posix(_) => {
                 validate_posix_pool("read", read_topology)?;
@@ -596,11 +648,7 @@ impl RuntimeOptions {
         Ok(())
     }
 
-    pub(super) fn l1_entry_capacity(
-        &self,
-        geometry: DataGeometry,
-        index_slots: usize,
-    ) -> io::Result<usize> {
+    fn l1_entry_capacity(&self, geometry: DataGeometry, index_slots: usize) -> io::Result<usize> {
         if self.l1_capacity_bytes == 0 {
             return Ok(0);
         }
@@ -625,7 +673,7 @@ impl RuntimeOptions {
             .min(maximum))
     }
 
-    pub(super) fn memory_requirements(
+    fn memory_requirements(
         &self,
         geometry: DataGeometry,
         fixed_bytes: usize,
@@ -647,7 +695,7 @@ impl RuntimeOptions {
             .and_then(|bytes| bytes.checked_add(topology_bytes))
             .ok_or_else(|| invalid_runtime_config("reserved memory requirements overflow"))?;
         let reclaim_buffers = usable_region
-            .checked_mul(self.reclaim_io_max_in_flight())
+            .checked_mul(IoPoolTopology::reclaim(self.io_engine).max_in_flight)
             .ok_or_else(|| invalid_runtime_config("reclaim buffer memory requirements overflow"))?;
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
@@ -664,9 +712,9 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
     let shard_count = config.append_shards as usize;
     // Reserve one stack per physical I/O thread, one possible shutdown reaper
     // per engine, and every append/reclaim worker.
-    let read = config.read_io_topology();
-    let write = config.write_io_topology();
-    let reclaim = config.reclaim_io_topology();
+    let read = IoPoolTopology::read(config.io_engine);
+    let write = IoPoolTopology::write(config.io_engine);
+    let reclaim = IoPoolTopology::reclaim(config.io_engine);
     let engine_count = read
         .engine_count
         .checked_add(write.engine_count)?
@@ -679,7 +727,7 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
         .checked_add(shard_count)?
         .checked_add(reclaim.max_in_flight)?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let read_wait_queue = config.read_io_wait_capacity();
+    let read_wait_queue = read_io_wait_capacity(config);
     let queue = write
         .max_in_flight
         .checked_add(read.max_in_flight)?
@@ -806,7 +854,7 @@ mod tests {
     fn io_engine_topology_matches_backend_shape() {
         let posix = IoEngine::Posix(PosixIoConfig::new(7, 5, 2));
         assert_eq!(
-            posix.read_topology(),
+            IoPoolTopology::read(posix),
             IoPoolTopology {
                 engine_count: 1,
                 max_in_flight: 7,
@@ -820,7 +868,7 @@ mod tests {
             IoUringPoolConfig::new(2, 5),
             IoUringPoolConfig::new(1, 2),
         ));
-        let read = io_uring.read_topology();
+        let read = IoPoolTopology::read(io_uring);
         assert_eq!(read.engine_count, 3);
         assert_eq!(read.max_in_flight, 8);
         assert_eq!(read.worker_threads, 3);

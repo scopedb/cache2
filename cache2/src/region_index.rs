@@ -42,7 +42,7 @@ const CANDIDATE_OFFSETS: [usize; INDEX_CANDIDATES] = [0, 23, 61, 97];
 const FINGERPRINT_MASK: u16 = (1 << 14) - 1;
 const REFERENCE_WORD_BITS: usize = u64::BITS as usize;
 
-pub(crate) fn heat_memory_bytes(slot_count: usize) -> Option<usize> {
+pub fn heat_memory_bytes(slot_count: usize) -> Option<usize> {
     let bitmap_bytes = slot_count
         .div_ceil(REFERENCE_WORD_BITS)
         .checked_mul(std::mem::size_of::<AtomicU64>())?;
@@ -118,13 +118,13 @@ impl SlotHeat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReclaimIndexAction {
+pub enum ReclaimIndexAction {
     Missing,
     Removed,
     Reinsert,
 }
 
-pub(crate) struct RegionIndex {
+pub struct RegionIndex {
     storage: PartitionedIndexStorage,
     heat: SlotHeat,
     statistics_enabled: AtomicBool,
@@ -136,12 +136,12 @@ pub(crate) struct RegionIndex {
 
 #[cfg(feature = "benchmarking")]
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct BenchmarkProbeStats {
-    pub(crate) operations: u64,
-    pub(crate) probes: u64,
-    pub(crate) stale_slots: u64,
-    pub(crate) full_windows: u64,
-    pub(crate) max_probes: usize,
+pub struct BenchmarkProbeStats {
+    pub operations: u64,
+    pub probes: u64,
+    pub stale_slots: u64,
+    pub full_windows: u64,
+    pub max_probes: usize,
 }
 
 #[cfg(feature = "benchmarking")]
@@ -162,12 +162,12 @@ impl BenchmarkProbeStats {
 }
 
 #[cfg(feature = "benchmarking")]
-pub(crate) fn reset_benchmark_probe_stats() {
+pub fn reset_benchmark_probe_stats() {
     BENCHMARK_PROBE_STATS.set(BenchmarkProbeStats::EMPTY);
 }
 
 #[cfg(feature = "benchmarking")]
-pub(crate) fn take_benchmark_probe_stats() -> BenchmarkProbeStats {
+pub fn take_benchmark_probe_stats() -> BenchmarkProbeStats {
     BENCHMARK_PROBE_STATS.replace(BenchmarkProbeStats::EMPTY)
 }
 
@@ -188,9 +188,7 @@ fn record_benchmark_probe(probes: usize) {
 }
 
 impl RegionIndex {
-    pub(crate) fn from_storage(
-        storage: PartitionedIndexStorage,
-    ) -> Result<Self, IndexStorageError> {
+    pub fn from_storage(storage: PartitionedIndexStorage) -> Result<Self, IndexStorageError> {
         let heat = SlotHeat::try_new(storage.slot_count())?;
         Ok(Self {
             storage,
@@ -203,15 +201,15 @@ impl RegionIndex {
         })
     }
 
-    pub(crate) const fn storage(&self) -> &PartitionedIndexStorage {
+    pub const fn storage(&self) -> &PartitionedIndexStorage {
         &self.storage
     }
 
-    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+    pub fn set_statistics_enabled(&self, enabled: bool) {
         self.statistics_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(&self) -> Result<CacheIndexSnapshot, IndexStorageError> {
+    pub fn snapshot(&self) -> Result<CacheIndexSnapshot, IndexStorageError> {
         let physical = self.storage.physical_stats()?;
         let slot_capacity = u64::try_from(self.storage.slot_count())
             .map_err(|_| IndexStorageError::SizeOverflow)?;
@@ -230,7 +228,7 @@ impl RegionIndex {
     }
 
     /// Returns one fingerprint candidate. Record validation owns correctness.
-    pub(crate) fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
+    pub fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let fingerprint = fingerprint(hash);
@@ -266,11 +264,7 @@ impl RegionIndex {
     }
 
     /// Installs a value with up to two bounded relocations and one bounded eviction.
-    pub(crate) fn upsert(
-        &self,
-        hash: u64,
-        supplied: IndexEntry,
-    ) -> Result<bool, IndexStorageError> {
+    pub fn upsert(&self, hash: u64, supplied: IndexEntry) -> Result<bool, IndexStorageError> {
         #[cfg(feature = "benchmarking")]
         record_benchmark_probe(INDEX_CANDIDATES);
         let mut partition = self.storage.write_hash_partition(hash)?;
@@ -476,14 +470,14 @@ impl RegionIndex {
         Ok(true)
     }
 
-    pub(crate) fn try_delete(&self, hash: u64) -> Result<bool, IndexStorageError> {
+    pub fn try_delete(&self, hash: u64) -> Result<bool, IndexStorageError> {
         self.remove_matching(hash, None, true)
     }
 
     /// Clears a mapping only while it still points at the reclaimed address.
     /// Persisted lengths are size-class upper bounds, so address identity uses
     /// Region, offset, and encoded size class rather than an exact byte count.
-    pub(crate) fn remove_if_match(
+    pub fn remove_if_match(
         &self,
         hash: u64,
         old_location: PackedLocation,
@@ -494,7 +488,7 @@ impl RegionIndex {
     /// Atomically classifies one reclaim candidate under its index partition.
     /// A hot current mapping is retained for a later conditional rewrite;
     /// every other current mapping is removed before the source Region is freed.
-    pub(crate) fn prepare_reclaim(
+    pub fn prepare_reclaim(
         &self,
         hash: u64,
         old_location: PackedLocation,
@@ -526,7 +520,7 @@ impl RegionIndex {
     /// Repoints one still-current source mapping after the replacement bytes
     /// have completed. Concurrent puts and deletes win by changing or removing
     /// the expected old address first.
-    pub(crate) fn replace_if_match(
+    pub fn replace_if_match(
         &self,
         hash: u64,
         old_location: PackedLocation,

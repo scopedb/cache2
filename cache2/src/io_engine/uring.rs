@@ -74,13 +74,13 @@ impl DriverWake for SocketWake {
 /// Linux `io_uring` engine. The ring and every raw buffer pointer are owned
 /// by one driver thread; callers communicate only through bounded commands.
 #[derive(Clone)]
-pub(crate) struct UringIoEngine {
+pub struct UringIoEngine {
     inner: Arc<RuntimeInner>,
     io_stats: RuntimeIoStatsHandle,
 }
 
 impl UringIoEngine {
-    pub(crate) fn new_with_files(
+    pub fn new_with_files(
         files: RuntimeFileSet,
         max_in_flight: usize,
         config: crate::config::IoUringPoolConfig,

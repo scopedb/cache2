@@ -23,28 +23,28 @@ use crc_fast::Digest;
 use crc_fast::crc32_iscsi;
 
 /// Computes the standard CRC32C checksum of `bytes`.
-pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
+pub fn crc32c(bytes: &[u8]) -> u32 {
     crc32_iscsi(bytes)
 }
 
 /// Incremental CRC32C state, useful for checksumming a key and value without
 /// first joining them in a temporary allocation.
-pub(crate) struct Crc32c {
+pub struct Crc32c {
     digest: Digest,
 }
 
 impl Crc32c {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             digest: Digest::new(CrcAlgorithm::Crc32Iscsi),
         }
     }
 
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
+    pub fn update(&mut self, bytes: &[u8]) {
         self.digest.update(bytes);
     }
 
-    pub(crate) fn finish(self) -> u32 {
+    pub fn finish(self) -> u32 {
         self.digest.finalize() as u32
     }
 }

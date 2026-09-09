@@ -25,11 +25,11 @@ use crate::hashing::FixedPrehashedMap;
 /// Maximum policy metadata inspected by one complete foreground admission.
 /// Exhausting this budget means L1 bypass; it never expands with cache size or
 /// the number of victims required by a mixed-size candidate.
-pub(crate) const MAX_POLICY_SCAN_STEPS: usize = 64;
+pub const MAX_POLICY_SCAN_STEPS: usize = 64;
 
 /// Memory slot indices are packed into `u32`; the final value is reserved as
 /// the end-of-chain sentinel by `memory` and the policy queues.
-pub(crate) const MAX_POLICY_SLOT_INDEX: usize = (u32::MAX - 1) as usize;
+pub const MAX_POLICY_SLOT_INDEX: usize = (u32::MAX - 1) as usize;
 
 const NO_POLICY_SLOT: u32 = u32::MAX;
 const RESIDENT_BIT: u8 = 1 << 0;
@@ -41,14 +41,14 @@ const S3FIFO_MAX_FREQUENCY: u8 = 3;
 const S3FIFO_MOVE_TO_MAIN_THRESHOLD: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct PolicySlot {
+pub struct PolicySlot {
     hash: u64,
     clock_position: u32,
     flags: u8,
 }
 
 impl PolicySlot {
-    pub(crate) const fn new_free(next: u32) -> Self {
+    pub const fn new_free(next: u32) -> Self {
         Self {
             hash: 0,
             clock_position: next,
@@ -56,7 +56,7 @@ impl PolicySlot {
         }
     }
 
-    pub(crate) fn free_next(&self) -> u32 {
+    pub fn free_next(&self) -> u32 {
         debug_assert!(!self.is_resident());
         self.clock_position
     }
@@ -80,7 +80,7 @@ impl PolicySlot {
         }
     }
 
-    pub(crate) const fn hash(&self) -> u64 {
+    pub const fn hash(&self) -> u64 {
         self.hash
     }
 
@@ -146,23 +146,23 @@ enum DetachedPolicyKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DetachedPolicy {
+pub struct DetachedPolicy {
     hash: u64,
     weight: usize,
     kind: DetachedPolicyKind,
 }
 
 impl DetachedPolicy {
-    pub(crate) const fn hash(self) -> u64 {
+    pub const fn hash(self) -> u64 {
         self.hash
     }
 
-    pub(crate) const fn weight(self) -> usize {
+    pub const fn weight(self) -> usize {
         self.weight
     }
 }
 
-pub(crate) struct EvictionState {
+pub struct EvictionState {
     policy: EvictionPolicyState,
 }
 
@@ -172,7 +172,7 @@ enum EvictionPolicyState {
 }
 
 impl EvictionState {
-    pub(crate) fn new(
+    pub fn new(
         policy: L1EvictionPolicy,
         capacity_bytes: usize,
         maximum_entries: usize,
@@ -188,23 +188,14 @@ impl EvictionState {
         Ok(Self { policy })
     }
 
-    pub(crate) fn allocation_bytes(
-        policy: L1EvictionPolicy,
-        maximum_entries: usize,
-    ) -> io::Result<usize> {
+    pub fn allocation_bytes(policy: L1EvictionPolicy, maximum_entries: usize) -> io::Result<usize> {
         match policy {
             L1EvictionPolicy::Clock => ClockState::allocation_bytes(maximum_entries),
             L1EvictionPolicy::S3Fifo => S3FifoState::allocation_bytes(maximum_entries),
         }
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        slots: &mut [PolicySlot],
-        index: usize,
-        hash: u64,
-        weight: usize,
-    ) {
+    pub fn insert(&mut self, slots: &mut [PolicySlot], index: usize, hash: u64, weight: usize) {
         debug_assert!(!slots[index].is_resident());
         match &mut self.policy {
             EvictionPolicyState::Clock(state) => {
@@ -218,14 +209,14 @@ impl EvictionState {
         }
     }
 
-    pub(crate) fn record_hit(&mut self, slots: &mut [PolicySlot], index: usize) {
+    pub fn record_hit(&mut self, slots: &mut [PolicySlot], index: usize) {
         match &mut self.policy {
             EvictionPolicyState::Clock(_) => slots[index].set_clock_visited(true),
             EvictionPolicyState::S3Fifo(_) => slots[index].increment_s3fifo_frequency(),
         }
     }
 
-    pub(crate) fn remove(&mut self, slots: &mut [PolicySlot], index: usize) {
+    pub fn remove(&mut self, slots: &mut [PolicySlot], index: usize) {
         if !slots.get(index).is_some_and(PolicySlot::is_resident) {
             return;
         }
@@ -238,7 +229,7 @@ impl EvictionState {
     /// Detaches a resident only from policy metadata while an admission plan
     /// is assembled. The memory directory and value remain intact so a failed
     /// plan can restore the entry without losing a cache hit.
-    pub(crate) fn detach_for_admission(
+    pub fn detach_for_admission(
         &mut self,
         slots: &mut [PolicySlot],
         index: usize,
@@ -258,7 +249,7 @@ impl EvictionState {
         }
     }
 
-    pub(crate) fn restore_for_admission(
+    pub fn restore_for_admission(
         &mut self,
         slots: &mut [PolicySlot],
         index: usize,
@@ -287,7 +278,7 @@ impl EvictionState {
     }
 
     /// Records policy history only after the associated memory victim commits.
-    pub(crate) fn commit_eviction(&mut self, detached: DetachedPolicy) {
+    pub fn commit_eviction(&mut self, detached: DetachedPolicy) {
         match (&mut self.policy, detached.kind) {
             (EvictionPolicyState::Clock(_), DetachedPolicyKind::Clock) => {}
             (EvictionPolicyState::S3Fifo(state), DetachedPolicyKind::S3Fifo { queue, .. }) => {
@@ -299,7 +290,7 @@ impl EvictionState {
         }
     }
 
-    pub(crate) fn select_victim<F>(
+    pub fn select_victim<F>(
         &mut self,
         slots: &mut [PolicySlot],
         remaining_steps: &mut usize,

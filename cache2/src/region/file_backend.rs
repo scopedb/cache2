@@ -24,18 +24,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-use super::core::FileRegionCore;
-use super::core::RegionAccessState;
-use super::core::RegionHealthLatch;
-use super::core::RegionManagerAuthority;
-use super::core::RegionShard;
-use super::core::guarded_index_result;
-use super::core::index_storage_io_error;
-use super::core::region_metadata_io_error;
+use super::FileRegionCore;
+use super::RegionAccessState;
+use super::RegionHealthLatch;
+use super::RegionManagerAuthority;
+use super::RegionShard;
+use super::guarded_index_result;
+use super::index_storage_io_error;
+use super::region_metadata_io_error;
 use crate::config::CacheConfig;
 use crate::config::IoMode;
 #[cfg(test)]
 use crate::config::RuntimeOptions;
+#[cfg(test)]
+use crate::config::cache_config;
 use crate::index::MAX_INDEX_PARTITIONS;
 use crate::index_storage::IndexImageBinding;
 use crate::index_storage::IndexPartitionRange;
@@ -100,14 +102,14 @@ const REGION_SHARDS: u32 = 4;
 
 /// Data and recovery sidecars owned by one concrete Region backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegionFiles {
-    pub(crate) data: PathBuf,
-    pub(crate) state: PathBuf,
-    pub(crate) image: PathBuf,
+pub struct RegionFiles {
+    pub data: PathBuf,
+    pub state: PathBuf,
+    pub image: PathBuf,
 }
 
 impl RegionFiles {
-    pub(crate) fn new(
+    pub fn new(
         data: impl Into<PathBuf>,
         state: impl Into<PathBuf>,
         image: impl Into<PathBuf>,
@@ -119,7 +121,7 @@ impl RegionFiles {
         }
     }
 }
-pub(crate) struct FileRegionRuntime {
+pub struct FileRegionRuntime {
     core: Arc<FileRegionCore>,
     data_plane: Option<RegionDataPlane>,
 }
@@ -131,18 +133,18 @@ impl Deref for FileRegionRuntime {
         &self.core
     }
 }
-pub(crate) struct FrozenFileRegionView {
+pub struct FrozenFileRegionView {
     core: Arc<FileRegionCore>,
     metadata: RegionMetadata,
 }
 
-pub(crate) struct CleanFileRegionImage {
+pub struct CleanFileRegionImage {
     file: File,
     header: RecoveryImageHeader,
     metadata: RegionMetadata,
 }
 
-pub(crate) struct PreparedFileRegionClean {
+pub struct PreparedFileRegionClean {
     state: StatePageWrite,
     health: RegionHealthLatch,
 }
@@ -232,7 +234,7 @@ impl FileRegionRuntime {
             .unwrap_or(Ok(false))
     }
 
-    pub(crate) fn data_plane(&self) -> io::Result<&RegionDataPlane> {
+    pub fn data_plane(&self) -> io::Result<&RegionDataPlane> {
         self.data_plane.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -243,22 +245,22 @@ impl FileRegionRuntime {
 }
 
 impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
-    pub(crate) fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
+    pub fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
         Ok(self.runtime()?.data_plane()?.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+    fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         self.runtime()?.data_plane()?.put(key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+    fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?.data_plane()?.get(key)
     }
 
     #[cfg(test)]
-    pub(crate) async fn get_value_async(
+    async fn get_value_async(
         &self,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
@@ -270,21 +272,21 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
     }
 
     #[cfg(test)]
-    pub(crate) fn drain(&self) -> io::Result<()> {
+    pub fn drain(&self) -> io::Result<()> {
         self.runtime()?.data_plane()?.drain()
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
+    pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
         self.runtime()?.data_plane()?.snapshot()
     }
 
     #[cfg(test)]
-    pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
+    pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         self.runtime()?.data_plane()?.detailed_snapshot()
     }
 }
-pub(crate) trait RegionFileSystem {
+pub trait RegionFileSystem {
     type File: ControlIoBackend;
 
     fn open(&self, path: &Path, create: bool) -> io::Result<Self::File>;
@@ -307,7 +309,7 @@ pub(crate) trait RegionFileSystem {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SystemRegionFileSystem;
+pub struct SystemRegionFileSystem;
 
 impl RegionFileSystem for SystemRegionFileSystem {
     type File = FileBackend;
@@ -357,7 +359,7 @@ impl RegionFileSystem for SystemRegionFileSystem {
 ///
 /// It owns the append/read runtime, persists one complete index plus the
 /// Region/FIFO physical view, and never scans records during open.
-pub(crate) struct FileRegionBackend<F = SystemRegionFileSystem>
+pub struct FileRegionBackend<F = SystemRegionFileSystem>
 where
     F: RegionFileSystem,
 {
@@ -380,30 +382,22 @@ where
 
 impl FileRegionBackend<SystemRegionFileSystem> {
     #[cfg(test)]
-    pub(crate) fn for_test(
-        files: RegionFiles,
-        format_data: DataSuperblock,
-        index_slots: usize,
-    ) -> Self {
+    fn for_test(files: RegionFiles, format_data: DataSuperblock, index_slots: usize) -> Self {
         Self::for_test_with_options(files, format_data, index_slots, RuntimeOptions::default())
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_with_options(
+    pub fn for_test_with_options(
         files: RegionFiles,
         format_data: DataSuperblock,
         index_slots: usize,
         runtime_config: RuntimeOptions,
     ) -> Self {
-        let config = CacheConfig::for_test(format_data.geometry, index_slots, runtime_config);
+        let config = cache_config(format_data.geometry, index_slots, runtime_config);
         Self::new(files, format_data, config)
     }
 
-    pub(crate) fn new(
-        files: RegionFiles,
-        format_data: DataSuperblock,
-        config: CacheConfig,
-    ) -> Self {
+    pub fn new(files: RegionFiles, format_data: DataSuperblock, config: CacheConfig) -> Self {
         Self::new_with_file_system(files, format_data, SystemRegionFileSystem, config)
     }
 }
@@ -419,8 +413,7 @@ where
         index_slots: usize,
         file_system: F,
     ) -> Self {
-        let config =
-            CacheConfig::for_test(format_data.geometry, index_slots, RuntimeOptions::default());
+        let config = cache_config(format_data.geometry, index_slots, RuntimeOptions::default());
         Self::new_with_file_system(files, format_data, file_system, config)
     }
 

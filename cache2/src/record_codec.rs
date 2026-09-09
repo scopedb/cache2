@@ -35,7 +35,7 @@ use crate::index::PackedLocationError;
 use crate::region_manager::RegionAppendReservation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecordEncodeError {
+pub enum RecordEncodeError {
     LengthOverflow,
     KeyTooLarge,
     RecordTooLarge,
@@ -84,14 +84,14 @@ impl std::error::Error for RecordEncodeError {
 }
 
 /// Borrowed payload with its checksum ready before entering the append gate.
-pub(crate) struct RecordPayload<'a> {
+pub struct RecordPayload<'a> {
     key: &'a [u8],
     value: &'a [u8],
     crc: u32,
 }
 
 impl<'a> RecordPayload<'a> {
-    pub(crate) fn new(key: &'a [u8], value: &'a [u8]) -> Self {
+    pub fn new(key: &'a [u8], value: &'a [u8]) -> Self {
         let mut crc = Crc32c::new();
         crc.update(key);
         crc.update(value);
@@ -104,10 +104,7 @@ impl<'a> RecordPayload<'a> {
 }
 
 /// Returns the minimum 32-byte-aligned envelope for one logical value.
-pub(crate) fn required_record_bytes(
-    key_len: usize,
-    value_len: usize,
-) -> Result<u32, RecordEncodeError> {
+pub fn required_record_bytes(key_len: usize, value_len: usize) -> Result<u32, RecordEncodeError> {
     if key_len > MAX_KEY_SIZE {
         return Err(RecordEncodeError::KeyTooLarge);
     }
@@ -129,7 +126,7 @@ pub(crate) fn required_record_bytes(
 /// path. Staging may later extend the final record of a sealed batch, rewriting
 /// its header and completion descriptor together.
 #[cfg(test)]
-pub(crate) fn encode_value_into(
+fn encode_value_into(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
     hash_seed: u64,
@@ -144,7 +141,7 @@ pub(crate) fn encode_value_into(
 }
 
 /// Encodes using point metadata computed once by the public operation entry.
-pub(crate) fn encode_value_into_hashed(
+pub fn encode_value_into_hashed(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
     hash: u64,
@@ -163,7 +160,7 @@ pub(crate) fn encode_value_into_hashed(
 
 /// Re-encodes one retained cache value at a new physical reservation while
 /// preserving the logical mutation sequence used by L1 publication.
-pub(crate) fn encode_reinsert_into_hashed(
+pub fn encode_reinsert_into_hashed(
     destination: &mut [u8],
     reservation: RegionAppendReservation,
     hash: u64,
@@ -259,7 +256,7 @@ fn encode_value_into_hashed_with_seqno(
     Ok(IndexEntry { location })
 }
 
-pub(crate) fn hash_key(seed: u64, key: &[u8]) -> u64 {
+pub fn hash_key(seed: u64, key: &[u8]) -> u64 {
     xxh3_64_with_seed(key, seed)
 }
 

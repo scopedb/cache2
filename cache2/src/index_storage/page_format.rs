@@ -17,10 +17,10 @@ use super::IndexImageBinding;
 use super::IndexStorageError;
 use crate::checksum::Crc32c;
 
-pub(crate) const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
-pub(crate) const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
-pub(crate) const INDEX_IMAGE_SLOT_SIZE: usize = 8;
-pub(crate) const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
+pub const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
+pub const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
+pub const INDEX_IMAGE_SLOT_SIZE: usize = 8;
+pub const INDEX_IMAGE_SLOTS_PER_PAGE: usize =
     (INDEX_IMAGE_PAGE_SIZE - INDEX_IMAGE_PAGE_HEADER_SIZE) / INDEX_IMAGE_SLOT_SIZE;
 
 const PAGE_MAGIC: [u8; 8] = *b"C2SIDX1\0";
@@ -36,7 +36,7 @@ const PAGE_VALID_SLOTS_OFFSET: usize = 32;
 const PAGE_FLAGS_OFFSET: usize = 36;
 const PAGE_GENERATION_OFFSET: usize = 40;
 const PAGE_IMAGE_TAG_OFFSET: usize = 48;
-pub(super) const PAGE_CHECKSUM_OFFSET: usize = 56;
+pub const PAGE_CHECKSUM_OFFSET: usize = 56;
 const PAGE_TRAILING_RESERVED_OFFSET: usize = 60;
 
 const PAGE_FLAG_NONE: u32 = 0;
@@ -47,7 +47,7 @@ const _: () = assert!(
         <= INDEX_IMAGE_PAGE_SIZE
 );
 
-pub(super) fn encode_page_header(
+pub fn encode_page_header(
     page: &mut [u8; INDEX_IMAGE_PAGE_SIZE],
     page_index: usize,
     first_slot: usize,
@@ -90,7 +90,7 @@ pub(super) fn encode_page_header(
     Ok(())
 }
 
-pub(super) fn validate_page_header(
+pub fn validate_page_header(
     page: &[u8; INDEX_IMAGE_PAGE_SIZE],
     expected_page_index: usize,
     expected_first_slot: usize,
@@ -194,7 +194,7 @@ pub(super) fn validate_page_header(
     Ok(())
 }
 
-pub(super) fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
+pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
     let mut checksum = Crc32c::new();
     checksum.update(&page[..PAGE_CHECKSUM_OFFSET]);
     checksum.update(&[0_u8; std::mem::size_of::<u32>()]);
@@ -218,7 +218,7 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
     )
 }
 
-pub(super) fn read_u64(input: &[u8], offset: usize) -> u64 {
+pub fn read_u64(input: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(
         input[offset..offset + 8]
             .try_into()
@@ -230,10 +230,10 @@ fn put_u16(output: &mut [u8], offset: usize, value: u16) {
     output[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(super) fn put_u32(output: &mut [u8], offset: usize, value: u32) {
+pub fn put_u32(output: &mut [u8], offset: usize, value: u32) {
     output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(super) fn put_u64(output: &mut [u8], offset: usize, value: u64) {
+pub fn put_u64(output: &mut [u8], offset: usize, value: u64) {
     output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }

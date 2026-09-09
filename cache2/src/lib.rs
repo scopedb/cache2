@@ -16,13 +16,13 @@
 //!
 //! Mutations provide process-local visibility. An unclean restart opens empty;
 //! [`Cache::close_warm`] publishes a recoverable image.
-//! See the [`error`] module for failure classifications and handling policy.
+//! See [`Error`] for failure classifications and handling policy.
 
 #[cfg(feature = "benchmarking")]
 #[doc(hidden)]
 pub mod benchmarking;
 
-pub mod error;
+mod error;
 pub use self::error::Error;
 pub use self::error::ErrorKind;
 pub use self::error::ErrorOperation;

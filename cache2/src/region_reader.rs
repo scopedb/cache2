@@ -39,41 +39,41 @@ use crate::recovery::DATA_REGION_AREA_OFFSET;
 use crate::recovery::DataGeometry;
 use crate::resources::BufferLease;
 
-pub(crate) const _READ_ALIGNMENT: usize = 4096;
-pub(crate) const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
+const _READ_ALIGNMENT: usize = 4096;
+const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadCandidate {
-    pub(crate) entry: IndexEntry,
-    pub(crate) region_generation: u64,
+pub struct ReadCandidate {
+    pub entry: IndexEntry,
+    pub region_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReadPlan {
-    pub(crate) hash: u64,
-    pub(crate) entry: IndexEntry,
-    pub(crate) region_generation: u64,
-    pub(crate) absolute: u64,
-    pub(crate) read_len: usize,
-    pub(crate) record_range: Range<usize>,
+pub struct ReadPlan {
+    pub hash: u64,
+    pub entry: IndexEntry,
+    pub region_generation: u64,
+    pub absolute: u64,
+    pub read_len: usize,
+    pub record_range: Range<usize>,
 }
 
-pub(crate) struct PendingRead {
+pub struct PendingRead {
     plan: ReadPlan,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
-pub(crate) struct ReadCompletion {
-    pub(crate) plan: ReadPlan,
-    pub(crate) result: io::Result<()>,
-    pub(crate) buffer: Option<BufferLease>,
+pub struct ReadCompletion {
+    pub plan: ReadPlan,
+    pub result: io::Result<()>,
+    pub buffer: Option<BufferLease>,
 }
 
 impl ReadCompletion {
     /// Returns the bounded candidate range only after every completion
     /// invariant has passed. Direct-I/O alignment bytes stay private.
-    pub(crate) fn record_bytes(&self) -> Option<&[u8]> {
+    pub fn record_bytes(&self) -> Option<&[u8]> {
         if self.result.is_err() {
             return None;
         }
@@ -87,7 +87,7 @@ impl ReadCompletion {
 
 impl PendingRead {
     #[cfg(test)]
-    pub(crate) fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
+    pub fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
         let Self {
             plan,
             request_id,
@@ -97,7 +97,7 @@ impl PendingRead {
         Self::finish(plan, request_id, completion)
     }
 
-    pub(crate) async fn wait_async(
+    pub async fn wait_async(
         self,
         engine: std::sync::Arc<dyn IoEngine>,
         tokio_handle: &tokio::runtime::Handle,
@@ -178,7 +178,7 @@ impl PendingRead {
 ///
 /// Validation happens before the lease is prepared or submitted. Any rejected
 /// operation drops its lease immediately.
-pub(crate) fn submit_read(
+pub fn submit_read(
     engine: &dyn IoEngine,
     slot: ReadSlot,
     plan: ReadPlan,
@@ -194,7 +194,7 @@ pub(crate) fn submit_read(
     })
 }
 
-pub(crate) fn plan_read(
+pub fn plan_read(
     geometry: DataGeometry,
     hash: u64,
     candidate: ReadCandidate,

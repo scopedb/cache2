@@ -16,9 +16,14 @@
 
 use std::io;
 
-use crate::error::Error;
+#[cfg(test)]
+use super::CacheConfig;
+#[cfg(test)]
+use super::RuntimeOptions;
+use super::StorageLayout;
 use crate::error::ErrorOperation;
 use crate::error::Result;
+use crate::error::from_io;
 use crate::index::MAX_PACKED_REGION_COUNT;
 use crate::index::MAX_PACKED_REGION_SIZE;
 use crate::index_storage::IndexStorageError;
@@ -34,7 +39,7 @@ use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
-pub(crate) const KEY_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
+pub const KEY_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
 const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
 
@@ -85,29 +90,12 @@ impl StorageOptions {
                 .max(MIN_INDEX_SLOTS);
             StorageLayout::new(self.capacity_bytes, self.region_size_bytes, index_slots)
         };
-        build().map_err(|error| Error::from_io(ErrorOperation::BuildStorage, error))
+        build().map_err(|error| from_io(ErrorOperation::BuildStorage, error))
     }
 }
 
-/// Immutable persistent geometry with a checked logical disk bound.
-///
-/// Created by [`StorageOptions::build`]. Changing the geometry or index size
-/// changes the disk identity, so an incompatible recovery image opens empty.
-/// Layout construction neither reserves disk space nor requires a Tokio runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageLayout {
-    pub(super) geometry: DataGeometry,
-    pub(super) index_slots: usize,
-    fingerprint: u64,
-    peak_disk_bytes: u64,
-}
-
 impl StorageLayout {
-    pub(super) fn new(
-        capacity_bytes: u64,
-        region_size_bytes: u64,
-        index_slots: usize,
-    ) -> io::Result<Self> {
+    fn new(capacity_bytes: u64, region_size_bytes: u64, index_slots: usize) -> io::Result<Self> {
         if region_size_bytes == 0
             || region_size_bytes > MAX_PACKED_REGION_SIZE
             || !region_size_bytes.is_multiple_of(4096)
@@ -141,40 +129,6 @@ impl StorageLayout {
             fingerprint: fingerprint(geometry, index_slots, u64::from(KEY_HASH_ALGORITHM_XXH3_64)),
             peak_disk_bytes: disk_peak_bytes(geometry, index_slots)?,
         })
-    }
-
-    /// Returns the total Region capacity, excluding file headers and sidecars.
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.geometry.region_size * self.geometry.region_count as u64
-    }
-
-    /// Returns the size of each Region in bytes.
-    pub const fn region_size_bytes(&self) -> u64 {
-        self.geometry.region_size
-    }
-
-    /// Returns the number of Regions available to append shards and reclaim.
-    pub const fn region_count(&self) -> u32 {
-        self.geometry.region_count
-    }
-
-    /// Returns the number of physical slots in the fixed L2 index.
-    pub const fn index_slots(&self) -> usize {
-        self.index_slots
-    }
-
-    /// Returns the maximum cache-owned logical disk usage: data and state files,
-    /// plus both the current and temporary recovery images used by warm close.
-    /// Filesystem metadata and block-allocation granularity are outside this bound.
-    pub const fn peak_disk_bytes(&self) -> u64 {
-        self.peak_disk_bytes
-    }
-
-    pub(crate) const fn geometry(&self) -> DataGeometry {
-        self.geometry
-    }
-    pub(crate) const fn fingerprint(&self) -> u64 {
-        self.fingerprint
     }
 }
 
@@ -235,6 +189,21 @@ fn index_layout_error(error: IndexStorageError) -> io::Error {
         IndexStorageError::Io(error) => error,
         error => io::Error::new(io::ErrorKind::InvalidInput, error),
     }
+}
+
+#[cfg(test)]
+pub fn cache_config(
+    geometry: DataGeometry,
+    index_slots: usize,
+    runtime: RuntimeOptions,
+) -> CacheConfig {
+    let storage = StorageLayout::new(
+        geometry.region_size * u64::from(geometry.region_count),
+        geometry.region_size,
+        index_slots,
+    )
+    .expect("test storage layout must be valid");
+    CacheConfig::new(storage, runtime).expect("test configuration must be valid")
 }
 
 #[cfg(test)]

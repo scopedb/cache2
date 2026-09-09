@@ -27,19 +27,19 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-pub(crate) const BUFFER_ALIGNMENT: usize = 4096;
+pub const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured
 /// topology cannot inherit an environment-dependent `RUST_MIN_STACK` value.
-pub(crate) const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_CONFIG_COUNT: usize = 65_536;
+pub const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
+pub const MAX_CONFIG_COUNT: usize = 65_536;
 
-pub(crate) struct ResourceLimits {
-    pub(crate) memory_limit_bytes: usize,
-    pub(crate) reserved_memory_bytes: usize,
+pub struct ResourceLimits {
+    pub memory_limit_bytes: usize,
+    pub reserved_memory_bytes: usize,
 }
 
 #[derive(Debug)]
-pub(crate) enum ResourceBuildError {
+pub enum ResourceBuildError {
     Invalid(&'static str),
     Allocation,
 }
@@ -53,14 +53,14 @@ impl fmt::Display for ResourceBuildError {
     }
 }
 
-pub(crate) struct ResourceController {
+pub struct ResourceController {
     memory: Arc<MemoryTracker>,
 }
 
 /// A fixed runtime allocation charged to the same hard memory limit as the
 /// request pools. The owner keeps this guard for exactly as long as the
 /// associated bounded structure exists.
-pub(crate) struct RuntimeMemoryReservation {
+pub struct RuntimeMemoryReservation {
     memory: Arc<MemoryTracker>,
     bytes: usize,
 }
@@ -72,7 +72,7 @@ impl Drop for RuntimeMemoryReservation {
 }
 
 impl ResourceController {
-    pub(crate) fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
+    pub fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
         if limits.reserved_memory_bytes > limits.memory_limit_bytes {
             return Err(ResourceBuildError::Invalid(
                 "memory limit cannot hold the cache's reserved memory",
@@ -86,7 +86,7 @@ impl ResourceController {
         Ok(Self { memory })
     }
 
-    pub(crate) fn reserve_runtime_memory(
+    pub fn reserve_runtime_memory(
         &self,
         bytes: usize,
     ) -> Result<RuntimeMemoryReservation, ResourceBuildError> {
@@ -102,11 +102,11 @@ impl ResourceController {
     /// Allocates one alignment-rounded foreground read buffer against the
     /// cache-wide hard memory limit. The caller maps failure to either a
     /// fail-open miss or an explicit bounded-wait overload.
-    pub(crate) fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
+    pub fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
         BufferLease::try_standalone(length, Arc::clone(&self.memory))
     }
 
-    pub(crate) fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
+    pub fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
         let current_bytes = self.memory.current.load(Ordering::Relaxed);
         ManagedMemorySnapshot {
             limit_bytes: self.memory.limit,
@@ -117,13 +117,13 @@ impl ResourceController {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ManagedMemorySnapshot {
-    pub(crate) limit_bytes: usize,
-    pub(crate) current_bytes: usize,
-    pub(crate) peak_bytes: usize,
+pub struct ManagedMemorySnapshot {
+    pub limit_bytes: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
 }
 
-pub(crate) struct BufferLease {
+pub struct BufferLease {
     owner: BufferOwner,
     buffer: Option<AlignedBuffer>,
 }
@@ -134,7 +134,7 @@ enum BufferOwner {
 }
 
 impl BufferLease {
-    pub(crate) fn try_fixed(length: usize) -> Result<Self, ResourceBuildError> {
+    pub fn try_fixed(length: usize) -> Result<Self, ResourceBuildError> {
         if length == 0 || !length.is_multiple_of(BUFFER_ALIGNMENT) || length > isize::MAX as usize {
             return Err(ResourceBuildError::Invalid(
                 "fixed buffer size must be a non-zero 4096-byte multiple",
@@ -176,7 +176,7 @@ impl BufferLease {
     }
 
     #[cfg(test)]
-    pub(crate) fn prepare(&mut self, length: usize) -> Result<&mut [u8], ()> {
+    pub fn prepare(&mut self, length: usize) -> Result<&mut [u8], ()> {
         let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
         if length > buffer.capacity {
             return Err(());
@@ -191,7 +191,7 @@ impl BufferLease {
     ///
     /// Fresh capacity is zeroed before it is exposed as initialized bytes.
     #[cfg(test)]
-    pub(crate) fn grow_preserving(&mut self, length: usize) -> Result<&mut [u8], ()> {
+    fn grow_preserving(&mut self, length: usize) -> Result<&mut [u8], ()> {
         let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
         if length > buffer.capacity {
             return Err(());
@@ -200,7 +200,7 @@ impl BufferLease {
         Ok(buffer.prefix_mut(length))
     }
 
-    pub(crate) fn prepared(&self, length: usize) -> Result<&[u8], ()> {
+    pub fn prepared(&self, length: usize) -> Result<&[u8], ()> {
         let buffer = self.buffer.as_ref().ok_or(())?;
         if length > buffer.initialized {
             return Err(());
@@ -210,7 +210,7 @@ impl BufferLease {
         Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), length) })
     }
 
-    pub(crate) fn prepared_mut(&mut self, length: usize) -> Result<&mut [u8], ()> {
+    pub fn prepared_mut(&mut self, length: usize) -> Result<&mut [u8], ()> {
         let buffer = self.buffer.as_mut().ok_or(())?;
         if length > buffer.initialized {
             return Err(());
@@ -218,13 +218,13 @@ impl BufferLease {
         Ok(buffer.prefix_mut(length))
     }
 
-    pub(crate) fn has_capacity(&self, length: usize) -> bool {
+    pub fn has_capacity(&self, length: usize) -> bool {
         self.buffer
             .as_ref()
             .is_some_and(|buffer| length <= buffer.capacity)
     }
 
-    pub(crate) fn read_target(&self, length: usize) -> Result<*mut u8, ()> {
+    pub fn read_target(&self, length: usize) -> Result<*mut u8, ()> {
         let buffer = self.buffer.as_ref().ok_or(())?;
         if length > buffer.capacity {
             return Err(());
@@ -232,7 +232,7 @@ impl BufferLease {
         Ok(buffer.ptr.as_ptr())
     }
 
-    pub(crate) fn mark_initialized(&mut self, length: usize) -> Result<(), ()> {
+    pub fn mark_initialized(&mut self, length: usize) -> Result<(), ()> {
         let buffer = self.buffer.as_mut().ok_or(())?;
         if length > buffer.capacity {
             return Err(());
@@ -387,7 +387,7 @@ impl MemoryTracker {
 }
 
 #[cfg(test)]
-pub(crate) fn aligned_buffer_capacity(value: usize) -> Option<usize> {
+pub fn aligned_buffer_capacity(value: usize) -> Option<usize> {
     align_up(value, BUFFER_ALIGNMENT)
 }
 

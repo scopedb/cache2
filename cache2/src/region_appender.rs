@@ -34,10 +34,10 @@ use crate::recovery::DATA_REGION_AREA_OFFSET;
 use crate::recovery::DataGeometry;
 use crate::region_manager::RegionWriteSpan;
 
-pub(crate) struct RegionSpanSubmitError {
-    pub(crate) error: io::Error,
-    pub(crate) span: RegionWriteSpan,
-    pub(crate) buffer: Option<IoBuffer>,
+pub struct RegionSpanSubmitError {
+    pub error: io::Error,
+    pub span: RegionWriteSpan,
+    pub buffer: Option<IoBuffer>,
 }
 
 impl fmt::Debug for RegionSpanSubmitError {
@@ -63,21 +63,21 @@ impl std::error::Error for RegionSpanSubmitError {
     }
 }
 
-pub(crate) struct RegionSpanFlight {
+pub struct RegionSpanFlight {
     span: RegionWriteSpan,
     expected_len: usize,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
-pub(crate) struct RegionSpanCompletion {
-    pub(crate) span: RegionWriteSpan,
-    pub(crate) result: io::Result<()>,
-    pub(crate) buffer: Option<IoBuffer>,
+pub struct RegionSpanCompletion {
+    pub span: RegionWriteSpan,
+    pub result: io::Result<()>,
+    pub buffer: Option<IoBuffer>,
 }
 
 impl RegionSpanFlight {
-    pub(crate) fn wait(self, engine: &dyn IoEngine) -> RegionSpanCompletion {
+    pub fn wait(self, engine: &dyn IoEngine) -> RegionSpanCompletion {
         let completion = match self.request.wait(engine) {
             Ok(completion) => completion,
             Err(timeout) => {
@@ -131,7 +131,7 @@ impl RegionSpanFlight {
 // The error returns the owned aligned buffer without another fallible
 // allocation; boxing it would violate that overload-path property.
 #[allow(clippy::result_large_err)]
-pub(crate) fn submit_span(
+pub fn submit_span(
     engine: &dyn IoEngine,
     geometry: DataGeometry,
     span: RegionWriteSpan,

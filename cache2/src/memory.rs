@@ -40,7 +40,7 @@ use crate::snapshot::CacheL1Snapshot;
 
 /// Charged retained-value ownership. Fixed entry, policy, and directory
 /// storage is planned and allocated separately during open.
-pub(crate) const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
+const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// Keep large Region records out of shard-local L1 critical sections. The
 /// complete retained entry, including its key and fixed ownership charge, must
 /// fit this bound before foreground publication or L2 promotion takes the lock.
@@ -63,8 +63,8 @@ const MAX_BUDGET_CAS_ATTEMPTS: usize = 8;
 /// mutation work; exhausted attempts still fall through to L2 immediately.
 const MAX_L1_LOOKUP_LOCK_ATTEMPTS: usize = 4;
 
-pub(crate) struct MemoryBudget {
-    pub(crate) capacity_bytes: usize,
+struct MemoryBudget {
+    capacity_bytes: usize,
     used_bytes: AtomicUsize,
 }
 
@@ -154,7 +154,7 @@ enum MemoryChargeAttempt {
     Contended,
 }
 
-pub(crate) struct MemoryCharge {
+struct MemoryCharge {
     budget: Option<Arc<MemoryBudget>>,
     bytes: usize,
 }
@@ -166,7 +166,7 @@ struct MemoryValueInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct MemoryValue(Arc<MemoryValueInner>);
+pub struct MemoryValue(Arc<MemoryValueInner>);
 
 impl MemoryValue {
     fn try_new(
@@ -196,11 +196,11 @@ impl MemoryValue {
         })))
     }
 
-    pub(crate) fn charged_bytes(&self) -> usize {
+    fn charged_bytes(&self) -> usize {
         MEMORY_ENTRY_OVERHEAD_BYTES + self.0.bytes.len() - MEMORY_VALUE_SEQNO_BYTES
     }
 
-    pub(crate) fn key(&self) -> &[u8] {
+    pub fn key(&self) -> &[u8] {
         &self.0.bytes[..self.0.key_length]
     }
 
@@ -740,16 +740,16 @@ impl MemoryInsertResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MemoryReadToken {
+pub struct MemoryReadToken {
     shard_id: usize,
 }
 
-pub(crate) enum MemoryLookup {
+pub enum MemoryLookup {
     Hit(MemoryValue),
     Miss(MemoryReadToken),
 }
 
-pub(crate) struct MemoryStore {
+pub struct MemoryStore {
     shards: Box<[MemoryShardLock]>,
     metrics: MemoryMetrics,
     entry_capacity: usize,
@@ -774,13 +774,13 @@ struct MemoryMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct MemoryMetricsSnapshot {
-    pub(crate) evictions: u64,
-    pub(crate) bypasses: u64,
+pub struct MemoryMetricsSnapshot {
+    pub evictions: u64,
+    pub bypasses: u64,
 }
 
 impl MemoryStore {
-    pub(crate) fn maximum_entry_capacity(capacity_bytes: usize, shard_count: usize) -> usize {
+    pub fn maximum_entry_capacity(capacity_bytes: usize, shard_count: usize) -> usize {
         if shard_count == 0 {
             return 0;
         }
@@ -792,7 +792,7 @@ impl MemoryStore {
         })
     }
 
-    pub(crate) fn new(
+    pub fn new(
         capacity_bytes: usize,
         entry_capacity: usize,
         shard_count: usize,
@@ -841,7 +841,7 @@ impl MemoryStore {
         })
     }
 
-    pub(crate) fn allocation_bytes(
+    pub fn allocation_bytes(
         capacity_bytes: usize,
         entry_capacity: usize,
         shard_count: usize,
@@ -877,7 +877,7 @@ impl MemoryStore {
         Ok(total)
     }
 
-    pub(crate) fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
+    pub fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
@@ -911,7 +911,7 @@ impl MemoryStore {
 
     /// Best-effort exact-key cleanup for a sequenced delete. Contention
     /// bypasses L1, and a newer resident value is never removed.
-    pub(crate) fn delete(&self, hash: u64, key: &[u8], seqno: u64) -> bool {
+    pub fn delete(&self, hash: u64, key: &[u8], seqno: u64) -> bool {
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
@@ -930,7 +930,7 @@ impl MemoryStore {
         true
     }
 
-    pub(crate) fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
+    pub fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
         let mut attempts = 1;
         let mut shard = loop {
@@ -956,7 +956,7 @@ impl MemoryStore {
         MemoryLookup::Hit(entry.value.clone())
     }
 
-    pub(crate) fn promote(
+    pub fn promote(
         &self,
         token: MemoryReadToken,
         hash: u64,
@@ -1006,14 +1006,14 @@ impl MemoryStore {
         promoted
     }
 
-    pub(crate) fn metrics_snapshot(&self) -> MemoryMetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> MemoryMetricsSnapshot {
         MemoryMetricsSnapshot {
             evictions: self.metrics.evictions.load(Ordering::Relaxed),
             bypasses: self.metrics.bypasses.load(Ordering::Relaxed),
         }
     }
 
-    pub(crate) fn detailed_snapshot(&self) -> io::Result<CacheL1Snapshot> {
+    pub fn detailed_snapshot(&self) -> io::Result<CacheL1Snapshot> {
         let mut resident_entries = 0_usize;
         let mut resident_bytes = 0_usize;
         let mut charged_bytes = 0_usize;

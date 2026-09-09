@@ -14,33 +14,29 @@
 
 //! Configuration construction, independent of file paths and runtime handles.
 
-use std::io;
-
-use crate::error::Error;
-use crate::error::ErrorOperation;
-use crate::error::Result;
-use crate::memory::MemoryStore;
-#[cfg(test)]
 use crate::recovery::DataGeometry;
 
 mod runtime;
 pub use self::runtime::IoEngine;
 pub use self::runtime::IoMode;
-pub(crate) use self::runtime::IoPoolTopology;
+pub use self::runtime::IoPoolTopology;
 pub use self::runtime::IoUringConfig;
 pub use self::runtime::IoUringPoolConfig;
 pub use self::runtime::IoUringSqPollConfig;
 pub use self::runtime::L1EvictionPolicy;
 #[cfg(test)]
-pub(crate) use self::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
+pub use self::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 pub use self::runtime::PosixIoConfig;
 pub use self::runtime::ReadAdmission;
 pub use self::runtime::RuntimeOptions;
+pub use self::runtime::read_io_wait_capacity;
+pub use self::runtime::read_io_wait_timeout;
 
 mod storage;
-pub(crate) use self::storage::KEY_HASH_SEED;
-pub use self::storage::StorageLayout;
+pub use self::storage::KEY_HASH_SEED;
 pub use self::storage::StorageOptions;
+#[cfg(test)]
+pub use self::storage::cache_config;
 
 /// Complete, immutable configuration for opening a [`crate::Cache`].
 ///
@@ -59,74 +55,6 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    /// Checks the complete combination and resolves dependent runtime defaults.
-    ///
-    /// ```no_run
-    /// # async fn example() -> cache2::Result<()> {
-    /// use cache2::Cache;
-    /// use cache2::CacheConfig;
-    /// use cache2::RuntimeOptions;
-    /// use cache2::StorageOptions;
-    /// let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
-    /// let config = CacheConfig::new(storage, RuntimeOptions::default())?;
-    /// let disk_peak = config.storage().peak_disk_bytes();
-    /// let memory_floor = config.minimum_memory_bytes();
-    /// let cache = Cache::open("cache.data", config).await?;
-    /// # cache.close_fast().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
-    /// counts, invalid runtime settings, unavailable build/platform features,
-    /// or insufficient managed memory. Device capabilities are checked at open.
-    pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self> {
-        let build = || -> io::Result<Self> {
-            let geometry = storage.geometry;
-            let index_slots = storage.index_slots;
-            runtime.resolve()?;
-            if geometry.region_count <= runtime.append_shards {
-                return Err(invalid_config(
-                    "append shards require valid geometry with one Active Region each plus one spare Region",
-                ));
-            }
-            let l1_entry_capacity = runtime.l1_entry_capacity(geometry, index_slots)?;
-            let l1_metadata_bytes = MemoryStore::allocation_bytes(
-                runtime.l1_capacity_bytes,
-                l1_entry_capacity,
-                runtime.l1_shards,
-                runtime.l1_eviction_policy,
-            )?;
-            let fixed_bytes = crate::region::core::runtime_fixed_memory_bytes(
-                index_slots,
-                geometry.region_count,
-            )?
-            .checked_add(l1_metadata_bytes)
-            .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
-            let (reserved_memory_bytes, minimum_memory_bytes) =
-                runtime.memory_requirements(geometry, fixed_bytes)?;
-            if minimum_memory_bytes > runtime.managed_memory_limit_bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "managed memory limit cannot hold the cache memory requirements: requires {minimum_memory_bytes} bytes, configured {} bytes",
-                        runtime.managed_memory_limit_bytes
-                    ),
-                ));
-            }
-            Ok(Self {
-                storage,
-                runtime,
-                l1_entry_capacity,
-                reserved_memory_bytes,
-                minimum_memory_bytes,
-            })
-        };
-        build().map_err(|error| Error::from_io(ErrorOperation::BuildConfig, error))
-    }
-
     /// Returns the immutable persistent layout and its disk bound.
     pub const fn storage(&self) -> &StorageLayout {
         &self.storage
@@ -145,30 +73,62 @@ impl CacheConfig {
     pub const fn minimum_memory_bytes(&self) -> usize {
         self.minimum_memory_bytes
     }
+}
 
-    pub(crate) const fn l1_entry_capacity(&self) -> usize {
-        self.l1_entry_capacity
-    }
-    pub(crate) const fn reserved_memory_bytes(&self) -> usize {
-        self.reserved_memory_bytes
+/// Immutable persistent geometry with a checked logical disk bound.
+///
+/// Created by [`StorageOptions::build`]. Changing the geometry or index size
+/// changes the disk identity, so an incompatible recovery image opens empty.
+/// Layout construction neither reserves disk space nor requires a Tokio runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageLayout {
+    geometry: DataGeometry,
+    index_slots: usize,
+    fingerprint: u64,
+    peak_disk_bytes: u64,
+}
+
+impl StorageLayout {
+    /// Returns the total Region capacity, excluding file headers and sidecars.
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.geometry.region_size * self.geometry.region_count as u64
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        geometry: DataGeometry,
-        index_slots: usize,
-        runtime: RuntimeOptions,
-    ) -> Self {
-        let storage = StorageLayout::new(
-            geometry.region_size * u64::from(geometry.region_count),
-            geometry.region_size,
-            index_slots,
-        )
-        .expect("test storage layout must be valid");
-        Self::new(storage, runtime).expect("test configuration must be valid")
+    /// Returns the size of each Region in bytes.
+    pub const fn region_size_bytes(&self) -> u64 {
+        self.geometry.region_size
+    }
+
+    /// Returns the number of Regions available to append shards and reclaim.
+    pub const fn region_count(&self) -> u32 {
+        self.geometry.region_count
+    }
+
+    /// Returns the number of physical slots in the fixed L2 index.
+    pub const fn index_slots(&self) -> usize {
+        self.index_slots
+    }
+
+    /// Returns the maximum cache-owned logical disk usage: data and state files,
+    /// plus both the current and temporary recovery images used by warm close.
+    /// Filesystem metadata and block-allocation granularity are outside this bound.
+    pub const fn peak_disk_bytes(&self) -> u64 {
+        self.peak_disk_bytes
     }
 }
 
-fn invalid_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
+pub const fn storage_geometry(storage: &StorageLayout) -> DataGeometry {
+    storage.geometry
+}
+
+pub const fn storage_fingerprint(storage: &StorageLayout) -> u64 {
+    storage.fingerprint
+}
+
+pub const fn l1_entry_capacity(config: &CacheConfig) -> usize {
+    config.l1_entry_capacity
+}
+
+pub const fn reserved_memory_bytes(config: &CacheConfig) -> usize {
+    config.reserved_memory_bytes
 }

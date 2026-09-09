@@ -100,7 +100,6 @@ use crate::resources::CACHE_THREAD_STACK_BYTES;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
-pub(crate) use self::posix::BackendIoEngine;
 
 #[cfg(all(
     feature = "io-uring",
@@ -125,15 +124,23 @@ mod uring;
         target_arch = "powerpc64"
     )
 ))]
-pub(crate) use self::uring::UringIoEngine;
+pub use self::uring::UringIoEngine;
 
-pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
-pub(crate) const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
+/// Reference engine: a small fixed worker pool executes exact operations
+/// through the existing fault-injectable positioned-I/O backend.
+#[derive(Clone)]
+pub struct BackendIoEngine {
+    inner: Arc<RuntimeInner>,
+    backend: Arc<dyn IoBackend>,
+}
+
+const IO_BUFFER_ALIGNMENT: usize = 4096;
+pub const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 // Common bounded command, completion, and request bookkeeping. Payload
 // buffers are charged by ResourceController separately.
-pub(crate) const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
+pub const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 
-pub(crate) fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option<usize> {
+pub fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option<usize> {
     // Together with the common 512 bytes, reserve 2 KiB per operation for the
     // flight table, rounded SQ/CQ buffers and failure cleanup. Another 256 KiB
     // per ring covers mapping headers and rounding on 64 KiB-page kernels.
@@ -145,25 +152,25 @@ pub(crate) fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) ->
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
 /// than a durability knob: cache contents are disposable.
-pub(crate) const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cancellation is only a request. Give the target operation a short window to
 /// publish its own completion, which is the actual buffer-lifetime fence.
-pub(crate) const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
+const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EngineIoSnapshot {
-    pub(crate) requests: CacheIoDirectionSnapshot,
-    pub(crate) runtime: RuntimeIoStats,
+pub struct EngineIoSnapshot {
+    pub requests: CacheIoDirectionSnapshot,
+    pub runtime: RuntimeIoStats,
 }
 
 /// A logical range of an engine-budgeted aligned buffer lease.
-pub(crate) struct IoBuffer {
+pub struct IoBuffer {
     lease: BufferLease,
     length: usize,
 }
 
 impl IoBuffer {
-    pub(crate) fn for_write(mut lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
+    pub fn for_write(mut lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
         if length > u32::MAX as usize {
             return Err(IoBufferError {
                 error: io::Error::new(
@@ -185,7 +192,7 @@ impl IoBuffer {
         Ok(Self { lease, length })
     }
 
-    pub(crate) fn for_read(lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
+    pub fn for_read(lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
         if length > u32::MAX as usize {
             return Err(IoBufferError {
                 error: io::Error::new(
@@ -207,7 +214,7 @@ impl IoBuffer {
         Ok(Self { lease, length })
     }
 
-    pub(crate) const fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.length
     }
 
@@ -222,11 +229,11 @@ impl IoBuffer {
             target_arch = "powerpc64"
         )
     ))]
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.length == 0
     }
 
-    pub(crate) fn as_slice(&self) -> io::Result<&[u8]> {
+    pub fn as_slice(&self) -> io::Result<&[u8]> {
         self.lease.prepared(self.length).map_err(|()| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -253,7 +260,7 @@ impl IoBuffer {
         })
     }
 
-    pub(crate) fn into_lease(self) -> BufferLease {
+    pub fn into_lease(self) -> BufferLease {
         self.lease
     }
 
@@ -298,9 +305,9 @@ impl fmt::Debug for IoBuffer {
     }
 }
 
-pub(crate) struct IoBufferError {
-    pub(crate) error: io::Error,
-    pub(crate) lease: BufferLease,
+pub struct IoBufferError {
+    pub error: io::Error,
+    pub lease: BufferLease,
 }
 
 impl fmt::Debug for IoBufferError {
@@ -325,7 +332,7 @@ impl std::error::Error for IoBufferError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RequestId(u64);
+pub struct RequestId(u64);
 
 impl RequestId {
     #[cfg(all(
@@ -339,13 +346,13 @@ impl RequestId {
             target_arch = "powerpc64"
         )
     ))]
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OperationKind {
+pub enum OperationKind {
     Read,
     Write,
 }
@@ -375,7 +382,7 @@ impl OperationKind {
 }
 
 /// An operation owns its buffer from slot reservation until target completion.
-pub(crate) enum IoOperation {
+pub enum IoOperation {
     Read {
         buffer: IoBuffer,
         offset: u64,
@@ -388,11 +395,11 @@ pub(crate) enum IoOperation {
 }
 
 impl IoOperation {
-    pub(crate) fn read(buffer: IoBuffer, offset: u64) -> Self {
+    pub fn read(buffer: IoBuffer, offset: u64) -> Self {
         Self::Read { buffer, offset }
     }
 
-    pub(crate) fn write(point: WritePoint, buffer: IoBuffer, offset: u64) -> Self {
+    pub fn write(point: WritePoint, buffer: IoBuffer, offset: u64) -> Self {
         Self::Write {
             point,
             buffer,
@@ -400,7 +407,7 @@ impl IoOperation {
         }
     }
 
-    pub(crate) const fn kind(&self) -> OperationKind {
+    pub const fn kind(&self) -> OperationKind {
         match self {
             Self::Read { .. } => OperationKind::Read,
             Self::Write { .. } => OperationKind::Write,
@@ -520,14 +527,14 @@ impl fmt::Debug for IoOperation {
 }
 
 #[derive(Debug)]
-pub(crate) enum CompletionStatus {
+pub enum CompletionStatus {
     Completed,
     Cancelled,
     Failed(io::Error),
 }
 
 impl CompletionStatus {
-    pub(crate) fn into_io_result(self, bytes_transferred: usize) -> io::Result<usize> {
+    pub fn into_io_result(self, bytes_transferred: usize) -> io::Result<usize> {
         match self {
             Self::Completed => Ok(bytes_transferred),
             Self::Cancelled => Err(io::Error::new(
@@ -540,33 +547,33 @@ impl CompletionStatus {
 }
 
 #[derive(Debug)]
-pub(crate) struct IoCompletion {
-    pub(crate) request_id: RequestId,
-    pub(crate) kind: OperationKind,
-    pub(crate) status: CompletionStatus,
-    pub(crate) bytes_transferred: usize,
-    pub(crate) buffer: Option<IoBuffer>,
+pub struct IoCompletion {
+    pub request_id: RequestId,
+    pub kind: OperationKind,
+    pub status: CompletionStatus,
+    pub bytes_transferred: usize,
+    pub buffer: Option<IoBuffer>,
 }
 
 impl IoCompletion {
     /// Split the result without ever discarding the owned buffer on failure.
-    pub(crate) fn into_io_result(self) -> (io::Result<usize>, Option<IoBuffer>) {
+    pub fn into_io_result(self) -> (io::Result<usize>, Option<IoBuffer>) {
         (
             self.status.into_io_result(self.bytes_transferred),
             self.buffer,
         )
     }
 
-    pub(crate) fn into_lease(self) -> (io::Result<usize>, Option<BufferLease>) {
+    pub fn into_lease(self) -> (io::Result<usize>, Option<BufferLease>) {
         let (result, buffer) = self.into_io_result();
         (result, buffer.map(IoBuffer::into_lease))
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct SubmitError {
-    pub(crate) error: io::Error,
-    pub(crate) operation: IoOperation,
+pub struct SubmitError {
+    pub error: io::Error,
+    pub operation: IoOperation,
 }
 
 impl fmt::Display for SubmitError {
@@ -582,16 +589,16 @@ impl std::error::Error for SubmitError {
 }
 
 impl SubmitError {
-    pub(crate) fn into_parts(self) -> (io::Error, IoOperation) {
+    fn into_parts(self) -> (io::Error, IoOperation) {
         (self.error, self.operation)
     }
 
-    pub(crate) fn into_lease(self) -> (io::Error, Option<BufferLease>) {
+    pub fn into_lease(self) -> (io::Error, Option<BufferLease>) {
         let (error, buffer) = self.into_buffer();
         (error, buffer.map(IoBuffer::into_lease))
     }
 
-    pub(crate) fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
+    pub fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
         let (error, operation) = self.into_parts();
         (error, operation.into_buffer())
     }
@@ -603,7 +610,7 @@ struct CompletionCell {
     waker: Option<Waker>,
 }
 
-pub(crate) struct CompletionState {
+pub struct CompletionState {
     cell: Mutex<CompletionCell>,
     ready: Condvar,
     cancel_requested: AtomicBool,
@@ -703,7 +710,7 @@ impl CompletionState {
 
 /// A single-consumer completion. Dropping it detaches the consumer; it does not
 /// cancel the operation or release an in-flight buffer.
-pub(crate) struct IoRequest {
+pub struct IoRequest {
     request_id: RequestId,
     completion: Arc<CompletionState>,
     finished: bool,
@@ -720,12 +727,12 @@ impl fmt::Debug for IoRequest {
 }
 
 impl IoRequest {
-    pub(crate) const fn id(&self) -> RequestId {
+    pub const fn id(&self) -> RequestId {
         self.request_id
     }
 
     #[cfg(test)]
-    pub(crate) fn wait(mut self) -> IoCompletion {
+    pub fn wait(mut self) -> IoCompletion {
         let completion = self.completion.wait();
         self.finished = true;
         completion
@@ -734,7 +741,7 @@ impl IoRequest {
     /// Wait through an absolute deadline without detaching the consumer. On
     /// timeout ownership of the request is returned so the caller can request
     /// cancellation and continue waiting for the target lifetime fence.
-    pub(crate) fn wait_until(mut self, deadline: Instant) -> Result<IoCompletion, Self> {
+    fn wait_until(mut self, deadline: Instant) -> Result<IoCompletion, Self> {
         match self.completion.wait_until(deadline) {
             Some(completion) => {
                 self.finished = true;
@@ -770,7 +777,7 @@ impl Drop for IoRequest {
 
 /// One cache I/O carrying the same absolute deadline through slot reservation
 /// and target completion.
-pub(crate) struct BoundedIoRequest {
+pub struct BoundedIoRequest {
     request: IoRequest,
     deadline: Instant,
     cancel_grace: Duration,
@@ -778,11 +785,11 @@ pub(crate) struct BoundedIoRequest {
 }
 
 impl BoundedIoRequest {
-    pub(crate) const fn id(&self) -> RequestId {
+    pub const fn id(&self) -> RequestId {
         self.request.id()
     }
 
-    pub(crate) fn wait(self, engine: &dyn IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
+    pub fn wait(self, engine: &dyn IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
         let request = match self.request.wait_until(self.deadline) {
             Ok(completion) => return Ok(completion),
             Err(request) => request,
@@ -810,7 +817,7 @@ impl BoundedIoRequest {
         }
     }
 
-    pub(crate) async fn wait_async(
+    pub async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
         tokio_handle: &tokio::runtime::Handle,
@@ -892,7 +899,7 @@ impl Drop for AsyncRequestGuard {
 }
 
 #[derive(Debug)]
-pub(crate) struct IoDeadlineExceeded {
+pub struct IoDeadlineExceeded {
     error: io::Error,
     completion: Option<IoCompletion>,
 }
@@ -909,21 +916,21 @@ impl IoDeadlineExceeded {
         }
     }
 
-    pub(crate) fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
+    pub fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
         let buffer = self
             .completion
             .and_then(|completion| completion.into_io_result().1);
         (self.error, buffer)
     }
 
-    pub(crate) fn into_lease(self) -> (io::Error, Option<BufferLease>) {
+    pub fn into_lease(self) -> (io::Error, Option<BufferLease>) {
         let (error, buffer) = self.into_buffer();
         (error, buffer.map(IoBuffer::into_lease))
     }
 }
 
 /// Submit one cache-device request with a hard end-to-end deadline.
-pub(crate) fn submit_cache_io(
+pub fn submit_cache_io(
     engine: &dyn IoEngine,
     operation: IoOperation,
 ) -> Result<BoundedIoRequest, SubmitError> {
@@ -934,7 +941,7 @@ pub(crate) fn submit_cache_io(
 }
 
 /// Submits a read whose engine slot was reserved before allocating its buffer.
-pub(crate) fn submit_cache_read(
+pub fn submit_cache_read(
     engine: &dyn IoEngine,
     slot: ReadSlot,
     operation: IoOperation,
@@ -968,7 +975,7 @@ fn submit_cache_io_until(
     })
 }
 
-pub(crate) trait IoEngine: Send + Sync {
+pub trait IoEngine: Send + Sync {
     fn try_reserve_read(&self) -> io::Result<ReadSlot>;
     fn read_slot_waiter(&self) -> ReadSlotWaiter;
     fn submit_reserved_read(
@@ -1032,12 +1039,12 @@ struct IoSlot {
 
 /// One read reservation against the engine's complete depth.
 /// Dropping it before submission releases the slot immediately.
-pub(crate) struct ReadSlot {
+pub struct ReadSlot {
     slot: IoSlot,
 }
 
 /// An async reservation handle backed by the engine's physical slot state.
-pub(crate) struct ReadSlotWaiter {
+pub struct ReadSlotWaiter {
     shared: Arc<RuntimeShared>,
 }
 
@@ -1143,7 +1150,7 @@ impl Drop for ReadWaiterGuard<'_> {
 }
 
 impl ReadSlotWaiter {
-    pub(crate) async fn reserve_until(
+    pub async fn reserve_until(
         self,
         deadline: Instant,
         tokio_handle: &tokio::runtime::Handle,
@@ -1971,7 +1978,7 @@ impl Drop for RuntimeInner {
 }
 
 #[cfg(unix)]
-pub(crate) fn build_file_engine(
+pub fn build_file_engine(
     files: RuntimeFileSet,
     max_in_flight: usize,
     posix_workers: usize,

@@ -74,28 +74,33 @@ use crate::resources::BufferLease;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
+mod file_backend;
+pub use self::file_backend::FileRegionBackend;
+pub use self::file_backend::RegionFiles;
+pub use self::file_backend::SystemRegionFileSystem;
+
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;
 /// One-way health fence shared by the live, frozen, and prepared-clean owners.
 /// Once a lazy index fault rejects the recovery image, no later phase may
 /// publish CLEAN from the partially trusted authority.
 #[derive(Clone)]
-pub(crate) struct RegionHealthLatch {
+pub struct RegionHealthLatch {
     state: Arc<AtomicU8>,
 }
 
 impl RegionHealthLatch {
-    pub(super) fn healthy() -> Self {
+    fn healthy() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(REGION_HEALTHY)),
         }
     }
 
-    pub(crate) fn is_healthy(&self) -> bool {
+    pub fn is_healthy(&self) -> bool {
         self.state.load(Ordering::Acquire) == REGION_HEALTHY
     }
 
-    pub(crate) fn enter_miss_only(&self) {
+    pub fn enter_miss_only(&self) {
         if self.transition_to_miss_only() {
             log::warn!(
                 target: "cache2::health",
@@ -129,7 +134,7 @@ impl RegionHealthLatch {
             .is_ok()
     }
 
-    pub(crate) fn require_healthy(&self) -> io::Result<()> {
+    fn require_healthy(&self) -> io::Result<()> {
         self.is_healthy().then_some(()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -142,20 +147,20 @@ impl RegionHealthLatch {
 /// The steady-state owner of Region allocation, FIFO rotation, and write-span
 /// accounting. Index publication is deliberately independent; reads validate
 /// the physical record locally and may observe an older valid completion.
-pub(super) struct RegionManagerAuthority {
-    pub(super) inner: Mutex<RegionManager>,
+struct RegionManagerAuthority {
+    inner: Mutex<RegionManager>,
     health: RegionHealthLatch,
 }
 
 impl RegionManagerAuthority {
-    pub(super) fn new(manager: RegionManager, health: RegionHealthLatch) -> Self {
+    fn new(manager: RegionManager, health: RegionHealthLatch) -> Self {
         Self {
             inner: Mutex::new(manager),
             health,
         }
     }
 
-    pub(super) fn lock(&self) -> io::Result<MutexGuard<'_, RegionManager>> {
+    fn lock(&self) -> io::Result<MutexGuard<'_, RegionManager>> {
         self.health.require_healthy()?;
         match self.inner.lock() {
             Ok(guard) if self.health.is_healthy() => Ok(guard),
@@ -193,49 +198,49 @@ impl RegionManagerAuthority {
     }
 }
 
-pub(crate) struct FileRegionCore {
-    pub(super) index: RegionIndex,
-    pub(super) manager: RegionManagerAuthority,
-    pub(super) shards: Box<[RegionShard]>,
-    pub(super) region_access: Box<[RegionAccessState]>,
-    pub(super) rotation: Mutex<()>,
-    pub(super) health: RegionHealthLatch,
+pub struct FileRegionCore {
+    index: RegionIndex,
+    manager: RegionManagerAuthority,
+    shards: Box<[RegionShard]>,
+    region_access: Box<[RegionAccessState]>,
+    rotation: Mutex<()>,
+    health: RegionHealthLatch,
 }
 
-pub(super) struct RegionAccessState {
-    pub(super) generation: AtomicU64,
+struct RegionAccessState {
+    generation: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RegionReclaimStats {
-    pub(crate) records_scanned: u64,
-    pub(crate) records_removed: u64,
-    pub(crate) bytes_read: u64,
-    pub(crate) reinsert_records: u64,
-    pub(crate) reinsert_bytes: u64,
-    pub(crate) reinsert_skipped: u64,
-    pub(crate) reinsert_budget_skipped: u64,
+pub struct RegionReclaimStats {
+    pub records_scanned: u64,
+    pub records_removed: u64,
+    pub bytes_read: u64,
+    pub reinsert_records: u64,
+    pub reinsert_bytes: u64,
+    pub reinsert_skipped: u64,
+    pub reinsert_budget_skipped: u64,
 }
 
-pub(crate) struct RegionReinsertRecord<'a> {
-    pub(crate) hash: u64,
-    pub(crate) previous_location: PackedLocation,
-    pub(crate) logical_seqno: u64,
-    pub(crate) record_bytes: u32,
-    pub(crate) key: &'a [u8],
-    pub(crate) value: &'a [u8],
+pub struct RegionReinsertRecord<'a> {
+    pub hash: u64,
+    pub previous_location: PackedLocation,
+    pub logical_seqno: u64,
+    pub record_bytes: u32,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
 }
 
 /// Short shard-local transaction gate. `mutation` makes manager receipts and
 /// staging transitions one operation. Span completion and rotation are already
 /// ordered by the shard's single production worker.
 #[derive(Default)]
-pub(super) struct RegionShard {
-    pub(super) mutation: Mutex<()>,
+struct RegionShard {
+    mutation: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionStageValue {
+pub enum RegionStageValue {
     Staged {
         seqno: u64,
         previous_bytes: usize,
@@ -245,7 +250,7 @@ pub(crate) enum RegionStageValue {
     NeedsRotation,
 }
 
-pub(crate) struct RegionValueRead {
+pub struct RegionValueRead {
     buffer: BufferLease,
     buffer_len: usize,
     value_range: Range<usize>,
@@ -258,58 +263,58 @@ pub(crate) struct RegionValueRead {
 unsafe impl Sync for RegionValueRead {}
 
 impl RegionValueRead {
-    pub(crate) fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         &self
             .buffer
             .prepared(self.buffer_len)
             .expect("validated read retains its prepared buffer")[self.value_range.clone()]
     }
 
-    pub(crate) const fn seqno(&self) -> u64 {
+    pub const fn seqno(&self) -> u64 {
         self.seqno
     }
 }
 
 impl FileRegionCore {
-    pub(crate) const fn shard_count(&self) -> usize {
+    pub const fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    pub(crate) const fn index_slot_count(&self) -> usize {
+    pub const fn index_slot_count(&self) -> usize {
         self.index.storage().slot_count()
     }
 
-    pub(crate) fn region_count(&self) -> io::Result<usize> {
+    pub fn region_count(&self) -> io::Result<usize> {
         Ok(self.manager.lock()?.regions().len())
     }
 
-    pub(crate) fn configure_reclaim_workers(&self, workers: usize) -> io::Result<()> {
+    pub fn configure_reclaim_workers(&self, workers: usize) -> io::Result<()> {
         self.manager
             .lock()?
             .configure_reclaim_workers(workers)
             .map_err(region_metadata_io_error)
     }
 
-    pub(crate) fn append_shard(&self, hash: u64) -> usize {
+    pub fn append_shard(&self, hash: u64) -> usize {
         route_hash(hash, self.shards.len())
     }
 
-    pub(crate) fn region_snapshot(&self) -> io::Result<RegionSnapshot> {
+    pub fn region_snapshot(&self) -> io::Result<RegionSnapshot> {
         self.manager
             .lock()?
             .region_snapshot()
             .map_err(region_metadata_io_error)
     }
 
-    pub(crate) fn index_snapshot(&self) -> io::Result<CacheIndexSnapshot> {
+    pub fn index_snapshot(&self) -> io::Result<CacheIndexSnapshot> {
         self.index.snapshot().map_err(index_storage_io_error)
     }
 
-    pub(crate) fn set_index_statistics_enabled(&self, enabled: bool) {
+    pub fn set_index_statistics_enabled(&self, enabled: bool) {
         self.index.set_statistics_enabled(enabled);
     }
 
-    pub(crate) fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {
+    pub fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {
         self.health.require_healthy()?;
         self.manager
             .lock()?
@@ -317,15 +322,15 @@ impl FileRegionCore {
             .map_err(|error| region_mutation_context("reclaim begin", error))
     }
 
-    pub(crate) fn reclaim_needed(&self) -> io::Result<bool> {
+    pub fn reclaim_needed(&self) -> io::Result<bool> {
         Ok(self.manager.lock()?.reclaim_needed())
     }
 
-    pub(crate) fn reclaim_can_reinsert(&self) -> io::Result<bool> {
+    pub fn reclaim_can_reinsert(&self) -> io::Result<bool> {
         Ok(self.manager.lock()?.reclaim_can_reinsert())
     }
 
-    pub(crate) fn reclaim_absolute(&self, receipt: RegionReclaimReceipt) -> io::Result<u64> {
+    pub fn reclaim_absolute(&self, receipt: RegionReclaimReceipt) -> io::Result<u64> {
         DATA_REGION_AREA_OFFSET
             .checked_add(
                 u64::from(receipt.region_id)
@@ -340,7 +345,7 @@ impl FileRegionCore {
     /// Scans one exact sealed prefix, removes cold mappings, and offers each
     /// hot current record once to a bounded reinsertion sink. The
     /// source Region remains exclusively pinned until [`Self::complete_reclaim`].
-    pub(crate) fn scan_reclaim(
+    pub fn scan_reclaim(
         &self,
         receipt: RegionReclaimReceipt,
         bytes: &[u8],
@@ -491,7 +496,7 @@ impl FileRegionCore {
 
     /// Releases one fully scanned source only after every accepted replacement
     /// batch has completed and conditionally published.
-    pub(crate) fn complete_reclaim(&self, receipt: RegionReclaimReceipt) -> io::Result<()> {
+    pub fn complete_reclaim(&self, receipt: RegionReclaimReceipt) -> io::Result<()> {
         let access = self
             .region_access
             .get(receipt.region_id as usize)
@@ -509,19 +514,15 @@ impl FileRegionCore {
         Ok(())
     }
 
-    pub(crate) fn enter_miss_only(&self) {
+    pub fn enter_miss_only(&self) {
         self.health.enter_miss_only();
     }
 
-    pub(crate) fn enter_miss_only_with_error(
-        &self,
-        reason: &'static str,
-        error: &impl std::fmt::Display,
-    ) {
+    pub fn enter_miss_only_with_error(&self, reason: &'static str, error: &impl std::fmt::Display) {
         self.health.enter_miss_only_with_error(reason, error);
     }
 
-    pub(crate) fn is_healthy(&self) -> bool {
+    pub fn is_healthy(&self) -> bool {
         self.health.is_healthy()
     }
 
@@ -548,7 +549,7 @@ impl FileRegionCore {
     /// point semantics. A lazy image failure latches the whole L2 miss-only;
     /// it is never surfaced as a cache hit or allowed to authorize CLEAN.
     #[cfg(test)]
-    pub(super) fn lookup_snapshot(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
+    fn lookup_snapshot(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
         if !self.health.is_healthy() {
             return Ok(None);
         }
@@ -564,7 +565,7 @@ impl FileRegionCore {
     }
 
     /// Begins one physical read with a single bounded index lookup.
-    pub(super) fn begin_point_read(&self, hash: u64) -> Option<ReadCandidate> {
+    fn begin_point_read(&self, hash: u64) -> Option<ReadCandidate> {
         if !self.health.is_healthy() {
             return None;
         }
@@ -594,12 +595,12 @@ impl FileRegionCore {
 
     /// Begins one durable value read. The owned read buffer becomes the value
     /// owner on a hit, avoiding a second payload copy.
-    pub(crate) fn begin_value_read(&self, hash: u64) -> Option<ReadCandidate> {
+    pub fn begin_value_read(&self, hash: u64) -> Option<ReadCandidate> {
         self.begin_point_read(hash)
     }
 
     #[cfg(test)]
-    pub(crate) fn read_value(
+    fn read_value(
         &self,
         engine: &dyn IoEngine,
         geometry: crate::recovery::DataGeometry,
@@ -617,7 +618,7 @@ impl FileRegionCore {
     }
 
     #[cfg(test)]
-    pub(crate) fn read_value_from_plan(
+    fn read_value_from_plan(
         &self,
         engine: &dyn IoEngine,
         slot: ReadSlot,
@@ -630,7 +631,7 @@ impl FileRegionCore {
         self.finish_value_read(completion, key)
     }
 
-    pub(crate) fn submit_value_read_from_plan(
+    pub fn submit_value_read_from_plan(
         &self,
         engine: &dyn IoEngine,
         slot: ReadSlot,
@@ -649,7 +650,7 @@ impl FileRegionCore {
         }
     }
 
-    pub(crate) fn finish_value_read(
+    pub fn finish_value_read(
         &self,
         completion: ReadCompletion,
         key: &[u8],
@@ -740,7 +741,7 @@ impl FileRegionCore {
     /// mutation gate; the gate protects reservation, copying and fill commit.
     /// Region reservation and open-span accounting share one manager try-lock.
     /// This method performs no device I/O and never publishes an index entry.
-    pub(crate) fn try_stage_value(
+    pub fn try_stage_value(
         &self,
         staging: &RegionStaging,
         shard_id: usize,
@@ -752,7 +753,7 @@ impl FileRegionCore {
         self.try_stage_record(staging, shard_id, hash, record_bytes, key, value, None)
     }
 
-    pub(crate) fn try_stage_reinsert(
+    pub fn try_stage_reinsert(
         &self,
         staging: &RegionStaging,
         shard_id: usize,
@@ -892,7 +893,7 @@ impl FileRegionCore {
     /// Allocates one ordering sequence and removes the current L2 candidate
     /// with a single non-waiting bounded index probe. No Region bytes are
     /// reserved or written for a delete.
-    pub(crate) fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
+    pub fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
         self.health.require_healthy()?;
         let seqno = {
             let Some(mut manager) = self.manager.try_lock()? else {
@@ -932,7 +933,7 @@ impl FileRegionCore {
     /// RUNNING recovery is safe-empty, and the only durability barrier is the
     /// later CLEAN data sync. Index entries become visible only after the
     /// exact owned-buffer write completion succeeds.
-    pub(crate) fn flush_staging_shard(
+    pub fn flush_staging_shard(
         &self,
         staging: &RegionStaging,
         engine: &dyn IoEngine,
@@ -1088,7 +1089,7 @@ impl FileRegionCore {
 
     /// Rotates one empty data shard. Concurrent reads validate the returned
     /// record identity and may observe either valid generation.
-    pub(crate) fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
+    pub fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
         self.health.require_healthy()?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let rotation = self.rotation.lock().map_err(|_| {
@@ -1138,7 +1139,7 @@ impl FileRegionCore {
     /// Publishes a completed batch without entering global Region authority.
     /// A delayed older completion may replace a newer candidate; stale values
     /// are accepted and exact physical identity is checked after the read.
-    pub(super) fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
+    fn publish_completed_records(&self, records: &[StagedRecord]) -> io::Result<()> {
         for record in records.iter().copied() {
             let entry = record.entry();
             let published = match record.previous_location() {
@@ -1176,10 +1177,7 @@ fn is_read_availability_error(kind: io::ErrorKind) -> bool {
     )
 }
 
-pub(crate) fn runtime_fixed_memory_bytes(
-    index_slots: usize,
-    region_count: u32,
-) -> io::Result<usize> {
+pub fn runtime_fixed_memory_bytes(index_slots: usize, region_count: u32) -> io::Result<usize> {
     let slots = u64::try_from(index_slots)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "index capacity is too large"))?;
     let index_bytes = recovery_image_index_len(slots)
@@ -1240,7 +1238,7 @@ pub(crate) fn runtime_fixed_memory_bytes(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))
 }
 
-pub(super) fn region_metadata_io_error(error: RegionMetadataError) -> io::Error {
+fn region_metadata_io_error(error: RegionMetadataError) -> io::Error {
     match error {
         RegionMetadataError::Allocation => io::Error::new(io::ErrorKind::OutOfMemory, error),
         error => io::Error::new(io::ErrorKind::InvalidData, error),
@@ -1275,14 +1273,14 @@ fn staging_io_error(error: StagingError) -> io::Error {
     io::Error::new(kind, error.to_string())
 }
 
-pub(super) fn index_storage_io_error(error: IndexStorageError) -> io::Error {
+fn index_storage_io_error(error: IndexStorageError) -> io::Error {
     match error {
         IndexStorageError::Io(error) => error,
         error => io::Error::new(io::ErrorKind::InvalidData, error),
     }
 }
 
-pub(super) fn guarded_index_result<T>(
+fn guarded_index_result<T>(
     health: &RegionHealthLatch,
     result: Result<T, IndexStorageError>,
 ) -> io::Result<T> {
