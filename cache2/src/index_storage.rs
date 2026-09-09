@@ -36,6 +36,14 @@ use std::sync::TryLockError;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
+use self::page_format::PAGE_CHECKSUM_OFFSET;
+use self::page_format::encode_page_header;
+use self::page_format::page_checksum;
+use self::page_format::put_u32;
+#[cfg(test)]
+use self::page_format::put_u64;
+use self::page_format::read_u64;
+use self::page_format::validate_page_header;
 use crate::index::INDEX_CANDIDATES;
 use crate::index::IndexEntry;
 use crate::index::MAX_INDEX_PARTITIONS;
@@ -45,19 +53,10 @@ use crate::index::index_partition_for;
 use crate::index::record_size_class_upper_bound;
 
 mod page_format;
-
 pub(crate) use self::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
 pub(crate) use self::page_format::INDEX_IMAGE_PAGE_SIZE;
 pub(crate) use self::page_format::INDEX_IMAGE_SLOT_SIZE;
 pub(crate) use self::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
-use self::page_format::PAGE_CHECKSUM_OFFSET;
-use self::page_format::encode_page_header;
-use self::page_format::page_checksum;
-use self::page_format::put_u32;
-#[cfg(test)]
-use self::page_format::put_u64;
-use self::page_format::read_u64;
-use self::page_format::validate_page_header;
 
 /// Upper bound for one underlying warm-image write.
 ///

@@ -24,23 +24,23 @@ use crate::memory::MemoryStore;
 use crate::recovery::DataGeometry;
 
 mod runtime;
-mod storage;
-
-pub use runtime::IoEngine;
-pub use runtime::IoMode;
-pub(crate) use runtime::IoPoolTopology;
-pub use runtime::IoUringConfig;
-pub use runtime::IoUringPoolConfig;
-pub use runtime::IoUringSqPollConfig;
-pub use runtime::L1EvictionPolicy;
+pub use self::runtime::IoEngine;
+pub use self::runtime::IoMode;
+pub(crate) use self::runtime::IoPoolTopology;
+pub use self::runtime::IoUringConfig;
+pub use self::runtime::IoUringPoolConfig;
+pub use self::runtime::IoUringSqPollConfig;
+pub use self::runtime::L1EvictionPolicy;
 #[cfg(test)]
-pub(crate) use runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
-pub use runtime::PosixIoConfig;
-pub use runtime::ReadAdmission;
-pub use runtime::RuntimeOptions;
-pub(crate) use storage::KEY_HASH_SEED;
-pub use storage::StorageLayout;
-pub use storage::StorageOptions;
+pub(crate) use self::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
+pub use self::runtime::PosixIoConfig;
+pub use self::runtime::ReadAdmission;
+pub use self::runtime::RuntimeOptions;
+
+mod storage;
+pub(crate) use self::storage::KEY_HASH_SEED;
+pub use self::storage::StorageLayout;
+pub use self::storage::StorageOptions;
 
 /// Complete, immutable configuration for opening a [`crate::Cache`].
 ///

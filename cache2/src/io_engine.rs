@@ -99,6 +99,34 @@ use crate::resources::BufferLease;
 use crate::resources::CACHE_THREAD_STACK_BYTES;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
+mod posix;
+pub(crate) use self::posix::BackendIoEngine;
+
+#[cfg(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+mod uring;
+#[cfg(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+pub(crate) use self::uring::UringIoEngine;
+
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub(crate) const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 // Common bounded command, completion, and request bookkeeping. Payload
@@ -1941,35 +1969,6 @@ impl Drop for RuntimeInner {
         let _ = self.shutdown();
     }
 }
-
-mod posix;
-pub(crate) use posix::BackendIoEngine;
-
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-mod uring;
-
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-pub(crate) use uring::UringIoEngine;
 
 #[cfg(unix)]
 pub(crate) fn build_file_engine(
