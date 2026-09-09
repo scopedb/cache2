@@ -29,16 +29,16 @@ use crate::snapshot::CacheSnapshot;
 
 static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-pub(super) struct RuntimeMetrics {
+pub struct RuntimeMetrics {
     metrics_epoch: u64,
-    pub(super) lifecycle: std::sync::atomic::AtomicU8,
+    pub lifecycle: std::sync::atomic::AtomicU8,
     activity: Box<[ActivityMetrics]>,
     l2_read_overloads: AtomicU64,
     l2_read_wait_ns: AtomicU64,
     write_rejections: AtomicU64,
-    pub(super) write_buffer_rejections: AtomicU64,
-    pub(super) io_failures: AtomicU64,
-    pub(super) region_rotations: AtomicU64,
+    pub write_buffer_rejections: AtomicU64,
+    pub io_failures: AtomicU64,
+    pub region_rotations: AtomicU64,
     reclaimed_regions: AtomicU64,
     reclaimed_bytes: AtomicU64,
     reclaim_records_scanned: AtomicU64,
@@ -50,18 +50,18 @@ pub(super) struct RuntimeMetrics {
 }
 
 #[repr(align(64))]
-pub(crate) struct ActivityMetrics {
-    pub(super) puts: AtomicU64,
-    pub(super) deletes: AtomicU64,
-    pub(super) written_bytes: AtomicU64,
-    pub(super) l1_hits: AtomicU64,
-    pub(super) l1_misses: AtomicU64,
-    pub(super) l2_hits: AtomicU64,
-    pub(super) l2_misses: AtomicU64,
-    pub(super) l2_read_memory_misses: AtomicU64,
-    pub(super) l2_read_busy_misses: AtomicU64,
-    pub(super) served_bytes: AtomicU64,
-    pub(super) l1_promotions: AtomicU64,
+pub struct ActivityMetrics {
+    pub puts: AtomicU64,
+    pub deletes: AtomicU64,
+    pub written_bytes: AtomicU64,
+    pub l1_hits: AtomicU64,
+    pub l1_misses: AtomicU64,
+    pub l2_hits: AtomicU64,
+    pub l2_misses: AtomicU64,
+    pub l2_read_memory_misses: AtomicU64,
+    pub l2_read_busy_misses: AtomicU64,
+    pub served_bytes: AtomicU64,
+    pub l1_promotions: AtomicU64,
 }
 
 impl ActivityMetrics {
@@ -83,7 +83,7 @@ impl ActivityMetrics {
 }
 
 impl RuntimeMetrics {
-    pub(super) fn new(shard_count: usize) -> io::Result<Self> {
+    pub fn new(shard_count: usize) -> io::Result<Self> {
         let mut activity = Vec::new();
         activity.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -113,37 +113,37 @@ impl RuntimeMetrics {
         })
     }
 
-    pub(super) fn activity(&self, shard_id: usize) -> &ActivityMetrics {
+    pub fn activity(&self, shard_id: usize) -> &ActivityMetrics {
         &self.activity[shard_id]
     }
 
-    pub(super) fn activity_for_hash(&self, hash: u64) -> &ActivityMetrics {
+    pub fn activity_for_hash(&self, hash: u64) -> &ActivityMetrics {
         self.activity(route_hash(hash, self.activity.len()))
     }
 
-    pub(super) fn add(counter: &AtomicU64, value: usize) {
+    pub fn add(counter: &AtomicU64, value: usize) {
         let value = u64::try_from(value).unwrap_or(u64::MAX);
         counter.fetch_add(value, Ordering::Relaxed);
     }
 
-    pub(super) fn increment(counter: &AtomicU64) {
+    pub fn increment(counter: &AtomicU64) {
         Self::add(counter, 1);
     }
 
-    pub(super) fn record_write_rejection(&self) {
+    pub fn record_write_rejection(&self) {
         Self::increment(&self.write_rejections);
     }
 
-    pub(super) fn record_read_overload(&self) {
+    pub fn record_read_overload(&self) {
         Self::increment(&self.l2_read_overloads);
     }
 
-    pub(super) fn record_read_wait(&self, elapsed: Duration) {
+    pub fn record_read_wait(&self, elapsed: Duration) {
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         self.l2_read_wait_ns.fetch_add(nanos, Ordering::Relaxed);
     }
 
-    pub(super) fn record_reclaim(&self, stats: crate::region::core::RegionReclaimStats) {
+    pub fn record_reclaim(&self, stats: crate::region::RegionReclaimStats) {
         Self::increment(&self.reclaimed_regions);
         self.reclaimed_bytes
             .fetch_add(stats.bytes_read, Ordering::Relaxed);
@@ -161,7 +161,7 @@ impl RuntimeMetrics {
             .fetch_add(stats.reinsert_budget_skipped, Ordering::Relaxed);
     }
 
-    pub(super) fn snapshot(
+    pub fn snapshot(
         &self,
         core_healthy: bool,
         statistics_enabled: bool,

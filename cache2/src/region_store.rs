@@ -30,14 +30,14 @@ use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryPlan<T> {
+pub enum RecoveryPlan<T> {
     Fresh,
     Running,
     Clean(T),
 }
 
 /// Physical lifecycle operations required by [`RegionStore`].
-pub(crate) trait RegionBackend {
+pub trait RegionBackend {
     type Runtime;
     type CleanImage;
     type FrozenView;
@@ -87,7 +87,7 @@ pub(crate) trait RegionBackend {
 }
 
 /// Owns the exclusive lifecycle of one backend runtime.
-pub(crate) struct RegionStore<B: RegionBackend> {
+pub struct RegionStore<B: RegionBackend> {
     backend: B,
     runtime: Option<B::Runtime>,
     startup: StartupMode,
@@ -95,7 +95,7 @@ pub(crate) struct RegionStore<B: RegionBackend> {
 }
 
 impl<B: RegionBackend> RegionStore<B> {
-    pub(crate) fn open(index_slots: usize, mut backend: B) -> io::Result<Self> {
+    pub fn open(index_slots: usize, mut backend: B) -> io::Result<Self> {
         validate_index_slots(index_slots)?;
         backend.acquire_exclusive()?;
 
@@ -133,11 +133,11 @@ impl<B: RegionBackend> RegionStore<B> {
         }
     }
 
-    pub(crate) const fn startup(&self) -> StartupMode {
+    pub const fn startup(&self) -> StartupMode {
         self.startup
     }
 
-    pub(crate) fn runtime(&self) -> io::Result<&B::Runtime> {
+    pub fn runtime(&self) -> io::Result<&B::Runtime> {
         if self.closed {
             return Err(closed_error());
         }
@@ -145,7 +145,7 @@ impl<B: RegionBackend> RegionStore<B> {
     }
 
     #[cfg(test)]
-    pub(crate) fn runtime_mut(&mut self) -> io::Result<&mut B::Runtime> {
+    pub fn runtime_mut(&mut self) -> io::Result<&mut B::Runtime> {
         if self.closed {
             return Err(closed_error());
         }
@@ -153,12 +153,12 @@ impl<B: RegionBackend> RegionStore<B> {
     }
 
     /// Stop without producing a recovery image. The next open starts empty.
-    pub(crate) fn close_fast(&mut self) -> io::Result<()> {
+    pub fn close_fast(&mut self) -> io::Result<()> {
         self.close(false)
     }
 
     /// Freeze and publish one complete warm-restart image.
-    pub(crate) fn close_warm(&mut self) -> io::Result<()> {
+    pub fn close_warm(&mut self) -> io::Result<()> {
         self.close(true)
     }
 

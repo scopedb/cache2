@@ -29,14 +29,14 @@ use crate::index::MAX_PACKED_REGION_SIZE;
 use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
 use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
 
-pub(crate) const RECOVERY_FORMAT_VERSION: u16 = 1;
-pub(crate) const RECOVERY_PAGE_SIZE: usize = 4 * 1024;
-pub(crate) const STATE_SLOT_COUNT: usize = 2;
-pub(crate) const STATE_FILE_SIZE: usize = STATE_SLOT_COUNT * RECOVERY_PAGE_SIZE;
-pub(crate) const DATA_REGION_AREA_OFFSET: u64 = RECOVERY_PAGE_SIZE as u64;
-pub(crate) const RECOVERY_IMAGE_INDEX_OFFSET: u64 = INDEX_IMAGE_PAGE_SIZE as u64;
-pub(crate) const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE as u64;
-pub(crate) const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
+const RECOVERY_FORMAT_VERSION: u16 = 1;
+pub const RECOVERY_PAGE_SIZE: usize = 4 * 1024;
+pub const STATE_SLOT_COUNT: usize = 2;
+pub const STATE_FILE_SIZE: usize = STATE_SLOT_COUNT * RECOVERY_PAGE_SIZE;
+pub const DATA_REGION_AREA_OFFSET: u64 = RECOVERY_PAGE_SIZE as u64;
+pub const RECOVERY_IMAGE_INDEX_OFFSET: u64 = INDEX_IMAGE_PAGE_SIZE as u64;
+const RECOVERY_IMAGE_SLOTS_PER_PAGE: u64 = INDEX_IMAGE_SLOTS_PER_PAGE as u64;
+pub const KEY_HASH_ALGORITHM_XXH3_64: u32 = 1;
 
 const DATA_MAGIC: [u8; 8] = *b"CRDATA\0\0";
 const STATE_MAGIC: [u8; 8] = *b"CRSTATE\0";
@@ -103,34 +103,34 @@ const IMAGE_REGION_TABLE_LEN_OFFSET: usize = 136;
 /// This type does not generate randomness. The format owner must supply bytes
 /// from its UUID/random source and must never reuse the resulting cache UUID.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct PersistentId([u8; 16]);
+pub struct PersistentId([u8; 16]);
 
 impl PersistentId {
-    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+    pub fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
         (bytes != [0; 16]).then_some(Self(bytes))
     }
 
-    pub(crate) const fn to_bytes(self) -> [u8; 16] {
+    pub const fn to_bytes(self) -> [u8; 16] {
         self.0
     }
 }
 
 /// Geometry whose exact values are part of the data identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DataGeometry {
-    pub(crate) data_file_len: u64,
-    pub(crate) region_size: u64,
-    pub(crate) region_count: u32,
+pub struct DataGeometry {
+    pub data_file_len: u64,
+    pub region_size: u64,
+    pub region_count: u32,
 }
 
 impl DataGeometry {
-    pub(crate) fn expected_file_len(region_size: u64, region_count: u32) -> Option<u64> {
+    pub fn expected_file_len(region_size: u64, region_count: u32) -> Option<u64> {
         region_size
             .checked_mul(u64::from(region_count))?
             .checked_add(DATA_REGION_AREA_OFFSET)
     }
 
-    pub(crate) fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         self.region_count != 0
             && self.region_count <= MAX_PACKED_REGION_COUNT
             && self.region_size >= RECOVERY_PAGE_SIZE as u64
@@ -146,17 +146,17 @@ impl DataGeometry {
 /// There is intentionally no clean/dirty/session bit here. Rewriting this page
 /// is a format/reset operation, not a normal cache mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DataSuperblock {
-    pub(crate) generation: u64,
-    pub(crate) cache_uuid: PersistentId,
-    pub(crate) data_identity: PersistentId,
-    pub(crate) geometry: DataGeometry,
-    pub(crate) hash_seed: u64,
-    pub(crate) config_fingerprint: u64,
+pub struct DataSuperblock {
+    pub generation: u64,
+    pub cache_uuid: PersistentId,
+    pub data_identity: PersistentId,
+    pub geometry: DataGeometry,
+    pub hash_seed: u64,
+    pub config_fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PageProbe<T> {
+pub enum PageProbe<T> {
     Empty,
     Valid(T),
     Corrupt,
@@ -165,10 +165,10 @@ pub(crate) enum PageProbe<T> {
     Truncated,
 }
 
-pub(crate) type DataSuperblockProbe = PageProbe<DataSuperblock>;
+pub type DataSuperblockProbe = PageProbe<DataSuperblock>;
 
 impl DataSuperblock {
-    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+    pub fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
         if !self.is_valid() {
             return Err(CodecError::DataSuperblock);
         }
@@ -213,7 +213,7 @@ impl DataSuperblock {
         Ok(page)
     }
 
-    pub(crate) fn probe(page: &[u8]) -> DataSuperblockProbe {
+    pub fn probe(page: &[u8]) -> DataSuperblockProbe {
         if page.len() != RECOVERY_PAGE_SIZE {
             return DataSuperblockProbe::Truncated;
         }
@@ -283,7 +283,7 @@ impl DataSuperblock {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryState {
+pub enum RecoveryState {
     Empty = 0,
     Running = 1,
     Clean = 2,
@@ -301,10 +301,10 @@ impl RecoveryState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ImageBinding {
-    pub(crate) identity: PersistentId,
-    pub(crate) generation: u64,
-    pub(crate) file_len: u64,
+pub struct ImageBinding {
+    pub identity: PersistentId,
+    pub generation: u64,
+    pub file_len: u64,
 }
 
 impl ImageBinding {
@@ -320,26 +320,26 @@ impl ImageBinding {
 /// The state file must bind the exact `image_binding()` before this image is
 /// eligible for a clean open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecoveryImageHeader {
-    pub(crate) cache_uuid: PersistentId,
-    pub(crate) data_identity: PersistentId,
-    pub(crate) data_superblock_generation: u64,
-    pub(crate) hash_seed: u64,
-    pub(crate) config_fingerprint: u64,
-    pub(crate) image_identity: PersistentId,
-    pub(crate) image_generation: u64,
-    pub(crate) image_file_len: u64,
-    pub(crate) index_slots: u64,
-    pub(crate) index_offset: u64,
-    pub(crate) index_len: u64,
-    pub(crate) region_table_offset: u64,
-    pub(crate) region_table_len: u64,
+pub struct RecoveryImageHeader {
+    pub cache_uuid: PersistentId,
+    pub data_identity: PersistentId,
+    pub data_superblock_generation: u64,
+    pub hash_seed: u64,
+    pub config_fingerprint: u64,
+    pub image_identity: PersistentId,
+    pub image_generation: u64,
+    pub image_file_len: u64,
+    pub index_slots: u64,
+    pub index_offset: u64,
+    pub index_len: u64,
+    pub region_table_offset: u64,
+    pub region_table_len: u64,
 }
 
-pub(crate) type RecoveryImageHeaderProbe = PageProbe<RecoveryImageHeader>;
+pub type RecoveryImageHeaderProbe = PageProbe<RecoveryImageHeader>;
 
 impl RecoveryImageHeader {
-    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+    pub fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
         if !self.is_valid() {
             return Err(CodecError::RecoveryImageHeader);
         }
@@ -382,7 +382,7 @@ impl RecoveryImageHeader {
         Ok(page)
     }
 
-    pub(crate) fn probe(page: &[u8]) -> RecoveryImageHeaderProbe {
+    pub fn probe(page: &[u8]) -> RecoveryImageHeaderProbe {
         if page.len() != RECOVERY_PAGE_SIZE {
             return RecoveryImageHeaderProbe::Truncated;
         }
@@ -444,7 +444,7 @@ impl RecoveryImageHeader {
         RecoveryImageHeaderProbe::Valid(header)
     }
 
-    pub(crate) const fn image_binding(self) -> ImageBinding {
+    pub const fn image_binding(self) -> ImageBinding {
         ImageBinding {
             identity: self.image_identity,
             generation: self.image_generation,
@@ -452,7 +452,7 @@ impl RecoveryImageHeader {
         }
     }
 
-    pub(crate) fn matches_data(self, data: DataSuperblock) -> bool {
+    pub fn matches_data(self, data: DataSuperblock) -> bool {
         self.cache_uuid == data.cache_uuid
             && self.data_identity == data.data_identity
             && self.data_superblock_generation == data.generation
@@ -485,7 +485,7 @@ impl RecoveryImageHeader {
 }
 
 /// Exact byte length of the self-checking index pages.
-pub(crate) fn recovery_image_index_len(index_slots: u64) -> Option<u64> {
+pub fn recovery_image_index_len(index_slots: u64) -> Option<u64> {
     if index_slots == 0 {
         return None;
     }
@@ -499,18 +499,18 @@ pub(crate) fn recovery_image_index_len(index_slots: u64) -> Option<u64> {
 /// Values that bind one state record to an exact data file and, for `CLEAN`,
 /// an exact recovery image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StateBinding {
-    pub(crate) cache_uuid: PersistentId,
-    pub(crate) data_identity: PersistentId,
-    pub(crate) data_superblock_generation: u64,
-    pub(crate) data_file_len: u64,
-    pub(crate) hash_seed: u64,
-    pub(crate) config_fingerprint: u64,
-    pub(crate) image: Option<ImageBinding>,
+pub struct StateBinding {
+    pub cache_uuid: PersistentId,
+    pub data_identity: PersistentId,
+    pub data_superblock_generation: u64,
+    pub data_file_len: u64,
+    pub hash_seed: u64,
+    pub config_fingerprint: u64,
+    pub image: Option<ImageBinding>,
 }
 
 impl StateBinding {
-    pub(crate) fn from_data(data: DataSuperblock, image: Option<ImageBinding>) -> Self {
+    pub fn from_data(data: DataSuperblock, image: Option<ImageBinding>) -> Self {
         Self {
             cache_uuid: data.cache_uuid,
             data_identity: data.data_identity,
@@ -522,7 +522,7 @@ impl StateBinding {
         }
     }
 
-    pub(crate) fn matches_data(self, data: DataSuperblock) -> bool {
+    pub fn matches_data(self, data: DataSuperblock) -> bool {
         self.cache_uuid == data.cache_uuid
             && self.data_identity == data.data_identity
             && self.data_superblock_generation == data.generation
@@ -539,16 +539,16 @@ impl StateBinding {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StateRecord {
-    pub(crate) generation: u64,
-    pub(crate) state: RecoveryState,
-    pub(crate) binding: StateBinding,
+pub struct StateRecord {
+    pub generation: u64,
+    pub state: RecoveryState,
+    pub binding: StateBinding,
 }
 
-pub(crate) type StateSlotProbe = PageProbe<StateRecord>;
+pub type StateSlotProbe = PageProbe<StateRecord>;
 
 impl StateRecord {
-    pub(crate) fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
+    pub fn encode(self) -> Result<[u8; RECOVERY_PAGE_SIZE], CodecError> {
         if !self.is_valid() {
             return Err(CodecError::StateRecord);
         }
@@ -591,14 +591,14 @@ impl StateRecord {
         Ok(page)
     }
 
-    pub(crate) fn decode(page: &[u8]) -> Option<Self> {
+    pub fn decode(page: &[u8]) -> Option<Self> {
         match Self::probe(page) {
             StateSlotProbe::Valid(record) => Some(record),
             _ => None,
         }
     }
 
-    pub(crate) fn probe(page: &[u8]) -> StateSlotProbe {
+    pub fn probe(page: &[u8]) -> StateSlotProbe {
         if page.len() != RECOVERY_PAGE_SIZE {
             return StateSlotProbe::Truncated;
         }
@@ -681,7 +681,7 @@ impl StateRecord {
         StateSlotProbe::Valid(record)
     }
 
-    pub(crate) fn matches_clean(self, data: DataSuperblock, image: ImageBinding) -> bool {
+    fn matches_clean(self, data: DataSuperblock, image: ImageBinding) -> bool {
         self.state == RecoveryState::Clean
             && self.binding.matches_data(data)
             && self.binding.image == Some(image)
@@ -699,7 +699,7 @@ impl StateRecord {
 /// This proves that a complete-layout immutable image is the one named by
 /// `CLEAN`; the Region recovery adapter must additionally validate the
 /// contents of its mandatory Region table before restoring any cache state.
-pub(crate) fn clean_image_matches(
+pub fn clean_image_matches(
     state: StateRecord,
     data: DataSuperblock,
     header: RecoveryImageHeader,
@@ -718,13 +718,13 @@ pub(crate) fn clean_image_matches(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SelectedState {
-    pub(crate) slot: u8,
-    pub(crate) record: StateRecord,
+pub struct SelectedState {
+    pub slot: u8,
+    pub record: StateRecord,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StateSelectionError {
+pub enum StateSelectionError {
     ConflictingGeneration(u64),
     UnsupportedVersion { slot: u8, version: u16 },
 }
@@ -736,7 +736,7 @@ pub(crate) enum StateSelectionError {
 /// `CLEAN` generation would allow a newer implementation's state to be
 /// misinterpreted. Two different records with the same greatest generation are
 /// likewise rejected instead of choosing an arbitrary recovery authority.
-pub(crate) fn latest_state(
+pub fn latest_state(
     pages: [&[u8]; STATE_SLOT_COUNT],
 ) -> Result<Option<SelectedState>, StateSelectionError> {
     let mut selected: Option<SelectedState> = None;
@@ -774,30 +774,30 @@ pub(crate) fn latest_state(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StatePageWrite {
-    pub(crate) slot: u8,
-    pub(crate) record: StateRecord,
-    pub(crate) page: [u8; RECOVERY_PAGE_SIZE],
+pub struct StatePageWrite {
+    pub slot: u8,
+    pub record: StateRecord,
+    pub page: [u8; RECOVERY_PAGE_SIZE],
 }
 
 /// The two writes required to invalidate every old `CLEAN` authority before
 /// opening the cache to mutations.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RunningBarrierWrite {
+pub struct RunningBarrierWrite {
     /// Write this page first, without an intervening sync.
-    pub(crate) first: StatePageWrite,
+    pub first: StatePageWrite,
     /// Write this page second, then `fdatasync` the state file once.
-    pub(crate) second: StatePageWrite,
+    pub second: StatePageWrite,
 }
 
 impl StatePageWrite {
-    pub(crate) const fn offset(&self) -> u64 {
+    pub const fn offset(&self) -> u64 {
         self.slot as u64 * RECOVERY_PAGE_SIZE as u64
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PrepareStateError {
+pub enum PrepareStateError {
     GenerationExhausted,
     InvalidSlot(u8),
     InvalidStateRecord,
@@ -808,7 +808,7 @@ pub(crate) enum PrepareStateError {
 /// With a blank state file, generation one is written to slot zero. This is a
 /// pure preparation step; publication still requires a full-page positioned
 /// write followed by `fdatasync` before the caller acts on the transition.
-pub(crate) fn prepare_next_state(
+pub fn prepare_next_state(
     current: Option<SelectedState>,
     state: RecoveryState,
     binding: StateBinding,
@@ -847,7 +847,7 @@ pub(crate) fn prepare_next_state(
 /// the old `CLEAN` record after this session had mutated data. Write `first`,
 /// write `second`, and perform one `fdatasync` before admitting any operation.
 /// A failed barrier must abort open.
-pub(crate) fn prepare_running_barrier(
+pub fn prepare_running_barrier(
     current: Option<SelectedState>,
     binding: StateBinding,
 ) -> Result<RunningBarrierWrite, PrepareStateError> {
@@ -861,7 +861,7 @@ pub(crate) fn prepare_running_barrier(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CodecError {
+pub enum CodecError {
     DataSuperblock,
     RecoveryImageHeader,
     StateRecord,

@@ -35,17 +35,17 @@ use crate::snapshot::RegionSnapshot;
 const UNASSIGNED_REGION: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionMetadataBinding {
-    pub(crate) cache_uuid: PersistentId,
-    pub(crate) data_identity: PersistentId,
-    pub(crate) data_superblock_generation: u64,
-    pub(crate) image_identity: PersistentId,
-    pub(crate) image_generation: u64,
-    pub(crate) config_fingerprint: u64,
+struct RegionMetadataBinding {
+    cache_uuid: PersistentId,
+    data_identity: PersistentId,
+    data_superblock_generation: u64,
+    image_identity: PersistentId,
+    image_generation: u64,
+    config_fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionMutationError {
+pub enum RegionMutationError {
     InvalidShard,
     InvalidRecordLength,
     WouldBlock,
@@ -62,13 +62,13 @@ pub(crate) enum RegionMutationError {
 /// deliberately represented by [`RegionWriteSpan`], not by this per-record
 /// receipt, so one shard can accumulate many records into a MiB-scale write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionAppendReservation {
-    pub(crate) shard_id: usize,
-    pub(crate) region_id: u32,
-    pub(crate) region_created_seqno: u64,
-    pub(crate) offset: u32,
-    pub(crate) record_bytes: u32,
-    pub(crate) seqno: u64,
+pub struct RegionAppendReservation {
+    pub shard_id: usize,
+    pub region_id: u32,
+    pub region_created_seqno: u64,
+    pub offset: u32,
+    pub record_bytes: u32,
+    pub seqno: u64,
 }
 
 impl RegionAppendReservation {
@@ -81,18 +81,18 @@ impl RegionAppendReservation {
 /// both offsets; staging may only extend its final record after validating this
 /// exact generation and span identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionPaddingReceipt {
-    pub(crate) shard_id: usize,
-    pub(crate) region_id: u32,
-    pub(crate) span_start_offset: u64,
-    pub(crate) unpadded_end_offset: u64,
-    pub(crate) padded_end_offset: u64,
-    pub(crate) record_count: u64,
-    pub(crate) max_seqno: u64,
+pub struct RegionPaddingReceipt {
+    pub shard_id: usize,
+    pub region_id: u32,
+    pub span_start_offset: u64,
+    pub unpadded_end_offset: u64,
+    pub padded_end_offset: u64,
+    pub record_count: u64,
+    pub max_seqno: u64,
 }
 
 impl RegionPaddingReceipt {
-    pub(crate) fn padding_bytes(self) -> Option<u32> {
+    pub fn padding_bytes(self) -> Option<u32> {
         self.padded_end_offset
             .checked_sub(self.unpadded_end_offset)
             .and_then(|padding| u32::try_from(padding).ok())
@@ -104,34 +104,34 @@ impl RegionPaddingReceipt {
 /// written cursor only when this exact generation and start offset still own
 /// the shard. Durability is established once, by the CLEAN data sync.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionWriteSpan {
-    pub(crate) shard_id: usize,
-    pub(crate) region_id: u32,
-    pub(crate) start_offset: u64,
-    pub(crate) end_offset: u64,
-    pub(crate) record_count: u64,
-    pub(crate) max_seqno: u64,
+pub struct RegionWriteSpan {
+    pub shard_id: usize,
+    pub region_id: u32,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub record_count: u64,
+    pub max_seqno: u64,
 }
 
 /// Exact in-memory authority carried across a Region rotation. Until
 /// [`RegionManager::finish_rotation`] accepts this receipt, the shard rejects
 /// new reservations and the sealed Region stays out of the reclaim FIFO.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionRotationReceipt {
-    pub(crate) shard_id: usize,
-    pub(crate) sealed_region_id: u32,
-    pub(crate) activated_region_id: u32,
-    pub(crate) activated_created_seqno: u64,
+pub struct RegionRotationReceipt {
+    pub shard_id: usize,
+    sealed_region_id: u32,
+    pub activated_region_id: u32,
+    pub activated_created_seqno: u64,
 }
 
 /// Exclusive ownership of one sealed Region while its records are scanned
 /// and conditionally removed from the index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionReclaimReceipt {
-    pub(crate) region_id: u32,
-    pub(crate) created_seqno: u64,
-    pub(crate) used_offset: u64,
-    pub(crate) physical_record_count: u64,
+pub struct RegionReclaimReceipt {
+    pub region_id: u32,
+    pub created_seqno: u64,
+    pub used_offset: u64,
+    pub physical_record_count: u64,
 }
 
 /// Read-only selection of the next FIFO rotation victim.
@@ -141,10 +141,10 @@ pub(crate) struct RegionReclaimReceipt {
 /// [`RegionManager::begin_rotation`] consumes the plan.
 /// `victim_created_seqno` identifies the generation being replaced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionRotationPlan {
-    pub(crate) shard_id: usize,
-    pub(crate) victim_region_id: u32,
-    pub(crate) victim_created_seqno: u64,
+pub struct RegionRotationPlan {
+    pub shard_id: usize,
+    victim_region_id: u32,
+    victim_created_seqno: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,20 +184,20 @@ impl ShardMutation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionRuntime {
-    pub(crate) state: RegionMetadataState,
-    pub(crate) created_seqno: u64,
+pub struct RegionRuntime {
+    pub state: RegionMetadataState,
+    pub created_seqno: u64,
     /// Last byte covered by a successful write completion. A buffered or
     /// io_uring CQE is not a durability barrier; CLEAN later syncs this prefix.
-    pub(crate) completed_used: u64,
+    pub completed_used: u64,
     /// Reservation cursor. A clean recovery has no outstanding writes, so it
     /// starts exactly at `completed_used`.
-    pub(crate) reserved_used: u64,
-    pub(crate) physical_record_count: u64,
+    reserved_used: u64,
+    pub physical_record_count: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct RegionManager {
+pub struct RegionManager {
     binding: RegionMetadataBinding,
     region_size: u64,
     next_seqno: u64,
@@ -215,7 +215,7 @@ pub(crate) struct RegionManager {
 impl RegionManager {
     /// Consumes one complete CLEAN metadata image and reconstructs runtime
     /// authority without scanning the index or Region data records.
-    pub(crate) fn from_metadata(metadata: RegionMetadata) -> Result<Self, RegionMetadataError> {
+    pub fn from_metadata(metadata: RegionMetadata) -> Result<Self, RegionMetadataError> {
         metadata.validate()?;
         let RegionMetadata {
             root,
@@ -302,24 +302,24 @@ impl RegionManager {
         })
     }
 
-    pub(crate) const fn region_size(&self) -> u64 {
+    pub const fn region_size(&self) -> u64 {
         self.region_size
     }
 
     #[cfg(test)]
-    pub(crate) const fn next_seqno(&self) -> u64 {
+    pub const fn next_seqno(&self) -> u64 {
         self.next_seqno
     }
 
-    pub(crate) fn regions(&self) -> &[RegionRuntime] {
+    pub fn regions(&self) -> &[RegionRuntime] {
         &self.regions
     }
 
-    pub(crate) fn active_regions(&self) -> &[u32] {
+    pub fn active_regions(&self) -> &[u32] {
         &self.active_regions
     }
 
-    pub(crate) fn region_snapshot(&self) -> Result<RegionSnapshot, RegionMetadataError> {
+    pub fn region_snapshot(&self) -> Result<RegionSnapshot, RegionMetadataError> {
         let mut snapshot = RegionSnapshot {
             capacity_bytes: u64::try_from(self.regions.len())
                 .ok()
@@ -350,19 +350,16 @@ impl RegionManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn free_regions(&self) -> &VecDeque<u32> {
+    pub fn free_regions(&self) -> &VecDeque<u32> {
         &self.free_regions
     }
 
     #[cfg(test)]
-    pub(crate) fn sealed_regions(&self) -> &VecDeque<u32> {
+    pub fn sealed_regions(&self) -> &VecDeque<u32> {
         &self.sealed_regions
     }
 
-    pub(crate) fn configure_reclaim_workers(
-        &mut self,
-        workers: usize,
-    ) -> Result<(), RegionMetadataError> {
+    pub fn configure_reclaim_workers(&mut self, workers: usize) -> Result<(), RegionMetadataError> {
         if workers == 0 || workers > self.active_regions.len() || !self.reclaiming.is_empty() {
             return Err(RegionMetadataError::InvalidField("reclaim_workers"));
         }
@@ -375,7 +372,7 @@ impl RegionManager {
         Ok(())
     }
 
-    pub(crate) fn reclaim_needed(&self) -> bool {
+    pub fn reclaim_needed(&self) -> bool {
         self.reclaiming.len() < self.reclaim_limit
             && !self.sealed_regions.is_empty()
             && self
@@ -387,14 +384,14 @@ impl RegionManager {
 
     /// Hot reinsertion remains best effort when foreground rotation has no
     /// immediately reusable Region.
-    pub(crate) fn reclaim_can_reinsert(&self) -> bool {
+    pub fn reclaim_can_reinsert(&self) -> bool {
         !self.free_regions.is_empty()
     }
 
     /// Allocates one process-local ordering version. Sequence exhaustion is a
     /// terminal condition for the current cache identity; `u64::MAX` is never
     /// issued because clean metadata reserves it as invalid.
-    pub(crate) fn allocate_seqno(&mut self) -> Result<u64, RegionMutationError> {
+    pub fn allocate_seqno(&mut self) -> Result<u64, RegionMutationError> {
         if self.next_seqno == u64::MAX {
             return Err(RegionMutationError::SequenceExhausted);
         }
@@ -406,7 +403,7 @@ impl RegionManager {
     /// Reserves the aligned tail of one shard's Active Region. Only the bytes
     /// needed to encode this record are exclusive; once staged, the shard may
     /// reserve the next record without waiting for device completion.
-    pub(crate) fn reserve_append(
+    pub fn reserve_append(
         &mut self,
         shard_id: usize,
         record_bytes: u32,
@@ -479,7 +476,7 @@ impl RegionManager {
     /// failure is terminal for the runtime, so no worker can seal manager
     /// accounting without its exact staged bytes. This is not a write
     /// completion and does not move `completed_used` or physical accounting.
-    pub(crate) fn stage_reservation(
+    pub fn stage_reservation(
         &mut self,
         receipt: RegionAppendReservation,
     ) -> Result<(), RegionMutationError> {
@@ -531,7 +528,7 @@ impl RegionManager {
     /// No receipt is needed when the open span already ends on a 4 KiB
     /// boundary. A non-zero receipt remains an exclusive shard fence until
     /// [`Self::seal_write_span_with_padding`] consumes it.
-    pub(crate) fn reserve_write_padding(
+    pub fn reserve_write_padding(
         &mut self,
         shard_id: usize,
     ) -> Result<Option<RegionPaddingReceipt>, RegionMutationError> {
@@ -615,7 +612,7 @@ impl RegionManager {
     /// consumed, but the reservation cursor is rolled back exactly because no
     /// later reservation can exist on the same shard.
     #[cfg(test)]
-    pub(crate) fn cancel_reservation(
+    fn cancel_reservation(
         &mut self,
         receipt: RegionAppendReservation,
     ) -> Result<(), RegionMutationError> {
@@ -650,7 +647,7 @@ impl RegionManager {
     /// Seals the shard's accumulated resident records into one ordered device
     /// span. A second span may be built concurrently in resident staging, but
     /// only one submitted span per shard is admitted in this first kernel.
-    pub(crate) fn seal_write_span(
+    pub fn seal_write_span(
         &mut self,
         shard_id: usize,
     ) -> Result<RegionWriteSpan, RegionMutationError> {
@@ -674,7 +671,7 @@ impl RegionManager {
     /// Atomically consumes one exact padding receipt and seals its open span.
     /// Keeping the receipt pending until this call prevents another append from
     /// entering between staging's padding update and manager publication.
-    pub(crate) fn seal_write_span_with_padding(
+    pub fn seal_write_span_with_padding(
         &mut self,
         padding: RegionPaddingReceipt,
     ) -> Result<RegionWriteSpan, RegionMutationError> {
@@ -760,7 +757,7 @@ impl RegionManager {
     /// Advances the completed prefix for one exact, ordered device completion.
     /// Duplicate, cancelled, wrong-generation, and late completions are
     /// rejected without touching the current Region generation.
-    pub(crate) fn complete_write_span(
+    pub fn complete_write_span(
         &mut self,
         receipt: RegionWriteSpan,
     ) -> Result<(), RegionMutationError> {
@@ -803,7 +800,7 @@ impl RegionManager {
     ///
     /// [`Self::begin_rotation`] validates the same FIFO selection again before
     /// it mutates any state.
-    pub(crate) fn plan_rotation(
+    pub fn plan_rotation(
         &self,
         shard_id: usize,
     ) -> Result<RegionRotationPlan, RegionMutationError> {
@@ -811,7 +808,7 @@ impl RegionManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn request_rotation_for_test(
+    pub fn request_rotation_for_test(
         &mut self,
         shard_id: usize,
     ) -> Result<(), RegionMutationError> {
@@ -830,7 +827,7 @@ impl RegionManager {
     ///
     /// This remains the only rotation mutation authority. A stale plan is
     /// rejected before a sequence number or queue entry is consumed.
-    pub(crate) fn begin_rotation(
+    pub fn begin_rotation(
         &mut self,
         plan: RegionRotationPlan,
     ) -> Result<RegionRotationReceipt, RegionMutationError> {
@@ -941,7 +938,7 @@ impl RegionManager {
     /// Publishes the outgoing Region at the tail of the sealed FIFO. A
     /// repeated or late receipt cannot make a Region reachable by the current
     /// generation.
-    pub(crate) fn finish_rotation(
+    pub fn finish_rotation(
         &mut self,
         receipt: RegionRotationReceipt,
     ) -> Result<(), RegionMutationError> {
@@ -990,9 +987,7 @@ impl RegionManager {
     /// Removes the oldest sealed Region from the reusable queues while a
     /// background owner scans it. Reclaim starts only when the clean reserve
     /// has fallen below one Region per append shard.
-    pub(crate) fn begin_reclaim(
-        &mut self,
-    ) -> Result<Option<RegionReclaimReceipt>, RegionMutationError> {
+    pub fn begin_reclaim(&mut self) -> Result<Option<RegionReclaimReceipt>, RegionMutationError> {
         if !self.reclaim_needed() {
             return Ok(None);
         }
@@ -1033,7 +1028,7 @@ impl RegionManager {
     /// Makes a scanned Region reusable. Index cleanup must complete before
     /// this transition because an Active owner may overwrite the bytes as soon
     /// as the Region enters the Free queue.
-    pub(crate) fn finish_reclaim(
+    pub fn finish_reclaim(
         &mut self,
         receipt: RegionReclaimReceipt,
     ) -> Result<(), RegionMutationError> {
@@ -1080,7 +1075,7 @@ impl RegionManager {
     /// Freezes the complete Region metadata table against the current
     /// canonical index partition directory and physical counters supplied by the
     /// index owner.
-    pub(crate) fn freeze_metadata(
+    pub fn freeze_metadata(
         &self,
         partitions: Box<[PartitionMetadataRecord]>,
     ) -> Result<RegionMetadata, RegionMetadataError> {

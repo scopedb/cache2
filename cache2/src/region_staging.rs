@@ -39,11 +39,11 @@ use crate::resources::ResourceBuildError;
 use crate::resources::ResourceController;
 use crate::resources::RuntimeMemoryReservation;
 
-pub(crate) const MAX_STAGING_RECORDS: usize = 4096;
+const MAX_STAGING_RECORDS: usize = 4096;
 const UPSERT_PUBLICATION: u64 = 1_u64 << (u64::BITS - 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StageAppend {
+pub enum StageAppend {
     Appended {
         previous_bytes: usize,
         current_bytes: usize,
@@ -52,9 +52,9 @@ pub(crate) enum StageAppend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ShardFillSnapshot {
-    pub(crate) bytes: usize,
-    pub(crate) records: usize,
+pub struct ShardFillSnapshot {
+    pub bytes: usize,
+    pub records: usize,
 }
 
 /// One record whose exact index identity is published only after its
@@ -63,7 +63,7 @@ pub(crate) struct ShardFillSnapshot {
 /// lock.
 /// Compact transient completion descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StagedRecord {
+pub struct StagedRecord {
     hash: u64,
     entry: IndexEntry,
     seqno: u64,
@@ -71,7 +71,7 @@ pub(crate) struct StagedRecord {
 }
 
 impl StagedRecord {
-    pub(crate) const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
+    pub const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
         Self {
             hash,
             entry,
@@ -80,7 +80,7 @@ impl StagedRecord {
         }
     }
 
-    pub(crate) const fn reinsert(
+    pub const fn reinsert(
         hash: u64,
         entry: IndexEntry,
         seqno: u64,
@@ -94,19 +94,19 @@ impl StagedRecord {
         }
     }
 
-    pub(crate) const fn hash(self) -> u64 {
+    pub const fn hash(self) -> u64 {
         self.hash
     }
 
-    pub(crate) const fn entry(self) -> IndexEntry {
+    pub const fn entry(self) -> IndexEntry {
         self.entry
     }
 
-    pub(crate) const fn seqno(self) -> u64 {
+    pub const fn seqno(self) -> u64 {
         self.seqno
     }
 
-    pub(crate) const fn previous_location(self) -> Option<PackedLocation> {
+    pub const fn previous_location(self) -> Option<PackedLocation> {
         if self.previous_location == UPSERT_PUBLICATION {
             None
         } else {
@@ -123,15 +123,15 @@ impl StagedRecord {
 /// therefore 4 KiB aligned. The I/O completion must return this exact buffer
 /// and the record vector to [`RegionStaging::finish_success`] or
 /// [`RegionStaging::finish_failure`].
-pub(crate) struct StagedWrite {
-    pub(crate) span: RegionWriteSpan,
-    pub(crate) buffer: IoBuffer,
-    pub(crate) absolute: u64,
-    pub(crate) records: Vec<StagedRecord>,
+pub struct StagedWrite {
+    pub span: RegionWriteSpan,
+    pub buffer: IoBuffer,
+    pub absolute: u64,
+    pub records: Vec<StagedRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StagingError {
+pub enum StagingError {
     Failed,
     Closed,
     InvalidShard,
@@ -154,7 +154,7 @@ impl fmt::Display for StagingError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum StagingEncodeError<E> {
+pub enum StagingEncodeError<E> {
     Staging(StagingError),
     Encode(E),
 }
@@ -248,7 +248,7 @@ impl Drop for EncodingBuffer<'_> {
 /// fill while the former is owned by the I/O engine. There is no resident-read
 /// copy and no staging-owned span sequence: the Region manager receipt is the
 /// sole identity accepted by sealing and completion.
-pub(crate) struct RegionStaging {
+pub struct RegionStaging {
     shards: Vec<ShardStaging>,
     chunk_bytes: usize,
     region_size: u64,
@@ -256,7 +256,7 @@ pub(crate) struct RegionStaging {
 }
 
 impl RegionStaging {
-    pub(crate) fn reservation_bytes(shard_count: usize, chunk_bytes: usize) -> Option<usize> {
+    pub fn reservation_bytes(shard_count: usize, chunk_bytes: usize) -> Option<usize> {
         let buffers_per_shard = chunk_bytes.checked_mul(2)?;
         let records_per_shard = MAX_STAGING_RECORDS
             .checked_mul(std::mem::size_of::<StagedRecord>())?
@@ -266,7 +266,7 @@ impl RegionStaging {
             .checked_mul(shard_count)
     }
 
-    pub(crate) fn try_new(
+    pub fn try_new(
         shard_count: usize,
         chunk_bytes: usize,
         region_size: u64,
@@ -333,7 +333,7 @@ impl RegionStaging {
         })
     }
 
-    pub(crate) const fn chunk_bytes(&self) -> usize {
+    pub const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
 
@@ -342,7 +342,7 @@ impl RegionStaging {
     /// The caller holds the shard mutation gate through this check, manager
     /// reservation, and [`Self::encode_reserved`], so a successful preflight
     /// cannot turn into ordinary staging saturation before encoding begins.
-    pub(crate) fn preflight_append(
+    pub fn preflight_append(
         &self,
         shard_id: usize,
         record_bytes: u32,
@@ -387,7 +387,7 @@ impl RegionStaging {
     /// encoder or an earlier submitted span. `Ok(None)` is the only empty-shard
     /// result, so a shard worker never has to probe the manager by attempting
     /// to seal an absent span.
-    pub(crate) fn shard_fill_snapshot(
+    pub fn shard_fill_snapshot(
         &self,
         shard_id: usize,
     ) -> Result<Option<ShardFillSnapshot>, StagingError> {
@@ -424,7 +424,7 @@ impl RegionStaging {
     /// The shard lock is released before `encode` runs. Until it returns, the
     /// exact receipt fences another producer or seal attempt on this shard. An
     /// encode error restores the lease without advancing staging state.
-    pub(crate) fn encode_reserved<E>(
+    pub fn encode_reserved<E>(
         &self,
         receipt: RegionAppendReservation,
         encode: impl FnOnce(&mut [u8]) -> Result<StagedRecord, E>,
@@ -537,10 +537,7 @@ impl RegionStaging {
     /// zeroed and the logical header remains unchanged.
     /// Any mismatch is terminal because the manager has already advanced its
     /// exclusive reservation cursor.
-    pub(crate) fn apply_write_padding(
-        &self,
-        receipt: RegionPaddingReceipt,
-    ) -> Result<(), StagingError> {
+    pub fn apply_write_padding(&self, receipt: RegionPaddingReceipt) -> Result<(), StagingError> {
         let shard = self
             .shards
             .get(receipt.shard_id)
@@ -661,10 +658,7 @@ impl RegionStaging {
 
     /// Moves the current fill lease into one exact manager-owned span without
     /// copying its bytes. The second fixed lease immediately becomes fill.
-    pub(crate) fn take_sealed(
-        &self,
-        span: RegionWriteSpan,
-    ) -> Result<Option<StagedWrite>, StagingError> {
+    pub fn take_sealed(&self, span: RegionWriteSpan) -> Result<Option<StagedWrite>, StagingError> {
         let shard = self
             .shards
             .get(span.shard_id)
@@ -731,7 +725,7 @@ impl RegionStaging {
         }))
     }
 
-    pub(crate) fn finish_success(
+    pub fn finish_success(
         &self,
         span: RegionWriteSpan,
         buffer: IoBuffer,
@@ -740,7 +734,7 @@ impl RegionStaging {
         self.finish(span, Some(buffer), records, false)
     }
 
-    pub(crate) fn finish_failure(
+    pub fn finish_failure(
         &self,
         span: RegionWriteSpan,
         buffer: Option<IoBuffer>,
@@ -798,7 +792,7 @@ impl RegionStaging {
         }
     }
 
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         for shard in &self.shards {
             let mut state = lock_unpoisoned(&shard.state);
             state.closed = true;

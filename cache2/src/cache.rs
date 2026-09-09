@@ -35,9 +35,11 @@ use std::time::UNIX_EPOCH;
 
 use crate::config::CacheConfig;
 use crate::config::KEY_HASH_SEED;
-use crate::error::Error;
+use crate::config::storage_fingerprint;
+use crate::config::storage_geometry;
 use crate::error::ErrorOperation;
 use crate::error::Result;
+use crate::error::from_io;
 use crate::recovery::DataSuperblock;
 use crate::recovery::PersistentId;
 use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
@@ -141,7 +143,7 @@ impl Cache {
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self> {
         let handle = tokio::runtime::Handle::try_current().map_err(|error| {
-            Error::from_io(
+            from_io(
                 ErrorOperation::Open,
                 io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
             )
@@ -168,7 +170,7 @@ impl Cache {
             .spawn_blocking(move || Self::open_blocking(path, config, cache_handle, started))
             .await
             .map_err(|error| {
-                Error::from_io(
+                from_io(
                     ErrorOperation::Open,
                     blocking_task_error("cache open", error),
                 )
@@ -230,9 +232,9 @@ impl Cache {
             generation: 1,
             cache_uuid: next_persistent_id(),
             data_identity: next_persistent_id(),
-            geometry: config.storage().geometry(),
+            geometry: storage_geometry(config.storage()),
             hash_seed: KEY_HASH_SEED,
-            config_fingerprint: config.storage().fingerprint(),
+            config_fingerprint: storage_fingerprint(config.storage()),
         };
         let files = RegionFiles::new(
             &path,
@@ -563,7 +565,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn public_result<T>(operation: ErrorOperation, result: io::Result<T>) -> Result<T> {
-    result.map_err(|error| Error::from_io(operation, error))
+    result.map_err(|error| from_io(operation, error))
 }
 
 fn next_persistent_id() -> PersistentId {

@@ -34,14 +34,14 @@ use crate::recovery::PersistentId;
 use crate::recovery::RECOVERY_PAGE_SIZE;
 use crate::recovery::RecoveryImageHeader;
 
-pub(crate) const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
-pub(crate) const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
-pub(crate) const REGION_METADATA_ROOT_SIZE: usize = 256;
-pub(crate) const REGION_METADATA_REGION_SIZE: usize = 21;
-pub(crate) const REGION_METADATA_PARTITION_SIZE: usize = 16;
-pub(crate) const REGION_METADATA_REGIONS_PER_PAGE: usize =
+pub const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
+const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
+const REGION_METADATA_ROOT_SIZE: usize = 256;
+const REGION_METADATA_REGION_SIZE: usize = 21;
+const REGION_METADATA_PARTITION_SIZE: usize = 16;
+pub const REGION_METADATA_REGIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_REGION_SIZE;
-pub(crate) const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
+pub const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_PARTITION_SIZE;
 
 const PAGE_MAGIC: [u8; 8] = *b"CRRMD\0\0\0";
@@ -128,7 +128,7 @@ impl PageKind {
 /// Only stable, quiescent Region states can appear in a CLEAN image.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionMetadataState {
+pub enum RegionMetadataState {
     Free = 0,
     Active = 1,
     Sealed = 2,
@@ -147,44 +147,44 @@ impl RegionMetadataState {
 
 /// Exact global authority frozen together with the index and Region table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionMetadataRoot {
-    pub(crate) cache_uuid: PersistentId,
-    pub(crate) data_identity: PersistentId,
-    pub(crate) data_superblock_generation: u64,
-    pub(crate) image_identity: PersistentId,
-    pub(crate) image_generation: u64,
-    pub(crate) config_fingerprint: u64,
-    pub(crate) index_slots: u64,
-    pub(crate) index_page_count: u64,
-    pub(crate) region_size: u64,
-    pub(crate) region_count: u32,
-    pub(crate) partition_count: u32,
-    pub(crate) shard_count: u32,
-    pub(crate) max_seqno: u64,
-    pub(crate) free_region_count: u32,
-    pub(crate) active_region_count: u32,
-    pub(crate) sealed_region_count: u32,
+pub struct RegionMetadataRoot {
+    pub cache_uuid: PersistentId,
+    pub data_identity: PersistentId,
+    pub data_superblock_generation: u64,
+    pub image_identity: PersistentId,
+    pub image_generation: u64,
+    pub config_fingerprint: u64,
+    pub index_slots: u64,
+    pub index_page_count: u64,
+    pub region_size: u64,
+    pub region_count: u32,
+    pub partition_count: u32,
+    pub shard_count: u32,
+    pub max_seqno: u64,
+    pub free_region_count: u32,
+    pub active_region_count: u32,
+    pub sealed_region_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegionMetadataRecord {
-    pub(crate) state: RegionMetadataState,
+pub struct RegionMetadataRecord {
+    pub state: RegionMetadataState,
     /// Free queue position, Active shard id, or Sealed FIFO position.
-    pub(crate) queue_ordinal: u32,
-    pub(crate) created_seqno: u64,
-    pub(crate) durable_used_offset: u64,
-    pub(crate) physical_record_count: u64,
+    pub queue_ordinal: u32,
+    pub created_seqno: u64,
+    pub durable_used_offset: u64,
+    pub physical_record_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PartitionMetadataRecord {
-    pub(crate) partition_id: u32,
-    pub(crate) first_index_page: u64,
-    pub(crate) index_page_count: u64,
-    pub(crate) first_slot: u64,
-    pub(crate) slot_count: u64,
-    pub(crate) physical_value_slots: u64,
-    pub(crate) physical_deleted_slots: u64,
+pub struct PartitionMetadataRecord {
+    pub partition_id: u32,
+    pub first_index_page: u64,
+    pub index_page_count: u64,
+    pub first_slot: u64,
+    pub slot_count: u64,
+    pub physical_value_slots: u64,
+    pub physical_deleted_slots: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -195,14 +195,14 @@ struct EncodedPartitionCounters {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegionMetadata {
-    pub(crate) root: RegionMetadataRoot,
-    pub(crate) regions: Box<[RegionMetadataRecord]>,
-    pub(crate) partitions: Box<[PartitionMetadataRecord]>,
+pub struct RegionMetadata {
+    pub root: RegionMetadataRoot,
+    pub regions: Box<[RegionMetadataRecord]>,
+    pub partitions: Box<[PartitionMetadataRecord]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegionMetadataError {
+pub enum RegionMetadataError {
     InvalidLength,
     InvalidMagic,
     UnsupportedVersion(u16),
@@ -235,14 +235,14 @@ impl std::error::Error for RegionMetadataError {}
 type Result<T> = std::result::Result<T, RegionMetadataError>;
 
 impl RegionMetadata {
-    pub(crate) fn encoded_len(&self) -> Result<u64> {
+    pub fn encoded_len(&self) -> Result<u64> {
         encoded_len_for_counts(self.root.region_count, self.root.partition_count)
     }
 
     /// Proves that this section belongs to the exact data and image authority
     /// selected by CLEAN. Content validation is performed separately by
     /// [`Self::validate`].
-    pub(crate) fn matches_image(&self, data: DataSuperblock, image: RecoveryImageHeader) -> bool {
+    pub fn matches_image(&self, data: DataSuperblock, image: RecoveryImageHeader) -> bool {
         let Ok(encoded_len) = self.encoded_len() else {
             return false;
         };
@@ -262,7 +262,7 @@ impl RegionMetadata {
             && encoded_len == image.region_table_len
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let layout = MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
         let encoded_len = usize::try_from(layout.encoded_len)
@@ -321,7 +321,7 @@ impl RegionMetadata {
     }
 
     #[cfg(test)]
-    pub(crate) fn decode(input: &[u8]) -> Result<Self> {
+    pub fn decode(input: &[u8]) -> Result<Self> {
         let metadata = Self::decode_pages(input)?;
         metadata.validate()?;
         Ok(metadata)
@@ -329,7 +329,7 @@ impl RegionMetadata {
 
     /// Decodes an owned image and releases its encoded pages before allocating
     /// the queue-validation workspaces used by [`Self::validate`].
-    pub(crate) fn decode_owned(input: Vec<u8>) -> Result<Self> {
+    pub fn decode_owned(input: Vec<u8>) -> Result<Self> {
         let metadata = Self::decode_pages(&input)?;
         drop(input);
         metadata.validate()?;
@@ -428,7 +428,7 @@ impl RegionMetadata {
         })
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let layout = MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
         validate_root_directory(self.root, layout)?;
         if self.regions.len() != self.root.region_count as usize {
@@ -448,7 +448,7 @@ impl RegionMetadata {
     /// Shrinking seals excess Active Regions at the back of the sealed FIFO.
     /// Growing activates Regions from the back of the free FIFO so its existing
     /// rotation order remains stable. No index or Region data needs rewriting.
-    pub(crate) fn rebind_append_shards(&mut self, shard_count: u32) -> Result<()> {
+    pub fn rebind_append_shards(&mut self, shard_count: u32) -> Result<()> {
         let old_shard_count = self.root.shard_count;
         if shard_count == old_shard_count {
             return Ok(());

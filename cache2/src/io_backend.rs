@@ -39,40 +39,40 @@ use std::sync::atomic::Ordering;
 use crate::config::IoMode;
 use crate::snapshot::CacheIoPathSnapshot;
 
-pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
-pub(crate) const MAX_INTERRUPTED_RETRIES: usize = 4;
+pub const DIRECT_IO_ALIGNMENT: usize = 4096;
+pub const MAX_INTERRUPTED_RETRIES: usize = 4;
 #[cfg(target_os = "linux")]
 const LINUX_EINTR: i32 = 4;
 #[cfg(unix)]
 const SAFE_CACHE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeIoPath {
+pub enum RuntimeIoPath {
     Buffered,
     Direct,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeIoDirection {
+pub enum RuntimeIoDirection {
     Read,
     Write,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeIoDirectionStats {
-    pub(crate) buffered: CacheIoPathSnapshot,
-    pub(crate) direct: CacheIoPathSnapshot,
+pub struct RuntimeIoDirectionStats {
+    pub buffered: CacheIoPathSnapshot,
+    pub direct: CacheIoPathSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeIoStats {
-    pub(crate) direct_active: bool,
-    pub(crate) read: RuntimeIoDirectionStats,
-    pub(crate) write: RuntimeIoDirectionStats,
+pub struct RuntimeIoStats {
+    pub direct_active: bool,
+    pub read: RuntimeIoDirectionStats,
+    pub write: RuntimeIoDirectionStats,
 }
 
 #[derive(Clone)]
-pub(crate) struct RuntimeIoStatsHandle {
+pub struct RuntimeIoStatsHandle {
     inner: Arc<RuntimeIoCounters>,
 }
 
@@ -154,13 +154,13 @@ impl RuntimeIoStatsHandle {
         path.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+    pub fn set_statistics_enabled(&self, enabled: bool) {
         self.inner
             .statistics_enabled
             .store(enabled, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(&self) -> RuntimeIoStats {
+    pub fn snapshot(&self) -> RuntimeIoStats {
         RuntimeIoStats {
             direct_active: self.inner.direct_active,
             read: self.inner.read.snapshot(),
@@ -173,7 +173,7 @@ impl RuntimeIoStatsHandle {
 /// the descriptor that owns flock, so retaining this set also retains the
 /// cache lock if an issued write or flush cannot be fenced. `direct`, when present,
 /// is a separate O_DIRECT open used only for aligned runtime data requests.
-pub(crate) struct RuntimeFileSet {
+pub struct RuntimeFileSet {
     buffered: File,
     direct: Option<File>,
     stats: RuntimeIoStatsHandle,
@@ -181,7 +181,7 @@ pub(crate) struct RuntimeFileSet {
 
 impl RuntimeFileSet {
     #[cfg(test)]
-    pub(crate) fn buffered(file: File) -> Self {
+    pub fn buffered(file: File) -> Self {
         Self {
             buffered: file,
             direct: None,
@@ -190,7 +190,7 @@ impl RuntimeFileSet {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(buffered: File, direct: Option<File>) -> Self {
+    pub fn new(buffered: File, direct: Option<File>) -> Self {
         Self::with_direct(buffered, direct)
     }
 
@@ -203,7 +203,7 @@ impl RuntimeFileSet {
         }
     }
 
-    pub(crate) fn select_path(
+    pub fn select_path(
         &self,
         buffer: *const u8,
         length: usize,
@@ -224,7 +224,7 @@ impl RuntimeFileSet {
         }
     }
 
-    pub(crate) fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
+    pub fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
         self.stats.record(direction, path, length);
     }
 
@@ -242,11 +242,11 @@ impl RuntimeFileSet {
             )
         )
     ))]
-    pub(crate) fn stats_handle(&self) -> RuntimeIoStatsHandle {
+    pub fn stats_handle(&self) -> RuntimeIoStatsHandle {
         self.stats.clone()
     }
 
-    pub(crate) fn set_statistics_enabled(&self, enabled: bool) {
+    pub fn set_statistics_enabled(&self, enabled: bool) {
         self.stats.set_statistics_enabled(enabled);
     }
 
@@ -264,7 +264,7 @@ impl RuntimeFileSet {
         )),
         allow(dead_code)
     )]
-    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+    pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             buffered: self.buffered.try_clone()?,
             direct: self.direct.as_ref().map(File::try_clone).transpose()?,
@@ -273,7 +273,7 @@ impl RuntimeFileSet {
     }
 
     #[cfg(unix)]
-    pub(crate) fn file_for(&self, path: RuntimeIoPath) -> &File {
+    pub fn file_for(&self, path: RuntimeIoPath) -> &File {
         match path {
             RuntimeIoPath::Buffered => &self.buffered,
             RuntimeIoPath::Direct => self
@@ -284,7 +284,7 @@ impl RuntimeFileSet {
     }
 }
 
-pub(crate) fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -> bool {
+fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -> bool {
     !buffer.is_null()
         && (buffer as usize).is_multiple_of(DIRECT_IO_ALIGNMENT)
         && length != 0
@@ -293,7 +293,7 @@ pub(crate) fn direct_io_aligned(buffer: *const u8, length: usize, offset: u64) -
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WritePoint {
+pub enum WritePoint {
     Record,
     DataSuperblock,
     State,
@@ -303,7 +303,7 @@ pub(crate) enum WritePoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SyncPoint {
+pub enum SyncPoint {
     FormatTruncate,
     FormatData,
     StateReset,
@@ -314,12 +314,12 @@ pub(crate) enum SyncPoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SyncMode {
+pub enum SyncMode {
     Data,
     All,
 }
 
-pub(crate) trait IoBackend: Send + Sync {
+pub trait IoBackend: Send + Sync {
     fn len(&self) -> io::Result<u64>;
     fn set_len(&self, len: u64) -> io::Result<()>;
     fn preallocate(&self, len: u64) -> io::Result<()> {
@@ -365,7 +365,7 @@ pub(crate) trait IoBackend: Send + Sync {
 /// immutable private mapping. File identity is intentionally descriptor-based
 /// so callers never need to reopen a path between validation and `mmap`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) trait ControlIoBackend: IoBackend {
+pub trait ControlIoBackend: IoBackend {
     fn try_clone_control_file(&self) -> io::Result<File>;
 
     fn control_file_identity(&self) -> io::Result<ControlFileIdentity>;
@@ -381,12 +381,12 @@ pub(crate) trait ControlIoBackend: IoBackend {
 /// aliased data, state, and image descriptors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct ControlFileIdentity {
+pub struct ControlFileIdentity {
     device: u64,
     inode: u64,
 }
 
-pub(crate) struct FileBackend {
+pub struct FileBackend {
     /// Buffered control descriptor and flock owner.
     file: File,
     /// Separate Linux O_DIRECT descriptor for aligned runtime data I/O.
@@ -395,22 +395,22 @@ pub(crate) struct FileBackend {
 
 impl FileBackend {
     #[cfg(test)]
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_io_mode(path, IoMode::Buffered)
     }
 
-    pub(crate) fn open_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
+    pub fn open_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
         Self::open_with_io_mode_and_create(path, mode, true)
     }
 
-    pub(crate) fn open_existing_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
+    pub fn open_existing_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
         Self::open_with_io_mode_and_create(path, mode, false)
     }
 
     /// Atomically creates a new buffered control file without following a
     /// symbolic link or opening an existing recovery-image target.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn create_new_buffered(path: &Path) -> io::Result<Self> {
+    pub fn create_new_buffered(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -461,13 +461,13 @@ impl FileBackend {
         }
     }
 
-    pub(crate) fn try_clone_runtime_files(&self) -> io::Result<RuntimeFileSet> {
+    pub fn try_clone_runtime_files(&self) -> io::Result<RuntimeFileSet> {
         let buffered = self.file.try_clone()?;
         let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
         Ok(RuntimeFileSet::with_direct(buffered, direct))
     }
 
-    pub(crate) const fn direct_active(&self) -> bool {
+    pub const fn direct_active(&self) -> bool {
         self.direct.is_some()
     }
 }
@@ -514,12 +514,12 @@ impl ControlIoBackend for FileBackend {
 /// Positioned-I/O backend used by the POSIX engine. Control,
 /// metadata, locking, and recovery continue to use `FileBackend`; this backend
 /// routes only aligned runtime reads and record writes to the direct fd.
-pub(crate) struct RuntimeFileBackend {
+pub struct RuntimeFileBackend {
     files: RuntimeFileSet,
 }
 
 impl RuntimeFileBackend {
-    pub(crate) fn new(files: RuntimeFileSet) -> Self {
+    pub fn new(files: RuntimeFileSet) -> Self {
         Self { files }
     }
 }
@@ -748,15 +748,11 @@ fn open_direct(path: &Path, buffered: &File) -> io::Result<File> {
     Ok(direct)
 }
 
-pub(crate) fn read_exact_at(
-    backend: &dyn IoBackend,
-    buffer: &mut [u8],
-    offset: u64,
-) -> io::Result<()> {
+pub fn read_exact_at(backend: &dyn IoBackend, buffer: &mut [u8], offset: u64) -> io::Result<()> {
     read_exact_at_with_progress(backend, buffer, offset).0
 }
 
-pub(crate) fn read_at_bounded(
+pub fn read_at_bounded(
     backend: &dyn IoBackend,
     buffer: &mut [u8],
     offset: u64,
@@ -764,7 +760,7 @@ pub(crate) fn read_at_bounded(
     retry_interrupted(|| backend.read_at(buffer, offset))
 }
 
-pub(crate) fn read_exact_at_with_progress(
+fn read_exact_at_with_progress(
     backend: &dyn IoBackend,
     mut buffer: &mut [u8],
     mut offset: u64,
@@ -811,7 +807,7 @@ pub(crate) fn read_exact_at_with_progress(
     (Ok(()), transferred)
 }
 
-pub(crate) fn read_exact_at_uninit_with_progress(
+pub fn read_exact_at_uninit_with_progress(
     backend: &dyn IoBackend,
     buffer: *mut u8,
     length: usize,
@@ -885,7 +881,7 @@ unsafe fn read_file_at_uninit(
     }
 }
 
-pub(crate) fn write_all_at(
+pub fn write_all_at(
     backend: &dyn IoBackend,
     point: WritePoint,
     buffer: &[u8],
@@ -894,7 +890,7 @@ pub(crate) fn write_all_at(
     write_all_at_with_progress(backend, point, buffer, offset).0
 }
 
-pub(crate) fn write_all_at_with_progress(
+pub fn write_all_at_with_progress(
     backend: &dyn IoBackend,
     point: WritePoint,
     mut buffer: &[u8],
@@ -1362,14 +1358,14 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) mod testing {
+pub mod testing {
     use std::sync::Arc;
     use std::sync::Mutex;
 
     use super::*;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum FaultEvent {
+    pub enum FaultEvent {
         Read,
         Write(WritePoint),
         Sync(SyncPoint),
@@ -1378,7 +1374,7 @@ pub(crate) mod testing {
     }
 
     #[derive(Clone, Copy, Debug)]
-    pub(crate) enum FaultAction {
+    pub enum FaultAction {
         Torn { bytes: usize, raw_os_error: i32 },
         Error(i32),
         ErrorAlways(i32),
@@ -1400,12 +1396,12 @@ pub(crate) mod testing {
     }
 
     #[derive(Clone, Default)]
-    pub(crate) struct FaultHandle {
+    pub struct FaultHandle {
         state: Arc<Mutex<FaultState>>,
     }
 
     impl FaultHandle {
-        pub(crate) fn arm(&self, event: FaultEvent, occurrence: usize, action: FaultAction) {
+        pub fn arm(&self, event: FaultEvent, occurrence: usize, action: FaultAction) {
             assert!(occurrence > 0, "fault occurrence is one-based");
             let mut state = self.state.lock().unwrap();
             state.events.clear();
@@ -1417,7 +1413,7 @@ pub(crate) mod testing {
             });
         }
 
-        pub(crate) fn events(&self) -> Vec<FaultEvent> {
+        pub fn events(&self) -> Vec<FaultEvent> {
             self.state.lock().unwrap().events.clone()
         }
 
@@ -1440,20 +1436,20 @@ pub(crate) mod testing {
         }
     }
 
-    pub(crate) struct FaultBackend {
+    pub struct FaultBackend {
         inner: FileBackend,
         handle: FaultHandle,
     }
 
     impl FaultBackend {
-        pub(crate) fn open(path: &Path) -> io::Result<(Self, FaultHandle)> {
+        pub fn open(path: &Path) -> io::Result<(Self, FaultHandle)> {
             let handle = FaultHandle::default();
             let backend = Self::open_with_handle(path, handle.clone())?;
             Ok((backend, handle))
         }
 
         /// Opens another control file governed by the same fault schedule.
-        pub(crate) fn open_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
+        pub fn open_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
             Ok(Self {
                 inner: FileBackend::open(path)?,
                 handle,
@@ -1461,10 +1457,7 @@ pub(crate) mod testing {
         }
 
         /// Opens an existing control file without creating a missing path.
-        pub(crate) fn open_existing_with_handle(
-            path: &Path,
-            handle: FaultHandle,
-        ) -> io::Result<Self> {
+        pub fn open_existing_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
             Ok(Self {
                 inner: FileBackend::open_existing_with_io_mode(path, IoMode::Buffered)?,
                 handle,
@@ -1473,7 +1466,7 @@ pub(crate) mod testing {
 
         /// Atomically creates a new control file governed by an existing fault
         /// schedule. This is used for unpublished recovery-image temporaries.
-        pub(crate) fn create_new_buffered_with_handle(
+        pub fn create_new_buffered_with_handle(
             path: &Path,
             handle: FaultHandle,
         ) -> io::Result<Self> {
@@ -1590,7 +1583,7 @@ pub(crate) mod testing {
     }
 
     #[cfg(unix)]
-    pub(crate) fn kill_process() -> ! {
+    pub fn kill_process() -> ! {
         const SIGKILL: i32 = 9;
         // SAFETY: both functions have no pointer arguments; SIGKILL cannot
         // run user code in the target process.

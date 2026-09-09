@@ -39,12 +39,12 @@ impl Default for FixedMapSlot {
 /// require full-hash identity validate it in the owner slot. The table is
 /// allocated once during open; point operations inspect a small constant
 /// number of slots and never allocate, resize, or rehash.
-pub(crate) struct FixedPrehashedMap {
+pub struct FixedPrehashedMap {
     slots: Box<[FixedMapSlot]>,
 }
 
 impl FixedPrehashedMap {
-    pub(crate) fn try_new(maximum_entries: usize) -> io::Result<Self> {
+    pub fn try_new(maximum_entries: usize) -> io::Result<Self> {
         let slot_count = Self::slot_count(maximum_entries)?;
         let mut slots = Vec::new();
         slots.try_reserve_exact(slot_count).map_err(|_| {
@@ -59,13 +59,13 @@ impl FixedPrehashedMap {
         })
     }
 
-    pub(crate) fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
+    pub fn allocation_bytes(maximum_entries: usize) -> io::Result<usize> {
         Self::slot_count(maximum_entries)?
             .checked_mul(std::mem::size_of::<FixedMapSlot>())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fixed map is too large"))
     }
 
-    pub(crate) fn get(&self, hash: u64) -> Option<u32> {
+    pub fn get(&self, hash: u64) -> Option<u32> {
         let slots = &self.slots;
         if slots.is_empty() {
             return None;
@@ -84,11 +84,11 @@ impl FixedPrehashedMap {
         None
     }
 
-    pub(crate) fn can_upsert(&self, hash: u64) -> bool {
+    pub fn can_upsert(&self, hash: u64) -> bool {
         self.find_upsert_slot(hash).is_some()
     }
 
-    pub(crate) fn insert(&mut self, hash: u64, value: u32) -> Option<Option<u32>> {
+    pub fn insert(&mut self, hash: u64, value: u32) -> Option<Option<u32>> {
         debug_assert!(value < DELETED_VALUE);
         let (slot_index, previous) = self.find_upsert_slot(hash)?;
         self.slots[slot_index] = FixedMapSlot {
@@ -98,7 +98,7 @@ impl FixedPrehashedMap {
         Some(previous)
     }
 
-    pub(crate) fn remove(&mut self, hash: u64) -> Option<u32> {
+    pub fn remove(&mut self, hash: u64) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
         }
@@ -220,7 +220,7 @@ fn probe_distance(home: usize, index: usize, slots: usize) -> usize {
 
 /// Preserves modulo routing while avoiding integer division for the common
 /// power-of-two shard and worker counts.
-pub(crate) fn route_hash(hash: u64, buckets: usize) -> usize {
+pub fn route_hash(hash: u64, buckets: usize) -> usize {
     debug_assert_ne!(buckets, 0);
     if buckets.is_power_of_two() {
         hash as usize & (buckets - 1)

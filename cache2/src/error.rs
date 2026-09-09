@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![doc = include_str!("../ERRORS.md")]
-
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
@@ -133,6 +131,7 @@ impl fmt::Display for ErrorOperation {
 /// The classification and operation are stable programmatic fields. The
 /// wrapped [`io::Error`] retains the detailed cause, its raw OS error when one
 /// exists, and the complete [`StdError::source`] chain.
+#[doc = include_str!("../ERRORS.md")]
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
@@ -141,14 +140,6 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn from_io(operation: ErrorOperation, source: io::Error) -> Self {
-        Self {
-            kind: classify(operation, &source),
-            operation,
-            source,
-        }
-    }
-
     /// Returns the actionable C² error classification.
     pub const fn kind(&self) -> ErrorKind {
         self.kind
@@ -220,6 +211,14 @@ impl From<Error> for io::Error {
     }
 }
 
+pub fn from_io(operation: ErrorOperation, source: io::Error) -> Error {
+    Error {
+        kind: classify(operation, &source),
+        operation,
+        source,
+    }
+}
+
 fn classify(operation: ErrorOperation, source: &io::Error) -> ErrorKind {
     use io::ErrorKind as IoKind;
 
@@ -273,7 +272,7 @@ mod tests {
     use super::*;
 
     fn error(operation: ErrorOperation, kind: io::ErrorKind) -> Error {
-        Error::from_io(operation, io::Error::new(kind, "injected failure"))
+        from_io(operation, io::Error::new(kind, "injected failure"))
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -351,7 +350,7 @@ mod tests {
 
     #[test]
     fn default_io_conversion_preserves_raw_os_error() {
-        let error = Error::from_io(ErrorOperation::Open, io::Error::from_raw_os_error(13));
+        let error = from_io(ErrorOperation::Open, io::Error::from_raw_os_error(13));
         let error = io::Error::from(error);
 
         assert_eq!(error.raw_os_error(), Some(13));
@@ -359,7 +358,7 @@ mod tests {
 
     #[test]
     fn contextual_io_conversion_retains_structured_error() {
-        let error = Error::from_io(ErrorOperation::Open, io::Error::from_raw_os_error(13))
+        let error = from_io(ErrorOperation::Open, io::Error::from_raw_os_error(13))
             .into_io_error_with_context();
 
         assert_eq!(error.raw_os_error(), None);

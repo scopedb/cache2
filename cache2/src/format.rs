@@ -20,16 +20,16 @@
 use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
 
-pub(crate) const RECORD_FORMAT_VERSION: u16 = 1;
+pub const RECORD_FORMAT_VERSION: u16 = 1;
 
-pub(crate) const RECORD_HEADER_SIZE: usize = 48;
-pub(crate) const RECORD_ALIGNMENT: u32 = 32;
+pub const RECORD_HEADER_SIZE: usize = 48;
+pub const RECORD_ALIGNMENT: u32 = 32;
 
-pub(crate) const MAX_KEY_SIZE: usize = 4 * 1024;
+pub const MAX_KEY_SIZE: usize = 4 * 1024;
 
-pub(crate) const RECORD_HEADER_MAGIC: [u8; 4] = *b"CRCD";
+const RECORD_HEADER_MAGIC: [u8; 4] = *b"CRCD";
 
-pub(crate) const RECORD_HEADER_CRC_OFFSET: usize = RECORD_HEADER_SIZE - size_of::<u32>();
+const RECORD_HEADER_CRC_OFFSET: usize = RECORD_HEADER_SIZE - size_of::<u32>();
 
 const RECORD_VERSION_OFFSET: usize = 4;
 const RECORD_KEY_LEN_OFFSET: usize = 6;
@@ -41,21 +41,21 @@ const RECORD_REGION_GENERATION_OFFSET: usize = 32;
 const RECORD_LEN_OFFSET: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecordHeader {
-    pub(crate) key_len: u16,
-    pub(crate) value_len: u32,
+pub struct RecordHeader {
+    pub key_len: u16,
+    pub value_len: u32,
     /// Logical mutation order, preserved when reclaim rewrites a value.
-    pub(crate) seqno: u64,
-    pub(crate) key_hash: u64,
-    pub(crate) payload_crc: u32,
+    pub seqno: u64,
+    pub key_hash: u64,
+    pub payload_crc: u32,
     /// Physical Region incarnation containing this encoded record.
-    pub(crate) region_generation: u64,
-    pub(crate) record_len: u32,
+    pub region_generation: u64,
+    pub record_len: u32,
 }
 
 impl RecordHeader {
     /// Returns the smallest 32-byte-aligned record length for this payload.
-    pub(crate) fn aligned_len(key_len: usize, value_len: usize) -> Option<u32> {
+    pub fn aligned_len(key_len: usize, value_len: usize) -> Option<u32> {
         let unaligned = RECORD_HEADER_SIZE
             .checked_add(key_len)?
             .checked_add(value_len)?;
@@ -63,7 +63,7 @@ impl RecordHeader {
         u32::try_from(aligned).ok()
     }
 
-    pub(crate) fn encode(&self) -> [u8; RECORD_HEADER_SIZE] {
+    pub fn encode(&self) -> [u8; RECORD_HEADER_SIZE] {
         let mut output = [0_u8; RECORD_HEADER_SIZE];
         output[..RECORD_HEADER_MAGIC.len()].copy_from_slice(&RECORD_HEADER_MAGIC);
         put_u16(&mut output, RECORD_VERSION_OFFSET, RECORD_FORMAT_VERSION);
@@ -84,7 +84,7 @@ impl RecordHeader {
         output
     }
 
-    pub(crate) fn decode(input: &[u8]) -> Option<Self> {
+    pub fn decode(input: &[u8]) -> Option<Self> {
         if input.len() != RECORD_HEADER_SIZE
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != RECORD_FORMAT_VERSION
@@ -109,7 +109,7 @@ impl RecordHeader {
         Some(header)
     }
 
-    pub(crate) fn has_valid_lengths(&self) -> bool {
+    fn has_valid_lengths(&self) -> bool {
         let key_len = usize::from(self.key_len);
         let Ok(value_len) = usize::try_from(self.value_len) else {
             return false;
@@ -125,7 +125,7 @@ impl RecordHeader {
     }
 }
 
-pub(crate) fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
+fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     if !alignment.is_power_of_two() {
         return None;
     }

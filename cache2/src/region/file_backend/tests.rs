@@ -42,7 +42,7 @@ use crate::record_codec::required_record_bytes;
 use crate::recovery::DATA_REGION_AREA_OFFSET;
 use crate::recovery::DataGeometry;
 use crate::recovery::PersistentId;
-use crate::region::core::RegionStageValue;
+use crate::region::RegionStageValue;
 use crate::region_reader::ReadCandidate;
 use crate::region_reader::ReadCompletion;
 use crate::region_reader::ReadPlan;

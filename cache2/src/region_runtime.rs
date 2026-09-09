@@ -42,6 +42,11 @@ use crate::config::IoPoolTopology;
 #[cfg(test)]
 use crate::config::ReadAdmission;
 use crate::config::RuntimeOptions;
+use crate::config::l1_entry_capacity;
+use crate::config::read_io_wait_capacity;
+use crate::config::read_io_wait_timeout;
+use crate::config::reserved_memory_bytes;
+use crate::config::storage_geometry;
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 #[cfg(test)]
@@ -67,11 +72,11 @@ use crate::record_codec::required_record_bytes;
 #[cfg(test)]
 use crate::recovery::DataGeometry;
 use crate::recovery::DataSuperblock;
-use crate::region::core::FileRegionCore;
-use crate::region::core::RegionStageValue;
-use crate::region::core::RegionValueRead;
+use crate::region::FileRegionCore;
+use crate::region::RegionStageValue;
+use crate::region::RegionValueRead;
 #[cfg(test)]
-use crate::region::core::runtime_fixed_memory_bytes;
+use crate::region::runtime_fixed_memory_bytes;
 use crate::region_reader::PendingRead;
 use crate::region_reader::ReadCompletion;
 use crate::region_reader::ReadPlan;
@@ -91,7 +96,7 @@ use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 
 mod metrics;
-pub(crate) use self::metrics::ActivityMetrics;
+pub use self::metrics::ActivityMetrics;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
@@ -279,7 +284,7 @@ const WAKE_DATA: u8 = 1;
 const WAKE_URGENT: u8 = 2;
 const WAKE_ROTATE: u8 = 4;
 
-pub(crate) enum HybridValueRead {
+pub enum HybridValueRead {
     L1(MemoryValue),
     L2(RegionValueRead),
     /// An L2 hit copied into the bounded L1 tier. The public tier remains
@@ -380,20 +385,20 @@ impl WaitingGet {
 }
 
 impl HybridValueRead {
-    pub(crate) fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         match self {
             Self::L1(value) | Self::PromotedL2(value) => value.as_ref(),
             Self::L2(value) => value.value(),
         }
     }
 
-    pub(crate) const fn is_l1(&self) -> bool {
+    pub const fn is_l1(&self) -> bool {
         matches!(self, Self::L1(_))
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct RegionDataPlane {
+pub struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     config: RuntimeOptions,
@@ -719,7 +724,7 @@ impl ShardControl {
 }
 
 impl RegionDataPlane {
-    pub(crate) fn new(
+    pub fn new(
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
@@ -728,7 +733,7 @@ impl RegionDataPlane {
         // Recovery supplies independently validated metadata. It must still
         // match the configuration selected for this open.
         let storage = configuration.storage();
-        if data.geometry != storage.geometry()
+        if data.geometry != storage_geometry(storage)
             || core.region_count()? != storage.region_count() as usize
             || core.index_slot_count() != storage.index_slots()
             || core.shard_count() != configuration.runtime().append_shards as usize
@@ -739,7 +744,7 @@ impl RegionDataPlane {
             ));
         }
         let config = configuration.runtime().clone();
-        core.configure_reclaim_workers(config.reclaim_io_max_in_flight())?;
+        core.configure_reclaim_workers(IoPoolTopology::reclaim(config.io_engine).max_in_flight)?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
         let operations = Arc::new(MutationGate::new());
@@ -763,15 +768,15 @@ impl RegionDataPlane {
         })
     }
 
-    pub(crate) fn start_close(&self) {
+    pub fn start_close(&self) {
         self.operations.start_close();
     }
 
-    pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         self.put_with_l1::<true>(key, value)
     }
 
-    pub(crate) fn put_l2(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+    pub fn put_l2(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         self.put_with_l1::<false>(key, value)
     }
 
@@ -850,7 +855,7 @@ impl RegionDataPlane {
         }
     }
 
-    pub(crate) fn delete(&self, key: &[u8]) -> io::Result<u64> {
+    pub fn delete(&self, key: &[u8]) -> io::Result<u64> {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -886,7 +891,7 @@ impl RegionDataPlane {
     }
 
     #[cfg(test)]
-    pub(crate) fn get(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
         match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => self.finish_get(pending.wait(), key),
@@ -896,7 +901,7 @@ impl RegionDataPlane {
         }
     }
 
-    pub(crate) async fn get_async(
+    pub async fn get_async(
         &self,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
@@ -1041,10 +1046,10 @@ impl RegionDataPlane {
             Ok(reservation) => reservation,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    && !self.config.read_io_wait_timeout().is_zero() =>
+                    && !read_io_wait_timeout(&self.config).is_zero() =>
             {
                 let waiting = running
-                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout())
+                    .try_queue_read(hash, plan, read_token, read_io_wait_timeout(&self.config))
                     .inspect_err(|_| {
                         if running.statistics {
                             running.metrics.record_read_overload();
@@ -1072,7 +1077,7 @@ impl RegionDataPlane {
             }
         };
         let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
-            if !self.config.read_io_wait_timeout().is_zero() {
+            if !read_io_wait_timeout(&self.config).is_zero() {
                 if running.statistics {
                     running.metrics.record_read_overload();
                 }
@@ -1109,7 +1114,7 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout().is_zero() {
+                if !read_io_wait_timeout(&self.config).is_zero() {
                     if running.statistics {
                         running.metrics.record_read_overload();
                     }
@@ -1177,7 +1182,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout().is_zero() {
+                if !read_io_wait_timeout(&self.config).is_zero() {
                     self.record_read_wait_error(&error);
                     return Err(error);
                 }
@@ -1199,7 +1204,7 @@ impl RegionDataPlane {
     /// Completes and publishes every record admitted before this call. This is
     /// an I/O completion barrier, not an fdatasync durability boundary.
     #[cfg(test)]
-    pub(crate) fn drain(&self) -> io::Result<()> {
+    pub fn drain(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait()?;
         let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
@@ -1207,7 +1212,7 @@ impl RegionDataPlane {
         drain_shards(running, false)
     }
 
-    pub(crate) async fn drain_async(&self) -> io::Result<()> {
+    pub async fn drain_async(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait_async().await;
         let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
@@ -1215,12 +1220,12 @@ impl RegionDataPlane {
         drain_shards_async(running, false).await
     }
 
-    pub(crate) fn snapshot(&self) -> io::Result<CacheSnapshot> {
+    pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
         let running = &self.shared;
         Ok(self.snapshot_running(running))
     }
 
-    pub(crate) fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
+    pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
         let running = &self.shared;
         Ok(DetailedCacheSnapshot {
             summary: self.snapshot_running(running),
@@ -1252,7 +1257,7 @@ impl RegionDataPlane {
     /// Fences admission, drains all workers, and shuts down the I/O engine.
     /// The return value asks the backend to retain flock for process lifetime
     /// because an issued write or flush could not be fenced.
-    pub(crate) fn shutdown(&self) -> io::Result<bool> {
+    pub fn shutdown(&self) -> io::Result<bool> {
         self.operations.start_close();
         self.operations.wait_quiescent()?;
         let _ = self.metrics.lifecycle.compare_exchange(
@@ -1272,7 +1277,7 @@ impl RegionDataPlane {
     }
 
     #[cfg(test)]
-    pub(crate) fn reserve_read_slot_for_test(&self) -> ReadSlot {
+    pub fn reserve_read_slot_for_test(&self) -> ReadSlot {
         self.shared
             .try_reserve_read(0)
             .map(|(_, slot)| slot)
@@ -1280,7 +1285,7 @@ impl RegionDataPlane {
     }
 
     #[cfg(test)]
-    pub(crate) fn poison_shard_for_test(&self, shard_id: usize) {
+    pub fn poison_shard_for_test(&self, shard_id: usize) {
         let shard = self.shared.shards.get(shard_id).expect("test shard exists");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = shard.state.lock().unwrap();
@@ -1353,12 +1358,12 @@ fn start_running(
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
     let config = configuration.runtime();
-    let l1_entry_capacity = configuration.l1_entry_capacity();
+    let l1_entry_capacity = l1_entry_capacity(&configuration);
     let memory_limit = config.managed_memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: memory_limit,
-            reserved_memory_bytes: configuration.reserved_memory_bytes(),
+            reserved_memory_bytes: reserved_memory_bytes(&configuration),
         })
         .map_err(resource_build_io_error)?,
     );
@@ -1381,7 +1386,7 @@ fn start_running(
         config.l1_eviction_policy,
         config.statistics,
     )?);
-    let reclaim_worker_count = config.reclaim_io_max_in_flight();
+    let reclaim_worker_count = IoPoolTopology::reclaim(config.io_engine).max_in_flight;
     let mut reclaim_buffers = Vec::new();
     reclaim_buffers
         .try_reserve_exact(reclaim_worker_count)
@@ -1401,14 +1406,27 @@ fn start_running(
     }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
-    let read_wait_enabled = !config.read_io_wait_timeout().is_zero();
-    let read_engines =
-        build_engine_pool(files, config, config.read_io_topology(), read_wait_enabled)?;
+    let read_wait_enabled = !read_io_wait_timeout(config).is_zero();
+    let read_engines = build_engine_pool(
+        files,
+        config,
+        IoPoolTopology::read(config.io_engine),
+        read_wait_enabled,
+    )?;
     let read_waiters =
-        read_wait_enabled.then(|| Arc::new(Semaphore::new(config.read_io_wait_capacity())));
-    let write_engines = build_engine_pool(write_files, config, config.write_io_topology(), false)?;
-    let reclaim_engines =
-        build_engine_pool(reclaim_files, config, config.reclaim_io_topology(), false)?;
+        read_wait_enabled.then(|| Arc::new(Semaphore::new(read_io_wait_capacity(config))));
+    let write_engines = build_engine_pool(
+        write_files,
+        config,
+        IoPoolTopology::write(config.io_engine),
+        false,
+    )?;
+    let reclaim_engines = build_engine_pool(
+        reclaim_files,
+        config,
+        IoPoolTopology::reclaim(config.io_engine),
+        false,
+    )?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1517,7 +1535,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if config.io_engine.is_posix() {
+    let posix_workers = if matches!(config.io_engine, crate::config::IoEngine::Posix(_)) {
         topology.max_in_flight
     } else {
         1

@@ -39,27 +39,23 @@ const LOG_SIZE_CLASS_FIRST_EXPONENT: u32 = 6;
 const LOG_SIZE_CLASS_STEPS: u32 = 15;
 const RECORD_SIZE_CLASS_UPPER_BOUNDS: [u32; 256] = build_record_size_class_upper_bounds();
 
-pub(crate) const MAX_REGION_ID: u32 = REGION_MASK as u32;
-pub(crate) const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMENT;
-pub(crate) const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32 + 1) * RECORD_LEN_ALIGNMENT;
-pub(crate) const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
-pub(crate) const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
-pub(crate) const INDEX_CANDIDATES: usize = 4;
+const MAX_REGION_ID: u32 = REGION_MASK as u32;
+pub const MAX_REGION_OFFSET: u32 = (OFFSET_MASK as u32) * OFFSET_ALIGNMENT;
+pub const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32 + 1) * RECORD_LEN_ALIGNMENT;
+pub const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
+pub const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
+pub const INDEX_CANDIDATES: usize = 4;
 #[cfg(feature = "benchmarking")]
-pub(crate) const MAX_INDEX_PROBES: usize = INDEX_CANDIDATES;
-pub(crate) const MAX_INDEX_PARTITIONS: usize = 4096;
+pub const MAX_INDEX_PROBES: usize = INDEX_CANDIDATES;
+pub const MAX_INDEX_PARTITIONS: usize = 4096;
 
 /// A record location packed into one machine word.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub(crate) struct PackedLocation(u64);
+pub struct PackedLocation(u64);
 
 impl PackedLocation {
-    pub(crate) fn new(
-        region_id: u32,
-        offset: u32,
-        record_len: u32,
-    ) -> Result<Self, PackedLocationError> {
+    pub fn new(region_id: u32, offset: u32, record_len: u32) -> Result<Self, PackedLocationError> {
         if region_id > MAX_REGION_ID {
             return Err(PackedLocationError::RegionOutOfRange);
         }
@@ -88,32 +84,32 @@ impl PackedLocation {
         ))
     }
 
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn raw(self) -> u64 {
+    pub const fn raw(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn region_id(self) -> u32 {
+    pub const fn region_id(self) -> u32 {
         ((self.0 >> REGION_SHIFT) & REGION_MASK) as u32
     }
 
-    pub(crate) const fn offset(self) -> u32 {
+    pub const fn offset(self) -> u32 {
         (((self.0 >> OFFSET_SHIFT) & OFFSET_MASK) as u32) * OFFSET_ALIGNMENT
     }
 
-    pub(crate) const fn record_len(self) -> u32 {
+    pub const fn record_len(self) -> u32 {
         ((((self.0 >> RECORD_LEN_SHIFT) & RECORD_LEN_MASK) as u32) + 1) * RECORD_LEN_ALIGNMENT
     }
 
-    pub(crate) fn index_size_class(self) -> u8 {
+    pub fn index_size_class(self) -> u8 {
         record_size_class(self.record_len())
             .expect("a valid packed location always has an index size class")
     }
 
-    pub(crate) fn index_equivalent(self, other: Self) -> bool {
+    pub fn index_equivalent(self, other: Self) -> bool {
         self.region_id() == other.region_id()
             && self.offset() == other.offset()
             && self.index_size_class() == other.index_size_class()
@@ -123,7 +119,7 @@ impl PackedLocation {
 /// Encodes one exact 32-byte unit count into the smallest representable upper
 /// bound. Sizes through 1 KiB remain exact; larger classes add less than 7%
 /// over-read while covering the complete 32 MiB Region limit with one byte.
-pub(crate) fn record_size_class(record_len: u32) -> Option<u8> {
+fn record_size_class(record_len: u32) -> Option<u8> {
     if record_len == 0
         || record_len > MAX_RECORD_LEN
         || !record_len.is_multiple_of(RECORD_LEN_ALIGNMENT)
@@ -150,7 +146,7 @@ pub(crate) fn record_size_class(record_len: u32) -> Option<u8> {
     u8::try_from(code).ok()
 }
 
-pub(crate) fn record_size_class_upper_bound(class: u8) -> Option<u32> {
+pub fn record_size_class_upper_bound(class: u8) -> Option<u32> {
     let upper = RECORD_SIZE_CLASS_UPPER_BOUNDS[usize::from(class)];
     (upper != 0).then_some(upper)
 }
@@ -190,7 +186,7 @@ impl fmt::Debug for PackedLocation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PackedLocationError {
+pub enum PackedLocationError {
     RegionOutOfRange,
     OffsetUnaligned,
     OffsetOutOfRange,
@@ -215,12 +211,12 @@ impl fmt::Display for PackedLocationError {
 impl std::error::Error for PackedLocationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IndexEntry {
-    pub(crate) location: PackedLocation,
+pub struct IndexEntry {
+    pub location: PackedLocation,
 }
 
 /// Stable power-of-two partition routing for persisted index layouts.
-pub(crate) fn index_partition_for(hash: u64, partition_count: usize) -> usize {
+pub fn index_partition_for(hash: u64, partition_count: usize) -> usize {
     debug_assert!(partition_count.is_power_of_two());
     if partition_count == 1 {
         return 0;
