@@ -20,6 +20,8 @@
 //! device path. A fixed age deadline publishes partial batches without adding
 //! a durability sync; CLEAN remains the only steady-state durability boundary.
 
+#[cfg(test)]
+use crate::config::ReadAdmission;
 use std::io;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -30,15 +32,12 @@ use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 use asyncband::watch;
 
 mod metrics;
-mod plan;
 
+pub(crate) use self::metrics::ActivityMetrics;
 use self::metrics::RuntimeMetrics;
-#[cfg(test)]
-use self::plan::{
-    IO_QUEUE_ENTRY_RESERVATION_BYTES, RUNTIME_CONTROL_RESERVATION_BYTES,
-    runtime_topology_memory_bytes,
-};
+use crate::config::CacheConfig;
 
+use crate::config::{IoMode, IoPoolTopology, RuntimeOptions};
 use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
 use crate::io_backend::RuntimeFileSet;
@@ -54,7 +53,6 @@ use crate::region_staging::{RegionStaging, StagingError};
 use crate::resources::{
     BufferLease, CACHE_THREAD_STACK_BYTES, ResourceBuildError, ResourceController, ResourceLimits,
 };
-use crate::runtime_config::{IoMode, IoPoolTopology, RuntimeConfig};
 use crate::snapshot::{
     CacheIoDirectionSnapshot, CacheIoSnapshot, CacheSnapshot, DetailedCacheSnapshot,
 };
@@ -373,7 +371,7 @@ impl HybridValueRead {
 pub(crate) struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    config: RuntimeConfig,
+    config: RuntimeOptions,
     metrics: Arc<RuntimeMetrics>,
     shared: Arc<RunningShared>,
     owner: Arc<Mutex<Option<RunningOwner>>>,
@@ -700,8 +698,22 @@ impl RegionDataPlane {
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RuntimeConfig,
+        configuration: CacheConfig,
     ) -> io::Result<Self> {
+        // Recovery supplies independently validated metadata. It must still
+        // match the configuration selected for this open.
+        let storage = configuration.storage();
+        if data.geometry != storage.geometry()
+            || core.region_count()? != storage.region_count() as usize
+            || core.index_slot_count() != storage.index_slots()
+            || core.shard_count() != configuration.runtime().append_shards as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recovered layout does not match the cache configuration",
+            ));
+        }
+        let config = configuration.runtime().clone();
         core.configure_reclaim_workers(config.reclaim_io_max_in_flight())?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
@@ -710,7 +722,7 @@ impl RegionDataPlane {
             Arc::clone(&core),
             data,
             files,
-            config.clone(),
+            configuration,
             Arc::clone(&metrics),
             Arc::clone(&operations),
         )?;
@@ -1004,10 +1016,10 @@ impl RegionDataPlane {
             Ok(reservation) => reservation,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    && !self.config.read_io_wait_timeout.is_zero() =>
+                    && !self.config.read_io_wait_timeout().is_zero() =>
             {
                 let waiting = running
-                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout)
+                    .try_queue_read(hash, plan, read_token, self.config.read_io_wait_timeout())
                     .inspect_err(|_| {
                         if running.statistics {
                             running.metrics.record_read_overload();
@@ -1035,7 +1047,7 @@ impl RegionDataPlane {
             }
         };
         let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
-            if !self.config.read_io_wait_timeout.is_zero() {
+            if !self.config.read_io_wait_timeout().is_zero() {
                 if running.statistics {
                     running.metrics.record_read_overload();
                 }
@@ -1072,7 +1084,7 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout.is_zero() {
+                if !self.config.read_io_wait_timeout().is_zero() {
                     if running.statistics {
                         running.metrics.record_read_overload();
                     }
@@ -1140,7 +1152,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !self.config.read_io_wait_timeout.is_zero() {
+                if !self.config.read_io_wait_timeout().is_zero() {
                     self.record_read_wait_error(&error);
                     return Err(error);
                 }
@@ -1310,29 +1322,18 @@ fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     files: RuntimeFileSet,
-    config: RuntimeConfig,
+    configuration: CacheConfig,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
-    let l1_entry_capacity = config.l1_entry_capacity(data.geometry, core.index_slot_count())?;
-    let l1_metadata_bytes = MemoryStore::allocation_bytes(
-        config.l1_capacity_bytes,
-        l1_entry_capacity,
-        config.l1_shards,
-        config.l1_eviction_policy,
-    )?;
-    let fixed_memory = core
-        .runtime_reserved_memory_bytes()?
-        .checked_add(l1_metadata_bytes)
-        .ok_or_else(|| invalid_runtime_config("fixed memory plan overflow"))?;
-    let reserved_memory =
-        config.validated_reserved_memory_bytes(data.geometry, shard_count, fixed_memory)?;
+    let config = configuration.runtime();
+    let l1_entry_capacity = configuration.l1_entry_capacity();
     let memory_limit = config.managed_memory_limit_bytes;
     let resources = Arc::new(
         ResourceController::try_new(ResourceLimits {
             memory_limit_bytes: memory_limit,
-            reserved_memory_bytes: reserved_memory,
+            reserved_memory_bytes: configuration.reserved_memory_bytes(),
         })
         .map_err(resource_build_io_error)?,
     );
@@ -1375,14 +1376,14 @@ fn start_running(
     }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
-    let read_wait_enabled = !config.read_io_wait_timeout.is_zero();
+    let read_wait_enabled = !config.read_io_wait_timeout().is_zero();
     let read_engines =
-        build_engine_pool(files, &config, config.read_io_topology(), read_wait_enabled)?;
+        build_engine_pool(files, config, config.read_io_topology(), read_wait_enabled)?;
     let read_waiters =
         read_wait_enabled.then(|| Arc::new(Semaphore::new(config.read_io_wait_capacity())));
-    let write_engines = build_engine_pool(write_files, &config, config.write_io_topology(), false)?;
+    let write_engines = build_engine_pool(write_files, config, config.write_io_topology(), false)?;
     let reclaim_engines =
-        build_engine_pool(reclaim_files, &config, config.reclaim_io_topology(), false)?;
+        build_engine_pool(reclaim_files, config, config.reclaim_io_topology(), false)?;
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -1481,7 +1482,7 @@ fn start_running(
 
 fn build_engine_pool(
     files: RuntimeFileSet,
-    config: &RuntimeConfig,
+    config: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
@@ -1491,7 +1492,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if config.io_engine().is_posix() {
+    let posix_workers = if config.io_engine.is_posix() {
         topology.max_in_flight
     } else {
         1
@@ -1506,7 +1507,7 @@ fn build_engine_pool(
             worker_files,
             topology.depth_for_engine(engine),
             posix_workers,
-            config.io_engine(),
+            config.io_engine,
             topology.io_uring,
             config.statistics,
             read_wait_enabled,
@@ -2401,11 +2402,11 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
+        use crate::config::{IoEngine, PosixIoConfig};
         use crate::index::{IndexEntry, PackedLocation};
         use crate::recovery::{DATA_REGION_AREA_OFFSET, PersistentId};
         use crate::region::{FileRegionBackend, RegionFiles};
         use crate::region_store::RegionStore;
-        use crate::runtime_config::{IoEngine, PosixIoConfig};
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -2430,15 +2431,24 @@ mod tests {
             config_fingerprint: 4,
         };
         for wait in [Duration::ZERO, Duration::from_millis(1)] {
-            let config = RuntimeConfig::default()
-                .with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 1)))
-                .with_append_shards(1)
-                .with_l1_capacity_bytes(0)
-                .with_read_io_wait_timeout(wait)
-                .with_statistics(true);
+            let config = RuntimeOptions {
+                io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+                append_shards: 1,
+                l1_capacity_bytes: 0,
+                statistics: true,
+                read_admission: if wait.is_zero() {
+                    ReadAdmission::Immediate
+                } else {
+                    ReadAdmission::Wait {
+                        timeout: wait,
+                        max_waiters: None,
+                    }
+                },
+                ..RuntimeOptions::default()
+            };
             let mut store = RegionStore::open(
                 8,
-                FileRegionBackend::new_with_configs(files.clone(), data, 1, config),
+                FileRegionBackend::for_test_with_options(files.clone(), data, 8, config),
             )
             .unwrap();
             let plane = store.data_plane_handle().unwrap();
@@ -2540,23 +2550,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_read_wait_queue_is_memory_accounted() {
-        let base = RuntimeConfig::default()
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(7, 4, 1),
-            ))
-            .with_read_io_wait_capacity(11);
-        let no_wait = runtime_topology_memory_bytes(4, &base).unwrap();
-        let with_wait = runtime_topology_memory_bytes(
-            4,
-            &base.with_read_io_wait_timeout(Duration::from_millis(1)),
-        )
-        .unwrap();
-
-        assert_eq!(with_wait - no_wait, 11 * IO_QUEUE_ENTRY_RESERVATION_BYTES);
-    }
-
-    #[test]
     fn index_page_validation_state_is_fixed_memory_accounted() {
         let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
         let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
@@ -2564,96 +2557,6 @@ mod tests {
         assert_eq!(
             two_pages - one_page,
             INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
-        );
-    }
-
-    #[test]
-    fn four_tib_memory_plan_covers_the_complete_production_shape() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        const INDEX_SLOTS: usize = 512 * 1024 * 1024;
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(32 * 1024 * 1024, 128 * 1024).unwrap(),
-            region_size: 32 * 1024 * 1024,
-            region_count: 128 * 1024,
-        };
-        let index_slots = INDEX_SLOTS;
-        let base = RuntimeConfig::default()
-            .with_l1_capacity_bytes(10 * GIB)
-            .with_managed_memory_limit_bytes(15 * GIB)
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .with_l1_shards(64);
-        let entry_capacity = base.l1_entry_capacity(geometry, index_slots).unwrap();
-        assert_eq!(entry_capacity, 2_621_440);
-        base.validate_memory_plan(geometry, index_slots, 4).unwrap();
-        let too_small = base.clone().with_managed_memory_limit_bytes(14 * GIB);
-        assert_eq!(
-            too_small
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-
-        let metadata = MemoryStore::allocation_bytes(
-            base.l1_capacity_bytes,
-            entry_capacity,
-            base.l1_shards,
-            base.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(metadata, 130 * 1024 * 1024);
-
-        let s3fifo = base
-            .clone()
-            .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo);
-        s3fifo
-            .validate_memory_plan(geometry, index_slots, 4)
-            .unwrap();
-        assert_eq!(
-            too_small
-                .with_l1_eviction_policy(crate::runtime_config::L1EvictionPolicy::S3Fifo)
-                .validate_memory_plan(geometry, index_slots, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        let s3fifo_metadata = MemoryStore::allocation_bytes(
-            s3fifo.l1_capacity_bytes,
-            entry_capacity,
-            s3fifo.l1_shards,
-            s3fifo.l1_eviction_policy,
-        )
-        .unwrap();
-        assert_eq!(s3fifo_metadata - metadata, 110 * 1024 * 1024);
-        assert_eq!(s3fifo_metadata, 240 * 1024 * 1024);
-    }
-
-    #[test]
-    fn each_additional_reclaimer_is_fully_memory_accounted() {
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
-            region_size: 512 * 1024,
-            region_count: 10,
-        };
-        let base = RuntimeConfig::default()
-            .with_append_shards(4)
-            .with_l1_capacity_bytes(0);
-        let (_, base_minimum) = base.memory_plan_bytes(geometry, 4, 0).unwrap();
-        let (_, parallel_minimum) = base
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(4, 4, 2),
-            ))
-            .memory_plan_bytes(geometry, 4, 0)
-            .unwrap();
-
-        assert_eq!(
-            parallel_minimum - base_minimum,
-            geometry.region_size as usize
-                + 2 * CACHE_THREAD_STACK_BYTES
-                + IO_QUEUE_ENTRY_RESERVATION_BYTES
-                + RUNTIME_CONTROL_RESERVATION_BYTES
         );
     }
 

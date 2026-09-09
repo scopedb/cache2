@@ -23,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StaticConfig,
+    Cache, CacheConfig, CacheHealth, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StorageOptions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -401,21 +401,25 @@ struct EffectiveConfig {
 }
 
 impl EffectiveConfig {
-    fn static_config(&self) -> StaticConfig {
-        StaticConfig::new(self.capacity_bytes)
-            .with_region_size_bytes(self.region_bytes as u64)
-            .with_expected_entries(self.key_count)
+    fn storage_options(&self) -> StorageOptions {
+        StorageOptions {
+            region_size_bytes: self.region_bytes as u64,
+            expected_entries: Some(self.key_count),
+            ..StorageOptions::new(self.capacity_bytes)
+        }
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.l1_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(true)
+    fn runtime_options(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.l1_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: true,
+            ..RuntimeOptions::default()
+        }
     }
 }
 
@@ -612,14 +616,9 @@ async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
     );
 
     let files = BenchFiles::new(&config.directory, scenario);
-    let static_config = config.static_config();
-    static_config.validate()?;
-    let cache = Arc::new(
-        CacheBuilder::from_static(&files.data, static_config)
-            .with_runtime_config(config.runtime_config())
-            .open()
-            .await?,
-    );
+    let storage = config.storage_options().build()?;
+    let cache_config = CacheConfig::new(storage, config.runtime_options())?;
+    let cache = Arc::new(Cache::open(&files.data, cache_config).await?);
     let expected: Arc<[AtomicU64]> = (0..config.key_count)
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>()

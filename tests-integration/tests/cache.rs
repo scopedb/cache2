@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use cache2::ReadAdmission;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,27 +23,48 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
 use cache2::{
-    CacheBuilder, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy,
-    PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
+    Cache, CacheConfig, CacheHealth, CacheTier, ErrorKind, ErrorOperation, IoEngine,
+    L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StartupMode, StorageLayout, StorageOptions,
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
-type RuntimeConfigCase = (&'static str, fn(RuntimeConfig) -> RuntimeConfig);
 
-fn test_static_config() -> StaticConfig {
-    StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(3277)
+fn test_storage() -> StorageLayout {
+    StorageOptions {
+        region_size_bytes: 512 * 1024,
+        expected_entries: Some(3277),
+        ..StorageOptions::new(3 * 512 * 1024)
+    }
+    .build()
+    .unwrap()
 }
 
-fn test_runtime_config(workers: usize, append_shards: u32) -> RuntimeConfig {
-    RuntimeConfig::default()
-        .with_io_engine(IoEngine::Posix(PosixIoConfig::new(workers, workers, 1)))
-        .with_append_shards(append_shards)
-        .with_l1_capacity_bytes(4 * 1024 * 1024)
-        .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        .with_write_flush_threshold_bytes(256 * 1024)
-        .with_statistics(true)
+fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
+    RuntimeOptions {
+        io_engine: IoEngine::Posix(PosixIoConfig::new(workers, workers, 1)),
+        append_shards,
+        l1_capacity_bytes: 4 * 1024 * 1024,
+        managed_memory_limit_bytes: 32 * 1024 * 1024,
+        write_flush_threshold_bytes: 256 * 1024,
+        statistics: true,
+        ..RuntimeOptions::default()
+    }
+}
+
+fn test_config(workers: usize) -> CacheConfig {
+    test_config_with_storage(workers, test_storage())
+}
+
+fn test_config_with_storage(workers: usize, storage: StorageLayout) -> CacheConfig {
+    test_config_with_storage_and_shards(workers, storage, 2)
+}
+
+fn test_config_with_storage_and_shards(
+    workers: usize,
+    storage: StorageLayout,
+    append_shards: u32,
+) -> CacheConfig {
+    CacheConfig::new(storage, test_runtime_options(workers, append_shards)).unwrap()
 }
 
 struct TestCache {
@@ -55,24 +77,6 @@ impl TestCache {
         let data =
             std::env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
         Self { data }
-    }
-
-    fn config(&self, workers: usize) -> CacheBuilder {
-        self.config_with_static(workers, test_static_config())
-    }
-
-    fn config_with_static(&self, workers: usize, static_config: StaticConfig) -> CacheBuilder {
-        self.config_with_static_and_shards(workers, static_config, 2)
-    }
-
-    fn config_with_static_and_shards(
-        &self,
-        workers: usize,
-        static_config: StaticConfig,
-        append_shards: u32,
-    ) -> CacheBuilder {
-        CacheBuilder::from_static(&self.data, static_config)
-            .with_runtime_config(test_runtime_config(workers, append_shards))
     }
 
     fn sidecar(&self, suffix: &str) -> PathBuf {
@@ -187,25 +191,35 @@ fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
     let caller_runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let cache_handle = cache_runtime.handle().clone();
+    let config = test_config(1);
+    let minimum_memory_bytes = config.minimum_memory_bytes();
+    let config = CacheConfig::new(
+        config.storage().clone(),
+        RuntimeOptions {
+            managed_memory_limit_bytes: minimum_memory_bytes,
+            ..config.runtime().clone()
+        },
+    )
+    .unwrap();
+    files.assert_absent();
 
     caller_runtime.block_on(async {
-        let cache = files
-            .config(1)
-            .with_tokio_handle(cache_handle.clone())
-            .open()
-            .await
-            .unwrap();
+        let cache =
+            Cache::open_with_handle(&files.data, config.clone(), cache_runtime.handle().clone())
+                .await
+                .unwrap();
+        assert_eq!(
+            cache.snapshot().unwrap().managed_memory_limit_bytes,
+            minimum_memory_bytes
+        );
         cache.put("key", "value").unwrap();
         cache.drain().await.unwrap();
         cache.close_warm().await.unwrap();
 
-        let reopened = files
-            .config(1)
-            .with_tokio_handle(cache_handle)
-            .open()
+        let reopened = Cache::open_with_handle(&files.data, config, cache_runtime.handle().clone())
             .await
             .unwrap();
+        assert_eq!(reopened.startup_mode(), StartupMode::Warm);
         let value = reopened.get("key").await.unwrap().unwrap();
         assert_eq!(value.tier(), CacheTier::L2);
         assert_eq!(value.as_ref(), b"value");
@@ -217,14 +231,14 @@ fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
 #[tokio::test]
 async fn fast_close_always_reopens_empty() {
     let files = TestCache::new("fast-close");
-    let cache = files.config(1).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
     assert_eq!(cache.startup_mode(), StartupMode::Cold);
     cache.put("key", "value").unwrap();
     cache.drain().await.unwrap();
     assert_eq!(cache.get("key").await.unwrap().unwrap().as_ref(), b"value");
     cache.close_fast().await.unwrap();
 
-    let reopened = files.config(7).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(7)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
     reopened.close_fast().await.unwrap();
@@ -233,7 +247,7 @@ async fn fast_close_always_reopens_empty() {
 #[tokio::test]
 async fn warm_close_with_retained_arc_fences_operations_and_recovers() {
     let files = TestCache::new("warm-close-retained-arc");
-    let cache = Arc::new(files.config(2).open().await.unwrap());
+    let cache = Arc::new(Cache::open(&files.data, test_config(2)).await.unwrap());
     let retained = Arc::clone(&cache);
 
     cache.put("key", "value").unwrap();
@@ -265,7 +279,7 @@ async fn warm_close_with_retained_arc_fences_operations_and_recovers() {
         ErrorKind::Unavailable
     );
 
-    let reopened = files.config(2).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(2)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     assert_eq!(
         reopened.get("key").await.unwrap().unwrap().as_ref(),
@@ -277,7 +291,7 @@ async fn warm_close_with_retained_arc_fences_operations_and_recovers() {
 #[tokio::test]
 async fn warm_close_fences_concurrent_arc_mutations() {
     let files = TestCache::new("warm-close-concurrent-mutations");
-    let cache = Arc::new(files.config(2).open().await.unwrap());
+    let cache = Arc::new(Cache::open(&files.data, test_config(2)).await.unwrap());
     let writer_cache = Arc::clone(&cache);
     let ready = Arc::new(Barrier::new(2));
     let writer_ready = Arc::clone(&ready);
@@ -304,7 +318,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
     cache.close_warm().await.unwrap();
     let accepted = writer.join().unwrap();
 
-    let reopened = files.config(2).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(2)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     for ordinal in accepted {
         assert_eq!(
@@ -323,9 +337,9 @@ async fn warm_close_fences_concurrent_arc_mutations() {
 #[tokio::test]
 async fn concurrent_open_reports_structured_busy_error() {
     let files = TestCache::new("concurrent-open");
-    let cache = files.config(1).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
 
-    let error = files.config(1).open().await.unwrap_err();
+    let error = Cache::open(&files.data, test_config(1)).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Busy);
     assert_eq!(error.operation(), ErrorOperation::Open);
     assert_eq!(error.io_kind(), std::io::ErrorKind::WouldBlock);
@@ -336,7 +350,7 @@ async fn concurrent_open_reports_structured_busy_error() {
 #[tokio::test]
 async fn l2_only_put_avoids_l1_until_the_first_demand_read() {
     let files = TestCache::new("l2-only-put");
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
 
     let sequence = eventually_admitted(|| cache.put_l2("key", [7_u8; 16 * 1024]));
     assert_ne!(sequence, 0);
@@ -357,7 +371,7 @@ async fn l2_only_put_avoids_l1_until_the_first_demand_read() {
 #[tokio::test]
 async fn l2_only_put_best_effort_invalidates_an_older_l1_value() {
     let files = TestCache::new("l2-only-replacement");
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
 
     let old_sequence = eventually_admitted(|| cache.put("key", b"old"));
     let old = cache.get("key").await.unwrap().unwrap();
@@ -379,14 +393,14 @@ async fn l2_only_put_best_effort_invalidates_an_older_l1_value() {
 #[tokio::test]
 async fn l2_only_put_survives_warm_recovery() {
     let files = TestCache::new("l2-only-warm-recovery");
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
     let expected = vec![7_u8; 16 * 1024];
 
     let sequence = eventually_admitted(|| cache.put_l2("key", &expected));
     assert_ne!(sequence, 0);
     cache.close_warm().await.unwrap();
 
-    let reopened = files.config(3).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(3)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     assert_eq!(reopened.detailed_snapshot().unwrap().l1.resident_entries, 0);
     let value = reopened.get("key").await.unwrap().unwrap();
@@ -399,15 +413,17 @@ async fn l2_only_put_survives_warm_recovery() {
 #[tokio::test]
 async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
-    let runtime = test_runtime_config(1, 2)
-        .with_l1_capacity_bytes(1024 * 1024)
-        .with_l1_shards(1);
-    let cache = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
+    let runtime = RuntimeOptions {
+        l1_capacity_bytes: 1024 * 1024,
+        l1_shards: 1,
+        ..test_runtime_options(1, 2)
+    };
+    let cache = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime).unwrap(),
+    )
+    .await
+    .unwrap();
     let first = vec![1_u8; 200 * 1024];
     let second = vec![2_u8; 200 * 1024];
 
@@ -427,16 +443,18 @@ async fn write_flush_threshold_does_not_cap_region_sized_staging() {
 #[tokio::test]
 async fn l1_bypass_may_remain_stale_after_region_completion() {
     let files = TestCache::new("l1-bypass-publication");
-    let runtime = test_runtime_config(2, 2)
-        .with_l1_capacity_bytes(512)
-        .with_l1_shards(1)
-        .with_write_flush_threshold_bytes(128 * 1024);
-    let cache = files
-        .config(2)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
+    let runtime = RuntimeOptions {
+        l1_capacity_bytes: 512,
+        l1_shards: 1,
+        write_flush_threshold_bytes: 128 * 1024,
+        ..test_runtime_options(2, 2)
+    };
+    let cache = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime).unwrap(),
+    )
+    .await
+    .unwrap();
 
     cache.put("key", "old").unwrap();
     cache.drain().await.unwrap();
@@ -465,43 +483,37 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
         target_arch = "powerpc64"
     )
 )))]
-#[tokio::test]
-async fn unavailable_io_engine_is_rejected_before_file_creation() {
+#[test]
+fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
-    let runtime = test_runtime_config(1, 2)
-        .with_io_engine(IoEngine::IoUring(cache2::IoUringConfig::default()))
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(false);
+    let runtime = RuntimeOptions {
+        io_engine: IoEngine::IoUring(cache2::IoUringConfig::default()),
+        write_flush_threshold_bytes: 128 * 1024,
+        statistics: false,
+        ..test_runtime_options(1, 2)
+    };
 
-    let error = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap_err();
+    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert_eq!(error.operation(), ErrorOperation::Open);
+    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
     assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
     files.assert_absent();
 }
 
 #[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn unavailable_direct_io_is_rejected_before_file_creation() {
+#[test]
+fn unavailable_direct_io_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-direct-io");
-    let runtime = test_runtime_config(1, 2)
-        .with_io_mode(IoMode::Direct)
-        .with_write_flush_threshold_bytes(128 * 1024)
-        .with_statistics(false);
+    let runtime = RuntimeOptions {
+        io_mode: IoMode::Direct,
+        write_flush_threshold_bytes: 128 * 1024,
+        statistics: false,
+        ..test_runtime_options(1, 2)
+    };
 
-    let error = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap_err();
+    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert_eq!(error.operation(), ErrorOperation::Open);
+    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
     assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
     files.assert_absent();
 }
@@ -509,13 +521,13 @@ async fn unavailable_direct_io_is_rejected_before_file_creation() {
 #[tokio::test]
 async fn latest_put_survives_warm_recovery() {
     let files = TestCache::new("latest-warm-recovery");
-    let cache = files.config(3).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(3)).await.unwrap();
     for version in 0_u8..64 {
         eventually_admitted(|| cache.put("key", [version; 1024]));
     }
     cache.close_warm().await.unwrap();
 
-    let reopened = files.config(5).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(5)).await.unwrap();
     let value = reopened.get("key").await.unwrap().unwrap();
     assert_eq!(value.tier(), CacheTier::L2);
     assert_eq!(value.as_ref(), &[63; 1024]);
@@ -524,27 +536,32 @@ async fn latest_put_survives_warm_recovery() {
 }
 
 #[tokio::test]
-async fn runtime_config_can_change_across_a_warm_reopen() {
+async fn runtime_options_can_change_across_a_warm_reopen() {
     let files = TestCache::new("warm-close");
-    let cache = files.config(1).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
     cache.put("key", vec![7_u8; 16 * 1024]).unwrap();
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let retuned = test_runtime_config(2, 2)
-        .with_io_engine(IoEngine::Posix(PosixIoConfig::new(7, 2, 2)))
-        .with_read_io_wait_timeout(Duration::from_millis(10))
-        .with_l1_capacity_bytes(2 * 1024 * 1024)
-        .with_l1_eviction_policy(L1EvictionPolicy::S3Fifo)
-        .with_l1_shards(7)
-        .with_write_flush_threshold_bytes(64 * 1024)
-        .with_statistics(false);
-    let reopened = files
-        .config(7)
-        .with_runtime_config(retuned)
-        .open()
-        .await
-        .unwrap();
+    let retuned = RuntimeOptions {
+        io_engine: IoEngine::Posix(PosixIoConfig::new(7, 2, 2)),
+        l1_capacity_bytes: 2 * 1024 * 1024,
+        l1_eviction_policy: L1EvictionPolicy::S3Fifo,
+        l1_shards: 7,
+        write_flush_threshold_bytes: 64 * 1024,
+        statistics: false,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_millis(10),
+            max_waiters: None,
+        },
+        ..test_runtime_options(2, 2)
+    };
+    let reopened = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), retuned).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     let first = reopened.get("key").await.unwrap().unwrap();
     assert_eq!(first.tier(), CacheTier::L2);
@@ -557,21 +574,23 @@ async fn runtime_config_can_change_across_a_warm_reopen() {
 #[tokio::test]
 async fn append_shards_rebind_across_warm_reopens() {
     let files = TestCache::new("append-shards");
-    let static_config = test_static_config();
+    let storage = test_storage();
 
-    let cache = files
-        .config_with_static_and_shards(1, static_config.clone(), 1)
-        .open()
-        .await
-        .unwrap();
+    let cache = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage.clone(), 1),
+    )
+    .await
+    .unwrap();
     cache.put("old-key", [7_u8; 1024]).unwrap();
     cache.close_warm().await.unwrap();
 
-    let reopened = files
-        .config_with_static_and_shards(2, static_config.clone(), 2)
-        .open()
-        .await
-        .unwrap();
+    let reopened = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(2, storage.clone(), 2),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     assert_eq!(
         reopened.get("old-key").await.unwrap().unwrap().as_ref(),
@@ -580,11 +599,12 @@ async fn append_shards_rebind_across_warm_reopens() {
     reopened.put("new-key", [9_u8; 1024]).unwrap();
     reopened.close_warm().await.unwrap();
 
-    let recovered = files
-        .config_with_static_and_shards(2, static_config.clone(), 2)
-        .open()
-        .await
-        .unwrap();
+    let recovered = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(2, storage.clone(), 2),
+    )
+    .await
+    .unwrap();
     assert_eq!(recovered.startup_mode(), StartupMode::Warm);
     assert_eq!(
         recovered.get("new-key").await.unwrap().unwrap().as_ref(),
@@ -592,11 +612,12 @@ async fn append_shards_rebind_across_warm_reopens() {
     );
     recovered.close_warm().await.unwrap();
 
-    let shrunk = files
-        .config_with_static_and_shards(1, static_config.clone(), 1)
-        .open()
-        .await
-        .unwrap();
+    let shrunk = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage.clone(), 1),
+    )
+    .await
+    .unwrap();
     assert_eq!(shrunk.startup_mode(), StartupMode::Warm);
     assert_eq!(
         shrunk.get("old-key").await.unwrap().unwrap().as_ref(),
@@ -609,11 +630,12 @@ async fn append_shards_rebind_across_warm_reopens() {
     shrunk.put("shrunk-key", [11_u8; 1024]).unwrap();
     shrunk.close_warm().await.unwrap();
 
-    let stable = files
-        .config_with_static_and_shards(1, static_config, 1)
-        .open()
-        .await
-        .unwrap();
+    let stable = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage, 1),
+    )
+    .await
+    .unwrap();
     assert_eq!(stable.startup_mode(), StartupMode::Warm);
     assert_eq!(
         stable.get("shrunk-key").await.unwrap().unwrap().as_ref(),
@@ -625,7 +647,7 @@ async fn append_shards_rebind_across_warm_reopens() {
 #[tokio::test]
 async fn delete_is_sequenced_and_warm_recoverable() {
     let files = TestCache::new("delete-warm-recovery");
-    let cache = files.config(3).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(3)).await.unwrap();
     let put_sequence = cache.put("key", "one").unwrap();
     cache.drain().await.unwrap();
     let records_before_delete = cache
@@ -648,7 +670,7 @@ async fn delete_is_sequenced_and_warm_recoverable() {
     );
     cache.close_warm().await.unwrap();
 
-    let reopened = files.config(5).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(5)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     assert!(reopened.get("key").await.unwrap().is_none());
 
@@ -669,7 +691,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     const HEADER_BYTES: usize = 16;
 
     let files = TestCache::new("concurrent-mixed");
-    let cache = files.config(4).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(4)).await.unwrap();
     let keys: Vec<_> = (0..KEY_COUNT)
         .map(|key| {
             format!("mixed-key-{key:04}")
@@ -770,79 +792,9 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
 }
 
 #[tokio::test]
-async fn invalid_runtime_config_is_rejected_before_file_creation() {
-    let cases: [RuntimeConfigCase; 16] = [
-        ("zero-append-shards", |config| config.with_append_shards(0)),
-        ("too-many-append-shards", |config| {
-            config.with_append_shards(257)
-        }),
-        ("zero-reclaim-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 0)))
-        }),
-        ("too-many-reclaim-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 1, 3)))
-        }),
-        ("zero-read-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(0, 1, 1)))
-        }),
-        ("zero-write-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 0, 1)))
-        }),
-        ("too-many-read-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(4097, 1, 1)))
-        }),
-        ("zero-read-wait-capacity", |config| {
-            config.with_read_io_wait_capacity(0)
-        }),
-        ("too-large-read-wait-capacity", |config| {
-            config.with_read_io_wait_capacity(65_537)
-        }),
-        ("too-many-write-workers", |config| {
-            config.with_io_engine(IoEngine::Posix(PosixIoConfig::new(1, 4097, 1)))
-        }),
-        ("excessive-read-wait", |config| {
-            config.with_read_io_wait_timeout(Duration::from_secs(5) + Duration::from_nanos(1))
-        }),
-        ("l1-exceeds-budget", |config| {
-            config
-                .with_l1_capacity_bytes(64 * 1024 * 1024)
-                .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-        }),
-        ("fixed-plan-exceeds-budget", |config| {
-            config
-                .with_io_engine(IoEngine::Posix(PosixIoConfig::new(2, 2, 1)))
-                .with_l1_capacity_bytes(0)
-                .with_managed_memory_limit_bytes(2 * 1024 * 1024)
-                .with_write_flush_threshold_bytes(128 * 1024)
-        }),
-        ("zero-l1-shards", |config| config.with_l1_shards(0)),
-        ("unaligned-write-flush-threshold", |config| {
-            config.with_write_flush_threshold_bytes(4097)
-        }),
-        ("oversized-write-flush-threshold", |config| {
-            config.with_write_flush_threshold_bytes(4 * 1024 * 1024 + 4096)
-        }),
-    ];
-
-    for (case, configure) in cases {
-        let files = TestCache::new(case);
-        let error = files
-            .config(2)
-            .with_runtime_config(configure(RuntimeConfig::default().with_append_shards(2)))
-            .open()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{case}");
-        assert_eq!(error.operation(), ErrorOperation::Open, "{case}");
-        assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidInput, "{case}");
-        files.assert_absent();
-    }
-}
-
-#[tokio::test]
 async fn public_key_and_record_size_limits_are_enforced() {
     let files = TestCache::new("entry-size-errors");
-    let cache = files.config(1).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
     let oversized_key = vec![0_u8; 4 * 1024 + 1];
     let oversized_value = vec![0_u8; 512 * 1024];
 
@@ -869,7 +821,7 @@ async fn public_key_and_record_size_limits_are_enforced() {
 #[tokio::test]
 async fn region_sized_records_remain_l2_only_and_warm_recover() {
     let files = TestCache::new("region-sized-record");
-    let cache = files.config(1).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
     let large_value = vec![7_u8; 512 * 1024 - 64];
 
     cache.put(b"large", &large_value).unwrap();
@@ -881,7 +833,7 @@ async fn region_sized_records_remain_l2_only_and_warm_recover() {
     }
     cache.close_warm().await.unwrap();
 
-    let reopened = files.config(1).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(1)).await.unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Warm);
     let value = reopened.get(b"large").await.unwrap().unwrap();
     assert_eq!(value.tier(), CacheTier::L2);
@@ -898,7 +850,7 @@ async fn cold_start_removes_stale_recovery_files() {
     std::fs::write(&image, b"stale image").unwrap();
     std::fs::write(&temporary, b"stale temporary image").unwrap();
 
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
     assert!(!image.exists());
     assert!(!temporary.exists());
     cache.close_fast().await.unwrap();
@@ -907,24 +859,30 @@ async fn cold_start_removes_stale_recovery_files() {
 #[tokio::test]
 async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
-    let static_config = StaticConfig::new(2 * 4096)
-        .with_region_size_bytes(4096)
-        .with_expected_entries(51);
+    let storage = StorageOptions {
+        region_size_bytes: 4096,
+        expected_entries: Some(51),
+        ..StorageOptions::new(2 * 4096)
+    }
+    .build()
+    .unwrap();
     let value = vec![0x5a; 128];
 
-    let cache = files
-        .config_with_static_and_shards(1, static_config.clone(), 1)
-        .open()
-        .await
-        .unwrap();
+    let cache = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage.clone(), 1),
+    )
+    .await
+    .unwrap();
     cache.put("first", &value).unwrap();
     cache.close_warm().await.unwrap();
 
-    let recovered = files
-        .config_with_static_and_shards(1, static_config, 1)
-        .open()
-        .await
-        .unwrap();
+    let recovered = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage, 1),
+    )
+    .await
+    .unwrap();
     assert_eq!(recovered.startup_mode(), StartupMode::Warm);
     assert_eq!(
         recovered.get("first").await.unwrap().unwrap().as_ref(),
@@ -936,14 +894,14 @@ async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
 #[tokio::test]
 async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
     let files = TestCache::new("disk-bound");
-    let static_config = test_static_config();
-    let peak_disk_bytes = static_config.peak_disk_bytes().unwrap();
+    let storage = test_storage();
+    let static_peak = storage.peak_disk_bytes();
+    let config = test_config_with_storage(2, storage);
+    let peak_disk_bytes = config.storage().peak_disk_bytes();
+    assert_eq!(peak_disk_bytes, static_peak);
+    files.assert_absent();
 
-    let cache = files
-        .config_with_static(2, static_config)
-        .open()
-        .await
-        .unwrap();
+    let cache = Cache::open(&files.data, config).await.unwrap();
     cache.put("key", vec![7_u8; 16 * 1024]).unwrap();
     cache.close_warm().await.unwrap();
 
@@ -966,8 +924,8 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 #[tokio::test]
 async fn detailed_snapshot_reports_bounded_resource_state() {
     let files = TestCache::new("resource-snapshot");
-    let expected_disk_peak = test_static_config().peak_disk_bytes().unwrap();
-    let cache = files.config(4).open().await.unwrap();
+    let expected_disk_peak = test_storage().peak_disk_bytes();
+    let cache = Cache::open(&files.data, test_config(4)).await.unwrap();
     let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
     assert_eq!(resources.health, CacheHealth::Running);
@@ -1003,7 +961,7 @@ async fn detailed_snapshot_reports_bounded_resource_state() {
 #[tokio::test]
 async fn detailed_snapshot_reports_reclaim_and_io_activity() {
     let files = TestCache::new("reclaim-snapshot");
-    let cache = files.config(4).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(4)).await.unwrap();
     let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
 
@@ -1049,7 +1007,7 @@ async fn detailed_snapshot_reports_reclaim_and_io_activity() {
 #[tokio::test]
 async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     let files = TestCache::new("activity-snapshot");
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
     cache.put("key", "value").unwrap();
     assert_eq!(
         cache.get("key").await.unwrap().unwrap().tier(),
@@ -1086,7 +1044,7 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(before_close.io.write.direct.operations, 0);
     cache.close_warm().await.unwrap();
 
-    let reopened = files.config(3).open().await.unwrap();
+    let reopened = Cache::open(&files.data, test_config(3)).await.unwrap();
     let fresh = reopened.snapshot().unwrap();
     assert_eq!(fresh.puts, 0);
     assert_eq!(fresh.deletes, 0);
@@ -1126,22 +1084,24 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
 #[tokio::test]
 async fn buffered_l2_read_reports_the_size_class_upper_bound() {
     let files = TestCache::new("buffered-size-class-read");
-    let static_config = test_static_config();
-    let cache = files
-        .config_with_static_and_shards(1, static_config.clone(), 1)
-        .open()
-        .await
-        .unwrap();
+    let storage = test_storage();
+    let cache = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage.clone(), 1),
+    )
+    .await
+    .unwrap();
     let value = vec![0x5a; 1000];
     cache.put("key-1", &value).unwrap();
     cache.put("key-2", &value).unwrap();
     cache.close_warm().await.unwrap();
 
-    let reopened = files
-        .config_with_static_and_shards(1, static_config, 1)
-        .open()
-        .await
-        .unwrap();
+    let reopened = Cache::open(
+        &files.data,
+        test_config_with_storage_and_shards(1, storage, 1),
+    )
+    .await
+    .unwrap();
     let hit = reopened.get("key-1").await.unwrap().unwrap();
     assert_eq!(hit.tier(), CacheTier::L2);
     assert_eq!(hit.as_ref(), value);
@@ -1157,15 +1117,17 @@ async fn buffered_l2_read_reports_the_size_class_upper_bound() {
 #[tokio::test]
 async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
-    let runtime = test_runtime_config(1, 2)
-        .with_l1_capacity_bytes(0)
-        .with_write_flush_threshold_bytes(128 * 1024);
-    let cache = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
+    let runtime = RuntimeOptions {
+        l1_capacity_bytes: 0,
+        write_flush_threshold_bytes: 128 * 1024,
+        ..test_runtime_options(1, 2)
+    };
+    let cache = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime).unwrap(),
+    )
+    .await
+    .unwrap();
     cache.put("key", vec![9_u8; 16 * 1024]).unwrap();
     cache.drain().await.unwrap();
 
@@ -1187,27 +1149,29 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
 #[tokio::test]
 async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let files = TestCache::new("promoted-l2-buffer-release");
-    let runtime = test_runtime_config(1, 2)
-        .with_l1_capacity_bytes(64 * 1024)
-        .with_l1_shards(1)
-        .with_write_flush_threshold_bytes(128 * 1024);
-    let cache = files
-        .config(1)
-        .with_runtime_config(runtime.clone())
-        .open()
-        .await
-        .unwrap();
+    let runtime = RuntimeOptions {
+        l1_capacity_bytes: 64 * 1024,
+        l1_shards: 1,
+        write_flush_threshold_bytes: 128 * 1024,
+        ..test_runtime_options(1, 2)
+    };
+    let cache = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime.clone()).unwrap(),
+    )
+    .await
+    .unwrap();
     cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
     cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let reopened = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
+    let reopened = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime).unwrap(),
+    )
+    .await
+    .unwrap();
     let baseline = reopened.snapshot().unwrap().managed_memory_bytes;
     let first = reopened.get("key-1").await.unwrap().unwrap();
     assert_eq!(first.tier(), CacheTier::L2);
@@ -1225,15 +1189,17 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
 #[tokio::test]
 async fn retained_l2_values_charge_and_release_transient_memory() {
     let files = TestCache::new("retained-read-memory");
-    let runtime = test_runtime_config(1, 2)
-        .with_l1_capacity_bytes(0)
-        .with_write_flush_threshold_bytes(128 * 1024);
-    let cache = files
-        .config(1)
-        .with_runtime_config(runtime)
-        .open()
-        .await
-        .unwrap();
+    let runtime = RuntimeOptions {
+        l1_capacity_bytes: 0,
+        write_flush_threshold_bytes: 128 * 1024,
+        ..test_runtime_options(1, 2)
+    };
+    let cache = Cache::open(
+        &files.data,
+        CacheConfig::new(test_storage(), runtime).unwrap(),
+    )
+    .await
+    .unwrap();
     cache.put("key-1", vec![3_u8; 16 * 1024]).unwrap();
     cache.put("key-2", vec![4_u8; 16 * 1024]).unwrap();
     cache.drain().await.unwrap();
@@ -1255,17 +1221,23 @@ async fn retained_l2_values_charge_and_release_transient_memory() {
 }
 
 #[tokio::test]
-async fn static_config_change_discards_the_old_image() {
+async fn storage_change_discards_the_old_image() {
     let files = TestCache::new("static-change");
-    let cache = files.config(2).open().await.unwrap();
+    let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
     cache.put("key", "old").unwrap();
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let changed = StaticConfig::new(3 * 512 * 1024)
-        .with_region_size_bytes(512 * 1024)
-        .with_expected_entries(6553);
-    let reopened = files.config_with_static(5, changed).open().await.unwrap();
+    let changed = StorageOptions {
+        region_size_bytes: 512 * 1024,
+        expected_entries: Some(6553),
+        ..StorageOptions::new(3 * 512 * 1024)
+    }
+    .build()
+    .unwrap();
+    let reopened = Cache::open(&files.data, test_config_with_storage(5, changed))
+        .await
+        .unwrap();
     assert_eq!(reopened.startup_mode(), StartupMode::Cold);
     assert!(reopened.get("key").await.unwrap().is_none());
     reopened.close_fast().await.unwrap();
@@ -1275,7 +1247,7 @@ async fn static_config_change_discards_the_old_image() {
 async fn unsupported_cache_format_versions_cold_start_empty() {
     for target in ["data", "state", "image"] {
         let files = TestCache::new(&format!("unsupported-{target}"));
-        let cache = files.config(2).open().await.unwrap();
+        let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
         cache.put("key", "old").unwrap();
         cache.close_warm().await.unwrap();
 
@@ -1289,7 +1261,7 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
             _ => unreachable!(),
         }
 
-        let reopened = files.config(3).open().await.unwrap();
+        let reopened = Cache::open(&files.data, test_config(3)).await.unwrap();
         assert_eq!(reopened.startup_mode(), StartupMode::Cold, "{target}");
         assert!(reopened.get("key").await.unwrap().is_none(), "{target}");
         reopened.close_fast().await.unwrap();

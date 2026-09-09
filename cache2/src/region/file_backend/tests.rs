@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::ReadAdmission;
 use crate::index::{IndexEntry, PackedLocation};
 use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, IndexSlot};
 use crate::io_backend::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
@@ -261,8 +262,11 @@ fn external_process_kill_recovery_contract() {
     ] {
         let directory = TestDirectory::new();
         let data = data_path_superblock();
-        let mut initial =
-            RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data)).unwrap();
+        let mut initial = RegionStore::open(
+            4096,
+            FileRegionBackend::for_test(directory.files.clone(), data, 4096),
+        )
+        .unwrap();
         eventually_admitted(|| initial.put_value(b"survivor", b"old"));
         initial.drain().unwrap();
         initial.close_warm().unwrap();
@@ -284,8 +288,11 @@ fn external_process_kill_recovery_contract() {
             "crash case {case} did not SIGKILL"
         );
 
-        let mut reopened =
-            RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data)).unwrap();
+        let mut reopened = RegionStore::open(
+            4096,
+            FileRegionBackend::for_test(directory.files.clone(), data, 4096),
+        )
+        .unwrap();
         if expect_clean {
             assert_eq!(reopened.startup(), StartupMode::Warm, "{case}");
             assert_eq!(
@@ -306,11 +313,13 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
     let data = data_path_superblock();
     match case {
         "open" => {
-            let _store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
+            let _store =
+                RegionStore::open(4096, FileRegionBackend::for_test(files, data, 4096)).unwrap();
             crate::io_backend::testing::kill_process();
         }
         "write" | "drain" => {
-            let store = RegionStore::open(4096, FileRegionBackend::new(files, data)).unwrap();
+            let store =
+                RegionStore::open(4096, FileRegionBackend::for_test(files, data, 4096)).unwrap();
             eventually_admitted(|| store.put_value(b"replacement", b"new"));
             if case == "drain" {
                 store.drain().unwrap();
@@ -321,7 +330,7 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
             let (file_system, faults, _) = FaultRegionFileSystem::new();
             let mut store = RegionStore::open(
                 4096,
-                FileRegionBackend::new_with_file_system(files, data, file_system),
+                FileRegionBackend::for_test_with_file_system(files, data, 4096, file_system),
             )
             .unwrap();
             let point = match case {
@@ -368,20 +377,22 @@ fn key_for_shard(data: DataSuperblock, shard: u64, ordinal: u64) -> Vec<u8> {
 fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig::default()
-        .with_io_engine(crate::runtime_config::IoEngine::Posix(
-            crate::runtime_config::PosixIoConfig::new(2, 4, 1),
-        ))
-        .with_read_io_wait_capacity(1)
-        .with_read_io_wait_timeout(Duration::from_millis(30))
-        .with_l1_capacity_bytes(0)
-        .with_statistics(true);
+    let runtime_config = RuntimeOptions {
+        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(2, 4, 1)),
+        l1_capacity_bytes: 0,
+        statistics: true,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_millis(30),
+            max_waiters: Some(1),
+        },
+        ..RuntimeOptions::default()
+    };
     let mut store = RegionStore::open(
         4096,
-        FileRegionBackend::new_with_configs(
+        FileRegionBackend::for_test_with_options(
             directory.files.clone(),
             data,
-            REGION_SHARDS,
+            4096,
             runtime_config,
         ),
     )
@@ -450,18 +461,21 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
 fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig::default()
-        .with_io_engine(crate::runtime_config::IoEngine::Posix(
-            crate::runtime_config::PosixIoConfig::new(1, 4, 1),
-        ))
-        .with_read_io_wait_timeout(Duration::from_secs(1))
-        .with_l1_capacity_bytes(0);
+    let runtime_config = RuntimeOptions {
+        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 4, 1)),
+        l1_capacity_bytes: 0,
+        read_admission: ReadAdmission::Wait {
+            timeout: Duration::from_secs(1),
+            max_waiters: None,
+        },
+        ..RuntimeOptions::default()
+    };
     let mut store = RegionStore::open(
         4096,
-        FileRegionBackend::new_with_configs(
+        FileRegionBackend::for_test_with_options(
             directory.files.clone(),
             data,
-            REGION_SHARDS,
+            4096,
             runtime_config.clone(),
         ),
     )
@@ -490,10 +504,10 @@ fn queued_l2_read_does_not_pin_warm_close() {
 
     let mut reopened = RegionStore::open(
         4096,
-        FileRegionBackend::new_with_configs(
+        FileRegionBackend::for_test_with_options(
             directory.files.clone(),
             data,
-            REGION_SHARDS,
+            4096,
             runtime_config,
         ),
     )
@@ -506,17 +520,17 @@ fn queued_l2_read_does_not_pin_warm_close() {
 fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeConfig {
+    let runtime_config = RuntimeOptions {
         l1_capacity_bytes: 0,
         statistics: true,
-        ..RuntimeConfig::default()
+        ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(
         4096,
-        FileRegionBackend::new_with_configs(
+        FileRegionBackend::for_test_with_options(
             directory.files.clone(),
             data,
-            REGION_SHARDS,
+            4096,
             runtime_config,
         ),
     )
@@ -590,8 +604,11 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     store.close_warm().unwrap();
     assert_eq!(retained_hits[0].value(), rotation_value);
     drop(retained_hits);
-    let mut recovered =
-        RegionStore::open(4096, FileRegionBackend::new(directory.files.clone(), data)).unwrap();
+    let mut recovered = RegionStore::open(
+        4096,
+        FileRegionBackend::for_test(directory.files.clone(), data, 4096),
+    )
+    .unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
     assert_eq!(
         recovered
@@ -609,19 +626,19 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
     for case in ["shard", "index"] {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
-        let runtime_config = RuntimeConfig::default()
-            .with_io_engine(crate::runtime_config::IoEngine::Posix(
-                crate::runtime_config::PosixIoConfig::new(1, 1, 1),
-            ))
-            .with_l1_capacity_bytes(0)
-            .with_managed_memory_limit_bytes(32 * 1024 * 1024)
-            .with_write_flush_threshold_bytes(128 * 1024);
+        let runtime_config = RuntimeOptions {
+            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 1, 1)),
+            l1_capacity_bytes: 0,
+            managed_memory_limit_bytes: 32 * 1024 * 1024,
+            write_flush_threshold_bytes: 128 * 1024,
+            ..RuntimeOptions::default()
+        };
         let mut store = RegionStore::open(
             4096,
-            FileRegionBackend::new_with_configs(
+            FileRegionBackend::for_test_with_options(
                 directory.files.clone(),
                 data,
-                REGION_SHARDS,
+                4096,
                 runtime_config.clone(),
             ),
         )
@@ -642,10 +659,10 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
 
         let mut reopened = RegionStore::open(
             4096,
-            FileRegionBackend::new_with_configs(
+            FileRegionBackend::for_test_with_options(
                 directory.files.clone(),
                 data,
-                REGION_SHARDS,
+                4096,
                 runtime_config,
             ),
         )
@@ -719,7 +736,7 @@ fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, RegionStagi
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -827,7 +844,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -989,7 +1006,7 @@ fn same_hash_candidate_requires_full_key() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -1131,7 +1148,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::runtime_config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -1216,7 +1233,12 @@ fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
     let (fresh_file_system, fresh_io, _) = FaultRegionFileSystem::new();
     let mut fresh = RegionStore::open(
         config,
-        FileRegionBackend::new_with_file_system(directory.files.clone(), data, fresh_file_system),
+        FileRegionBackend::for_test_with_file_system(
+            directory.files.clone(),
+            data,
+            config,
+            fresh_file_system,
+        ),
     )
     .unwrap();
     assert_eq!(fresh.startup(), StartupMode::Cold);
@@ -1226,7 +1248,12 @@ fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
     let (dirty_file_system, dirty_io, _) = FaultRegionFileSystem::new();
     let mut dirty = RegionStore::open(
         config,
-        FileRegionBackend::new_with_file_system(directory.files.clone(), data, dirty_file_system),
+        FileRegionBackend::for_test_with_file_system(
+            directory.files.clone(),
+            data,
+            config,
+            dirty_file_system,
+        ),
     )
     .unwrap();
     assert_eq!(dirty.startup(), StartupMode::Cold);
@@ -1241,11 +1268,14 @@ fn publish_custom_clean_image(
     metadata: RegionMetadata,
 ) {
     let shard_count = metadata.root.shard_count;
-    let runtime_config = RuntimeConfig::default().with_append_shards(shard_count);
-    let mut backend = FileRegionBackend::new_with_configs(
+    let runtime_config = RuntimeOptions {
+        append_shards: shard_count,
+        ..RuntimeOptions::default()
+    };
+    let mut backend = FileRegionBackend::for_test_with_options(
         directory.files.clone(),
         data,
-        shard_count,
+        index_slots,
         runtime_config,
     );
     backend.acquire_exclusive().unwrap();
@@ -1277,7 +1307,7 @@ fn clean_image_rebinds_a_different_append_shard_topology() {
 
     let mut reopened = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(reopened.startup(), StartupMode::Warm);
@@ -1289,7 +1319,7 @@ fn clean_image_rebinds_a_different_append_shard_topology() {
 
     let mut stable = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(stable.startup(), StartupMode::Warm);
@@ -1326,7 +1356,7 @@ fn append_shard_growth_without_free_regions_cold_starts_safely() {
 
     let mut reopened = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(reopened.startup(), StartupMode::Cold);
@@ -1346,7 +1376,7 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
     let data = test_data_superblock();
     let mut first = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     first.close_fast().unwrap();
@@ -1362,7 +1392,7 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
 
     let mut cold = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
@@ -1373,24 +1403,6 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
         .unwrap();
     assert_eq!(observed, [0; 12]);
     cold.close_fast().unwrap();
-}
-
-#[test]
-fn concrete_recovery_profile_rejects_fewer_than_five_regions_before_file_creation() {
-    let directory = TestDirectory::new();
-    let opened = RegionStore::open(
-        8,
-        FileRegionBackend::new(
-            directory.files.clone(),
-            test_data_superblock_with_regions(REGION_SHARDS),
-        ),
-    );
-    assert!(matches!(
-        opened,
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput
-    ));
-    assert!(!directory.files.data.exists());
-    assert!(!directory.files.state.exists());
 }
 
 #[test]
@@ -1408,7 +1420,7 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
 
     let mut first = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     let runtime = first.runtime_mut().unwrap();
@@ -1423,7 +1435,7 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
 
     let mut recovered = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
@@ -1449,7 +1461,7 @@ fn corrupt_region_metadata_rejects_the_complete_clean_image() {
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
     let mut first = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     first.close_warm().unwrap();
@@ -1471,7 +1483,7 @@ fn corrupt_region_metadata_rejects_the_complete_clean_image() {
 
     let mut rejected = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(rejected.startup(), StartupMode::Cold);
@@ -1491,7 +1503,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
     let mut first = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     first.close_warm().unwrap();
@@ -1511,7 +1523,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
 
     let mut recovered = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
@@ -1526,7 +1538,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
 
     let mut cold = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
@@ -1595,8 +1607,12 @@ fn every_prepublication_failure_leaves_no_selectable_clean_state() {
         let config = 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
         let (file_system, io_faults, file_system_faults) = FaultRegionFileSystem::new();
-        let backend =
-            FileRegionBackend::new_with_file_system(directory.files.clone(), data, file_system);
+        let backend = FileRegionBackend::for_test_with_file_system(
+            directory.files.clone(),
+            data,
+            config,
+            file_system,
+        );
         let mut store = RegionStore::open(config, backend).unwrap();
         if let Some((event, action)) = io_fault {
             io_faults.arm(event, 1, action);
@@ -1608,7 +1624,7 @@ fn every_prepublication_failure_leaves_no_selectable_clean_state() {
 
         let mut reopened = RegionStore::open(
             config,
-            FileRegionBackend::new(directory.files.clone(), data),
+            FileRegionBackend::for_test(directory.files.clone(), data, config),
         )
         .unwrap();
         assert_eq!(reopened.startup(), StartupMode::Cold, "failure case {case}");
@@ -1647,13 +1663,18 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
         faults.arm(event, occurrence, action);
         let opened = RegionStore::open(
             config,
-            FileRegionBackend::new_with_file_system(directory.files.clone(), data, file_system),
+            FileRegionBackend::for_test_with_file_system(
+                directory.files.clone(),
+                data,
+                config,
+                file_system,
+            ),
         );
         assert!(opened.is_err(), "RUNNING barrier case {case}");
 
         let mut cold = RegionStore::open(
             config,
-            FileRegionBackend::new(directory.files.clone(), data),
+            FileRegionBackend::for_test(directory.files.clone(), data, config),
         )
         .unwrap();
         assert!(matches!(cold.startup(), StartupMode::Cold));
@@ -1669,7 +1690,12 @@ fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
     let (file_system, faults, _) = FaultRegionFileSystem::new();
     let mut store = RegionStore::open(
         config,
-        FileRegionBackend::new_with_file_system(directory.files.clone(), data, file_system),
+        FileRegionBackend::for_test_with_file_system(
+            directory.files.clone(),
+            data,
+            config,
+            file_system,
+        ),
     )
     .unwrap();
     faults.arm(
@@ -1681,7 +1707,7 @@ fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
 
     let mut reopened = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
     assert!(matches!(
@@ -1706,7 +1732,7 @@ fn data_and_state_inode_alias_is_rejected_without_truncation() {
 
     let opened = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     );
     assert!(matches!(
         opened,
@@ -1726,7 +1752,11 @@ fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
 
     let opened = RegionStore::open(
         8,
-        FileRegionBackend::new(files, test_data_superblock_with_regions(REGION_SHARDS + 1)),
+        FileRegionBackend::for_test(
+            files,
+            test_data_superblock_with_regions(REGION_SHARDS + 1),
+            8,
+        ),
     );
     assert!(matches!(
         opened,
@@ -1745,7 +1775,10 @@ fn recovery_sidecars_must_share_one_directory() {
         other.join("state"),
         directory.root.join("image"),
     );
-    let opened = RegionStore::open(8, FileRegionBackend::new(files, test_data_superblock()));
+    let opened = RegionStore::open(
+        8,
+        FileRegionBackend::for_test(files, test_data_superblock(), 8),
+    );
     assert!(matches!(
         opened,
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
@@ -1761,7 +1794,7 @@ fn state_sidecar_lock_prevents_cross_data_file_races() {
     let data = test_data_superblock();
     let mut first = RegionStore::open(
         config,
-        FileRegionBackend::new(directory.files.clone(), data),
+        FileRegionBackend::for_test(directory.files.clone(), data, config),
     )
     .unwrap();
 
@@ -1770,7 +1803,10 @@ fn state_sidecar_lock_prevents_cross_data_file_races() {
         directory.files.state.clone(),
         directory.root.join("other-image"),
     );
-    let opened = RegionStore::open(config, FileRegionBackend::new(conflicting_files, data));
+    let opened = RegionStore::open(
+        config,
+        FileRegionBackend::for_test(conflicting_files, data, config),
+    );
     assert!(opened.is_err());
     first.close_fast().unwrap();
 }

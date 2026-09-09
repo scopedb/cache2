@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 
 use asyncband::semaphore::{OwnedSemaphorePermit, Semaphore};
 
+#[cfg(unix)]
+use crate::config::{IoEngine as ConfiguredIoEngine, IoUringPoolConfig};
 #[cfg(all(
     feature = "io-uring",
     target_os = "linux",
@@ -62,8 +64,6 @@ use crate::io_backend::{RuntimeFileBackend, RuntimeFileSet};
 ))]
 use crate::io_backend::{RuntimeIoDirection, RuntimeIoPath};
 use crate::resources::{BufferLease, CACHE_THREAD_STACK_BYTES};
-#[cfg(unix)]
-use crate::runtime_config::{IoEngine as ConfiguredIoEngine, IoUringPoolConfig};
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 pub(crate) const IO_BUFFER_ALIGNMENT: usize = 4096;

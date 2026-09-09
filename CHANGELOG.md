@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Breaking Changes
+
+- Configuration now separates editable `StorageOptions` / `RuntimeOptions`
+  from immutable `StorageLayout` / `CacheConfig`. Build the layout, construct
+  `CacheConfig::new(layout, options)`, and call `Cache::open(path, config)` or
+  `Cache::open_with_handle(path, config, handle)`. `StaticConfig`, `RuntimeConfig`,
+  `CacheBuilder`, and the standalone `validate` method are removed.
+- `ReadAdmission::Immediate` and `ReadAdmission::Wait { timeout, max_waiters }`
+  replace the separate read-wait setters. Waiting requires a positive timeout;
+  an omitted waiter bound follows the selected read execution capacity.
+- Configuration errors identify `ErrorOperation::BuildStorage` or `BuildConfig`.
+  `StorageLayout::peak_disk_bytes()` is now an infallible query.
+
+### Improvements
+
+- Geometry and memory requirements are retained through startup. Configurations
+  can be inspected and reused without file access or an active Tokio runtime;
+  paths and runtime handles are supplied separately when opening each cache.
+
 ## v0.3.0 (2026-09-04)
 
 This release keeps the version 1 on-disk format and requires no disk

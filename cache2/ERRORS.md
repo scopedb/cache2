@@ -47,11 +47,11 @@ buffer pressure, and deadline expiry are `ErrorKind::Overloaded`.
 
 | `ErrorKind` | Meaning | Usual response |
 | --- | --- | --- |
-| `InvalidInput` | Static/runtime configuration or a request key/value is invalid. | Fix the input; retrying it unchanged cannot succeed. |
+| `InvalidInput` | Storage/runtime options or a request key/value is invalid. | Fix the input; retrying it unchanged cannot succeed. |
 | `Unsupported` | The selected I/O engine, mode, or platform capability is unavailable. | Select a supported configuration or build target. |
 | `Busy` | `open` could not acquire exclusive ownership of the cache files. | Coordinate ownership or retry later with a bound. |
 | `Overloaded` | A bounded request-path slot, queue, buffer, or deadline is exhausted. | Fall through to the authoritative path or retry with a bound. |
-| `ResourceExhausted` | Startup or lifecycle work could not satisfy a required allocation/resource plan. | Reduce the configured footprint or provide more resources. |
+| `ResourceExhausted` | Startup or lifecycle work could not satisfy a required allocation/resource requirement. | Reduce the configured footprint or provide more resources. |
 | `Unavailable` | The runtime, worker, or required service has stopped or was interrupted. | Stop using this cache instance and reopen or replace it. |
 | `CorruptData` | Cache data or internal structure failed validation. | Treat the cache as disposable; inspect logs/device health and reopen it. |
 | `Io` | A filesystem or device operation failed. | Inspect `io_kind()`, `raw_os_error()`, and the source chain. |
@@ -135,3 +135,15 @@ Use `error.io_kind() == std::io::ErrorKind::WouldBlock` only when exact legacy
 I/O behavior is required. Returning a C² error from a `std::io::Result`
 function requires `Err(error.into())`; the `?` operator performs that
 conversion automatically.
+
+## Configuration and open failures
+
+`StorageOptions::build` reports `BuildStorage`; `CacheConfig::new` reports
+`BuildConfig`. Correct invalid options or an insufficient managed-memory limit
+before trying again. Successful results retain the checked layout and resource
+requirements, so inspecting their disk and memory bounds cannot fail.
+
+`Cache::open` and `Cache::open_with_handle` report `Open`. A valid configuration
+can still encounter a busy file, unavailable device support, an allocation
+failure, or an unavailable runtime. Handle these according to `ErrorKind` just
+like other lifecycle failures.

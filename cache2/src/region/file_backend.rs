@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use crate::config::IoMode;
+#[cfg(test)]
+use crate::config::RuntimeOptions;
 use crate::index::MAX_INDEX_PARTITIONS;
 use crate::index_storage::{
     IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, PartitionedIndexStorage,
@@ -45,7 +48,6 @@ use crate::region_metadata::{
     RegionMetadataRoot, RegionMetadataState,
 };
 use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
-use crate::runtime_config::{IoMode, RuntimeConfig};
 #[cfg(test)]
 use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
 
@@ -53,6 +55,7 @@ use super::core::{
     FileRegionCore, RegionAccessState, RegionHealthLatch, RegionManagerAuthority, RegionShard,
     guarded_index_result, index_storage_io_error, region_metadata_io_error,
 };
+use crate::config::CacheConfig;
 #[cfg(test)]
 use crate::region_runtime::HybridValueRead;
 use crate::region_runtime::RegionDataPlane;
@@ -171,7 +174,7 @@ impl FileRegionRuntime {
         &mut self,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        config: RuntimeConfig,
+        config: CacheConfig,
     ) -> io::Result<()> {
         if self.data_plane.is_some() {
             return Err(io::Error::new(
@@ -329,8 +332,7 @@ where
     /// files retain their on-disk identities but must match this geometry and
     /// configuration fingerprint.
     format_data: DataSuperblock,
-    shard_count: u32,
-    runtime_config: RuntimeConfig,
+    config: CacheConfig,
     file_system: F,
     data_file: Option<F::File>,
     state_file: Option<F::File>,
@@ -344,23 +346,31 @@ where
 
 impl FileRegionBackend<SystemRegionFileSystem> {
     #[cfg(test)]
-    pub(crate) fn new(files: RegionFiles, format_data: DataSuperblock) -> Self {
-        Self::new_with_configs(files, format_data, REGION_SHARDS, RuntimeConfig::default())
-    }
-
-    pub(crate) fn new_with_configs(
+    pub(crate) fn for_test(
         files: RegionFiles,
         format_data: DataSuperblock,
-        shards: u32,
-        runtime_config: RuntimeConfig,
+        index_slots: usize,
     ) -> Self {
-        Self::new_with_file_system_and_configs(
-            files,
-            format_data,
-            SystemRegionFileSystem,
-            shards,
-            runtime_config,
-        )
+        Self::for_test_with_options(files, format_data, index_slots, RuntimeOptions::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_options(
+        files: RegionFiles,
+        format_data: DataSuperblock,
+        index_slots: usize,
+        runtime_config: RuntimeOptions,
+    ) -> Self {
+        let config = CacheConfig::for_test(format_data.geometry, index_slots, runtime_config);
+        Self::new(files, format_data, config)
+    }
+
+    pub(crate) fn new(
+        files: RegionFiles,
+        format_data: DataSuperblock,
+        config: CacheConfig,
+    ) -> Self {
+        Self::new_with_file_system(files, format_data, SystemRegionFileSystem, config)
     }
 }
 
@@ -369,32 +379,27 @@ where
     F: RegionFileSystem,
 {
     #[cfg(test)]
+    fn for_test_with_file_system(
+        files: RegionFiles,
+        format_data: DataSuperblock,
+        index_slots: usize,
+        file_system: F,
+    ) -> Self {
+        let config =
+            CacheConfig::for_test(format_data.geometry, index_slots, RuntimeOptions::default());
+        Self::new_with_file_system(files, format_data, file_system, config)
+    }
+
     fn new_with_file_system(
         files: RegionFiles,
         format_data: DataSuperblock,
         file_system: F,
-    ) -> Self {
-        Self::new_with_file_system_and_configs(
-            files,
-            format_data,
-            file_system,
-            REGION_SHARDS,
-            RuntimeConfig::default(),
-        )
-    }
-
-    fn new_with_file_system_and_configs(
-        files: RegionFiles,
-        format_data: DataSuperblock,
-        file_system: F,
-        shard_count: u32,
-        runtime_config: RuntimeConfig,
+        config: CacheConfig,
     ) -> Self {
         Self {
             files,
             format_data,
-            shard_count,
-            runtime_config,
+            config,
             file_system,
             data_file: None,
             state_file: None,
@@ -493,13 +498,6 @@ where
                 "RegionStore backend is already locked",
             ));
         }
-        self.runtime_config.validate()?;
-        if self.shard_count == 0 || self.format_data.geometry.region_count <= self.shard_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RegionStore requires at least one data shard and one additional Region",
-            ));
-        }
         if self.files.data == self.files.state
             || self.files.data == self.files.image
             || self.files.state == self.files.image
@@ -529,7 +527,7 @@ where
         }
         let data =
             self.file_system
-                .open_data(&self.files.data, true, self.runtime_config.io_mode())?;
+                .open_data(&self.files.data, true, self.config.runtime().io_mode)?;
         data.try_lock_exclusive()?;
         let state = match self.file_system.open(&self.files.state, true) {
             Ok(state) => state,
@@ -740,7 +738,8 @@ where
             self.current_state = None;
             self.cold_reset_needed = false;
         }
-        let metadata = empty_region_metadata(data, index_slots, self.shard_count)?;
+        let metadata =
+            empty_region_metadata(data, index_slots, self.config.runtime().append_shards)?;
         let index = match PartitionedIndexStorage::anonymous(index_slots) {
             Ok(index) => index,
             Err(error) => {
@@ -798,23 +797,20 @@ where
             return Ok(None);
         }
         let previous_append_shards = clean.metadata.root.shard_count;
-        if previous_append_shards != self.shard_count {
-            let added_shards = self.shard_count.saturating_sub(previous_append_shards);
+        let shard_count = self.config.runtime().append_shards;
+        if previous_append_shards != shard_count {
+            let added_shards = shard_count.saturating_sub(previous_append_shards);
             if added_shards > clean.metadata.root.free_region_count {
                 self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_insufficient_free_regions");
                 return Ok(None);
             }
-            if clean
-                .metadata
-                .rebind_append_shards(self.shard_count)
-                .is_err()
-            {
+            if clean.metadata.rebind_append_shards(shard_count).is_err() {
                 self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_invalid");
                 return Ok(None);
             }
-            self.log_append_shards_rebind_planned(previous_append_shards, self.shard_count);
+            self.log_append_shards_rebind_planned(previous_append_shards, shard_count);
         }
         let partition_stats = metadata_partition_stats(&clean.metadata)?;
         let binding = index_image_binding(clean.header);
@@ -867,7 +863,7 @@ where
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
         if let Some(files) = self.file_system.try_clone_runtime_files(data_file)? {
-            runtime.attach_data_plane(data, files, self.runtime_config.clone())?;
+            runtime.attach_data_plane(data, files, self.config.clone())?;
         }
         Ok(runtime)
     }

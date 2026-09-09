@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use cache2::ReadAdmission;
 use std::env;
 use std::hint::black_box;
 use std::io;
@@ -23,9 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asyncband::barrier::Barrier;
 use benchmarks::report::{JobReport, LatencyHistogram, RunReporter, emit_cache_report};
 use cache2::{
-    Cache, CacheBuilder, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
-    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeConfig, StartupMode, StaticConfig,
-    Value,
+    Cache, CacheConfig, CacheTier, ErrorKind as CacheErrorKind, IoEngine, IoMode, IoUringConfig,
+    IoUringPoolConfig, L1EvictionPolicy, PosixIoConfig, RuntimeOptions, StartupMode,
+    StorageOptions, Value,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -250,26 +251,33 @@ impl BenchConfig {
         })
     }
 
-    fn static_config(&self) -> StaticConfig {
-        StaticConfig::new(self.capacity_bytes)
-            .with_region_size_bytes(REGION_BYTES as u64)
-            // Keep replacement rare so the successful-hit rate measures
-            // storage. Legal bounded-index eviction remains an explicit miss.
-            // Production-load behavior has its own turnover benchmark.
-            .with_expected_entries(self.entries.saturating_mul(4))
+    fn storage_options(&self) -> StorageOptions {
+        StorageOptions {
+            region_size_bytes: REGION_BYTES as u64,
+            expected_entries: Some(self.entries.saturating_mul(4)),
+            ..StorageOptions::new(self.capacity_bytes)
+        }
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_read_io_wait_capacity(self.read_io_wait_capacity)
-            .with_read_io_wait_timeout(self.read_io_wait_timeout)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.memory_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(self.statistics_enabled)
+    fn runtime_options(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.memory_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: self.statistics_enabled,
+            read_admission: if self.read_io_wait_timeout.is_zero() {
+                ReadAdmission::Immediate
+            } else {
+                ReadAdmission::Wait {
+                    timeout: self.read_io_wait_timeout,
+                    max_waiters: Some(self.read_io_wait_capacity),
+                }
+            },
+            ..RuntimeOptions::default()
+        }
     }
 
     fn l2_clients(&self) -> usize {
@@ -298,22 +306,6 @@ impl BenchFiles {
                 std::process::id()
             )),
         }
-    }
-
-    fn config(&self, config: &BenchConfig) -> CacheBuilder {
-        self.config_with_l1_capacity(config, config.memory_bytes)
-    }
-
-    fn config_with_l1_capacity(
-        &self,
-        config: &BenchConfig,
-        l1_capacity_bytes: usize,
-    ) -> CacheBuilder {
-        CacheBuilder::from_static(&self.data, config.static_config()).with_runtime_config(
-            config
-                .runtime_config()
-                .with_l1_capacity_bytes(l1_capacity_bytes),
-        )
     }
 }
 
@@ -391,7 +383,9 @@ fn run_benchmark() -> io::Result<()> {
 async fn run(config: BenchConfig) -> io::Result<()> {
     let files = BenchFiles::new(&config.directory);
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
-    let index_slots = config.static_config().index_slots();
+    let cache_config =
+        CacheConfig::new(config.storage_options().build()?, config.runtime_options())?;
+    let index_slots = cache_config.storage().index_slots();
     let index_load = config.entries as f64 * 100.0 / index_slots as f64;
     let initial_l1_bytes = if config.hot_entries == 0 {
         config.memory_bytes
@@ -432,10 +426,21 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("file={}", files.data.display());
 
     let cache = Arc::new(
-        files
-            .config_with_l1_capacity(&config, initial_l1_bytes)
-            .open()
-            .await?,
+        Cache::open(
+            &files.data,
+            if initial_l1_bytes == config.memory_bytes {
+                cache_config.clone()
+            } else {
+                CacheConfig::new(
+                    cache_config.storage().clone(),
+                    RuntimeOptions {
+                        l1_capacity_bytes: initial_l1_bytes,
+                        ..cache_config.runtime().clone()
+                    },
+                )?
+            },
+        )
+        .await?,
     );
     let mut write = concurrent_writes(
         Arc::clone(&cache),
@@ -483,7 +488,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
-    let cache = Arc::new(files.config(&config).open().await?);
+    let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
     if cache.startup_mode() != StartupMode::Warm {
         return Err(io::Error::other(
             "benchmark did not reopen from a clean image",
@@ -664,7 +669,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     drop(cache);
 
     let resident = if l1_entry_eligible {
-        let cache = Arc::new(files.config(&config).open().await?);
+        let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
         if cache.startup_mode() != StartupMode::Cold {
             return Err(io::Error::other(
                 "fast-closed benchmark did not reopen empty",

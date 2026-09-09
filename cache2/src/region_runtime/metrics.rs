@@ -46,7 +46,7 @@ pub(super) struct RuntimeMetrics {
 }
 
 #[repr(align(64))]
-pub(super) struct ActivityMetrics {
+pub(crate) struct ActivityMetrics {
     pub(super) puts: AtomicU64,
     pub(super) deletes: AtomicU64,
     pub(super) written_bytes: AtomicU64,

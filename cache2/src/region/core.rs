@@ -257,11 +257,8 @@ impl FileRegionCore {
         self.index.storage().slot_count()
     }
 
-    pub(crate) fn runtime_reserved_memory_bytes(&self) -> io::Result<usize> {
-        let region_count = u32::try_from(self.manager.lock()?.regions().len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large")
-        })?;
-        runtime_fixed_memory_bytes(self.index.storage().slot_count(), region_count)
+    pub(crate) fn region_count(&self) -> io::Result<usize> {
+        Ok(self.manager.lock()?.regions().len())
     }
 
     pub(crate) fn configure_reclaim_workers(&self, workers: usize) -> io::Result<()> {

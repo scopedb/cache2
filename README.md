@@ -12,12 +12,12 @@ It keeps request paths short and cache-owned resources fixed.
 ## Quick start
 
 ```rust
-use cache2::{CacheBuilder, ErrorKind, Result};
+use cache2::{Cache, CacheConfig, ErrorKind, Result, RuntimeOptions, StorageOptions};
 
 async fn run() -> Result<()> {
-    let cache = CacheBuilder::new("/var/tmp/cache2.data", 1024 * 1024 * 1024)
-        .open()
-        .await?;
+    let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
+    let config = CacheConfig::new(storage, RuntimeOptions::default())?;
+    let cache = Cache::open("/var/tmp/cache2.data", config).await?;
 
     match cache.put(b"chunk:42", b"cached bytes") {
         Ok(_) => {}
@@ -36,7 +36,7 @@ async fn run() -> Result<()> {
 ```
 
 `open` uses the current Tokio runtime. Use
-`CacheBuilder::with_tokio_handle` to bind C² to another runtime; it must have
+`Cache::open_with_handle(path, config, handle)` to bind C² to another runtime; it must have
 time enabled and outlive the cache.
 
 ## Semantics
@@ -78,46 +78,53 @@ public operations.
 
 ## Configuration
 
-`StaticConfig` defines the persistent L2 layout. `RuntimeConfig` selects the
-process-local topology for each open.
+`StorageOptions` and `RuntimeOptions` are editable inputs. Build the storage
+options into a `StorageLayout`, then combine it with runtime options using
+`CacheConfig::new`. The resulting configuration is immutable and ready for
+`Cache::open(path, config)`.
+
+Construction requires neither file access nor Tokio. Inspect
+`config.storage().peak_disk_bytes()` and `config.minimum_memory_bytes()` before
+opening; both queries reuse computed values. Clone a configuration to reuse it
+across paths or successive opens. File locks, device support, recovery, and
+actual allocations are checked when opening each instance.
 
 ### Persistent layout
 
-- `StaticConfig::new(capacity_bytes)` uses 32 MiB Regions and assumes 16 KiB
-  average live entries when sizing the fixed index.
-- `with_region_size_bytes` changes Region geometry.
-- `with_expected_entries` sizes the index for the expected simultaneously live
-  key count.
-- `peak_disk_bytes` reports the maximum cache-owned logical disk space.
+`StorageOptions::new(capacity_bytes)` selects the total Region capacity,
+excluding headers, state, and recovery images. Its public fields allow explicit
+`region_size_bytes` and `expected_entries` values. Defaults are 32 MiB Regions
+and an index sized for 16 KiB average live entries. Build candidate layouts and
+compare `StorageLayout::peak_disk_bytes()` with the disk budget before choosing
+runtime tuning. Changing the persistent layout starts with an empty cache.
 
-Changing the persistent layout starts with an empty cache. Open validates the
-complete geometry and memory plan before creating cache files.
+See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for
+examples, budget accounting, error boundaries, and migration from the builder API.
 
 ### Runtime tuning
 
 | Area      | Controls                                                                              | Default and behavior                                                                        |
 |-----------|---------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
-| L1        | `with_l1_capacity_bytes`, `with_l1_shards`, `with_l1_eviction_policy`                 | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| I/O pools | `with_io_engine(IoEngine::Posix(PosixIoConfig))` or `IoEngine::IoUring(IoUringConfig)` | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
-| Read wait | `with_read_io_wait_capacity`, `with_read_io_wait_timeout`                             | Immediate admission; wait capacity defaults to aggregate read capacity.                    |
-| Writes    | `with_append_shards`, `with_write_flush_threshold_bytes`                              | Four append shards and a 4 MiB flush threshold.                                             |
-| Memory    | `with_managed_memory_limit_bytes`                                                     | 1 GiB across cache-managed allocations.                                                     |
-| I/O mode  | `with_io_mode`                                                                          | Buffered I/O.                                                                               |
-| Metrics   | `with_statistics`                                                                       | Health and resource gauges enabled; cumulative activity counters opt in.                    |
+| L1        | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                 | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
+| I/O pools | `io_engine: IoEngine::Posix(...)` or `IoEngine::IoUring(...)` | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
+| Read wait | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }`                             | Immediate admission; wait capacity defaults to aggregate read capacity.                    |
+| Writes    | `append_shards`, `write_flush_threshold_bytes`                              | Four append shards and a 4 MiB flush threshold.                                             |
+| Memory    | `managed_memory_limit_bytes`                                                     | 1 GiB across cache-managed allocations.                                                     |
+| I/O mode  | `io_mode`                                                                          | Buffered I/O.                                                                               |
+| Metrics   | `statistics`                                                                       | Health and resource gauges enabled; cumulative activity counters opt in.                    |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm
 open. Growth uses available Free Regions; when there are not enough, the
 disposable cache safely starts empty.
 
-The default read-wait timeout is zero, so read-engine or buffer pressure returns
-a miss. A positive timeout enables a queue bounded by the configured wait
-capacity. Queued requests retain their read plan and allocate a buffer after
+The default `ReadAdmission::Immediate` returns a miss under read-engine or
+buffer pressure. `ReadAdmission::Wait` enables a queue bounded by `max_waiters`
+and a positive `timeout`. Queued requests retain their read plan and allocate a buffer after
 admission. Queue saturation, memory pressure, and timeout return explicit
 overload.
 
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux
-mode. io_uring requires the `io-uring` feature and remains experimental in
-0.2; its ring count and aggregate in-flight limit are independent. SQPOLL and
+mode. io_uring requires the `io-uring` feature and remains experimental; its ring count and aggregate in-flight limit are independent. SQPOLL and
 IOPOLL are explicit per-pool opt-ins: SQPOLL adds kernel submission polling
 with configurable idle time and optional CPU affinity, while IOPOLL adds
 completion polling and requires direct I/O on polling-capable storage.
@@ -149,7 +156,7 @@ starts across releases and monitor `Cache::startup_mode()`.
 ### Metrics
 
 `Cache::snapshot()` provides lock-free health and resource gauges.
-`RuntimeConfig::with_statistics(true)` adds cumulative cache and I/O counters.
+`RuntimeOptions { statistics: true, .. }` adds cumulative cache and I/O counters.
 `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and
 Region metadata for periodic diagnostics.
 

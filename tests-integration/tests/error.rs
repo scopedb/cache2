@@ -14,31 +14,23 @@
 
 use std::error::Error as _;
 
-use cache2::{ErrorKind, ErrorOperation, StaticConfig};
+use cache2::{ErrorKind, ErrorOperation, StorageOptions};
 
 #[test]
-fn static_validation_errors_expose_structured_context() {
-    let error = StaticConfig::new(1).validate().unwrap_err();
+fn storage_construction_errors_expose_structured_context() {
+    let error = StorageOptions::new(1).build().unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    assert_eq!(error.operation(), ErrorOperation::ValidateConfig);
+    assert_eq!(error.operation(), ErrorOperation::BuildStorage);
     assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.raw_os_error().is_none());
     assert!(error.source().is_some());
-    assert!(error.to_string().contains("validate_config"));
-}
-
-#[test]
-fn disk_estimation_has_its_own_operation_context() {
-    let error = StaticConfig::new(1).peak_disk_bytes().unwrap_err();
-
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    assert_eq!(error.operation(), ErrorOperation::PeakDiskBytes);
+    assert!(error.to_string().contains("build_storage"));
 }
 
 #[test]
 fn default_io_conversion_preserves_the_original_error() {
-    let error = StaticConfig::new(1).validate().unwrap_err();
+    let error = StorageOptions::new(1).build().unwrap_err();
     let message = error.as_io_error().to_string();
     let error = std::io::Error::from(error);
 
@@ -54,8 +46,8 @@ fn default_io_conversion_preserves_the_original_error() {
 
 #[test]
 fn contextual_io_conversion_keeps_structured_source() {
-    let error = StaticConfig::new(1)
-        .validate()
+    let error = StorageOptions::new(1)
+        .build()
         .unwrap_err()
         .into_io_error_with_context();
 
@@ -64,5 +56,5 @@ fn contextual_io_conversion_keeps_structured_source() {
         .get_ref()
         .and_then(|source| source.downcast_ref::<cache2::Error>())
         .expect("structured error remains in the source chain");
-    assert_eq!(source.operation(), ErrorOperation::ValidateConfig);
+    assert_eq!(source.operation(), ErrorOperation::BuildStorage);
 }

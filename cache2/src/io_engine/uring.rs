@@ -77,7 +77,7 @@ impl UringIoEngine {
     pub(crate) fn new_with_files(
         files: RuntimeFileSet,
         max_in_flight: usize,
-        config: crate::runtime_config::IoUringPoolConfig,
+        config: crate::config::IoUringPoolConfig,
         statistics_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {

@@ -65,9 +65,11 @@ const IMAGE_STATE_REJECTED: u8 = 1;
 
 const _: () = assert!(WARM_IMAGE_WRITE_BATCH_BYTES.is_multiple_of(INDEX_IMAGE_PAGE_SIZE));
 
-/// Validates one complete cache-index capacity without allocating its mapping
-/// or slot storage.
-pub(crate) fn validate_index_slot_count(slot_count: usize) -> Result<(), IndexStorageError> {
+/// Returns the canonical directory after checking v1 recovery counter bounds.
+/// Does not allocate the index mapping or slot storage.
+pub(crate) fn validated_index_partition_ranges(
+    slot_count: usize,
+) -> Result<Box<[IndexPartitionRange]>, IndexStorageError> {
     let ranges = canonical_index_partition_ranges(slot_count)?;
     if ranges
         .iter()
@@ -77,7 +79,7 @@ pub(crate) fn validate_index_slot_count(slot_count: usize) -> Result<(), IndexSt
             "index partition exceeds the v1 recovery counter",
         ));
     }
-    Ok(())
+    Ok(ranges)
 }
 
 fn validated_index_image_layout(slot_count: usize) -> Result<ImageLayout, IndexStorageError> {
@@ -1955,16 +1957,16 @@ mod tests {
             .checked_mul(MAX_INDEX_PARTITIONS)
             .unwrap();
 
-        assert!(validate_index_slot_count(1_usize << 32).is_ok());
-        assert!(validate_index_slot_count(recoverable_slot_count).is_ok());
+        assert!(validated_index_partition_ranges(1_usize << 32).is_ok());
+        assert!(validated_index_partition_ranges(recoverable_slot_count).is_ok());
         assert!(matches!(
-            validate_index_slot_count(oversized_partition_slots),
+            validated_index_partition_ranges(oversized_partition_slots),
             Err(IndexStorageError::InvalidArgument(
                 "index partition exceeds the v1 recovery counter"
             ))
         ));
         assert!(matches!(
-            validate_index_slot_count(usize::MAX),
+            validated_index_partition_ranges(usize::MAX),
             Err(IndexStorageError::SizeOverflow)
         ));
     }

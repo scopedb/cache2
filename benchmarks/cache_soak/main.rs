@@ -23,9 +23,9 @@ use benchmarks::report::{
     AtomicLatencyHistogram, JobReport, LatencyHistogram, RunReporter, emit_cache_report,
 };
 use cache2::{
-    Cache, CacheBuilder, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
+    Cache, CacheConfig, CacheHealth, DetailedCacheSnapshot, ErrorKind as CacheErrorKind, IoEngine,
     IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy, PosixIoConfig,
-    RuntimeConfig, StartupMode, StaticConfig,
+    RuntimeOptions, StartupMode, StorageOptions,
 };
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
@@ -191,21 +191,25 @@ impl SoakConfig {
         })
     }
 
-    fn static_config(&self) -> StaticConfig {
-        StaticConfig::new(self.capacity_bytes)
-            .with_region_size_bytes(REGION_BYTES as u64)
-            .with_expected_entries(self.key_count)
+    fn storage_options(&self) -> StorageOptions {
+        StorageOptions {
+            region_size_bytes: REGION_BYTES as u64,
+            expected_entries: Some(self.key_count),
+            ..StorageOptions::new(self.capacity_bytes)
+        }
     }
 
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig::default()
-            .with_io_engine(self.io_engine)
-            .with_io_mode(self.io_mode)
-            .with_append_shards(self.append_shards)
-            .with_l1_capacity_bytes(self.memory_bytes)
-            .with_l1_eviction_policy(self.l1_eviction_policy)
-            .with_managed_memory_limit_bytes(self.managed_memory_limit_bytes)
-            .with_statistics(true)
+    fn runtime_options(&self) -> RuntimeOptions {
+        RuntimeOptions {
+            io_engine: self.io_engine,
+            io_mode: self.io_mode,
+            append_shards: self.append_shards,
+            l1_capacity_bytes: self.memory_bytes,
+            l1_eviction_policy: self.l1_eviction_policy,
+            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
+            statistics: true,
+            ..RuntimeOptions::default()
+        }
     }
 }
 
@@ -351,9 +355,10 @@ fn run_benchmark() -> io::Result<()> {
         .enable_time()
         .build()?;
     let files = SoakFiles::new(&config.directory);
-    let static_config = config.static_config();
-    let peak_disk_bytes = static_config.peak_disk_bytes()?;
-    let mut cache = open_cache(&runtime, &files, &config)?;
+    let storage = config.storage_options().build()?;
+    let peak_disk_bytes = storage.peak_disk_bytes();
+    let cache_config = CacheConfig::new(storage, config.runtime_options())?;
+    let mut cache = open_cache(&runtime, &files, &cache_config)?;
     let key_count =
         u64::try_from(config.key_count).map_err(|_| invalid("soak key count exceeds u64"))?;
     let value_size_count = u64::try_from(config.value_bytes.len())
@@ -364,7 +369,7 @@ fn run_benchmark() -> io::Result<()> {
             populate_for_warm_reopen(&cache, &config, &expected, key_count, value_size_count)?;
         runtime.block_on(cache.drain())?;
         runtime.block_on(cache.close_warm())?;
-        cache = open_cache(&runtime, &files, &config)?;
+        cache = open_cache(&runtime, &files, &cache_config)?;
         if cache.startup_mode() != StartupMode::Warm {
             return Err(io::Error::other(
                 "soak warm-reopen preparation did not recover a clean image",
@@ -551,7 +556,7 @@ fn run_benchmark() -> io::Result<()> {
     }
     if config.final_warm_verify {
         runtime.block_on(cache.close_warm())?;
-        cache = open_cache(&runtime, &files, &config)?;
+        cache = open_cache(&runtime, &files, &cache_config)?;
         if cache.startup_mode() != StartupMode::Warm {
             return Err(io::Error::other(
                 "soak final verification did not recover a clean image",
@@ -622,14 +627,9 @@ fn init_logforth() -> io::Result<()> {
 fn open_cache(
     runtime: &tokio::runtime::Runtime,
     files: &SoakFiles,
-    config: &SoakConfig,
+    config: &CacheConfig,
 ) -> io::Result<Cache> {
-    Ok(runtime.block_on(async {
-        CacheBuilder::from_static(&files.data, config.static_config())
-            .with_runtime_config(config.runtime_config())
-            .open()
-            .await
-    })?)
+    Ok(runtime.block_on(Cache::open(&files.data, config.clone()))?)
 }
 
 fn populate_for_warm_reopen(

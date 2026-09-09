@@ -22,7 +22,7 @@ use crate::checksum::Crc32c;
 use crate::index::{MAX_INDEX_PARTITIONS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
 use crate::index_storage::{
     INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE, IndexStorageError,
-    canonical_index_partition_ranges, validate_index_slot_count,
+    canonical_index_partition_ranges, validated_index_partition_ranges,
 };
 use crate::recovery::{DataSuperblock, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeader};
 use std::fmt;
@@ -572,7 +572,7 @@ fn validate_root_directory(root: RegionMetadataRoot, layout: MetadataLayout) -> 
     }
     let index_slots =
         usize::try_from(root.index_slots).map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
-    validate_index_slot_count(index_slots).map_err(index_layout_metadata_error)?;
+    validated_index_partition_ranges(index_slots).map_err(index_layout_metadata_error)?;
     let expected_index_pages = root.index_slots.div_ceil(INDEX_IMAGE_SLOTS_PER_PAGE as u64);
     if root.data_superblock_generation == 0
         || root.image_generation == 0
