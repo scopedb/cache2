@@ -36,6 +36,27 @@ use asyncband::semaphore::Semaphore;
 use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
+use super::FileRegionCore;
+use super::RegionStageValue;
+use super::RegionValueRead;
+#[cfg(test)]
+use super::index::storage::INDEX_IMAGE_PAGE_SIZE;
+#[cfg(test)]
+use super::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use super::reader::PendingRead;
+use super::reader::ReadCompletion;
+use super::reader::ReadPlan;
+use super::reader::plan_read;
+use super::record::MAX_KEY_SIZE;
+use super::record::hash_key;
+use super::record::required_record_bytes;
+#[cfg(test)]
+use super::recovery::DataGeometry;
+use super::recovery::DataSuperblock;
+#[cfg(test)]
+use super::runtime_fixed_memory_bytes;
+use super::staging::RegionStaging;
+use super::staging::StagingError;
 use crate::config::CacheConfig;
 use crate::config::IoMode;
 use crate::config::IoPoolTopology;
@@ -47,42 +68,21 @@ use crate::config::read_io_wait_capacity;
 use crate::config::read_io_wait_timeout;
 use crate::config::reserved_memory_bytes;
 use crate::config::storage_geometry;
-use crate::format::MAX_KEY_SIZE;
 use crate::hashing::route_hash;
-#[cfg(test)]
-use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
-#[cfg(test)]
-use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use crate::io_backend::RuntimeFileSet;
-use crate::io_engine::IoBuffer;
-use crate::io_engine::IoEngine;
-use crate::io_engine::IoOperation;
-use crate::io_engine::ReadSlot;
-use crate::io_engine::ReadSlotWaiter;
-use crate::io_engine::build_file_engine;
-use crate::io_engine::submit_cache_io;
+use crate::io::backend::RuntimeFileSet;
+use crate::io::engine::IoBuffer;
+use crate::io::engine::IoEngine;
+use crate::io::engine::IoOperation;
+use crate::io::engine::ReadSlot;
+use crate::io::engine::ReadSlotWaiter;
+use crate::io::engine::build_file_engine;
+use crate::io::engine::submit_cache_io;
 use crate::memory::MemoryLookup;
 #[cfg(test)]
 use crate::memory::MemoryMetricsSnapshot;
 use crate::memory::MemoryReadToken;
 use crate::memory::MemoryStore;
 use crate::memory::MemoryValue;
-use crate::record_codec::hash_key;
-use crate::record_codec::required_record_bytes;
-#[cfg(test)]
-use crate::recovery::DataGeometry;
-use crate::recovery::DataSuperblock;
-use crate::region::FileRegionCore;
-use crate::region::RegionStageValue;
-use crate::region::RegionValueRead;
-#[cfg(test)]
-use crate::region::runtime_fixed_memory_bytes;
-use crate::region_reader::PendingRead;
-use crate::region_reader::ReadCompletion;
-use crate::region_reader::ReadPlan;
-use crate::region_reader::plan_read;
-use crate::region_staging::RegionStaging;
-use crate::region_staging::StagingError;
 use crate::resources::BufferLease;
 use crate::resources::CACHE_THREAD_STACK_BYTES;
 #[cfg(test)]
@@ -2153,9 +2153,9 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::io_backend::FileBackend;
-    use crate::io_backend::IoBackend;
-    use crate::io_engine::BackendIoEngine;
+    use crate::io::backend::FileBackend;
+    use crate::io::backend::IoBackend;
+    use crate::io::engine::BackendIoEngine;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2452,13 +2452,13 @@ mod tests {
     fn completion_timeouts_follow_read_wait_mode() {
         use crate::config::IoEngine;
         use crate::config::PosixIoConfig;
-        use crate::index::IndexEntry;
-        use crate::index::PackedLocation;
-        use crate::recovery::DATA_REGION_AREA_OFFSET;
-        use crate::recovery::PersistentId;
         use crate::region::FileRegionBackend;
         use crate::region::RegionFiles;
-        use crate::region_store::RegionStore;
+        use crate::region::index::IndexEntry;
+        use crate::region::index::PackedLocation;
+        use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+        use crate::region::recovery::PersistentId;
+        use crate::region::store::RegionStore;
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -2552,17 +2552,17 @@ mod tests {
             region_size: 512 * 1024,
             region_count: 10,
         };
-        let value_len = geometry.region_size as usize - crate::format::RECORD_HEADER_SIZE;
+        let value_len = geometry.region_size as usize - crate::region::record::RECORD_HEADER_SIZE;
         let record_len = required_record_bytes(0, value_len).unwrap();
         assert_eq!(u64::from(record_len), geometry.region_size);
-        let entry = crate::index::IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, record_len).unwrap(),
+        let entry = crate::region::index::IndexEntry {
+            location: crate::region::index::PackedLocation::new(0, 0, record_len).unwrap(),
         };
         assert_eq!(
             plan_read(
                 geometry,
                 1,
-                crate::region_reader::ReadCandidate {
+                crate::region::reader::ReadCandidate {
                     entry,
                     region_generation: 1,
                 },

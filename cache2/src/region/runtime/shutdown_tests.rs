@@ -15,17 +15,17 @@
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use crate::io_backend::IoBackend;
-use crate::io_backend::SyncMode;
-use crate::io_backend::SyncPoint;
-use crate::io_backend::WritePoint;
-use crate::io_engine::BackendIoEngine;
-use crate::io_engine::CompletionState;
-use crate::io_engine::EngineIoSnapshot;
-use crate::io_engine::IoRequest;
-use crate::io_engine::ReadSlotWaiter;
-use crate::io_engine::RequestId;
-use crate::io_engine::SubmitError;
+use crate::io::backend::IoBackend;
+use crate::io::backend::SyncMode;
+use crate::io::backend::SyncPoint;
+use crate::io::backend::WritePoint;
+use crate::io::engine::BackendIoEngine;
+use crate::io::engine::CompletionState;
+use crate::io::engine::EngineIoSnapshot;
+use crate::io::engine::IoRequest;
+use crate::io::engine::ReadSlotWaiter;
+use crate::io::engine::RequestId;
+use crate::io::engine::SubmitError;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -203,10 +203,10 @@ fn submitted_read_must_not_pin_close() {
 
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::config::PosixIoConfig;
-    use crate::recovery::PersistentId;
     use crate::region::FileRegionBackend;
     use crate::region::RegionFiles;
-    use crate::region_store::RegionStore;
+    use crate::region::recovery::PersistentId;
+    use crate::region::store::RegionStore;
     let root = std::env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
         std::process::id()

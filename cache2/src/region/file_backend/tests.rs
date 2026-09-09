@@ -27,28 +27,28 @@ use std::time::Instant;
 
 use super::*;
 use crate::config::ReadAdmission;
-use crate::index::IndexEntry;
-use crate::index::PackedLocation;
-use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use crate::index_storage::IndexSlot;
-use crate::io_backend::testing::FaultAction;
-use crate::io_backend::testing::FaultBackend;
-use crate::io_backend::testing::FaultEvent;
-use crate::io_backend::testing::FaultHandle;
-use crate::io_engine::BackendIoEngine;
-use crate::io_engine::IoEngine;
-use crate::record_codec::hash_key;
-use crate::record_codec::required_record_bytes;
-use crate::recovery::DATA_REGION_AREA_OFFSET;
-use crate::recovery::DataGeometry;
-use crate::recovery::PersistentId;
+use crate::io::backend::testing::FaultAction;
+use crate::io::backend::testing::FaultBackend;
+use crate::io::backend::testing::FaultEvent;
+use crate::io::backend::testing::FaultHandle;
+use crate::io::engine::BackendIoEngine;
+use crate::io::engine::IoEngine;
 use crate::region::RegionStageValue;
-use crate::region_reader::ReadCandidate;
-use crate::region_reader::ReadCompletion;
-use crate::region_reader::ReadPlan;
-use crate::region_reader::plan_read;
-use crate::region_staging::RegionStaging;
-use crate::region_staging::StagedRecord;
+use crate::region::index::IndexEntry;
+use crate::region::index::PackedLocation;
+use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::storage::IndexSlot;
+use crate::region::reader::ReadCandidate;
+use crate::region::reader::ReadCompletion;
+use crate::region::reader::ReadPlan;
+use crate::region::reader::plan_read;
+use crate::region::record::hash_key;
+use crate::region::record::required_record_bytes;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::PersistentId;
+use crate::region::staging::RegionStaging;
+use crate::region::staging::StagedRecord;
 use crate::resources::ResourceController;
 use crate::resources::ResourceLimits;
 use crate::snapshot::StartupMode;
@@ -125,7 +125,7 @@ fn state_page_reads_stop_after_the_interrupted_retry_budget() {
             .iter()
             .filter(|event| **event == FaultEvent::Read)
             .count(),
-        crate::io_backend::MAX_INTERRUPTED_RETRIES + 1
+        crate::io::backend::MAX_INTERRUPTED_RETRIES + 1
     );
 }
 
@@ -335,7 +335,7 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
         "open" => {
             let _store =
                 RegionStore::open(4096, FileRegionBackend::for_test(files, data, 4096)).unwrap();
-            crate::io_backend::testing::kill_process();
+            crate::io::backend::testing::kill_process();
         }
         "write" | "drain" => {
             let store =
@@ -344,7 +344,7 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
             if case == "drain" {
                 store.drain().unwrap();
             }
-            crate::io_backend::testing::kill_process();
+            crate::io::backend::testing::kill_process();
         }
         "warm-data" | "warm-image" | "clean-state" => {
             let (file_system, faults, _) = FaultRegionFileSystem::new();
@@ -833,7 +833,7 @@ fn completed_record_publication_does_not_enter_region_manager() {
     let record = StagedRecord::new(
         7,
         IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
+            location: crate::region::index::PackedLocation::new(0, 0, 64).unwrap(),
         },
         1,
     );
@@ -1114,7 +1114,7 @@ fn same_hash_candidate_requires_full_key() {
     let wrong_length_location = PackedLocation::new(
         current.entry.location.region_id(),
         current.entry.location.offset(),
-        current.entry.location.record_len() + crate::format::RECORD_ALIGNMENT,
+        current.entry.location.record_len() + crate::region::record::RECORD_ALIGNMENT,
     )
     .unwrap();
     let wrong_length = ReadCandidate {
@@ -1430,11 +1430,11 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
     let directory = TestDirectory::new();
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
-    let value = IndexSlot::from_state(crate::index_storage::IndexSlotState::Value {
+    let value = IndexSlot::from_state(crate::region::index::storage::IndexSlotState::Value {
         fingerprint: 7,
         displacement: 0,
         entry: IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
+            location: crate::region::index::PackedLocation::new(0, 0, 32).unwrap(),
         },
     });
 

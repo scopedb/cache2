@@ -20,19 +20,19 @@
 
 use std::fmt;
 
+use super::DataSuperblock;
+use super::PersistentId;
+use super::RECOVERY_PAGE_SIZE;
+use super::RecoveryImageHeader;
 use crate::checksum::Crc32c;
-use crate::index::MAX_INDEX_PARTITIONS;
-use crate::index::MAX_PACKED_REGION_COUNT;
-use crate::index::MAX_PACKED_REGION_SIZE;
-use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
-use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use crate::index_storage::IndexStorageError;
-use crate::index_storage::canonical_index_partition_ranges;
-use crate::index_storage::validated_index_partition_ranges;
-use crate::recovery::DataSuperblock;
-use crate::recovery::PersistentId;
-use crate::recovery::RECOVERY_PAGE_SIZE;
-use crate::recovery::RecoveryImageHeader;
+use crate::region::index::MAX_INDEX_PARTITIONS;
+use crate::region::index::MAX_PACKED_REGION_COUNT;
+use crate::region::index::MAX_PACKED_REGION_SIZE;
+use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::storage::IndexStorageError;
+use crate::region::index::storage::canonical_index_partition_ranges;
+use crate::region::index::storage::validated_index_partition_ranges;
 
 pub const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
@@ -1355,7 +1355,7 @@ mod tests {
         let encoded = expected.encode().unwrap();
         let golden = assert_golden(
             &encoded,
-            include_str!("fixtures/format_v1/region_metadata.golden"),
+            include_str!("../../fixtures/format_v1/region_metadata.golden"),
         );
         assert_eq!(RegionMetadata::decode(&golden).unwrap(), expected);
     }

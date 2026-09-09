@@ -20,19 +20,19 @@ use std::fmt;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-use crate::format::RECORD_ALIGNMENT;
-use crate::format::RECORD_HEADER_SIZE;
-use crate::format::RecordHeader;
-use crate::index::IndexEntry;
-use crate::index::MAX_RECORD_LEN;
-use crate::index::PackedLocation;
-use crate::io_backend::DIRECT_IO_ALIGNMENT;
-use crate::io_engine::IoBuffer;
-use crate::recovery::DATA_REGION_AREA_OFFSET;
-use crate::recovery::RECOVERY_PAGE_SIZE;
-use crate::region_manager::RegionAppendReservation;
-use crate::region_manager::RegionPaddingReceipt;
-use crate::region_manager::RegionWriteSpan;
+use super::index::IndexEntry;
+use super::index::MAX_RECORD_LEN;
+use super::index::PackedLocation;
+use super::manager::RegionAppendReservation;
+use super::manager::RegionPaddingReceipt;
+use super::manager::RegionWriteSpan;
+use super::record::RECORD_ALIGNMENT;
+use super::record::RECORD_HEADER_SIZE;
+use super::record::RecordHeader;
+use super::recovery::DATA_REGION_AREA_OFFSET;
+use super::recovery::RECOVERY_PAGE_SIZE;
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::engine::IoBuffer;
 use crate::resources::BUFFER_ALIGNMENT;
 use crate::resources::BufferLease;
 use crate::resources::ResourceBuildError;
@@ -904,7 +904,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::index::PackedLocation;
+    use crate::region::index::PackedLocation;
     use crate::resources::ResourceLimits;
 
     fn resources(memory_limit_bytes: usize) -> ResourceController {

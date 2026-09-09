@@ -50,6 +50,8 @@ cargo test --workspace --release --all-features
 
 ## Rust Style
 
+Use `module/mod.rs` for modules with child files; keep leaf modules in a single `.rs` file.
+
 Declare restricted visibility at the module boundary and use `pub` for items in that module's API.
 
 ## Documentation

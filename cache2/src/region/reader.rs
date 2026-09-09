@@ -23,20 +23,20 @@
 use std::io;
 use std::ops::Range;
 
-use crate::format::RECORD_ALIGNMENT;
-use crate::index::IndexEntry;
-use crate::io_engine::BoundedIoRequest;
-use crate::io_engine::IoBuffer;
-use crate::io_engine::IoCompletion;
-use crate::io_engine::IoDeadlineExceeded;
-use crate::io_engine::IoEngine;
-use crate::io_engine::IoOperation;
-use crate::io_engine::OperationKind;
-use crate::io_engine::ReadSlot;
-use crate::io_engine::RequestId;
-use crate::io_engine::submit_cache_read;
-use crate::recovery::DATA_REGION_AREA_OFFSET;
-use crate::recovery::DataGeometry;
+use super::index::IndexEntry;
+use super::record::RECORD_ALIGNMENT;
+use super::recovery::DATA_REGION_AREA_OFFSET;
+use super::recovery::DataGeometry;
+use crate::io::engine::BoundedIoRequest;
+use crate::io::engine::IoBuffer;
+use crate::io::engine::IoCompletion;
+use crate::io::engine::IoDeadlineExceeded;
+use crate::io::engine::IoEngine;
+use crate::io::engine::IoOperation;
+use crate::io::engine::OperationKind;
+use crate::io::engine::ReadSlot;
+use crate::io::engine::RequestId;
+use crate::io::engine::submit_cache_read;
 use crate::resources::BufferLease;
 
 const _READ_ALIGNMENT: usize = 4096;
@@ -319,12 +319,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::index::PackedLocation;
-    use crate::io_backend::IoBackend;
-    use crate::io_backend::SyncMode;
-    use crate::io_backend::SyncPoint;
-    use crate::io_backend::WritePoint;
-    use crate::io_engine::BackendIoEngine;
+    use crate::io::backend::IoBackend;
+    use crate::io::backend::SyncMode;
+    use crate::io::backend::SyncPoint;
+    use crate::io::backend::WritePoint;
+    use crate::io::engine::BackendIoEngine;
+    use crate::region::index::PackedLocation;
     use crate::resources::ResourceController;
     use crate::resources::ResourceLimits;
 
@@ -380,7 +380,7 @@ mod tests {
         }
     }
 
-    fn entry(location: crate::index::PackedLocation) -> IndexEntry {
+    fn entry(location: crate::region::index::PackedLocation) -> IndexEntry {
         IndexEntry { location }
     }
 

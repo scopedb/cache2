@@ -20,14 +20,25 @@
 //! `CLEAN`. This module performs no I/O; callers must write the returned page
 //! to the selected slot and provide the required `fdatasync` barrier.
 
+use super::index::MAX_PACKED_REGION_COUNT;
+use super::index::MAX_PACKED_REGION_SIZE;
+use super::index::storage::INDEX_IMAGE_PAGE_SIZE;
+use super::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use super::record::RECORD_ALIGNMENT;
+use super::record::RECORD_FORMAT_VERSION;
 use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
-use crate::format::RECORD_ALIGNMENT;
-use crate::format::RECORD_FORMAT_VERSION;
-use crate::index::MAX_PACKED_REGION_COUNT;
-use crate::index::MAX_PACKED_REGION_SIZE;
-use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
-use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+
+mod metadata;
+pub use self::metadata::PartitionMetadataRecord;
+pub use self::metadata::REGION_METADATA_PAGE_SIZE;
+pub use self::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+pub use self::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+pub use self::metadata::RegionMetadata;
+pub use self::metadata::RegionMetadataError;
+pub use self::metadata::RegionMetadataRecord;
+pub use self::metadata::RegionMetadataRoot;
+pub use self::metadata::RegionMetadataState;
 
 const RECOVERY_FORMAT_VERSION: u16 = 1;
 pub const RECOVERY_PAGE_SIZE: usize = 4 * 1024;
@@ -1009,7 +1020,7 @@ mod tests {
         let data = data_superblock();
         let data_golden = assert_golden(
             &data.encode().unwrap(),
-            include_str!("fixtures/format_v1/data_superblock.golden"),
+            include_str!("../../fixtures/format_v1/data_superblock.golden"),
         );
         assert_eq!(
             DataSuperblock::probe(&data_golden),
@@ -1022,7 +1033,7 @@ mod tests {
         let clean = record(19, RecoveryState::Clean);
         let clean_golden = assert_golden(
             &clean.encode().unwrap(),
-            include_str!("fixtures/format_v1/clean_state.golden"),
+            include_str!("../../fixtures/format_v1/clean_state.golden"),
         );
         assert_eq!(StateRecord::decode(&clean_golden), Some(clean));
     }
@@ -1033,7 +1044,7 @@ mod tests {
         let header = image_header();
         let image_golden = assert_golden(
             &header.encode().unwrap(),
-            include_str!("fixtures/format_v1/recovery_image_header.golden"),
+            include_str!("../../fixtures/format_v1/recovery_image_header.golden"),
         );
         assert_eq!(
             RecoveryImageHeader::probe(&image_golden),

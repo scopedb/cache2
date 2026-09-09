@@ -21,18 +21,18 @@
 use std::fmt;
 use std::io;
 
-use crate::io_backend::DIRECT_IO_ALIGNMENT;
-use crate::io_backend::WritePoint;
-use crate::io_engine::BoundedIoRequest;
-use crate::io_engine::IoBuffer;
-use crate::io_engine::IoEngine;
-use crate::io_engine::IoOperation;
-use crate::io_engine::OperationKind;
-use crate::io_engine::RequestId;
-use crate::io_engine::submit_cache_io;
-use crate::recovery::DATA_REGION_AREA_OFFSET;
-use crate::recovery::DataGeometry;
-use crate::region_manager::RegionWriteSpan;
+use super::manager::RegionWriteSpan;
+use super::recovery::DATA_REGION_AREA_OFFSET;
+use super::recovery::DataGeometry;
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::backend::WritePoint;
+use crate::io::engine::BoundedIoRequest;
+use crate::io::engine::IoBuffer;
+use crate::io::engine::IoEngine;
+use crate::io::engine::IoOperation;
+use crate::io::engine::OperationKind;
+use crate::io::engine::RequestId;
+use crate::io::engine::submit_cache_io;
 
 pub struct RegionSpanSubmitError {
     pub error: io::Error,
@@ -242,10 +242,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::io_backend::IoBackend;
-    use crate::io_backend::SyncMode;
-    use crate::io_backend::SyncPoint;
-    use crate::io_engine::BackendIoEngine;
+    use crate::io::backend::IoBackend;
+    use crate::io::backend::SyncMode;
+    use crate::io::backend::SyncPoint;
+    use crate::io::engine::BackendIoEngine;
     use crate::resources::BufferLease;
 
     #[derive(Default)]

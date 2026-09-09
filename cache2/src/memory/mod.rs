@@ -28,15 +28,17 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use self::eviction::DetachedPolicy;
+use self::eviction::EvictionState;
+use self::eviction::MAX_POLICY_SCAN_STEPS;
+use self::eviction::MAX_POLICY_SLOT_INDEX;
+use self::eviction::PolicySlot;
 use crate::config::L1EvictionPolicy;
-use crate::eviction::DetachedPolicy;
-use crate::eviction::EvictionState;
-use crate::eviction::MAX_POLICY_SCAN_STEPS;
-use crate::eviction::MAX_POLICY_SLOT_INDEX;
-use crate::eviction::PolicySlot;
 use crate::hashing::FixedPrehashedMap;
 use crate::hashing::route_hash;
 use crate::snapshot::CacheL1Snapshot;
+
+mod eviction;
 
 /// Charged retained-value ownership. Fixed entry, policy, and directory
 /// storage is planned and allocated separately during open.

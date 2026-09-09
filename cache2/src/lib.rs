@@ -61,25 +61,10 @@ pub use self::snapshot::RegionSnapshot;
 pub use self::snapshot::StartupMode;
 
 mod checksum;
-mod eviction;
-mod format;
 mod hashing;
-mod index;
-mod index_storage;
-mod io_backend;
-mod io_engine;
+mod io;
 mod memory;
-mod record_codec;
-mod recovery;
 mod region;
-mod region_appender;
-mod region_index;
-mod region_manager;
-mod region_metadata;
-mod region_reader;
-mod region_runtime;
-mod region_staging;
-mod region_store;
 mod resources;
 
 #[cfg(test)]

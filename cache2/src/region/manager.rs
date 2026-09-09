@@ -21,15 +21,15 @@
 
 use std::collections::VecDeque;
 
-use crate::format::RECORD_ALIGNMENT;
-use crate::io_backend::DIRECT_IO_ALIGNMENT;
-use crate::recovery::PersistentId;
-use crate::region_metadata::PartitionMetadataRecord;
-use crate::region_metadata::RegionMetadata;
-use crate::region_metadata::RegionMetadataError;
-use crate::region_metadata::RegionMetadataRecord;
-use crate::region_metadata::RegionMetadataRoot;
-use crate::region_metadata::RegionMetadataState;
+use super::record::RECORD_ALIGNMENT;
+use super::recovery::PartitionMetadataRecord;
+use super::recovery::PersistentId;
+use super::recovery::RegionMetadata;
+use super::recovery::RegionMetadataError;
+use super::recovery::RegionMetadataRecord;
+use super::recovery::RegionMetadataRoot;
+use super::recovery::RegionMetadataState;
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::snapshot::RegionSnapshot;
 
 const UNASSIGNED_REGION: u32 = u32::MAX;
@@ -1280,8 +1280,8 @@ fn try_unassigned_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-    use crate::index_storage::canonical_index_partition_ranges;
+    use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+    use crate::region::index::storage::canonical_index_partition_ranges;
 
     fn id(byte: u8) -> PersistentId {
         PersistentId::from_bytes([byte; 16]).unwrap()

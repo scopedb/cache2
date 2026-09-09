@@ -23,16 +23,16 @@ use std::fmt;
 
 use hashcrew::xxhash::xxh3_64_with_seed;
 
+use super::MAX_KEY_SIZE;
+use super::RECORD_ALIGNMENT;
+use super::RECORD_HEADER_SIZE;
+use super::RecordHeader;
 use crate::checksum::Crc32c;
-use crate::format::MAX_KEY_SIZE;
-use crate::format::RECORD_ALIGNMENT;
-use crate::format::RECORD_HEADER_SIZE;
-use crate::format::RecordHeader;
-use crate::index::IndexEntry;
-use crate::index::MAX_RECORD_LEN;
-use crate::index::PackedLocation;
-use crate::index::PackedLocationError;
-use crate::region_manager::RegionAppendReservation;
+use crate::region::index::IndexEntry;
+use crate::region::index::MAX_RECORD_LEN;
+use crate::region::index::PackedLocation;
+use crate::region::index::PackedLocationError;
+use crate::region::manager::RegionAppendReservation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordEncodeError {
@@ -301,7 +301,7 @@ mod tests {
             required_record_bytes(key_len, value_len).unwrap() as usize,
             expected
         );
-        assert!(!expected.is_multiple_of(crate::io_backend::DIRECT_IO_ALIGNMENT));
+        assert!(!expected.is_multiple_of(crate::io::backend::DIRECT_IO_ALIGNMENT));
     }
 
     #[test]

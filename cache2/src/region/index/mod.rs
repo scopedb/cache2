@@ -28,15 +28,30 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use self::storage::IndexPartitionWriteGuard;
+use self::storage::IndexSlotState;
+use self::storage::IndexStorageError;
+use self::storage::PartitionedIndexStorage;
 use crate::hashing::route_hash;
-use crate::index::INDEX_CANDIDATES;
-use crate::index::IndexEntry;
-use crate::index::PackedLocation;
-use crate::index_storage::IndexPartitionWriteGuard;
-use crate::index_storage::IndexSlotState;
-use crate::index_storage::IndexStorageError;
-use crate::index_storage::PartitionedIndexStorage;
 use crate::snapshot::CacheIndexSnapshot;
+
+mod packed;
+pub use self::packed::INDEX_CANDIDATES;
+pub use self::packed::IndexEntry;
+pub use self::packed::MAX_INDEX_PARTITIONS;
+#[cfg(feature = "benchmarking")]
+pub use self::packed::MAX_INDEX_PROBES;
+pub use self::packed::MAX_PACKED_REGION_COUNT;
+pub use self::packed::MAX_PACKED_REGION_SIZE;
+pub use self::packed::MAX_RECORD_LEN;
+#[cfg(feature = "benchmarking")]
+pub use self::packed::MAX_REGION_OFFSET;
+pub use self::packed::PackedLocation;
+pub use self::packed::PackedLocationError;
+pub use self::packed::index_partition_for;
+pub use self::packed::record_size_class_upper_bound;
+
+pub mod storage;
 
 const CANDIDATE_OFFSETS: [usize; INDEX_CANDIDATES] = [0, 23, 61, 97];
 const FINGERPRINT_MASK: u16 = (1 << 14) - 1;
@@ -692,8 +707,8 @@ fn candidate_offset(displacement: usize, slot_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_storage::IndexPhysicalStats;
-    use crate::record_codec::hash_key;
+    use crate::region::index::storage::IndexPhysicalStats;
+    use crate::region::record::hash_key;
 
     fn entry(region_id: u32, offset: u32) -> IndexEntry {
         IndexEntry {

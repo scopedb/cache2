@@ -14,7 +14,7 @@
 
 //! Configuration construction, independent of file paths and runtime handles.
 
-use crate::recovery::DataGeometry;
+use crate::region::recovery::DataGeometry;
 
 mod runtime;
 pub use self::runtime::IoEngine;

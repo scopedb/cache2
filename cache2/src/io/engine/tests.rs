@@ -19,9 +19,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use super::*;
-use crate::io_backend::FileBackend;
-use crate::io_backend::SyncMode;
-use crate::io_backend::SyncPoint;
+use crate::io::backend::FileBackend;
+use crate::io::backend::SyncMode;
+use crate::io::backend::SyncPoint;
 use crate::resources::ResourceController;
 use crate::resources::ResourceLimits;
 use crate::resources::aligned_buffer_capacity;

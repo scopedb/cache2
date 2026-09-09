@@ -44,13 +44,13 @@ use self::page_format::put_u32;
 use self::page_format::put_u64;
 use self::page_format::read_u64;
 use self::page_format::validate_page_header;
-use crate::index::INDEX_CANDIDATES;
-use crate::index::IndexEntry;
-use crate::index::MAX_INDEX_PARTITIONS;
-use crate::index::PackedLocation;
-use crate::index::PackedLocationError;
-use crate::index::index_partition_for;
-use crate::index::record_size_class_upper_bound;
+use super::INDEX_CANDIDATES;
+use super::IndexEntry;
+use super::MAX_INDEX_PARTITIONS;
+use super::PackedLocation;
+use super::PackedLocationError;
+use super::index_partition_for;
+use super::record_size_class_upper_bound;
 
 mod page_format;
 pub use self::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
@@ -278,7 +278,8 @@ impl IndexSlot {
                 entry,
             } => {
                 let location = entry.location;
-                let offset_units = u64::from(location.offset() / crate::format::RECORD_ALIGNMENT);
+                let offset_units =
+                    u64::from(location.offset() / crate::region::record::RECORD_ALIGNMENT);
                 Self {
                     encoded: u64::from(location.region_id())
                         | (offset_units << SLOT_OFFSET_SHIFT)
@@ -311,7 +312,7 @@ impl IndexSlot {
             .ok_or(IndexSlotSemanticError::NonCanonicalMarker)?;
         let region_id = ((self.encoded >> SLOT_REGION_SHIFT) & SLOT_REGION_MASK) as u32;
         let offset_units = ((self.encoded >> SLOT_OFFSET_SHIFT) & SLOT_OFFSET_MASK) as u32;
-        let offset = offset_units * crate::format::RECORD_ALIGNMENT;
+        let offset = offset_units * crate::region::record::RECORD_ALIGNMENT;
         let location = PackedLocation::new(region_id, offset, record_len)
             .map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
@@ -1882,7 +1883,7 @@ mod tests {
     fn sample_slot(seed: u64) -> IndexSlot {
         let location = PackedLocation::new(
             (seed % 64) as u32,
-            ((seed % 128) * u64::from(crate::format::RECORD_ALIGNMENT)) as u32,
+            ((seed % 128) * u64::from(crate::region::record::RECORD_ALIGNMENT)) as u32,
             32,
         )
         .unwrap();
@@ -2288,7 +2289,7 @@ mod tests {
             .unwrap();
         assert_golden(
             &encoded,
-            include_str!("fixtures/format_v1/index_page.golden"),
+            include_str!("../../../fixtures/format_v1/index_page.golden"),
         );
     }
 

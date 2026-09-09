@@ -24,18 +24,18 @@ use super::StorageLayout;
 use crate::error::ErrorOperation;
 use crate::error::Result;
 use crate::error::from_io;
-use crate::index::MAX_PACKED_REGION_COUNT;
-use crate::index::MAX_PACKED_REGION_SIZE;
-use crate::index_storage::IndexStorageError;
-use crate::index_storage::validated_index_partition_ranges;
-use crate::recovery::DataGeometry;
-use crate::recovery::KEY_HASH_ALGORITHM_XXH3_64;
-use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
-use crate::recovery::STATE_FILE_SIZE;
-use crate::recovery::recovery_image_index_len;
-use crate::region_metadata::REGION_METADATA_PAGE_SIZE;
-use crate::region_metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::index::MAX_PACKED_REGION_COUNT;
+use crate::region::index::MAX_PACKED_REGION_SIZE;
+use crate::region::index::storage::IndexStorageError;
+use crate::region::index::storage::validated_index_partition_ranges;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::KEY_HASH_ALGORITHM_XXH3_64;
+use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::region::recovery::REGION_METADATA_PAGE_SIZE;
+use crate::region::recovery::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region::recovery::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::STATE_FILE_SIZE;
+use crate::region::recovery::recovery_image_index_len;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
@@ -209,8 +209,8 @@ pub fn cache_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recovery::DataSuperblock;
-    use crate::recovery::PersistentId;
+    use crate::region::recovery::DataSuperblock;
+    use crate::region::recovery::PersistentId;
 
     #[test]
     fn constructed_layouts_encode_at_format_boundaries() {
