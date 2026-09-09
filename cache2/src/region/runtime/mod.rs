@@ -42,15 +42,15 @@ use asyncband::watch;
 use self::metrics::RuntimeMetrics;
 use crate::IoEngineConfig;
 use crate::config::CacheConfig;
-use crate::config::IoMode;
-use crate::config::IoPoolTopology;
-#[cfg(test)]
-use crate::config::ReadAdmission;
-use crate::config::RuntimeOptions;
 use crate::config::l1_entry_capacity;
-use crate::config::read_io_wait_capacity;
-use crate::config::read_io_wait_timeout;
 use crate::config::reserved_memory_bytes;
+use crate::config::runtime::IoMode;
+use crate::config::runtime::IoPoolTopology;
+#[cfg(test)]
+use crate::config::runtime::ReadAdmission;
+use crate::config::runtime::RuntimeOptions;
+use crate::config::runtime::read_io_wait_capacity;
+use crate::config::runtime::read_io_wait_timeout;
 use crate::config::storage_geometry;
 use crate::hashing::route_hash;
 use crate::io::backend::RuntimeFileSet;
@@ -71,13 +71,13 @@ use crate::region::FileRegionCore;
 use crate::region::RegionStageValue;
 use crate::region::RegionValueRead;
 #[cfg(test)]
-use crate::region::index::IndexEntry;
+use crate::region::index::packed::IndexEntry;
 #[cfg(test)]
-use crate::region::index::PackedLocation;
+use crate::region::index::packed::PackedLocation;
 #[cfg(test)]
-use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 #[cfg(test)]
-use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::reader::PendingRead;
 #[cfg(test)]
 use crate::region::reader::ReadCandidate;
@@ -87,8 +87,8 @@ use crate::region::reader::plan_read;
 use crate::region::record::MAX_KEY_SIZE;
 #[cfg(test)]
 use crate::region::record::RECORD_HEADER_SIZE;
-use crate::region::record::hash_key;
-use crate::region::record::required_record_bytes;
+use crate::region::record::codec::hash_key;
+use crate::region::record::codec::required_record_bytes;
 #[cfg(test)]
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::DataSuperblock;
@@ -108,8 +108,7 @@ use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 
-mod metrics;
-pub use self::metrics::ActivityMetrics;
+pub mod metrics;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const _RETRY_AGE: Duration = Duration::from_micros(50);
@@ -2464,12 +2463,12 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
-        use crate::config::IoEngineConfig;
-        use crate::config::PosixIoConfig;
-        use crate::region::FileRegionBackend;
-        use crate::region::RegionFiles;
-        use crate::region::index::IndexEntry;
-        use crate::region::index::PackedLocation;
+        use crate::config::runtime::IoEngineConfig;
+        use crate::config::runtime::PosixIoConfig;
+        use crate::region::file_backend::FileRegionBackend;
+        use crate::region::file_backend::RegionFiles;
+        use crate::region::index::packed::IndexEntry;
+        use crate::region::index::packed::PackedLocation;
         use crate::region::recovery::DATA_REGION_AREA_OFFSET;
         use crate::region::recovery::PersistentId;
         use crate::region::store::RegionStore;

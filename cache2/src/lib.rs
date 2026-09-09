@@ -34,17 +34,17 @@ pub use self::cache::Value;
 
 mod config;
 pub use self::config::CacheConfig;
-pub use self::config::IoEngineConfig;
-pub use self::config::IoMode;
-pub use self::config::IoUringConfig;
-pub use self::config::IoUringPoolConfig;
-pub use self::config::IoUringSqPollConfig;
-pub use self::config::L1EvictionPolicy;
-pub use self::config::PosixIoConfig;
-pub use self::config::ReadAdmission;
-pub use self::config::RuntimeOptions;
 pub use self::config::StorageLayout;
-pub use self::config::StorageOptions;
+pub use self::config::runtime::IoEngineConfig;
+pub use self::config::runtime::IoMode;
+pub use self::config::runtime::IoUringConfig;
+pub use self::config::runtime::IoUringPoolConfig;
+pub use self::config::runtime::IoUringSqPollConfig;
+pub use self::config::runtime::L1EvictionPolicy;
+pub use self::config::runtime::PosixIoConfig;
+pub use self::config::runtime::ReadAdmission;
+pub use self::config::runtime::RuntimeOptions;
+pub use self::config::storage::StorageOptions;
 
 mod snapshot;
 pub use self::snapshot::CacheHealth;

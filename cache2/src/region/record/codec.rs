@@ -26,10 +26,10 @@ use hashcrew::xxhash::xxh3_64_with_seed;
 use crate::checksum::Crc32c;
 #[cfg(test)]
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
-use crate::region::index::IndexEntry;
-use crate::region::index::MAX_RECORD_LEN;
-use crate::region::index::PackedLocation;
-use crate::region::index::PackedLocationError;
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::MAX_RECORD_LEN;
+use crate::region::index::packed::PackedLocation;
+use crate::region::index::packed::PackedLocationError;
 use crate::region::manager::RegionAppendReservation;
 use crate::region::record::MAX_KEY_SIZE;
 use crate::region::record::RECORD_ALIGNMENT;

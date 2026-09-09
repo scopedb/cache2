@@ -46,7 +46,7 @@ use asyncband::semaphore::Semaphore;
 
 use crate::IoEngineConfig;
 #[cfg(unix)]
-use crate::config::IoUringPoolConfig;
+use crate::config::runtime::IoUringPoolConfig;
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
@@ -93,18 +93,6 @@ mod posix;
     )
 ))]
 mod uring;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-pub use self::uring::UringIoEngine;
 
 /// Reference engine: a small fixed worker pool executes exact operations
 /// through the existing fault-injectable positioned-I/O backend.
@@ -1996,7 +1984,7 @@ pub fn build_file_engine(
                         "io_uring pool configuration is missing",
                     )
                 })?;
-                UringIoEngine::new_with_files(
+                uring::UringIoEngine::new_with_files(
                     files,
                     max_in_flight,
                     io_uring_config,

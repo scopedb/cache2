@@ -36,7 +36,7 @@ use self::eviction::EvictionState;
 use self::eviction::MAX_POLICY_SCAN_STEPS;
 use self::eviction::MAX_POLICY_SLOT_INDEX;
 use self::eviction::PolicySlot;
-use crate::config::L1EvictionPolicy;
+use crate::config::runtime::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;
 use crate::hashing::route_hash;
 use crate::snapshot::CacheL1Snapshot;

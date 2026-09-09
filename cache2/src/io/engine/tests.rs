@@ -22,7 +22,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::config::PosixIoConfig;
+use crate::config::runtime::PosixIoConfig;
 use crate::io::backend::FileBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;

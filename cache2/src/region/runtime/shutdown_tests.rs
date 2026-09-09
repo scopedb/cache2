@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 use super::*;
+use crate::IoEngineConfig;
 use crate::io::backend::IoBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
@@ -28,7 +29,6 @@ use crate::io::engine::IoRequest;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::RequestId;
 use crate::io::engine::SubmitError;
-use crate::IoEngineConfig;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -205,9 +205,9 @@ fn submitted_read_must_not_pin_close() {
 }
 
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
-    use crate::config::PosixIoConfig;
-    use crate::region::FileRegionBackend;
-    use crate::region::RegionFiles;
+    use crate::config::runtime::PosixIoConfig;
+    use crate::region::file_backend::FileRegionBackend;
+    use crate::region::file_backend::RegionFiles;
     use crate::region::recovery::PersistentId;
     use crate::region::store::RegionStore;
     let root = env::temp_dir().join(format!(

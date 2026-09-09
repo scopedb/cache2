@@ -23,9 +23,9 @@ use std::sync::MutexGuard;
 
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
-use crate::region::index::IndexEntry;
-use crate::region::index::MAX_RECORD_LEN;
-use crate::region::index::PackedLocation;
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::MAX_RECORD_LEN;
+use crate::region::index::packed::PackedLocation;
 use crate::region::manager::RegionAppendReservation;
 use crate::region::manager::RegionPaddingReceipt;
 use crate::region::manager::RegionWriteSpan;
@@ -905,7 +905,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::region::index::PackedLocation;
+    use crate::region::index::packed::PackedLocation;
     use crate::resources::ResourceLimits;
 
     fn resources(memory_limit_bytes: usize) -> ResourceController {

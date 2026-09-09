@@ -21,17 +21,17 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::region::index::BenchmarkProbeStats;
-use crate::region::index::IndexEntry;
-use crate::region::index::MAX_INDEX_PROBES;
-use crate::region::index::MAX_PACKED_REGION_COUNT;
-use crate::region::index::MAX_REGION_OFFSET;
-use crate::region::index::PackedLocation;
 use crate::region::index::RegionIndex;
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::MAX_INDEX_PROBES;
+use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
+use crate::region::index::packed::MAX_REGION_OFFSET;
+use crate::region::index::packed::PackedLocation;
 use crate::region::index::reset_benchmark_probe_stats;
 use crate::region::index::storage::PartitionedIndexStorage;
 use crate::region::index::storage::validated_index_partition_ranges;
 use crate::region::index::take_benchmark_probe_stats;
-use crate::region::record::hash_key;
+use crate::region::record::codec::hash_key;
 use crate::snapshot::CacheIndexSnapshot;
 
 const BENCHMARK_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;

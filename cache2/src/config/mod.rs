@@ -14,29 +14,11 @@
 
 //! Configuration construction, independent of file paths and runtime handles.
 
+use crate::config::runtime::RuntimeOptions;
 use crate::region::recovery::DataGeometry;
 
-mod runtime;
-pub use self::runtime::IoEngineConfig;
-pub use self::runtime::IoMode;
-pub use self::runtime::IoPoolTopology;
-pub use self::runtime::IoUringConfig;
-pub use self::runtime::IoUringPoolConfig;
-pub use self::runtime::IoUringSqPollConfig;
-pub use self::runtime::L1EvictionPolicy;
-#[cfg(test)]
-pub use self::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
-pub use self::runtime::PosixIoConfig;
-pub use self::runtime::ReadAdmission;
-pub use self::runtime::RuntimeOptions;
-pub use self::runtime::read_io_wait_capacity;
-pub use self::runtime::read_io_wait_timeout;
-
-mod storage;
-pub use self::storage::KEY_HASH_SEED;
-pub use self::storage::StorageOptions;
-#[cfg(test)]
-pub use self::storage::cache_config;
+pub mod runtime;
+pub mod storage;
 
 /// Complete, immutable configuration for opening a [`Cache`](crate::Cache).
 ///
@@ -77,8 +59,8 @@ impl CacheConfig {
 
 /// Immutable persistent geometry with a checked logical disk bound.
 ///
-/// Created by [`StorageOptions::build`]. Changing the geometry or index size
-/// changes the disk identity, so an incompatible recovery image opens empty.
+/// Created by [`StorageOptions::build`](crate::StorageOptions::build). Changing the geometry or
+/// index size changes the disk identity, so an incompatible recovery image opens empty.
 /// Layout construction neither reserves disk space nor requires a Tokio runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageLayout {

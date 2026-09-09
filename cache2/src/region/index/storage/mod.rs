@@ -45,20 +45,20 @@ use self::page_format::put_u32;
 use self::page_format::put_u64;
 use self::page_format::read_u64;
 use self::page_format::validate_page_header;
-use crate::region::index::INDEX_CANDIDATES;
-use crate::region::index::IndexEntry;
-use crate::region::index::MAX_INDEX_PARTITIONS;
-use crate::region::index::PackedLocation;
-use crate::region::index::PackedLocationError;
-use crate::region::index::index_partition_for;
-use crate::region::index::record_size_class_upper_bound;
+use crate::region::index::packed::INDEX_CANDIDATES;
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::MAX_INDEX_PARTITIONS;
+use crate::region::index::packed::PackedLocation;
+use crate::region::index::packed::PackedLocationError;
+use crate::region::index::packed::index_partition_for;
+use crate::region::index::packed::record_size_class_upper_bound;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOT_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::record::RECORD_ALIGNMENT;
 
-mod page_format;
-pub use self::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
-pub use self::page_format::INDEX_IMAGE_PAGE_SIZE;
-pub use self::page_format::INDEX_IMAGE_SLOT_SIZE;
-pub use self::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+pub mod page_format;
 
 /// Upper bound for one underlying warm-image write.
 ///

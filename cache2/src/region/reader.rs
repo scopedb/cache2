@@ -34,7 +34,7 @@ use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
-use crate::region::index::IndexEntry;
+use crate::region::index::packed::IndexEntry;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
@@ -325,7 +325,7 @@ mod tests {
     use crate::io::backend::SyncPoint;
     use crate::io::backend::WritePoint;
     use crate::io::engine::BackendIoEngine;
-    use crate::region::index::PackedLocation;
+    use crate::region::index::packed::PackedLocation;
     use crate::resources::ResourceController;
     use crate::resources::ResourceLimits;
 

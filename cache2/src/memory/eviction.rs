@@ -19,7 +19,7 @@
 
 use std::io;
 
-use crate::config::L1EvictionPolicy;
+use crate::config::runtime::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;
 
 /// Maximum policy metadata inspected by one complete foreground admission.

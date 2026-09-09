@@ -20,13 +20,7 @@
 use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
 
-mod codec;
-pub use self::codec::RecordEncodeError;
-pub use self::codec::RecordPayload;
-pub use self::codec::encode_reinsert_into_hashed;
-pub use self::codec::encode_value_into_hashed;
-pub use self::codec::hash_key;
-pub use self::codec::required_record_bytes;
+pub mod codec;
 
 pub const RECORD_FORMAT_VERSION: u16 = 1;
 

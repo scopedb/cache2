@@ -42,7 +42,7 @@ use io_uring::opcode;
 use io_uring::squeue;
 use io_uring::types;
 
-use crate::config::IoUringPoolConfig;
+use crate::config::runtime::IoUringPoolConfig;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStatsHandle;

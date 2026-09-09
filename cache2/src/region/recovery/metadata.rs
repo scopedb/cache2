@@ -22,13 +22,13 @@ use std::fmt;
 use std::mem;
 
 use crate::checksum::Crc32c;
-use crate::region::index::MAX_INDEX_PARTITIONS;
-use crate::region::index::MAX_PACKED_REGION_COUNT;
-use crate::region::index::MAX_PACKED_REGION_SIZE;
-use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
-use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::packed::MAX_INDEX_PARTITIONS;
+use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
+use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
 use crate::region::index::storage::IndexStorageError;
 use crate::region::index::storage::canonical_index_partition_ranges;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::index::storage::validated_index_partition_ranges;
 use crate::region::recovery::DataSuperblock;
 use crate::region::recovery::PersistentId;

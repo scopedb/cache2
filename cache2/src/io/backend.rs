@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use crate::config::IoMode;
+use crate::config::runtime::IoMode;
 use crate::snapshot::CacheIoPathSnapshot;
 
 pub const DIRECT_IO_ALIGNMENT: usize = 4096;

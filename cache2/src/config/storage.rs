@@ -18,23 +18,23 @@ use std::io;
 
 #[cfg(test)]
 use crate::config::CacheConfig;
-#[cfg(test)]
-use crate::config::RuntimeOptions;
 use crate::config::StorageLayout;
+#[cfg(test)]
+use crate::config::runtime::RuntimeOptions;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
-use crate::region::index::MAX_PACKED_REGION_COUNT;
-use crate::region::index::MAX_PACKED_REGION_SIZE;
+use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
+use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
 use crate::region::index::storage::IndexStorageError;
 use crate::region::index::storage::validated_index_partition_ranges;
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::KEY_HASH_ALGORITHM_XXH3_64;
 use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
-use crate::region::recovery::REGION_METADATA_PAGE_SIZE;
-use crate::region::recovery::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region::recovery::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::STATE_FILE_SIZE;
+use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::recovery_image_index_len;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;

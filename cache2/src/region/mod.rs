@@ -26,13 +26,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use self::appender::submit_span;
-#[cfg(test)]
-use self::index::IndexEntry;
-use self::index::PackedLocation;
 use self::index::ReclaimIndexAction;
 use self::index::RegionIndex;
 use self::index::heat_memory_bytes;
-use self::index::storage::INDEX_IMAGE_PAGE_SIZE;
 use self::index::storage::IndexStorageError;
 use self::index::storage::WARM_IMAGE_WRITE_BATCH_BYTES;
 use self::index::storage::canonical_index_partition_ranges;
@@ -48,18 +44,8 @@ use self::reader::plan_read;
 use self::reader::submit_read;
 use self::record::RECORD_ALIGNMENT;
 use self::record::RECORD_HEADER_SIZE;
-use self::record::RecordEncodeError;
 use self::record::RecordHeader;
-use self::record::RecordPayload;
-use self::record::encode_reinsert_into_hashed;
-use self::record::encode_value_into_hashed;
-#[cfg(test)]
-use self::record::hash_key;
 use self::recovery::DATA_REGION_AREA_OFFSET;
-use self::recovery::REGION_METADATA_PAGE_SIZE;
-use self::recovery::REGION_METADATA_PARTITIONS_PER_PAGE;
-use self::recovery::REGION_METADATA_REGIONS_PER_PAGE;
-use self::recovery::RegionMetadataError;
 use self::recovery::recovery_image_index_len;
 use self::staging::StageAppend;
 use self::staging::StagedRecord;
@@ -73,32 +59,35 @@ use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
 use crate::region::appender::RegionSpanCompletion;
+#[cfg(test)]
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 use crate::region::manager::RegionWriteSpan;
+use crate::region::record::codec::RecordEncodeError;
+use crate::region::record::codec::RecordPayload;
+use crate::region::record::codec::encode_reinsert_into_hashed;
+use crate::region::record::codec::encode_value_into_hashed;
+#[cfg(test)]
+use crate::region::record::codec::hash_key;
 use crate::region::recovery::DataGeometry;
+use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::metadata::RegionMetadataError;
+use crate::region::staging::RegionStaging;
 use crate::resources::BufferLease;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
-mod file_backend;
-pub use self::file_backend::FileRegionBackend;
-pub use self::file_backend::RegionFiles;
-pub use self::file_backend::SystemRegionFileSystem;
-
+pub mod file_backend;
 pub mod index;
 pub mod manager;
 pub mod record;
 pub mod recovery;
-
-mod runtime;
-pub use self::runtime::ActivityMetrics;
-pub use self::runtime::HybridValueRead;
-pub use self::runtime::RegionDataPlane;
-
-mod staging;
-pub use self::staging::RegionStaging;
-
-mod store;
-pub use self::store::RegionStore;
+pub mod runtime;
+pub mod staging;
+pub mod store;
 
 mod appender;
 mod reader;

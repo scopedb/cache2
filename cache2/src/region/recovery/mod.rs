@@ -22,23 +22,14 @@
 
 use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
-use crate::region::index::MAX_PACKED_REGION_COUNT;
-use crate::region::index::MAX_PACKED_REGION_SIZE;
-use crate::region::index::storage::INDEX_IMAGE_PAGE_SIZE;
-use crate::region::index::storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
+use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::record::RECORD_FORMAT_VERSION;
 
-mod metadata;
-pub use self::metadata::PartitionMetadataRecord;
-pub use self::metadata::REGION_METADATA_PAGE_SIZE;
-pub use self::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-pub use self::metadata::REGION_METADATA_REGIONS_PER_PAGE;
-pub use self::metadata::RegionMetadata;
-pub use self::metadata::RegionMetadataError;
-pub use self::metadata::RegionMetadataRecord;
-pub use self::metadata::RegionMetadataRoot;
-pub use self::metadata::RegionMetadataState;
+pub mod metadata;
 
 const RECOVERY_FORMAT_VERSION: u16 = 1;
 pub const RECOVERY_PAGE_SIZE: usize = 4 * 1024;
