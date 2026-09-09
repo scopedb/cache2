@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::io;
-use std::mem::size_of;
 use std::time::Duration;
 
 use crate::config::CacheConfig;
@@ -95,7 +94,7 @@ impl Default for PosixIoConfig {
 /// experimental io_uring engine.
 ///
 /// `max_in_flight` is distributed as evenly as possible across `rings`. This
-/// keeps admission capacity independent from the number of driver threads.
+/// keeps admission capacity independent of the number of driver threads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringPoolConfig {
     rings: usize,
@@ -482,8 +481,7 @@ impl CacheConfig {
     /// Checks the complete combination and resolves dependent runtime defaults.
     ///
     /// ```no_run
-    /// # use cache2::Error;
-    /// # async fn example() -> Result<(), Error> {
+    /// # async fn example() -> Result<(), cache2::Error> {
     /// use cache2::Cache;
     /// use cache2::CacheConfig;
     /// use cache2::RuntimeOptions;

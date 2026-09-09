@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! CRC32C (Castagnoli) used by the on-disk format.
+//! CRC32C used by the on-disk format.
 //!
 //! The dependency selects hardware acceleration when the host supports it and
 //! retains a portable software fallback. This wrapper keeps the cache's codec
-//! API and checksum values independent from that implementation detail.
+//! API and checksum values independent of that implementation detail.
 
 use crc_fast::CrcAlgorithm;
 use crc_fast::Digest;
@@ -27,8 +27,8 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     crc32_iscsi(bytes)
 }
 
-/// Incremental CRC32C state, useful for checksumming a key and value without
-/// first joining them in a temporary allocation.
+/// Incremental CRC32C state, useful for checksum a key and value without first joining them in a
+/// temporary allocation.
 pub struct Crc32c {
     digest: Digest,
 }
