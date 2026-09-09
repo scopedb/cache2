@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
-use crate::io_backend::{SyncMode, SyncPoint};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use super::*;
 use crate::io_backend::FileBackend;
-use crate::resources::{ResourceController, ResourceLimits, aligned_buffer_capacity};
+use crate::io_backend::SyncMode;
+use crate::io_backend::SyncPoint;
+use crate::resources::ResourceController;
+use crate::resources::ResourceLimits;
+use crate::resources::aligned_buffer_capacity;
 
 static FILE_ID: AtomicU64 = AtomicU64::new(1);
 

@@ -209,9 +209,10 @@ fn validate_index_slots(index_slots: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    use super::*;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Event {

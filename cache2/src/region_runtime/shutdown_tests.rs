@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
-use crate::io_backend::{IoBackend, SyncMode, SyncPoint, WritePoint};
-use crate::io_engine::{
-    BackendIoEngine, CompletionState, EngineIoSnapshot, IoRequest, ReadSlotWaiter, RequestId,
-    SubmitError,
-};
 use std::sync::atomic::AtomicBool;
+
+use super::*;
+use crate::io_backend::IoBackend;
+use crate::io_backend::SyncMode;
+use crate::io_backend::SyncPoint;
+use crate::io_backend::WritePoint;
+use crate::io_engine::BackendIoEngine;
+use crate::io_engine::CompletionState;
+use crate::io_engine::EngineIoSnapshot;
+use crate::io_engine::IoRequest;
+use crate::io_engine::ReadSlotWaiter;
+use crate::io_engine::RequestId;
+use crate::io_engine::SubmitError;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -197,7 +204,8 @@ fn submitted_read_must_not_pin_close() {
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::config::PosixIoConfig;
     use crate::recovery::PersistentId;
-    use crate::region::{FileRegionBackend, RegionFiles};
+    use crate::region::FileRegionBackend;
+    use crate::region::RegionFiles;
     use crate::region_store::RegionStore;
     let root = std::env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",

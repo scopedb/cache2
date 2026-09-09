@@ -18,14 +18,21 @@
 //! manager or index mapping becomes visible. Index slots remain independently
 //! lazy-validated; this section contains only O(regions + index partitions) state.
 
-use crate::checksum::Crc32c;
-use crate::index::{MAX_INDEX_PARTITIONS, MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
-use crate::index_storage::{
-    INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE, IndexStorageError,
-    canonical_index_partition_ranges, validated_index_partition_ranges,
-};
-use crate::recovery::{DataSuperblock, PersistentId, RECOVERY_PAGE_SIZE, RecoveryImageHeader};
 use std::fmt;
+
+use crate::checksum::Crc32c;
+use crate::index::MAX_INDEX_PARTITIONS;
+use crate::index::MAX_PACKED_REGION_COUNT;
+use crate::index::MAX_PACKED_REGION_SIZE;
+use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::index_storage::IndexStorageError;
+use crate::index_storage::canonical_index_partition_ranges;
+use crate::index_storage::validated_index_partition_ranges;
+use crate::recovery::DataSuperblock;
+use crate::recovery::PersistentId;
+use crate::recovery::RECOVERY_PAGE_SIZE;
+use crate::recovery::RecoveryImageHeader;
 
 pub(crate) const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 pub(crate) const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;

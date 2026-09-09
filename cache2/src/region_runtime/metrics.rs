@@ -13,15 +13,19 @@
 // limitations under the License.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use super::LIFECYCLE_DRAINING;
+use super::LIFECYCLE_FAILED;
 use crate::hashing::route_hash;
 use crate::memory::MemoryMetricsSnapshot;
 use crate::resources::ManagedMemorySnapshot;
-use crate::snapshot::{CacheHealth, CacheIoSnapshot, CacheReclaimSnapshot, CacheSnapshot};
-
-use super::{LIFECYCLE_DRAINING, LIFECYCLE_FAILED};
+use crate::snapshot::CacheHealth;
+use crate::snapshot::CacheIoSnapshot;
+use crate::snapshot::CacheReclaimSnapshot;
+use crate::snapshot::CacheSnapshot;
 
 static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 

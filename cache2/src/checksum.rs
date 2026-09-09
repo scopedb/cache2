@@ -18,7 +18,9 @@
 //! retains a portable software fallback. This wrapper keeps the cache's codec
 //! API and checksum values independent from that implementation detail.
 
-use crc_fast::{CrcAlgorithm, Digest, crc32_iscsi};
+use crc_fast::CrcAlgorithm;
+use crc_fast::Digest;
+use crc_fast::crc32_iscsi;
 
 /// Computes the standard CRC32C checksum of `bytes`.
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {

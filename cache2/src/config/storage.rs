@@ -16,17 +16,21 @@
 
 use std::io;
 
-use crate::error::{Error, ErrorOperation, Result};
-use crate::index::{MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
-use crate::index_storage::{IndexStorageError, validated_index_partition_ranges};
-use crate::recovery::{
-    DataGeometry, KEY_HASH_ALGORITHM_XXH3_64, RECOVERY_IMAGE_INDEX_OFFSET, STATE_FILE_SIZE,
-    recovery_image_index_len,
-};
-use crate::region_metadata::{
-    REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
-    REGION_METADATA_REGIONS_PER_PAGE,
-};
+use crate::error::Error;
+use crate::error::ErrorOperation;
+use crate::error::Result;
+use crate::index::MAX_PACKED_REGION_COUNT;
+use crate::index::MAX_PACKED_REGION_SIZE;
+use crate::index_storage::IndexStorageError;
+use crate::index_storage::validated_index_partition_ranges;
+use crate::recovery::DataGeometry;
+use crate::recovery::KEY_HASH_ALGORITHM_XXH3_64;
+use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::recovery::STATE_FILE_SIZE;
+use crate::recovery::recovery_image_index_len;
+use crate::region_metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region_metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
@@ -236,7 +240,8 @@ fn index_layout_error(error: IndexStorageError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recovery::{DataSuperblock, PersistentId};
+    use crate::recovery::DataSuperblock;
+    use crate::recovery::PersistentId;
 
     #[test]
     fn constructed_layouts_encode_at_format_boundaries() {

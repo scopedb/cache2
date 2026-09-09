@@ -15,50 +15,84 @@
 //! File ownership, recovery, and lifecycle adapter for the Region core.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
+use std::io::{self};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 
+use super::core::FileRegionCore;
+use super::core::RegionAccessState;
+use super::core::RegionHealthLatch;
+use super::core::RegionManagerAuthority;
+use super::core::RegionShard;
+use super::core::guarded_index_result;
+use super::core::index_storage_io_error;
+use super::core::region_metadata_io_error;
+use crate::config::CacheConfig;
 use crate::config::IoMode;
 #[cfg(test)]
 use crate::config::RuntimeOptions;
 use crate::index::MAX_INDEX_PARTITIONS;
-use crate::index_storage::{
-    IndexImageBinding, IndexPartitionRange, IndexPhysicalStats, PartitionedIndexStorage,
-    canonical_index_partition_ranges,
-};
-use crate::io_backend::{
-    ControlIoBackend, FileBackend, IoBackend, RuntimeFileSet, SyncMode, SyncPoint, WritePoint,
-    read_at_bounded, read_exact_at, write_all_at,
-};
-use crate::recovery::{
-    DataSuperblock, DataSuperblockProbe, PersistentId, RECOVERY_IMAGE_INDEX_OFFSET,
-    RECOVERY_PAGE_SIZE, RecoveryImageHeader, RecoveryImageHeaderProbe, RecoveryState,
-    STATE_FILE_SIZE, STATE_SLOT_COUNT, SelectedState, StateBinding, StatePageWrite, StateRecord,
-    StateSelectionError, clean_image_matches, latest_state, prepare_next_state,
-    prepare_running_barrier, recovery_image_index_len,
-};
+use crate::index_storage::IndexImageBinding;
+use crate::index_storage::IndexPartitionRange;
+use crate::index_storage::IndexPhysicalStats;
+use crate::index_storage::PartitionedIndexStorage;
+use crate::index_storage::canonical_index_partition_ranges;
+use crate::io_backend::ControlIoBackend;
+use crate::io_backend::FileBackend;
+use crate::io_backend::IoBackend;
+use crate::io_backend::RuntimeFileSet;
+use crate::io_backend::SyncMode;
+use crate::io_backend::SyncPoint;
+use crate::io_backend::WritePoint;
+use crate::io_backend::read_at_bounded;
+use crate::io_backend::read_exact_at;
+use crate::io_backend::write_all_at;
+use crate::recovery::DataSuperblock;
+use crate::recovery::DataSuperblockProbe;
+use crate::recovery::PersistentId;
+use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::recovery::RECOVERY_PAGE_SIZE;
+use crate::recovery::RecoveryImageHeader;
+use crate::recovery::RecoveryImageHeaderProbe;
+use crate::recovery::RecoveryState;
+use crate::recovery::STATE_FILE_SIZE;
+use crate::recovery::STATE_SLOT_COUNT;
+use crate::recovery::SelectedState;
+use crate::recovery::StateBinding;
+use crate::recovery::StatePageWrite;
+use crate::recovery::StateRecord;
+use crate::recovery::StateSelectionError;
+use crate::recovery::clean_image_matches;
+use crate::recovery::latest_state;
+use crate::recovery::prepare_next_state;
+use crate::recovery::prepare_running_barrier;
+use crate::recovery::recovery_image_index_len;
 use crate::region_index::RegionIndex;
 use crate::region_manager::RegionManager;
-use crate::region_metadata::{
-    PartitionMetadataRecord, REGION_METADATA_PAGE_SIZE, REGION_METADATA_PARTITIONS_PER_PAGE,
-    REGION_METADATA_REGIONS_PER_PAGE, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
-    RegionMetadataRoot, RegionMetadataState,
-};
-use crate::region_store::{RecoveryPlan, RegionBackend, RegionStore};
-#[cfg(test)]
-use crate::snapshot::{CacheSnapshot, DetailedCacheSnapshot};
-
-use super::core::{
-    FileRegionCore, RegionAccessState, RegionHealthLatch, RegionManagerAuthority, RegionShard,
-    guarded_index_result, index_storage_io_error, region_metadata_io_error,
-};
-use crate::config::CacheConfig;
+use crate::region_metadata::PartitionMetadataRecord;
+use crate::region_metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region_metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region_metadata::RegionMetadata;
+use crate::region_metadata::RegionMetadataError;
+use crate::region_metadata::RegionMetadataRecord;
+use crate::region_metadata::RegionMetadataRoot;
+use crate::region_metadata::RegionMetadataState;
 #[cfg(test)]
 use crate::region_runtime::HybridValueRead;
 use crate::region_runtime::RegionDataPlane;
+use crate::region_store::RecoveryPlan;
+use crate::region_store::RegionBackend;
+use crate::region_store::RegionStore;
+#[cfg(test)]
+use crate::snapshot::CacheSnapshot;
+#[cfg(test)]
+use crate::snapshot::DetailedCacheSnapshot;
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]

@@ -15,10 +15,13 @@
 //! Bounded benchmark measurements and fio-style reporting.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use cache2::{CacheIoDirectionSnapshot, DetailedCacheSnapshot};
+use cache2::CacheIoDirectionSnapshot;
+use cache2::DetailedCacheSnapshot;
 
 const LATENCY_BUCKETS: usize = 65;
 

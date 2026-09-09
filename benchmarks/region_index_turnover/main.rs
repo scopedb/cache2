@@ -15,10 +15,11 @@
 use std::env;
 use std::io;
 
-use benchmarks::report::{JobReport, RunReporter};
-use cache2::benchmarking::{
-    RegionIndexTurnoverConfig, RegionIndexTurnoverPhase, run_region_index_turnover,
-};
+use benchmarks::report::JobReport;
+use benchmarks::report::RunReporter;
+use cache2::benchmarking::RegionIndexTurnoverConfig;
+use cache2::benchmarking::RegionIndexTurnoverPhase;
+use cache2::benchmarking::run_region_index_turnover;
 
 fn main() -> io::Result<()> {
     let reporter = RunReporter::start("region_index_turnover", None);

@@ -21,4 +21,6 @@
 pub(crate) mod core;
 mod file_backend;
 
-pub(crate) use file_backend::{FileRegionBackend, RegionFiles, SystemRegionFileSystem};
+pub(crate) use file_backend::FileRegionBackend;
+pub(crate) use file_backend::RegionFiles;
+pub(crate) use file_backend::SystemRegionFileSystem;

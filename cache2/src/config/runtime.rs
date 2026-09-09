@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io_engine::{
-    IO_QUEUE_ENTRY_RESERVATION_BYTES, MAX_IO_REQUESTS_PER_ENGINE, io_uring_extra_memory_bytes,
-};
+use std::io;
+use std::time::Duration;
+
+use crate::io_engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
+use crate::io_engine::MAX_IO_REQUESTS_PER_ENGINE;
+use crate::io_engine::io_uring_extra_memory_bytes;
 use crate::memory::MemoryStore;
 use crate::recovery::DataGeometry;
 use crate::region_runtime::ActivityMetrics;
 use crate::region_staging::RegionStaging;
-use crate::resources::{CACHE_THREAD_STACK_BYTES, MAX_CONFIG_COUNT};
-use std::io;
-use std::time::Duration;
+use crate::resources::CACHE_THREAD_STACK_BYTES;
+use crate::resources::MAX_CONFIG_COUNT;
 
 const DEFAULT_L1_SHARDS: usize = 32;
 pub(crate) const MAX_APPEND_SHARDS: u32 = 256;

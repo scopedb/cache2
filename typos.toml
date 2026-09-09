@@ -12,16 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-[advisories]
-yanked = "deny"
-
-[licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
-confidence-threshold = 0.93
-
-[bans]
-wildcards = "deny"
-
-[sources]
-unknown-git = "deny"
-unknown-registry = "deny"
+[files]
+extend-exclude = ["/target"]

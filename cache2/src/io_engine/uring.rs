@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io::Read;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use hashcrew::xxhash::Xxh3_64Builder;
-use io_uring::{IoUring, Probe, opcode, squeue, types};
+use io_uring::IoUring;
+use io_uring::Probe;
+use io_uring::opcode;
+use io_uring::squeue;
+use io_uring::types;
 
 use super::*;
 
@@ -1058,9 +1064,12 @@ fn build_target_entry(
 
 #[cfg(test)]
 mod tests {
+    use std::task::Wake;
+    use std::task::Waker;
+
     use super::*;
-    use crate::resources::{ResourceController, ResourceLimits};
-    use std::task::{Wake, Waker};
+    use crate::resources::ResourceController;
+    use crate::resources::ResourceLimits;
 
     struct CancelledCommandProducer {
         shared: Arc<RuntimeShared>,

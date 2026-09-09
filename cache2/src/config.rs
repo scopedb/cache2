@@ -16,7 +16,9 @@
 
 use std::io;
 
-use crate::error::{Error, ErrorOperation, Result};
+use crate::error::Error;
+use crate::error::ErrorOperation;
+use crate::error::Result;
 use crate::memory::MemoryStore;
 #[cfg(test)]
 use crate::recovery::DataGeometry;
@@ -24,15 +26,21 @@ use crate::recovery::DataGeometry;
 mod runtime;
 mod storage;
 
+pub use runtime::IoEngine;
+pub use runtime::IoMode;
 pub(crate) use runtime::IoPoolTopology;
+pub use runtime::IoUringConfig;
+pub use runtime::IoUringPoolConfig;
+pub use runtime::IoUringSqPollConfig;
+pub use runtime::L1EvictionPolicy;
 #[cfg(test)]
 pub(crate) use runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
-pub use runtime::{
-    IoEngine, IoMode, IoUringConfig, IoUringPoolConfig, IoUringSqPollConfig, L1EvictionPolicy,
-    PosixIoConfig, ReadAdmission, RuntimeOptions,
-};
+pub use runtime::PosixIoConfig;
+pub use runtime::ReadAdmission;
+pub use runtime::RuntimeOptions;
 pub(crate) use storage::KEY_HASH_SEED;
-pub use storage::{StorageLayout, StorageOptions};
+pub use storage::StorageLayout;
+pub use storage::StorageOptions;
 
 /// Complete, immutable configuration for opening a [`crate::Cache`].
 ///
@@ -55,7 +63,10 @@ impl CacheConfig {
     ///
     /// ```no_run
     /// # async fn example() -> cache2::Result<()> {
-    /// use cache2::{Cache, CacheConfig, RuntimeOptions, StorageOptions};
+    /// use cache2::Cache;
+    /// use cache2::CacheConfig;
+    /// use cache2::RuntimeOptions;
+    /// use cache2::StorageOptions;
     /// let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
     /// let config = CacheConfig::new(storage, RuntimeOptions::default())?;
     /// let disk_peak = config.storage().peak_disk_bytes();

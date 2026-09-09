@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command as StdCommand;
 
-use cargo_metadata::{Metadata, MetadataCommand};
-use clap::{Parser, Subcommand};
+use cargo_metadata::Metadata;
+use cargo_metadata::MetadataCommand;
+use clap::Parser;
+use clap::Subcommand;
 
 const PACKAGE_NAME: &str = "cache2";
 
@@ -54,7 +57,9 @@ enum SubCommand {
     Bench(CommandBench),
     #[command(about = "Check the workspace and cache2 feature matrix")]
     Check(CommandCheck),
-    #[command(about = "Run formatting, lint, documentation, package, and policy checks")]
+    #[command(
+        about = "Run nightly Rust lints, formatting, spelling, documentation, and policy checks"
+    )]
     Lint(CommandLint),
     #[command(about = "Run workspace tests and extended library tests")]
     Test(CommandTest),
@@ -144,24 +149,51 @@ fn cache2_features() -> Vec<String> {
 }
 
 #[derive(Parser)]
-struct CommandLint;
+struct CommandLint {
+    #[arg(
+        long,
+        help = "Apply Clippy fixes, Rust/TOML formatting, and license headers"
+    )]
+    fix: bool,
+}
 
 impl CommandLint {
     fn run(self) {
-        cargo_run(["fmt", "--all", "--", "--check"]);
-        cargo_run([
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ]);
+        let mut clippy = nightly_cargo();
+        clippy.args(["clippy", "--workspace", "--all-targets", "--all-features"]);
+        if self.fix {
+            clippy.args(["--fix", "--allow-dirty", "--allow-staged"]);
+        } else {
+            clippy.args(["--", "-D", "warnings"]);
+        }
+        run(clippy);
 
-        let mut docs = cargo();
-        docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs");
-        docs.args(["doc", "--package", PACKAGE_NAME, "--no-deps", "--locked"]);
+        let mut format = nightly_cargo();
+        format.args(["fmt", "--all"]);
+        if !self.fix {
+            format.args(["--", "--check"]);
+        }
+        run(format);
+
+        if self.fix {
+            command_run("taplo", ["format"]);
+            command_run("hawkeye", ["format"]);
+        } else {
+            command_run("taplo", ["format", "--check"]);
+            command_run("hawkeye", ["check"]);
+        }
+        command_run("typos", std::iter::empty::<&str>());
+
+        let mut docs = nightly_cargo();
+        docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs --cfg docsrs");
+        docs.args([
+            "doc",
+            "--package",
+            PACKAGE_NAME,
+            "--all-features",
+            "--no-deps",
+            "--locked",
+        ]);
         run(docs);
 
         cargo_run([
@@ -171,7 +203,6 @@ impl CommandLint {
             "--locked",
             "--allow-dirty",
         ]);
-        command_run("hawkeye", ["check"]);
         cargo_run([
             "deny",
             "--all-features",
@@ -206,6 +237,14 @@ fn cargo() -> StdCommand {
     let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = StdCommand::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
+    command
+}
+
+fn nightly_cargo() -> StdCommand {
+    let mut command = StdCommand::new("rustup");
+    command
+        .args(["run", "nightly", "cargo"])
+        .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command
 }
 

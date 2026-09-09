@@ -19,15 +19,18 @@
 //! canonical shard records from the index owner and derives every Region and
 //! queue field from live manager state.
 
+use std::collections::VecDeque;
+
 use crate::format::RECORD_ALIGNMENT;
 use crate::io_backend::DIRECT_IO_ALIGNMENT;
 use crate::recovery::PersistentId;
-use crate::region_metadata::{
-    PartitionMetadataRecord, RegionMetadata, RegionMetadataError, RegionMetadataRecord,
-    RegionMetadataRoot, RegionMetadataState,
-};
+use crate::region_metadata::PartitionMetadataRecord;
+use crate::region_metadata::RegionMetadata;
+use crate::region_metadata::RegionMetadataError;
+use crate::region_metadata::RegionMetadataRecord;
+use crate::region_metadata::RegionMetadataRoot;
+use crate::region_metadata::RegionMetadataState;
 use crate::snapshot::RegionSnapshot;
-use std::collections::VecDeque;
 
 const UNASSIGNED_REGION: u32 = u32::MAX;
 
@@ -1282,7 +1285,8 @@ fn try_unassigned_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index_storage::{INDEX_IMAGE_SLOTS_PER_PAGE, canonical_index_partition_ranges};
+    use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
+    use crate::index_storage::canonical_index_partition_ranges;
 
     fn id(byte: u8) -> PersistentId {
         PersistentId::from_bytes([byte; 16]).unwrap()

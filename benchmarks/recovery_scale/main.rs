@@ -14,15 +14,25 @@
 
 use std::env;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use benchmarks::report::{JobReport, RunReporter};
-use cache2::{
-    Cache, CacheConfig, ErrorKind as CacheErrorKind, IoEngine, IoMode, PosixIoConfig,
-    RuntimeOptions, StartupMode, StorageOptions,
-};
+use benchmarks::report::JobReport;
+use benchmarks::report::RunReporter;
+use cache2::Cache;
+use cache2::CacheConfig;
+use cache2::ErrorKind as CacheErrorKind;
+use cache2::IoEngine;
+use cache2::IoMode;
+use cache2::PosixIoConfig;
+use cache2::RuntimeOptions;
+use cache2::StartupMode;
+use cache2::StorageOptions;
 
 const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);

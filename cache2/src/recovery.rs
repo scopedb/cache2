@@ -20,10 +20,14 @@
 //! `CLEAN`. This module performs no I/O; callers must write the returned page
 //! to the selected slot and provide the required `fdatasync` barrier.
 
-use crate::checksum::{Crc32c, crc32c};
-use crate::format::{RECORD_ALIGNMENT, RECORD_FORMAT_VERSION};
-use crate::index::{MAX_PACKED_REGION_COUNT, MAX_PACKED_REGION_SIZE};
-use crate::index_storage::{INDEX_IMAGE_PAGE_SIZE, INDEX_IMAGE_SLOTS_PER_PAGE};
+use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
+use crate::format::RECORD_ALIGNMENT;
+use crate::format::RECORD_FORMAT_VERSION;
+use crate::index::MAX_PACKED_REGION_COUNT;
+use crate::index::MAX_PACKED_REGION_SIZE;
+use crate::index_storage::INDEX_IMAGE_PAGE_SIZE;
+use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
 
 pub(crate) const RECOVERY_FORMAT_VERSION: u16 = 1;
 pub(crate) const RECOVERY_PAGE_SIZE: usize = 4 * 1024;

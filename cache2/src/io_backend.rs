@@ -19,15 +19,9 @@
 //! record, superblock, or barrier operation without changing the cache
 //! algorithm.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-use crate::config::IoMode;
-use crate::snapshot::CacheIoPathSnapshot;
-
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -36,6 +30,14 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+use crate::config::IoMode;
+use crate::snapshot::CacheIoPathSnapshot;
 
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 pub(crate) const MAX_INTERRUPTED_RETRIES: usize = 4;
@@ -968,7 +970,9 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -1302,7 +1306,10 @@ mod tests {
 
     #[test]
     fn one_fault_handle_controls_multiple_recovery_files() {
-        use super::testing::{FaultAction, FaultBackend, FaultEvent, FaultHandle};
+        use super::testing::FaultAction;
+        use super::testing::FaultBackend;
+        use super::testing::FaultEvent;
+        use super::testing::FaultHandle;
 
         let state = TestFile::new("shared-fault-state");
         let image = TestFile::new("shared-fault-image");
@@ -1356,7 +1363,8 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use super::*;
 

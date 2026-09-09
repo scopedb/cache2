@@ -14,10 +14,16 @@
 
 use std::time::Duration;
 
-use cache2::{
-    CacheConfig, ErrorKind, ErrorOperation, IoEngine, L1EvictionPolicy, PosixIoConfig,
-    ReadAdmission, RuntimeOptions, StorageLayout, StorageOptions,
-};
+use cache2::CacheConfig;
+use cache2::ErrorKind;
+use cache2::ErrorOperation;
+use cache2::IoEngine;
+use cache2::L1EvictionPolicy;
+use cache2::PosixIoConfig;
+use cache2::ReadAdmission;
+use cache2::RuntimeOptions;
+use cache2::StorageLayout;
+use cache2::StorageOptions;
 
 type RuntimeOptionsCase = (&'static str, fn(RuntimeOptions) -> RuntimeOptions);
 

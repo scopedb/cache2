@@ -25,11 +25,18 @@ use std::ops::Range;
 
 use crate::format::RECORD_ALIGNMENT;
 use crate::index::IndexEntry;
-use crate::io_engine::{
-    BoundedIoRequest, IoBuffer, IoCompletion, IoDeadlineExceeded, IoEngine, IoOperation,
-    OperationKind, ReadSlot, RequestId, submit_cache_read,
-};
-use crate::recovery::{DATA_REGION_AREA_OFFSET, DataGeometry};
+use crate::io_engine::BoundedIoRequest;
+use crate::io_engine::IoBuffer;
+use crate::io_engine::IoCompletion;
+use crate::io_engine::IoDeadlineExceeded;
+use crate::io_engine::IoEngine;
+use crate::io_engine::IoOperation;
+use crate::io_engine::OperationKind;
+use crate::io_engine::ReadSlot;
+use crate::io_engine::RequestId;
+use crate::io_engine::submit_cache_read;
+use crate::recovery::DATA_REGION_AREA_OFFSET;
+use crate::recovery::DataGeometry;
 use crate::resources::BufferLease;
 
 pub(crate) const _READ_ALIGNMENT: usize = 4096;
@@ -308,13 +315,18 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::index::PackedLocation;
-    use crate::io_backend::{IoBackend, SyncMode, SyncPoint, WritePoint};
+    use crate::io_backend::IoBackend;
+    use crate::io_backend::SyncMode;
+    use crate::io_backend::SyncPoint;
+    use crate::io_backend::WritePoint;
     use crate::io_engine::BackendIoEngine;
-    use crate::resources::{ResourceController, ResourceLimits};
+    use crate::resources::ResourceController;
+    use crate::resources::ResourceLimits;
 
     #[derive(Default)]
     struct RecordingBackend {
