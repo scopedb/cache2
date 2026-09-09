@@ -190,40 +190,9 @@ fn put_u64(output: &mut [u8], offset: usize, value: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn sparse_golden(input: &str) -> Vec<u8> {
-    let mut output: Option<Vec<u8>> = None;
-    for raw_line in input.lines() {
-        let line = raw_line.split('#').next().unwrap().trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let first = fields.next().unwrap();
-        if first == "length" {
-            let length = fields.next().unwrap().parse::<usize>().unwrap();
-            assert!(output.replace(vec![0_u8; length]).is_none());
-            continue;
-        }
-        let offset = usize::from_str_radix(first, 16).unwrap();
-        let encoded = fields.next().unwrap();
-        assert_eq!(encoded.len() % 2, 0);
-        let bytes = encoded
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect::<Vec<_>>();
-        let output = output.as_mut().expect("golden length must come first");
-        output[offset..offset + bytes.len()].copy_from_slice(&bytes);
-        assert!(fields.next().is_none());
-    }
-    output.expect("golden fixture must declare its length")
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format_fixtures::assert_golden;
 
     #[test]
     fn value_record_matches_committed_golden_bytes() {
@@ -244,10 +213,10 @@ mod tests {
         let mut encoded = vec![0_u8; record_len as usize];
         encoded[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
         encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()].copy_from_slice(&payload);
-        let golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/value_record.golden"
-        ));
-        assert_eq!(encoded, golden);
+        let golden = assert_golden(
+            &encoded,
+            include_str!("format_fixtures/format_v1/value_record.golden"),
+        );
         assert_eq!(
             RecordHeader::decode(&golden[..RECORD_HEADER_SIZE]),
             Some(header)

@@ -14,7 +14,9 @@ The repository separates published code from development-only consumers:
 | `examples/`          | Runnable programs that demonstrate complete integrations.                                     |
 | `xtask/`             | The `cargo x` repository workflow entrypoint.                                                 |
 
-Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`. Format fixtures remain under `cache2/tests/fixtures` because private decoder tests are their primary consumers.
+Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`. Persistent-format tests use private codecs and remain library unit tests; their shared assertion helper and versioned byte fixtures live in `cache2/src/format_fixtures`.
+
+Format fixtures preserve exact encoded bytes, including checksums and zero padding, and provide independent inputs to decoder compatibility tests. Keep their sparse hexadecimal representation reviewable in Git. An intentional byte change requires a format-version decision; these fixtures are not regenerated as routine snapshot updates. See the [format fixture notes](cache2/src/format_fixtures/format_v1/README.md) for their contents and a focused test command.
 
 ## Repository workflows
 

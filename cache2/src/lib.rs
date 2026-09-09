@@ -27,6 +27,8 @@ mod config;
 pub mod error;
 mod eviction;
 mod format;
+#[cfg(test)]
+mod format_fixtures;
 mod hashing;
 mod index;
 mod index_storage;

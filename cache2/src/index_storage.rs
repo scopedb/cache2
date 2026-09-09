@@ -1852,7 +1852,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::format::sparse_golden;
+    use crate::format_fixtures::assert_golden;
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -2298,10 +2298,10 @@ mod tests {
         source
             .write_warm_image(&mut encoded, binding(0x1122_3344_5566_7788))
             .unwrap();
-        let golden = sparse_golden(include_str!(
-            "../tests/fixtures/format_v1/index_page.golden"
-        ));
-        assert_eq!(encoded, golden);
+        assert_golden(
+            &encoded,
+            include_str!("format_fixtures/format_v1/index_page.golden"),
+        );
     }
 
     #[test]
