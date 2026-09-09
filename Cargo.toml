@@ -32,7 +32,7 @@ asyncband = { version = "0.7.1", features = ["barrier", "semaphore", "watch"] }
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
-hashcrew = { version = "0.1.2" }
+hashcrew = { version = "0.2.0", features = ["std", "xxhash"] }
 io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }
