@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
@@ -232,7 +233,7 @@ impl CommandTest {
 }
 
 fn cargo() -> std::process::Command {
-    let executable = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = std::process::Command::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command

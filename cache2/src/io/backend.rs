@@ -966,6 +966,7 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
@@ -980,7 +981,7 @@ mod tests {
     impl TestFile {
         fn new(label: &str) -> Self {
             let nonce = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
+            Self(env::temp_dir().join(format!(
                 "cache2-{label}-{}-{nonce}.cache",
                 std::process::id()
             )))

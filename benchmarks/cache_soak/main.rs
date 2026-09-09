@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -157,9 +158,9 @@ impl SoakConfig {
         )?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
-        let directory = std::env::var_os("CACHE_SOAK_DIR")
+        let directory = env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(env::temp_dir);
         if duration.is_zero()
             || sample_period.is_zero()
             || value_bytes.is_empty()
@@ -1181,11 +1182,11 @@ fn peak_rss_bytes() -> u64 {
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1197,7 +1198,7 @@ fn env_usize(name: &str, default: usize) -> io::Result<usize> {
 }
 
 fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .split(',')
             .map(|item| {
@@ -1206,7 +1207,7 @@ fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
             })
             .collect::<io::Result<Vec<_>>>()
             .map(Vec::into_boxed_slice),
-        Err(std::env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
+        Err(env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1217,22 +1218,22 @@ fn env_u32(name: &str, default: u32) -> io::Result<u32> {
 }
 
 fn env_optional_u32(name: &str) -> io::Result<Option<u32>> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse::<u32>()
             .map(Some)
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
         Ok(value) if value == "false" || value == "0" => Ok(false),
         Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
@@ -1243,7 +1244,7 @@ fn parse_io_engine(
     write_workers: usize,
     reclaim_workers: usize,
 ) -> io::Result<IoEngine> {
-    match std::env::var(name)
+    match env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
@@ -1320,7 +1321,7 @@ fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolConfig> {
 }
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {
-    match std::env::var(name)
+    match env::var(name)
         .unwrap_or_else(|_| "buffered".to_owned())
         .as_str()
     {
@@ -1331,7 +1332,7 @@ fn parse_io_mode(name: &str) -> io::Result<IoMode> {
 }
 
 fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
-    match std::env::var(name)
+    match env::var(name)
         .unwrap_or_else(|_| "clock".to_owned())
         .as_str()
     {

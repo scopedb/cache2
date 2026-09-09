@@ -1832,6 +1832,7 @@ unsafe impl Sync for Mapping {}
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::io::Seek;
@@ -1860,7 +1861,7 @@ mod tests {
     impl TestFile {
         fn create() -> Self {
             let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = env::temp_dir().join(format!(
                 "cache2-index-image-{}-{id}.tmp",
                 std::process::id()
             ));

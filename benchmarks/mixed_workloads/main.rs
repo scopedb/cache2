@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::f64::consts::TAU;
 use std::fmt;
 use std::fs;
@@ -235,7 +236,7 @@ impl HarnessConfig {
         let reclaim_workers = env_usize("CACHE_WORKLOAD_RECLAIM_WORKERS", 1)?;
         let latency_sample_interval = env_usize("CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL", 16)?;
         let seed = env_u64("CACHE_WORKLOAD_SEED", DEFAULT_SEED)?;
-        let io_engine = match std::env::var("CACHE_WORKLOAD_IO_ENGINE")
+        let io_engine = match env::var("CACHE_WORKLOAD_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
@@ -261,7 +262,7 @@ impl HarnessConfig {
             )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
-        let io_mode = match std::env::var("CACHE_WORKLOAD_IO_MODE")
+        let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
         {
@@ -269,7 +270,7 @@ impl HarnessConfig {
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
-        let l1_eviction_policy = match std::env::var("CACHE_WORKLOAD_L1_EVICTION")
+        let l1_eviction_policy = match env::var("CACHE_WORKLOAD_L1_EVICTION")
             .unwrap_or_else(|_| "clock".to_owned())
             .as_str()
         {
@@ -277,9 +278,9 @@ impl HarnessConfig {
             "s3-fifo" => L1EvictionPolicy::S3Fifo,
             value => return Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
         };
-        let directory = std::env::var_os("CACHE_WORKLOAD_DIR")
+        let directory = env::var_os("CACHE_WORKLOAD_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(env::temp_dir);
 
         if operations_per_thread == Some(0)
             || threads == Some(0)
@@ -1170,7 +1171,7 @@ fn report_latency(scenario: Scenario, operation: &str, latency: &LatencyHistogra
 }
 
 fn parse_scenarios() -> io::Result<Box<[Scenario]>> {
-    let value = std::env::var("CACHE_WORKLOAD_SCENARIO").unwrap_or_else(|_| "all".to_owned());
+    let value = env::var("CACHE_WORKLOAD_SCENARIO").unwrap_or_else(|_| "all".to_owned());
     if value == "all" {
         return Ok(Scenario::ALL.into());
     }
@@ -1235,22 +1236,22 @@ fn mixed(mut value: u64) -> u64 {
 }
 
 fn env_optional_usize(name: &str) -> io::Result<Option<usize>> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse::<usize>()
             .map(Some)
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

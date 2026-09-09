@@ -2157,6 +2157,7 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
@@ -2186,7 +2187,7 @@ mod tests {
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "cache2-read-lane-{}-{id}.cache",
             std::process::id()
         ));
@@ -2228,7 +2229,7 @@ mod tests {
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "cache2-read-lane-rotation-{}-{id}.cache",
             std::process::id()
         ));
@@ -2473,7 +2474,7 @@ mod tests {
         use crate::region::store::RegionStore;
 
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "cache2-completion-timeout-{}-{id}",
             std::process::id()
         ));

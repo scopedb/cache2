@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::io;
 
 use cache2::Cache;
@@ -27,7 +28,7 @@ use logforth::layout::JsonLayout;
 async fn main() -> io::Result<()> {
     init_logforth();
 
-    let path = std::env::args_os().nth(1).ok_or_else(|| {
+    let path = env::args_os().nth(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: logforth <cache-data-path>",

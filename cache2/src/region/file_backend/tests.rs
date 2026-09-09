@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fs;
 use std::future::Future;
 use std::future::poll_fn;
@@ -100,8 +101,7 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
+        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let files = RegionFiles::new(
@@ -272,8 +272,8 @@ fn external_process_kill_recovery_contract() {
     const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
     const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
 
-    if let Ok(case) = std::env::var(CHILD_CASE) {
-        let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child root is set"));
+    if let Ok(case) = env::var(CHILD_CASE) {
+        let root = PathBuf::from(env::var_os(CHILD_ROOT).expect("child root is set"));
         let files = RegionFiles::new(
             root.join("data"),
             root.join("state"),
@@ -301,7 +301,7 @@ fn external_process_kill_recovery_contract() {
         initial.drain().unwrap();
         initial.close_warm().unwrap();
 
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = Command::new(env::current_exe().unwrap())
             .arg("--exact")
             .arg("region::file_backend::tests::external_process_kill_recovery_contract")
             .arg("--ignored")

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fmt;
 use std::fs;
 use std::hint::black_box;
@@ -108,7 +109,7 @@ impl BenchConfig {
         let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
-        let io_engine = match std::env::var("CACHE_BENCH_IO_ENGINE")
+        let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
@@ -134,7 +135,7 @@ impl BenchConfig {
             )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
-        let io_mode = match std::env::var("CACHE_BENCH_IO_MODE")
+        let io_mode = match env::var("CACHE_BENCH_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
         {
@@ -142,7 +143,7 @@ impl BenchConfig {
             "direct" => IoMode::Direct,
             value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
         };
-        let l1_eviction_policy = match std::env::var("CACHE_BENCH_L1_EVICTION")
+        let l1_eviction_policy = match env::var("CACHE_BENCH_L1_EVICTION")
             .unwrap_or_else(|_| "clock".to_owned())
             .as_str()
         {
@@ -153,9 +154,9 @@ impl BenchConfig {
             }
         };
         let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
-        let directory = std::env::var_os("CACHE_BENCH_DIR")
+        let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(env::temp_dir);
 
         if entries == 0
             || read_ops == 0
@@ -1165,7 +1166,7 @@ fn require_minimum_rate(name: &str, measurement: &Measurement) -> io::Result<()>
 }
 
 fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => {
             let parsed = value
                 .parse::<f64>()
@@ -1177,37 +1178,37 @@ fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
             }
             Ok(Some(parsed))
         }
-        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_u32(name: &str, default: u32) -> io::Result<u32> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }
 
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
         Ok(value) if value == "false" || value == "0" => Ok(false),
         Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -62,9 +63,9 @@ impl ScaleConfig {
                 .ok_or_else(|| invalid("recovery benchmark managed memory limit is too large"))?;
         let sentinel_count = env_usize("CACHE_RECOVERY_SENTINELS", 1_024)?;
         let value_bytes = env_usize("CACHE_RECOVERY_VALUE_BYTES", 1_024)?;
-        let directory = std::env::var_os("CACHE_RECOVERY_DIR")
+        let directory = env::var_os("CACHE_RECOVERY_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(env::temp_dir);
         if expected_entries == 0 || sentinel_count == 0 || value_bytes < 8 || !directory.is_dir() {
             return Err(invalid(
                 "expected entries and sentinels must be positive, values must be at least 8 bytes, and the benchmark directory must exist",
@@ -418,11 +419,11 @@ fn sentinel_key(ordinal: usize) -> [u8; 16] {
 }
 
 fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

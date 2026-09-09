@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -99,8 +100,7 @@ struct TestCache {
 impl TestCache {
     fn new(name: &str) -> Self {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-        let data =
-            std::env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
+        let data = env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
         Self { data }
     }
 

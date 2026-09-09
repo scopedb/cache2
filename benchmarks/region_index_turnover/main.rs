@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fmt;
 use std::io;
 
@@ -134,11 +135,11 @@ fn report_phase(turn: usize, phase: &str, measurement: RegionIndexTurnoverPhase)
 }
 
 fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
@@ -208,7 +209,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::region::RegionFiles;
     use crate::region::recovery::PersistentId;
     use crate::region::store::RegionStore;
-    let root = std::env::temp_dir().join(format!(
+    let root = env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
         std::process::id()
     ));

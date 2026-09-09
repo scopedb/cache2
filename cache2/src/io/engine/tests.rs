@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -77,7 +78,7 @@ impl TestFile {
     fn new() -> Self {
         let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!("cache2-io-engine-{}-{id}.bin", std::process::id()));
+            env::temp_dir().join(format!("cache2-io-engine-{}-{id}.bin", std::process::id()));
         Self { path }
     }
 
