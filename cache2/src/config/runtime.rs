@@ -47,13 +47,13 @@ const DEFAULT_RECLAIM_IO_CONCURRENCY: usize = 1;
 /// Every admitted request occupies one worker until its blocking system call
 /// completes, so worker counts are also the per-pool in-flight limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PosixIoConfig {
+pub struct PosixIoOptions {
     read_workers: usize,
     write_workers: usize,
     reclaim_workers: usize,
 }
 
-impl PosixIoConfig {
+impl PosixIoOptions {
     /// Creates a POSIX topology with independent read, write, and reclaim
     /// worker pools.
     pub const fn new(read_workers: usize, write_workers: usize, reclaim_workers: usize) -> Self {
@@ -80,7 +80,7 @@ impl PosixIoConfig {
     }
 }
 
-impl Default for PosixIoConfig {
+impl Default for PosixIoOptions {
     fn default() -> Self {
         Self::new(
             DEFAULT_POSIX_IO_WORKERS,
@@ -96,14 +96,14 @@ impl Default for PosixIoConfig {
 /// `max_in_flight` is distributed as evenly as possible across `rings`. This
 /// keeps admission capacity independent of the number of driver threads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoUringPoolConfig {
+pub struct IoUringPoolOptions {
     rings: usize,
     max_in_flight: usize,
-    sq_poll: Option<IoUringSqPollConfig>,
+    sq_poll: Option<IoUringSqPollOptions>,
     io_poll: bool,
 }
 
-impl IoUringPoolConfig {
+impl IoUringPoolOptions {
     /// Creates one io_uring pool.
     pub const fn new(rings: usize, max_in_flight: usize) -> Self {
         Self {
@@ -116,7 +116,7 @@ impl IoUringPoolConfig {
 
     /// Enables kernel-side submission queue polling for every ring in this
     /// pool.
-    pub const fn with_sq_poll(mut self, sq_poll: IoUringSqPollConfig) -> Self {
+    pub const fn with_sq_poll(mut self, sq_poll: IoUringSqPollOptions) -> Self {
         self.sq_poll = Some(sq_poll);
         self
     }
@@ -141,7 +141,7 @@ impl IoUringPoolConfig {
     }
 
     /// Returns the submission queue polling configuration.
-    pub const fn sq_poll(self) -> Option<IoUringSqPollConfig> {
+    pub const fn sq_poll(self) -> Option<IoUringSqPollOptions> {
         self.sq_poll
     }
 
@@ -151,7 +151,7 @@ impl IoUringPoolConfig {
     }
 }
 
-impl Default for IoUringPoolConfig {
+impl Default for IoUringPoolOptions {
     fn default() -> Self {
         Self::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT)
     }
@@ -160,12 +160,12 @@ impl Default for IoUringPoolConfig {
 /// Kernel submission queue polling parameters for the experimental io_uring
 /// engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoUringSqPollConfig {
+pub struct IoUringSqPollOptions {
     idle_millis: u32,
     cpu: Option<u32>,
 }
 
-impl IoUringSqPollConfig {
+impl IoUringSqPollOptions {
     /// Enables submission polling and lets the kernel polling thread sleep
     /// after `idle_millis` without new submissions.
     pub const fn new(idle_millis: u32) -> Self {
@@ -196,18 +196,18 @@ impl IoUringSqPollConfig {
 /// Independent topology for the experimental io_uring engine's read, write,
 /// and reclaim traffic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoUringConfig {
-    read: IoUringPoolConfig,
-    write: IoUringPoolConfig,
-    reclaim: IoUringPoolConfig,
+pub struct IoUringOptions {
+    read: IoUringPoolOptions,
+    write: IoUringPoolOptions,
+    reclaim: IoUringPoolOptions,
 }
 
-impl IoUringConfig {
+impl IoUringOptions {
     /// Creates an io_uring topology from its three independent pools.
     pub const fn new(
-        read: IoUringPoolConfig,
-        write: IoUringPoolConfig,
-        reclaim: IoUringPoolConfig,
+        read: IoUringPoolOptions,
+        write: IoUringPoolOptions,
+        reclaim: IoUringPoolOptions,
     ) -> Self {
         Self {
             read,
@@ -217,27 +217,27 @@ impl IoUringConfig {
     }
 
     /// Returns the read-pool topology.
-    pub const fn read(self) -> IoUringPoolConfig {
+    pub const fn read(self) -> IoUringPoolOptions {
         self.read
     }
 
     /// Returns the write-pool topology.
-    pub const fn write(self) -> IoUringPoolConfig {
+    pub const fn write(self) -> IoUringPoolOptions {
         self.write
     }
 
     /// Returns the reclaim-pool topology.
-    pub const fn reclaim(self) -> IoUringPoolConfig {
+    pub const fn reclaim(self) -> IoUringPoolOptions {
         self.reclaim
     }
 }
 
-impl Default for IoUringConfig {
+impl Default for IoUringOptions {
     fn default() -> Self {
         Self::new(
-            IoUringPoolConfig::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
-            IoUringPoolConfig::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
-            IoUringPoolConfig::new(1, DEFAULT_RECLAIM_IO_CONCURRENCY),
+            IoUringPoolOptions::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
+            IoUringPoolOptions::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
+            IoUringPoolOptions::new(1, DEFAULT_RECLAIM_IO_CONCURRENCY),
         )
     }
 }
@@ -246,9 +246,9 @@ impl Default for IoUringConfig {
 /// I/O pools.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IoEngineConfig {
+pub enum IoEngineOptions {
     /// Worker-backed POSIX positioned I/O with explicit thread counts.
-    Posix(PosixIoConfig),
+    Posix(PosixIoOptions),
     /// Experimental Linux io_uring engine with independent ring and in-flight
     /// bounds.
     ///
@@ -257,16 +257,16 @@ pub enum IoEngineConfig {
     ///
     /// This variant is available only with the `io-uring` crate feature on a
     /// supported Linux target.
-    IoUring(IoUringConfig),
+    IoUring(IoUringOptions),
 }
 
-impl Default for IoEngineConfig {
+impl Default for IoEngineOptions {
     fn default() -> Self {
-        Self::Posix(PosixIoConfig::default())
+        Self::Posix(PosixIoOptions::default())
     }
 }
 
-impl IoEngineConfig {
+impl IoEngineOptions {
     const fn is_available(self) -> bool {
         match self {
             Self::Posix(_) => true,
@@ -290,28 +290,28 @@ pub struct IoPoolTopology {
     pub engine_count: usize,
     pub max_in_flight: usize,
     pub worker_threads: usize,
-    pub io_uring: Option<IoUringPoolConfig>,
+    pub io_uring: Option<IoUringPoolOptions>,
 }
 
 impl IoPoolTopology {
-    pub const fn read(engine: IoEngineConfig) -> Self {
+    pub const fn read(engine: IoEngineOptions) -> Self {
         match engine {
-            IoEngineConfig::Posix(config) => Self::posix(config.read_workers),
-            IoEngineConfig::IoUring(config) => Self::io_uring(config.read),
+            IoEngineOptions::Posix(config) => Self::posix(config.read_workers),
+            IoEngineOptions::IoUring(config) => Self::io_uring(config.read),
         }
     }
 
-    pub const fn write(engine: IoEngineConfig) -> Self {
+    pub const fn write(engine: IoEngineOptions) -> Self {
         match engine {
-            IoEngineConfig::Posix(config) => Self::posix(config.write_workers),
-            IoEngineConfig::IoUring(config) => Self::io_uring(config.write),
+            IoEngineOptions::Posix(config) => Self::posix(config.write_workers),
+            IoEngineOptions::IoUring(config) => Self::io_uring(config.write),
         }
     }
 
-    pub const fn reclaim(engine: IoEngineConfig) -> Self {
+    pub const fn reclaim(engine: IoEngineOptions) -> Self {
         match engine {
-            IoEngineConfig::Posix(config) => Self::posix(config.reclaim_workers),
-            IoEngineConfig::IoUring(config) => Self::io_uring(config.reclaim),
+            IoEngineOptions::Posix(config) => Self::posix(config.reclaim_workers),
+            IoEngineOptions::IoUring(config) => Self::io_uring(config.reclaim),
         }
     }
 
@@ -324,7 +324,7 @@ impl IoPoolTopology {
         }
     }
 
-    const fn io_uring(config: IoUringPoolConfig) -> Self {
+    const fn io_uring(config: IoUringPoolOptions) -> Self {
         Self {
             engine_count: config.rings,
             max_in_flight: config.max_in_flight,
@@ -404,7 +404,7 @@ pub enum ReadAdmission {
 pub struct RuntimeOptions {
     /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
     /// and 1 workers.
-    pub io_engine: IoEngineConfig,
+    pub io_engine: IoEngineOptions,
     /// Record I/O mode. Defaults to buffered; direct I/O requires supported Linux storage.
     pub io_mode: IoMode,
     /// Admission policy after an L2 candidate has been selected.
@@ -438,7 +438,7 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            io_engine: IoEngineConfig::default(),
+            io_engine: IoEngineOptions::default(),
             io_mode: IoMode::Buffered,
             read_admission: ReadAdmission::Immediate,
             append_shards: DEFAULT_APPEND_SHARDS,
@@ -572,12 +572,12 @@ impl RuntimeOptions {
         let write_topology = IoPoolTopology::write(self.io_engine);
         let reclaim_topology = IoPoolTopology::reclaim(self.io_engine);
         match self.io_engine {
-            IoEngineConfig::Posix(_) => {
+            IoEngineOptions::Posix(_) => {
                 validate_posix_pool("read", read_topology)?;
                 validate_posix_pool("write", write_topology)?;
                 validate_posix_pool("reclaim", reclaim_topology)?;
             }
-            IoEngineConfig::IoUring(config) => {
+            IoEngineOptions::IoUring(config) => {
                 validate_io_uring_pool("read", config.read())?;
                 validate_io_uring_pool("write", config.write())?;
                 validate_io_uring_pool("reclaim", config.reclaim())?;
@@ -767,7 +767,7 @@ fn validate_posix_pool(name: &str, topology: IoPoolTopology) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_io_uring_pool(name: &str, config: IoUringPoolConfig) -> io::Result<()> {
+fn validate_io_uring_pool(name: &str, config: IoUringPoolOptions) -> io::Result<()> {
     if !(1..=MAX_CONFIG_COUNT).contains(&config.rings()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
         let base = RuntimeOptions {
-            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(7, 4, 1)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(7, 4, 1)),
             ..RuntimeOptions::default()
         };
         let no_wait = runtime_topology_memory_bytes(&base).unwrap();
@@ -836,7 +836,7 @@ mod tests {
         };
         let (_, base_minimum) = base.memory_requirements(geometry, 0).unwrap();
         let (_, parallel_minimum) = RuntimeOptions {
-            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(4, 4, 2)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(4, 4, 2)),
             ..base
         }
         .memory_requirements(geometry, 0)
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn io_engine_topology_matches_backend_shape() {
-        let posix = IoEngineConfig::Posix(PosixIoConfig::new(7, 5, 2));
+        let posix = IoEngineOptions::Posix(PosixIoOptions::new(7, 5, 2));
         assert_eq!(
             IoPoolTopology::read(posix),
             IoPoolTopology {
@@ -864,10 +864,10 @@ mod tests {
             }
         );
 
-        let io_uring = IoEngineConfig::IoUring(IoUringConfig::new(
-            IoUringPoolConfig::new(3, 8),
-            IoUringPoolConfig::new(2, 5),
-            IoUringPoolConfig::new(1, 2),
+        let io_uring = IoEngineOptions::IoUring(IoUringOptions::new(
+            IoUringPoolOptions::new(3, 8),
+            IoUringPoolOptions::new(2, 5),
+            IoUringPoolOptions::new(1, 2),
         ));
         let read = IoPoolTopology::read(io_uring);
         assert_eq!(read.engine_count, 3);
@@ -880,14 +880,14 @@ mod tests {
 
     #[test]
     fn io_uring_depth_reserves_more_than_common_request_bookkeeping() {
-        let pool = IoUringPoolConfig::new(1, 1);
+        let pool = IoUringPoolOptions::new(1, 1);
         let shallow = RuntimeOptions {
-            io_engine: IoEngineConfig::IoUring(IoUringConfig::new(pool, pool, pool)),
+            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(pool, pool, pool)),
             ..RuntimeOptions::default()
         };
         let deep = RuntimeOptions {
-            io_engine: IoEngineConfig::IoUring(IoUringConfig::new(
-                IoUringPoolConfig::new(1, MAX_IO_REQUESTS_PER_ENGINE),
+            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(
+                IoUringPoolOptions::new(1, MAX_IO_REQUESTS_PER_ENGINE),
                 pool,
                 pool,
             )),
@@ -900,13 +900,13 @@ mod tests {
 
     #[test]
     fn io_uring_pool_validation_bounds_rings_and_depth() {
-        validate_io_uring_pool("read", IoUringPoolConfig::new(3, 8)).unwrap();
+        validate_io_uring_pool("read", IoUringPoolOptions::new(3, 8)).unwrap();
 
         for config in [
-            IoUringPoolConfig::new(0, 8),
-            IoUringPoolConfig::new(1, 0),
-            IoUringPoolConfig::new(3, 2),
-            IoUringPoolConfig::new(1, MAX_IO_REQUESTS_PER_ENGINE + 1),
+            IoUringPoolOptions::new(0, 8),
+            IoUringPoolOptions::new(1, 0),
+            IoUringPoolOptions::new(3, 2),
+            IoUringPoolOptions::new(1, MAX_IO_REQUESTS_PER_ENGINE + 1),
         ] {
             assert_eq!(
                 validate_io_uring_pool("read", config).unwrap_err().kind(),
@@ -928,12 +928,12 @@ mod tests {
     ))]
     #[test]
     fn io_poll_requires_direct_mode() {
-        let pool = IoUringPoolConfig::default().with_io_poll(true);
+        let pool = IoUringPoolOptions::default().with_io_poll(true);
         let mut config = RuntimeOptions {
-            io_engine: IoEngineConfig::IoUring(IoUringConfig::new(
+            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(
                 pool,
-                IoUringPoolConfig::default(),
-                IoUringPoolConfig::new(1, 1),
+                IoUringPoolOptions::default(),
+                IoUringPoolOptions::new(1, 1),
             )),
             ..RuntimeOptions::default()
         };

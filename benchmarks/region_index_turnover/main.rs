@@ -18,7 +18,7 @@ use std::io;
 
 use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
-use cache2::benchmarking::RegionIndexTurnoverConfig;
+use cache2::benchmarking::RegionIndexTurnoverOptions;
 use cache2::benchmarking::RegionIndexTurnoverPhase;
 use cache2::benchmarking::run_region_index_turnover;
 
@@ -35,8 +35,8 @@ fn main() -> io::Result<()> {
 }
 
 fn run_benchmark() -> io::Result<()> {
-    let defaults = RegionIndexTurnoverConfig::default();
-    let config = RegionIndexTurnoverConfig {
+    let defaults = RegionIndexTurnoverOptions::default();
+    let config = RegionIndexTurnoverOptions {
         region_count: env_usize("CACHE_INDEX_TURNOVER_REGIONS", defaults.region_count)?,
         entries_per_region: env_usize(
             "CACHE_INDEX_TURNOVER_ENTRIES_PER_REGION",
