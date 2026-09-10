@@ -18,7 +18,7 @@ description = "Performance-first bounded RAM and NVMe hybrid cache"
 documentation = "https://docs.rs/cache2"
 keywords = ["cache", "nvme", "storage"]
 name = "cache2"
-version = "0.3.0"
+version = "0.4.0"
 
 edition.workspace = true
 license.workspace = true
