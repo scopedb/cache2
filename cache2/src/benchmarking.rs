@@ -39,6 +39,7 @@ const ENTRY_HASH_DOMAIN: u64 = 0x656e_7472_792d_6b65;
 const MISSING_HASH_DOMAIN: u64 = 0x6d69_7373_696e_672d;
 const BENCHMARK_RECORD_BYTES: u32 = 16 * 1024;
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct RegionIndexTurnoverOptions {
     pub region_count: usize,

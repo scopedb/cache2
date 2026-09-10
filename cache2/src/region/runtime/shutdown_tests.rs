@@ -231,7 +231,11 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let config = RuntimeOptions {
         append_shards: 1,
         l1_capacity_bytes: 0,
-        io_engine: IoEngineOptions::Posix(PosixIoOptions::new(1, 1, 1)),
+        io_engine: IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 1,
+            write_workers: 1,
+            reclaim_workers: 1,
+        }),
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(

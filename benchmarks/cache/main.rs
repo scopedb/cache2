@@ -37,7 +37,6 @@ use cache2::CacheTier;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
 use cache2::IoUringOptions;
-use cache2::IoUringPoolOptions;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoOptions;
 use cache2::ReadAdmission;
@@ -113,26 +112,27 @@ impl BenchConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngineOptions::Posix(PosixIoOptions::new(
-                read_io_workers,
-                write_io_workers,
-                reclaim_workers,
-            )),
-            "io-uring" => IoEngineOptions::IoUring(IoUringOptions::new(
-                IoUringPoolOptions::new(
-                    read_io_workers,
-                    read_io_workers
-                        .checked_mul(64)
-                        .ok_or_else(|| invalid("read io_uring depth is too large"))?,
-                ),
-                IoUringPoolOptions::new(
-                    write_io_workers,
-                    write_io_workers
-                        .checked_mul(64)
-                        .ok_or_else(|| invalid("write io_uring depth is too large"))?,
-                ),
-                IoUringPoolOptions::new(reclaim_workers, reclaim_workers),
-            )),
+            "posix" => {
+                let mut options = PosixIoOptions::default();
+                options.read_workers = read_io_workers;
+                options.write_workers = write_io_workers;
+                options.reclaim_workers = reclaim_workers;
+                IoEngineOptions::Posix(options)
+            }
+            "io-uring" => {
+                let mut options = IoUringOptions::default();
+                options.read.rings = read_io_workers;
+                options.read.max_in_flight = read_io_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("read io_uring depth is too large"))?;
+                options.write.rings = write_io_workers;
+                options.write.max_in_flight = write_io_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("write io_uring depth is too large"))?;
+                options.reclaim.rings = reclaim_workers;
+                options.reclaim.max_in_flight = reclaim_workers;
+                IoEngineOptions::IoUring(options)
+            }
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_BENCH_IO_MODE")
@@ -269,32 +269,30 @@ impl BenchConfig {
     }
 
     fn storage_options(&self) -> StorageOptions {
-        StorageOptions {
-            region_size_bytes: REGION_BYTES as u64,
-            expected_entries: Some(self.entries.saturating_mul(4)),
-            ..StorageOptions::new(self.capacity_bytes)
-        }
+        let mut options = StorageOptions::new(self.capacity_bytes);
+        options.region_size_bytes = REGION_BYTES as u64;
+        options.expected_entries = Some(self.entries.saturating_mul(4));
+        options
     }
 
     fn runtime_options(&self) -> RuntimeOptions {
-        RuntimeOptions {
-            io_engine: self.io_engine,
-            io_mode: self.io_mode,
-            append_shards: self.append_shards,
-            l1_capacity_bytes: self.memory_bytes,
-            l1_eviction_policy: self.l1_eviction_policy,
-            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
-            statistics: self.statistics_enabled,
-            read_admission: if self.read_io_wait_timeout.is_zero() {
-                ReadAdmission::Immediate
-            } else {
-                ReadAdmission::Wait {
-                    timeout: self.read_io_wait_timeout,
-                    max_waiters: Some(self.read_io_wait_capacity),
-                }
-            },
-            ..RuntimeOptions::default()
-        }
+        let mut options = RuntimeOptions::default();
+        options.io_engine = self.io_engine;
+        options.io_mode = self.io_mode;
+        options.append_shards = self.append_shards;
+        options.l1_capacity_bytes = self.memory_bytes;
+        options.l1_eviction_policy = self.l1_eviction_policy;
+        options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
+        options.statistics = self.statistics_enabled;
+        options.read_admission = if self.read_io_wait_timeout.is_zero() {
+            ReadAdmission::Immediate
+        } else {
+            ReadAdmission::Wait {
+                timeout: self.read_io_wait_timeout,
+                max_waiters: Some(self.read_io_wait_capacity),
+            }
+        };
+        options
     }
 
     fn l2_clients(&self) -> usize {
@@ -448,13 +446,9 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             if initial_l1_bytes == config.memory_bytes {
                 cache_config.clone()
             } else {
-                CacheConfig::new(
-                    cache_config.storage().clone(),
-                    RuntimeOptions {
-                        l1_capacity_bytes: initial_l1_bytes,
-                        ..cache_config.runtime().clone()
-                    },
-                )?
+                let mut options = cache_config.runtime().clone();
+                options.l1_capacity_bytes = initial_l1_bytes;
+                CacheConfig::new(cache_config.storage().clone(), options)?
             },
         )
         .await?,

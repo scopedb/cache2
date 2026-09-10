@@ -2497,7 +2497,11 @@ mod tests {
         };
         for wait in [Duration::ZERO, Duration::from_millis(1)] {
             let config = RuntimeOptions {
-                io_engine: IoEngineOptions::Posix(PosixIoOptions::new(1, 1, 1)),
+                io_engine: IoEngineOptions::Posix(PosixIoOptions {
+                    read_workers: 1,
+                    write_workers: 1,
+                    reclaim_workers: 1,
+                }),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
                 statistics: true,

@@ -5,6 +5,7 @@
 ### Breaking Changes
 
 - Unchecked I/O inputs now consistently use `Options` names: replace `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` with their `Options` counterparts. The benchmarking input is likewise renamed to `RegionIndexTurnoverOptions`. Validated `CacheConfig` and `StorageLayout` retain their names and construction semantics.
+- All option structs are now `#[non_exhaustive]` with public fields. Replace struct literals with `new(required_input)` or `Default` followed by field assignments. I/O option getters, positional constructors, and `with_*` methods are removed; `IoUringSqPollOptions::new(idle_millis)` is retained. See [the configuration migration guide](CONFIGURATION.md#migrating-from-04) for details.
 
 ## v0.4.0 (2026-09-10)
 

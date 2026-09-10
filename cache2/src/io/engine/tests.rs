@@ -764,7 +764,11 @@ fn configured_posix_engine_shares_its_worker_capacity() {
         files,
         4,
         4,
-        IoEngineOptions::Posix(PosixIoOptions::new(4, 4, 1)),
+        IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 4,
+            write_workers: 4,
+            reclaim_workers: 1,
+        }),
         None,
         false,
         false,

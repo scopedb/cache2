@@ -56,25 +56,25 @@ use cache2::StorageOptions;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
 fn test_storage() -> StorageLayout {
-    StorageOptions {
-        region_size_bytes: 512 * 1024,
-        expected_entries: Some(3277),
-        ..StorageOptions::new(3 * 512 * 1024)
-    }
-    .build()
-    .unwrap()
+    let mut options = StorageOptions::new(3 * 512 * 1024);
+    options.region_size_bytes = 512 * 1024;
+    options.expected_entries = Some(3277);
+    options.build().unwrap()
 }
 
 fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
-    RuntimeOptions {
-        io_engine: IoEngineOptions::Posix(PosixIoOptions::new(workers, workers, 1)),
-        append_shards,
-        l1_capacity_bytes: 4 * 1024 * 1024,
-        managed_memory_limit_bytes: 32 * 1024 * 1024,
-        write_flush_threshold_bytes: 256 * 1024,
-        statistics: true,
-        ..RuntimeOptions::default()
-    }
+    let mut io = PosixIoOptions::default();
+    io.read_workers = workers;
+    io.write_workers = workers;
+    io.reclaim_workers = 1;
+    let mut options = RuntimeOptions::default();
+    options.io_engine = IoEngineOptions::Posix(io);
+    options.append_shards = append_shards;
+    options.l1_capacity_bytes = 4 * 1024 * 1024;
+    options.managed_memory_limit_bytes = 32 * 1024 * 1024;
+    options.write_flush_threshold_bytes = 256 * 1024;
+    options.statistics = true;
+    options
 }
 
 fn test_config(workers: usize) -> CacheConfig {
@@ -218,14 +218,9 @@ fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
         .unwrap();
     let config = test_config(1);
     let minimum_memory_bytes = config.minimum_memory_bytes();
-    let config = CacheConfig::new(
-        config.storage().clone(),
-        RuntimeOptions {
-            managed_memory_limit_bytes: minimum_memory_bytes,
-            ..config.runtime().clone()
-        },
-    )
-    .unwrap();
+    let mut options = config.runtime().clone();
+    options.managed_memory_limit_bytes = minimum_memory_bytes;
+    let config = CacheConfig::new(config.storage().clone(), options).unwrap();
     files.assert_absent();
 
     caller_runtime.block_on(async {
@@ -438,11 +433,9 @@ async fn l2_only_put_survives_warm_recovery() {
 #[tokio::test]
 async fn write_flush_threshold_does_not_cap_region_sized_staging() {
     let files = TestCache::new("reject-write-buffer-flush");
-    let runtime = RuntimeOptions {
-        l1_capacity_bytes: 1024 * 1024,
-        l1_shards: 1,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.l1_capacity_bytes = 1024 * 1024;
+    runtime.l1_shards = 1;
     let cache = Cache::open(
         &files.data,
         CacheConfig::new(test_storage(), runtime).unwrap(),
@@ -468,12 +461,10 @@ async fn write_flush_threshold_does_not_cap_region_sized_staging() {
 #[tokio::test]
 async fn l1_bypass_may_remain_stale_after_region_completion() {
     let files = TestCache::new("l1-bypass-publication");
-    let runtime = RuntimeOptions {
-        l1_capacity_bytes: 512,
-        l1_shards: 1,
-        write_flush_threshold_bytes: 128 * 1024,
-        ..test_runtime_options(2, 2)
-    };
+    let mut runtime = test_runtime_options(2, 2);
+    runtime.l1_capacity_bytes = 512;
+    runtime.l1_shards = 1;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
     let cache = Cache::open(
         &files.data,
         CacheConfig::new(test_storage(), runtime).unwrap(),
@@ -511,12 +502,10 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
 #[test]
 fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
-    let runtime = RuntimeOptions {
-        io_engine: IoEngineOptions::IoUring(IoUringOptions::default()),
-        write_flush_threshold_bytes: 128 * 1024,
-        statistics: false,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.io_engine = IoEngineOptions::IoUring(IoUringOptions::default());
+    runtime.write_flush_threshold_bytes = 128 * 1024;
+    runtime.statistics = false;
 
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -529,12 +518,10 @@ fn unavailable_io_engine_is_rejected_before_file_creation() {
 #[test]
 fn unavailable_direct_io_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-direct-io");
-    let runtime = RuntimeOptions {
-        io_mode: IoMode::Direct,
-        write_flush_threshold_bytes: 128 * 1024,
-        statistics: false,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.io_mode = IoMode::Direct;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
+    runtime.statistics = false;
 
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -568,18 +555,20 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let retuned = RuntimeOptions {
-        io_engine: IoEngineOptions::Posix(PosixIoOptions::new(7, 2, 2)),
-        l1_capacity_bytes: 2 * 1024 * 1024,
-        l1_eviction_policy: L1EvictionPolicy::S3Fifo,
-        l1_shards: 7,
-        write_flush_threshold_bytes: 64 * 1024,
-        statistics: false,
-        read_admission: ReadAdmission::Wait {
-            timeout: Duration::from_millis(10),
-            max_waiters: None,
-        },
-        ..test_runtime_options(2, 2)
+    let mut io = PosixIoOptions::default();
+    io.read_workers = 7;
+    io.write_workers = 2;
+    io.reclaim_workers = 2;
+    let mut retuned = test_runtime_options(2, 2);
+    retuned.io_engine = IoEngineOptions::Posix(io);
+    retuned.l1_capacity_bytes = 2 * 1024 * 1024;
+    retuned.l1_eviction_policy = L1EvictionPolicy::S3Fifo;
+    retuned.l1_shards = 7;
+    retuned.write_flush_threshold_bytes = 64 * 1024;
+    retuned.statistics = false;
+    retuned.read_admission = ReadAdmission::Wait {
+        timeout: Duration::from_millis(10),
+        max_waiters: None,
     };
     let reopened = Cache::open(
         &files.data,
@@ -884,13 +873,10 @@ async fn cold_start_removes_stale_recovery_files() {
 #[tokio::test]
 async fn minimum_region_stores_its_first_record_at_offset_zero_and_recovers() {
     let files = TestCache::new("minimum-region");
-    let storage = StorageOptions {
-        region_size_bytes: 4096,
-        expected_entries: Some(51),
-        ..StorageOptions::new(2 * 4096)
-    }
-    .build()
-    .unwrap();
+    let mut storage_options = StorageOptions::new(2 * 4096);
+    storage_options.region_size_bytes = 4096;
+    storage_options.expected_entries = Some(51);
+    let storage = storage_options.build().unwrap();
     let value = vec![0x5a; 128];
 
     let cache = Cache::open(
@@ -1142,11 +1128,9 @@ async fn buffered_l2_read_reports_the_size_class_upper_bound() {
 #[tokio::test]
 async fn read_io_failure_is_counted_and_latches_miss_only() {
     let files = TestCache::new("snapshot-read-failure");
-    let runtime = RuntimeOptions {
-        l1_capacity_bytes: 0,
-        write_flush_threshold_bytes: 128 * 1024,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.l1_capacity_bytes = 0;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
     let cache = Cache::open(
         &files.data,
         CacheConfig::new(test_storage(), runtime).unwrap(),
@@ -1174,12 +1158,10 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
 #[tokio::test]
 async fn promoted_l2_values_release_transient_read_memory_before_return() {
     let files = TestCache::new("promoted-l2-buffer-release");
-    let runtime = RuntimeOptions {
-        l1_capacity_bytes: 64 * 1024,
-        l1_shards: 1,
-        write_flush_threshold_bytes: 128 * 1024,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.l1_capacity_bytes = 64 * 1024;
+    runtime.l1_shards = 1;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
     let cache = Cache::open(
         &files.data,
         CacheConfig::new(test_storage(), runtime.clone()).unwrap(),
@@ -1214,11 +1196,9 @@ async fn promoted_l2_values_release_transient_read_memory_before_return() {
 #[tokio::test]
 async fn retained_l2_values_charge_and_release_transient_memory() {
     let files = TestCache::new("retained-read-memory");
-    let runtime = RuntimeOptions {
-        l1_capacity_bytes: 0,
-        write_flush_threshold_bytes: 128 * 1024,
-        ..test_runtime_options(1, 2)
-    };
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.l1_capacity_bytes = 0;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
     let cache = Cache::open(
         &files.data,
         CacheConfig::new(test_storage(), runtime).unwrap(),
@@ -1253,13 +1233,10 @@ async fn storage_change_discards_the_old_image() {
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let changed = StorageOptions {
-        region_size_bytes: 512 * 1024,
-        expected_entries: Some(6553),
-        ..StorageOptions::new(3 * 512 * 1024)
-    }
-    .build()
-    .unwrap();
+    let mut storage_options = StorageOptions::new(3 * 512 * 1024);
+    storage_options.region_size_bytes = 512 * 1024;
+    storage_options.expected_entries = Some(6553);
+    let changed = storage_options.build().unwrap();
     let reopened = Cache::open(&files.data, test_config_with_storage(5, changed))
         .await
         .unwrap();

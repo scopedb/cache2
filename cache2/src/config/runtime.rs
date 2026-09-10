@@ -42,208 +42,120 @@ const DEFAULT_POSIX_IO_WORKERS: usize = 4;
 const DEFAULT_IO_URING_MAX_IN_FLIGHT: usize = 64;
 const DEFAULT_RECLAIM_IO_CONCURRENCY: usize = 1;
 
-/// Worker topology for POSIX positioned I/O.
+/// Unchecked worker topology for POSIX positioned I/O.
 ///
+/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
 /// Every admitted request occupies one worker until its blocking system call
 /// completes, so worker counts are also the per-pool in-flight limits.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PosixIoOptions {
-    read_workers: usize,
-    write_workers: usize,
-    reclaim_workers: usize,
-}
-
-impl PosixIoOptions {
-    /// Creates a POSIX topology with independent read, write, and reclaim
-    /// worker pools.
-    pub const fn new(read_workers: usize, write_workers: usize, reclaim_workers: usize) -> Self {
-        Self {
-            read_workers,
-            write_workers,
-            reclaim_workers,
-        }
-    }
-
-    /// Returns the number of read workers.
-    pub const fn read_workers(self) -> usize {
-        self.read_workers
-    }
-
-    /// Returns the number of write workers.
-    pub const fn write_workers(self) -> usize {
-        self.write_workers
-    }
-
-    /// Returns the number of reclaim workers.
-    pub const fn reclaim_workers(self) -> usize {
-        self.reclaim_workers
-    }
+    /// Number of read workers. Defaults to 4.
+    pub read_workers: usize,
+    /// Number of write workers. Defaults to 4.
+    pub write_workers: usize,
+    /// Number of reclaim workers. Defaults to 1.
+    pub reclaim_workers: usize,
 }
 
 impl Default for PosixIoOptions {
     fn default() -> Self {
-        Self::new(
-            DEFAULT_POSIX_IO_WORKERS,
-            DEFAULT_POSIX_IO_WORKERS,
-            DEFAULT_RECLAIM_IO_CONCURRENCY,
-        )
-    }
-}
-
-/// One pool's physical rings and aggregate execution bound for the
-/// experimental io_uring engine.
-///
-/// `max_in_flight` is distributed as evenly as possible across `rings`. This
-/// keeps admission capacity independent of the number of driver threads.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoUringPoolOptions {
-    rings: usize,
-    max_in_flight: usize,
-    sq_poll: Option<IoUringSqPollOptions>,
-    io_poll: bool,
-}
-
-impl IoUringPoolOptions {
-    /// Creates one io_uring pool.
-    pub const fn new(rings: usize, max_in_flight: usize) -> Self {
         Self {
-            rings,
-            max_in_flight,
-            sq_poll: None,
-            io_poll: false,
+            read_workers: DEFAULT_POSIX_IO_WORKERS,
+            write_workers: DEFAULT_POSIX_IO_WORKERS,
+            reclaim_workers: DEFAULT_RECLAIM_IO_CONCURRENCY,
         }
     }
+}
 
-    /// Enables kernel-side submission queue polling for every ring in this
-    /// pool.
-    pub const fn with_sq_poll(mut self, sq_poll: IoUringSqPollOptions) -> Self {
-        self.sq_poll = Some(sq_poll);
-        self
-    }
-
-    /// Enables or disables completion polling for every ring in this pool.
+/// Unchecked physical rings and aggregate execution bound for one pool of the
+/// experimental io_uring engine.
+///
+/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
+/// `max_in_flight` is distributed as evenly as possible across `rings`. This
+/// keeps admission capacity independent of the number of driver threads.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringPoolOptions {
+    /// Number of independent rings and driver threads. Defaults to 1.
+    pub rings: usize,
+    /// Aggregate maximum number of in-flight requests. Defaults to 64.
+    pub max_in_flight: usize,
+    /// Kernel submission queue polling for every ring in this pool. Defaults to
+    /// `None`, which disables polling.
+    pub sq_poll: Option<IoUringSqPollOptions>,
+    /// Completion polling for every ring in this pool. Defaults to false.
     ///
     /// I/O polling consumes CPU while waiting and requires direct I/O on a
     /// filesystem and block device that support polling.
-    pub const fn with_io_poll(mut self, enabled: bool) -> Self {
-        self.io_poll = enabled;
-        self
-    }
-
-    /// Returns the number of independent rings and driver threads.
-    pub const fn rings(self) -> usize {
-        self.rings
-    }
-
-    /// Returns the aggregate maximum number of in-flight requests.
-    pub const fn max_in_flight(self) -> usize {
-        self.max_in_flight
-    }
-
-    /// Returns the submission queue polling configuration.
-    pub const fn sq_poll(self) -> Option<IoUringSqPollOptions> {
-        self.sq_poll
-    }
-
-    /// Returns whether completion polling is enabled.
-    pub const fn io_poll(self) -> bool {
-        self.io_poll
-    }
+    pub io_poll: bool,
 }
 
 impl Default for IoUringPoolOptions {
     fn default() -> Self {
-        Self::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT)
+        Self {
+            rings: 1,
+            max_in_flight: DEFAULT_IO_URING_MAX_IN_FLIGHT,
+            sq_poll: None,
+            io_poll: false,
+        }
     }
 }
 
-/// Kernel submission queue polling parameters for the experimental io_uring
-/// engine.
+/// Unchecked kernel submission queue polling parameters for the experimental
+/// io_uring engine.
+///
+/// Start with [`Self::new`] and assign fields before building [`CacheConfig`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringSqPollOptions {
-    idle_millis: u32,
-    cpu: Option<u32>,
+    /// Idle time in milliseconds before the kernel polling thread can sleep.
+    pub idle_millis: u32,
+    /// Optional CPU affinity. Defaults to `None`, which leaves the thread unpinned.
+    /// For a multi-ring pool, every ring's polling thread uses this CPU.
+    pub cpu: Option<u32>,
 }
 
 impl IoUringSqPollOptions {
-    /// Enables submission polling and lets the kernel polling thread sleep
-    /// after `idle_millis` without new submissions.
+    /// Selects a submission polling idle time with no CPU affinity.
     pub const fn new(idle_millis: u32) -> Self {
         Self {
             idle_millis,
             cpu: None,
         }
     }
-
-    /// Pins the kernel polling thread to one CPU.
-    /// For a multi-ring pool, every ring's polling thread uses this CPU.
-    pub const fn with_cpu(mut self, cpu: u32) -> Self {
-        self.cpu = Some(cpu);
-        self
-    }
-
-    /// Returns the idle time in milliseconds.
-    pub const fn idle_millis(self) -> u32 {
-        self.idle_millis
-    }
-
-    /// Returns the optional CPU affinity.
-    pub const fn cpu(self) -> Option<u32> {
-        self.cpu
-    }
 }
 
-/// Independent topology for the experimental io_uring engine's read, write,
-/// and reclaim traffic.
+/// Unchecked topology for the experimental io_uring engine's independent read,
+/// write, and reclaim pools.
+///
+/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringOptions {
-    read: IoUringPoolOptions,
-    write: IoUringPoolOptions,
-    reclaim: IoUringPoolOptions,
-}
-
-impl IoUringOptions {
-    /// Creates an io_uring topology from its three independent pools.
-    pub const fn new(
-        read: IoUringPoolOptions,
-        write: IoUringPoolOptions,
-        reclaim: IoUringPoolOptions,
-    ) -> Self {
-        Self {
-            read,
-            write,
-            reclaim,
-        }
-    }
-
-    /// Returns the read-pool topology.
-    pub const fn read(self) -> IoUringPoolOptions {
-        self.read
-    }
-
-    /// Returns the write-pool topology.
-    pub const fn write(self) -> IoUringPoolOptions {
-        self.write
-    }
-
-    /// Returns the reclaim-pool topology.
-    pub const fn reclaim(self) -> IoUringPoolOptions {
-        self.reclaim
-    }
+    /// Read pool. Defaults to one ring and 64 in-flight requests.
+    pub read: IoUringPoolOptions,
+    /// Write pool. Defaults to one ring and 64 in-flight requests.
+    pub write: IoUringPoolOptions,
+    /// Reclaim pool. Defaults to one ring and one in-flight request.
+    pub reclaim: IoUringPoolOptions,
 }
 
 impl Default for IoUringOptions {
     fn default() -> Self {
-        Self::new(
-            IoUringPoolOptions::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
-            IoUringPoolOptions::new(1, DEFAULT_IO_URING_MAX_IN_FLIGHT),
-            IoUringPoolOptions::new(1, DEFAULT_RECLAIM_IO_CONCURRENCY),
-        )
+        Self {
+            read: IoUringPoolOptions::default(),
+            write: IoUringPoolOptions::default(),
+            reclaim: IoUringPoolOptions {
+                max_in_flight: DEFAULT_RECLAIM_IO_CONCURRENCY,
+                ..IoUringPoolOptions::default()
+            },
+        }
     }
 }
 
-/// Runtime implementation used by the independent read, write, and reclaim
-/// I/O pools.
+/// Unchecked engine selection and topology for the independent read, write,
+/// and reclaim I/O pools, validated by [`CacheConfig::new`].
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoEngineOptions {
@@ -400,6 +312,8 @@ pub enum ReadAdmission {
 /// from recovered Active and Free Regions when the requested topology fits.
 /// Fields are unchecked inputs. Configuration construction resolves defaults and
 /// checks the complete combination before any files are opened.
+/// Start with [`Self::default`] and assign the fields to customize.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
     /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
@@ -484,10 +398,19 @@ impl CacheConfig {
     /// # async fn example() -> Result<(), cache2::Error> {
     /// use cache2::Cache;
     /// use cache2::CacheConfig;
+    /// use cache2::IoEngineOptions;
+    /// use cache2::PosixIoOptions;
     /// use cache2::RuntimeOptions;
     /// use cache2::StorageOptions;
-    /// let storage = StorageOptions::new(1024 * 1024 * 1024).build()?;
-    /// let config = CacheConfig::new(storage, RuntimeOptions::default())?;
+    /// let mut storage = StorageOptions::new(1024 * 1024 * 1024);
+    /// storage.expected_entries = Some(100_000);
+    /// let storage = storage.build()?;
+    /// let mut io = PosixIoOptions::default();
+    /// io.read_workers = 8;
+    /// let mut runtime = RuntimeOptions::default();
+    /// runtime.io_engine = IoEngineOptions::Posix(io);
+    /// runtime.statistics = true;
+    /// let config = CacheConfig::new(storage, runtime)?;
     /// let disk_peak = config.storage().peak_disk_bytes();
     /// let memory_floor = config.minimum_memory_bytes();
     /// let cache = Cache::open("cache.data", config).await?;
@@ -578,13 +501,11 @@ impl RuntimeOptions {
                 validate_posix_pool("reclaim", reclaim_topology)?;
             }
             IoEngineOptions::IoUring(config) => {
-                validate_io_uring_pool("read", config.read())?;
-                validate_io_uring_pool("write", config.write())?;
-                validate_io_uring_pool("reclaim", config.reclaim())?;
+                validate_io_uring_pool("read", config.read)?;
+                validate_io_uring_pool("write", config.write)?;
+                validate_io_uring_pool("reclaim", config.reclaim)?;
                 if self.io_mode != IoMode::Direct
-                    && (config.read().io_poll()
-                        || config.write().io_poll()
-                        || config.reclaim().io_poll())
+                    && (config.read.io_poll || config.write.io_poll || config.reclaim.io_poll)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -768,25 +689,25 @@ fn validate_posix_pool(name: &str, topology: IoPoolTopology) -> io::Result<()> {
 }
 
 fn validate_io_uring_pool(name: &str, config: IoUringPoolOptions) -> io::Result<()> {
-    if !(1..=MAX_CONFIG_COUNT).contains(&config.rings()) {
+    if !(1..=MAX_CONFIG_COUNT).contains(&config.rings) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} ring count must be in 1..={MAX_CONFIG_COUNT}"),
         ));
     }
-    if !(1..=MAX_CONFIG_COUNT).contains(&config.max_in_flight()) {
+    if !(1..=MAX_CONFIG_COUNT).contains(&config.max_in_flight) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} maximum in-flight requests must be in 1..={MAX_CONFIG_COUNT}"),
         ));
     }
-    if config.rings() > config.max_in_flight() {
+    if config.rings > config.max_in_flight {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} ring count must not exceed its in-flight limit"),
         ));
     }
-    if config.max_in_flight().div_ceil(config.rings()) > MAX_IO_REQUESTS_PER_ENGINE {
+    if config.max_in_flight.div_ceil(config.rings) > MAX_IO_REQUESTS_PER_ENGINE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} per-ring depth must not exceed {MAX_IO_REQUESTS_PER_ENGINE}"),
@@ -806,7 +727,11 @@ mod tests {
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {
         let base = RuntimeOptions {
-            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(7, 4, 1)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions {
+                read_workers: 7,
+                write_workers: 4,
+                reclaim_workers: 1,
+            }),
             ..RuntimeOptions::default()
         };
         let no_wait = runtime_topology_memory_bytes(&base).unwrap();
@@ -836,7 +761,11 @@ mod tests {
         };
         let (_, base_minimum) = base.memory_requirements(geometry, 0).unwrap();
         let (_, parallel_minimum) = RuntimeOptions {
-            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(4, 4, 2)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions {
+                read_workers: 4,
+                write_workers: 4,
+                reclaim_workers: 2,
+            }),
             ..base
         }
         .memory_requirements(geometry, 0)
@@ -853,7 +782,11 @@ mod tests {
 
     #[test]
     fn io_engine_topology_matches_backend_shape() {
-        let posix = IoEngineOptions::Posix(PosixIoOptions::new(7, 5, 2));
+        let posix = IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 7,
+            write_workers: 5,
+            reclaim_workers: 2,
+        });
         assert_eq!(
             IoPoolTopology::read(posix),
             IoPoolTopology {
@@ -864,11 +797,23 @@ mod tests {
             }
         );
 
-        let io_uring = IoEngineOptions::IoUring(IoUringOptions::new(
-            IoUringPoolOptions::new(3, 8),
-            IoUringPoolOptions::new(2, 5),
-            IoUringPoolOptions::new(1, 2),
-        ));
+        let io_uring = IoEngineOptions::IoUring(IoUringOptions {
+            read: IoUringPoolOptions {
+                rings: 3,
+                max_in_flight: 8,
+                ..IoUringPoolOptions::default()
+            },
+            write: IoUringPoolOptions {
+                rings: 2,
+                max_in_flight: 5,
+                ..IoUringPoolOptions::default()
+            },
+            reclaim: IoUringPoolOptions {
+                rings: 1,
+                max_in_flight: 2,
+                ..IoUringPoolOptions::default()
+            },
+        });
         let read = IoPoolTopology::read(io_uring);
         assert_eq!(read.engine_count, 3);
         assert_eq!(read.max_in_flight, 8);
@@ -880,17 +825,29 @@ mod tests {
 
     #[test]
     fn io_uring_depth_reserves_more_than_common_request_bookkeeping() {
-        let pool = IoUringPoolOptions::new(1, 1);
+        let pool = IoUringPoolOptions {
+            rings: 1,
+            max_in_flight: 1,
+            ..IoUringPoolOptions::default()
+        };
         let shallow = RuntimeOptions {
-            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(pool, pool, pool)),
+            io_engine: IoEngineOptions::IoUring(IoUringOptions {
+                read: pool,
+                write: pool,
+                reclaim: pool,
+            }),
             ..RuntimeOptions::default()
         };
         let deep = RuntimeOptions {
-            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(
-                IoUringPoolOptions::new(1, MAX_IO_REQUESTS_PER_ENGINE),
-                pool,
-                pool,
-            )),
+            io_engine: IoEngineOptions::IoUring(IoUringOptions {
+                read: IoUringPoolOptions {
+                    rings: 1,
+                    max_in_flight: MAX_IO_REQUESTS_PER_ENGINE,
+                    ..IoUringPoolOptions::default()
+                },
+                write: pool,
+                reclaim: pool,
+            }),
             ..shallow.clone()
         };
         let growth = runtime_topology_memory_bytes(&deep).unwrap()
@@ -900,13 +857,37 @@ mod tests {
 
     #[test]
     fn io_uring_pool_validation_bounds_rings_and_depth() {
-        validate_io_uring_pool("read", IoUringPoolOptions::new(3, 8)).unwrap();
+        validate_io_uring_pool(
+            "read",
+            IoUringPoolOptions {
+                rings: 3,
+                max_in_flight: 8,
+                ..IoUringPoolOptions::default()
+            },
+        )
+        .unwrap();
 
         for config in [
-            IoUringPoolOptions::new(0, 8),
-            IoUringPoolOptions::new(1, 0),
-            IoUringPoolOptions::new(3, 2),
-            IoUringPoolOptions::new(1, MAX_IO_REQUESTS_PER_ENGINE + 1),
+            IoUringPoolOptions {
+                rings: 0,
+                max_in_flight: 8,
+                ..IoUringPoolOptions::default()
+            },
+            IoUringPoolOptions {
+                rings: 1,
+                max_in_flight: 0,
+                ..IoUringPoolOptions::default()
+            },
+            IoUringPoolOptions {
+                rings: 3,
+                max_in_flight: 2,
+                ..IoUringPoolOptions::default()
+            },
+            IoUringPoolOptions {
+                rings: 1,
+                max_in_flight: MAX_IO_REQUESTS_PER_ENGINE + 1,
+                ..IoUringPoolOptions::default()
+            },
         ] {
             assert_eq!(
                 validate_io_uring_pool("read", config).unwrap_err().kind(),
@@ -928,13 +909,20 @@ mod tests {
     ))]
     #[test]
     fn io_poll_requires_direct_mode() {
-        let pool = IoUringPoolOptions::default().with_io_poll(true);
+        let pool = IoUringPoolOptions {
+            io_poll: true,
+            ..IoUringPoolOptions::default()
+        };
         let mut config = RuntimeOptions {
-            io_engine: IoEngineOptions::IoUring(IoUringOptions::new(
-                pool,
-                IoUringPoolOptions::default(),
-                IoUringPoolOptions::new(1, 1),
-            )),
+            io_engine: IoEngineOptions::IoUring(IoUringOptions {
+                read: pool,
+                write: IoUringPoolOptions::default(),
+                reclaim: IoUringPoolOptions {
+                    rings: 1,
+                    max_in_flight: 1,
+                    ..IoUringPoolOptions::default()
+                },
+            }),
             ..RuntimeOptions::default()
         };
 
