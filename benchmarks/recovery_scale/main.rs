@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
+use std::fs;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -26,8 +28,7 @@ use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
 use cache2::Cache;
 use cache2::CacheConfig;
-use cache2::ErrorKind as CacheErrorKind;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::PosixIoConfig;
 use cache2::RuntimeOptions;
@@ -91,7 +92,7 @@ impl ScaleConfig {
 
     fn runtime_options(&self) -> RuntimeOptions {
         RuntimeOptions {
-            io_engine: IoEngine::Posix(PosixIoConfig::new(1, 1, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
             io_mode: IoMode::Buffered,
             append_shards: 4,
             l1_capacity_bytes: self.memory_bytes,
@@ -129,7 +130,7 @@ impl ScaleFiles {
     fn logical_bytes(&self) -> io::Result<u64> {
         self.paths()
             .into_iter()
-            .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+            .try_fold(0_u64, |total, path| match fs::metadata(path) {
                 Ok(metadata) => total
                     .checked_add(metadata.len())
                     .ok_or_else(|| invalid("logical file size overflow")),
@@ -144,7 +145,7 @@ impl ScaleFiles {
 
         self.paths()
             .into_iter()
-            .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+            .try_fold(0_u64, |total, path| match fs::metadata(path) {
                 Ok(metadata) => total
                     .checked_add(metadata.blocks().saturating_mul(512))
                     .ok_or_else(|| invalid("allocated file size overflow")),
@@ -178,7 +179,7 @@ impl Drop for ScaleFiles {
             return;
         }
         for path in self.paths() {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -190,7 +191,7 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -279,11 +280,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     Ok(())
 }
 
-async fn verify_sentinels(
-    cache: &cache2::Cache,
-    keys: &[[u8; 16]],
-    value_bytes: usize,
-) -> io::Result<()> {
+async fn verify_sentinels(cache: &Cache, keys: &[[u8; 16]], value_bytes: usize) -> io::Result<()> {
     let started = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         let observed = cache
@@ -307,19 +304,19 @@ async fn verify_sentinels(
     Ok(())
 }
 
-fn put_eventually(cache: &cache2::Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
+fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
     loop {
         match cache.put(key, value) {
             Ok(_) => return Ok(()),
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "recovery benchmark write did not enter bounded staging",
                     ));
                 }
-                thread::sleep(Duration::from_micros(50));
+                std::thread::sleep(Duration::from_micros(50));
             }
             Err(error) => return Err(error.into()),
         }
@@ -357,7 +354,7 @@ fn emit(phase: &str, operation: &str, elapsed: Duration, operations: u64, bytes:
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for one `rusage` value.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return 0;
@@ -383,7 +380,7 @@ fn peak_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
+    fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
             status.lines().find_map(|line| {

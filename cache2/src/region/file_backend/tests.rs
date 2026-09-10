@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
+use std::fs;
+use std::future::Future;
+use std::future::poll_fn;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::pin::Pin;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
@@ -22,33 +27,42 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use super::*;
-use crate::config::ReadAdmission;
-use crate::index::IndexEntry;
-use crate::index::PackedLocation;
-use crate::index_storage::INDEX_IMAGE_SLOTS_PER_PAGE;
-use crate::index_storage::IndexSlot;
-use crate::io_backend::testing::FaultAction;
-use crate::io_backend::testing::FaultBackend;
-use crate::io_backend::testing::FaultEvent;
-use crate::io_backend::testing::FaultHandle;
-use crate::io_engine::BackendIoEngine;
-use crate::io_engine::IoEngine;
-use crate::record_codec::hash_key;
-use crate::record_codec::required_record_bytes;
-use crate::recovery::DATA_REGION_AREA_OFFSET;
-use crate::recovery::DataGeometry;
-use crate::recovery::PersistentId;
+use crate::IoEngineConfig;
+use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
+use crate::config::runtime::PosixIoConfig;
+use crate::config::runtime::ReadAdmission;
+use crate::io::backend::MAX_INTERRUPTED_RETRIES;
+use crate::io::backend::testing::FaultAction;
+use crate::io::backend::testing::FaultBackend;
+use crate::io::backend::testing::FaultEvent;
+use crate::io::backend::testing::FaultHandle;
+use crate::io::backend::testing::kill_process;
+use crate::io::engine::BackendIoEngine;
+use crate::io::engine::IoEngine;
 use crate::region::RegionStageValue;
-use crate::region_reader::ReadCandidate;
-use crate::region_reader::ReadCompletion;
-use crate::region_reader::ReadPlan;
-use crate::region_reader::plan_read;
-use crate::region_staging::RegionStaging;
-use crate::region_staging::StagedRecord;
+use crate::region::index::packed::IndexEntry;
+use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::IndexSlot;
+use crate::region::index::storage::IndexSlotState;
+use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::reader::ReadCandidate;
+use crate::region::reader::ReadCompletion;
+use crate::region::reader::ReadPlan;
+use crate::region::reader::plan_read;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::codec::hash_key;
+use crate::region::record::codec::required_record_bytes;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::PersistentId;
+use crate::region::staging::RegionStaging;
+use crate::region::staging::StagedRecord;
 use crate::resources::ResourceController;
 use crate::resources::ResourceLimits;
 use crate::snapshot::StartupMode;
@@ -72,13 +86,11 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
     }
 }
 
-async fn assert_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>, message: &str) {
-    std::future::poll_fn(
-        |context| match std::future::Future::poll(future.as_mut(), context) {
-            std::task::Poll::Pending => std::task::Poll::Ready(()),
-            std::task::Poll::Ready(_) => panic!("{message}"),
-        },
-    )
+async fn assert_pending<F: Future>(mut future: Pin<&mut F>, message: &str) {
+    poll_fn(|context| match Future::poll(future.as_mut(), context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("{message}"),
+    })
     .await;
 }
 
@@ -90,10 +102,9 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
+        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
         let files = RegionFiles::new(
             root.join("data"),
             root.join("state"),
@@ -105,7 +116,7 @@ impl TestDirectory {
 
 impl Drop for TestDirectory {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -125,7 +136,7 @@ fn state_page_reads_stop_after_the_interrupted_retry_budget() {
             .iter()
             .filter(|event| **event == FaultEvent::Read)
             .count(),
-        crate::io_backend::MAX_INTERRUPTED_RETRIES + 1
+        MAX_INTERRUPTED_RETRIES + 1
     );
 }
 
@@ -193,7 +204,7 @@ impl RegionFileSystem for FaultRegionFileSystem {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        match std::fs::remove_file(path) {
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -202,7 +213,7 @@ impl RegionFileSystem for FaultRegionFileSystem {
 
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
         self.file_system.check(FileSystemFault::Rename)?;
-        std::fs::rename(source, destination)
+        fs::rename(source, destination)
     }
 
     fn sync_parent(&self, path: &Path) -> io::Result<()> {
@@ -262,8 +273,8 @@ fn external_process_kill_recovery_contract() {
     const CHILD_CASE: &str = "CACHE2_CRASH_CHILD_CASE";
     const CHILD_ROOT: &str = "CACHE2_CRASH_CHILD_ROOT";
 
-    if let Ok(case) = std::env::var(CHILD_CASE) {
-        let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child root is set"));
+    if let Ok(case) = env::var(CHILD_CASE) {
+        let root = PathBuf::from(env::var_os(CHILD_ROOT).expect("child root is set"));
         let files = RegionFiles::new(
             root.join("data"),
             root.join("state"),
@@ -291,7 +302,7 @@ fn external_process_kill_recovery_contract() {
         initial.drain().unwrap();
         initial.close_warm().unwrap();
 
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = Command::new(env::current_exe().unwrap())
             .arg("--exact")
             .arg("region::file_backend::tests::external_process_kill_recovery_contract")
             .arg("--ignored")
@@ -335,7 +346,7 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
         "open" => {
             let _store =
                 RegionStore::open(4096, FileRegionBackend::for_test(files, data, 4096)).unwrap();
-            crate::io_backend::testing::kill_process();
+            kill_process();
         }
         "write" | "drain" => {
             let store =
@@ -344,7 +355,7 @@ fn run_crash_child(case: &str, files: RegionFiles) -> ! {
             if case == "drain" {
                 store.drain().unwrap();
             }
-            crate::io_backend::testing::kill_process();
+            kill_process();
         }
         "warm-data" | "warm-image" | "clean-state" => {
             let (file_system, faults, _) = FaultRegionFileSystem::new();
@@ -398,7 +409,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(2, 4, 1)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(2, 4, 1)),
         l1_capacity_bytes: 0,
         statistics: true,
         read_admission: ReadAdmission::Wait {
@@ -482,7 +493,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 4, 1)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 4, 1)),
         l1_capacity_bytes: 0,
         read_admission: ReadAdmission::Wait {
             timeout: Duration::from_secs(1),
@@ -647,7 +658,7 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
         let runtime_config = RuntimeOptions {
-            io_engine: crate::config::IoEngine::Posix(crate::config::PosixIoConfig::new(1, 1, 1)),
+            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
             l1_capacity_bytes: 0,
             managed_memory_limit_bytes: 32 * 1024 * 1024,
             write_flush_threshold_bytes: 128 * 1024,
@@ -756,7 +767,7 @@ fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, RegionStagi
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -788,7 +799,7 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let mutation = runtime.core.shards[0].mutation.lock().unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (sender, receiver) = mpsc::sync_channel(1);
     let core = Arc::clone(&runtime.core);
     let writer = std::thread::spawn(move || {
         let result = core.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
@@ -833,11 +844,11 @@ fn completed_record_publication_does_not_enter_region_manager() {
     let record = StagedRecord::new(
         7,
         IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, 64).unwrap(),
+            location: PackedLocation::new(0, 0, 64).unwrap(),
         },
         1,
     );
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (sender, receiver) = mpsc::sync_channel(1);
     let publisher_core = Arc::clone(&core);
     let publisher = std::thread::spawn(move || {
         sender
@@ -845,7 +856,7 @@ fn completed_record_publication_does_not_enter_region_manager() {
             .unwrap();
     });
 
-    let published = receiver.recv_timeout(std::time::Duration::from_secs(1));
+    let published = receiver.recv_timeout(Duration::from_secs(1));
     drop(manager);
     publisher.join().unwrap();
     published.unwrap().unwrap();
@@ -864,7 +875,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -1026,7 +1037,7 @@ fn same_hash_candidate_requires_full_key() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -1114,7 +1125,7 @@ fn same_hash_candidate_requires_full_key() {
     let wrong_length_location = PackedLocation::new(
         current.entry.location.region_id(),
         current.entry.location.offset(),
-        current.entry.location.record_len() + crate::format::RECORD_ALIGNMENT,
+        current.entry.location.record_len() + RECORD_ALIGNMENT,
     )
     .unwrap();
     let wrong_length = ReadCandidate {
@@ -1168,7 +1179,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     let resources = data_path_resources();
     let staging = RegionStaging::try_new(
         1,
-        crate::config::MAX_WRITE_FLUSH_THRESHOLD_BYTES,
+        MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
         &resources,
     )
@@ -1430,11 +1441,11 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
     let directory = TestDirectory::new();
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
-    let value = IndexSlot::from_state(crate::index_storage::IndexSlotState::Value {
+    let value = IndexSlot::from_state(IndexSlotState::Value {
         fingerprint: 7,
         displacement: 0,
         entry: IndexEntry {
-            location: crate::index::PackedLocation::new(0, 0, 32).unwrap(),
+            location: PackedLocation::new(0, 0, 32).unwrap(),
         },
     });
 
@@ -1747,8 +1758,8 @@ fn data_and_state_inode_alias_is_rejected_without_truncation() {
     let config = 8;
     let data = test_data_superblock();
     let marker = b"do-not-truncate";
-    std::fs::write(&directory.files.data, marker).unwrap();
-    std::fs::hard_link(&directory.files.data, &directory.files.state).unwrap();
+    fs::write(&directory.files.data, marker).unwrap();
+    fs::hard_link(&directory.files.data, &directory.files.state).unwrap();
 
     let opened = RegionStore::open(
         config,
@@ -1758,7 +1769,7 @@ fn data_and_state_inode_alias_is_rejected_without_truncation() {
         opened,
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
-    assert_eq!(std::fs::read(&directory.files.data).unwrap(), marker);
+    assert_eq!(fs::read(&directory.files.data).unwrap(), marker);
 }
 
 #[test]
@@ -1767,7 +1778,7 @@ fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
     let marker = b"keep-data";
     let image = directory.root.join("recovery");
     let data_path = directory.root.join("recovery.next");
-    std::fs::write(&data_path, marker).unwrap();
+    fs::write(&data_path, marker).unwrap();
     let files = RegionFiles::new(&data_path, directory.root.join("state"), image);
 
     let opened = RegionStore::open(
@@ -1782,14 +1793,14 @@ fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
         opened,
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
-    assert_eq!(std::fs::read(data_path).unwrap(), marker);
+    assert_eq!(fs::read(data_path).unwrap(), marker);
 }
 
 #[test]
 fn recovery_sidecars_must_share_one_directory() {
     let directory = TestDirectory::new();
     let other = directory.root.join("other");
-    std::fs::create_dir(&other).unwrap();
+    fs::create_dir(&other).unwrap();
     let files = RegionFiles::new(
         directory.root.join("data"),
         other.join("state"),

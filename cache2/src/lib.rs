@@ -26,7 +26,6 @@ mod error;
 pub use self::error::Error;
 pub use self::error::ErrorKind;
 pub use self::error::ErrorOperation;
-pub use self::error::Result;
 
 mod cache;
 pub use self::cache::Cache;
@@ -35,17 +34,17 @@ pub use self::cache::Value;
 
 mod config;
 pub use self::config::CacheConfig;
-pub use self::config::IoEngine;
-pub use self::config::IoMode;
-pub use self::config::IoUringConfig;
-pub use self::config::IoUringPoolConfig;
-pub use self::config::IoUringSqPollConfig;
-pub use self::config::L1EvictionPolicy;
-pub use self::config::PosixIoConfig;
-pub use self::config::ReadAdmission;
-pub use self::config::RuntimeOptions;
 pub use self::config::StorageLayout;
-pub use self::config::StorageOptions;
+pub use self::config::runtime::IoEngineConfig;
+pub use self::config::runtime::IoMode;
+pub use self::config::runtime::IoUringConfig;
+pub use self::config::runtime::IoUringPoolConfig;
+pub use self::config::runtime::IoUringSqPollConfig;
+pub use self::config::runtime::L1EvictionPolicy;
+pub use self::config::runtime::PosixIoConfig;
+pub use self::config::runtime::ReadAdmission;
+pub use self::config::runtime::RuntimeOptions;
+pub use self::config::storage::StorageOptions;
 
 mod snapshot;
 pub use self::snapshot::CacheHealth;
@@ -61,25 +60,10 @@ pub use self::snapshot::RegionSnapshot;
 pub use self::snapshot::StartupMode;
 
 mod checksum;
-mod eviction;
-mod format;
 mod hashing;
-mod index;
-mod index_storage;
-mod io_backend;
-mod io_engine;
+mod io;
 mod memory;
-mod record_codec;
-mod recovery;
 mod region;
-mod region_appender;
-mod region_index;
-mod region_manager;
-mod region_metadata;
-mod region_reader;
-mod region_runtime;
-mod region_staging;
-mod region_store;
 mod resources;
 
 #[cfg(test)]

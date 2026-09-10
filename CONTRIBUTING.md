@@ -1,24 +1,21 @@
 # Contributing to C²
 
-C² requires Rust 1.98.0. Run development commands from the repository root so Cargo uses the complete workspace and the shared dependency and lint policy.
+## Workspace
 
-## Workspace layout
+`cache2/` contains the published library and its private implementation tests. `tests-integration/` exercises the public API; `benchmarks/` and `examples/` contain workloads and runnable integrations. `xtask/` implements the `cargo x` development commands.
 
-The repository separates published code from development-only consumers:
+## Development
 
-| Path                 | Purpose                                                                                       |
-|----------------------|-----------------------------------------------------------------------------------------------|
-| `cache2/`            | The publishable `cache2` crate and private implementation tests.                              |
-| `tests-integration/` | End-to-end tests that exercise only the public `cache2` API.                                  |
-| `benchmarks/`        | Standalone benchmark targets and workload-specific harnesses.                                 |
-| `examples/`          | Runnable programs that demonstrate complete integrations.                                     |
-| `xtask/`             | The `cargo x` repository workflow entrypoint.                                                 |
+Run commands from the repository root. Use `cargo x` as the source of truth for repository workflows. Read `cargo x --help` and the relevant subcommand's `--help` before running build, test, lint, or formatting commands.
 
-Keep unit tests beside the implementation when they need private access. Behavior visible to callers belongs in `tests-integration/tests`.
+Use a Rust toolchain at or above the `rust-version` declared in [Cargo.toml](Cargo.toml). Linting also requires nightly Rust and these tools:
 
-## Repository workflows
+```sh
+rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+cargo install --locked cargo-deny hawkeye taplo-cli typos-cli
+```
 
-The `.cargo/config.toml` alias maps `cargo x` to the `x` package in `xtask/`. Use these commands before opening a pull request:
+Before submitting a pull request, run:
 
 ```sh
 cargo x check
@@ -26,50 +23,27 @@ cargo x test
 cargo x lint
 ```
 
-`cargo x check` verifies the workspace and each optional `cache2` feature. `cargo x test` runs workspace tests with all features and the ignored extended library tests. These commands use the selected toolchain. `cargo x lint` explicitly uses nightly for Rust formatting, Clippy, and public documentation, and also checks TOML formatting, spelling, the publishable package, license headers, dependency licenses, advisories, and sources.
+`check` covers the workspace and optional features, `test` includes the extended library tests, and `lint` checks formatting, code, documentation, packaging, and dependencies. Use `cargo x lint --fix` to apply supported automatic fixes, then review the diff.
 
-The lint workflow uses nightly Rust and the latest releases of the lint tools so new diagnostics are caught early:
+Cover observable behavior changes with tests. See [BENCHMARK.md](BENCHMARK.md) for performance workloads and qualification.
 
-```sh
-rustup toolchain install nightly --profile minimal --component rustfmt,clippy
-cargo install cargo-deny --locked
-cargo install hawkeye --locked
-cargo install taplo-cli --locked
-cargo install typos-cli --locked
-```
+## Design and Rust Style
 
-Run `cargo x lint --fix` to apply Clippy fixes, Rust and TOML formatting, and license headers. Review the changes, then run `cargo x lint` to verify the result. The Rust import and comment style follows `rustfmt.toml`; TOML formatting follows `taplo.toml`.
+Follow the surrounding code and the design constraints in [ARCHITECTURE.md](ARCHITECTURE.md), including bounded resource use, best-effort consistency, request-path priorities, and recovery guarantees.
 
-CI runs nightly lint and feature checks in `check`, tests on Linux and macOS with Rust 1.98.0 and stable in `test`, and the pinned ASan/TSan suite in `safety`. The final `Required` job succeeds only when all three jobs succeed; failures, cancellations, and skipped dependencies fail the gate. Pull requests and pushes to `main`, including documentation changes, run the workflow.
-
-Use the underlying Cargo commands directly when isolating a failure. The release-mode test pass used by CI is:
-
-```sh
-cargo test --workspace --release --all-features
-```
-
-## Rust Style
-
-Declare restricted visibility at the module boundary and use `pub` for items in that module's API.
+Declare restricted visibility at module boundaries and use `pub` for items in those modules' APIs. Keep items private when only their defining module and its descendants need them. For items reachable through public modules or re-exported public types, reserve `pub` for intentional public API and use narrower visibility for internal callers.
 
 ## Documentation
 
-Keep each Markdown prose paragraph and list item on one source line.
-
-## Benchmarks and property tests
-
-Each benchmark is an explicit target in the `benchmarks` package. Run one target with:
-
-```sh
-cargo x bench --bench cache
-```
-
-See `BENCHMARK.md` for workload controls and qualification requirements. The normal test workflow also runs 10,000 QuickCheck cases for each of four properties: persistent decoders, record round trips, the fixed-map state machine, and the Region-index state machine. Inputs are capped at 16 KiB. Run that group directly with:
-
-```sh
-cargo test --package cache2 --lib property_tests::
-```
+Keep public documentation current and describe observable contracts. Keep each Markdown prose paragraph and list item on one source line. Format Markdown tables so their columns and separators align in the source.
 
 ## Changelog
 
-Update `CHANGELOG.md` for user-visible API, correctness, compatibility, performance, or operational changes. Internal refactors, tests, documentation, CI, tooling, and dependency maintenance do not need an entry unless they alter observable behavior.
+- Update [CHANGELOG.md](CHANGELOG.md) for significant user-visible changes by comparing the final behavior with the latest release tag, not the sequence of commits in the current development cycle. Add entries under `Unreleased`, using only categories that contain entries.
+- Before adding a bug-fix entry, verify from the latest release tag that the faulty behavior was shipped. If the affected API or behavior is unreleased, describe only its final contract in the relevant feature entry and omit the development-only correction.
+- Include public API migrations, new capabilities, correctness or compatibility changes, and meaningful performance improvements. Exclude tests, internal refactors, documentation, CI, tooling, dependency maintenance, discarded intermediate APIs, and implementation history unless they change supported or observable behavior relative to the latest release.
+- Write each entry from the user's perspective as one coherent observable change, including required migration guidance for breaking changes. Scope performance claims to the workloads supported by evidence.
+
+## Pull Requests
+
+Format pull request titles according to [.github/semantic.yml](.github/semantic.yml) and keep the description concise. Use a `Summary` section for routine changes and add `Design Notes` only when the design needs explanation.

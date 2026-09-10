@@ -13,12 +13,14 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
+use std::fs;
 use std::hint::black_box;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -32,8 +34,7 @@ use benchmarks::report::emit_cache_report;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheTier;
-use cache2::ErrorKind as CacheErrorKind;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -77,7 +78,7 @@ struct BenchConfig {
     reclaim_workers: usize,
     write_clients: usize,
     clients: usize,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     statistics_enabled: bool,
@@ -112,12 +113,12 @@ impl BenchConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix(PosixIoConfig::new(
+            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
                 read_io_workers,
                 write_io_workers,
                 reclaim_workers,
             )),
-            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
                 IoUringPoolConfig::new(
                     read_io_workers,
                     read_io_workers
@@ -300,7 +301,7 @@ impl BenchConfig {
         match (self.io_engine, self.read_io_wait_timeout.is_zero()) {
             // Keep the benchmark at the POSIX engine's exact admission depth.
             // Saturation misses belong in the soak, not the device-rate phase.
-            (IoEngine::Posix(_), true) => self.clients.min(self.read_io_workers),
+            (IoEngineConfig::Posix(_), true) => self.clients.min(self.read_io_workers),
             _ => self.clients,
         }
     }
@@ -333,7 +334,7 @@ impl Drop for BenchFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -381,7 +382,7 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -752,7 +753,7 @@ fn concurrent_writes(
     clients: usize,
 ) -> io::Result<WriteAdmission> {
     let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
-    thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(clients);
         for client in 0..clients {
             let cache = Arc::clone(&cache);
@@ -804,7 +805,7 @@ fn concurrent_writes(
 
 async fn concurrent_reads(
     cache: Arc<Cache>,
-    key_range: std::ops::Range<usize>,
+    key_range: Range<usize>,
     operations: usize,
     clients: usize,
     expected_tier: CacheTier,
@@ -985,7 +986,7 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
         attempts = attempts.saturating_add(1);
         match cache.put(key, value) {
             Ok(receipt) => return Ok((receipt, attempts)),
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -993,9 +994,9 @@ fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, u
                     ));
                 }
                 if attempts <= WRITE_YIELD_RETRIES {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 } else {
-                    thread::sleep(RETRY_DELAY);
+                    std::thread::sleep(RETRY_DELAY);
                 }
             }
             Err(error) => return Err(error.into()),

@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use std::env;
+use std::f64::consts::TAU;
+use std::fmt;
+use std::fs;
 use std::hint::black_box;
 use std::io;
 use std::path::Path;
@@ -33,8 +36,9 @@ use benchmarks::report::emit_cache_report;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
-use cache2::ErrorKind as CacheErrorKind;
-use cache2::IoEngine;
+use cache2::CacheSnapshot;
+use cache2::DetailedCacheSnapshot;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -209,7 +213,7 @@ struct HarnessConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -236,12 +240,12 @@ impl HarnessConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngine::Posix(PosixIoConfig::new(
+            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
                 read_io_workers,
                 write_io_workers,
                 reclaim_workers,
             )),
-            "io-uring" => IoEngine::IoUring(IoUringConfig::new(
+            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
                 IoUringPoolConfig::new(
                     read_io_workers,
                     read_io_workers
@@ -410,7 +414,7 @@ struct EffectiveConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -467,7 +471,7 @@ impl Drop for BenchFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(file);
+            let _ = fs::remove_file(file);
         }
     }
 }
@@ -602,7 +606,7 @@ async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -744,7 +748,7 @@ async fn run_worker(
                     ));
                 }
                 Ok(None) => result.misses = result.misses.saturating_add(1),
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                     result.get_overloaded = result.get_overloaded.saturating_add(1);
                 }
                 Err(error) => return Err(error.into()),
@@ -781,7 +785,7 @@ async fn run_worker(
                         ));
                     }
                     Ok(None) => result.misses = result.misses.saturating_add(1),
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.get_overloaded = result.get_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -808,7 +812,7 @@ async fn run_worker(
                             .accepted_value_bytes
                             .saturating_add(value_size as u64);
                     }
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.set_overloaded = result.set_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -823,7 +827,7 @@ async fn run_worker(
                     Ok(_) => {
                         result.delete_accepted = result.delete_accepted.saturating_add(1);
                     }
-                    Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                         result.delete_overloaded = result.delete_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -854,7 +858,7 @@ fn sample_normal_key(left: usize, right: usize, rng: &mut DeterministicRng) -> u
     let standard_deviation = (right - left) as f64 * 0.25;
     for _ in 0..NORMAL_SAMPLE_ATTEMPTS {
         let radius = (-2.0 * rng.open_unit_f64().ln()).sqrt();
-        let angle = std::f64::consts::TAU * rng.open_unit_f64();
+        let angle = TAU * rng.open_unit_f64();
         let sampled = (mean + standard_deviation * radius * angle.cos()).round();
         if sampled >= left as f64 && sampled <= right as f64 {
             return sampled as usize;
@@ -961,7 +965,7 @@ fn should_sample(operation: Operation, result: &WorkloadResult, interval: usize)
         }
 }
 
-fn validate_snapshot(result: &WorkloadResult, snapshot: &cache2::CacheSnapshot) -> io::Result<()> {
+fn validate_snapshot(result: &WorkloadResult, snapshot: &CacheSnapshot) -> io::Result<()> {
     let cache_hits = snapshot.l1_hits.saturating_add(snapshot.l2_hits);
     if snapshot.health != CacheHealth::Running || snapshot.io_failures != 0 {
         return Err(io::Error::other(
@@ -993,7 +997,7 @@ fn report(
     result: &WorkloadResult,
     workload_elapsed: Duration,
     drain_elapsed: Duration,
-    detailed: &cache2::DetailedCacheSnapshot,
+    detailed: &DetailedCacheSnapshot,
 ) {
     let snapshot = detailed.summary;
     let seconds = workload_elapsed.as_secs_f64();

@@ -33,23 +33,25 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use tokio::task::JoinError;
+
 use crate::config::CacheConfig;
-use crate::config::KEY_HASH_SEED;
+use crate::config::storage::KEY_HASH_SEED;
 use crate::config::storage_fingerprint;
 use crate::config::storage_geometry;
+use crate::error::Error;
 use crate::error::ErrorOperation;
-use crate::error::Result;
 use crate::error::from_io;
-use crate::recovery::DataSuperblock;
-use crate::recovery::PersistentId;
-use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
-use crate::recovery::recovery_image_index_len;
-use crate::region::FileRegionBackend;
-use crate::region::RegionFiles;
-use crate::region::SystemRegionFileSystem;
-use crate::region_runtime::HybridValueRead;
-use crate::region_runtime::RegionDataPlane;
-use crate::region_store::RegionStore;
+use crate::region::file_backend::FileRegionBackend;
+use crate::region::file_backend::RegionFiles;
+use crate::region::file_backend::SystemRegionFileSystem;
+use crate::region::recovery::DataSuperblock;
+use crate::region::recovery::PersistentId;
+use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::region::recovery::recovery_image_index_len;
+use crate::region::runtime::HybridValueRead;
+use crate::region::runtime::RegionDataPlane;
+use crate::region::store::RegionStore;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 use crate::snapshot::StartupMode;
@@ -141,7 +143,7 @@ impl Cache {
     /// Returns [`ErrorOperation::Open`] for file locking, recovery, allocation,
     /// device support, runtime binding, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
-    pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self> {
+    pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self, Error> {
         let handle = tokio::runtime::Handle::try_current().map_err(|error| {
             from_io(
                 ErrorOperation::Open,
@@ -162,7 +164,7 @@ impl Cache {
         path: impl AsRef<Path>,
         config: CacheConfig,
         tokio_handle: tokio::runtime::Handle,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
         let cache_handle = tokio_handle.clone();
         let started = Instant::now();
@@ -269,12 +271,12 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key or
-    /// record and [`crate::ErrorKind::Overloaded`] when bounded mutation
-    /// admission is busy. Returns [`crate::ErrorKind::Unavailable`] after close
-    /// starts. Runtime and device failures use their corresponding structured
+    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) for an oversized key or
+    /// record and [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) when bounded mutation
+    /// admission is busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after
+    /// close starts. Runtime and device failures use their corresponding structured
     /// classifications.
-    pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
+    pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.ensure_open(ErrorOperation::Put)?;
         public_result(
             ErrorOperation::Put,
@@ -293,8 +295,8 @@ impl Cache {
     ///
     /// Uses the same input, overload, runtime, and device classifications as
     /// [`Self::put`], including unavailable after close starts, with
-    /// [`crate::ErrorOperation::PutL2`] as its context.
-    pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64> {
+    /// [`ErrorOperation::PutL2`](crate::ErrorOperation::PutL2) as its context.
+    pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.ensure_open(ErrorOperation::PutL2)?;
         public_result(
             ErrorOperation::PutL2,
@@ -309,11 +311,11 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::InvalidInput`] for an oversized key and
-    /// [`crate::ErrorKind::Overloaded`] when bounded mutation admission is
-    /// busy. Returns [`crate::ErrorKind::Unavailable`] after close starts.
+    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) for an oversized key and
+    /// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) when bounded mutation admission is
+    /// busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
     /// Runtime and device failures remain explicit.
-    pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64> {
+    pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.ensure_open(ErrorOperation::Delete)?;
         public_result(ErrorOperation::Delete, self.data_plane.delete(key.as_ref()))
     }
@@ -329,11 +331,11 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Overloaded`] for explicit read pressure when
-    /// waiting is enabled. Cache data and device failures that can safely fail
+    /// Returns [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) for explicit read pressure
+    /// when waiting is enabled. Cache data and device failures that can safely fail
     /// open transition reads to misses instead of surfacing an application
     /// error.
-    pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>> {
+    pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>, Error> {
         if self.is_closed() {
             return Ok(None);
         }
@@ -352,10 +354,10 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Overloaded`] if another drain is active, or
-    /// [`crate::ErrorKind::Unavailable`] after close starts. Accepted work that
-    /// cannot complete returns a structured runtime/device failure.
-    pub async fn drain(&self) -> Result<()> {
+    /// Returns [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) if another drain is active,
+    /// or [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
+    /// Accepted work that cannot complete returns a structured runtime/device failure.
+    pub async fn drain(&self) -> Result<(), Error> {
         self.ensure_open(ErrorOperation::Drain)?;
         public_result(ErrorOperation::Drain, self.data_plane.drain_async().await)
     }
@@ -366,9 +368,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] after close starts, or a
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts, or a
     /// structured runtime failure if the snapshot cannot be read.
-    pub fn snapshot(&self) -> Result<CacheSnapshot> {
+    pub fn snapshot(&self) -> Result<CacheSnapshot, Error> {
         self.ensure_open(ErrorOperation::Snapshot)?;
         let mut snapshot = public_result(ErrorOperation::Snapshot, self.data_plane.snapshot())?;
         snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
@@ -382,10 +384,10 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] after close starts, or a
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts, or a
     /// structured runtime failure if any diagnostic partition cannot be
     /// sampled.
-    pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot> {
+    pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot, Error> {
         self.ensure_open(ErrorOperation::DetailedSnapshot)?;
         let mut snapshot = public_result(
             ErrorOperation::DetailedSnapshot,
@@ -402,10 +404,10 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] if close already started, or a
-    /// structured runtime, worker, or filesystem failure with
-    /// [`crate::ErrorOperation::CloseFast`].
-    pub fn close_fast(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
+    /// or a structured runtime, worker, or filesystem failure with
+    /// [`ErrorOperation::CloseFast`](crate::ErrorOperation::CloseFast).
+    pub fn close_fast(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         self.close(false)
     }
 
@@ -417,16 +419,16 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ErrorKind::Unavailable`] if close already started, or a
-    /// structured runtime, worker, filesystem, or device failure with
-    /// [`crate::ErrorOperation::CloseWarm`]. A failed warm close does not
-    /// publish a recoverable image.
-    pub fn close_warm(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+    /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
+    /// or a structured runtime, worker, filesystem, or device failure with
+    /// [`ErrorOperation::CloseWarm`](crate::ErrorOperation::CloseWarm). A failed warm close does
+    /// not publish a recoverable image.
+    pub fn close_warm(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         self.close(true)
     }
 
     #[inline(always)]
-    fn ensure_open(&self, operation: ErrorOperation) -> Result<()> {
+    fn ensure_open(&self, operation: ErrorOperation) -> Result<(), Error> {
         if self.is_closed() {
             return public_result(operation, Err(cache_closed_error()));
         }
@@ -438,7 +440,7 @@ impl Cache {
         self.closed.load(Ordering::Acquire)
     }
 
-    fn close(&self, warm: bool) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn close(&self, warm: bool) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         let (operation, mode) = if warm {
             (ErrorOperation::CloseWarm, "warm")
         } else {
@@ -554,7 +556,7 @@ fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &
     }
 }
 
-fn blocking_task_error(operation: &'static str, error: tokio::task::JoinError) -> io::Error {
+fn blocking_task_error(operation: &'static str, error: JoinError) -> io::Error {
     io::Error::other(format!("{operation} task failed: {error}"))
 }
 
@@ -564,7 +566,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn public_result<T>(operation: ErrorOperation, result: io::Result<T>) -> Result<T> {
+fn public_result<T>(operation: ErrorOperation, result: io::Result<T>) -> Result<T, Error> {
     result.map_err(|error| from_io(operation, error))
 }
 

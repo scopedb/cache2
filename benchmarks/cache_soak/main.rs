@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::env;
+use std::fmt;
+use std::fs;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -34,8 +37,7 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
-use cache2::ErrorKind as CacheErrorKind;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 use cache2::IoMode;
 use cache2::IoUringConfig;
 use cache2::IoUringPoolConfig;
@@ -83,7 +85,7 @@ struct SoakConfig {
     final_warm_verify: bool,
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
-    io_engine: IoEngine,
+    io_engine: IoEngineConfig,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -263,7 +265,7 @@ impl SoakFiles {
             sidecar(&self.data, ".image.next"),
         ]
         .into_iter()
-        .try_fold(0_u64, |total, path| match std::fs::metadata(path) {
+        .try_fold(0_u64, |total, path| match fs::metadata(path) {
             Ok(metadata) => total
                 .checked_add(metadata.len())
                 .ok_or_else(|| invalid("logical disk byte count overflow")),
@@ -288,7 +290,7 @@ impl Drop for SoakFiles {
             sidecar(&self.data, ".image"),
             sidecar(&self.data, ".image.next"),
         ] {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -359,7 +361,7 @@ fn main() -> io::Result<()> {
         result
             .as_ref()
             .err()
-            .map(|error| error as &dyn std::fmt::Display),
+            .map(|error| error as &dyn fmt::Display),
     );
     result
 }
@@ -446,7 +448,7 @@ fn run_benchmark() -> io::Result<()> {
         files.data.display(),
     );
 
-    thread::scope(|scope| -> io::Result<()> {
+    std::thread::scope(|scope| -> io::Result<()> {
         let mut workers = Vec::with_capacity(client_count);
         for _ in 0..config.writers {
             workers.push(scope.spawn(|| {
@@ -499,9 +501,9 @@ fn run_benchmark() -> io::Result<()> {
             .ok_or_else(|| invalid("soak sample deadline is too far in the future"))?;
         let mut sample_error = None;
         while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
-            let wake_at = std::cmp::min(next_sample, deadline);
+            let wake_at = min(next_sample, deadline);
             if let Some(remaining) = wake_at.checked_duration_since(Instant::now()) {
-                thread::sleep(remaining);
+                std::thread::sleep(remaining);
             }
             let now = Instant::now();
             if now >= next_sample && now < deadline {
@@ -677,8 +679,8 @@ fn populate_for_warm_reopen(
         loop {
             match cache.put(key, &value[..value_bytes]) {
                 Ok(_) => break,
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
-                    thread::sleep(OVERLOAD_DELAY);
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                    std::thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -729,10 +731,10 @@ fn run_writer(
                 record_latency(&counters.put_latency, put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 record_latency(&counters.put_latency, put_started);
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(OVERLOAD_DELAY);
+                std::thread::sleep(OVERLOAD_DELAY);
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -747,10 +749,10 @@ fn run_writer(
                     record_latency(&counters.delete_latency, delete_started);
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(error) if error.kind() == CacheErrorKind::Overloaded => {
+                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                     record_latency(&counters.delete_latency, delete_started);
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
-                    thread::sleep(OVERLOAD_DELAY);
+                    std::thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1131,13 +1133,13 @@ fn record_latency(histogram: &AtomicLatencyHistogram, started: Option<Instant>) 
 
 fn pace(interval: Duration) {
     if !interval.is_zero() {
-        thread::sleep(interval);
+        std::thread::sleep(interval);
     }
 }
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for one `rusage` value.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return 0;
@@ -1158,7 +1160,7 @@ fn peak_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> io::Result<u64> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
+    let status = fs::read_to_string("/proc/self/status")?;
     let kib = status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
@@ -1241,17 +1243,17 @@ fn parse_io_engine(
     read_workers: usize,
     write_workers: usize,
     reclaim_workers: usize,
-) -> io::Result<IoEngine> {
+) -> io::Result<IoEngineConfig> {
     match env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
-        "posix" => Ok(IoEngine::Posix(PosixIoConfig::new(
+        "posix" => Ok(IoEngineConfig::Posix(PosixIoConfig::new(
             read_workers,
             write_workers,
             reclaim_workers,
         ))),
-        "io-uring" => Ok(IoEngine::IoUring(IoUringConfig::new(
+        "io-uring" => Ok(IoEngineConfig::IoUring(IoUringConfig::new(
             io_uring_read_pool(read_workers)?,
             io_uring_write_pool(write_workers)?,
             IoUringPoolConfig::new(reclaim_workers, reclaim_workers),

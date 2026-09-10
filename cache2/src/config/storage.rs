@@ -17,25 +17,25 @@
 use std::io;
 
 #[cfg(test)]
-use super::CacheConfig;
+use crate::config::CacheConfig;
+use crate::config::StorageLayout;
 #[cfg(test)]
-use super::RuntimeOptions;
-use super::StorageLayout;
+use crate::config::runtime::RuntimeOptions;
+use crate::error::Error;
 use crate::error::ErrorOperation;
-use crate::error::Result;
 use crate::error::from_io;
-use crate::index::MAX_PACKED_REGION_COUNT;
-use crate::index::MAX_PACKED_REGION_SIZE;
-use crate::index_storage::IndexStorageError;
-use crate::index_storage::validated_index_partition_ranges;
-use crate::recovery::DataGeometry;
-use crate::recovery::KEY_HASH_ALGORITHM_XXH3_64;
-use crate::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
-use crate::recovery::STATE_FILE_SIZE;
-use crate::recovery::recovery_image_index_len;
-use crate::region_metadata::REGION_METADATA_PAGE_SIZE;
-use crate::region_metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region_metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
+use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
+use crate::region::index::storage::IndexStorageError;
+use crate::region::index::storage::validated_index_partition_ranges;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::KEY_HASH_ALGORITHM_XXH3_64;
+use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
+use crate::region::recovery::STATE_FILE_SIZE;
+use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
+use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
+use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::recovery_image_index_len;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
@@ -70,14 +70,14 @@ impl StorageOptions {
 
     /// Checks the inputs and computes an immutable layout without opening files.
     /// Use [`StorageLayout::peak_disk_bytes`] to compare a candidate with a disk
-    /// budget, then pass the chosen layout to [`super::CacheConfig::new`].
+    /// budget, then pass the chosen layout to [`CacheConfig::new`](crate::CacheConfig::new).
     ///
     /// # Errors
     ///
     /// Returns [`ErrorOperation::BuildStorage`] if the geometry or index cannot
     /// be represented, disk accounting overflows, or bounded layout allocation
     /// fails.
-    pub fn build(self) -> Result<StorageLayout> {
+    pub fn build(self) -> Result<StorageLayout, Error> {
         let build = || {
             let entries = match self.expected_entries {
                 Some(entries) => entries,
@@ -209,8 +209,8 @@ pub fn cache_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recovery::DataSuperblock;
-    use crate::recovery::PersistentId;
+    use crate::region::recovery::DataSuperblock;
+    use crate::region::recovery::PersistentId;
 
     #[test]
     fn constructed_layouts_encode_at_format_boundaries() {

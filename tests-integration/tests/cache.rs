@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -23,19 +28,23 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
+use cache2::CacheIoSnapshot;
 use cache2::CacheTier;
+use cache2::DetailedCacheSnapshot;
+use cache2::Error;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
-use cache2::IoEngine;
+use cache2::IoEngineConfig;
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
+#[cfg(not(target_os = "linux"))]
+use cache2::IoUringConfig;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoConfig;
 use cache2::ReadAdmission;
@@ -58,7 +67,7 @@ fn test_storage() -> StorageLayout {
 
 fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
     RuntimeOptions {
-        io_engine: IoEngine::Posix(PosixIoConfig::new(workers, workers, 1)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(workers, workers, 1)),
         append_shards,
         l1_capacity_bytes: 4 * 1024 * 1024,
         managed_memory_limit_bytes: 32 * 1024 * 1024,
@@ -91,8 +100,7 @@ struct TestCache {
 impl TestCache {
     fn new(name: &str) -> Self {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-        let data =
-            std::env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
+        let data = env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
         Self { data }
     }
 
@@ -120,17 +128,17 @@ impl Drop for TestCache {
             self.sidecar(".image"),
             self.sidecar(".image.next"),
         ] {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }
 
-fn rewrite_page_version(path: &std::path::Path, offset: u64, version: u16) {
+fn rewrite_page_version(path: &Path, offset: u64, version: u16) {
     const PAGE_BYTES: usize = 4096;
     const VERSION_OFFSET: usize = 8;
     const CRC_OFFSET: usize = PAGE_BYTES - 4;
 
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
@@ -147,7 +155,7 @@ fn rewrite_page_version(path: &std::path::Path, offset: u64, version: u16) {
     file.sync_all().unwrap();
 }
 
-fn eventually_admitted<T>(mut put: impl FnMut() -> cache2::Result<T>) -> T {
+fn eventually_admitted<T>(mut put: impl FnMut() -> Result<T, Error>) -> T {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match put() {
@@ -164,7 +172,7 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> cache2::Result<T>) -> T {
     }
 }
 
-async fn completed_reclaim_snapshot(cache: &cache2::Cache) -> cache2::DetailedCacheSnapshot {
+async fn completed_reclaim_snapshot(cache: &Cache) -> DetailedCacheSnapshot {
     for ordinal in 0_u64..128 {
         eventually_admitted(|| cache.put(ordinal.to_le_bytes(), vec![ordinal as u8; 8 * 1024]));
     }
@@ -193,7 +201,7 @@ async fn completed_reclaim_snapshot(cache: &cache2::Cache) -> cache2::DetailedCa
             return detailed;
         }
         assert!(Instant::now() < deadline, "reclaim did not make progress");
-        thread::yield_now();
+        std::thread::yield_now();
     }
 }
 
@@ -312,7 +320,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
     let writer_cache = Arc::clone(&cache);
     let ready = Arc::new(Barrier::new(2));
     let writer_ready = Arc::clone(&ready);
-    let writer = thread::spawn(move || {
+    let writer = std::thread::spawn(move || {
         writer_ready.wait();
         let mut accepted = Vec::new();
         for ordinal in 0_u64..256 {
@@ -322,7 +330,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
                         accepted.push(ordinal);
                         break;
                     }
-                    Err(error) if error.kind() == ErrorKind::Overloaded => thread::yield_now(),
+                    Err(error) if error.kind() == ErrorKind::Overloaded => std::thread::yield_now(),
                     Err(error) if error.kind() == ErrorKind::Unavailable => return accepted,
                     Err(error) => panic!("concurrent cache write failed: {error}"),
                 }
@@ -359,7 +367,7 @@ async fn concurrent_open_reports_structured_busy_error() {
     let error = Cache::open(&files.data, test_config(1)).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Busy);
     assert_eq!(error.operation(), ErrorOperation::Open);
-    assert_eq!(error.io_kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.io_kind(), io::ErrorKind::WouldBlock);
 
     cache.close_fast().await.unwrap();
 }
@@ -504,7 +512,7 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
 fn unavailable_io_engine_is_rejected_before_file_creation() {
     let files = TestCache::new("unavailable-io-engine");
     let runtime = RuntimeOptions {
-        io_engine: IoEngine::IoUring(cache2::IoUringConfig::default()),
+        io_engine: IoEngineConfig::IoUring(IoUringConfig::default()),
         write_flush_threshold_bytes: 128 * 1024,
         statistics: false,
         ..test_runtime_options(1, 2)
@@ -513,7 +521,7 @@ fn unavailable_io_engine_is_rejected_before_file_creation() {
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.operation(), ErrorOperation::BuildConfig);
-    assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
     files.assert_absent();
 }
 
@@ -531,7 +539,7 @@ fn unavailable_direct_io_is_rejected_before_file_creation() {
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.operation(), ErrorOperation::BuildConfig);
-    assert_eq!(error.io_kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
     files.assert_absent();
 }
 
@@ -561,7 +569,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     cache.close_warm().await.unwrap();
 
     let retuned = RuntimeOptions {
-        io_engine: IoEngine::Posix(PosixIoConfig::new(7, 2, 2)),
+        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(7, 2, 2)),
         l1_capacity_bytes: 2 * 1024 * 1024,
         l1_eviction_policy: L1EvictionPolicy::S3Fifo,
         l1_shards: 7,
@@ -722,7 +730,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     let hits = AtomicU64::new(0);
     let runtime = tokio::runtime::Handle::current();
 
-    thread::scope(|scope| {
+    std::thread::scope(|scope| {
         for writer in 0..WRITERS {
             let cache = &cache;
             let keys = &keys;
@@ -731,7 +739,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let start = &start;
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 }
                 let mut value = vec![0_u8; *VALUE_SIZES.iter().max().unwrap()];
                 for ordinal in 0..WRITES_PER_CLIENT {
@@ -766,7 +774,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let runtime = runtime.clone();
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    thread::yield_now();
+                    std::thread::yield_now();
                 }
                 let mut ordinal = reader;
                 while writers_left.load(Ordering::Acquire) != 0 {
@@ -818,7 +826,7 @@ async fn public_key_and_record_size_limits_are_enforced() {
     let error = cache.put(&oversized_key, b"value").unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
     assert_eq!(error.operation(), ErrorOperation::Put);
-    assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.io_kind(), io::ErrorKind::InvalidInput);
 
     let error = cache.put(b"too-large", &oversized_value).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -864,8 +872,8 @@ async fn cold_start_removes_stale_recovery_files() {
     let files = TestCache::new("stale-recovery-files");
     let image = files.sidecar(".image");
     let temporary = files.sidecar(".image.next");
-    std::fs::write(&image, b"stale image").unwrap();
-    std::fs::write(&temporary, b"stale temporary image").unwrap();
+    fs::write(&image, b"stale image").unwrap();
+    fs::write(&temporary, b"stale temporary image").unwrap();
 
     let cache = Cache::open(&files.data, test_config(2)).await.unwrap();
     assert!(!image.exists());
@@ -924,7 +932,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 
     let image = files.sidecar(".image");
     let temporary = files.sidecar(".image.next");
-    std::fs::copy(&image, &temporary).unwrap();
+    fs::copy(&image, &temporary).unwrap();
     let logical_bytes = [
         files.data.clone(),
         files.sidecar(".state"),
@@ -932,7 +940,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
         temporary,
     ]
     .into_iter()
-    .map(|path| std::fs::metadata(path).unwrap().len())
+    .map(|path| fs::metadata(path).unwrap().len())
     .sum::<u64>();
 
     assert_eq!(logical_bytes, peak_disk_bytes);
@@ -1068,7 +1076,7 @@ async fn cache_snapshot_reports_tier_activity_and_resets_on_open() {
     assert_eq!(fresh.l1_hits, 0);
     assert_eq!(fresh.l2_hits, 0);
     assert_ne!(fresh.metrics_epoch, before_close.metrics_epoch);
-    assert_eq!(fresh.io, cache2::CacheIoSnapshot::default());
+    assert_eq!(fresh.io, CacheIoSnapshot::default());
     assert_eq!(
         reopened.get("key").await.unwrap().unwrap().tier(),
         CacheTier::L2
@@ -1148,7 +1156,7 @@ async fn read_io_failure_is_counted_and_latches_miss_only() {
     cache.put("key", vec![9_u8; 16 * 1024]).unwrap();
     cache.drain().await.unwrap();
 
-    std::fs::OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .open(&files.data)
         .unwrap()
