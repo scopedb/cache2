@@ -171,7 +171,7 @@ The read path first selects an index candidate, then admits one bounded read. Th
 2. the optional wait queue;
 3. managed memory for the aligned read buffer.
 
-Physical execution is backend-specific. `PosixIoConfig::read_workers` is both the number of blocking worker threads and the maximum admitted reads; every additional worker adds a 512 KiB reserved cache-thread stack. `IoUringPoolConfig` instead separates the number of rings/driver threads from the aggregate `max_in_flight` bound, which is distributed across those rings. The normal hash route stays stable; only a saturated primary lane probes one rotating alternate, so a hot route can use every ring without scanning them.
+Physical execution is backend-specific. `PosixIoOptions::read_workers` is both the number of blocking worker threads and the maximum admitted reads; every additional worker adds a 512 KiB reserved cache-thread stack. `IoUringPoolOptions` instead separates the number of rings/driver threads from the aggregate `max_in_flight` bound, which is distributed across those rings. The normal hash route stays stable; only a saturated primary lane probes one rotating alternate, so a hot route can use every ring without scanning them.
 
 `read_admission` chooses pressure behavior independently of physical capacity:
 
@@ -270,17 +270,17 @@ io_uring is feature-gated and experimental. Its three pools configure physical r
 
 ```rust
 use cache2::{
-    IoEngineConfig, IoMode, IoUringConfig, IoUringPoolConfig,
-    IoUringSqPollConfig, RuntimeOptions,
+    IoEngineOptions, IoMode, IoUringOptions, IoUringPoolOptions,
+    IoUringSqPollOptions, RuntimeOptions,
 };
 
-let read = IoUringPoolConfig::new(1, 128)
-    .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
+let read = IoUringPoolOptions::new(1, 128)
+    .with_sq_poll(IoUringSqPollOptions::new(2_000).with_cpu(4));
 let runtime = RuntimeOptions {
-    io_engine: IoEngineConfig::IoUring(IoUringConfig::new(
+    io_engine: IoEngineOptions::IoUring(IoUringOptions::new(
         read,
-        IoUringPoolConfig::new(1, 64),
-        IoUringPoolConfig::new(1, 1),
+        IoUringPoolOptions::new(1, 64),
+        IoUringPoolOptions::new(1, 1),
     )),
     io_mode: IoMode::Direct,
     ..RuntimeOptions::default()
@@ -289,7 +289,7 @@ let runtime = RuntimeOptions {
 
 `rings` controls driver-thread and kernel-ring count. `max_in_flight` is the aggregate admission bound and is divided as evenly as possible across those rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to each ring in that pool. SQPOLL defaults off; requested flags fail explicitly when the kernel cannot provide them.
 
-IOPOLL is an additional explicit per-pool opt-in through `IoUringPoolConfig::with_io_poll(true)`. It requires `IoMode::Direct` and a filesystem and block device that support polling. While requests are outstanding the driver busy-polls the device and consumes CPU, and a cancellation stays advisory until the polled operation completes, so profile IOPOLL on the target host before adopting it.
+IOPOLL is an additional explicit per-pool opt-in through `IoUringPoolOptions::with_io_poll(true)`. It requires `IoMode::Direct` and a filesystem and block device that support polling. While requests are outstanding the driver busy-polls the device and consumes CPU, and a cancellation stays advisory until the polled operation completes, so profile IOPOLL on the target host before adopting it.
 
 ### Statistics
 

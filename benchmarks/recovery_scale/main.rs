@@ -28,9 +28,9 @@ use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
 use cache2::Cache;
 use cache2::CacheConfig;
-use cache2::IoEngineConfig;
+use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::PosixIoConfig;
+use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
@@ -92,7 +92,7 @@ impl ScaleConfig {
 
     fn runtime_options(&self) -> RuntimeOptions {
         RuntimeOptions {
-            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(1, 1, 1)),
             io_mode: IoMode::Buffered,
             append_shards: 4,
             l1_capacity_bytes: self.memory_bytes,

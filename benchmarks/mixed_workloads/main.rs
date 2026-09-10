@@ -38,12 +38,12 @@ use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
-use cache2::IoEngineConfig;
+use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringConfig;
-use cache2::IoUringPoolConfig;
+use cache2::IoUringOptions;
+use cache2::IoUringPoolOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoConfig;
+use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
 
@@ -213,7 +213,7 @@ struct HarnessConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngineConfig,
+    io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -240,25 +240,25 @@ impl HarnessConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
+            "posix" => IoEngineOptions::Posix(PosixIoOptions::new(
                 read_io_workers,
                 write_io_workers,
                 reclaim_workers,
             )),
-            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
-                IoUringPoolConfig::new(
+            "io-uring" => IoEngineOptions::IoUring(IoUringOptions::new(
+                IoUringPoolOptions::new(
                     read_io_workers,
                     read_io_workers
                         .checked_mul(64)
                         .ok_or_else(|| invalid("read io_uring depth is too large"))?,
                 ),
-                IoUringPoolConfig::new(
+                IoUringPoolOptions::new(
                     write_io_workers,
                     write_io_workers
                         .checked_mul(64)
                         .ok_or_else(|| invalid("write io_uring depth is too large"))?,
                 ),
-                IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
+                IoUringPoolOptions::new(reclaim_workers, reclaim_workers),
             )),
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
@@ -414,7 +414,7 @@ struct EffectiveConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngineConfig,
+    io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,

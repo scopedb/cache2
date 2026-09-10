@@ -37,13 +37,13 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
-use cache2::IoEngineConfig;
+use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringConfig;
-use cache2::IoUringPoolConfig;
-use cache2::IoUringSqPollConfig;
+use cache2::IoUringOptions;
+use cache2::IoUringPoolOptions;
+use cache2::IoUringSqPollOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoConfig;
+use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
@@ -85,7 +85,7 @@ struct SoakConfig {
     final_warm_verify: bool,
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
-    io_engine: IoEngineConfig,
+    io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -1243,20 +1243,20 @@ fn parse_io_engine(
     read_workers: usize,
     write_workers: usize,
     reclaim_workers: usize,
-) -> io::Result<IoEngineConfig> {
+) -> io::Result<IoEngineOptions> {
     match env::var(name)
         .unwrap_or_else(|_| "posix".to_owned())
         .as_str()
     {
-        "posix" => Ok(IoEngineConfig::Posix(PosixIoConfig::new(
+        "posix" => Ok(IoEngineOptions::Posix(PosixIoOptions::new(
             read_workers,
             write_workers,
             reclaim_workers,
         ))),
-        "io-uring" => Ok(IoEngineConfig::IoUring(IoUringConfig::new(
+        "io-uring" => Ok(IoEngineOptions::IoUring(IoUringOptions::new(
             io_uring_read_pool(read_workers)?,
             io_uring_write_pool(write_workers)?,
-            IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
+            IoUringPoolOptions::new(reclaim_workers, reclaim_workers),
         ))),
         value => Err(invalid(format!("unsupported I/O engine: {value}"))),
     }
@@ -1272,7 +1272,7 @@ fn parse_io_engine(
 /// `CACHE_SOAK_IO_URING_READ_SQPOLL_MS` opts the pool into kernel submission
 /// polling with the given idle time; `CACHE_SOAK_IO_URING_READ_SQPOLL_CPU`
 /// optionally pins the polling threads.
-fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolConfig> {
+fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolOptions> {
     let rings = env_usize("CACHE_SOAK_IO_URING_READ_RINGS", read_workers)?;
     let max_in_flight = env_usize(
         "CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT",
@@ -1285,12 +1285,12 @@ fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolConfig> {
             "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
         ));
     }
-    let mut pool = IoUringPoolConfig::new(rings, max_in_flight);
+    let mut pool = IoUringPoolOptions::new(rings, max_in_flight);
     if env_bool("CACHE_SOAK_IO_URING_READ_IOPOLL", false)? {
         pool = pool.with_io_poll(true);
     }
     if let Some(idle_millis) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_MS")? {
-        let mut sq_poll = IoUringSqPollConfig::new(idle_millis);
+        let mut sq_poll = IoUringSqPollOptions::new(idle_millis);
         if let Some(cpu) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_CPU")? {
             sq_poll = sq_poll.with_cpu(cpu);
         }
@@ -1304,7 +1304,7 @@ fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolConfig> {
 /// `CACHE_SOAK_IO_URING_WRITE_RINGS` and
 /// `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT` default to the legacy mapping
 /// (one ring per worker with 64 in-flight slots per ring).
-fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolConfig> {
+fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolOptions> {
     let rings = env_usize("CACHE_SOAK_IO_URING_WRITE_RINGS", write_workers)?;
     let max_in_flight = env_usize(
         "CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT",
@@ -1317,7 +1317,7 @@ fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolConfig> {
             "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
         ));
     }
-    Ok(IoUringPoolConfig::new(rings, max_in_flight))
+    Ok(IoUringPoolOptions::new(rings, max_in_flight))
 }
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {

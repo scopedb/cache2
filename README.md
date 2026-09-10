@@ -77,7 +77,7 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 | Area      | Controls                                                                   | Default and behavior                                                                        |
 |-----------|----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
 | L1        | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                     | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| I/O pools | `io_engine: IoEngineConfig::Posix(...)` or `IoEngineConfig::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
+| I/O pools | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
 | Read wait | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }` | Immediate admission; wait capacity defaults to aggregate read capacity.                     |
 | Writes    | `append_shards`, `write_flush_threshold_bytes`                             | Four append shards and a 4 MiB flush threshold.                                             |
 | Memory    | `managed_memory_limit_bytes`                                               | 1 GiB across cache-managed allocations.                                                     |

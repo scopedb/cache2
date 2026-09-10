@@ -42,7 +42,7 @@ use io_uring::opcode;
 use io_uring::squeue;
 use io_uring::types;
 
-use crate::config::runtime::IoUringPoolConfig;
+use crate::config::runtime::IoUringPoolOptions;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStatsHandle;
@@ -130,7 +130,7 @@ impl UringIoEngine {
     pub fn new_with_files(
         files: RuntimeFileSet,
         max_in_flight: usize,
-        config: IoUringPoolConfig,
+        config: IoUringPoolOptions,
         statistics_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
