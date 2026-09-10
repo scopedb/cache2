@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0 (2026-09-10)
+
 ### Breaking Changes
 
 - The public I/O configuration enum is now named `IoEngineConfig`; replace `IoEngine` imports and variant paths with `IoEngineConfig`.
