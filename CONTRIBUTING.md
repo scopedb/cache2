@@ -35,7 +35,7 @@ Declare restricted visibility at module boundaries and use `pub` for items in th
 
 ## Documentation
 
-Keep public documentation current and describe observable contracts. Keep each Markdown prose paragraph and list item on one source line.
+Keep public documentation current and describe observable contracts. Keep each Markdown prose paragraph and list item on one source line. Format Markdown tables so their columns and separators align in the source.
 
 ## Changelog
 

@@ -1,4 +1,4 @@
-# Repository Instructions for Agents
+# C² Engineering Guidelines
 
 Before planning or modifying this repository, read [CONTRIBUTING.md](CONTRIBUTING.md) in full and treat its development, design, Rust style, documentation, changelog, and pull request guidance as repository requirements.
 
