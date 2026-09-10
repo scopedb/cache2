@@ -44,6 +44,9 @@ const MIN_INDEX_SLOTS: usize = 8;
 const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
 
 /// Inputs for a persistent L2 layout, checked by [`Self::build`].
+///
+/// Start with [`Self::new`] and assign the fields to customize before building.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageOptions {
     /// Total Region capacity, excluding file headers, state, and recovery images.

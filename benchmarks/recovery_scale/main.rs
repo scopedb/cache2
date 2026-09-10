@@ -83,23 +83,25 @@ impl ScaleConfig {
     }
 
     fn storage_options(&self) -> StorageOptions {
-        StorageOptions {
-            region_size_bytes: 32 * MIB as u64,
-            expected_entries: Some(self.expected_entries),
-            ..StorageOptions::new(self.capacity_bytes)
-        }
+        let mut options = StorageOptions::new(self.capacity_bytes);
+        options.region_size_bytes = 32 * MIB as u64;
+        options.expected_entries = Some(self.expected_entries);
+        options
     }
 
     fn runtime_options(&self) -> RuntimeOptions {
-        RuntimeOptions {
-            io_engine: IoEngineOptions::Posix(PosixIoOptions::new(1, 1, 1)),
-            io_mode: IoMode::Buffered,
-            append_shards: 4,
-            l1_capacity_bytes: self.memory_bytes,
-            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
-            statistics: false,
-            ..RuntimeOptions::default()
-        }
+        let mut io = PosixIoOptions::default();
+        io.read_workers = 1;
+        io.write_workers = 1;
+        io.reclaim_workers = 1;
+        let mut options = RuntimeOptions::default();
+        options.io_engine = IoEngineOptions::Posix(io);
+        options.io_mode = IoMode::Buffered;
+        options.append_shards = 4;
+        options.l1_capacity_bytes = self.memory_bytes;
+        options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
+        options.statistics = false;
+        options
     }
 }
 

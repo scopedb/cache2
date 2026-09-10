@@ -154,12 +154,12 @@ impl UringIoEngine {
         })?;
         let mut builder = IoUring::builder();
         builder.setup_cqsize(completion_entries).dontfork();
-        if config.io_poll() {
+        if config.io_poll {
             builder.setup_iopoll();
         }
-        if let Some(sq_poll) = config.sq_poll() {
-            builder.setup_sqpoll(sq_poll.idle_millis());
-            if let Some(cpu) = sq_poll.cpu() {
+        if let Some(sq_poll) = config.sq_poll {
+            builder.setup_sqpoll(sq_poll.idle_millis);
+            if let Some(cpu) = sq_poll.cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
         }
@@ -170,7 +170,7 @@ impl UringIoEngine {
                 "kernel io_uring can drop completion entries",
             ));
         }
-        if config.sq_poll().is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
+        if config.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "kernel io_uring SQPOLL requires registered files",
