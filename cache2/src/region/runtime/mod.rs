@@ -40,7 +40,7 @@ use asyncband::semaphore::Semaphore;
 use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
-use crate::IoEngineConfig;
+use crate::IoEngineOptions;
 use crate::config::CacheConfig;
 use crate::config::l1_entry_capacity;
 use crate::config::reserved_memory_bytes;
@@ -1547,7 +1547,7 @@ fn build_engine_pool(
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if matches!(config.io_engine, IoEngineConfig::Posix(_)) {
+    let posix_workers = if matches!(config.io_engine, IoEngineOptions::Posix(_)) {
         topology.max_in_flight
     } else {
         1
@@ -2463,8 +2463,8 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
-        use crate::config::runtime::IoEngineConfig;
-        use crate::config::runtime::PosixIoConfig;
+        use crate::config::runtime::IoEngineOptions;
+        use crate::config::runtime::PosixIoOptions;
         use crate::region::file_backend::FileRegionBackend;
         use crate::region::file_backend::RegionFiles;
         use crate::region::index::packed::IndexEntry;
@@ -2497,7 +2497,11 @@ mod tests {
         };
         for wait in [Duration::ZERO, Duration::from_millis(1)] {
             let config = RuntimeOptions {
-                io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
+                io_engine: IoEngineOptions::Posix(PosixIoOptions {
+                    read_workers: 1,
+                    write_workers: 1,
+                    reclaim_workers: 1,
+                }),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
                 statistics: true,

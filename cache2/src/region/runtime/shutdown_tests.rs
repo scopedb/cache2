@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 use super::*;
-use crate::IoEngineConfig;
+use crate::IoEngineOptions;
 use crate::io::backend::IoBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
@@ -205,7 +205,7 @@ fn submitted_read_must_not_pin_close() {
 }
 
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
-    use crate::config::runtime::PosixIoConfig;
+    use crate::config::runtime::PosixIoOptions;
     use crate::region::file_backend::FileRegionBackend;
     use crate::region::file_backend::RegionFiles;
     use crate::region::recovery::PersistentId;
@@ -231,7 +231,11 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let config = RuntimeOptions {
         append_shards: 1,
         l1_capacity_bytes: 0,
-        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
+        io_engine: IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 1,
+            write_workers: 1,
+            reclaim_workers: 1,
+        }),
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(

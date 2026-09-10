@@ -6,22 +6,17 @@ This guide explains the interactions between `StorageLayout` and `RuntimeOptions
 
 ## Configuration lifecycle
 
-Fill in `StorageOptions` and `RuntimeOptions` using their public fields. `StorageOptions::build()` returns an immutable `StorageLayout` with checked geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the complete combination and retains the resolved runtime choices and memory requirements. Neither step opens files, starts workers, or needs Tokio.
+Unchecked inputs consistently use `*Options` names and public fields. These structs are `#[non_exhaustive]`: start with `new(required_input)` or `Default`, then assign the fields to customize. This allows new optional fields without breaking callers; struct literals, including `..Default::default()`, cannot be used outside the crate. `StorageOptions::build()` returns an immutable `StorageLayout` with checked geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the complete combination and retains the resolved runtime choices and memory requirements. Neither step opens files, starts workers, or needs Tokio.
 
 ```rust
 use cache2::{Cache, CacheConfig, L1EvictionPolicy, RuntimeOptions, StorageOptions};
 
-let storage = StorageOptions {
-    expected_entries: Some(1_000_000),
-    ..StorageOptions::new(8 * 1024 * 1024 * 1024)
-}.build()?;
-let runtime = RuntimeOptions {
-    l1_capacity_bytes: 256 * 1024 * 1024,
-    l1_eviction_policy: L1EvictionPolicy::S3Fifo,
-    managed_memory_limit_bytes: 1024 * 1024 * 1024,
-    statistics: true,
-    ..RuntimeOptions::default()
-};
+let mut storage = StorageOptions::new(8 * 1024 * 1024 * 1024);
+storage.expected_entries = Some(1_000_000);
+let storage = storage.build()?;
+let mut runtime = RuntimeOptions::default();
+runtime.l1_eviction_policy = L1EvictionPolicy::S3Fifo;
+runtime.statistics = true;
 let config = CacheConfig::new(storage, runtime)?;
 let disk_peak = config.storage().peak_disk_bytes();
 let memory_floor = config.minimum_memory_bytes();
@@ -33,10 +28,9 @@ The two resource queries cannot fail or repeat configuration checks. When choosi
 `CacheConfig::runtime()` reports the selected options with dependent defaults resolved. Both result types have private fields and can be cloned. Changing options constructs a new result; there is no validation flag to invalidate. Cloning `config.runtime()` preserves the resolved waiter bound. Set `max_waiters` back to `None` if it should follow a newly selected I/O pool. For example, reuse the same layout when changing L1:
 
 ```rust
-let adjusted = CacheConfig::new(config.storage().clone(), RuntimeOptions {
-    l1_capacity_bytes: 128 * 1024 * 1024,
-    ..config.runtime().clone()
-})?;
+let mut runtime = config.runtime().clone();
+runtime.l1_capacity_bytes = 128 * 1024 * 1024;
+let adjusted = CacheConfig::new(config.storage().clone(), runtime)?;
 ```
 
 `Cache::open` consumes one configuration and uses the current Tokio runtime when first polled. Use `Cache::open_with_handle(path, config, handle)` for an explicit runtime, which must have time enabled and outlive the cache. Clone the configuration before opening when it will be reused. Each open locks files and acquires its own resources; constructing a configuration reserves none of them.
@@ -48,6 +42,12 @@ let adjusted = CacheConfig::new(config.storage().clone(), RuntimeOptions {
 | Open cache | `Open` | File locks, filesystem/device capabilities, recovery, actual allocation, runtime binding, worker startup |
 
 Recovery still validates persisted metadata against the selected layout, and reads still validate records. Configuration construction cannot establish the contents of files or guarantee that external resources remain available.
+
+### Migrating from 0.4
+
+Rename unchecked `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` to their `Options` counterparts. The benchmarking input `RegionIndexTurnoverConfig` likewise becomes `RegionIndexTurnoverOptions`. `CacheConfig` remains the validated result, and `StorageLayout` remains the validated persistent layout.
+
+Replace option struct literals with `StorageOptions::new(capacity_bytes)` or `RuntimeOptions::default()` followed by field assignments. For POSIX and io_uring, replace positional `new(...)` calls and `with_*` methods with `Default` and named fields; read fields directly instead of calling getters. Keep `IoUringSqPollOptions::new(idle_millis)` to supply the polling idle time. Defaults, validation boundaries, and persistent data formats are unchanged.
 
 ### Migrating from the builder API
 
@@ -171,7 +171,7 @@ The read path first selects an index candidate, then admits one bounded read. Th
 2. the optional wait queue;
 3. managed memory for the aligned read buffer.
 
-Physical execution is backend-specific. `PosixIoConfig::read_workers` is both the number of blocking worker threads and the maximum admitted reads; every additional worker adds a 512 KiB reserved cache-thread stack. `IoUringPoolConfig` instead separates the number of rings/driver threads from the aggregate `max_in_flight` bound, which is distributed across those rings. The normal hash route stays stable; only a saturated primary lane probes one rotating alternate, so a hot route can use every ring without scanning them.
+Physical execution is backend-specific. `PosixIoOptions::read_workers` is both the number of blocking worker threads and the maximum admitted reads; every additional worker adds a 512 KiB reserved cache-thread stack. `IoUringPoolOptions` instead separates the number of rings/driver threads from the aggregate `max_in_flight` bound, which is distributed across those rings. The normal hash route stays stable; only a saturated primary lane probes one rotating alternate, so a hot route can use every ring without scanning them.
 
 `read_admission` chooses pressure behavior independently of physical capacity:
 
@@ -186,12 +186,10 @@ Physical execution is backend-specific. `PosixIoConfig::read_workers` is both th
 use std::time::Duration;
 use cache2::{ReadAdmission, RuntimeOptions};
 
-let runtime = RuntimeOptions {
-    read_admission: ReadAdmission::Wait {
-        timeout: Duration::from_millis(2),
-        max_waiters: Some(16),
-    },
-    ..RuntimeOptions::default()
+let mut runtime = RuntimeOptions::default();
+runtime.read_admission = ReadAdmission::Wait {
+    timeout: Duration::from_millis(2),
+    max_waiters: Some(16),
 };
 ```
 
@@ -270,26 +268,22 @@ io_uring is feature-gated and experimental. Its three pools configure physical r
 
 ```rust
 use cache2::{
-    IoEngineConfig, IoMode, IoUringConfig, IoUringPoolConfig,
-    IoUringSqPollConfig, RuntimeOptions,
+    IoEngineOptions, IoMode, IoUringOptions, IoUringSqPollOptions, RuntimeOptions,
 };
 
-let read = IoUringPoolConfig::new(1, 128)
-    .with_sq_poll(IoUringSqPollConfig::new(2_000).with_cpu(4));
-let runtime = RuntimeOptions {
-    io_engine: IoEngineConfig::IoUring(IoUringConfig::new(
-        read,
-        IoUringPoolConfig::new(1, 64),
-        IoUringPoolConfig::new(1, 1),
-    )),
-    io_mode: IoMode::Direct,
-    ..RuntimeOptions::default()
-};
+let mut sq_poll = IoUringSqPollOptions::new(2_000);
+sq_poll.cpu = Some(4);
+let mut io = IoUringOptions::default();
+io.read.max_in_flight = 128;
+io.read.sq_poll = Some(sq_poll);
+let mut runtime = RuntimeOptions::default();
+runtime.io_engine = IoEngineOptions::IoUring(io);
+runtime.io_mode = IoMode::Direct;
 ```
 
 `rings` controls driver-thread and kernel-ring count. `max_in_flight` is the aggregate admission bound and is divided as evenly as possible across those rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to each ring in that pool. SQPOLL defaults off; requested flags fail explicitly when the kernel cannot provide them.
 
-IOPOLL is an additional explicit per-pool opt-in through `IoUringPoolConfig::with_io_poll(true)`. It requires `IoMode::Direct` and a filesystem and block device that support polling. While requests are outstanding the driver busy-polls the device and consumes CPU, and a cancellation stays advisory until the polled operation completes, so profile IOPOLL on the target host before adopting it.
+IOPOLL is an additional explicit per-pool opt-in through the `IoUringPoolOptions::io_poll` field. It requires `IoMode::Direct` and a filesystem and block device that support polling. While requests are outstanding the driver busy-polls the device and consumes CPU, and a cancellation stays advisory until the polled operation completes, so profile IOPOLL on the target host before adopting it.
 
 ### Statistics
 

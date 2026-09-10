@@ -34,11 +34,9 @@ async fn main() -> io::Result<()> {
             "usage: logforth <cache-data-path>",
         )
     })?;
-    let storage = StorageOptions {
-        region_size_bytes: 4096,
-        ..StorageOptions::new(5 * 4096)
-    }
-    .build()?;
+    let mut storage_options = StorageOptions::new(5 * 4096);
+    storage_options.region_size_bytes = 4096;
+    let storage = storage_options.build()?;
     let config = CacheConfig::new(storage, RuntimeOptions::default())?;
     let cache = Cache::open(path, config).await?;
     cache.close_warm().await?;

@@ -38,12 +38,11 @@ use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
-use cache2::IoEngineConfig;
+use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringConfig;
-use cache2::IoUringPoolConfig;
+use cache2::IoUringOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoConfig;
+use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
 
@@ -213,7 +212,7 @@ struct HarnessConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngineConfig,
+    io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -240,26 +239,27 @@ impl HarnessConfig {
             .unwrap_or_else(|_| "posix".to_owned())
             .as_str()
         {
-            "posix" => IoEngineConfig::Posix(PosixIoConfig::new(
-                read_io_workers,
-                write_io_workers,
-                reclaim_workers,
-            )),
-            "io-uring" => IoEngineConfig::IoUring(IoUringConfig::new(
-                IoUringPoolConfig::new(
-                    read_io_workers,
-                    read_io_workers
-                        .checked_mul(64)
-                        .ok_or_else(|| invalid("read io_uring depth is too large"))?,
-                ),
-                IoUringPoolConfig::new(
-                    write_io_workers,
-                    write_io_workers
-                        .checked_mul(64)
-                        .ok_or_else(|| invalid("write io_uring depth is too large"))?,
-                ),
-                IoUringPoolConfig::new(reclaim_workers, reclaim_workers),
-            )),
+            "posix" => {
+                let mut options = PosixIoOptions::default();
+                options.read_workers = read_io_workers;
+                options.write_workers = write_io_workers;
+                options.reclaim_workers = reclaim_workers;
+                IoEngineOptions::Posix(options)
+            }
+            "io-uring" => {
+                let mut options = IoUringOptions::default();
+                options.read.rings = read_io_workers;
+                options.read.max_in_flight = read_io_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("read io_uring depth is too large"))?;
+                options.write.rings = write_io_workers;
+                options.write.max_in_flight = write_io_workers
+                    .checked_mul(64)
+                    .ok_or_else(|| invalid("write io_uring depth is too large"))?;
+                options.reclaim.rings = reclaim_workers;
+                options.reclaim.max_in_flight = reclaim_workers;
+                IoEngineOptions::IoUring(options)
+            }
             value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
         };
         let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
@@ -414,7 +414,7 @@ struct EffectiveConfig {
     reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
-    io_engine: IoEngineConfig,
+    io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -422,24 +422,22 @@ struct EffectiveConfig {
 
 impl EffectiveConfig {
     fn storage_options(&self) -> StorageOptions {
-        StorageOptions {
-            region_size_bytes: self.region_bytes as u64,
-            expected_entries: Some(self.key_count),
-            ..StorageOptions::new(self.capacity_bytes)
-        }
+        let mut options = StorageOptions::new(self.capacity_bytes);
+        options.region_size_bytes = self.region_bytes as u64;
+        options.expected_entries = Some(self.key_count);
+        options
     }
 
     fn runtime_options(&self) -> RuntimeOptions {
-        RuntimeOptions {
-            io_engine: self.io_engine,
-            io_mode: self.io_mode,
-            append_shards: self.append_shards,
-            l1_capacity_bytes: self.l1_bytes,
-            l1_eviction_policy: self.l1_eviction_policy,
-            managed_memory_limit_bytes: self.managed_memory_limit_bytes,
-            statistics: true,
-            ..RuntimeOptions::default()
-        }
+        let mut options = RuntimeOptions::default();
+        options.io_engine = self.io_engine;
+        options.io_mode = self.io_mode;
+        options.append_shards = self.append_shards;
+        options.l1_capacity_bytes = self.l1_bytes;
+        options.l1_eviction_policy = self.l1_eviction_policy;
+        options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
+        options.statistics = true;
+        options
     }
 }
 

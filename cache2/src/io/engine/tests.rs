@@ -22,7 +22,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::config::runtime::PosixIoConfig;
+use crate::config::runtime::PosixIoOptions;
 use crate::io::backend::FileBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
@@ -764,7 +764,11 @@ fn configured_posix_engine_shares_its_worker_capacity() {
         files,
         4,
         4,
-        IoEngineConfig::Posix(PosixIoConfig::new(4, 4, 1)),
+        IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 4,
+            write_workers: 4,
+            reclaim_workers: 1,
+        }),
         None,
         false,
         false,

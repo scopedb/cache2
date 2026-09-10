@@ -68,7 +68,7 @@ Construction requires neither file access nor Tokio. Inspect `config.storage().p
 
 ### Persistent layout
 
-`StorageOptions::new(capacity_bytes)` selects the total Region capacity, excluding headers, state, and recovery images. Its public fields allow explicit `region_size_bytes` and `expected_entries` values. Defaults are 32 MiB Regions and an index sized for 16 KiB average live entries. Build candidate layouts and compare `StorageLayout::peak_disk_bytes()` with the disk budget before choosing runtime tuning. Changing the persistent layout starts with an empty cache.
+`StorageOptions::new(capacity_bytes)` selects the total Region capacity, excluding headers, state, and recovery images. Assign its public fields to customize `region_size_bytes` and `expected_entries`. All option structs are `#[non_exhaustive]`: create them with `new(required_input)` or `Default`, then assign fields. Defaults are 32 MiB Regions and an index sized for 16 KiB average live entries. Build candidate layouts and compare `StorageLayout::peak_disk_bytes()` with the disk budget before choosing runtime tuning. Changing the persistent layout starts with an empty cache.
 
 See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for examples, budget accounting, error boundaries, and migration from the builder API.
 
@@ -77,7 +77,7 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 | Area      | Controls                                                                   | Default and behavior                                                                        |
 |-----------|----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
 | L1        | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                     | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| I/O pools | `io_engine: IoEngineConfig::Posix(...)` or `IoEngineConfig::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
+| I/O pools | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
 | Read wait | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }` | Immediate admission; wait capacity defaults to aggregate read capacity.                     |
 | Writes    | `append_shards`, `write_flush_threshold_bytes`                             | Four append shards and a 4 MiB flush threshold.                                             |
 | Memory    | `managed_memory_limit_bytes`                                               | 1 GiB across cache-managed allocations.                                                     |
@@ -106,7 +106,7 @@ The on-disk format is versioned. During 0.x, deployments should expect cold star
 
 ### Metrics
 
-`Cache::snapshot()` provides lock-free health and resource gauges. `RuntimeOptions { statistics: true, .. }` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
+`Cache::snapshot()` provides lock-free health and resource gauges. Setting `RuntimeOptions::statistics` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
 
 C² exposes snapshots for integration with the application's metrics SDK. An OpenTelemetry or Prometheus adapter can export:
 
