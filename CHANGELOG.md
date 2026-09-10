@@ -5,15 +5,10 @@
 ### Breaking Changes
 
 - The public I/O configuration enum is now named `IoEngineConfig`; replace `IoEngine` imports and variant paths with `IoEngineConfig`.
-- Error types are exported only from the crate root. Replace imports from `cache2::error` with `cache2::{Error, ErrorKind, ErrorOperation}`.
-- The `cache2::Result` alias is removed. Use the standard `Result<T, Error>` with `Error` imported from `cache2`; public operation error types are unchanged.
-- Configuration now separates editable `StorageOptions` / `RuntimeOptions` from immutable `StorageLayout` / `CacheConfig`. Build the layout, construct `CacheConfig::new(layout, options)`, and call `Cache::open(path, config)` or `Cache::open_with_handle(path, config, handle)`. `StaticConfig`, `RuntimeConfig`, `CacheBuilder`, and the standalone `validate` method are removed.
+- Error types are exported only from the crate root, and the `cache2::Result` alias is removed. Replace imports from `cache2::error` with `cache2::{Error, ErrorKind, ErrorOperation}` and use the standard `Result<T, Error>`; public operation error types are unchanged.
+- Configuration now separates editable `StorageOptions` / `RuntimeOptions` from immutable `StorageLayout` / `CacheConfig`. Replace `StaticConfig`, `RuntimeConfig`, and `CacheBuilder` by building a layout, constructing `CacheConfig::new(layout, options)`, and calling `Cache::open(path, config)` or `Cache::open_with_handle(path, config, handle)`. Construction validates and retains geometry and memory requirements; the standalone `validate` method is removed. Configurations can be inspected and reused without file access or an active Tokio runtime, with paths and runtime handles supplied separately at open.
 - `ReadAdmission::Immediate` and `ReadAdmission::Wait { timeout, max_waiters }` replace the separate read-wait setters. Waiting requires a positive timeout; an omitted waiter bound follows the selected read execution capacity.
-- Configuration errors identify `ErrorOperation::BuildStorage` or `BuildConfig`. `StorageLayout::peak_disk_bytes()` is now an infallible query.
-
-### Improvements
-
-- Geometry and memory requirements are retained through startup. Configurations can be inspected and reused without file access or an active Tokio runtime; paths and runtime handles are supplied separately when opening each cache.
+- Configuration errors identify `ErrorOperation::BuildStorage` or `BuildConfig` instead of `ValidateConfig` or `PeakDiskBytes`. Replace fallible `StaticConfig::peak_disk_bytes()` calls with the infallible `StorageLayout::peak_disk_bytes()` query.
 
 ## v0.3.0 (2026-09-04)
 
@@ -29,7 +24,7 @@ This release keeps the version 1 on-disk format and requires no disk migration. 
 
 ### Breaking Changes
 
-- `IoEngineConfig` now carries backend-specific topology. Configure POSIX worker counts with `PosixIoConfig`; configure independent io_uring pools with `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods were removed.
+- `IoEngine` now carries backend-specific topology. Configure POSIX worker counts with `PosixIoConfig`; configure independent io_uring pools with `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods were removed.
 
 ### Improvements
 
