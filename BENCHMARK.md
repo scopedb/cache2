@@ -43,6 +43,8 @@ The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults
 | Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_STATS` (default false; true adds cache/I/O/resource records)                            |
 | Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                       |
 
+The additional stats implementation is controlled independently by `CACHE_BENCH_REQUEST_STATS` (complete request counters, default false), `CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL`, `CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL`, and `CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL` (independent: 0 off, 1 full, greater values sample with that mean interval; default 0), `CACHE_BENCH_IO_LATENCY` (full engine latency, default false), and `CACHE_BENCH_STATS_SHARDS` (default 16). These instrument the library itself. `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` remains the independent benchmark observer and should be held constant across comparisons. The effective additional settings are printed with each run. Compare disabled, counters-only, full and sampled modes on the same workload, keeping actual hit/overload populations in view.
+
 `CACHE_BENCH_STATS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs.
 
 For device measurements, use a data set larger than host RAM and no larger than half of L2 capacity. Run baseline and candidate in alternating order at least five times, compare medians, and retain every sample. Throughput does not replace correctness, overload, memory, or latency checks.

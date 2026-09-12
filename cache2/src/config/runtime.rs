@@ -433,6 +433,9 @@ pub struct RuntimeOptions {
     /// Enable cumulative request, cache, and I/O counters. Defaults to false;
     /// health and managed-resource gauges remain available.
     pub statistics: bool,
+    /// Additional request accounting and latency distributions. Independent of
+    /// `statistics`; defaults disable all additional recorders.
+    pub stats: crate::StatsOptions,
 }
 
 impl Default for RuntimeOptions {
@@ -448,6 +451,7 @@ impl Default for RuntimeOptions {
             l1_shards: DEFAULT_L1_SHARDS,
             write_flush_threshold_bytes: MAX_WRITE_FLUSH_THRESHOLD_BYTES,
             statistics: false,
+            stats: crate::StatsOptions::default(),
         }
     }
 }
@@ -506,6 +510,7 @@ impl CacheConfig {
             let geometry = storage.geometry;
             let index_slots = storage.index_slots;
             runtime.resolve()?;
+            let stats_bytes = crate::stats::recording::Recorder::allocation_bytes(runtime.stats)?;
             if geometry.region_count <= runtime.append_shards {
                 return Err(invalid_config(
                     "append shards require valid geometry with one Active Region each plus one spare Region",
@@ -520,6 +525,7 @@ impl CacheConfig {
             )?;
             let fixed_bytes = runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
                 .checked_add(l1_metadata_bytes)
+                .and_then(|bytes| bytes.checked_add(stats_bytes))
                 .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
             let (reserved_memory_bytes, minimum_memory_bytes) =
                 runtime.memory_requirements(geometry, fixed_bytes)?;

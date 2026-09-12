@@ -568,7 +568,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     cache.drain().await.unwrap();
     cache.close_warm().await.unwrap();
 
-    let retuned = RuntimeOptions {
+    let reopened_options = RuntimeOptions {
         io_engine: IoEngineConfig::Posix(PosixIoConfig::new(7, 2, 2)),
         l1_capacity_bytes: 2 * 1024 * 1024,
         l1_eviction_policy: L1EvictionPolicy::S3Fifo,
@@ -583,7 +583,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     };
     let reopened = Cache::open(
         &files.data,
-        CacheConfig::new(test_storage(), retuned).unwrap(),
+        CacheConfig::new(test_storage(), reopened_options).unwrap(),
     )
     .await
     .unwrap();
@@ -1290,5 +1290,199 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
         assert_eq!(reopened.startup_mode(), StartupMode::Cold, "{target}");
         assert!(reopened.get("key").await.unwrap().is_none(), "{target}");
         reopened.close_fast().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn structured_stats_track_original_hit_tier_and_full_distributions() {
+    use cache2::IoOutcome;
+    use cache2::IoRole;
+    use cache2::LatencyMode;
+    use cache2::RequestOperation;
+    use cache2::RequestOutcome;
+    use cache2::StatsOptions;
+
+    let files = TestCache::new("structured-stats");
+    let mut options = test_runtime_options(1, 2);
+    options.statistics = false;
+    options.stats = StatsOptions {
+        request_counters: true,
+        l1_latency: LatencyMode::Full,
+        l2_latency: LatencyMode::Full,
+        mutation_latency: LatencyMode::Full,
+        io_latency: true,
+        shards: 2,
+    };
+    let base = CacheConfig::new(test_storage(), test_runtime_options(1, 2)).unwrap();
+    let config = CacheConfig::new(test_storage(), options).unwrap();
+    let cache = Cache::open(&files.data, config.clone()).await.unwrap();
+    let before = cache.stats_snapshot().unwrap();
+    assert_eq!(
+        config.minimum_memory_bytes() - base.minimum_memory_bytes(),
+        before.recorder_bytes
+    );
+    assert!(before.summary.managed_memory_bytes >= before.recorder_bytes);
+    // Future construction must not count or start timing.
+    drop(cache.get(b"never-polled"));
+    cache.put_l2(b"l2", b"value").unwrap();
+    cache.drain().await.unwrap();
+    let value = cache.get(b"l2").await.unwrap().unwrap();
+    assert_eq!(value.as_ref(), b"value");
+    assert_eq!(value.tier(), CacheTier::L2);
+    assert!(cache.get(b"l2").await.unwrap().is_some());
+    assert!(cache.get(b"missing").await.unwrap().is_none());
+    assert_eq!(
+        cache.put(vec![0; 4097], b"value").unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    cache.delete(b"l2").unwrap();
+    let stats = cache.stats_snapshot().unwrap();
+    assert!(!stats.summary.statistics_enabled);
+    assert_eq!(stats.summary.l2_hits, 0);
+    for (operation, outcome) in [
+        (RequestOperation::PutL2, RequestOutcome::Accepted),
+        (RequestOperation::Get, RequestOutcome::L2Hit),
+        (RequestOperation::Get, RequestOutcome::L1Hit),
+        (RequestOperation::Get, RequestOutcome::Miss),
+        (RequestOperation::Put, RequestOutcome::InvalidInput),
+        (RequestOperation::Delete, RequestOutcome::Accepted),
+    ] {
+        let row = stats
+            .requests
+            .iter()
+            .find(|row| row.operation == operation && row.outcome == outcome)
+            .unwrap();
+        assert_eq!(row.count, Some(1), "{row:?}");
+        assert_eq!(row.latency.as_ref().unwrap().count, 1);
+    }
+    assert_eq!(
+        stats
+            .requests
+            .iter()
+            .map(|row| row.count.unwrap())
+            .sum::<u64>(),
+        6
+    );
+    let read = stats
+        .io_latency
+        .iter()
+        .find(|row| row.role == IoRole::Read && row.outcome == IoOutcome::Completed)
+        .unwrap();
+    assert_eq!(read.latency.count, 1);
+    let write = stats
+        .io_latency
+        .iter()
+        .find(|row| row.role == IoRole::Write && row.outcome == IoOutcome::Completed)
+        .unwrap();
+    assert!(write.latency.count >= 1);
+    let epoch = stats.summary.metrics_epoch;
+    cache.close_warm().await.unwrap();
+    assert!(cache.stats_snapshot().is_err());
+    drop(cache);
+    let reopened = Cache::open(&files.data, config).await.unwrap();
+    let reset = reopened.stats_snapshot().unwrap();
+    assert_ne!(reset.summary.metrics_epoch, epoch);
+    assert!(reset.requests.iter().all(|row| row.count == Some(0)));
+    reopened.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_stats_do_not_allocate_recorders() {
+    let files = TestCache::new("disabled-stats");
+    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
+    let stats = cache.stats_snapshot().unwrap();
+    assert!(stats.requests.is_empty());
+    assert!(stats.io_latency.is_empty());
+    assert_eq!(stats.recorder_bytes, 0);
+    cache.close_fast().await.unwrap();
+}
+
+#[tokio::test]
+async fn tier_latency_modes_are_independent_and_describe_their_scope() {
+    use std::num::NonZeroU32;
+
+    use cache2::LatencyMode;
+    use cache2::RequestOperation;
+    use cache2::RequestOutcome;
+    use cache2::StatsOptions;
+
+    let sampled = LatencyMode::Sampled {
+        interval: NonZeroU32::new(64).unwrap(),
+    };
+    for (l1_latency, l2_latency) in [
+        (LatencyMode::Off, LatencyMode::Full),
+        (sampled, LatencyMode::Full),
+        (LatencyMode::Full, LatencyMode::Off),
+        (LatencyMode::Full, sampled),
+    ] {
+        let files = TestCache::new("tier-latency");
+        let mut options = test_runtime_options(1, 2);
+        options.stats = StatsOptions {
+            request_counters: true,
+            l1_latency,
+            l2_latency,
+            ..StatsOptions::default()
+        };
+        let cache = Cache::open(
+            &files.data,
+            CacheConfig::new(test_storage(), options).unwrap(),
+        )
+        .await
+        .unwrap();
+        cache.put_l2(b"key", b"value").unwrap();
+        cache.drain().await.unwrap();
+        assert_eq!(
+            cache.get(b"key").await.unwrap().unwrap().tier(),
+            CacheTier::L2
+        );
+        for _ in 0..4096 {
+            assert_eq!(
+                cache.get(b"key").await.unwrap().unwrap().tier(),
+                CacheTier::L1
+            );
+            assert!(cache.get(b"absent").await.unwrap().is_none());
+        }
+        // Rejected before the L1 lookup: count the miss without inventing an L2 duration.
+        assert!(cache.get(vec![0; 4097]).await.unwrap().is_none());
+        let stats = cache.stats_snapshot().unwrap();
+        for (outcome, mode, count, scope) in [
+            (
+                RequestOutcome::L1Hit,
+                l1_latency,
+                4096,
+                cache2::RequestLatencyScope::L1Hit,
+            ),
+            (
+                RequestOutcome::Miss,
+                l2_latency,
+                4097,
+                cache2::RequestLatencyScope::L2Lookup,
+            ),
+        ] {
+            let row = stats
+                .requests
+                .iter()
+                .find(|row| row.operation == RequestOperation::Get && row.outcome == outcome)
+                .unwrap();
+            assert_eq!(row.count, Some(count));
+            assert_eq!(row.latency_mode, mode);
+            assert_eq!(row.latency_scope, scope);
+            match mode {
+                LatencyMode::Off => assert!(row.latency.is_none()),
+                LatencyMode::Full => assert_eq!(row.latency.as_ref().unwrap().count, 4096),
+                LatencyMode::Sampled { .. } => {
+                    assert!((10..140).contains(&row.latency.as_ref().unwrap().count))
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            stats
+                .requests
+                .iter()
+                .filter(|row| row.operation != RequestOperation::Get)
+                .all(|row| row.latency.is_none())
+        );
+        cache.close_fast().await.unwrap();
     }
 }

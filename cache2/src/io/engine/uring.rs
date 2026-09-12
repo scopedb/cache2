@@ -245,6 +245,13 @@ impl UringIoEngine {
 }
 
 impl IoEngine for UringIoEngine {
+    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+        assert!(
+            self.inner.shared.latency.set(recorder).is_ok(),
+            "I/O recorder installed twice"
+        );
+    }
+
     fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         self.inner.try_reserve_read()
     }

@@ -944,6 +944,8 @@ fn submit_cache_io_until(
 }
 
 pub trait IoEngine: Send + Sync {
+    /// Installed once during construction, before any requests are admitted.
+    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming);
     fn try_reserve_read(&self) -> io::Result<ReadSlot>;
     fn read_slot_waiter(&self) -> ReadSlotWaiter;
     fn submit_reserved_read(
@@ -1009,6 +1011,7 @@ struct IoSlot {
 /// Dropping it before submission releases the slot immediately.
 pub struct ReadSlot {
     slot: IoSlot,
+    reserved_at: Option<Instant>,
 }
 
 /// An async reservation handle backed by the engine's physical slot state.
@@ -1165,6 +1168,7 @@ const fn active_write_slots(state: u64) -> usize {
 }
 
 struct RuntimeShared {
+    latency: std::sync::OnceLock<crate::stats::recording::IoTiming>,
     max_in_flight: usize,
     statistics_enabled: bool,
     accepting: AtomicBool,
@@ -1196,6 +1200,7 @@ enum SlotWaitError {
 impl RuntimeShared {
     fn new(max_in_flight: usize, statistics_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
+            latency: std::sync::OnceLock::new(),
             max_in_flight,
             statistics_enabled,
             accepting: AtomicBool::new(true),
@@ -1276,7 +1281,9 @@ impl RuntimeShared {
             .try_reserve_slot(false)
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))?;
         slot.read_permit = permit;
-        Ok(ReadSlot { slot })
+        let reserved_at =
+            (self.statistics_enabled || self.latency.get().is_some()).then(Instant::now);
+        Ok(ReadSlot { slot, reserved_at })
     }
 
     fn stop_accepting_slots(&self) {
@@ -1475,8 +1482,19 @@ impl RuntimeShared {
                     self.requests_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            if let Some(submitted_at) = submitted_at {
-                add_duration_ns(&self.request_time_ns, submitted_at.elapsed());
+        }
+        if let Some(submitted_at) = submitted_at {
+            let elapsed = submitted_at.elapsed();
+            if self.statistics_enabled {
+                add_duration_ns(&self.request_time_ns, elapsed);
+            }
+            if let Some(recorder) = self.latency.get() {
+                let outcome = match &status {
+                    CompletionStatus::Completed => crate::IoOutcome::Completed,
+                    CompletionStatus::Cancelled => crate::IoOutcome::Cancelled,
+                    CompletionStatus::Failed(_) => crate::IoOutcome::Failed,
+                };
+                recorder.record(elapsed, outcome);
             }
         }
         drop(slot);
@@ -1654,8 +1672,9 @@ impl RuntimeInner {
         if let Err(error) = operation.validate() {
             return Err(SubmitError { error, operation });
         }
-        let request_started = self.shared.statistics_enabled.then(Instant::now);
-        self.submit_with_slot(operation, slot.slot, request_started, true)
+        // Include buffer preparation and scheduling after the reservation.
+        // Dropped, unsubmitted reservations still produce no observation.
+        self.submit_with_slot(operation, slot.slot, slot.reserved_at, true)
     }
 
     #[cfg(test)]
@@ -1737,7 +1756,9 @@ impl RuntimeInner {
             add_duration_ns(&self.shared.slot_wait_ns, slot_wait_started.elapsed());
         }
 
-        let request_started = self.shared.statistics_enabled.then(Instant::now);
+        let request_started = (self.shared.statistics_enabled
+            || self.shared.latency.get().is_some())
+        .then(Instant::now);
         self.submit_with_slot(operation, slot, request_started, nonblocking)
     }
 

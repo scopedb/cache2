@@ -70,3 +70,17 @@ mod resources;
 mod fixtures;
 #[cfg(test)]
 mod property_tests;
+
+mod stats;
+pub use self::stats::CacheStatsSnapshot;
+pub use self::stats::IoLatencySnapshot;
+pub use self::stats::IoOutcome;
+pub use self::stats::IoRole;
+pub use self::stats::LATENCY_BUCKET_UPPER_BOUNDS_NS;
+pub use self::stats::LatencyMode;
+pub use self::stats::LatencySnapshot;
+pub use self::stats::RequestLatencyScope;
+pub use self::stats::RequestOperation;
+pub use self::stats::RequestOutcome;
+pub use self::stats::RequestStatsSnapshot;
+pub use self::stats::StatsOptions;

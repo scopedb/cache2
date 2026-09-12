@@ -521,7 +521,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let slot = plane.reserve_read_slot_for_test();
 
     tokio_runtime.block_on(async {
-        let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle()));
+        let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle(), None));
         assert_pending(waiting.as_mut(), "saturated read must enter the wait queue").await;
 
         store.close_warm().unwrap();

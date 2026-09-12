@@ -108,6 +108,8 @@ The on-disk format is versioned. During 0.x, deployments should expect cold star
 
 `Cache::snapshot()` provides lock-free health and resource gauges. `RuntimeOptions { statistics: true, .. }` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
 
+`RuntimeOptions::stats` independently enables complete public request outcomes, L1-hit, L2-lookup and mutation latency (each `Off`, `Full`, or `Sampled`), and full I/O latency by read/write/reclaim role. `Cache::stats_snapshot()` combines these with the existing summary without metadata scans. Structured request rows include their timing scope and collection mode. Applications own metric conversion, timestamps, scheduling and transport. Run `cargo run --example stats -- <cache-data-path>` for an example. Full timing avoids sampling work; sampled histograms retain actual sample counts and cannot guarantee observation of rare tail events. Recorder storage is preallocated, bounded and charged to managed memory.
+
 C² exposes snapshots for integration with the application's metrics SDK. An OpenTelemetry or Prometheus adapter can export:
 
 - get outcomes from `l1_hits`, `l2_hits`, `l2_misses`, and `l2_read_overloads`;
