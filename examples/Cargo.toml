@@ -30,5 +30,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 name = "logforth"
 path = "src/logforth.rs"
 
+[[example]]
+name = "stats"
+path = "src/stats.rs"
+
 [lints]
 workspace = true

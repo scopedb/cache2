@@ -82,6 +82,7 @@ struct BenchConfig {
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     statistics_enabled: bool,
+    stats: cache2::StatsOptions,
     directory: PathBuf,
 }
 
@@ -154,6 +155,23 @@ impl BenchConfig {
             }
         };
         let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
+        let latency = |name| -> io::Result<cache2::LatencyMode> {
+            Ok(match env_u32(name, 0)? {
+                0 => cache2::LatencyMode::Off,
+                1 => cache2::LatencyMode::Full,
+                interval => cache2::LatencyMode::Sampled {
+                    interval: std::num::NonZeroU32::new(interval).expect("positive interval"),
+                },
+            })
+        };
+        let stats = cache2::StatsOptions {
+            request_counters: env_bool("CACHE_BENCH_REQUEST_STATS", false)?,
+            l1_latency: latency("CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL")?,
+            l2_latency: latency("CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL")?,
+            mutation_latency: latency("CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL")?,
+            io_latency: env_bool("CACHE_BENCH_IO_LATENCY", false)?,
+            shards: env_usize("CACHE_BENCH_STATS_SHARDS", 16)?,
+        };
         let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
@@ -264,6 +282,7 @@ impl BenchConfig {
             io_mode,
             l1_eviction_policy,
             statistics_enabled,
+            stats,
             directory,
         })
     }
@@ -285,6 +304,7 @@ impl BenchConfig {
             l1_eviction_policy: self.l1_eviction_policy,
             managed_memory_limit_bytes: self.managed_memory_limit_bytes,
             statistics: self.statistics_enabled,
+            stats: self.stats,
             read_admission: if self.read_io_wait_timeout.is_zero() {
                 ReadAdmission::Immediate
             } else {
@@ -411,6 +431,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     };
 
     println!("C² cache benchmark");
+    println!("additional_stats={:?}", config.stats);
     println!(
         "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
         config.entries,

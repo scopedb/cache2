@@ -284,3 +284,40 @@ fn invalid_runtime_options_are_rejected_when_building_configuration() {
         assert_eq!(error.operation(), ErrorOperation::BuildConfig, "{case}");
     }
 }
+
+#[test]
+fn stats_storage_is_bounded_and_included_in_the_memory_floor() {
+    let options = RuntimeOptions {
+        append_shards: 2,
+        ..RuntimeOptions::default()
+    };
+    let base = CacheConfig::new(test_storage(), options.clone()).unwrap();
+    for shards in [0, 3, 65, usize::MAX] {
+        let mut invalid = options.clone();
+        invalid.stats.shards = shards;
+        assert_eq!(
+            CacheConfig::new(test_storage(), invalid)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+    let mut enabled = options;
+    enabled.stats = cache2::StatsOptions {
+        request_counters: true,
+        l1_latency: cache2::LatencyMode::Full,
+        l2_latency: cache2::LatencyMode::Full,
+        mutation_latency: cache2::LatencyMode::Full,
+        io_latency: true,
+        shards: 64,
+    };
+    let configured = CacheConfig::new(test_storage(), enabled.clone()).unwrap();
+    assert!(configured.minimum_memory_bytes() > base.minimum_memory_bytes());
+    enabled.managed_memory_limit_bytes = base.minimum_memory_bytes();
+    assert_eq!(
+        CacheConfig::new(test_storage(), enabled)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+}

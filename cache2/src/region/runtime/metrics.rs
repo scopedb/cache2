@@ -34,6 +34,7 @@ static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct RuntimeMetrics {
     metrics_epoch: u64,
+    pub stats: std::sync::Arc<crate::stats::recording::Recorder>,
     pub lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
     l2_read_overloads: AtomicU64,
@@ -86,7 +87,7 @@ impl ActivityMetrics {
 }
 
 impl RuntimeMetrics {
-    pub fn new(shard_count: usize) -> io::Result<Self> {
+    pub fn new(shard_count: usize, stats: crate::StatsOptions) -> io::Result<Self> {
         let mut activity = Vec::new();
         activity.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -97,6 +98,7 @@ impl RuntimeMetrics {
         activity.resize_with(shard_count, ActivityMetrics::new);
         Ok(Self {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
+            stats: std::sync::Arc::new(crate::stats::recording::Recorder::new(stats)?),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
             l2_read_overloads: AtomicU64::new(0),

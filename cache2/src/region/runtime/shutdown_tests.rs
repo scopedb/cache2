@@ -104,6 +104,9 @@ struct RacingEngine {
 }
 
 impl IoEngine for RacingEngine {
+    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+        self.inner.set_latency_recorder(recorder);
+    }
     fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         self.inner.try_reserve_read()
     }
