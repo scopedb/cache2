@@ -17,3 +17,8 @@ x = "run --package x --"
 
 [env]
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
+
+# Cargo normalizes Git dependencies to registry versions when verifying a package.
+# Keep this temporary patch in sync with Cargo.toml until AutoResetEvent is released.
+[patch.crates-io]
+asyncband = { git = "https://github.com/tisonkun/asyncband.git", rev = "085390437eba05a76efdcfd7e4388b1ea0023dbc" }
