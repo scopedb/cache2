@@ -27,8 +27,14 @@ rust-version = "1.98"
 # Workspace crates
 cache2 = { path = "cache2", version = "0.4.0" }
 
+# Unreleased AutoResetEvent implementation; use its crates.io release before merging.
+asyncband = { version = "0.7.2", git = "https://github.com/tisonkun/asyncband.git", rev = "085390437eba05a76efdcfd7e4388b1ea0023dbc", features = [
+  "barrier",
+  "event",
+  "semaphore",
+] }
+
 # Crates.io dependencies
-asyncband = { version = "0.7.1", features = ["barrier", "semaphore", "watch"] }
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
