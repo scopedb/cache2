@@ -31,6 +31,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use asyncband::blocking::FutureExt as _;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
@@ -206,16 +207,8 @@ async fn completed_reclaim_snapshot(cache: &Cache) -> DetailedCacheSnapshot {
 }
 
 #[test]
-fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
-    let files = TestCache::new("explicit-tokio-handle");
-    let cache_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_time()
-        .build()
-        .unwrap();
-    let caller_runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
+fn cache_works_without_an_async_runtime() {
+    let files = TestCache::new("without-runtime");
     let config = test_config(1);
     let minimum_memory_bytes = config.minimum_memory_bytes();
     let config = CacheConfig::new(
@@ -228,11 +221,8 @@ fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
     .unwrap();
     files.assert_absent();
 
-    caller_runtime.block_on(async {
-        let cache =
-            Cache::open_with_handle(&files.data, config.clone(), cache_runtime.handle().clone())
-                .await
-                .unwrap();
+    async {
+        let cache = Cache::open(&files.data, config.clone()).await.unwrap();
         assert_eq!(
             cache.snapshot().unwrap().managed_memory_limit_bytes,
             minimum_memory_bytes
@@ -241,16 +231,35 @@ fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
         cache.drain().await.unwrap();
         cache.close_warm().await.unwrap();
 
-        let reopened = Cache::open_with_handle(&files.data, config, cache_runtime.handle().clone())
-            .await
-            .unwrap();
+        let reopened = Cache::open(&files.data, config).await.unwrap();
         assert_eq!(reopened.startup_mode(), StartupMode::Warm);
         let value = reopened.get("key").await.unwrap().unwrap();
         assert_eq!(value.tier(), CacheTier::L2);
         assert_eq!(value.as_ref(), b"value");
         drop(value);
         reopened.close_fast().await.unwrap();
-    });
+    }
+    .block_on();
+}
+
+#[test]
+fn cache_can_outlive_its_opening_executor() {
+    let files = TestCache::new("outlive-executor");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let cache = runtime
+        .block_on(Cache::open(&files.data, test_config(1)))
+        .unwrap();
+    drop(runtime);
+
+    cache.put_l2("key", "value").unwrap();
+    cache.drain().block_on().unwrap();
+    assert_eq!(
+        cache.get("key").block_on().unwrap().unwrap().as_ref(),
+        b"value"
+    );
+    cache.close_warm().block_on().unwrap();
 }
 
 #[tokio::test]

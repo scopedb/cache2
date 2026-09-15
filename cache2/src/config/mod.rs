@@ -24,7 +24,7 @@ pub mod storage;
 ///
 /// Construction checks runtime settings against the storage layout and managed
 /// memory limit. It performs bounded calculations without opening files, starting
-/// workers, or requiring Tokio. Resource queries reuse the computed results.
+/// workers, or requiring an async runtime. Resource queries reuse the computed results.
 /// Clone a configuration to reuse it across paths or successive opens; each open
 /// acquires its own resources and can still fail on I/O or allocation.
 #[derive(Clone, Debug)]
@@ -61,7 +61,7 @@ impl CacheConfig {
 ///
 /// Created by [`StorageOptions::build`](crate::StorageOptions::build). Changing the geometry or
 /// index size changes the disk identity, so an incompatible recovery image opens empty.
-/// Layout construction neither reserves disk space nor requires a Tokio runtime.
+/// Layout construction neither reserves disk space nor requires an async runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageLayout {
     geometry: DataGeometry,

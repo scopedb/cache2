@@ -20,8 +20,10 @@
 
 use std::fmt;
 use std::future::Future;
+use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -43,6 +45,7 @@ use std::time::Instant;
 
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
+use futures_timer::Delay;
 
 use crate::IoEngineConfig;
 #[cfg(unix)]
@@ -788,26 +791,19 @@ impl BoundedIoRequest {
     pub async fn wait_async(
         self,
         engine: Arc<dyn IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
-        let deadline = tokio::time::Instant::from_std(self.deadline);
-        let completion = {
-            let _entered = tokio_handle.enter();
-            tokio::time::timeout_at(deadline, request.request_mut())
-        }
-        .await;
+        let completion = timeout_at(self.deadline, request.request_mut()).await;
         if let Ok(completion) = completion {
             request.disarm();
             return Ok(completion);
         }
 
         let cancel_error = request.cancel().err();
-        let completion = {
-            let _entered = tokio_handle.enter();
-            tokio::time::timeout(self.cancel_grace, request.request_mut())
-        }
-        .await;
+        let grace_deadline = Instant::now()
+            .checked_add(self.cancel_grace)
+            .unwrap_or_else(Instant::now);
+        let completion = timeout_at(grace_deadline, request.request_mut()).await;
         match completion {
             Ok(completion) => {
                 request.disarm();
@@ -1081,23 +1077,16 @@ impl ReadSlotAdmission {
         Ok(permit)
     }
 
-    async fn acquire_until(
-        &self,
-        deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<OwnedSemaphorePermit> {
+    async fn acquire_until(&self, deadline: Instant) -> io::Result<OwnedSemaphorePermit> {
         self.ensure_open()?;
         let acquire = Arc::clone(&self.slots).acquire_owned(1);
-        {
-            let _entered = tokio_handle.enter();
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
-        }
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))
-        .and_then(|permit| {
-            self.ensure_open()?;
-            Ok(permit)
-        })
+        timeout_at(deadline, acquire)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L2 read wait deadline expired"))
+            .and_then(|permit| {
+                self.ensure_open()?;
+                Ok(permit)
+            })
     }
 
     fn close(&self) {
@@ -1105,6 +1094,25 @@ impl ReadSlotAdmission {
             self.slots.release(self.capacity);
         }
     }
+}
+
+async fn timeout_at<F: Future>(deadline: Instant, future: F) -> Result<F::Output, ()> {
+    let mut future = pin!(future);
+    let mut timer = None;
+    poll_fn(|context| {
+        // A ready completion wins even at the deadline. Delay registration is
+        // unnecessary when I/O or admission completed before the first poll.
+        if let Poll::Ready(output) = future.as_mut().poll(context) {
+            return Poll::Ready(Ok(output));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Poll::Ready(Err(()));
+        }
+        let timer = timer.get_or_insert_with(|| Delay::new(remaining));
+        Pin::new(timer).poll(context).map(|()| Err(()))
+    })
+    .await
 }
 
 struct ReadWaiterGuard<'a> {
@@ -1118,11 +1126,7 @@ impl Drop for ReadWaiterGuard<'_> {
 }
 
 impl ReadSlotWaiter {
-    pub async fn reserve_until(
-        self,
-        deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<ReadSlot> {
+    pub async fn reserve_until(self, deadline: Instant) -> io::Result<ReadSlot> {
         let admission = self
             .shared
             .read_slot_admission
@@ -1130,7 +1134,7 @@ impl ReadSlotWaiter {
             .ok_or_else(|| io::Error::other("async read admission is disabled"))?;
         let _waiter = admission.register_waiter();
         self.shared.ensure_accepting()?;
-        let permit = admission.acquire_until(deadline, tokio_handle).await?;
+        let permit = admission.acquire_until(deadline).await?;
         self.shared.try_reserve_read_slot(Some(permit))
     }
 }

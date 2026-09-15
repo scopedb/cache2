@@ -114,7 +114,7 @@ Reads and writes use independent bounded engine pools. Reclaim has separate read
 
 ### Memory
 
-The managed-memory limit covers the index mapping, heat bits, L1, append buffers, reclaim buffers, metadata, cache-owned thread stacks, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, Tokio, process overhead, and the kernel page cache. `CacheConfig::new` rejects invalid or insufficient memory budgets before file access; actual allocation can still fail during open.
+The managed-memory limit covers the index mapping, heat bits, L1, append buffers, reclaim buffers, metadata, worker thread stacks, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, lifecycle thread stacks, timer infrastructure, the application executor, process overhead, and the kernel page cache. `CacheConfig::new` rejects invalid or insufficient memory budgets before file access; actual allocation can still fail during open.
 
 ### Storage path
 

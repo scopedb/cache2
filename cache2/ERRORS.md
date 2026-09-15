@@ -109,4 +109,4 @@ Use `error.kind() == cache2::ErrorKind::Overloaded` for application policy. Use 
 
 `StorageOptions::build` reports `BuildStorage`; `CacheConfig::new` reports `BuildConfig`. Correct invalid options or an insufficient managed-memory limit before trying again. Successful results retain the checked layout and resource requirements, so inspecting their disk and memory bounds cannot fail.
 
-`Cache::open` and `Cache::open_with_handle` report `Open`. A valid configuration can still encounter a busy file, unavailable device support, an allocation failure, or an unavailable runtime. Handle these according to `ErrorKind` just like other lifecycle failures.
+`Cache::open` reports `Open`. A valid configuration can still encounter a busy file, unavailable device support, an allocation failure, or a worker startup failure. Handle these according to `ErrorKind` just like other lifecycle failures.

@@ -420,8 +420,9 @@ pub struct RuntimeOptions {
     /// Bounded L1 eviction policy. Defaults to CLOCK; S3-FIFO adds ghost metadata.
     pub l1_eviction_policy: L1EvictionPolicy,
     /// Aggregate cache-managed memory limit, defaulting to 1 GiB. Covers index
-    /// mappings, L1, buffers, metadata, queues, and cache threads. Allocator
-    /// overhead, Tokio, application memory, and the kernel page cache are outside it.
+    /// mappings, L1, buffers, metadata, queues, and worker stacks. Allocator
+    /// overhead, lifecycle thread stacks, timer infrastructure, application memory,
+    /// and the kernel page cache are outside it.
     pub managed_memory_limit_bytes: usize,
     /// Independently locked L1 shards, from 1 through 65536 (default 32). Powers
     /// of two give the cheapest routing; more shards require more metadata.

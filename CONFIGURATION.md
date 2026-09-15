@@ -6,7 +6,7 @@ This guide explains the interactions between `StorageLayout` and `RuntimeOptions
 
 ## Configuration lifecycle
 
-Fill in `StorageOptions` and `RuntimeOptions` using their public fields. `StorageOptions::build()` returns an immutable `StorageLayout` with checked geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the complete combination and retains the resolved runtime choices and memory requirements. Neither step opens files, starts workers, or needs Tokio.
+Fill in `StorageOptions` and `RuntimeOptions` using their public fields. `StorageOptions::build()` returns an immutable `StorageLayout` with checked geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the complete combination and retains the resolved runtime choices and memory requirements. Neither step opens files, starts workers, or needs an async runtime.
 
 ```rust
 use cache2::{Cache, CacheConfig, L1EvictionPolicy, RuntimeOptions, StorageOptions};
@@ -39,7 +39,7 @@ let adjusted = CacheConfig::new(config.storage().clone(), RuntimeOptions {
 })?;
 ```
 
-`Cache::open` consumes one configuration and uses the current Tokio runtime when first polled. Use `Cache::open_with_handle(path, config, handle)` for an explicit runtime, which must have time enabled and outlive the cache. Clone the configuration before opening when it will be reused. Each open locks files and acquires its own resources; constructing a configuration reserves none of them.
+`Cache::open` consumes one configuration and can be polled by any executor. File setup and recovery use a lifecycle thread; the cache is not bound to the executor that opened it. Clone the configuration before opening when it will be reused. Each open locks files and acquires its own resources; constructing a configuration reserves none of them.
 
 | Stage | Error operation | What can fail |
 |-------|-----------------|---------------|
@@ -51,7 +51,7 @@ Recovery still validates persisted metadata against the selected layout, and rea
 
 ### Migrating from the builder API
 
-Replace `StaticConfig` with `StorageOptions` and call `build()` once to obtain the layout. Replace `RuntimeConfig` setters with `RuntimeOptions` fields, then construct `CacheConfig::new(layout, options)`. Replace `CacheBuilder::open()` with `Cache::open(path, config)`, passing any explicit Tokio handle through `Cache::open_with_handle`. The standalone `validate()` method is removed; disk-usage queries now belong to `StorageLayout` and return `u64` directly. Use `ReadAdmission::Immediate` for the former zero timeout, or `ReadAdmission::Wait { timeout, max_waiters }` for bounded waiting.
+Replace `StaticConfig` with `StorageOptions` and call `build()` once to obtain the layout. Replace `RuntimeConfig` setters with `RuntimeOptions` fields, then construct `CacheConfig::new(layout, options)`. Replace `CacheBuilder::open()` or `Cache::open_with_handle(path, config, handle)` with `Cache::open(path, config)`; no runtime handle is needed. The standalone `validate()` method is removed; disk-usage queries now belong to `StorageLayout` and return `u64` directly. Use `ReadAdmission::Immediate` for the former zero timeout, or `ReadAdmission::Wait { timeout, max_waiters }` for bounded waiting.
 
 ## Measure the workload envelope first
 
@@ -87,7 +87,7 @@ This is a floor, not a recommended limit. Concurrent L2 reads allocate alignment
 
 `CacheConfig::new` rejects a combination whose fixed footprint cannot fit the managed-memory limit. A configuration that barely meets `minimum_memory_bytes()` can still produce read-memory misses or overload once concurrent transient buffers consume the remaining budget.
 
-The managed-memory limit is not an RSS limit. Allocator metadata, Tokio, the application, mapped-file residency, and the kernel page cache are outside it. Buffered I/O can therefore use substantial kernel memory even when the C² managed-memory gauges remain below their limit.
+The managed-memory limit is not an RSS limit. Allocator metadata, lifecycle thread stacks, timer infrastructure, the application executor, mapped-file residency, and the kernel page cache are outside it. Buffered I/O can therefore use substantial kernel memory even when the C² managed-memory gauges remain below their limit.
 
 ### High-impact interaction map
 

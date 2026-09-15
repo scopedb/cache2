@@ -358,7 +358,7 @@ impl PendingGet {
         }
     }
 
-    async fn wait_async(self, tokio_handle: &tokio::runtime::Handle) -> CompletedGet {
+    async fn wait_async(self) -> CompletedGet {
         let Self {
             engine,
             read,
@@ -366,7 +366,7 @@ impl PendingGet {
             hash,
         } = self;
         CompletedGet {
-            read: read.wait_async(engine, tokio_handle).await,
+            read: read.wait_async(engine).await,
             read_token,
             hash,
         }
@@ -374,7 +374,7 @@ impl PendingGet {
 }
 
 impl WaitingGet {
-    async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
+    async fn reserve_async(self) -> io::Result<ReservedGet> {
         let Self {
             engine,
             slot_waiter,
@@ -384,7 +384,7 @@ impl WaitingGet {
             deadline,
             waiter_permit,
         } = self;
-        let slot = slot_waiter.reserve_until(deadline, tokio_handle).await?;
+        let slot = slot_waiter.reserve_until(deadline).await?;
         drop(waiter_permit);
         Ok(ReservedGet {
             engine,
@@ -913,19 +913,13 @@ impl RegionDataPlane {
         }
     }
 
-    pub async fn get_async(
-        &self,
-        key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<Option<HybridValueRead>> {
+    pub async fn get_async(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
         match self.prepare_get(key)? {
             PreparedGet::Complete(value) => Ok(value),
-            PreparedGet::Pending(pending) => {
-                self.finish_get(pending.wait_async(tokio_handle).await, key)
-            }
+            PreparedGet::Pending(pending) => self.finish_get(pending.wait_async().await, key),
             PreparedGet::Waiting(waiting) => {
                 let wait_started = self.config.statistics.then(Instant::now);
-                let reserved = waiting.reserve_async(tokio_handle).await;
+                let reserved = waiting.reserve_async().await;
                 if let Some(wait_started) = wait_started {
                     self.metrics.record_read_wait(wait_started.elapsed());
                 }
@@ -933,7 +927,7 @@ impl RegionDataPlane {
                 let Some(pending) = self.submit_reserved_get(reserved)? else {
                     return Ok(None);
                 };
-                self.finish_get(pending.wait_async(tokio_handle).await, key)
+                self.finish_get(pending.wait_async().await, key)
             }
         }
     }

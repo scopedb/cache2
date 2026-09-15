@@ -34,7 +34,7 @@ async fn run() -> Result<(), Error> {
 }
 ```
 
-`open` uses the current Tokio runtime. Use `Cache::open_with_handle(path, config, handle)` to bind C² to another runtime; it must have time enabled and outlive the cache.
+`Cache::open` and all other asynchronous operations work with any executor. File setup and shutdown use short-lived lifecycle threads; read deadlines use an independent shared timer. No Tokio runtime or timer driver is required.
 
 ## Semantics
 
@@ -58,13 +58,13 @@ Public failures are `cache2::Error` values with an actionable `ErrorKind`, the f
 
 ### Lifecycle
 
-`close_fast`, drop, and an unclean exit make the next open a cold start. `close_warm` publishes a clean recovery image for a warm start. Both close methods work through `Arc<Cache>` without `Arc::try_unwrap`: the first close call immediately makes every shared handle inert, then fences accepted persistent work on Tokio's blocking pool. Prefer explicit async close because drop closes the cache synchronously. Retained handles may keep bounded in-memory resources allocated until they are dropped, but no longer admit public operations.
+`close_fast`, drop, and an unclean exit make the next open a cold start. `close_warm` publishes a clean recovery image for a warm start. Both close methods work through `Arc<Cache>` without `Arc::try_unwrap`: the first close call immediately makes every shared handle inert, then fences accepted persistent work on a lifecycle thread. Prefer explicit async close because drop closes the cache synchronously. Retained handles may keep bounded in-memory resources allocated until they are dropped, but no longer admit public operations.
 
 ## Configuration
 
 `StorageOptions` and `RuntimeOptions` are editable inputs. Build the storage options into a `StorageLayout`, then combine it with runtime options using `CacheConfig::new`. The resulting configuration is immutable and ready for `Cache::open(path, config)`.
 
-Construction requires neither file access nor Tokio. Inspect `config.storage().peak_disk_bytes()` and `config.minimum_memory_bytes()` before opening; both queries reuse computed values. Clone a configuration to reuse it across paths or successive opens. File locks, device support, recovery, and actual allocations are checked when opening each instance.
+Construction requires neither file access nor an async runtime. Inspect `config.storage().peak_disk_bytes()` and `config.minimum_memory_bytes()` before opening; both queries reuse computed values. Clone a configuration to reuse it across paths or successive opens. File locks, device support, recovery, and actual allocations are checked when opening each instance.
 
 ### Persistent layout
 
@@ -98,7 +98,7 @@ C² supports 64-bit Linux and macOS. Buffered positioned I/O is available on bot
 
 C² accepts one data-file path. For multiple homogeneous SSDs, expose RAID0 or an equivalent striped block device below the filesystem. Losing any member discards the complete cache.
 
-The managed-memory limit covers the index, L1, append and reclaim buffers, metadata, cache-owned threads, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, Tokio, process overhead, and the kernel page cache.
+The managed-memory limit covers the index, L1, append and reclaim buffers, metadata, worker thread stacks, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, lifecycle thread stacks, timer infrastructure, the application executor, process overhead, and the kernel page cache.
 
 The on-disk format is versioned. During 0.x, deployments should expect cold starts across releases and monitor `Cache::startup_mode()`.
 

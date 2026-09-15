@@ -74,8 +74,7 @@ pub enum ErrorOperation {
     BuildConfig,
     /// [`StorageOptions::build`](crate::StorageOptions::build).
     BuildStorage,
-    /// [`Cache::open`](crate::Cache::open) or
-    /// [`Cache::open_with_handle`](crate::Cache::open_with_handle).
+    /// [`Cache::open`](crate::Cache::open).
     Open,
     /// [`Cache::put`](crate::Cache::put).
     Put,

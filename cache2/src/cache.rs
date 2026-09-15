@@ -33,7 +33,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use tokio::task::JoinError;
+use asyncband::oneshot;
 
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
@@ -106,7 +106,7 @@ impl Value {
     }
 }
 
-/// An open cache bound to one Tokio runtime.
+/// An open cache whose futures can run on any executor.
 ///
 /// Prefer [`Self::close_fast`] or [`Self::close_warm`] for async shutdown.
 /// Either close method can be called through a shared [`Arc`] and immediately
@@ -121,7 +121,6 @@ pub struct Cache {
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
-    tokio_handle: tokio::runtime::Handle,
 }
 
 impl fmt::Debug for Cache {
@@ -134,65 +133,32 @@ impl fmt::Debug for Cache {
 }
 
 impl Cache {
-    /// Opens a configured cache using the current Tokio runtime at first poll.
-    /// The runtime must have time enabled and outlive the cache. File setup and
-    /// recovery run on its blocking pool.
+    /// Opens a configured cache without requiring a particular async runtime.
+    /// File setup and recovery run on a separate lifecycle thread.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorOperation::Open`] for file locking, recovery, allocation,
-    /// device support, runtime binding, or worker startup failures. Configuration
+    /// device support, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self, Error> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
-            from_io(
-                ErrorOperation::Open,
-                io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
-            )
-        })?;
-        Self::open_with_handle(path, config, handle).await
-    }
-
-    /// Opens on an explicit Tokio runtime, including from a caller without an
-    /// active runtime. The selected runtime must have time enabled and outlive
-    /// the cache. Each open independently locks files and acquires resources.
-    ///
-    /// # Errors
-    ///
-    /// Uses the same [`ErrorOperation::Open`] failures as [`Self::open`].
-    pub async fn open_with_handle(
-        path: impl AsRef<Path>,
-        config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
-    ) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
-        let cache_handle = tokio_handle.clone();
         let started = Instant::now();
-        let result = tokio_handle
-            .spawn_blocking(move || Self::open_blocking(path, config, cache_handle, started))
-            .await
-            .map_err(|error| {
-                from_io(
-                    ErrorOperation::Open,
-                    blocking_task_error("cache open", error),
-                )
-            })?;
+        let result = spawn_lifecycle("cache2-open", move || {
+            Self::open_blocking(path, config, started)
+        })
+        .await;
         public_result(ErrorOperation::Open, result)
     }
 
-    fn open_blocking(
-        path: PathBuf,
-        config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
-        started: Instant,
-    ) -> io::Result<Cache> {
+    fn open_blocking(path: PathBuf, config: CacheConfig, started: Instant) -> io::Result<Cache> {
         let capacity_bytes = config.storage().capacity_bytes();
         let index_slots = config.storage().index_slots();
         let index_bytes = u64::try_from(index_slots)
             .ok()
             .and_then(recovery_image_index_len)
             .unwrap_or(0);
-        let result = Self::open_blocking_inner(path.clone(), config, tokio_handle);
+        let result = Self::open_blocking_inner(path.clone(), config);
         match &result {
             Ok(cache) => {
                 let startup = cache.startup_mode();
@@ -225,11 +191,7 @@ impl Cache {
         result
     }
 
-    fn open_blocking_inner(
-        path: PathBuf,
-        config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
-    ) -> io::Result<Cache> {
+    fn open_blocking_inner(path: PathBuf, config: CacheConfig) -> io::Result<Cache> {
         let format_data = DataSuperblock {
             generation: 1,
             cache_uuid: next_persistent_id(),
@@ -256,7 +218,6 @@ impl Cache {
             startup,
             path,
             logical_disk_peak_bytes,
-            tokio_handle,
         })
     }
     /// Reports whether this open started empty or mapped a clean recovery image.
@@ -341,9 +302,7 @@ impl Cache {
         }
         public_result(
             ErrorOperation::Get,
-            self.data_plane
-                .get_async(key.as_ref(), &self.tokio_handle)
-                .await,
+            self.data_plane.get_async(key.as_ref()).await,
         )
         .map(|value| value.map(|inner| Value { inner }))
     }
@@ -397,7 +356,7 @@ impl Cache {
         Ok(snapshot)
     }
 
-    /// Stops on Tokio's blocking pool and makes the next open a cold start.
+    /// Stops on a lifecycle thread and makes the next open a cold start.
     /// Calling this method immediately rejects new operations through every
     /// shared handle; unique [`Arc`] ownership is not required. The first close
     /// call wins and continues even if the returned future is dropped.
@@ -411,7 +370,7 @@ impl Cache {
         self.close(false)
     }
 
-    /// Publishes a clean recovery image on Tokio's blocking pool. Calling this
+    /// Publishes a clean recovery image on a lifecycle thread. Calling this
     /// method immediately rejects new operations through every shared handle;
     /// unique [`Arc`] ownership is not required. Accepted mutations and their
     /// submitted writes are fenced before the image is frozen. The first close
@@ -446,13 +405,12 @@ impl Cache {
         } else {
             (ErrorOperation::CloseFast, "fast")
         };
-        let tokio_handle = self.tokio_handle.clone();
         let close = (!self.closed.swap(true, Ordering::AcqRel)).then(|| {
             self.data_plane.start_close();
             let owner = Arc::clone(&self.owner);
             let path = self.path.clone();
             let started = Instant::now();
-            tokio_handle.spawn_blocking(move || {
+            spawn_lifecycle("cache2-close", move || {
                 let result = owner
                     .lock()
                     .map_err(|_| cache_lifecycle_poisoned())
@@ -469,10 +427,7 @@ impl Cache {
         });
         async move {
             let result = match close {
-                Some(close) => match close.await {
-                    Ok(result) => result,
-                    Err(error) => Err(blocking_task_error("cache close", error)),
-                },
+                Some(close) => close.await,
                 None => Err(cache_closed_error()),
             };
             public_result(operation, result)
@@ -556,8 +511,25 @@ fn log_cache_close(path: &Path, mode: &'static str, elapsed: Duration, result: &
     }
 }
 
-fn blocking_task_error(operation: &'static str, error: JoinError) -> io::Error {
-    io::Error::other(format!("{operation} task failed: {error}"))
+fn spawn_lifecycle<T: Send + 'static>(
+    name: &'static str,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> impl Future<Output = io::Result<T>> + Send {
+    let (sender, receiver) = oneshot::channel();
+    // Starting before the returned future is polled preserves close's eager,
+    // cancellation-independent contract. There is at most one open and one
+    // close task per cache; request-path operations never spawn threads here.
+    let thread = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        });
+    async move {
+        drop(thread?);
+        receiver
+            .await
+            .map_err(|_| io::Error::other(format!("{name} task panicked")))?
+    }
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -590,6 +562,8 @@ fn next_persistent_id() -> PersistentId {
 
 #[cfg(test)]
 mod tests {
+    use asyncband::blocking::FutureExt as _;
+
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -598,5 +572,31 @@ mod tests {
     fn public_cache_and_values_are_send_and_sync() {
         assert_send_sync::<Cache>();
         assert_send_sync::<Value>();
+    }
+
+    #[test]
+    fn lifecycle_work_continues_when_its_unpolled_future_is_dropped() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let work = spawn_lifecycle("cache2-test-close", move || {
+            wait.recv().unwrap();
+            finished.send(()).unwrap();
+            Ok(())
+        });
+        drop(work);
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_panics_are_reported_as_io_errors() {
+        let error = spawn_lifecycle("cache2-test-panic", || -> io::Result<()> {
+            panic!("injected lifecycle failure")
+        })
+        .wait_timeout(Duration::from_secs(2))
+        .expect("panicking lifecycle task did not wake its caller")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("cache2-test-panic"));
     }
 }

@@ -25,6 +25,7 @@ default = []
 io-uring = ["cache2/io-uring"]
 
 [dev-dependencies]
+asyncband = { workspace = true, features = ["blocking"] }
 cache2 = { workspace = true }
 crc-fast = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

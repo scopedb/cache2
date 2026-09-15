@@ -98,17 +98,13 @@ impl PendingRead {
         Self::finish(plan, request_id, completion)
     }
 
-    pub async fn wait_async(
-        self,
-        engine: Arc<dyn IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> ReadCompletion {
+    pub async fn wait_async(self, engine: Arc<dyn IoEngine>) -> ReadCompletion {
         let Self {
             plan,
             request_id,
             request,
         } = self;
-        let completion = request.wait_async(engine, tokio_handle).await;
+        let completion = request.wait_async(engine).await;
         Self::finish(plan, request_id, completion)
     }
 

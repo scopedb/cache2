@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking Changes
+
+- Cache futures now work with any executor and no longer require a Tokio runtime or timer driver. Replace `Cache::open_with_handle(path, config, handle)` with `Cache::open(path, config)`. Opening and closing use lifecycle threads; read admission, I/O deadlines, and cancellation retain their existing bounds, and closing still continues if its returned future is dropped.
+
 ## v0.4.0 (2026-09-10)
 
 ### Breaking Changes

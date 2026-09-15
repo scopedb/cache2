@@ -262,15 +262,8 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
     }
 
     #[cfg(test)]
-    async fn get_value_async(
-        &self,
-        key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?
-            .data_plane()?
-            .get_async(key, tokio_handle)
-            .await
+    async fn get_value_async(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+        self.runtime()?.data_plane()?.get_async(key).await
     }
 
     #[cfg(test)]

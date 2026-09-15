@@ -94,6 +94,7 @@ version = "0.4.0"
 dependencies = [
  "asyncband",
  "crc-fast",
+ "futures-timer",
  "hashcrew",
  "io-uring",
  "libc",
@@ -251,11 +252,17 @@ dependencies = [
 name = "examples"
 version = "0.0.0"
 dependencies = [
+ "asyncband",
  "cache2",
  "log",
  "logforth",
- "tokio",
 ]
+
+[[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 
 [[package]]
 name = "generic-array"
@@ -281,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "hashcrew"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd3730de410a9d5f2ca41072653e79059e2c6fd9cd87300de4becacb1a93154"
+checksum = "f73782af6df9e45939f4e6206b646f3cbab68c2cc5c0c375dab045800cafb018"
 
 [[package]]
 name = "heck"
@@ -605,6 +612,7 @@ dependencies = [
 name = "tests-integration"
 version = "0.0.0"
 dependencies = [
+ "asyncband",
  "cache2",
  "crc-fast",
  "tokio",

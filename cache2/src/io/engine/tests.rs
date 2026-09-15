@@ -21,6 +21,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use asyncband::blocking::FutureExt as _;
+
 use super::*;
 use crate::config::runtime::PosixIoConfig;
 use crate::io::backend::FileBackend;
@@ -54,11 +56,8 @@ async fn spawn_registered_read_slot_waiter(
     expected_waiters: usize,
 ) -> tokio::task::JoinHandle<io::Result<ReadSlot>> {
     let slot_waiter = engine.read_slot_waiter();
-    let waiter = tokio::spawn(async move {
-        slot_waiter
-            .reserve_until(Instant::now() + timeout, &tokio::runtime::Handle::current())
-            .await
-    });
+    let waiter =
+        tokio::spawn(async move { slot_waiter.reserve_until(Instant::now() + timeout).await });
     wait_for_registered_read_waiters(engine, expected_waiters).await;
     waiter
 }
@@ -369,8 +368,8 @@ fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
     engine.shutdown().unwrap();
 }
 
-#[tokio::test]
-async fn async_request_is_woken_by_driver_completion() {
+#[test]
+fn async_request_is_woken_by_driver_completion_without_a_runtime() {
     let file = TestFile::new();
     file.file().set_len(4096).unwrap();
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
@@ -382,8 +381,9 @@ async fn async_request_is_woken_by_driver_completion() {
     .unwrap();
 
     let completion = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
-        .await
+        .wait_async(Arc::clone(&engine))
+        .wait_timeout(Duration::from_secs(2))
+        .expect("driver completion did not wake the executor")
         .unwrap();
 
     assert!(matches!(completion.status, CompletionStatus::Completed));
@@ -402,11 +402,7 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
     )
     .unwrap();
     let waiter_engine = Arc::clone(&engine);
-    let waiter = tokio::spawn(async move {
-        request
-            .wait_async(waiter_engine, &tokio::runtime::Handle::current())
-            .await
-    });
+    let waiter = tokio::spawn(async move { request.wait_async(waiter_engine).await });
     tokio::task::yield_now().await;
     assert!(backend.wait_for_entered(1));
 
@@ -431,11 +427,7 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
     )
     .unwrap();
     let request_engine = Arc::clone(&engine);
-    let request_waiter = tokio::spawn(async move {
-        request
-            .wait_async(request_engine, &tokio::runtime::Handle::current())
-            .await
-    });
+    let request_waiter = tokio::spawn(async move { request.wait_async(request_engine).await });
     tokio::task::yield_now().await;
     assert!(backend.wait_for_entered(1));
 
@@ -445,8 +437,7 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
 
     let slot_waiter = engine.read_slot_waiter();
     let deadline = Instant::now() + Duration::from_secs(1);
-    let tokio_handle = tokio::runtime::Handle::current();
-    let mut reservation = Box::pin(slot_waiter.reserve_until(deadline, &tokio_handle));
+    let mut reservation = Box::pin(slot_waiter.reserve_until(deadline));
     assert!(
         tokio::time::timeout(Duration::from_millis(20), reservation.as_mut())
             .await
@@ -585,8 +576,8 @@ async fn cancelled_queue_head_passes_priority_to_next_read() {
     engine.shutdown().unwrap();
 }
 
-#[tokio::test]
-async fn async_read_deadline_keeps_other_slots_available() {
+#[test]
+fn async_read_deadline_keeps_other_slots_available_without_a_runtime() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
     let resources = resources();
@@ -600,8 +591,9 @@ async fn async_read_deadline_keeps_other_slots_available() {
     assert!(backend.wait_for_entered(1));
 
     let timeout = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
-        .await
+        .wait_async(Arc::clone(&engine))
+        .wait_timeout(Duration::from_secs(2))
+        .expect("I/O deadline did not wake the executor")
         .unwrap_err();
     let (error, buffer) = timeout.into_buffer();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -610,6 +602,25 @@ async fn async_read_deadline_keeps_other_slots_available() {
     drop(engine.try_reserve_read().unwrap());
 
     backend.release();
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn read_slot_deadline_without_a_runtime_does_not_leak_capacity() {
+    let file = TestFile::new();
+    let engine = BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap();
+    let held = engine.try_reserve_read().unwrap();
+    let reservation = engine
+        .read_slot_waiter()
+        .reserve_until(Instant::now() + Duration::from_millis(20))
+        .wait_timeout(Duration::from_secs(2))
+        .expect("admission deadline did not wake the executor");
+    match reservation {
+        Ok(_) => panic!("a read was admitted without physical capacity"),
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+    }
+    drop(held);
+    drop(engine.try_reserve_read().unwrap());
     engine.shutdown().unwrap();
 }
 

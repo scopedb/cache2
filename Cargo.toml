@@ -28,11 +28,17 @@ rust-version = "1.98"
 cache2 = { path = "cache2", version = "0.4.0" }
 
 # Crates.io dependencies
-asyncband = { version = "0.7.1", features = ["barrier", "semaphore", "watch"] }
+asyncband = { version = "0.7.1", features = [
+  "barrier",
+  "oneshot",
+  "semaphore",
+  "watch",
+] }
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
-hashcrew = { version = "0.2.0", features = ["std", "xxhash"] }
+futures-timer = { version = "3.0.4" }
+hashcrew = { version = "0.3.0", features = ["std", "crc", "xxhash"] }
 io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }
 log = { version = "0.4.31", features = ["kv"] }

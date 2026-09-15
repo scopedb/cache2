@@ -15,6 +15,7 @@
 use std::env;
 use std::io;
 
+use asyncband::blocking::FutureExt as _;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::RuntimeOptions;
@@ -24,8 +25,7 @@ use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     init_logforth();
 
     let path = env::args_os().nth(1).ok_or_else(|| {
@@ -40,8 +40,8 @@ async fn main() -> io::Result<()> {
     }
     .build()?;
     let config = CacheConfig::new(storage, RuntimeOptions::default())?;
-    let cache = Cache::open(path, config).await?;
-    cache.close_warm().await?;
+    let cache = Cache::open(path, config).block_on()?;
+    cache.close_warm().block_on()?;
     Ok(())
 }
 

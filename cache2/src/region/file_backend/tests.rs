@@ -438,7 +438,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let plane = store.data_plane_handle().unwrap();
     let mut slots: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
     tokio_runtime.block_on(async {
-        let mut cancelled = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+        let mut cancelled = Box::pin(store.get_value_async(b"queued-read"));
         assert_pending(
             cancelled.as_mut(),
             "saturated read must enter the wait queue",
@@ -447,7 +447,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         drop(cancelled);
     });
     let value = tokio_runtime.block_on(async {
-        let mut waiting = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+        let mut waiting = Box::pin(store.get_value_async(b"queued-read"));
         assert_pending(
             waiting.as_mut(),
             "a cancelled read must release its wait-queue permit",
@@ -461,16 +461,13 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     drop(value);
     let blocked: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
     tokio_runtime.block_on(async {
-        let mut waiting = Box::pin(store.get_value_async(b"queued-read", tokio_runtime.handle()));
+        let mut waiting = Box::pin(store.get_value_async(b"queued-read"));
         assert_pending(
             waiting.as_mut(),
             "saturated read must enter the bounded wait queue",
         )
         .await;
-        let queue_full = match store
-            .get_value_async(b"queued-read", tokio_runtime.handle())
-            .await
-        {
+        let queue_full = match store.get_value_async(b"queued-read").await {
             Err(error) => error,
             Ok(_) => panic!("a second saturated read must not enter a full wait queue"),
         };
@@ -521,7 +518,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let slot = plane.reserve_read_slot_for_test();
 
     tokio_runtime.block_on(async {
-        let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle()));
+        let mut waiting = Box::pin(plane.get_async(b"queued-close"));
         assert_pending(waiting.as_mut(), "saturated read must enter the wait queue").await;
 
         store.close_warm().unwrap();
