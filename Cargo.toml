@@ -31,7 +31,7 @@ cache2 = { path = "cache2", version = "0.4.0" }
 async-io = { version = "2.6.0" }
 asyncband = { version = "0.7.1", features = [
   "barrier",
-  "oneshot",
+  "mpsc",
   "semaphore",
   "watch",
 ] }

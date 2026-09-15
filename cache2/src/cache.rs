@@ -33,7 +33,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use asyncband::oneshot;
+use asyncband::mpsc;
 
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
@@ -515,18 +515,21 @@ fn spawn_lifecycle<T: Send + 'static>(
     name: &'static str,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> impl Future<Output = io::Result<T>> + Send {
-    let (sender, receiver) = oneshot::channel();
+    // AsyncBand 0.7's oneshot uses atomic fences unsupported by ThreadSanitizer.
+    // A bounded mpsc channel keeps the lifecycle handoff observable to the checker.
+    let (sender, mut receiver) = mpsc::bounded(1);
     // Starting before the returned future is polled preserves close's eager,
     // cancellation-independent contract. There is at most one open and one
     // close task per cache; request-path operations never spawn threads here.
     let thread = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            let _ = sender.send(operation());
+            let _ = sender.try_send(operation());
         });
     async move {
         drop(thread?);
         receiver
+            .recv()
             .await
             .map_err(|_| io::Error::other(format!("{name} task panicked")))?
     }
