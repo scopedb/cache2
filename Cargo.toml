@@ -28,6 +28,7 @@ rust-version = "1.98"
 cache2 = { path = "cache2", version = "0.4.0" }
 
 # Crates.io dependencies
+async-io = { version = "2.6.0" }
 asyncband = { version = "0.7.1", features = [
   "barrier",
   "oneshot",
@@ -37,7 +38,6 @@ asyncband = { version = "0.7.1", features = [
 cargo_metadata = { version = "0.23.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
-futures-timer = { version = "3.0.4" }
 hashcrew = { version = "0.3.0", features = ["std", "crc", "xxhash"] }
 io-uring = { version = "0.7.14" }
 libc = { version = "0.2.189" }

@@ -31,8 +31,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+async-io = { workspace = true }
 asyncband = { workspace = true }
-futures-timer = { workspace = true }
 hashcrew = { workspace = true }
 log = { workspace = true }
 

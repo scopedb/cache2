@@ -593,8 +593,7 @@ mod tests {
         let error = spawn_lifecycle("cache2-test-panic", || -> io::Result<()> {
             panic!("injected lifecycle failure")
         })
-        .wait_timeout(Duration::from_secs(2))
-        .expect("panicking lifecycle task did not wake its caller")
+        .block_on()
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("cache2-test-panic"));

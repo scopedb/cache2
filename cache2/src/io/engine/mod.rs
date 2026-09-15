@@ -43,9 +43,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use async_io::Timer;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
-use futures_timer::Delay;
 
 use crate::IoEngineConfig;
 #[cfg(unix)]
@@ -1098,19 +1098,14 @@ impl ReadSlotAdmission {
 
 async fn timeout_at<F: Future>(deadline: Instant, future: F) -> Result<F::Output, ()> {
     let mut future = pin!(future);
-    let mut timer = None;
+    let mut timer = Timer::at(deadline);
     poll_fn(|context| {
-        // A ready completion wins even at the deadline. Delay registration is
-        // unnecessary when I/O or admission completed before the first poll.
+        // A ready completion wins even at the deadline. The timer registers
+        // only when polled, after I/O or admission has returned Pending.
         if let Poll::Ready(output) = future.as_mut().poll(context) {
             return Poll::Ready(Ok(output));
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Poll::Ready(Err(()));
-        }
-        let timer = timer.get_or_insert_with(|| Delay::new(remaining));
-        Pin::new(timer).poll(context).map(|()| Err(()))
+        Pin::new(&mut timer).poll(context).map(|_| Err(()))
     })
     .await
 }
