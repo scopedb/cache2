@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.0 (2026-09-16)
+
 ### Breaking Changes
 
 - Unchecked I/O inputs now consistently use `Options` names: replace `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` with their `Options` counterparts. The benchmarking input is likewise renamed to `RegionIndexTurnoverOptions`. Validated `CacheConfig` and `StorageLayout` retain their names and construction semantics.
