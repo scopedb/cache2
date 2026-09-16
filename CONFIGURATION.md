@@ -289,7 +289,7 @@ IOPOLL is an additional explicit per-pool opt-in through the `IoUringPoolOptions
 
 Health and managed-resource gauges are always available. Enable `RuntimeOptions::statistics` while tuning to obtain cumulative request, index, L1, and I/O counters. Enabled counters add relaxed atomic work on active paths, so measure the overhead before leaving all activity statistics enabled in a latency-critical deployment.
 
-`RuntimeOptions::stats` adds independent controls: `request_counters` records all terminal public results; `l1_latency`, `l2_latency`, and `mutation_latency` independently select `LatencyMode::Off`, `Full`, or `Sampled { interval }`; `io_latency` records every engine completion by role; and `shards` selects a power of two from 1 through 64 (default 16). Defaults disable all additional recorders and preserve the legacy `statistics` switch. Fully specified `RuntimeOptions` literals need `stats: StatsOptions::default()` or a struct-update default.
+`RuntimeOptions::stats` adds independent controls: `request_counters` records all terminal public results; `l1_latency`, `l2_latency`, and `mutation_latency` independently select `LatencyMode::Off`, `Full`, or `Sampled { interval }`; `io_latency` records every engine completion by role; and `shards` selects a power of two from 1 through 64 (default 16). Defaults disable all additional recorders and preserve the legacy `statistics` switch. Construct `RuntimeOptions::default()` and assign `options.stats` fields directly; `StatsOptions` is also non-exhaustive.
 
 Request counters distinguish original L1/L2 hits, misses, accepted mutations, overload, invalid input, unavailable mutations, other errors and cancelled gets. Never-polled futures contribute nothing; cancelled durations are partial lifetimes. L1 timing covers successful L1 lookups from the first poll. L2 timing begins immediately after L1 miss and covers index lookup, admission waiting, I/O and promotion, excluding the initial L1 lookup; early misses before L1 lookup contribute only to request counters. L1 miss discards the L1 timer and makes an independent L2 sampling decision. Put timing ends at acceptance, not publication or durability. I/O timing reuses engine timestamps and covers slot reservation through terminal completion, including engine queueing rather than just device service. An I/O histogram may complete after its caller has cancelled.
 
@@ -413,3 +413,7 @@ Change one resource family at a time and alternate baseline and candidate runs o
 | Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed footprint                                                                               |
 
 Storage and configuration construction enforce these bounds before file access. Open checks the selected filesystem, device, and runtime environment.
+
+### Reclaim read timeout
+
+Set `options.reclaim_io_timeout = Duration::from_secs(30)` after constructing `RuntimeOptions::default()` to allow longer background reclaim reads. The default remains five seconds; positive durations must fit an absolute deadline. Foreground I/O deadlines and timeout failure handling are unchanged. Longer waits can delay shutdown and cause fill overload when free Regions run out.

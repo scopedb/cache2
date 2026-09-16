@@ -229,10 +229,8 @@ fn invalid_posix_options_are_rejected_when_building_configuration() {
 
 #[test]
 fn stats_storage_is_bounded_and_included_in_the_memory_floor() {
-    let options = RuntimeOptions {
-        append_shards: 2,
-        ..RuntimeOptions::default()
-    };
+    let mut options = RuntimeOptions::default();
+    options.append_shards = 2;
     let base = CacheConfig::new(test_storage(), options.clone()).unwrap();
     for shards in [0, 3, 65, usize::MAX] {
         let mut invalid = options.clone();
@@ -245,14 +243,12 @@ fn stats_storage_is_bounded_and_included_in_the_memory_floor() {
         );
     }
     let mut enabled = options;
-    enabled.stats = cache2::StatsOptions {
-        request_counters: true,
-        l1_latency: cache2::LatencyMode::Full,
-        l2_latency: cache2::LatencyMode::Full,
-        mutation_latency: cache2::LatencyMode::Full,
-        io_latency: true,
-        shards: 64,
-    };
+    enabled.stats.request_counters = true;
+    enabled.stats.l1_latency = cache2::LatencyMode::Full;
+    enabled.stats.l2_latency = cache2::LatencyMode::Full;
+    enabled.stats.mutation_latency = cache2::LatencyMode::Full;
+    enabled.stats.io_latency = true;
+    enabled.stats.shards = 64;
     let configured = CacheConfig::new(test_storage(), enabled.clone()).unwrap();
     assert!(configured.minimum_memory_bytes() > base.minimum_memory_bytes());
     enabled.managed_memory_limit_bytes = base.minimum_memory_bytes();

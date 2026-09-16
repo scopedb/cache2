@@ -164,14 +164,13 @@ impl BenchConfig {
                 },
             })
         };
-        let stats = cache2::StatsOptions {
-            request_counters: env_bool("CACHE_BENCH_REQUEST_STATS", false)?,
-            l1_latency: latency("CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL")?,
-            l2_latency: latency("CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL")?,
-            mutation_latency: latency("CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL")?,
-            io_latency: env_bool("CACHE_BENCH_IO_LATENCY", false)?,
-            shards: env_usize("CACHE_BENCH_STATS_SHARDS", 16)?,
-        };
+        let mut stats = cache2::StatsOptions::default();
+        stats.request_counters = env_bool("CACHE_BENCH_REQUEST_STATS", false)?;
+        stats.l1_latency = latency("CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL")?;
+        stats.l2_latency = latency("CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL")?;
+        stats.mutation_latency = latency("CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL")?;
+        stats.io_latency = env_bool("CACHE_BENCH_IO_LATENCY", false)?;
+        stats.shards = env_usize("CACHE_BENCH_STATS_SHARDS", 16)?;
         let directory = env::var_os("CACHE_BENCH_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);

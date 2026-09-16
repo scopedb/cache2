@@ -1277,19 +1277,16 @@ async fn structured_stats_track_original_hit_tier_and_full_distributions() {
     use cache2::LatencyMode;
     use cache2::RequestOperation;
     use cache2::RequestOutcome;
-    use cache2::StatsOptions;
 
     let files = TestCache::new("structured-stats");
     let mut options = test_runtime_options(1, 2);
     options.statistics = false;
-    options.stats = StatsOptions {
-        request_counters: true,
-        l1_latency: LatencyMode::Full,
-        l2_latency: LatencyMode::Full,
-        mutation_latency: LatencyMode::Full,
-        io_latency: true,
-        shards: 2,
-    };
+    options.stats.request_counters = true;
+    options.stats.l1_latency = LatencyMode::Full;
+    options.stats.l2_latency = LatencyMode::Full;
+    options.stats.mutation_latency = LatencyMode::Full;
+    options.stats.io_latency = true;
+    options.stats.shards = 2;
     let base = CacheConfig::new(test_storage(), test_runtime_options(1, 2)).unwrap();
     let config = CacheConfig::new(test_storage(), options).unwrap();
     let cache = Cache::open(&files.data, config.clone()).await.unwrap();
@@ -1381,7 +1378,6 @@ async fn tier_latency_modes_are_independent_and_describe_their_scope() {
     use cache2::LatencyMode;
     use cache2::RequestOperation;
     use cache2::RequestOutcome;
-    use cache2::StatsOptions;
 
     let sampled = LatencyMode::Sampled {
         interval: NonZeroU32::new(64).unwrap(),
@@ -1394,12 +1390,9 @@ async fn tier_latency_modes_are_independent_and_describe_their_scope() {
     ] {
         let files = TestCache::new("tier-latency");
         let mut options = test_runtime_options(1, 2);
-        options.stats = StatsOptions {
-            request_counters: true,
-            l1_latency,
-            l2_latency,
-            ..StatsOptions::default()
-        };
+        options.stats.request_counters = true;
+        options.stats.l1_latency = l1_latency;
+        options.stats.l2_latency = l2_latency;
         let cache = Cache::open(
             &files.data,
             CacheConfig::new(test_storage(), options).unwrap(),
