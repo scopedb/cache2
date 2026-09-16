@@ -39,8 +39,9 @@ const ENTRY_HASH_DOMAIN: u64 = 0x656e_7472_792d_6b65;
 const MISSING_HASH_DOMAIN: u64 = 0x6d69_7373_696e_672d;
 const BENCHMARK_RECORD_BYTES: u32 = 16 * 1024;
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
-pub struct RegionIndexTurnoverConfig {
+pub struct RegionIndexTurnoverOptions {
     pub region_count: usize,
     pub entries_per_region: usize,
     pub turns: usize,
@@ -48,7 +49,7 @@ pub struct RegionIndexTurnoverConfig {
     pub key_space_multiplier: usize,
 }
 
-impl Default for RegionIndexTurnoverConfig {
+impl Default for RegionIndexTurnoverOptions {
     fn default() -> Self {
         Self {
             // One 4 TiB / 16 KiB production partition contains 65,536 live
@@ -88,7 +89,7 @@ pub struct RegionIndexTurnoverCheckpoint {
 
 #[derive(Debug)]
 pub struct RegionIndexTurnoverReport {
-    pub config: RegionIndexTurnoverConfig,
+    pub config: RegionIndexTurnoverOptions,
     pub physical_entries: usize,
     pub key_space_entries: usize,
     pub index_slots: usize,
@@ -99,7 +100,7 @@ pub struct RegionIndexTurnoverReport {
 }
 
 pub fn run_region_index_turnover(
-    config: RegionIndexTurnoverConfig,
+    config: RegionIndexTurnoverOptions,
 ) -> io::Result<RegionIndexTurnoverReport> {
     let plan = TurnoverPlan::new(config)?;
     let mut workload = TurnoverWorkload::new(plan)?;
@@ -150,14 +151,14 @@ pub fn run_region_index_turnover(
 
 #[derive(Clone, Copy)]
 struct TurnoverPlan {
-    config: RegionIndexTurnoverConfig,
+    config: RegionIndexTurnoverOptions,
     physical_entries: usize,
     key_space_entries: usize,
     index_slots: usize,
 }
 
 impl TurnoverPlan {
-    fn new(config: RegionIndexTurnoverConfig) -> io::Result<Self> {
+    fn new(config: RegionIndexTurnoverOptions) -> io::Result<Self> {
         if config.region_count == 0
             || config.entries_per_region == 0
             || config.turns == 0
@@ -522,7 +523,7 @@ mod tests {
 
     #[test]
     fn accelerated_turnover_stays_bounded_and_classifies_false_candidates_as_misses() {
-        let report = run_region_index_turnover(RegionIndexTurnoverConfig {
+        let report = run_region_index_turnover(RegionIndexTurnoverOptions {
             region_count: 8,
             entries_per_region: 8,
             turns: 2,

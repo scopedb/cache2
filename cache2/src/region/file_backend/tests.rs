@@ -33,9 +33,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::*;
-use crate::IoEngineConfig;
+use crate::IoEngineOptions;
 use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
-use crate::config::runtime::PosixIoConfig;
+use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
 use crate::io::backend::MAX_INTERRUPTED_RETRIES;
 use crate::io::backend::testing::FaultAction;
@@ -409,7 +409,11 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(2, 4, 1)),
+        io_engine: IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 2,
+            write_workers: 4,
+            reclaim_workers: 1,
+        }),
         l1_capacity_bytes: 0,
         statistics: true,
         read_admission: ReadAdmission::Wait {
@@ -493,7 +497,11 @@ fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_config = RuntimeOptions {
-        io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 4, 1)),
+        io_engine: IoEngineOptions::Posix(PosixIoOptions {
+            read_workers: 1,
+            write_workers: 4,
+            reclaim_workers: 1,
+        }),
         l1_capacity_bytes: 0,
         read_admission: ReadAdmission::Wait {
             timeout: Duration::from_secs(1),
@@ -658,7 +666,11 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
         let runtime_config = RuntimeOptions {
-            io_engine: IoEngineConfig::Posix(PosixIoConfig::new(1, 1, 1)),
+            io_engine: IoEngineOptions::Posix(PosixIoOptions {
+                read_workers: 1,
+                write_workers: 1,
+                reclaim_workers: 1,
+            }),
             l1_capacity_bytes: 0,
             managed_memory_limit_bytes: 32 * 1024 * 1024,
             write_flush_threshold_bytes: 128 * 1024,

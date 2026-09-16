@@ -2,17 +2,22 @@
 
 ## Unreleased
 
+### Breaking Changes
+
+- Unchecked I/O inputs now consistently use `Options` names: replace `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` with their `Options` counterparts. The benchmarking input is likewise renamed to `RegionIndexTurnoverOptions`. Validated `CacheConfig` and `StorageLayout` retain their names and construction semantics.
+- All option structs are now `#[non_exhaustive]` with public fields. Replace struct literals with `new(required_input)` or `Default` followed by field assignments. I/O option getters, positional constructors, and `with_*` methods are removed; `IoUringSqPollOptions::new(idle_millis)` is retained. See [the configuration migration guide](CONFIGURATION.md#migrating-from-04) for details.
+
 ### Bug Fixes
 
 - Read I/O duration accounting now includes buffer preparation and scheduling between slot reservation and submission, matching the documented reservation-to-completion interval.
 
 ### Features
 
-- Added `RuntimeOptions::stats` and `Cache::stats_snapshot()` for complete public request outcomes, independently configured full or sampled L1-hit, L2-lookup and mutation latency, and full read/write/reclaim I/O latency. L2 timing starts after L1 miss, allowing full L2 collection without clocks on L1 hits; structured durations identify their scope and collection mode. Recorders have bounded managed-memory accounting; snapshots preserve cumulative values and distinguish disabled families and sampled observations. The structured snapshots are independent of monitoring SDKs; applications own metric conversion and export. The existing `statistics` switch retains its behavior; fully specified runtime-option literals must add `stats` or use `..RuntimeOptions::default()`.
+- Added `RuntimeOptions::stats` and `Cache::stats_snapshot()` for complete public request outcomes, independently configured full or sampled L1-hit, L2-lookup and mutation latency, and full read/write/reclaim I/O latency. L2 timing starts after L1 miss, allowing full L2 collection without clocks on L1 hits; structured durations identify their scope and collection mode. Recorders have bounded managed-memory accounting; snapshots preserve cumulative values and distinguish disabled families and sampled observations. The structured snapshots are independent of monitoring SDKs; applications own metric conversion and export. The existing `statistics` switch retains its behavior; configure `stats` through public fields after constructing `RuntimeOptions::default()`.
 
 ### Improvements
 
-- `RuntimeOptions::reclaim_io_timeout` configures the background reclaim read deadline independently of foreground I/O, retaining the five-second default. Complete `RuntimeOptions` struct literals must supply the new field or use `..RuntimeOptions::default()`.
+- `RuntimeOptions::reclaim_io_timeout` configures the background reclaim read deadline independently of foreground I/O, retaining the five-second default. Set the field after constructing `RuntimeOptions::default()`.
 
 ## v0.4.0 (2026-09-10)
 

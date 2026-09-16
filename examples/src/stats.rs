@@ -19,7 +19,6 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::LatencyMode;
 use cache2::RuntimeOptions;
-use cache2::StatsOptions;
 use cache2::StorageOptions;
 
 #[tokio::main]
@@ -27,24 +26,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args_os()
         .nth(1)
         .ok_or("usage: stats <cache-data-path>")?;
-    let storage = StorageOptions {
-        region_size_bytes: 1024 * 1024,
-        ..StorageOptions::new(8 * 1024 * 1024)
-    }
-    .build()?;
-    let runtime = RuntimeOptions {
-        statistics: true,
-        stats: StatsOptions {
-            request_counters: true,
-            l1_latency: LatencyMode::Sampled {
-                interval: NonZeroU32::new(64).unwrap(),
-            },
-            l2_latency: LatencyMode::Full,
-            io_latency: true,
-            ..StatsOptions::default()
-        },
-        ..RuntimeOptions::default()
+    let mut storage = StorageOptions::new(8 * 1024 * 1024);
+    storage.region_size_bytes = 1024 * 1024;
+    let storage = storage.build()?;
+    let mut runtime = RuntimeOptions::default();
+    runtime.statistics = true;
+    runtime.stats.request_counters = true;
+    runtime.stats.l1_latency = LatencyMode::Sampled {
+        interval: NonZeroU32::new(64).unwrap(),
     };
+    runtime.stats.l2_latency = LatencyMode::Full;
+    runtime.stats.io_latency = true;
     let cache = Cache::open(path, CacheConfig::new(storage, runtime)?).await?;
     cache.put("example", "value")?;
     let _value = cache.get("example").await?;

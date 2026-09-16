@@ -18,7 +18,7 @@ use std::io;
 
 use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
-use cache2::benchmarking::RegionIndexTurnoverConfig;
+use cache2::benchmarking::RegionIndexTurnoverOptions;
 use cache2::benchmarking::RegionIndexTurnoverPhase;
 use cache2::benchmarking::run_region_index_turnover;
 
@@ -35,24 +35,20 @@ fn main() -> io::Result<()> {
 }
 
 fn run_benchmark() -> io::Result<()> {
-    let defaults = RegionIndexTurnoverConfig::default();
-    let config = RegionIndexTurnoverConfig {
-        region_count: env_usize("CACHE_INDEX_TURNOVER_REGIONS", defaults.region_count)?,
-        entries_per_region: env_usize(
-            "CACHE_INDEX_TURNOVER_ENTRIES_PER_REGION",
-            defaults.entries_per_region,
-        )?,
-        turns: env_usize("CACHE_INDEX_TURNOVER_TURNS", defaults.turns)?,
-        sample_operations: env_usize(
-            "CACHE_INDEX_TURNOVER_SAMPLE_OPS",
-            defaults.sample_operations,
-        )?,
-        key_space_multiplier: env_usize(
-            "CACHE_INDEX_TURNOVER_KEY_MULTIPLIER",
-            defaults.key_space_multiplier,
-        )?,
-    };
-    let report = run_region_index_turnover(config)?;
+    let mut options = RegionIndexTurnoverOptions::default();
+    options.region_count = env_usize("CACHE_INDEX_TURNOVER_REGIONS", options.region_count)?;
+    options.entries_per_region = env_usize(
+        "CACHE_INDEX_TURNOVER_ENTRIES_PER_REGION",
+        options.entries_per_region,
+    )?;
+    options.turns = env_usize("CACHE_INDEX_TURNOVER_TURNS", options.turns)?;
+    options.sample_operations =
+        env_usize("CACHE_INDEX_TURNOVER_SAMPLE_OPS", options.sample_operations)?;
+    options.key_space_multiplier = env_usize(
+        "CACHE_INDEX_TURNOVER_KEY_MULTIPLIER",
+        options.key_space_multiplier,
+    )?;
+    let report = run_region_index_turnover(options)?;
 
     println!("C² RegionIndex turnover benchmark");
     println!(
