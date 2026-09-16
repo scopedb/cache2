@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- Read I/O duration accounting now includes buffer preparation and scheduling between slot reservation and submission, matching the documented reservation-to-completion interval.
+
+### Features
+
+- Added `RuntimeOptions::stats` and `Cache::stats_snapshot()` for complete public request outcomes, independently configured full or sampled L1-hit, L2-lookup and mutation latency, and full read/write/reclaim I/O latency. L2 timing starts after L1 miss, allowing full L2 collection without clocks on L1 hits; structured durations identify their scope and collection mode. Recorders have bounded managed-memory accounting; snapshots preserve cumulative values and distinguish disabled families and sampled observations. The structured snapshots are independent of monitoring SDKs; applications own metric conversion and export. The existing `statistics` switch retains its behavior; fully specified runtime-option literals must add `stats` or use `..RuntimeOptions::default()`.
+
 ## v0.4.0 (2026-09-10)
 
 ### Breaking Changes

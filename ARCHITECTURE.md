@@ -120,6 +120,12 @@ The managed-memory limit covers the index mapping, heat bits, L1, append buffers
 
 C² owns one logical data path. Multi-device deployments stripe below the filesystem with RAID0 or an equivalent layer. Request routing, recovery identity, and descriptor count stay independent of device topology.
 
+## Statistics
+
+Existing health/resource snapshots and optional legacy activity counters retain their populations. Additional `RuntimeOptions::stats` recorders use cache-owned, preallocated atomic stripes whose allocation is validated and included in managed memory. Public operations contribute one exclusive terminal outcome; original L2 hits remain L2 even after promotion. L1 hit, L2 lookup and mutation timing are independently disabled, full or randomly sampled. L2 clocks start immediately after L1 miss, before index lookup and admission, so full L2 timing does not require clocks on L1 hits; full I/O timing reuses engine timestamps and preserves separate read/write/reclaim populations. Fixed scalar thread-local routing and sampling state cannot retain a cache instance or grow a per-cache registry. Recording adds no allocation, queue, recorder lock or worker.
+
+Statistics snapshots load cumulative counters without resetting them or scanning metadata. Histogram bucket counts and duration sums may reflect slightly different instants during concurrent updates; quiescent snapshots are exact. Snapshot collection runs on the caller, with bounded output determined by the fixed operation/outcome set and histogram layout. Applications own all metric conversion and transport. Sampled observations remain explicitly distinct from full-population metrics, and invalid overflowed distributions are flagged for applications to omit. Additional recorder control objects fit the fixed runtime control reservation; variable stripe storage is separately charged.
+
 ## Recovery and failures
 
 ### Persistent artifacts

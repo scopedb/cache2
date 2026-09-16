@@ -395,6 +395,14 @@ async fn async_request_is_woken_by_driver_completion() {
 async fn dropping_async_wait_requests_bounded_cancellation() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+    let recorder = Arc::new(
+        crate::stats::recording::Recorder::new(crate::StatsOptions {
+            io_latency: true,
+            ..crate::StatsOptions::default()
+        })
+        .unwrap(),
+    );
+    engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
     let resources = resources();
     let request = submit_cache_io(
         engine.as_ref(),
@@ -412,9 +420,82 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
 
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(
+        recorder
+            .io_snapshot()
+            .iter()
+            .all(|row| row.latency.count == 0)
+    );
     backend.release();
     engine.shutdown().unwrap();
     assert_eq!(engine.in_flight(), 0);
+    assert_eq!(
+        recorder
+            .io_snapshot()
+            .iter()
+            .map(|row| row.latency.count)
+            .sum::<u64>(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reserved_read_latency_includes_time_before_submission() {
+    for statistics_enabled in [false, true] {
+        let file = TestFile::new();
+        file.file().set_len(4096).unwrap();
+        let engine = BackendIoEngine::new_with_workers_and_statistics(
+            file.backend(),
+            1,
+            1,
+            statistics_enabled,
+            true,
+        )
+        .unwrap();
+        let recorder = Arc::new(
+            crate::stats::recording::Recorder::new(crate::StatsOptions {
+                io_latency: true,
+                ..crate::StatsOptions::default()
+            })
+            .unwrap(),
+        );
+        engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
+        drop(engine.try_reserve_read().unwrap());
+        let slot = engine.try_reserve_read().unwrap();
+        let reserved_at = slot.reserved_at.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let before_submit = reserved_at.elapsed();
+        assert!(
+            recorder
+                .io_snapshot()
+                .iter()
+                .all(|row| row.latency.count == 0)
+        );
+        let completion = submit_cache_read(
+            &engine,
+            slot,
+            IoOperation::read(read_buffer(&resources(), 4096), 0),
+        )
+        .unwrap()
+        .wait(&engine)
+        .unwrap();
+        assert!(matches!(completion.status, CompletionStatus::Completed));
+        engine.shutdown().unwrap();
+        let snapshots = recorder.io_snapshot();
+        let completed = snapshots
+            .iter()
+            .find(|row| {
+                row.role == crate::IoRole::Read && row.outcome == crate::IoOutcome::Completed
+            })
+            .unwrap();
+        assert_eq!(completed.latency.count, 1);
+        assert!(completed.latency.sum_ns >= before_submit.as_nanos());
+        if statistics_enabled {
+            assert!(
+                u128::from(engine.stats().requests.request_time_ns) >= before_submit.as_nanos()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1040,4 +1121,35 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
     drop(completion);
     drop(shared);
     assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+}
+
+#[test]
+fn io_histograms_include_failures_when_legacy_statistics_are_disabled() {
+    let file = TestFile::new();
+    let engine =
+        BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false, false)
+            .unwrap();
+    let recorder = Arc::new(
+        crate::stats::recording::Recorder::new(crate::StatsOptions {
+            io_latency: true,
+            ..crate::StatsOptions::default()
+        })
+        .unwrap(),
+    );
+    engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
+    let resources = resources();
+    let completion = engine
+        .read_exact_at(read_buffer(&resources, 4096), 0)
+        .unwrap()
+        .wait();
+    assert!(matches!(completion.status, CompletionStatus::Failed(_)));
+    assert_eq!(engine.stats(), EngineIoSnapshot::default());
+    let snapshot = recorder.io_snapshot();
+    let failed = snapshot
+        .iter()
+        .find(|row| row.role == crate::IoRole::Read && row.outcome == crate::IoOutcome::Failed)
+        .unwrap();
+    assert_eq!(failed.latency.count, 1);
+    assert!(failed.latency.valid);
+    engine.shutdown().unwrap();
 }

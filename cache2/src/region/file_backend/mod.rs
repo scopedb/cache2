@@ -269,7 +269,7 @@ impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
     ) -> io::Result<Option<HybridValueRead>> {
         self.runtime()?
             .data_plane()?
-            .get_async(key, tokio_handle)
+            .get_async(key, tokio_handle, None)
             .await
     }
 

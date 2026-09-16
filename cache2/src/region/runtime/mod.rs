@@ -736,6 +736,10 @@ impl ShardControl {
 }
 
 impl RegionDataPlane {
+    pub fn stats_recorder(&self) -> &crate::stats::recording::Recorder {
+        &self.metrics.stats
+    }
+
     pub fn new(
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
@@ -758,7 +762,7 @@ impl RegionDataPlane {
         let config = configuration.runtime().clone();
         core.configure_reclaim_workers(IoPoolTopology::reclaim(config.io_engine).max_in_flight)?;
         core.set_index_statistics_enabled(config.statistics);
-        let metrics = Arc::new(RuntimeMetrics::new(core.shard_count())?);
+        let metrics = Arc::new(RuntimeMetrics::new(core.shard_count(), config.stats)?);
         let operations = Arc::new(MutationGate::new());
         let running = start_running(
             Arc::clone(&core),
@@ -904,7 +908,7 @@ impl RegionDataPlane {
 
     #[cfg(test)]
     pub fn get(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
-        match self.prepare_get(key)? {
+        match self.prepare_get(key, None)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => self.finish_get(pending.wait(), key),
             PreparedGet::Waiting(_) => Err(io::Error::other(
@@ -917,8 +921,9 @@ impl RegionDataPlane {
         &self,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
+        guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
     ) -> io::Result<Option<HybridValueRead>> {
-        match self.prepare_get(key)? {
+        match self.prepare_get(key, guard)? {
             PreparedGet::Complete(value) => Ok(value),
             PreparedGet::Pending(pending) => {
                 self.finish_get(pending.wait_async(tokio_handle).await, key)
@@ -990,7 +995,11 @@ impl RegionDataPlane {
         }
     }
 
-    fn prepare_get(&self, key: &[u8]) -> io::Result<PreparedGet> {
+    fn prepare_get(
+        &self,
+        key: &[u8],
+        guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
+    ) -> io::Result<PreparedGet> {
         if key.len() > MAX_KEY_SIZE {
             if self.config.statistics {
                 let activity = self.metrics.activity(0);
@@ -1023,6 +1032,9 @@ impl RegionDataPlane {
                 return Ok(PreparedGet::Complete(Some(HybridValueRead::L1(value))));
             }
             MemoryLookup::Miss(token) => {
+                if let Some(guard) = guard {
+                    guard.enter_l2();
+                }
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&activity.l1_misses);
                 }
@@ -1439,6 +1451,17 @@ fn start_running(
         IoPoolTopology::reclaim(config.io_engine),
         false,
     )?;
+    for (engines, role) in [
+        (&read_engines, crate::IoRole::Read),
+        (&write_engines, crate::IoRole::Write),
+        (&reclaim_engines, crate::IoRole::Reclaim),
+    ] {
+        for engine in engines.iter() {
+            if let Some(timing) = metrics.stats.io_timing(role) {
+                engine.set_latency_recorder(timing);
+            }
+        }
+    }
     let mut shards = Vec::new();
     shards.try_reserve_exact(shard_count).map_err(|_| {
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
@@ -2589,7 +2612,7 @@ mod tests {
 
     #[test]
     fn read_resource_misses_remain_separately_observable() {
-        let metrics = RuntimeMetrics::new(1).unwrap();
+        let metrics = RuntimeMetrics::new(1, crate::StatsOptions::default()).unwrap();
         let activity = metrics.activity(0);
         RuntimeMetrics::add(&activity.l2_misses, 2);
         RuntimeMetrics::increment(&activity.l2_read_memory_misses);

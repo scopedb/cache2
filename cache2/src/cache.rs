@@ -56,17 +56,16 @@ use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 use crate::snapshot::StartupMode;
 
-/// Storage tier that backs a returned [`Value`].
+/// Storage tier that served a lookup.
 ///
-/// This describes the value's backing after the lookup completes, not
-/// necessarily the tier where the lookup began. A successful L2 promotion is
-/// therefore backed by L1.
+/// An L2 value promoted before return still reports L2, even though its owned
+/// bytes are backed by L1. This agrees with the hit counters.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheTier {
     /// Process-local in-memory storage.
     L1,
-    /// A transient buffer read from the Region store.
+    /// A validated Region lookup, including a value promoted to L1.
     L2,
 }
 
@@ -93,10 +92,10 @@ impl AsRef<[u8]> for Value {
 }
 
 impl Value {
-    /// Returns the storage tier backing this value.
+    /// Returns the storage tier that served this lookup.
     ///
-    /// A Region hit successfully promoted before return reports
-    /// [`CacheTier::L1`]; hit counters still record it as an L2 hit.
+    /// A Region hit successfully promoted before return still reports
+    /// [`CacheTier::L2`], matching the hit counters.
     pub const fn tier(&self) -> CacheTier {
         if self.inner.is_l1() {
             CacheTier::L1
@@ -116,6 +115,8 @@ impl Value {
 pub struct Cache {
     // Keep public reads off the write-mutated admission counter's cache line.
     closed: AtomicBool,
+    read_statistics: bool,
+    mutation_statistics: bool,
     data_plane: RegionDataPlane,
     owner: Arc<Mutex<RegionStore<FileRegionBackend<SystemRegionFileSystem>>>>,
     startup: StartupMode,
@@ -245,12 +246,20 @@ impl Cache {
         );
         let index_slots = config.storage().index_slots();
         let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
+        let stats = config.runtime().stats;
+        let read_statistics = stats.request_counters
+            || stats.l1_latency != crate::LatencyMode::Off
+            || stats.l2_latency != crate::LatencyMode::Off;
+        let mutation_statistics =
+            stats.request_counters || stats.mutation_latency != crate::LatencyMode::Off;
         let backend = FileRegionBackend::new(files, format_data, config);
         let store = RegionStore::open(index_slots, backend)?;
         let startup = store.startup();
         let data_plane = store.data_plane_handle()?;
         Ok(Cache {
             closed: AtomicBool::new(false),
+            read_statistics,
+            mutation_statistics,
             data_plane,
             owner: Arc::new(Mutex::new(store)),
             startup,
@@ -277,11 +286,9 @@ impl Cache {
     /// close starts. Runtime and device failures use their corresponding structured
     /// classifications.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.ensure_open(ErrorOperation::Put)?;
-        public_result(
-            ErrorOperation::Put,
-            self.data_plane.put(key.as_ref(), value.as_ref()),
-        )
+        self.mutate(ErrorOperation::Put, crate::RequestOperation::Put, || {
+            self.data_plane.put(key.as_ref(), value.as_ref())
+        })
     }
 
     /// Stages a value directly for L2 and returns its monotonic mutation
@@ -297,10 +304,10 @@ impl Cache {
     /// [`Self::put`], including unavailable after close starts, with
     /// [`ErrorOperation::PutL2`](crate::ErrorOperation::PutL2) as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.ensure_open(ErrorOperation::PutL2)?;
-        public_result(
+        self.mutate(
             ErrorOperation::PutL2,
-            self.data_plane.put_l2(key.as_ref(), value.as_ref()),
+            crate::RequestOperation::PutL2,
+            || self.data_plane.put_l2(key.as_ref(), value.as_ref()),
         )
     }
 
@@ -316,8 +323,11 @@ impl Cache {
     /// busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
     /// Runtime and device failures remain explicit.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.ensure_open(ErrorOperation::Delete)?;
-        public_result(ErrorOperation::Delete, self.data_plane.delete(key.as_ref()))
+        self.mutate(
+            ErrorOperation::Delete,
+            crate::RequestOperation::Delete,
+            || self.data_plane.delete(key.as_ref()),
+        )
     }
 
     /// Looks up a value in L1 and then L2.
@@ -336,16 +346,42 @@ impl Cache {
     /// open transition reads to misses instead of surfacing an application
     /// error.
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>, Error> {
-        if self.is_closed() {
-            return Ok(None);
+        // Keep the disabled arm identical to the uninstrumented read path: no
+        // recorder access, guard, clock, TLS or terminal-result classification.
+        if !self.read_statistics {
+            if self.is_closed() {
+                return Ok(None);
+            }
+            return public_result(
+                ErrorOperation::Get,
+                self.data_plane
+                    .get_async(key.as_ref(), &self.tokio_handle, None)
+                    .await,
+            )
+            .map(|value| value.map(|inner| Value { inner }));
         }
-        public_result(
-            ErrorOperation::Get,
-            self.data_plane
-                .get_async(key.as_ref(), &self.tokio_handle)
-                .await,
-        )
-        .map(|value| value.map(|inner| Value { inner }))
+        let mut guard = self
+            .data_plane
+            .stats_recorder()
+            .begin(crate::RequestOperation::Get);
+        let result = if self.is_closed() {
+            Ok(None)
+        } else {
+            public_result(
+                ErrorOperation::Get,
+                self.data_plane
+                    .get_async(key.as_ref(), &self.tokio_handle, Some(&mut guard))
+                    .await,
+            )
+            .map(|value| value.map(|inner| Value { inner }))
+        };
+        let outcome = match &result {
+            Ok(Some(value)) if value.inner.is_l1() => crate::RequestOutcome::L1Hit,
+            Ok(Some(_)) => crate::RequestOutcome::L2Hit,
+            _ => crate::RequestOutcome::Miss,
+        };
+        guard.finish(&result, outcome);
+        result
     }
 
     /// Waits until all accepted mutations have completed their Region writes
@@ -375,6 +411,20 @@ impl Cache {
         let mut snapshot = public_result(ErrorOperation::Snapshot, self.data_plane.snapshot())?;
         snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
+    }
+
+    /// Returns cumulative legacy statistics, complete optional request outcomes,
+    /// and optional request/I/O latency histograms without scanning metadata.
+    ///
+    /// Repeated or concurrent readers do not reset counts. Duration populations
+    /// and enablement are explicit in [`crate::CacheStatsSnapshot`]. Snapshot
+    /// allocations are bounded by the configured stripes and fixed series set.
+    ///
+    /// # Errors
+    ///
+    /// Uses the same availability and runtime failures as [`Self::snapshot`].
+    pub fn stats_snapshot(&self) -> Result<crate::CacheStatsSnapshot, Error> {
+        Ok(self.data_plane.stats_recorder().snapshot(self.snapshot()?))
     }
 
     /// Samples L1, index, write-buffer rejection, I/O, and Region state in
@@ -425,6 +475,25 @@ impl Cache {
     /// not publish a recoverable image.
     pub fn close_warm(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         self.close(true)
+    }
+
+    #[inline]
+    fn mutate(
+        &self,
+        operation: ErrorOperation,
+        stats_operation: crate::RequestOperation,
+        mutation: impl FnOnce() -> io::Result<u64>,
+    ) -> Result<u64, Error> {
+        let guard = self
+            .mutation_statistics
+            .then(|| self.data_plane.stats_recorder().begin(stats_operation));
+        let result = self
+            .ensure_open(operation)
+            .and_then(|()| public_result(operation, mutation()));
+        if let Some(guard) = guard {
+            guard.finish(&result, crate::RequestOutcome::Accepted);
+        }
+        result
     }
 
     #[inline(always)]
