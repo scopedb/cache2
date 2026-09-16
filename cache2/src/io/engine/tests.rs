@@ -1153,3 +1153,44 @@ fn io_histograms_include_failures_when_legacy_statistics_are_disabled() {
     assert!(failed.latency.valid);
     engine.shutdown().unwrap();
 }
+
+#[test]
+fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
+    let resources = resources();
+    let request = submit_cache_io_with_timeout(
+        &engine,
+        IoOperation::read(read_buffer(&resources, 4096), 0),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    assert!(backend.wait_for_entered(1));
+    let (error, buffer) = request.wait(&engine).unwrap_err().into_buffer();
+    backend.release();
+    engine.shutdown().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(buffer.is_none());
+}
+
+#[test]
+fn background_read_can_complete_after_default_deadline() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let resources = resources();
+    let request = submit_cache_io_with_timeout(
+        &engine,
+        IoOperation::read(read_buffer(&resources, 4096), 0),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(backend.wait_for_entered(1));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(200));
+        backend.release();
+    });
+    let completion = request.wait(&engine);
+    release.join().unwrap();
+    engine.shutdown().unwrap();
+    assert!(completion.is_ok());
+}

@@ -154,3 +154,7 @@ The root workspace keeps the publishable crate, integration tests, benchmarks, e
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+### Reclaim read deadline
+
+Set `RuntimeOptions::reclaim_io_timeout` to allow longer background reclaim reads, for example `Duration::from_secs(30)`. The default is five seconds; the value must be positive and fit an absolute deadline. It covers I/O admission and completion, and does not change foreground read/write deadlines or reclaim reinsertion writes. A longer deadline can delay shutdown and cause cache fills to return overload if free Regions run out. Expiration still triggers the existing cache-failure policy.

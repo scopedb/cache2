@@ -902,8 +902,17 @@ pub fn submit_cache_io(
     engine: &dyn IoEngine,
     operation: IoOperation,
 ) -> Result<BoundedIoRequest, SubmitError> {
+    submit_cache_io_with_timeout(engine, operation, CACHE_IO_COMPLETION_TIMEOUT)
+}
+
+/// Submits background I/O with its configured admission and completion budget.
+pub fn submit_cache_io_with_timeout(
+    engine: &dyn IoEngine,
+    operation: IoOperation,
+    timeout: Duration,
+) -> Result<BoundedIoRequest, SubmitError> {
     let deadline = Instant::now()
-        .checked_add(CACHE_IO_COMPLETION_TIMEOUT)
+        .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
 }
