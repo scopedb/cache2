@@ -104,7 +104,7 @@ When free capacity is low, a reclaim worker takes the oldest sealed Region, read
 
 The first L2 candidate access sets `seen`; a later access sets `hot`. Reclaim clears these volatile bits. Cold current mappings are removed. Hot current records may be rewritten through an existing append shard while preserving their logical sequence number. Reinsertion is capped at roughly one eighth of the reclaimed bytes and rotates successive source Regions across append shards. An empty Free queue disables reinsertion for that reclaim pass so foreground write capacity is restored first; staging or budget pressure drops the remaining candidates.
 
-The source Region stays pinned until accepted replacement writes finish. Conditional index replacement lets a newer foreground put or delete win over a delayed reinsert. Only then is the Region returned to the free FIFO. Reclaim uses background I/O lanes and bounded single-pass work.
+The source Region stays pinned until accepted replacement writes finish. Conditional index replacement lets a newer foreground put or delete win over a delayed reinsert. Only then is the Region returned to the free FIFO. Reclaim uses background I/O lanes and bounded single-pass work. `RuntimeOptions::reclaim_io_timeout` bounds each reclaim read from I/O admission through completion, defaulting to five seconds; foreground I/O deadlines are independent. Expiration retains the existing cancellation and cache-failure policy. Longer deadlines can delay shutdown and allow free capacity to run out while reclaim waits.
 
 ## Resource bounds
 

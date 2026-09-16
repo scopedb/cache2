@@ -14,6 +14,7 @@
 
 use std::io;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
@@ -409,6 +410,12 @@ pub struct RuntimeOptions {
     pub io_mode: IoMode,
     /// Admission policy after an L2 candidate has been selected.
     pub read_admission: ReadAdmission,
+    /// Deadline for each background reclaim read, including I/O admission.
+    /// Defaults to five seconds. Must be positive and representable as an
+    /// absolute deadline. Does not change foreground reads or writes. Longer
+    /// deadlines can delay shutdown and exhaust free Regions while waiting;
+    /// expiration still fails the cache instance after bounded cancellation.
+    pub reclaim_io_timeout: Duration,
     /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
     /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
     /// spare Region.
@@ -444,6 +451,7 @@ impl Default for RuntimeOptions {
             io_engine: IoEngineConfig::default(),
             io_mode: IoMode::Buffered,
             read_admission: ReadAdmission::Immediate,
+            reclaim_io_timeout: Duration::from_secs(5),
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             l1_eviction_policy: L1EvictionPolicy::Clock,
@@ -572,6 +580,15 @@ impl RuntimeOptions {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "append shards must be in 1..=256",
+            ));
+        }
+        if self.reclaim_io_timeout.is_zero()
+            || Instant::now()
+                .checked_add(self.reclaim_io_timeout)
+                .is_none()
+        {
+            return Err(invalid_runtime_config(
+                "reclaim I/O timeout must be positive and fit an absolute deadline",
             ));
         }
         let read_topology = IoPoolTopology::read(self.io_engine);
@@ -808,6 +825,36 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reclaim_timeout_is_validated_at_config_construction() {
+        let storage = crate::StorageOptions::new(1024 * 1024 * 1024)
+            .build()
+            .unwrap();
+        assert_eq!(
+            RuntimeOptions::default().reclaim_io_timeout,
+            Duration::from_secs(5)
+        );
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let error = CacheConfig::new(
+                storage.clone(),
+                RuntimeOptions {
+                    reclaim_io_timeout: timeout,
+                    ..RuntimeOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), crate::error::ErrorKind::InvalidInput);
+        }
+        CacheConfig::new(
+            storage,
+            RuntimeOptions {
+                reclaim_io_timeout: Duration::from_secs(30),
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+    }
 
     #[test]
     fn optional_read_wait_queue_is_memory_accounted() {

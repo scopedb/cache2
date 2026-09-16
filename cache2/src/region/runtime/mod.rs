@@ -60,7 +60,7 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
-use crate::io::engine::submit_cache_io;
+use crate::io::engine::submit_cache_io_with_timeout;
 use crate::memory::MemoryLookup;
 #[cfg(test)]
 use crate::memory::MemoryMetricsSnapshot;
@@ -436,6 +436,7 @@ struct RunningShared {
     write_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
+    reclaim_io_timeout: Duration,
     resources: Arc<ResourceController>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -1475,6 +1476,7 @@ fn start_running(
         write_engines,
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
+        reclaim_io_timeout: config.reclaim_io_timeout,
         resources,
         metrics,
         memory,
@@ -1746,9 +1748,12 @@ fn reclaim_worker_result(
                 // count. Use the bounded background wait so transient CAS
                 // contention cannot turn a healthy cache miss-only; foreground
                 // reads use their separately configured admission path.
-                let request =
-                    submit_cache_io(engine.as_ref(), IoOperation::read(io_buffer, absolute))
-                        .map_err(|error| error.into_lease().0)?;
+                let request = submit_cache_io_with_timeout(
+                    engine.as_ref(),
+                    IoOperation::read(io_buffer, absolute),
+                    shared.reclaim_io_timeout,
+                )
+                .map_err(|error| error.into_lease().0)?;
                 let completion = request
                     .wait(engine.as_ref())
                     .map_err(|error| error.into_lease().0)?;
