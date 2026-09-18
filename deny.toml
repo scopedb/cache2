@@ -25,3 +25,5 @@ wildcards = "deny"
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"
+# Temporary source for the revision pinned in Cargo.toml; remove with the crates.io migration.
+allow-git = ["https://github.com/tisonkun/asyncband.git"]

@@ -35,9 +35,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use asyncband::event::AutoResetEvent;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
-use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
 use crate::IoEngineOptions;
@@ -160,17 +160,17 @@ struct MutationGate {
     state: AtomicUsize,
     quiescent: Mutex<()>,
     quiescent_changed: Condvar,
-    async_changed: watch::Sender<()>,
+    // MutationDrainGuard admits only one async drain; synchronous close waits use the condvar.
+    async_changed: AutoResetEvent,
 }
 
 impl MutationGate {
     fn new() -> Self {
-        let (async_changed, _) = watch::channel(());
         Self {
             state: AtomicUsize::new(0),
             quiescent: Mutex::new(()),
             quiescent_changed: Condvar::new(),
-            async_changed,
+            async_changed: AutoResetEvent::new(),
         }
     }
 
@@ -231,14 +231,10 @@ impl MutationGate {
     }
 
     async fn wait_quiescent_async(&self) {
-        // Subscribe before inspecting the predicate so a transition racing the check advances the
-        // receiver version and cannot be missed.
-        let mut changed = self.async_changed.subscribe();
+        // A completion between the check and wait leaves a stored signal. A signal left by a
+        // cancelled drain only causes another predicate check in the next drain.
         while self.active_mutations() != 0 {
-            changed
-                .changed()
-                .await
-                .expect("the mutation gate retains its watch sender");
+            self.async_changed.wait().await;
         }
     }
 
@@ -252,7 +248,7 @@ impl MutationGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.quiescent_changed.notify_all();
             drop(quiescent);
-            self.async_changed.send_replace(());
+            self.async_changed.set();
         }
     }
 }
@@ -616,16 +612,17 @@ struct ShardControlState {
 struct ShardControl {
     state: Mutex<ShardControlState>,
     changed: Condvar,
-    async_changed: watch::Sender<()>,
+    // drain_async holds MutationDrainGuard across all shard waits, so only one async observer
+    // competes for this signal. Synchronous drain/close observers use changed instead.
+    async_changed: AutoResetEvent,
 }
 
 impl ShardControl {
     fn new() -> Self {
-        let (async_changed, _) = watch::channel(());
         Self {
             state: Mutex::new(ShardControlState::default()),
             changed: Condvar::new(),
-            async_changed,
+            async_changed: AutoResetEvent::new(),
         }
     }
 
@@ -698,9 +695,8 @@ impl ShardControl {
     }
 
     async fn wait_for_drain_async(&self, generation: u64) -> io::Result<()> {
-        // Subscribe before inspecting the predicate so a completion racing the check advances the
-        // receiver version and cannot be missed.
-        let mut changed = self.async_changed.subscribe();
+        // Completion is recorded in state; the event only prompts a recheck. Signals from older
+        // generations may remain stored but cannot satisfy this generation's predicate.
         loop {
             {
                 let state = self.lock()?;
@@ -711,10 +707,7 @@ impl ShardControl {
                     return Ok(());
                 }
             }
-            changed
-                .changed()
-                .await
-                .expect("the shard control retains its watch sender");
+            self.async_changed.wait().await;
         }
     }
 
@@ -728,7 +721,7 @@ impl ShardControl {
             .get_or_insert_with(|| ShardFailure::from_error(error));
         drop(state);
         self.changed.notify_all();
-        self.async_changed.send_replace(());
+        self.async_changed.set();
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, ShardControlState>> {
@@ -1982,7 +1975,7 @@ fn complete_shard_drain(control: &ShardControl, generation: u64) -> io::Result<(
     state.drain_completed = state.drain_completed.max(generation);
     control.changed.notify_all();
     drop(state);
-    control.async_changed.send_replace(());
+    control.async_changed.set();
     Ok(())
 }
 
@@ -2383,6 +2376,50 @@ mod tests {
         assert!(drain.await.unwrap_err().is_cancelled());
         assert!(gate.try_enter().is_some());
         drop(mutation);
+    }
+
+    #[test]
+    fn async_drain_remains_exclusive_and_can_retry_after_a_selected_wait_is_cancelled() {
+        let gate = MutationGate::new();
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+        let mut wait = Box::pin(drain.wait_async());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert!(
+            matches!(gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+
+        drop(mutation);
+        drop(wait); // Cancel after the completion signal was assigned, before observing it.
+        drop(drain);
+
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+        let mut retry = Box::pin(drain.wait_async());
+        assert!(retry.as_mut().poll(&mut context).is_pending());
+        drop(mutation);
+        assert!(retry.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn old_shard_signals_do_not_complete_new_drain_generations() {
+        let control = ShardControl::new();
+        let first = control.request_drain(false).unwrap();
+        complete_shard_drain(&control, first).unwrap();
+
+        let second = control.request_drain(false).unwrap();
+        let mut cancelled = Box::pin(control.wait_for_drain_async(second));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        complete_shard_drain(&control, second).unwrap();
+        drop(cancelled);
+
+        let third = control.request_drain(false).unwrap();
+        let mut next = Box::pin(control.wait_for_drain_async(third));
+        assert!(next.as_mut().poll(&mut context).is_pending());
+        complete_shard_drain(&control, third).unwrap();
+        assert!(next.as_mut().poll(&mut context).is_ready());
     }
 
     #[test]
