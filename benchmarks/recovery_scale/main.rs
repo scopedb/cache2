@@ -41,7 +41,7 @@ const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 struct ScaleConfig {
     expected_entries: usize,
     capacity_bytes: u64,
-    memory_bytes: usize,
+    l1_capacity_bytes: usize,
     managed_memory_limit_bytes: usize,
     sentinel_count: usize,
     value_bytes: usize,
@@ -50,11 +50,12 @@ struct ScaleConfig {
 
 impl ScaleConfig {
     fn from_env() -> io::Result<Self> {
+        benchmarks::config::reject_renamed_env("CACHE_RECOVERY")?;
         let expected_entries = env_usize("CACHE_RECOVERY_EXPECTED_ENTRIES", 1_000_000)?;
         let capacity_bytes = env_u64("CACHE_RECOVERY_CAPACITY_MIB", 256)?
             .checked_mul(MIB as u64)
             .ok_or_else(|| invalid("recovery benchmark capacity is too large"))?;
-        let memory_bytes = env_usize("CACHE_RECOVERY_MEMORY_MIB", 16)?
+        let l1_capacity_bytes = env_usize("CACHE_RECOVERY_L1_CAPACITY_MIB", 16)?
             .checked_mul(MIB)
             .ok_or_else(|| invalid("recovery benchmark RAM tier is too large"))?;
         let managed_memory_limit_bytes =
@@ -74,7 +75,7 @@ impl ScaleConfig {
         Ok(Self {
             expected_entries,
             capacity_bytes,
-            memory_bytes,
+            l1_capacity_bytes,
             managed_memory_limit_bytes,
             sentinel_count,
             value_bytes,
@@ -98,7 +99,7 @@ impl ScaleConfig {
         options.io_engine = IoEngineOptions::Posix(io);
         options.io_mode = IoMode::Buffered;
         options.append_shards = 4;
-        options.l1_capacity_bytes = self.memory_bytes;
+        options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
         options.statistics = false;
         options
@@ -212,11 +213,11 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     let cache_config = CacheConfig::new(storage.clone(), config.runtime_options())?;
     let peak_disk_bytes = storage.peak_disk_bytes();
     println!(
-        "config expected_entries={} index_slots={} capacity_bytes={} memory_bytes={} managed_memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
+        "config expected_entries={} index_slots={} capacity_bytes={} l1_capacity_bytes={} managed_memory_limit_bytes={} sentinels={} value_bytes={} peak_disk_bytes={} directory={}",
         config.expected_entries,
         storage.index_slots(),
         config.capacity_bytes,
-        config.memory_bytes,
+        config.l1_capacity_bytes,
         config.managed_memory_limit_bytes,
         config.sentinel_count,
         config.value_bytes,

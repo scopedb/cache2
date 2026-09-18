@@ -28,6 +28,8 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use benchmarks::config::io_engine_from_env;
+use benchmarks::config::reclaim_max_in_flight;
 use benchmarks::report::AtomicLatencyHistogram;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
@@ -39,11 +41,7 @@ use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringOptions;
-use cache2::IoUringPoolOptions;
-use cache2::IoUringSqPollOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
@@ -67,16 +65,13 @@ struct SoakConfig {
     duration: Duration,
     sample_period: Duration,
     capacity_bytes: u64,
-    memory_bytes: usize,
+    l1_capacity_bytes: usize,
     managed_memory_limit_bytes: usize,
     value_bytes: Box<[usize]>,
     rss_slack_bytes: usize,
     rss_reopen_allowance_bytes: usize,
     key_count: usize,
     append_shards: u32,
-    read_io_workers: usize,
-    write_io_workers: usize,
-    reclaim_workers: usize,
     writers: usize,
     readers: usize,
     operation_interval: Duration,
@@ -98,22 +93,22 @@ impl SoakConfig {
         let capacity_bytes = env_u64("CACHE_SOAK_CAPACITY_MIB", 256)?
             .checked_mul(MIB as u64)
             .ok_or_else(|| invalid("soak capacity is too large"))?;
-        let memory_mib = env_usize("CACHE_SOAK_MEMORY_MIB", 64)?;
-        let memory_bytes = memory_mib
+        let l1_capacity_mib = env_usize("CACHE_SOAK_L1_CAPACITY_MIB", 64)?;
+        let l1_capacity_bytes = l1_capacity_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak memory capacity is too large"))?;
         let append_shards = env_u32("CACHE_SOAK_APPEND_SHARDS", 4)?;
-        let reclaim_workers = env_usize("CACHE_SOAK_RECLAIM_WORKERS", 1)?;
+        let io_engine = io_engine_from_env("CACHE_SOAK")?;
         let shard_count = usize::try_from(append_shards)
             .map_err(|_| invalid("soak shard count does not fit usize"))?;
-        let read_reservation_bytes = reclaim_workers
+        let read_reservation_bytes = reclaim_max_in_flight(io_engine)
             .checked_add(1)
             .and_then(|buffers| buffers.checked_mul(REGION_BYTES))
             .ok_or_else(|| invalid("soak read reservation is too large"))?;
         let default_managed_memory_limit_mib = shard_count
             .checked_mul(2 * REGION_BYTES)
             .and_then(|bytes| bytes.checked_add(read_reservation_bytes))
-            .and_then(|bytes| bytes.checked_add(memory_bytes))
+            .and_then(|bytes| bytes.checked_add(l1_capacity_bytes))
             // Cover the fixed index/L1 metadata and recovery scratch for the
             // default harness. Large custom plans should set an explicit limit.
             .and_then(|bytes| bytes.checked_add(REGION_BYTES))
@@ -130,8 +125,6 @@ impl SoakConfig {
             .checked_mul(MIB)
             .ok_or_else(|| invalid("soak RSS slack is too large"))?;
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
-        let read_io_workers = env_usize("CACHE_SOAK_READ_IO_WORKERS", 4)?;
-        let write_io_workers = env_usize("CACHE_SOAK_WRITE_IO_WORKERS", 4)?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
         let operation_interval =
@@ -144,18 +137,12 @@ impl SoakConfig {
         // not cache-owned managed memory, and is bounded by one L1 capacity for
         // this harness's fixed reopen topology.
         let rss_reopen_allowance_bytes = if warm_reopen || final_warm_verify {
-            memory_bytes
+            l1_capacity_bytes
         } else {
             0
         };
         let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
         let require_reinsert_coverage = env_bool("CACHE_SOAK_REQUIRE_REINSERT_COVERAGE", false)?;
-        let io_engine = parse_io_engine(
-            "CACHE_SOAK_IO_ENGINE",
-            read_io_workers,
-            write_io_workers,
-            reclaim_workers,
-        )?;
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
@@ -169,10 +156,6 @@ impl SoakConfig {
                 .any(|bytes| !(VALUE_HEADER_BYTES..=MAX_VALUE_BYTES).contains(bytes))
             || key_count == 0
             || append_shards == 0
-            || reclaim_workers == 0
-            || reclaim_workers > shard_count
-            || read_io_workers == 0
-            || write_io_workers == 0
             || (writers == 0 && !warm_reopen)
             || readers == 0
             || operation_interval > Duration::from_secs(1)
@@ -186,16 +169,13 @@ impl SoakConfig {
             duration,
             sample_period,
             capacity_bytes,
-            memory_bytes,
+            l1_capacity_bytes,
             managed_memory_limit_bytes,
             value_bytes,
             rss_slack_bytes,
             rss_reopen_allowance_bytes,
             key_count,
             append_shards,
-            read_io_workers,
-            write_io_workers,
-            reclaim_workers,
             writers,
             readers,
             operation_interval,
@@ -223,7 +203,7 @@ impl SoakConfig {
         options.io_engine = self.io_engine;
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
-        options.l1_capacity_bytes = self.memory_bytes;
+        options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
         options.statistics = true;
@@ -412,10 +392,10 @@ fn run_benchmark() -> io::Result<()> {
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB memory={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} read_io_workers={} write_io_workers={} reclaim_workers={} writers={} readers={} operation_interval_us={} latency_sample_interval={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB l1_capacity={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} writers={} readers={} operation_interval_us={} latency_sample_interval={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
-        config.memory_bytes as f64 / MIB as f64,
+        config.l1_capacity_bytes as f64 / MIB as f64,
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config
             .value_bytes
@@ -425,9 +405,6 @@ fn run_benchmark() -> io::Result<()> {
             .join(","),
         config.key_count,
         config.append_shards,
-        config.read_io_workers,
-        config.write_io_workers,
-        config.reclaim_workers,
         config.writers,
         config.readers,
         config.operation_interval.as_micros(),
@@ -1215,17 +1192,6 @@ fn env_u32(name: &str, default: u32) -> io::Result<u32> {
         .and_then(|value| u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds u32"))))
 }
 
-fn env_optional_u32(name: &str) -> io::Result<Option<u32>> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
 fn env_bool(name: &str, default: bool) -> io::Result<bool> {
     match env::var(name) {
         Ok(value) if value == "true" || value == "1" => Ok(true),
@@ -1234,94 +1200,6 @@ fn env_bool(name: &str, default: bool) -> io::Result<bool> {
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
     }
-}
-
-fn parse_io_engine(
-    name: &str,
-    read_workers: usize,
-    write_workers: usize,
-    reclaim_workers: usize,
-) -> io::Result<IoEngineOptions> {
-    match env::var(name)
-        .unwrap_or_else(|_| "posix".to_owned())
-        .as_str()
-    {
-        "posix" => {
-            let mut options = PosixIoOptions::default();
-            options.read_workers = read_workers;
-            options.write_workers = write_workers;
-            options.reclaim_workers = reclaim_workers;
-            Ok(IoEngineOptions::Posix(options))
-        }
-        "io-uring" => {
-            let mut options = IoUringOptions::default();
-            options.read = io_uring_read_pool(read_workers)?;
-            options.write = io_uring_write_pool(write_workers)?;
-            options.reclaim.rings = reclaim_workers;
-            options.reclaim.max_in_flight = reclaim_workers;
-            Ok(IoEngineOptions::IoUring(options))
-        }
-        value => Err(invalid(format!("unsupported I/O engine: {value}"))),
-    }
-}
-
-/// Builds the io_uring read pool from the benchmark-only topology knobs.
-///
-/// `CACHE_SOAK_IO_URING_READ_RINGS` and
-/// `CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT` default to the legacy mapping
-/// (one ring per worker with 64 in-flight slots per ring). Setting
-/// `CACHE_SOAK_IO_URING_READ_IOPOLL=true` enables kernel completion polling
-/// and requires `CACHE_SOAK_IO_MODE=direct`. Setting
-/// `CACHE_SOAK_IO_URING_READ_SQPOLL_MS` opts the pool into kernel submission
-/// polling with the given idle time; `CACHE_SOAK_IO_URING_READ_SQPOLL_CPU`
-/// optionally pins the polling threads.
-fn io_uring_read_pool(read_workers: usize) -> io::Result<IoUringPoolOptions> {
-    let rings = env_usize("CACHE_SOAK_IO_URING_READ_RINGS", read_workers)?;
-    let max_in_flight = env_usize(
-        "CACHE_SOAK_IO_URING_READ_MAX_IN_FLIGHT",
-        read_workers
-            .checked_mul(64)
-            .ok_or_else(|| invalid("read io_uring depth is too large"))?,
-    )?;
-    if rings == 0 || max_in_flight == 0 || max_in_flight < rings {
-        return Err(invalid(
-            "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
-        ));
-    }
-    let mut pool = IoUringPoolOptions::default();
-    pool.rings = rings;
-    pool.max_in_flight = max_in_flight;
-    pool.io_poll = env_bool("CACHE_SOAK_IO_URING_READ_IOPOLL", false)?;
-    if let Some(idle_millis) = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_MS")? {
-        let mut sq_poll = IoUringSqPollOptions::new(idle_millis);
-        sq_poll.cpu = env_optional_u32("CACHE_SOAK_IO_URING_READ_SQPOLL_CPU")?;
-        pool.sq_poll = Some(sq_poll);
-    }
-    Ok(pool)
-}
-
-/// Builds the io_uring write pool from the benchmark-only topology knobs.
-///
-/// `CACHE_SOAK_IO_URING_WRITE_RINGS` and
-/// `CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT` default to the legacy mapping
-/// (one ring per worker with 64 in-flight slots per ring).
-fn io_uring_write_pool(write_workers: usize) -> io::Result<IoUringPoolOptions> {
-    let rings = env_usize("CACHE_SOAK_IO_URING_WRITE_RINGS", write_workers)?;
-    let max_in_flight = env_usize(
-        "CACHE_SOAK_IO_URING_WRITE_MAX_IN_FLIGHT",
-        write_workers
-            .checked_mul(64)
-            .ok_or_else(|| invalid("write io_uring depth is too large"))?,
-    )?;
-    if rings == 0 || max_in_flight == 0 || max_in_flight < rings {
-        return Err(invalid(
-            "io_uring rings and max in-flight must satisfy 0 < rings <= max_in_flight",
-        ));
-    }
-    let mut pool = IoUringPoolOptions::default();
-    pool.rings = rings;
-    pool.max_in_flight = max_in_flight;
-    Ok(pool)
 }
 
 fn parse_io_mode(name: &str) -> io::Result<IoMode> {

@@ -27,6 +27,8 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::io_engine_from_env;
+use benchmarks::config::read_max_in_flight;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
 use benchmarks::report::RunReporter;
@@ -36,9 +38,7 @@ use cache2::CacheConfig;
 use cache2::CacheTier;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoOptions;
 use cache2::ReadAdmission;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
@@ -66,15 +66,12 @@ struct BenchConfig {
     hot_entries: usize,
     hot_read_interval: usize,
     capacity_bytes: u64,
-    memory_bytes: usize,
+    l1_capacity_bytes: usize,
     managed_memory_limit_bytes: usize,
     append_shards: u32,
-    read_io_workers: usize,
     read_io_wait_capacity: usize,
     read_io_wait_timeout: Duration,
     read_latency_sample_interval: usize,
-    write_io_workers: usize,
-    reclaim_workers: usize,
     write_clients: usize,
     clients: usize,
     io_engine: IoEngineOptions,
@@ -93,11 +90,13 @@ impl BenchConfig {
         let hot_entries = env_usize("CACHE_BENCH_HOT_ENTRIES", 0)?;
         let hot_read_interval = env_usize("CACHE_BENCH_HOT_READ_INTERVAL", 8)?;
         let capacity_mib = env_usize("CACHE_BENCH_CAPACITY_MIB", 512)?;
-        let memory_mib = env_usize("CACHE_BENCH_MEMORY_MIB", 256)?;
+        let l1_capacity_mib = env_usize("CACHE_BENCH_L1_CAPACITY_MIB", 256)?;
         let append_shards = env_u32("CACHE_BENCH_APPEND_SHARDS", 4)?;
-        let read_io_workers = env_usize("CACHE_BENCH_READ_IO_WORKERS", 4)?;
-        let read_io_wait_capacity =
-            env_usize("CACHE_BENCH_READ_IO_WAIT_CAPACITY", read_io_workers)?;
+        let io_engine = io_engine_from_env("CACHE_BENCH")?;
+        let read_io_wait_capacity = env_usize(
+            "CACHE_BENCH_READ_IO_WAIT_CAPACITY",
+            read_max_in_flight(io_engine),
+        )?;
         let read_io_wait_timeout_us = env_usize("CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US", 0)?;
         let read_io_wait_timeout = Duration::from_micros(
             u64::try_from(read_io_wait_timeout_us)
@@ -105,37 +104,8 @@ impl BenchConfig {
         );
         let read_latency_sample_interval =
             env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 16)?;
-        let write_io_workers = env_usize("CACHE_BENCH_WRITE_IO_WORKERS", 4)?;
-        let reclaim_workers = env_usize("CACHE_BENCH_RECLAIM_WORKERS", 1)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
-        let io_engine = match env::var("CACHE_BENCH_IO_ENGINE")
-            .unwrap_or_else(|_| "posix".to_owned())
-            .as_str()
-        {
-            "posix" => {
-                let mut options = PosixIoOptions::default();
-                options.read_workers = read_io_workers;
-                options.write_workers = write_io_workers;
-                options.reclaim_workers = reclaim_workers;
-                IoEngineOptions::Posix(options)
-            }
-            "io-uring" => {
-                let mut options = IoUringOptions::default();
-                options.read.rings = read_io_workers;
-                options.read.max_in_flight = read_io_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("read io_uring depth is too large"))?;
-                options.write.rings = write_io_workers;
-                options.write.max_in_flight = write_io_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("write io_uring depth is too large"))?;
-                options.reclaim.rings = reclaim_workers;
-                options.reclaim.max_in_flight = reclaim_workers;
-                IoEngineOptions::IoUring(options)
-            }
-            value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
-        };
         let io_mode = match env::var("CACHE_BENCH_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
@@ -177,11 +147,7 @@ impl BenchConfig {
 
         if entries == 0
             || read_ops == 0
-            || read_io_workers == 0
             || read_io_wait_capacity == 0
-            || write_io_workers == 0
-            || reclaim_workers == 0
-            || reclaim_workers > append_shards as usize
             || write_clients == 0
             || clients == 0
             || append_shards == 0
@@ -206,13 +172,13 @@ impl BenchConfig {
             .ok()
             .and_then(|value| value.checked_mul(MIB as u64))
             .ok_or_else(|| invalid("benchmark capacity is too large"))?;
-        let memory_bytes = memory_mib
+        let l1_capacity_bytes = l1_capacity_mib
             .checked_mul(MIB)
             .ok_or_else(|| invalid("benchmark memory capacity is too large"))?;
         let estimated_index_bytes = entries
             .checked_mul(160)
             .ok_or_else(|| invalid("benchmark index estimate is too large"))?;
-        let default_managed_memory_limit_mib = memory_bytes
+        let default_managed_memory_limit_mib = l1_capacity_bytes
             .checked_add(estimated_index_bytes)
             .and_then(|bytes| bytes.checked_add(512 * MIB))
             .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?
@@ -225,7 +191,7 @@ impl BenchConfig {
             .checked_mul(MIB)
             .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?;
         let maximum_resident_entries = if benchmark_entry_is_l1_eligible(value_bytes) {
-            memory_bytes
+            l1_capacity_bytes
                 .saturating_mul(3)
                 .saturating_div(4)
                 .saturating_div(value_bytes.saturating_add(256))
@@ -266,15 +232,12 @@ impl BenchConfig {
             hot_entries,
             hot_read_interval,
             capacity_bytes,
-            memory_bytes,
+            l1_capacity_bytes,
             managed_memory_limit_bytes,
             append_shards,
-            read_io_workers,
             read_io_wait_capacity,
             read_io_wait_timeout,
             read_latency_sample_interval,
-            write_io_workers,
-            reclaim_workers,
             write_clients,
             clients,
             io_engine,
@@ -298,7 +261,7 @@ impl BenchConfig {
         options.io_engine = self.io_engine;
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
-        options.l1_capacity_bytes = self.memory_bytes;
+        options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
         options.statistics = self.statistics_enabled;
@@ -318,7 +281,7 @@ impl BenchConfig {
         match (self.io_engine, self.read_io_wait_timeout.is_zero()) {
             // Keep the benchmark at the POSIX engine's exact admission depth.
             // Saturation misses belong in the soak, not the device-rate phase.
-            (IoEngineOptions::Posix(_), true) => self.clients.min(self.read_io_workers),
+            (IoEngineOptions::Posix(options), true) => self.clients.min(options.read_workers),
             _ => self.clients,
         }
     }
@@ -422,7 +385,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let index_slots = cache_config.storage().index_slots();
     let index_load = config.entries as f64 * 100.0 / index_slots as f64;
     let initial_l1_bytes = if config.hot_entries == 0 {
-        config.memory_bytes
+        config.l1_capacity_bytes
     } else {
         0
     };
@@ -430,7 +393,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("C² cache benchmark");
     println!("additional_stats={:?}", config.stats);
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB memory={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_workers={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_workers={} reclaim_workers={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
         config.entries,
         index_slots,
         index_load,
@@ -439,16 +402,13 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.hot_read_interval,
         config.value_bytes,
         (config.entries as f64 * config.value_bytes as f64) / MIB as f64,
-        config.memory_bytes as f64 / MIB as f64,
+        config.l1_capacity_bytes as f64 / MIB as f64,
         initial_l1_bytes as f64 / MIB as f64,
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config.append_shards,
-        config.read_io_workers,
         config.read_io_wait_capacity,
         config.read_io_wait_timeout.as_micros(),
         config.read_latency_sample_interval,
-        config.write_io_workers,
-        config.reclaim_workers,
         config.write_clients,
         config.clients,
         config.l2_clients(),
@@ -463,7 +423,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let cache = Arc::new(
         Cache::open(
             &files.data,
-            if initial_l1_bytes == config.memory_bytes {
+            if initial_l1_bytes == config.l1_capacity_bytes {
                 cache_config.clone()
             } else {
                 let mut options = cache_config.runtime().clone();

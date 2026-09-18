@@ -326,8 +326,8 @@ run_benchmark_profile() {
     CACHE_BENCH_DIR="$cache_directory" \
     CACHE_BENCH_IO_ENGINE="$engine" \
     CACHE_BENCH_IO_MODE="$mode" \
-    CACHE_BENCH_READ_IO_WORKERS="$read_workers" \
-    CACHE_BENCH_WRITE_IO_WORKERS="$write_workers" \
+    CACHE_BENCH_POSIX_READ_WORKERS="$read_workers" \
+    CACHE_BENCH_POSIX_WRITE_WORKERS="$write_workers" \
       cargo +1.98.0 bench --locked --package benchmarks --bench cache --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
