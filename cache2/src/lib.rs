@@ -62,9 +62,9 @@ pub use self::snapshot::StartupMode;
 mod checksum;
 mod hashing;
 mod io;
+mod managed_memory;
 mod memory;
 mod region;
-mod resources;
 
 #[cfg(test)]
 mod fixtures;

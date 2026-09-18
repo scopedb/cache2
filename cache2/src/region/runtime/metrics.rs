@@ -19,12 +19,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::hashing::route_hash;
+use crate::managed_memory::ManagedMemorySnapshot;
 use crate::memory::MemoryMetricsSnapshot;
 use crate::region::RegionReclaimStats;
 use crate::region::runtime::LIFECYCLE_DRAINING;
 use crate::region::runtime::LIFECYCLE_FAILED;
 use crate::region::runtime::LIFECYCLE_RUNNING;
-use crate::resources::ManagedMemorySnapshot;
 use crate::snapshot::CacheHealth;
 use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheReclaimSnapshot;

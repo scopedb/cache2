@@ -41,7 +41,7 @@ struct RegionMetadataBinding {
     data_superblock_generation: u64,
     image_identity: PersistentId,
     image_generation: u64,
-    config_fingerprint: u64,
+    storage_fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,7 +286,7 @@ impl RegionManager {
                 data_superblock_generation: root.data_superblock_generation,
                 image_identity: root.image_identity,
                 image_generation: root.image_generation,
-                config_fingerprint: root.config_fingerprint,
+                storage_fingerprint: root.storage_fingerprint,
             },
             region_size: root.region_size,
             next_seqno,
@@ -1124,7 +1124,7 @@ impl RegionManager {
                 data_superblock_generation: self.binding.data_superblock_generation,
                 image_identity: self.binding.image_identity,
                 image_generation: self.binding.image_generation,
-                config_fingerprint: self.binding.config_fingerprint,
+                storage_fingerprint: self.binding.storage_fingerprint,
                 index_slots: partition_totals.slot_count,
                 index_page_count: partition_totals.page_count,
                 region_size: self.region_size,
@@ -1312,7 +1312,7 @@ mod tests {
                 data_superblock_generation: 3,
                 image_identity: id(4),
                 image_generation: 5,
-                config_fingerprint: 6,
+                storage_fingerprint: 6,
                 index_slots: index_slots as u64,
                 index_page_count: 2,
                 region_size: 32 * 1024 * 1024,

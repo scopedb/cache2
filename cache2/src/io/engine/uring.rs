@@ -73,7 +73,7 @@ use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 #[cfg(test)]
 use crate::io::engine::io_uring_extra_memory_bytes;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
@@ -1122,13 +1122,13 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::resources::ResourceController;
-    use crate::resources::ResourceLimits;
+    use crate::managed_memory::ManagedMemory;
+    use crate::managed_memory::ManagedMemoryLimits;
 
     struct CancelledCommandProducer {
         shared: Arc<RuntimeShared>,
         commands: mpsc::SyncSender<DriverCommand>,
-        resources: ResourceController,
+        managed_memory: ManagedMemory,
         next: AtomicU64,
         completed: AtomicUsize,
     }
@@ -1143,7 +1143,7 @@ mod tests {
                 completion.cell.lock().unwrap().waker = Some(Waker::from(Arc::clone(self)));
             }
             let buffer =
-                IoBuffer::for_read(self.resources.try_read_buffer(4096).unwrap(), 1).unwrap();
+                IoBuffer::for_read(self.managed_memory.try_read_buffer(4096).unwrap(), 1).unwrap();
             let task = Task {
                 request_id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 operation: IoOperation::read(buffer, 0),
@@ -1172,7 +1172,7 @@ mod tests {
         let producer = Arc::new(CancelledCommandProducer {
             shared: Arc::clone(&shared),
             commands,
-            resources: ResourceController::try_new(ResourceLimits {
+            managed_memory: ManagedMemory::try_new(ManagedMemoryLimits {
                 memory_limit_bytes: 16 * 1024,
                 reserved_memory_bytes: 0,
             })

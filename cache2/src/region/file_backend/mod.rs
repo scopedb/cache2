@@ -368,7 +368,7 @@ where
     files: RegionFiles,
     /// Used when the data file is missing or empty. Existing
     /// files retain their on-disk identities but must match this geometry and
-    /// configuration fingerprint.
+    /// storage-layout fingerprint.
     format_data: DataSuperblock,
     config: CacheConfig,
     file_system: F,
@@ -393,9 +393,9 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         files: RegionFiles,
         format_data: DataSuperblock,
         index_slots: usize,
-        runtime_config: RuntimeOptions,
+        runtime_options: RuntimeOptions,
     ) -> Self {
-        let config = cache_config(format_data.geometry, index_slots, runtime_config);
+        let config = cache_config(format_data.geometry, index_slots, runtime_options);
         Self::new(files, format_data, config)
     }
 
@@ -998,7 +998,7 @@ where
             data_identity: data.data_identity,
             data_superblock_generation: data.generation,
             hash_seed: data.hash_seed,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             image_identity,
             image_generation,
             image_file_len,
@@ -1152,7 +1152,7 @@ where
             DataSuperblockProbe::Valid(data) => {
                 if data.geometry != format_data.geometry
                     || data.hash_seed != format_data.hash_seed
-                    || data.config_fingerprint != format_data.config_fingerprint
+                    || data.storage_fingerprint != format_data.storage_fingerprint
                     || file_len != data.geometry.data_file_len
                 {
                     format_empty_data(file, state, format_data)?;
@@ -1428,7 +1428,7 @@ fn empty_region_metadata(
             data_superblock_generation: data.generation,
             image_identity: data.data_identity,
             image_generation: 1,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             index_slots,
             index_page_count,
             region_size: data.geometry.region_size,

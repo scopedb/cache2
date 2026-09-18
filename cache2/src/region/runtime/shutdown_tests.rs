@@ -98,7 +98,7 @@ impl IoBackend for BlockedRead {
 struct RacingEngine {
     inner: BackendIoEngine,
     backend: Arc<BlockedRead>,
-    resources: Arc<ResourceController>,
+    managed_memory: Arc<ManagedMemory>,
     inject: AtomicBool,
     pending: Mutex<Option<IoRequest>>,
 }
@@ -158,7 +158,7 @@ impl IoEngine for RacingEngine {
             // Schedule a competing read immediately after the idle observation.
             if let Ok(slot) = self.inner.try_reserve_read() {
                 let buffer =
-                    IoBuffer::for_read(self.resources.try_read_buffer(4096).unwrap(), 4096)
+                    IoBuffer::for_read(self.managed_memory.try_read_buffer(4096).unwrap(), 4096)
                         .unwrap();
                 if let Ok(request) = self
                     .inner
@@ -229,7 +229,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
             region_count: 2,
         },
         hash_seed: 3,
-        config_fingerprint: 4,
+        storage_fingerprint: 4,
     };
     let config = RuntimeOptions {
         append_shards: 1,
@@ -254,7 +254,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     let engine = Arc::new(RacingEngine {
         inner: BackendIoEngine::new(backend.clone(), 1).unwrap(),
         backend: backend.clone(),
-        resources: shared.resources.clone(),
+        managed_memory: shared.managed_memory.clone(),
         inject: AtomicBool::new(true),
         pending: Mutex::new(None),
     });

@@ -24,14 +24,14 @@ use crate::error::from_io;
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::io_uring_extra_memory_bytes;
+use crate::managed_memory::BUFFER_ALIGNMENT;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::MAX_CONFIG_COUNT;
 use crate::memory::MemoryStore;
 use crate::region::recovery::DataGeometry;
 use crate::region::runtime::metrics::ActivityMetrics;
 use crate::region::runtime_fixed_memory_bytes;
 use crate::region::staging::RegionStaging;
-use crate::resources::BUFFER_ALIGNMENT;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
-use crate::resources::MAX_CONFIG_COUNT;
 
 const DEFAULT_L1_SHARDS: usize = 32;
 const MAX_APPEND_SHARDS: u32 = 256;
@@ -422,18 +422,18 @@ impl Default for RuntimeOptions {
     }
 }
 
-pub const fn read_io_wait_capacity(config: &RuntimeOptions) -> usize {
-    match config.read_admission {
+pub const fn read_io_wait_capacity(options: &RuntimeOptions) -> usize {
+    match options.read_admission {
         ReadAdmission::Immediate => 0,
         ReadAdmission::Wait { max_waiters, .. } => match max_waiters {
             Some(capacity) => capacity,
-            None => IoPoolTopology::read(config.io_engine).max_in_flight(),
+            None => IoPoolTopology::read(options.io_engine).max_in_flight(),
         },
     }
 }
 
-pub const fn read_io_wait_timeout(config: &RuntimeOptions) -> Duration {
-    match config.read_admission {
+pub const fn read_io_wait_timeout(options: &RuntimeOptions) -> Duration {
+    match options.read_admission {
         ReadAdmission::Immediate => Duration::ZERO,
         ReadAdmission::Wait { timeout, .. } => timeout,
     }
@@ -567,12 +567,12 @@ impl RuntimeOptions {
                 validate_posix_pool("write", write_topology)?;
                 validate_posix_pool("reclaim", reclaim_topology)?;
             }
-            IoEngineOptions::IoUring(config) => {
-                validate_io_uring_pool("read", config.read)?;
-                validate_io_uring_pool("write", config.write)?;
-                validate_io_uring_pool("reclaim", config.reclaim)?;
+            IoEngineOptions::IoUring(options) => {
+                validate_io_uring_pool("read", options.read)?;
+                validate_io_uring_pool("write", options.write)?;
+                validate_io_uring_pool("reclaim", options.reclaim)?;
                 if self.io_mode != IoMode::Direct
-                    && (config.read.io_poll || config.write.io_poll || config.reclaim.io_poll)
+                    && (options.read.io_poll || options.write.io_poll || options.reclaim.io_poll)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -697,13 +697,13 @@ impl RuntimeOptions {
     }
 }
 
-fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
-    let shard_count = config.append_shards as usize;
+fn runtime_topology_memory_bytes(options: &RuntimeOptions) -> Option<usize> {
+    let shard_count = options.append_shards as usize;
     // Reserve one stack per physical I/O thread, one possible shutdown reaper
     // per engine, and every append/reclaim worker.
-    let read = IoPoolTopology::read(config.io_engine);
-    let write = IoPoolTopology::write(config.io_engine);
-    let reclaim = IoPoolTopology::reclaim(config.io_engine);
+    let read = IoPoolTopology::read(options.io_engine);
+    let write = IoPoolTopology::write(options.io_engine);
+    let reclaim = IoPoolTopology::reclaim(options.io_engine);
     let engine_count = read
         .engine_count()
         .checked_add(write.engine_count())?
@@ -716,7 +716,7 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
         .checked_add(shard_count)?
         .checked_add(reclaim.max_in_flight())?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
-    let read_wait_queue = read_io_wait_capacity(config);
+    let read_wait_queue = read_io_wait_capacity(options);
     let queue = write
         .max_in_flight()
         .checked_add(read.max_in_flight())?
@@ -730,7 +730,7 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
         })?;
     let controls = engine_count
         .checked_add(shard_count)?
-        .checked_add(config.l1_shards)?
+        .checked_add(options.l1_shards)?
         .checked_add(reclaim.max_in_flight())?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
     let metrics = shard_count.checked_mul(size_of::<ActivityMetrics>())?;
@@ -751,26 +751,26 @@ fn validate_posix_pool(name: &str, topology: IoPoolTopology) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_io_uring_pool(name: &str, config: IoUringPoolOptions) -> io::Result<()> {
-    if !(1..=MAX_CONFIG_COUNT).contains(&config.rings) {
+fn validate_io_uring_pool(name: &str, options: IoUringPoolOptions) -> io::Result<()> {
+    if !(1..=MAX_CONFIG_COUNT).contains(&options.rings) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} ring count must be in 1..={MAX_CONFIG_COUNT}"),
         ));
     }
-    if !(1..=MAX_CONFIG_COUNT).contains(&config.max_in_flight) {
+    if !(1..=MAX_CONFIG_COUNT).contains(&options.max_in_flight) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} maximum in-flight requests must be in 1..={MAX_CONFIG_COUNT}"),
         ));
     }
-    if config.rings > config.max_in_flight {
+    if options.rings > options.max_in_flight {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} ring count must not exceed its in-flight limit"),
         ));
     }
-    if config.max_in_flight.div_ceil(config.rings) > MAX_IO_REQUESTS_PER_ENGINE {
+    if options.max_in_flight.div_ceil(options.rings) > MAX_IO_REQUESTS_PER_ENGINE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("io_uring {name} per-ring depth must not exceed {MAX_IO_REQUESTS_PER_ENGINE}"),

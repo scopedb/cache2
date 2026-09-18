@@ -75,7 +75,7 @@ use crate::io::backend::RuntimeIoDirection;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::WritePoint;
-use crate::resources::BufferLease;
+use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
@@ -104,7 +104,7 @@ pub struct BackendIoEngine {
 const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 // Common bounded command, completion, and request bookkeeping. Payload
-// buffers are charged by ResourceController separately.
+// buffers are charged by ManagedMemory separately.
 pub const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 
 pub fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option<usize> {

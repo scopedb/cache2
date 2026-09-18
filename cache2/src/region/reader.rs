@@ -34,11 +34,11 @@ use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
+use crate::managed_memory::BufferLease;
 use crate::region::index::packed::IndexEntry;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
-use crate::resources::BufferLease;
 
 const _READ_ALIGNMENT: usize = 4096;
 const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
@@ -325,9 +325,9 @@ mod tests {
     use crate::io::backend::SyncPoint;
     use crate::io::backend::WritePoint;
     use crate::io::engine::BackendIoEngine;
+    use crate::managed_memory::ManagedMemory;
+    use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
-    use crate::resources::ResourceController;
-    use crate::resources::ResourceLimits;
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -396,7 +396,7 @@ mod tests {
     fn unaligned_record_uses_one_aligned_read_and_returns_its_exact_slice() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let resources = ResourceController::try_new(ResourceLimits {
+        let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
@@ -410,7 +410,7 @@ mod tests {
             &engine,
             slot,
             plan,
-            resources.try_read_buffer(_READ_ALIGNMENT).unwrap(),
+            managed_memory.try_read_buffer(_READ_ALIGNMENT).unwrap(),
         )
         .unwrap()
         .wait(&engine);
@@ -431,14 +431,14 @@ mod tests {
         drop(reads);
         drop(completion.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+        assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
 
     #[test]
     fn buffered_record_uses_one_size_class_upper_bound_read() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let resources = ResourceController::try_new(ResourceLimits {
+        let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
@@ -451,7 +451,7 @@ mod tests {
             &engine,
             engine.try_reserve_read().unwrap(),
             plan,
-            resources.try_read_buffer(1120).unwrap(),
+            managed_memory.try_read_buffer(1120).unwrap(),
         )
         .unwrap()
         .wait(&engine);
@@ -468,7 +468,7 @@ mod tests {
         );
         drop(completion.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+        assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
 
     #[test]

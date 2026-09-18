@@ -58,6 +58,7 @@ use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
+use crate::managed_memory::BufferLease;
 use crate::region::appender::RegionSpanCompletion;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
@@ -76,7 +77,6 @@ use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadataError;
 use crate::region::staging::RegionStaging;
-use crate::resources::BufferLease;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 

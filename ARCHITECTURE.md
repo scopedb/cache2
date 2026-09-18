@@ -134,7 +134,7 @@ C² owns three distinct files in one directory:
 
 | File        | Authority                                                                                                                                                                                                                       |
 |-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Data        | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and static-configuration fingerprint. It has no session-state bit.             |
+| Data        | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and storage-layout fingerprint. It has no session-state bit.             |
 | State       | Two checksummed 4 KiB slots. The newest valid generation is the sole authority for `EMPTY`, `RUNNING`, or `CLEAN` and binds an exact data identity; `CLEAN` additionally binds an exact image identity, generation, and length. |
 | Clean image | An immutable 4 KiB header followed by checksummed L2 index pages and mandatory Region metadata. It is produced only by a successful warm close.                                                                                 |
 
@@ -154,7 +154,7 @@ Open first acquires exclusive ownership of the data and state files, then inspec
 
 Before workers start or the cache becomes observable, every successful open publishes and syncs `RUNNING`. Consequently, a crash, process kill, drop, or fast close leaves an unclean state whose next open is cold.
 
-For a warm open, the state, data superblock, image header, image length, index layout, and Region metadata must describe one identity and generation. The checks include the cache UUID, data and image identities, generations, hash seed, static-configuration fingerprint, and expected geometry. A mismatch, unsupported format, missing/truncated image, invalid Region metadata, failed append-shard rebind, or unavailable private mapping rejects the complete image and starts cold.
+For a warm open, the state, data superblock, image header, image length, index layout, and Region metadata must describe one identity and generation. The checks include the cache UUID, data and image identities, generations, hash seed, storage-layout fingerprint, and expected geometry. A mismatch, unsupported format, missing/truncated image, invalid Region metadata, failed append-shard rebind, or unavailable private mapping rejects the complete image and starts cold.
 
 The index image is mapped writable and private. Runtime mutations therefore use copy-on-write pages and never modify the immutable clean image. Index pages are validated lazily on first read or mutation to avoid an O(slot-count) startup scan; the header and Region metadata are validated eagerly. A page CRC, identity, layout, or slot-semantics failure makes the shared image unusable and moves safe reads to miss-only rather than returning unvalidated data.
 

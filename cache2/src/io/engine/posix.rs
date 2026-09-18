@@ -51,7 +51,7 @@ use crate::io::engine::ShutdownState;
 use crate::io::engine::SubmitError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::lock_unpoisoned;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
 impl BackendIoEngine {
     #[cfg(unix)]

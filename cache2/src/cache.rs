@@ -14,7 +14,7 @@
 
 //! Public cache API and configuration.
 //!
-//! Static configuration defines disk identity; runtime configuration is chosen
+//! Storage layout defines disk identity; runtime options are chosen
 //! per open. `close_warm` publishes recoverable state.
 
 use std::fmt;
@@ -237,7 +237,7 @@ impl Cache {
             data_identity: next_persistent_id(),
             geometry: storage_geometry(config.storage()),
             hash_seed: KEY_HASH_SEED,
-            config_fingerprint: storage_fingerprint(config.storage()),
+            storage_fingerprint: storage_fingerprint(config.storage()),
         };
         let files = RegionFiles::new(
             &path,

@@ -68,7 +68,7 @@ const ROOT_DATA_IDENTITY_OFFSET: usize = 16;
 const ROOT_DATA_GENERATION_OFFSET: usize = 32;
 const ROOT_IMAGE_IDENTITY_OFFSET: usize = 40;
 const ROOT_IMAGE_GENERATION_OFFSET: usize = 56;
-const ROOT_CONFIG_FINGERPRINT_OFFSET: usize = 64;
+const ROOT_STORAGE_FINGERPRINT_OFFSET: usize = 64;
 const ROOT_INDEX_SLOTS_OFFSET: usize = 72;
 const ROOT_INDEX_PAGE_COUNT_OFFSET: usize = 80;
 const ROOT_REGION_SIZE_OFFSET: usize = 88;
@@ -154,7 +154,7 @@ pub struct RegionMetadataRoot {
     pub data_superblock_generation: u64,
     pub image_identity: PersistentId,
     pub image_generation: u64,
-    pub config_fingerprint: u64,
+    pub storage_fingerprint: u64,
     pub index_slots: u64,
     pub index_page_count: u64,
     pub region_size: u64,
@@ -250,13 +250,13 @@ impl RegionMetadata {
             && self.root.data_superblock_generation == data.generation
             && self.root.region_size == data.geometry.region_size
             && self.root.region_count == data.geometry.region_count
-            && self.root.config_fingerprint == data.config_fingerprint
+            && self.root.storage_fingerprint == data.storage_fingerprint
             && self.root.cache_uuid == image.cache_uuid
             && self.root.data_identity == image.data_identity
             && self.root.data_superblock_generation == image.data_superblock_generation
             && self.root.image_identity == image.image_identity
             && self.root.image_generation == image.image_generation
-            && self.root.config_fingerprint == image.config_fingerprint
+            && self.root.storage_fingerprint == image.storage_fingerprint
             && self.root.index_slots == image.index_slots
             && encoded_len == image.region_table_len
     }
@@ -982,8 +982,8 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
     put_u64(output, ROOT_IMAGE_GENERATION_OFFSET, root.image_generation);
     put_u64(
         output,
-        ROOT_CONFIG_FINGERPRINT_OFFSET,
-        root.config_fingerprint,
+        ROOT_STORAGE_FINGERPRINT_OFFSET,
+        root.storage_fingerprint,
     );
     put_u64(output, ROOT_INDEX_SLOTS_OFFSET, root.index_slots);
     put_u64(output, ROOT_INDEX_PAGE_COUNT_OFFSET, root.index_page_count);
@@ -1056,7 +1056,7 @@ fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot, RegionMetadataError> 
         data_superblock_generation: get_u64(input, ROOT_DATA_GENERATION_OFFSET)?,
         image_identity: get_id(input, ROOT_IMAGE_IDENTITY_OFFSET)?,
         image_generation: get_u64(input, ROOT_IMAGE_GENERATION_OFFSET)?,
-        config_fingerprint: get_u64(input, ROOT_CONFIG_FINGERPRINT_OFFSET)?,
+        storage_fingerprint: get_u64(input, ROOT_STORAGE_FINGERPRINT_OFFSET)?,
         index_slots: get_u64(input, ROOT_INDEX_SLOTS_OFFSET)?,
         index_page_count: get_u64(input, ROOT_INDEX_PAGE_COUNT_OFFSET)?,
         region_size: get_u64(input, ROOT_REGION_SIZE_OFFSET)?,
@@ -1231,7 +1231,7 @@ mod tests {
                 data_superblock_generation: 3,
                 image_identity: id(4),
                 image_generation: 5,
-                config_fingerprint: 6,
+                storage_fingerprint: 6,
                 index_slots: 508,
                 index_page_count: 2,
                 region_size: 32 * 1024 * 1024,

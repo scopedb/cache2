@@ -25,9 +25,9 @@ use super::*;
 use crate::io::backend::FileBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
-use crate::resources::ResourceController;
-use crate::resources::ResourceLimits;
-use crate::resources::aligned_buffer_capacity;
+use crate::managed_memory::ManagedMemory;
+use crate::managed_memory::ManagedMemoryLimits;
+use crate::managed_memory::aligned_buffer_capacity;
 
 static FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -279,9 +279,9 @@ impl IoBackend for ShortThenErrorBackend {
     }
 }
 
-fn resources() -> Arc<ResourceController> {
+fn managed_memory() -> Arc<ManagedMemory> {
     Arc::new(
-        ResourceController::try_new(ResourceLimits {
+        ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: 1024 * 1024,
             reserved_memory_bytes: 0,
         })
@@ -289,21 +289,21 @@ fn resources() -> Arc<ResourceController> {
     )
 }
 
-fn read_buffer(resources: &Arc<ResourceController>, length: usize) -> IoBuffer {
-    let lease = resources.try_read_buffer(length).unwrap();
+fn read_buffer(managed_memory: &Arc<ManagedMemory>, length: usize) -> IoBuffer {
+    let lease = managed_memory.try_read_buffer(length).unwrap();
     IoBuffer::for_read(lease, length).unwrap()
 }
 
-fn write_buffer(resources: &Arc<ResourceController>, bytes: &[u8]) -> IoBuffer {
-    let mut lease = resources.try_read_buffer(bytes.len()).unwrap();
+fn write_buffer(managed_memory: &Arc<ManagedMemory>, bytes: &[u8]) -> IoBuffer {
+    let mut lease = managed_memory.try_read_buffer(bytes.len()).unwrap();
     lease.prepare(bytes.len()).unwrap().copy_from_slice(bytes);
     IoBuffer::for_write(lease, bytes.len()).unwrap()
 }
 
 #[test]
 fn aligned_buffer_has_stable_alignment() {
-    let resources = resources();
-    let buffer = read_buffer(&resources, 8193);
+    let managed_memory = managed_memory();
+    let buffer = read_buffer(&managed_memory, 8193);
     assert_eq!(
         buffer.read_target().unwrap() as usize % IO_BUFFER_ALIGNMENT,
         0
@@ -315,17 +315,21 @@ fn aligned_buffer_has_stable_alignment() {
 fn posix_engine_round_trips_owned_buffers_and_drains() {
     let file = TestFile::new();
     let engine = BackendIoEngine::new(file.backend(), 4).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let input = b"owned async positioned I/O";
     let write = engine
-        .write_all_at(WritePoint::Record, write_buffer(&resources, input), 4096)
+        .write_all_at(
+            WritePoint::Record,
+            write_buffer(&managed_memory, input),
+            4096,
+        )
         .unwrap()
         .wait();
     assert!(matches!(write.status, CompletionStatus::Completed));
     assert_eq!(write.bytes_transferred, input.len());
 
     let read = engine
-        .read_exact_at(read_buffer(&resources, input.len()), 4096)
+        .read_exact_at(read_buffer(&managed_memory, input.len()), 4096)
         .unwrap()
         .wait();
     assert!(matches!(read.status, CompletionStatus::Completed));
@@ -339,7 +343,7 @@ fn posix_engine_round_trips_owned_buffers_and_drains() {
     assert!(stats.requests.requests_in_flight_peak >= 1);
     assert!(
         engine
-            .read_exact_at(read_buffer(&resources, input.len()), 4096)
+            .read_exact_at(read_buffer(&managed_memory, input.len()), 4096)
             .unwrap_err()
             .error
             .kind()
@@ -350,17 +354,21 @@ fn posix_engine_round_trips_owned_buffers_and_drains() {
 #[test]
 fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
     let engine = BackendIoEngine::new(Arc::new(ShortThenErrorBackend::default()), 2).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
 
     let read = engine
-        .read_exact_at(read_buffer(&resources, 8), 0)
+        .read_exact_at(read_buffer(&managed_memory, 8), 0)
         .unwrap()
         .wait();
     assert!(matches!(read.status, CompletionStatus::Failed(_)));
     assert_eq!(read.bytes_transferred, 3);
 
     let write = engine
-        .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x33; 8]), 0)
+        .write_all_at(
+            WritePoint::Record,
+            write_buffer(&managed_memory, &[0x33; 8]),
+            0,
+        )
         .unwrap()
         .wait();
     assert!(matches!(write.status, CompletionStatus::Failed(_)));
@@ -373,10 +381,10 @@ async fn async_request_is_woken_by_driver_completion() {
     let file = TestFile::new();
     file.file().set_len(4096).unwrap();
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io(
         engine.as_ref(),
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
     )
     .unwrap();
 
@@ -402,10 +410,10 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
         .unwrap(),
     );
     engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io(
         engine.as_ref(),
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
     )
     .unwrap();
     let waiter_engine = Arc::clone(&engine);
@@ -473,7 +481,7 @@ async fn reserved_read_latency_includes_time_before_submission() {
         let completion = submit_cache_read(
             &engine,
             slot,
-            IoOperation::read(read_buffer(&resources(), 4096), 0),
+            IoOperation::read(read_buffer(&managed_memory(), 4096), 0),
         )
         .unwrap()
         .wait(&engine)
@@ -502,12 +510,12 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> =
         Arc::new(BackendIoEngine::new_with_read_wait(backend.clone(), 1).unwrap());
-    let resources = resources();
+    let managed_memory = managed_memory();
     let slot = engine.try_reserve_read().unwrap();
     let request = submit_cache_read(
         engine.as_ref(),
         slot,
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
     )
     .unwrap();
     let request_engine = Arc::clone(&engine);
@@ -669,10 +677,10 @@ async fn cancelled_queue_head_passes_priority_to_next_read() {
 async fn async_read_deadline_keeps_other_slots_available() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io_until(
         engine.as_ref(),
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
         Instant::now() + Duration::from_millis(20),
         Duration::from_millis(10),
     )
@@ -705,12 +713,16 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
     let engine =
         BackendIoEngine::new_with_files(RuntimeFileSet::new(buffered_file, Some(direct_file)), 2)
             .unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
 
     let aligned = vec![0x5a; 4096];
     assert!(matches!(
         engine
-            .write_all_at(WritePoint::Record, write_buffer(&resources, &aligned), 0,)
+            .write_all_at(
+                WritePoint::Record,
+                write_buffer(&managed_memory, &aligned),
+                0,
+            )
             .unwrap()
             .wait()
             .status,
@@ -720,7 +732,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
         engine
             .write_all_at(
                 WritePoint::Record,
-                write_buffer(&resources, &[0x33; 32]),
+                write_buffer(&managed_memory, &[0x33; 32]),
                 4096,
             )
             .unwrap()
@@ -755,11 +767,11 @@ fn unfenced_write_state_remains_unsafe_after_shutdown() {
 fn read_completion_deadline_retains_only_its_bounded_slot() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let deadline = Instant::now() + Duration::from_millis(20);
     let request = submit_cache_io_until(
         &engine,
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
         deadline,
         Duration::from_millis(10),
     )
@@ -776,7 +788,7 @@ fn read_completion_deadline_retains_only_its_bounded_slot() {
     assert_eq!(pending_writes, 0);
 
     let rejected = engine
-        .submit(IoOperation::read(read_buffer(&resources, 1), 0))
+        .submit(IoOperation::read(read_buffer(&managed_memory, 1), 0))
         .unwrap_err();
     assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
 
@@ -789,12 +801,12 @@ fn read_completion_deadline_retains_only_its_bounded_slot() {
 fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io_until(
         &engine,
         IoOperation::write(
             WritePoint::Record,
-            write_buffer(&resources, &[0x5a; 4096]),
+            write_buffer(&managed_memory, &[0x5a; 4096]),
             0,
         ),
         Instant::now() + Duration::from_millis(20),
@@ -809,7 +821,7 @@ fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
     let rejected = engine
         .submit(IoOperation::write(
             WritePoint::Record,
-            write_buffer(&resources, &[0x33; 4096]),
+            write_buffer(&managed_memory, &[0x33; 4096]),
             4096,
         ))
         .unwrap_err();
@@ -859,9 +871,13 @@ fn disabled_io_statistics_skip_cumulative_engine_counters() {
     let engine =
         BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false, false)
             .unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let completion = engine
-        .write_all_at(WritePoint::Record, write_buffer(&resources, &[0x5a]), 0)
+        .write_all_at(
+            WritePoint::Record,
+            write_buffer(&managed_memory, &[0x5a]),
+            0,
+        )
         .unwrap()
         .wait();
     assert!(matches!(completion.status, CompletionStatus::Completed));
@@ -902,7 +918,7 @@ fn unused_read_reservation_releases_its_engine_slot() {
 fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
     let file = TestFile::new();
     let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let fence = engine
         .inner
         .submit_state
@@ -910,7 +926,7 @@ fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let rejected = engine
-        .submit(IoOperation::read(read_buffer(&resources, 1), 0))
+        .submit(IoOperation::read(read_buffer(&managed_memory, 1), 0))
         .unwrap_err();
     assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(engine.in_flight(), 0);
@@ -923,9 +939,13 @@ fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
 fn backend_workers_execute_independent_reads_concurrently() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
-    let resources = resources();
-    let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
-    let second = engine.read_exact_at(read_buffer(&resources, 1), 1).unwrap();
+    let managed_memory = managed_memory();
+    let first = engine
+        .read_exact_at(read_buffer(&managed_memory, 1), 0)
+        .unwrap();
+    let second = engine
+        .read_exact_at(read_buffer(&managed_memory, 1), 1)
+        .unwrap();
 
     let both_entered = backend.wait_for_entered(2);
     backend.release();
@@ -943,12 +963,14 @@ fn backend_workers_execute_independent_reads_concurrently() {
 fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources();
-    let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
+    let managed_memory = managed_memory();
+    let first = engine
+        .read_exact_at(read_buffer(&managed_memory, 1), 0)
+        .unwrap();
     assert!(backend.wait_for_entered(1));
 
     let waiting_engine = engine.clone();
-    let waiting_buffer = read_buffer(&resources, 1);
+    let waiting_buffer = read_buffer(&managed_memory, 1);
     let rejected = engine
         .submit(IoOperation::read(waiting_buffer, 1))
         .unwrap_err();
@@ -990,14 +1012,16 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
 fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources();
-    let first = engine.read_exact_at(read_buffer(&resources, 1), 0).unwrap();
+    let managed_memory = managed_memory();
+    let first = engine
+        .read_exact_at(read_buffer(&managed_memory, 1), 0)
+        .unwrap();
     assert!(backend.wait_for_entered(1));
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let waiting_engine = engine.clone();
     let waiting_cancelled = Arc::clone(&cancelled);
-    let waiting_operation = IoOperation::read(read_buffer(&resources, 1), 1);
+    let waiting_operation = IoOperation::read(read_buffer(&managed_memory, 1), 1);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
     let submitter = std::thread::spawn(move || {
@@ -1028,7 +1052,7 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let deadline_cancelled = AtomicBool::new(false);
     let timed_out = engine
         .submit_wait_controlled(
-            IoOperation::read(read_buffer(&resources, 1), 2),
+            IoOperation::read(read_buffer(&managed_memory, 1), 2),
             &deadline_cancelled,
             Some(Instant::now()),
         )
@@ -1044,9 +1068,9 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
 #[test]
 fn backend_panic_completes_the_request_and_worker_survives() {
     let engine = BackendIoEngine::new(Arc::new(PanicOnceBackend::new()), 1).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let failed = engine
-        .read_exact_at(read_buffer(&resources, 1), 0)
+        .read_exact_at(read_buffer(&managed_memory, 1), 0)
         .unwrap()
         .wait();
     let (result, lease) = failed.into_lease();
@@ -1055,7 +1079,7 @@ fn backend_panic_completes_the_request_and_worker_survives() {
     drop(lease);
 
     let succeeded = engine
-        .read_exact_at(read_buffer(&resources, 1), 1)
+        .read_exact_at(read_buffer(&managed_memory, 1), 1)
         .unwrap()
         .wait();
     assert!(matches!(succeeded.status, CompletionStatus::Completed));
@@ -1081,10 +1105,10 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
     let completion = Arc::new(CompletionState::new());
     shared.requests_submitted.fetch_add(1, Ordering::Relaxed);
 
-    let resources = resources();
+    let managed_memory = managed_memory();
     let task = Task {
         request_id,
-        operation: IoOperation::read(read_buffer(&resources, 1), 0),
+        operation: IoOperation::read(read_buffer(&managed_memory, 1), 0),
         completion: Arc::clone(&completion),
         slot,
         submitted_at: Some(Instant::now()),
@@ -1103,15 +1127,15 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
     // The uncertain buffer remains charged instead of being reused while
     // the kernel may still own its address.
     assert_eq!(
-        resources.managed_memory_snapshot().current_bytes,
+        managed_memory.snapshot().current_bytes,
         aligned_buffer_capacity(1).unwrap()
     );
-    assert!(resources.try_read_buffer(1).is_some());
+    assert!(managed_memory.try_read_buffer(1).is_some());
 
     drop(completed);
     drop(completion);
     drop(shared);
-    assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+    assert_eq!(managed_memory.snapshot().current_bytes, 0);
 }
 
 #[test]
@@ -1128,9 +1152,9 @@ fn io_histograms_include_failures_when_legacy_statistics_are_disabled() {
         .unwrap(),
     );
     engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
-    let resources = resources();
+    let managed_memory = managed_memory();
     let completion = engine
-        .read_exact_at(read_buffer(&resources, 4096), 0)
+        .read_exact_at(read_buffer(&managed_memory, 4096), 0)
         .unwrap()
         .wait();
     assert!(matches!(completion.status, CompletionStatus::Failed(_)));
@@ -1149,10 +1173,10 @@ fn io_histograms_include_failures_when_legacy_statistics_are_disabled() {
 fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io_with_timeout(
         &engine,
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
         Duration::from_millis(20),
     )
     .unwrap();
@@ -1168,10 +1192,10 @@ fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
 fn background_read_can_complete_after_default_deadline() {
     let backend = Arc::new(BlockingBackend::default());
     let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-    let resources = resources();
+    let managed_memory = managed_memory();
     let request = submit_cache_io_with_timeout(
         &engine,
-        IoOperation::read(read_buffer(&resources, 4096), 0),
+        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
         Duration::from_secs(30),
     )
     .unwrap();

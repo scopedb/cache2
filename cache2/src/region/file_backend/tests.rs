@@ -45,6 +45,8 @@ use crate::io::backend::testing::FaultHandle;
 use crate::io::backend::testing::kill_process;
 use crate::io::engine::BackendIoEngine;
 use crate::io::engine::IoEngine;
+use crate::managed_memory::ManagedMemory;
+use crate::managed_memory::ManagedMemoryLimits;
 use crate::region::RegionStageValue;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
@@ -63,8 +65,6 @@ use crate::region::recovery::DataGeometry;
 use crate::region::recovery::PersistentId;
 use crate::region::staging::RegionStaging;
 use crate::region::staging::StagedRecord;
-use crate::resources::ResourceController;
-use crate::resources::ResourceLimits;
 use crate::snapshot::StartupMode;
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -238,7 +238,7 @@ fn test_data_superblock_with_regions(region_count: u32) -> DataSuperblock {
             region_count,
         },
         hash_seed: 3,
-        config_fingerprint: 4,
+        storage_fingerprint: 4,
     }
 }
 
@@ -258,8 +258,8 @@ fn data_path_superblock() -> DataSuperblock {
     }
 }
 
-fn data_path_resources() -> ResourceController {
-    ResourceController::try_new(ResourceLimits {
+fn data_path_memory() -> ManagedMemory {
+    ManagedMemory::try_new(ManagedMemoryLimits {
         memory_limit_bytes: 32 * 1024 * 1024,
         reserved_memory_bytes: 0,
     })
@@ -390,7 +390,7 @@ fn production_data_superblock(region_size: u64) -> DataSuperblock {
             region_count,
         },
         hash_seed: 23,
-        config_fingerprint: 24,
+        storage_fingerprint: 24,
     }
 }
 
@@ -408,7 +408,7 @@ fn key_for_shard(data: DataSuperblock, shard: u64, ordinal: u64) -> Vec<u8> {
 fn configured_read_wait_is_bounded_and_cancel_safe() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeOptions {
+    let runtime_options = RuntimeOptions {
         io_engine: IoEngineOptions::Posix(PosixIoOptions {
             read_workers: 2,
             write_workers: 4,
@@ -428,7 +428,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
             directory.files.clone(),
             data,
             4096,
-            runtime_config,
+            runtime_options,
         ),
     )
     .unwrap();
@@ -496,7 +496,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
 fn queued_l2_read_does_not_pin_warm_close() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeOptions {
+    let runtime_options = RuntimeOptions {
         io_engine: IoEngineOptions::Posix(PosixIoOptions {
             read_workers: 1,
             write_workers: 4,
@@ -515,7 +515,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
             directory.files.clone(),
             data,
             4096,
-            runtime_config.clone(),
+            runtime_options.clone(),
         ),
     )
     .unwrap();
@@ -547,7 +547,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
             directory.files.clone(),
             data,
             4096,
-            runtime_config,
+            runtime_options,
         ),
     )
     .unwrap();
@@ -559,7 +559,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
 fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
-    let runtime_config = RuntimeOptions {
+    let runtime_options = RuntimeOptions {
         l1_capacity_bytes: 0,
         statistics: true,
         ..RuntimeOptions::default()
@@ -570,7 +570,7 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
             directory.files.clone(),
             data,
             4096,
-            runtime_config,
+            runtime_options,
         ),
     )
     .unwrap();
@@ -665,7 +665,7 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
     for case in ["shard", "index"] {
         let directory = TestDirectory::new();
         let data = production_data_superblock(512 * 1024);
-        let runtime_config = RuntimeOptions {
+        let runtime_options = RuntimeOptions {
             io_engine: IoEngineOptions::Posix(PosixIoOptions {
                 read_workers: 1,
                 write_workers: 1,
@@ -682,7 +682,7 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
                 directory.files.clone(),
                 data,
                 4096,
-                runtime_config.clone(),
+                runtime_options.clone(),
             ),
         )
         .unwrap();
@@ -706,7 +706,7 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
                 directory.files.clone(),
                 data,
                 4096,
-                runtime_config,
+                runtime_options,
             ),
         )
         .unwrap();
@@ -776,12 +776,12 @@ fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, RegionStagi
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    let resources = data_path_resources();
+    let managed_memory = data_path_memory();
     let staging = RegionStaging::try_new(
         1,
         MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
-        &resources,
+        &managed_memory,
     )
     .unwrap();
     (data, runtime, staging)
@@ -884,12 +884,12 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         empty_region_metadata(data, index_slots, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    let resources = data_path_resources();
+    let managed_memory = data_path_memory();
     let staging = RegionStaging::try_new(
         1,
         MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
-        &resources,
+        &managed_memory,
     )
     .unwrap();
     let directory = TestDirectory::new();
@@ -971,12 +971,12 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     let read_buffer_bytes = plan_read(data.geometry, last_hash, last_read, true)
         .unwrap()
         .read_len;
-    let memory_before_read = resources.managed_memory_snapshot().current_bytes;
+    let memory_before_read = managed_memory.snapshot().current_bytes;
     let hit = runtime
         .read_value(
             &engine,
             data.geometry,
-            resources.try_read_buffer(read_buffer_bytes).unwrap(),
+            managed_memory.try_read_buffer(read_buffer_bytes).unwrap(),
             data.hash_seed,
             last_key.as_bytes(),
         )
@@ -985,10 +985,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     assert_eq!(hit.value(), value);
     assert_eq!(hit.seqno(), last_seqno);
     drop(hit);
-    assert_eq!(
-        resources.managed_memory_snapshot().current_bytes,
-        memory_before_read
-    );
+    assert_eq!(managed_memory.snapshot().current_bytes, memory_before_read);
 
     assert_eq!(
         faults.events(),
@@ -1046,12 +1043,12 @@ fn same_hash_candidate_requires_full_key() {
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    let resources = data_path_resources();
+    let managed_memory = data_path_memory();
     let staging = RegionStaging::try_new(
         1,
         MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
-        &resources,
+        &managed_memory,
     )
     .unwrap();
     let directory = TestDirectory::new();
@@ -1086,8 +1083,8 @@ fn same_hash_candidate_requires_full_key() {
     };
     let read_buffer_bytes =
         (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE) * RECOVERY_PAGE_SIZE;
-    let memory_before_read = resources.managed_memory_snapshot().current_bytes;
-    let read_buffer = resources.try_read_buffer(read_buffer_bytes).unwrap();
+    let memory_before_read = managed_memory.snapshot().current_bytes;
+    let read_buffer = managed_memory.try_read_buffer(read_buffer_bytes).unwrap();
     let entry = runtime
         .begin_point_read(owner_hash)
         .expect("hash lookup must return the collision candidate");
@@ -1108,10 +1105,7 @@ fn same_hash_candidate_requires_full_key() {
             .is_none()
     );
     assert!(runtime.health.is_healthy());
-    assert_eq!(
-        resources.managed_memory_snapshot().current_bytes,
-        memory_before_read
-    );
+    assert_eq!(managed_memory.snapshot().current_bytes, memory_before_read);
 
     let current = runtime
         .begin_point_read(owner_hash)
@@ -1126,7 +1120,7 @@ fn same_hash_candidate_requires_full_key() {
             .read_value_from_plan(
                 &engine,
                 engine.try_reserve_read().unwrap(),
-                resources.try_read_buffer(read_buffer_bytes).unwrap(),
+                managed_memory.try_read_buffer(read_buffer_bytes).unwrap(),
                 stale_plan,
                 owner_key,
             )
@@ -1153,7 +1147,9 @@ fn same_hash_candidate_requires_full_key() {
             .read_value_from_plan(
                 &engine,
                 engine.try_reserve_read().unwrap(),
-                resources.try_read_buffer(wrong_length_read_bytes).unwrap(),
+                managed_memory
+                    .try_read_buffer(wrong_length_read_bytes)
+                    .unwrap(),
                 wrong_length_plan,
                 owner_key,
             )
@@ -1165,7 +1161,7 @@ fn same_hash_candidate_requires_full_key() {
         .read_value(
             &engine,
             data.geometry,
-            resources.try_read_buffer(read_buffer_bytes).unwrap(),
+            managed_memory.try_read_buffer(read_buffer_bytes).unwrap(),
             data.hash_seed,
             owner_key,
         )
@@ -1173,10 +1169,7 @@ fn same_hash_candidate_requires_full_key() {
         .expect("the owning full key must still hit");
     assert_eq!(hit.value(), value);
     drop(hit);
-    assert_eq!(
-        resources.managed_memory_snapshot().current_bytes,
-        memory_before_read
-    );
+    assert_eq!(managed_memory.snapshot().current_bytes, memory_before_read);
     engine.shutdown().unwrap();
 }
 
@@ -1188,12 +1181,12 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    let resources = data_path_resources();
+    let managed_memory = data_path_memory();
     let staging = RegionStaging::try_new(
         1,
         MAX_WRITE_FLUSH_THRESHOLD_BYTES,
         data.geometry.region_size,
-        &resources,
+        &managed_memory,
     )
     .unwrap();
     let directory = TestDirectory::new();
@@ -1311,7 +1304,7 @@ fn publish_custom_clean_image(
     metadata: RegionMetadata,
 ) {
     let shard_count = metadata.root.shard_count;
-    let runtime_config = RuntimeOptions {
+    let runtime_options = RuntimeOptions {
         append_shards: shard_count,
         ..RuntimeOptions::default()
     };
@@ -1319,7 +1312,7 @@ fn publish_custom_clean_image(
         directory.files.clone(),
         data,
         index_slots,
-        runtime_config,
+        runtime_options,
     );
     backend.acquire_exclusive().unwrap();
     assert!(matches!(
