@@ -323,8 +323,8 @@ impl FileRegionCore {
         self.index.snapshot().map_err(index_storage_io_error)
     }
 
-    pub fn set_index_statistics_enabled(&self, enabled: bool) {
-        self.index.set_statistics_enabled(enabled);
+    pub fn set_index_activity_counters_enabled(&self, enabled: bool) {
+        self.index.set_activity_counters_enabled(enabled);
     }
 
     pub fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {

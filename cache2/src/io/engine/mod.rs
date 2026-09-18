@@ -1178,7 +1178,7 @@ const fn active_write_slots(state: u64) -> usize {
 struct RuntimeShared {
     latency: std::sync::OnceLock<crate::stats::recording::IoTiming>,
     max_in_flight: usize,
-    statistics_enabled: bool,
+    activity_counters_enabled: bool,
     accepting: AtomicBool,
     /// Packed total and write counts. A single CAS is the slot reservation
     /// linearization point.
@@ -1206,11 +1206,11 @@ enum SlotWaitError {
 }
 
 impl RuntimeShared {
-    fn new(max_in_flight: usize, statistics_enabled: bool, read_wait_enabled: bool) -> Self {
+    fn new(max_in_flight: usize, activity_counters_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
             latency: std::sync::OnceLock::new(),
             max_in_flight,
-            statistics_enabled,
+            activity_counters_enabled,
             accepting: AtomicBool::new(true),
             slot_state: AtomicU64::new(0),
             in_flight_peak: AtomicUsize::new(0),
@@ -1265,7 +1265,7 @@ impl RuntimeShared {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if self.statistics_enabled {
+                    if self.activity_counters_enabled {
                         update_peak(&self.in_flight_peak, total + 1);
                     }
                     return Some(IoSlot {
@@ -1290,7 +1290,7 @@ impl RuntimeShared {
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))?;
         slot.read_permit = permit;
         let reserved_at =
-            (self.statistics_enabled || self.latency.get().is_some()).then(Instant::now);
+            (self.activity_counters_enabled || self.latency.get().is_some()).then(Instant::now);
         Ok(ReadSlot { slot, reserved_at })
     }
 
@@ -1478,7 +1478,7 @@ impl RuntimeShared {
         slot: IoSlot,
         submitted_at: Option<Instant>,
     ) {
-        if self.statistics_enabled {
+        if self.activity_counters_enabled {
             match &status {
                 CompletionStatus::Completed => {
                     self.requests_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -1493,7 +1493,7 @@ impl RuntimeShared {
         }
         if let Some(submitted_at) = submitted_at {
             let elapsed = submitted_at.elapsed();
-            if self.statistics_enabled {
+            if self.activity_counters_enabled {
                 add_duration_ns(&self.request_time_ns, elapsed);
             }
             if let Some(recorder) = self.latency.get() {
@@ -1721,7 +1721,7 @@ impl RuntimeInner {
             return Err(SubmitError { error, operation });
         }
         let write = operation.kind().uses_write_slot();
-        let slot_wait_started = self.shared.statistics_enabled.then(Instant::now);
+        let slot_wait_started = self.shared.activity_counters_enabled.then(Instant::now);
         let slot = match slot_mode {
             #[cfg(test)]
             SlotMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(io::Error::new(
@@ -1764,7 +1764,7 @@ impl RuntimeInner {
             add_duration_ns(&self.shared.slot_wait_ns, slot_wait_started.elapsed());
         }
 
-        let request_started = (self.shared.statistics_enabled
+        let request_started = (self.shared.activity_counters_enabled
             || self.shared.latency.get().is_some())
         .then(Instant::now);
         self.submit_with_slot(operation, slot, request_started, nonblocking)
@@ -1813,7 +1813,7 @@ impl RuntimeInner {
             slot,
             submitted_at: request_started,
         };
-        if self.shared.statistics_enabled {
+        if self.shared.activity_counters_enabled {
             self.shared
                 .requests_submitted
                 .fetch_add(1, Ordering::Release);
@@ -1831,7 +1831,7 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
-                if self.shared.statistics_enabled {
+                if self.shared.activity_counters_enabled {
                     self.shared
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
@@ -1846,7 +1846,7 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
-                if self.shared.statistics_enabled {
+                if self.shared.activity_counters_enabled {
                     self.shared
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
@@ -1978,7 +1978,7 @@ impl Drop for RuntimeInner {
 pub fn build_file_engine(
     files: RuntimeFileSet,
     plan: IoEnginePlan,
-    statistics_enabled: bool,
+    activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
     match plan {
@@ -1986,7 +1986,7 @@ pub fn build_file_engine(
             files,
             workers,
             workers,
-            statistics_enabled,
+            activity_counters_enabled,
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
@@ -2006,7 +2006,7 @@ pub fn build_file_engine(
                 uring::UringIoEngine::new_with_files(
                     files,
                     plan,
-                    statistics_enabled,
+                    activity_counters_enabled,
                     read_wait_enabled,
                 )
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)

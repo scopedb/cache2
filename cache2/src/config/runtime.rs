@@ -395,11 +395,8 @@ pub struct RuntimeOptions {
     /// through 4 MiB (the default). Partial buffers also flush on a bounded delay,
     /// pressure, and completion barriers.
     pub write_flush_threshold_bytes: usize,
-    /// Enable cumulative request, cache, and I/O counters. Defaults to false;
-    /// health and managed-resource gauges remain available.
-    pub statistics: bool,
-    /// Additional request accounting and latency distributions. Independent of
-    /// `statistics`; defaults disable all additional recorders.
+    /// Activity counters, request outcomes, and latency distributions.
+    /// Defaults disable collection; health and resource gauges remain available.
     pub stats: crate::StatsOptions,
 }
 
@@ -416,7 +413,6 @@ impl Default for RuntimeOptions {
             managed_memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
             write_flush_threshold_bytes: MAX_WRITE_FLUSH_THRESHOLD_BYTES,
-            statistics: false,
             stats: crate::StatsOptions::default(),
         }
     }
@@ -465,7 +461,7 @@ impl CacheConfig {
     /// io.read_workers = 8;
     /// let mut runtime = RuntimeOptions::default();
     /// runtime.io_engine = IoEngineOptions::Posix(io);
-    /// runtime.statistics = true;
+    /// runtime.stats.activity_counters = true;
     /// let config = CacheConfig::new(storage, runtime)?;
     /// let disk_peak = config.storage().peak_disk_bytes();
     /// let memory_floor = config.minimum_memory_bytes();

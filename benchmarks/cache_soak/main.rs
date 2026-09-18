@@ -206,7 +206,7 @@ impl SoakConfig {
         options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
-        options.statistics = true;
+        options.stats.activity_counters = true;
         options
     }
 }

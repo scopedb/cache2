@@ -77,6 +77,7 @@ pub fn reclaim_max_in_flight(options: IoEngineOptions) -> usize {
 /// Rejects renamed knobs so old scripts cannot silently select different defaults.
 pub fn reject_renamed_env(prefix: &str) -> io::Result<()> {
     for (old, new) in [
+        ("STATS", "ACTIVITY_COUNTERS"),
         ("MEMORY_MIB", "L1_CAPACITY_MIB"),
         ("L1_MIB", "L1_CAPACITY_MIB"),
         ("L2_MIB", "CAPACITY_MIB"),

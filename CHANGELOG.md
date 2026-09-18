@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking Changes
+
+- All optional statistics now use `RuntimeOptions::stats`: replace `runtime.statistics` with `runtime.stats.activity_counters` and `CacheSnapshot::statistics_enabled` with `activity_counters_enabled`. Activity counters, terminal request counters, and latency collection remain independent and disabled by default; counter semantics and the on-disk format are unchanged. See [the configuration migration guide](CONFIGURATION.md#migrating-from-05).
+
 ## v0.5.0 (2026-09-16)
 
 ### Breaking Changes

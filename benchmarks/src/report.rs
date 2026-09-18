@@ -319,7 +319,7 @@ impl<'a> JobReport<'a> {
             );
         }
         println!(
-            "report version=1 type=job benchmark={} scenario={} job={} operation={} jobs={} runtime_ns={} attempts={} operations={} errors={} bytes={} attempt_iops={:.3} iops={:.3} bw_bytes_per_sec={:.3} latency_sample_interval={} latency_samples={} latency_min_ns={} latency_mean_estimate_ns={:.3} latency_stddev_estimate_ns={:.3} latency_p50_upper_ns={} latency_p90_upper_ns={} latency_p95_upper_ns={} latency_p99_upper_ns={} latency_p999_upper_ns={} latency_max_ns={}",
+            "report version=2 type=job benchmark={} scenario={} job={} operation={} jobs={} runtime_ns={} attempts={} operations={} errors={} bytes={} attempt_iops={:.3} iops={:.3} bw_bytes_per_sec={:.3} latency_sample_interval={} latency_samples={} latency_min_ns={} latency_mean_estimate_ns={:.3} latency_stddev_estimate_ns={:.3} latency_p50_upper_ns={} latency_p90_upper_ns={} latency_p95_upper_ns={} latency_p99_upper_ns={} latency_p999_upper_ns={} latency_max_ns={}",
             self.benchmark,
             self.scenario,
             self.name,
@@ -366,7 +366,7 @@ impl RunReporter {
             benchmark, scenario, OS, ARCH,
         );
         println!(
-            "report version=1 type=header benchmark={benchmark} scenario={scenario} os={} arch={}",
+            "report version=2 type=header benchmark={benchmark} scenario={scenario} os={} arch={}",
             OS, ARCH,
         );
         Self {
@@ -406,7 +406,7 @@ impl RunReporter {
             println!("  error: {error}");
         }
         println!(
-            "report version=1 type=run benchmark={} scenario={} status={} runtime_ns={} errors={} cpu_user_ns={} cpu_system_ns={} voluntary_context_switches={} involuntary_context_switches={} major_faults={} minor_faults={} max_rss_bytes={}",
+            "report version=2 type=run benchmark={} scenario={} status={} runtime_ns={} errors={} cpu_user_ns={} cpu_system_ns={} voluntary_context_switches={} involuntary_context_switches={} major_faults={} minor_faults={} max_rss_bytes={}",
             self.benchmark,
             self.scenario,
             status,
@@ -459,12 +459,12 @@ pub fn emit_cache_report(
         format_bytes(cache.logical_disk_peak_bytes as f64),
     );
     println!(
-        "report version=1 type=cache benchmark={} scenario={} phase={} health={:?} statistics_enabled={} puts={} deletes={} written_bytes={} served_bytes={} l1_hits={} l1_misses={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} l2_read_overloads={} l2_read_wait_ns={} promotions={} l1_evictions={} l1_bypasses={} write_rejections={} io_failures={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reinsert_records={} reinsert_bytes={} reinsert_skipped={} reinsert_budget_skipped={}",
+        "report version=2 type=cache benchmark={} scenario={} phase={} health={:?} activity_counters_enabled={} puts={} deletes={} written_bytes={} served_bytes={} l1_hits={} l1_misses={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} l2_read_overloads={} l2_read_wait_ns={} promotions={} l1_evictions={} l1_bypasses={} write_rejections={} io_failures={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reinsert_records={} reinsert_bytes={} reinsert_skipped={} reinsert_budget_skipped={}",
         benchmark,
         scenario,
         phase,
         cache.health,
-        cache.statistics_enabled,
+        cache.activity_counters_enabled,
         cache.puts,
         cache.deletes,
         cache.written_bytes,
@@ -492,7 +492,7 @@ pub fn emit_cache_report(
         cache.reclaim.reinsert_budget_skipped,
     );
     println!(
-        "report version=1 type=resources benchmark={} scenario={} phase={} managed_bytes={} managed_peak_bytes={} managed_limit_bytes={} max_rss_bytes={} logical_disk_peak_bytes={} l1_entries={} l1_entry_capacity={} l1_resident_bytes={} l1_retained_bytes={} l1_metadata_bytes={} index_values={} index_slots={} index_relocations={} index_overflow_evictions={} index_conditional_remove_misses={} index_conditional_replace_misses={} region_records={} region_bytes={}",
+        "report version=2 type=resources benchmark={} scenario={} phase={} managed_bytes={} managed_peak_bytes={} managed_limit_bytes={} max_rss_bytes={} logical_disk_peak_bytes={} l1_entries={} l1_entry_capacity={} l1_resident_bytes={} l1_retained_bytes={} l1_metadata_bytes={} index_values={} index_slots={} index_relocations={} index_overflow_evictions={} index_conditional_remove_misses={} index_conditional_replace_misses={} region_records={} region_bytes={}",
         benchmark,
         scenario,
         phase,
@@ -553,7 +553,7 @@ fn emit_io_direction(
         format_bytes(io.direct.bytes as f64),
     );
     println!(
-        "report version=1 type=io benchmark={} scenario={} phase={} direction={} runtime_ns={} requests_submitted={} requests_succeeded={} requests_failed={} requests_cancelled={} in_flight={} in_flight_peak={} slot_wait_ns={} request_time_ns={} average_slot_wait_ns={} average_request_time_ns={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={} operations={} bytes={} iops={:.3} bw_bytes_per_sec={:.3}",
+        "report version=2 type=io benchmark={} scenario={} phase={} direction={} runtime_ns={} requests_submitted={} requests_succeeded={} requests_failed={} requests_cancelled={} in_flight={} in_flight_peak={} slot_wait_ns={} request_time_ns={} average_slot_wait_ns={} average_request_time_ns={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={} operations={} bytes={} iops={:.3} bw_bytes_per_sec={:.3}",
         benchmark,
         scenario,
         phase,

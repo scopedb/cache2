@@ -16,7 +16,7 @@ storage.expected_entries = Some(1_000_000);
 let storage = storage.build()?;
 let mut runtime = RuntimeOptions::default();
 runtime.l1_eviction_policy = L1EvictionPolicy::S3Fifo;
-runtime.statistics = true;
+runtime.stats.activity_counters = true;
 let config = CacheConfig::new(storage, runtime)?;
 let disk_peak = config.storage().peak_disk_bytes();
 let memory_floor = config.minimum_memory_bytes();
@@ -42,6 +42,10 @@ let adjusted = CacheConfig::new(config.storage().clone(), runtime)?;
 | Open cache | `Open` | File locks, filesystem/device capabilities, recovery, actual allocation, runtime binding, worker startup |
 
 Recovery still validates persisted metadata against the selected layout, and reads still validate records. Configuration construction cannot establish the contents of files or guarantee that external resources remain available.
+
+### Migrating from 0.5
+
+Move `runtime.statistics = true` to `runtime.stats.activity_counters = true`. All optional collection now lives under `StatsOptions`: activity counters, terminal request counters, and latency collection remain independent and disabled by default. Replace `snapshot.statistics_enabled` with `snapshot.activity_counters_enabled`; this flag describes the activity family only, while `CacheStatsSnapshot::options` describes all collection settings. The counter populations, memory accounting, and on-disk format are unchanged.
 
 ### Migrating from 0.4
 
@@ -287,9 +291,9 @@ IOPOLL is an additional explicit per-pool opt-in through the `IoUringPoolOptions
 
 ### Statistics
 
-Health and managed-resource gauges are always available. Enable `RuntimeOptions::statistics` while tuning to obtain cumulative request, index, L1, and I/O counters. Enabled counters add relaxed atomic work on active paths, so measure the overhead before leaving all activity statistics enabled in a latency-critical deployment.
+Health and managed-resource gauges are always available. Enable `RuntimeOptions::stats.activity_counters` while tuning to obtain cumulative request, index, L1, and I/O counters. Enabled counters add relaxed atomic work on active paths, so measure the overhead before leaving all activity statistics enabled in a latency-critical deployment.
 
-`RuntimeOptions::stats` adds independent controls: `request_counters` records all terminal public results; `l1_latency`, `l2_latency`, and `mutation_latency` independently select `LatencyMode::Off`, `Full`, or `Sampled { interval }`; `io_latency` records every engine completion by role; and `shards` selects a power of two from 1 through 64 (default 16). Defaults disable all additional recorders and preserve the legacy `statistics` switch. Construct `RuntimeOptions::default()` and assign `options.stats` fields directly; `StatsOptions` is also non-exhaustive.
+`RuntimeOptions::stats` groups the independent controls: `request_counters` records all terminal public results; `l1_latency`, `l2_latency`, and `mutation_latency` independently select `LatencyMode::Off`, `Full`, or `Sampled { interval }`; `io_latency` records every engine completion by role; and `shards` selects a power of two from 1 through 64 (default 16). All collection is disabled by default. `activity_counters` does not enable request/latency recorders, and those recorders do not implicitly enable activity counters. Construct `RuntimeOptions::default()` and assign `options.stats` fields directly; `StatsOptions` is also non-exhaustive.
 
 Request counters distinguish original L1/L2 hits, misses, accepted mutations, overload, invalid input, unavailable mutations, other errors and cancelled gets. Never-polled futures contribute nothing; cancelled durations are partial lifetimes. L1 timing covers successful L1 lookups from the first poll. L2 timing begins immediately after L1 miss and covers index lookup, admission waiting, I/O and promotion, excluding the initial L1 lookup; early misses before L1 lookup contribute only to request counters. L1 miss discards the L1 timer and makes an independent L2 sampling decision. Put timing ends at acceptance, not publication or durability. I/O timing reuses engine timestamps and covers slot reservation through terminal completion, including engine queueing rather than just device service. An I/O histogram may complete after its caller has cancelled.
 

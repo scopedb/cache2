@@ -169,7 +169,7 @@ impl RuntimeMetrics {
     pub fn snapshot(
         &self,
         core_healthy: bool,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
         memory: ManagedMemorySnapshot,
         memory_metrics: MemoryMetricsSnapshot,
     ) -> CacheSnapshot {
@@ -215,7 +215,7 @@ impl RuntimeMetrics {
         CacheSnapshot {
             metrics_epoch: self.metrics_epoch,
             health,
-            statistics_enabled,
+            activity_counters_enabled,
             puts,
             deletes,
             written_bytes,

@@ -130,12 +130,12 @@ impl UringIoEngine {
     pub fn new_with_files(
         files: RuntimeFileSet,
         plan: IoUringEnginePlan,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
         let max_in_flight = plan.max_in_flight;
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
-        files.set_statistics_enabled(statistics_enabled);
+        files.set_activity_counters_enabled(activity_counters_enabled);
         let io_stats = files.stats_handle();
         let ring_entries = max_in_flight
             .checked_add(2)
@@ -201,7 +201,7 @@ impl UringIoEngine {
         });
         let shared = Arc::new(RuntimeShared::new(
             max_in_flight,
-            statistics_enabled,
+            activity_counters_enabled,
             read_wait_enabled,
         ));
         let command_capacity = max_in_flight

@@ -448,14 +448,14 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
 
 #[tokio::test]
 async fn reserved_read_latency_includes_time_before_submission() {
-    for statistics_enabled in [false, true] {
+    for activity_counters_enabled in [false, true] {
         let file = TestFile::new();
         file.file().set_len(4096).unwrap();
-        let engine = BackendIoEngine::new_with_workers_and_statistics(
+        let engine = BackendIoEngine::new_with_workers_and_activity_counters(
             file.backend(),
             1,
             1,
-            statistics_enabled,
+            activity_counters_enabled,
             true,
         )
         .unwrap();
@@ -497,7 +497,7 @@ async fn reserved_read_latency_includes_time_before_submission() {
             .unwrap();
         assert_eq!(completed.latency.count, 1);
         assert!(completed.latency.sum_ns >= before_submit.as_nanos());
-        if statistics_enabled {
+        if activity_counters_enabled {
             assert!(
                 u128::from(engine.stats().requests.request_time_ns) >= before_submit.as_nanos()
             );
@@ -869,7 +869,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
 fn disabled_io_statistics_skip_cumulative_engine_counters() {
     let file = TestFile::new();
     let engine =
-        BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false, false)
+        BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
             .unwrap();
     let managed_memory = managed_memory();
     let completion = engine
@@ -1139,10 +1139,10 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
 }
 
 #[test]
-fn io_histograms_include_failures_when_legacy_statistics_are_disabled() {
+fn io_histograms_include_failures_when_activity_counters_are_disabled() {
     let file = TestFile::new();
     let engine =
-        BackendIoEngine::new_with_workers_and_statistics(file.backend(), 1, 1, false, false)
+        BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
             .unwrap();
     let recorder = Arc::new(
         crate::stats::recording::Recorder::new(crate::StatsOptions {

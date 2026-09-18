@@ -399,8 +399,9 @@ impl Cache {
     }
 
     /// Returns a lock-free operational snapshot. Activity and I/O counters are
-    /// cumulative for this open and are populated only when statistics are
-    /// enabled; health and resource gauges are always available.
+    /// cumulative for this open and are populated only when
+    /// `RuntimeOptions::stats.activity_counters` is enabled; health and resource gauges are
+    /// always available.
     ///
     /// # Errors
     ///
@@ -413,7 +414,7 @@ impl Cache {
         Ok(snapshot)
     }
 
-    /// Returns cumulative legacy statistics, complete optional request outcomes,
+    /// Returns cumulative activity counters, complete optional request outcomes,
     /// and optional request/I/O latency histograms without scanning metadata.
     ///
     /// Repeated or concurrent readers do not reset counts. Duration populations

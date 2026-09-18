@@ -6,7 +6,7 @@ Compare revisions only on the same host, filesystem, device, toolchain, and work
 
 All benchmark targets emit a common fio-style report in addition to their existing `result ...` records. The human-readable section groups work into jobs and reports completed-operation rate, attempts, payload bandwidth, bytes, runtime, worker count, errors or overloads, and sampled latency. Every run ends with process CPU time, context switches, page faults, peak RSS, and pass or error status.
 
-Lines beginning with `report version=1` are the stable machine-readable form. They are whitespace-separated `key=value` records with these types:
+Lines beginning with `report version=2` are the stable machine-readable form. They are whitespace-separated `key=value` records with these types:
 
 | Type          | Contents                                                                                    |
 | ------------- | ------------------------------------------------------------------------------------------- |
@@ -17,7 +17,7 @@ Lines beginning with `report version=1` are the stable machine-readable form. Th
 | `resources`   | Managed memory, peak RSS, logical disk use, and L1/index/Region occupancy                   |
 | `run`         | Overall status, runtime, CPU, scheduler, faults, and peak RSS                               |
 
-`mixed_workloads` and `cache_soak` emit the cache-specific records by default; `cache` emits them when `CACHE_BENCH_STATS=true`. The `phase` field distinguishes independently reset cache instances, such as the initial write and warm-reopened L2 phases. Existing `result ...` lines are kept for qualification scripts and compatibility.
+`mixed_workloads` and `cache_soak` emit the cache-specific records by default; `cache` emits them when `CACHE_BENCH_ACTIVITY_COUNTERS=true`. The `phase` field distinguishes independently reset cache instances, such as the initial write and warm-reopened L2 phases. Existing `result ...` lines are kept for qualification scripts and compatibility.
 
 The `io` records count logical engine requests and positive runtime file operations. They distinguish buffered and direct paths, but they are not physical-device I/O counters; use OS or device telemetry when that distinction matters.
 
@@ -39,13 +39,13 @@ The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults
 | Capacity       | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_L1_CAPACITY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                                                                                                     |
 | Concurrency    | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_POSIX_READ_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_POSIX_WRITE_WORKERS`, `CACHE_BENCH_POSIX_RECLAIM_WORKERS` |
 | I/O path       | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                                                                                                                     |
-| Cache policy   | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                                                                                                                   |
-| Measurement    | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_STATS` (default false; true adds cache/I/O/resource records)                                                                                                                     |
+| Cache policy   | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                                                                                                                  |
+| Measurement    | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_ACTIVITY_COUNTERS` (default false; true adds cache/I/O/resource records)                                                                                                         |
 | Gates          | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                                                                                                               |
 
-The additional stats implementation is controlled independently by `CACHE_BENCH_REQUEST_STATS` (complete request counters, default false), `CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL`, `CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL`, and `CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL` (independent: 0 off, 1 full, greater values sample with that mean interval; default 0), `CACHE_BENCH_IO_LATENCY` (full engine latency, default false), and `CACHE_BENCH_STATS_SHARDS` (default 16). These instrument the library itself. `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` remains the independent benchmark observer and should be held constant across comparisons. The effective additional settings are printed with each run. Compare disabled, counters-only, full and sampled modes on the same workload, keeping actual hit/overload populations in view.
+Request and latency collection are controlled independently by `CACHE_BENCH_REQUEST_STATS` (complete request counters, default false), `CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL`, `CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL`, and `CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL` (independent: 0 off, 1 full, greater values sample with that mean interval; default 0), `CACHE_BENCH_IO_LATENCY` (full engine latency, default false), and `CACHE_BENCH_STATS_SHARDS` (default 16). These instrument the library itself. `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` remains the independent benchmark observer and should be held constant across comparisons. The effective statistics settings are printed with each run. Compare disabled, counters-only, full and sampled modes on the same workload, keeping actual hit/overload populations in view.
 
-`CACHE_BENCH_STATS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs.
+`CACHE_BENCH_ACTIVITY_COUNTERS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs.
 
 For device measurements, use a data set larger than host RAM and no larger than half of L2 capacity. Run baseline and candidate in alternating order at least five times, compare medians, and retain every sample. Throughput does not replace correctness, overload, memory, or latency checks.
 
@@ -115,6 +115,8 @@ Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution. Us
 | io_uring  | `_IO_URING_<ROLE>_SQPOLL_CPU`    | absent (unpinned)                 |
 
 Select the backend with `_IO_ENGINE=posix|io-uring`. POSIX workers bound concurrent operations. io_uring ring count and aggregate in-flight limit are independent; changing one does not rewrite the other. Ring count must not exceed the in-flight limit. IOPOLL requires `_IO_MODE=direct`; SQPOLL CPU requires an idle timeout. Only the selected backend's settings are read. Each harness prints the resulting `IoEngineOptions`, and buffer estimates use its actual concurrency. The request benchmark's default read-wait capacity follows the selected read pool's in-flight limit.
+
+`CACHE_BENCH_STATS` is now `CACHE_BENCH_ACTIVITY_COUNTERS`. Machine-readable reports use `version=2`, renaming the cache record field `statistics_enabled` to `activity_counters_enabled`; the counter population is unchanged.
 
 The previous `_READ_IO_WORKERS`, `_WRITE_IO_WORKERS`, and `_RECLAIM_WORKERS` variables are rejected with a migration error. For POSIX, use `_POSIX_<ROLE>_WORKERS`. For io_uring, specify ring count and total in-flight depth separately; to reproduce a previous non-default read/write worker value of N, use N rings and 64 × N in-flight requests. The default effective topology is unchanged.
 

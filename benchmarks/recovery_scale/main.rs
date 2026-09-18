@@ -101,7 +101,7 @@ impl ScaleConfig {
         options.append_shards = 4;
         options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
-        options.statistics = false;
+        options.stats.activity_counters = false;
         options
     }
 }

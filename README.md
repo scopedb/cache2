@@ -48,13 +48,13 @@ Public failures are `cache2::Error` values with an actionable `ErrorKind`, the f
 
 ### Operations
 
-| Operation | Behavior                                                                                                        |
-|-----------|-----------------------------------------------------------------------------------------------------------------|
-| `put`     | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission.      |
-| `put_l2`  | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes. |
-| `get`     | Checks L1, then performs at most one bounded, locally validated L2 record read.                                 |
-| `delete`  | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work.                  |
-| `drain`   | Waits for accepted Region writes and L2 index publication.                                                      |
+| Operation   | Behavior                                                                                                          |
+| ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| `put`       | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission.        |
+| `put_l2`    | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes.   |
+| `get`       | Checks L1, then performs at most one bounded, locally validated L2 record read.                                   |
+| `delete`    | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work.                    |
+| `drain`     | Waits for accepted Region writes and L2 index publication.                                                        |
 
 ### Lifecycle
 
@@ -74,15 +74,15 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 
 ### Runtime tuning
 
-| Area      | Controls                                                                   | Default and behavior                                                                        |
-|-----------|----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
-| L1        | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                     | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
-| I/O pools | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
-| Read wait | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }` | Immediate admission; wait capacity defaults to aggregate read capacity.                     |
-| Writes    | `append_shards`, `write_flush_threshold_bytes`                             | Four append shards and a 4 MiB flush threshold.                                             |
-| Memory    | `managed_memory_limit_bytes`                                               | 1 GiB across cache-managed allocations.                                                     |
-| I/O mode  | `io_mode`                                                                  | Buffered I/O.                                                                               |
-| Metrics   | `statistics`                                                               | Health and resource gauges enabled; cumulative activity counters opt in.                    |
+| Area        | Controls                                                                     | Default and behavior                                                                          |
+| ----------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| L1          | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                       | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2.   |
+| I/O pools   | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.     |
+| Read wait   | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }`   | Immediate admission; wait capacity defaults to aggregate read capacity.                       |
+| Writes      | `append_shards`, `write_flush_threshold_bytes`                               | Four append shards and a 4 MiB flush threshold.                                               |
+| Memory      | `managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                       |
+| I/O mode    | `io_mode`                                                                    | Buffered I/O.                                                                                 |
+| Metrics     | `stats: StatsOptions`                                                        | Health/resource gauges always available; activity, request, and latency collection opt in.    |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm open. Growth uses available Free Regions; when there are not enough, the disposable cache safely starts empty.
 
@@ -106,7 +106,7 @@ The on-disk format is versioned. During 0.x, deployments should expect cold star
 
 ### Metrics
 
-`Cache::snapshot()` provides lock-free health and resource gauges. Setting `RuntimeOptions::statistics` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
+`Cache::snapshot()` provides lock-free health and resource gauges. Setting `RuntimeOptions::stats.activity_counters` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
 
 `RuntimeOptions::stats` independently enables complete public request outcomes, L1-hit, L2-lookup and mutation latency (each `Off`, `Full`, or `Sampled`), and full I/O latency by read/write/reclaim role. `Cache::stats_snapshot()` combines these with the existing summary without metadata scans. Structured request rows include their timing scope and collection mode. Applications own metric conversion, timestamps, scheduling and transport. Run `cargo run --example stats -- <cache-data-path>` for an example. Full timing avoids sampling work; sampled histograms retain actual sample counts and cannot guarantee observation of rare tail events. Recorder storage is preallocated, bounded and charged to managed memory.
 
@@ -119,7 +119,7 @@ C² exposes snapshots for integration with the application's metrics SDK. An Ope
 
 Export counters cumulatively and derive rates in the backend. Use fixed labels such as direction, path, and outcome. Treat `metrics_epoch` as a reset marker. Report `l1_misses` separately because it overlaps L2 outcomes.
 
-Runtime file-operation counters describe application-level operations; system telemetry supplies physical device IOPS. Convert nanoseconds to seconds before export. Activity series correspond to statistics-enabled opens.
+Runtime file-operation counters describe application-level operations; system telemetry supplies physical device IOPS. Convert nanoseconds to seconds before export. Activity series are populated when `stats.activity_counters` is enabled.
 
 ### Logs
 

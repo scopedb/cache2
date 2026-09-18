@@ -77,7 +77,6 @@ struct BenchConfig {
     io_engine: IoEngineOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
-    statistics_enabled: bool,
     stats: cache2::StatsOptions,
     directory: PathBuf,
 }
@@ -124,7 +123,6 @@ impl BenchConfig {
                 return Err(invalid(format!("unsupported L1 eviction policy: {value}")));
             }
         };
-        let statistics_enabled = env_bool("CACHE_BENCH_STATS", false)?;
         let latency = |name| -> io::Result<cache2::LatencyMode> {
             Ok(match env_u32(name, 0)? {
                 0 => cache2::LatencyMode::Off,
@@ -135,6 +133,7 @@ impl BenchConfig {
             })
         };
         let mut stats = cache2::StatsOptions::default();
+        stats.activity_counters = env_bool("CACHE_BENCH_ACTIVITY_COUNTERS", false)?;
         stats.request_counters = env_bool("CACHE_BENCH_REQUEST_STATS", false)?;
         stats.l1_latency = latency("CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL")?;
         stats.l2_latency = latency("CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL")?;
@@ -243,7 +242,6 @@ impl BenchConfig {
             io_engine,
             io_mode,
             l1_eviction_policy,
-            statistics_enabled,
             stats,
             directory,
         })
@@ -264,7 +262,6 @@ impl BenchConfig {
         options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
-        options.statistics = self.statistics_enabled;
         options.stats = self.stats;
         options.read_admission = if self.read_io_wait_timeout.is_zero() {
             ReadAdmission::Immediate
@@ -391,9 +388,9 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     };
 
     println!("C² cache benchmark");
-    println!("additional_stats={:?}", config.stats);
+    println!("stats={:?}", config.stats);
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} statistics={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} activity_counters={}",
         config.entries,
         index_slots,
         index_load,
@@ -416,7 +413,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.l1_eviction_policy,
         config.io_engine,
         config.io_mode,
-        config.statistics_enabled,
+        config.stats.activity_counters,
     );
     println!("file={}", files.data.display());
 
@@ -443,7 +440,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     cache.drain().await?;
     write.measurement.elapsed += drain_started.elapsed();
     let write_detailed = config
-        .statistics_enabled
+        .stats
+        .activity_counters
         .then(|| cache.detailed_snapshot())
         .transpose()?;
     report(
@@ -543,7 +541,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             &hot_before,
         );
         let scan_start = config
-            .statistics_enabled
+            .stats
+            .activity_counters
             .then(|| cache.snapshot())
             .transpose()?;
         let cold_scan = concurrent_reads(
@@ -606,7 +605,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         cold_scan.measurement
     };
 
-    if config.statistics_enabled {
+    if config.stats.activity_counters {
         let detailed = cache.detailed_snapshot()?;
         let snapshot = detailed.summary;
         emit_cache_report("cache", None, "l2", l2_read.elapsed, &detailed);
@@ -674,7 +673,8 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         )?;
         cache.drain().await?;
         let before = config
-            .statistics_enabled
+            .stats
+            .activity_counters
             .then(|| cache.snapshot())
             .transpose()?;
         let resident = concurrent_reads(

@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.region_size_bytes = 1024 * 1024;
     let storage = storage.build()?;
     let mut runtime = RuntimeOptions::default();
-    runtime.statistics = true;
+    runtime.stats.activity_counters = true;
     runtime.stats.request_counters = true;
     runtime.stats.l1_latency = LatencyMode::Sampled {
         interval: NonZeroU32::new(64).unwrap(),

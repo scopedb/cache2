@@ -444,7 +444,7 @@ struct RunningShared {
     shards: Box<[Arc<ShardControl>]>,
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
-    statistics: bool,
+    activity_counters: bool,
 }
 
 #[derive(Default)]
@@ -761,7 +761,7 @@ impl RegionDataPlane {
         }
         let runtime = config.runtime().clone();
         core.configure_reclaim_workers(IoPoolTopology::reclaim(runtime.io_engine).max_in_flight())?;
-        core.set_index_statistics_enabled(runtime.statistics);
+        core.set_index_activity_counters_enabled(runtime.stats.activity_counters);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count(), runtime.stats)?);
         let operations = Arc::new(MutationGate::new());
         let running = start_running(
@@ -816,12 +816,12 @@ impl RegionDataPlane {
         let shard_id = self.core.append_shard(hash);
         let control = &running.shards[shard_id];
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let operation = match self.operations.try_enter() {
             Some(operation) => operation,
             None => {
-                if running.statistics {
+                if running.activity_counters {
                     running.metrics.record_write_rejection();
                 }
                 return Err(write_overload_error());
@@ -881,12 +881,12 @@ impl RegionDataPlane {
         let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let operation = match self.operations.try_enter() {
             Some(operation) => operation,
             None => {
-                if running.statistics {
+                if running.activity_counters {
                     running.metrics.record_write_rejection();
                 }
                 return Err(write_overload_error());
@@ -894,7 +894,7 @@ impl RegionDataPlane {
         };
         let Some(seqno) = self.core.try_delete_value(hash)? else {
             drop(operation);
-            if running.statistics {
+            if running.activity_counters {
                 running.metrics.record_write_rejection();
             }
             return Err(write_overload_error());
@@ -929,7 +929,7 @@ impl RegionDataPlane {
                 self.finish_get(pending.wait_async(tokio_handle).await, key)
             }
             PreparedGet::Waiting(waiting) => {
-                let wait_started = self.runtime.statistics.then(Instant::now);
+                let wait_started = self.runtime.stats.activity_counters.then(Instant::now);
                 let reserved = waiting.reserve_async(tokio_handle).await;
                 if let Some(wait_started) = wait_started {
                     self.metrics.record_read_wait(wait_started.elapsed());
@@ -944,7 +944,7 @@ impl RegionDataPlane {
     }
 
     fn record_read_wait_error(&self, error: &io::Error) {
-        if !self.runtime.statistics {
+        if !self.runtime.stats.activity_counters {
             return;
         }
         if is_read_pressure(error.kind()) {
@@ -963,7 +963,7 @@ impl RegionDataPlane {
             hash,
         } = reserved;
         let Some(buffer) = self.shared.managed_memory.try_read_buffer(plan.read_len) else {
-            if self.runtime.statistics {
+            if self.runtime.stats.activity_counters {
                 self.metrics.record_read_overload();
             }
             return Err(io::Error::new(
@@ -982,7 +982,7 @@ impl RegionDataPlane {
                 hash,
             })),
             Err(_) if !self.core.is_healthy() => {
-                if self.runtime.statistics {
+                if self.runtime.stats.activity_counters {
                     RuntimeMetrics::increment(&self.metrics.io_failures);
                     RuntimeMetrics::increment(&self.metrics.activity_for_hash(hash).l2_misses);
                 }
@@ -1001,7 +1001,7 @@ impl RegionDataPlane {
         guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
     ) -> io::Result<PreparedGet> {
         if key.len() > MAX_KEY_SIZE {
-            if self.runtime.statistics {
+            if self.runtime.stats.activity_counters {
                 let activity = self.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
@@ -1011,7 +1011,7 @@ impl RegionDataPlane {
         let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         if !self.core.is_healthy() {
             if let Some(activity) = activity {
@@ -1057,7 +1057,7 @@ impl RegionDataPlane {
             Err(error) => {
                 self.core
                     .enter_miss_only_with_error("record_read_plan_invalid", &error);
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 if let Some(activity) = activity {
@@ -1075,7 +1075,7 @@ impl RegionDataPlane {
                 let waiting = running
                     .try_queue_read(hash, plan, read_token, read_io_wait_timeout(&self.runtime))
                     .inspect_err(|_| {
-                        if running.statistics {
+                        if running.activity_counters {
                             running.metrics.record_read_overload();
                         }
                     })?;
@@ -1091,7 +1091,7 @@ impl RegionDataPlane {
             Err(error) => {
                 self.core
                     .enter_miss_only_with_error("read_engine_reservation_failed", &error);
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 if let Some(activity) = activity {
@@ -1102,7 +1102,7 @@ impl RegionDataPlane {
         };
         let Some(buffer) = running.managed_memory.try_read_buffer(plan.read_len) else {
             if !read_io_wait_timeout(&self.runtime).is_zero() {
-                if running.statistics {
+                if running.activity_counters {
                     running.metrics.record_read_overload();
                 }
                 return Err(io::Error::new(
@@ -1139,7 +1139,7 @@ impl RegionDataPlane {
             }
             Err(error) if is_read_pressure(error.kind()) => {
                 if !read_io_wait_timeout(&self.runtime).is_zero() {
-                    if running.statistics {
+                    if running.activity_counters {
                         running.metrics.record_read_overload();
                     }
                     return Err(error);
@@ -1151,7 +1151,7 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) => {
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 Err(error)
@@ -1171,7 +1171,7 @@ impl RegionDataPlane {
             hash,
         } = completed;
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let result = self.core.finish_value_read(read, key);
         match result {
@@ -1217,7 +1217,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) => {
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 Err(error)
@@ -1266,7 +1266,7 @@ impl RegionDataPlane {
     fn snapshot_running(&self, running: &RunningShared) -> CacheSnapshot {
         let mut snapshot = self.metrics.snapshot(
             self.core.is_healthy(),
-            self.runtime.statistics,
+            self.runtime.stats.activity_counters,
             running.managed_memory.snapshot(),
             running.memory.metrics_snapshot(),
         );
@@ -1408,7 +1408,7 @@ fn start_running(
         l1_entry_capacity,
         runtime.l1_shards,
         runtime.l1_eviction_policy,
-        runtime.statistics,
+        runtime.stats.activity_counters,
     )?);
     let reclaim_worker_count = IoPoolTopology::reclaim(runtime.io_engine).max_in_flight();
     let mut reclaim_buffers = Vec::new();
@@ -1488,7 +1488,7 @@ fn start_running(
         shards: shards.into_boxed_slice(),
         write_flush_threshold_bytes: runtime.write_flush_threshold_bytes,
         align_reads_for_direct_io: runtime.io_mode == IoMode::Direct,
-        statistics: runtime.statistics,
+        activity_counters: runtime.stats.activity_counters,
     });
     // Inspect the recovered queue before workers can contend with foreground
     // mutations. Fresh caches have no sealed Regions and need no wakeup.
@@ -1584,7 +1584,7 @@ fn build_engine_pool(
         engines.push(build_file_engine(
             worker_files,
             topology.engine_plan(engine),
-            runtime.statistics,
+            runtime.stats.activity_counters,
             read_wait_enabled,
         )?);
     }
@@ -1601,7 +1601,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("shard worker panicked"),
     };
-    if shared.statistics {
+    if shared.activity_counters {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
     let first_failure = shared
@@ -1677,7 +1677,7 @@ fn reclaim_worker(
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("Region reclaim worker panicked"),
     };
-    if shared.statistics {
+    if shared.activity_counters {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
     shared
@@ -1815,7 +1815,7 @@ fn reclaim_worker_result(
             }
             shared.core.complete_reclaim(receipt)?;
             drop(reinsert_operation);
-            if shared.statistics {
+            if shared.activity_counters {
                 shared.metrics.record_reclaim(stats);
             }
             log::debug!(
@@ -1873,7 +1873,7 @@ fn shard_worker_result(
                 deadline = None;
                 if rotate {
                     let rotated = shared.core.rotate_shard(shard_id)?;
-                    if rotated && shared.statistics {
+                    if rotated && shared.activity_counters {
                         RuntimeMetrics::increment(&shared.metrics.region_rotations);
                     }
                     if rotated {
@@ -1965,7 +1965,7 @@ fn reject_staged_write<Operation>(
 ) -> io::Result<u64> {
     control.notify(flags)?;
     drop(operation);
-    if running.statistics {
+    if running.activity_counters {
         RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
         running.metrics.record_write_rejection();
     }
@@ -2527,7 +2527,10 @@ mod tests {
                 }),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
-                statistics: true,
+                stats: crate::StatsOptions {
+                    activity_counters: true,
+                    ..Default::default()
+                },
                 read_admission: if wait.is_zero() {
                     ReadAdmission::Immediate
                 } else {

@@ -802,7 +802,7 @@ impl MemoryStore {
         entry_capacity: usize,
         shard_count: usize,
         eviction_policy: L1EvictionPolicy,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
     ) -> io::Result<Self> {
         if shard_count == 0 {
             return Err(io::Error::new(
@@ -837,7 +837,7 @@ impl MemoryStore {
         Ok(Self {
             shards: shards.into_boxed_slice(),
             metrics: MemoryMetrics {
-                enabled: statistics_enabled,
+                enabled: activity_counters_enabled,
                 evictions: AtomicU64::new(0),
                 bypasses: AtomicU64::new(0),
             },

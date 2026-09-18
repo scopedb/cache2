@@ -415,7 +415,10 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
             reclaim_workers: 1,
         }),
         l1_capacity_bytes: 0,
-        statistics: true,
+        stats: crate::StatsOptions {
+            activity_counters: true,
+            ..Default::default()
+        },
         read_admission: ReadAdmission::Wait {
             timeout: Duration::from_millis(30),
             max_waiters: Some(1),
@@ -561,7 +564,10 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
         l1_capacity_bytes: 0,
-        statistics: true,
+        stats: crate::StatsOptions {
+            activity_counters: true,
+            ..Default::default()
+        },
         ..RuntimeOptions::default()
     };
     let mut store = RegionStore::open(
