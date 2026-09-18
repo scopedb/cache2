@@ -44,9 +44,8 @@ use std::time::Instant;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 
-use crate::IoEngineOptions;
 #[cfg(unix)]
-use crate::config::runtime::IoUringPoolOptions;
+use crate::config::runtime::IoEnginePlan;
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
@@ -1978,24 +1977,20 @@ impl Drop for RuntimeInner {
 #[cfg(unix)]
 pub fn build_file_engine(
     files: RuntimeFileSet,
-    max_in_flight: usize,
-    posix_workers: usize,
-    kind: IoEngineOptions,
-    io_uring_config: Option<IoUringPoolOptions>,
+    plan: IoEnginePlan,
     statistics_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
-    match kind {
-        IoEngineOptions::Posix(_) => BackendIoEngine::new_with_files_and_workers(
+    match plan {
+        IoEnginePlan::Posix { workers } => BackendIoEngine::new_with_files_and_workers(
             files,
-            max_in_flight,
-            posix_workers,
+            workers,
+            workers,
             statistics_enabled,
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        IoEngineOptions::IoUring(_) => {
-            let _ = posix_workers;
+        IoEnginePlan::IoUring(plan) => {
             #[cfg(all(
                 feature = "io-uring",
                 target_os = "linux",
@@ -2008,16 +2003,9 @@ pub fn build_file_engine(
                 )
             ))]
             {
-                let io_uring_config = io_uring_config.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "io_uring pool configuration is missing",
-                    )
-                })?;
                 uring::UringIoEngine::new_with_files(
                     files,
-                    max_in_flight,
-                    io_uring_config,
+                    plan,
                     statistics_enabled,
                     read_wait_enabled,
                 )
@@ -2036,7 +2024,7 @@ pub fn build_file_engine(
             )))]
             {
                 let _ = files;
-                let _ = io_uring_config;
+                let _ = plan;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "io_uring is unavailable on this build or platform",

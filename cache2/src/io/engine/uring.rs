@@ -42,7 +42,7 @@ use io_uring::opcode;
 use io_uring::squeue;
 use io_uring::types;
 
-use crate::config::runtime::IoUringPoolOptions;
+use crate::config::runtime::IoUringEnginePlan;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStatsHandle;
@@ -129,11 +129,11 @@ pub struct UringIoEngine {
 impl UringIoEngine {
     pub fn new_with_files(
         files: RuntimeFileSet,
-        max_in_flight: usize,
-        config: IoUringPoolOptions,
+        plan: IoUringEnginePlan,
         statistics_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
+        let max_in_flight = plan.max_in_flight;
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
         files.set_statistics_enabled(statistics_enabled);
         let io_stats = files.stats_handle();
@@ -154,10 +154,10 @@ impl UringIoEngine {
         })?;
         let mut builder = IoUring::builder();
         builder.setup_cqsize(completion_entries).dontfork();
-        if config.io_poll {
+        if plan.io_poll {
             builder.setup_iopoll();
         }
-        if let Some(sq_poll) = config.sq_poll {
+        if let Some(sq_poll) = plan.sq_poll {
             builder.setup_sqpoll(sq_poll.idle_millis);
             if let Some(cpu) = sq_poll.cpu {
                 builder.setup_sqpoll_cpu(cpu);
@@ -170,7 +170,7 @@ impl UringIoEngine {
                 "kernel io_uring can drop completion entries",
             ));
         }
-        if config.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
+        if plan.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "kernel io_uring SQPOLL requires registered files",

@@ -198,59 +198,103 @@ impl IoEngineOptions {
     }
 }
 
+// Pool topology owns aggregate bounds; engine plans contain only one instance's
+// execution parameters. Both accounting and construction derive from this shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoPoolTopology {
-    pub engine_count: usize,
-    pub max_in_flight: usize,
-    pub worker_threads: usize,
-    pub io_uring: Option<IoUringPoolOptions>,
+pub enum IoPoolTopology {
+    Posix { workers: usize },
+    IoUring(IoUringPoolOptions),
 }
 
 impl IoPoolTopology {
-    pub const fn read(engine: IoEngineOptions) -> Self {
-        match engine {
-            IoEngineOptions::Posix(config) => Self::posix(config.read_workers),
-            IoEngineOptions::IoUring(config) => Self::io_uring(config.read),
+    pub const fn read(options: IoEngineOptions) -> Self {
+        match options {
+            IoEngineOptions::Posix(options) => Self::Posix {
+                workers: options.read_workers,
+            },
+            IoEngineOptions::IoUring(options) => Self::IoUring(options.read),
         }
     }
 
-    pub const fn write(engine: IoEngineOptions) -> Self {
-        match engine {
-            IoEngineOptions::Posix(config) => Self::posix(config.write_workers),
-            IoEngineOptions::IoUring(config) => Self::io_uring(config.write),
+    pub const fn write(options: IoEngineOptions) -> Self {
+        match options {
+            IoEngineOptions::Posix(options) => Self::Posix {
+                workers: options.write_workers,
+            },
+            IoEngineOptions::IoUring(options) => Self::IoUring(options.write),
         }
     }
 
-    pub const fn reclaim(engine: IoEngineOptions) -> Self {
-        match engine {
-            IoEngineOptions::Posix(config) => Self::posix(config.reclaim_workers),
-            IoEngineOptions::IoUring(config) => Self::io_uring(config.reclaim),
+    pub const fn reclaim(options: IoEngineOptions) -> Self {
+        match options {
+            IoEngineOptions::Posix(options) => Self::Posix {
+                workers: options.reclaim_workers,
+            },
+            IoEngineOptions::IoUring(options) => Self::IoUring(options.reclaim),
         }
     }
 
-    const fn posix(workers: usize) -> Self {
-        Self {
-            engine_count: 1,
-            max_in_flight: workers,
-            worker_threads: workers,
-            io_uring: None,
+    pub const fn engine_count(self) -> usize {
+        match self {
+            Self::Posix { .. } => 1,
+            Self::IoUring(options) => options.rings,
         }
     }
 
-    const fn io_uring(config: IoUringPoolOptions) -> Self {
-        Self {
-            engine_count: config.rings,
-            max_in_flight: config.max_in_flight,
-            worker_threads: config.rings,
-            io_uring: Some(config),
+    pub const fn max_in_flight(self) -> usize {
+        match self {
+            Self::Posix { workers } => workers,
+            Self::IoUring(options) => options.max_in_flight,
         }
     }
 
-    pub const fn depth_for_engine(self, engine: usize) -> usize {
-        let base = self.max_in_flight / self.engine_count;
-        let remainder = self.max_in_flight % self.engine_count;
-        base + if engine < remainder { 1 } else { 0 }
+    pub const fn worker_threads(self) -> usize {
+        match self {
+            Self::Posix { workers } => workers,
+            Self::IoUring(options) => options.rings,
+        }
     }
+
+    pub fn extra_memory_bytes(self) -> Option<usize> {
+        match self {
+            Self::Posix { .. } => Some(0),
+            Self::IoUring(options) => {
+                io_uring_extra_memory_bytes(options.max_in_flight, options.rings)
+            }
+        }
+    }
+
+    pub const fn engine_plan(self, engine: usize) -> IoEnginePlan {
+        assert!(
+            engine < self.engine_count(),
+            "engine index exceeds pool topology"
+        );
+        match self {
+            Self::Posix { workers } => IoEnginePlan::Posix { workers },
+            Self::IoUring(options) => {
+                let base = options.max_in_flight / options.rings;
+                let remainder = options.max_in_flight % options.rings;
+                IoEnginePlan::IoUring(IoUringEnginePlan {
+                    max_in_flight: base + if engine < remainder { 1 } else { 0 },
+                    sq_poll: options.sq_poll,
+                    io_poll: options.io_poll,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoEnginePlan {
+    Posix { workers: usize },
+    IoUring(IoUringEnginePlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringEnginePlan {
+    pub max_in_flight: usize,
+    pub sq_poll: Option<IoUringSqPollOptions>,
+    pub io_poll: bool,
 }
 
 /// Buffered/direct policy for runtime cache-record I/O.
@@ -383,7 +427,7 @@ pub const fn read_io_wait_capacity(config: &RuntimeOptions) -> usize {
         ReadAdmission::Immediate => 0,
         ReadAdmission::Wait { max_waiters, .. } => match max_waiters {
             Some(capacity) => capacity,
-            None => IoPoolTopology::read(config.io_engine).max_in_flight,
+            None => IoPoolTopology::read(config.io_engine).max_in_flight(),
         },
     }
 }
@@ -537,7 +581,7 @@ impl RuntimeOptions {
                 }
             }
         }
-        if reclaim_topology.max_in_flight > self.append_shards as usize {
+        if reclaim_topology.max_in_flight() > self.append_shards as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "reclaim I/O concurrency must be no greater than append shards",
@@ -553,7 +597,7 @@ impl RuntimeOptions {
                     "read wait timeout must be greater than zero and at most five seconds",
                 ));
             }
-            let capacity = max_waiters.unwrap_or(read_topology.max_in_flight);
+            let capacity = max_waiters.unwrap_or(read_topology.max_in_flight());
             if !(1..=MAX_CONFIG_COUNT).contains(&capacity) {
                 return Err(invalid_runtime_config(
                     "maximum read waiters must be in 1..=65536",
@@ -640,7 +684,7 @@ impl RuntimeOptions {
             .and_then(|bytes| bytes.checked_add(topology_bytes))
             .ok_or_else(|| invalid_runtime_config("reserved memory requirements overflow"))?;
         let reclaim_buffers = usable_region
-            .checked_mul(IoPoolTopology::reclaim(self.io_engine).max_in_flight)
+            .checked_mul(IoPoolTopology::reclaim(self.io_engine).max_in_flight())
             .ok_or_else(|| invalid_runtime_config("reclaim buffer memory requirements overflow"))?;
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
@@ -661,37 +705,33 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
     let write = IoPoolTopology::write(config.io_engine);
     let reclaim = IoPoolTopology::reclaim(config.io_engine);
     let engine_count = read
-        .engine_count
-        .checked_add(write.engine_count)?
-        .checked_add(reclaim.engine_count)?;
+        .engine_count()
+        .checked_add(write.engine_count())?
+        .checked_add(reclaim.engine_count())?;
     let stack_count = read
-        .worker_threads
-        .checked_add(write.worker_threads)?
-        .checked_add(reclaim.worker_threads)?
+        .worker_threads()
+        .checked_add(write.worker_threads())?
+        .checked_add(reclaim.worker_threads())?
         .checked_add(engine_count)?
         .checked_add(shard_count)?
-        .checked_add(reclaim.max_in_flight)?;
+        .checked_add(reclaim.max_in_flight())?;
     let stacks = stack_count.checked_mul(CACHE_THREAD_STACK_BYTES)?;
     let read_wait_queue = read_io_wait_capacity(config);
     let queue = write
-        .max_in_flight
-        .checked_add(read.max_in_flight)?
+        .max_in_flight()
+        .checked_add(read.max_in_flight())?
         .checked_add(read_wait_queue)?
-        .checked_add(reclaim.max_in_flight)?
+        .checked_add(reclaim.max_in_flight())?
         .checked_mul(IO_QUEUE_ENTRY_RESERVATION_BYTES)?;
     let uring = [read, write, reclaim]
         .into_iter()
-        .filter(|pool| pool.io_uring.is_some())
         .try_fold(0_usize, |bytes, pool| {
-            bytes.checked_add(io_uring_extra_memory_bytes(
-                pool.max_in_flight,
-                pool.engine_count,
-            )?)
+            bytes.checked_add(pool.extra_memory_bytes()?)
         })?;
     let controls = engine_count
         .checked_add(shard_count)?
         .checked_add(config.l1_shards)?
-        .checked_add(reclaim.max_in_flight)?
+        .checked_add(reclaim.max_in_flight())?
         .checked_mul(RUNTIME_CONTROL_RESERVATION_BYTES)?;
     let metrics = shard_count.checked_mul(size_of::<ActivityMetrics>())?;
     stacks
@@ -702,7 +742,7 @@ fn runtime_topology_memory_bytes(config: &RuntimeOptions) -> Option<usize> {
 }
 
 fn validate_posix_pool(name: &str, topology: IoPoolTopology) -> io::Result<()> {
-    if !(1..=MAX_IO_REQUESTS_PER_ENGINE).contains(&topology.max_in_flight) {
+    if !(1..=MAX_IO_REQUESTS_PER_ENGINE).contains(&topology.max_in_flight()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("POSIX {name} worker count must be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"),
@@ -842,12 +882,7 @@ mod tests {
         });
         assert_eq!(
             IoPoolTopology::read(posix),
-            IoPoolTopology {
-                engine_count: 1,
-                max_in_flight: 7,
-                worker_threads: 7,
-                io_uring: None,
-            }
+            IoPoolTopology::Posix { workers: 7 }
         );
 
         let io_uring = IoEngineOptions::IoUring(IoUringOptions {
@@ -868,12 +903,17 @@ mod tests {
             },
         });
         let read = IoPoolTopology::read(io_uring);
-        assert_eq!(read.engine_count, 3);
-        assert_eq!(read.max_in_flight, 8);
-        assert_eq!(read.worker_threads, 3);
-        assert_eq!(read.depth_for_engine(0), 3);
-        assert_eq!(read.depth_for_engine(1), 3);
-        assert_eq!(read.depth_for_engine(2), 2);
+        assert_eq!(read.engine_count(), 3);
+        assert_eq!(read.max_in_flight(), 8);
+        assert_eq!(read.worker_threads(), 3);
+        let depths: Vec<_> = (0..read.engine_count())
+            .map(|engine| match read.engine_plan(engine) {
+                IoEnginePlan::IoUring(plan) => plan.max_in_flight,
+                IoEnginePlan::Posix { .. } => panic!("expected an io_uring engine"),
+            })
+            .collect();
+        assert_eq!(depths, [3, 3, 2]);
+        assert_eq!(depths.iter().sum::<usize>(), read.max_in_flight());
     }
 
     #[test]

@@ -40,7 +40,6 @@ use asyncband::semaphore::Semaphore;
 use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
-use crate::IoEngineOptions;
 use crate::config::CacheConfig;
 use crate::config::l1_entry_capacity;
 use crate::config::reserved_memory_bytes;
@@ -761,7 +760,7 @@ impl RegionDataPlane {
             ));
         }
         let config = configuration.runtime().clone();
-        core.configure_reclaim_workers(IoPoolTopology::reclaim(config.io_engine).max_in_flight)?;
+        core.configure_reclaim_workers(IoPoolTopology::reclaim(config.io_engine).max_in_flight())?;
         core.set_index_statistics_enabled(config.statistics);
         let metrics = Arc::new(RuntimeMetrics::new(core.shard_count(), config.stats)?);
         let operations = Arc::new(MutationGate::new());
@@ -1411,7 +1410,7 @@ fn start_running(
         config.l1_eviction_policy,
         config.statistics,
     )?);
-    let reclaim_worker_count = IoPoolTopology::reclaim(config.io_engine).max_in_flight;
+    let reclaim_worker_count = IoPoolTopology::reclaim(config.io_engine).max_in_flight();
     let mut reclaim_buffers = Vec::new();
     reclaim_buffers
         .try_reserve_exact(reclaim_worker_count)
@@ -1567,16 +1566,11 @@ fn build_engine_pool(
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
-    let engine_count = topology.engine_count;
+    let engine_count = topology.engine_count();
     let mut engines = Vec::new();
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if matches!(config.io_engine, IoEngineOptions::Posix(_)) {
-        topology.max_in_flight
-    } else {
-        1
-    };
     for engine in 0..engine_count {
         let worker_files = if engine + 1 == engine_count {
             source.take().expect("last I/O worker owns file set")
@@ -1585,10 +1579,7 @@ fn build_engine_pool(
         };
         engines.push(build_file_engine(
             worker_files,
-            topology.depth_for_engine(engine),
-            posix_workers,
-            config.io_engine,
-            topology.io_uring,
+            topology.engine_plan(engine),
             config.statistics,
             read_wait_enabled,
         )?);
