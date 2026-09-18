@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "hashcrew"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd3730de410a9d5f2ca41072653e79059e2c6fd9cd87300de4becacb1a93154"
+checksum = "f73782af6df9e45939f4e6206b646f3cbab68c2cc5c0c375dab045800cafb018"
 
 [[package]]
 name = "heck"

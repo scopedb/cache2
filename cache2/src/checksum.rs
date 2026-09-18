@@ -18,9 +18,8 @@
 //! retains a portable software fallback. This wrapper keeps the cache's codec
 //! API and checksum values independent of that implementation detail.
 
-use crc_fast::CrcAlgorithm;
-use crc_fast::Digest;
-use crc_fast::crc32_iscsi;
+use hashcrew::crc::Crc32Iscsi;
+use hashcrew::crc::crc32_iscsi;
 
 /// Computes the standard CRC32C checksum of `bytes`.
 pub fn crc32c(bytes: &[u8]) -> u32 {
@@ -30,13 +29,13 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// Incremental CRC32C state, useful for checksum a key and value without first joining them in a
 /// temporary allocation.
 pub struct Crc32c {
-    digest: Digest,
+    digest: Crc32Iscsi,
 }
 
 impl Crc32c {
     pub fn new() -> Self {
         Self {
-            digest: Digest::new(CrcAlgorithm::Crc32Iscsi),
+            digest: Crc32Iscsi::new(),
         }
     }
 
@@ -45,7 +44,7 @@ impl Crc32c {
     }
 
     pub fn finish(self) -> u32 {
-        self.digest.finalize() as u32
+        self.digest.digest()
     }
 }
 
@@ -57,11 +56,43 @@ impl Default for Crc32c {
 
 #[cfg(test)]
 mod tests {
+    use crate::checksum::Crc32c;
     use crate::checksum::crc32c;
 
     #[test]
     fn matches_the_crc32c_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn fragmented_checksums_match_the_previous_implementation() {
+        let bytes: Vec<_> = (0..65_544).map(|index| (index * 37) as u8).collect();
+        for offset in [0, 1, 7] {
+            for len in [0, 1, 44, 48, 4092, 4096, 65_537] {
+                let input = &bytes[offset..offset + len];
+                let expected = crc_fast::crc32_iscsi(input);
+                assert_eq!(crc32c(input), expected);
+                for split in [0, len.min(44), len.min(56), len / 2, len] {
+                    let mut checksum = Crc32c::new();
+                    checksum.update(&input[..split]);
+                    checksum.update(&[]);
+                    checksum.update(&input[split..]);
+                    assert_eq!(checksum.finish(), expected, "len={len}, split={split}");
+                }
+            }
+        }
+
+        // Record headers, index pages, and recovery pages zero their checksum
+        // field without concatenating the surrounding slices.
+        for (len, checksum_offset) in [(48, 44), (4096, 56), (4096, 4092)] {
+            let mut page = bytes[..len].to_vec();
+            page[checksum_offset..checksum_offset + 4].fill(0);
+            let mut checksum = Crc32c::new();
+            checksum.update(&page[..checksum_offset]);
+            checksum.update(&[0; 4]);
+            checksum.update(&page[checksum_offset + 4..]);
+            assert_eq!(checksum.finish(), crc_fast::crc32_iscsi(&page));
+        }
     }
 }

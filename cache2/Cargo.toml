@@ -32,12 +32,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 asyncband = { workspace = true }
-crc-fast = { workspace = true }
 hashcrew = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+crc-fast = { workspace = true }
 quickcheck = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
