@@ -138,10 +138,10 @@ pub struct RegionReclaimReceipt {
 ///
 /// A caller may retain this value while it drops manager authority. It must
 /// hold the process-wide rotation gate until
-/// [`RegionManager::begin_rotation`] consumes the plan.
+/// [`RegionManager::begin_rotation`] consumes the candidate.
 /// `victim_created_seqno` identifies the generation being replaced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RegionRotationPlan {
+pub struct RegionRotationCandidate {
     pub shard_id: usize,
     victim_region_id: u32,
     victim_created_seqno: u64,
@@ -149,7 +149,7 @@ pub struct RegionRotationPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegionRotationSelection {
-    plan: RegionRotationPlan,
+    candidate: RegionRotationCandidate,
     old_index: usize,
     victim_index: usize,
 }
@@ -800,11 +800,11 @@ impl RegionManager {
     ///
     /// [`Self::begin_rotation`] validates the same FIFO selection again before
     /// it mutates any state.
-    pub fn plan_rotation(
+    pub fn rotation_candidate(
         &self,
         shard_id: usize,
-    ) -> Result<RegionRotationPlan, RegionMutationError> {
-        Ok(self.select_rotation(shard_id)?.plan)
+    ) -> Result<RegionRotationCandidate, RegionMutationError> {
+        Ok(self.select_rotation(shard_id)?.candidate)
     }
 
     #[cfg(test)]
@@ -820,19 +820,19 @@ impl RegionManager {
         Ok(())
     }
 
-    /// Starts one previously planned FIFO rotation without performing I/O.
+    /// Starts one previously selected FIFO rotation without performing I/O.
     /// Only a Region already cleaned into the Free queue may be activated. The
     /// outgoing Active Region is withheld from the FIFO until
     /// [`Self::finish_rotation`] commits the in-memory rotation.
     ///
-    /// This remains the only rotation mutation authority. A stale plan is
+    /// This remains the only rotation mutation authority. A stale candidate is
     /// rejected before a sequence number or queue entry is consumed.
     pub fn begin_rotation(
         &mut self,
-        plan: RegionRotationPlan,
+        candidate: RegionRotationCandidate,
     ) -> Result<RegionRotationReceipt, RegionMutationError> {
-        let selection = self.select_rotation(plan.shard_id)?;
-        if selection.plan != plan {
+        let selection = self.select_rotation(candidate.shard_id)?;
+        if selection.candidate != candidate {
             return Err(RegionMutationError::StaleReceipt);
         }
         let RegionRotationSelection {
@@ -840,8 +840,8 @@ impl RegionManager {
             victim_index,
             ..
         } = selection;
-        let shard_id = plan.shard_id;
-        let victim_region_id = plan.victim_region_id;
+        let shard_id = candidate.shard_id;
+        let victim_region_id = candidate.victim_region_id;
         let created_seqno = self.allocate_seqno()?;
         let removed = self.free_regions.pop_front();
         if removed != Some(victim_region_id) {
@@ -925,7 +925,7 @@ impl RegionManager {
             ));
         }
         Ok(RegionRotationSelection {
-            plan: RegionRotationPlan {
+            candidate: RegionRotationCandidate {
                 shard_id,
                 victim_region_id,
                 victim_created_seqno: victim.created_seqno,
@@ -1586,16 +1586,16 @@ mod tests {
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
 
         request_rotation(&mut manager, 0);
-        let plan = manager.plan_rotation(0).unwrap();
+        let candidate = manager.rotation_candidate(0).unwrap();
         assert_eq!(
-            plan,
-            RegionRotationPlan {
+            candidate,
+            RegionRotationCandidate {
                 shard_id: 0,
                 victim_region_id: 5,
                 victim_created_seqno: 0,
             }
         );
-        let rotation = manager.begin_rotation(plan).unwrap();
+        let rotation = manager.begin_rotation(candidate).unwrap();
         assert_eq!(rotation.sealed_region_id, 3);
         assert_eq!(rotation.activated_region_id, 5);
         assert_eq!(rotation.activated_created_seqno, 8);
@@ -1619,7 +1619,7 @@ mod tests {
 
         manager.finish_rotation(rotation).unwrap();
         assert_eq!(
-            manager.plan_rotation(0),
+            manager.rotation_candidate(0),
             Err(RegionMutationError::WouldBlock),
             "a delayed duplicate wake must not rotate the new empty Region"
         );
@@ -1641,22 +1641,22 @@ mod tests {
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
         request_rotation(&mut manager, 0);
         assert_eq!(
-            manager.plan_rotation(0),
+            manager.rotation_candidate(0),
             Err(RegionMutationError::WouldBlock)
         );
         let reclaim = manager.begin_reclaim().unwrap().unwrap();
         assert_eq!(reclaim.region_id, 4);
         manager.finish_reclaim(reclaim).unwrap();
-        let plan = manager.plan_rotation(0).unwrap();
+        let candidate = manager.rotation_candidate(0).unwrap();
         assert_eq!(
-            plan,
-            RegionRotationPlan {
+            candidate,
+            RegionRotationCandidate {
                 shard_id: 0,
                 victim_region_id: 4,
                 victim_created_seqno: 0,
             }
         );
-        let rotation = manager.begin_rotation(plan).unwrap();
+        let rotation = manager.begin_rotation(candidate).unwrap();
         assert_eq!(rotation.activated_region_id, 4);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.regions[4].physical_record_count, 0);
@@ -1725,7 +1725,7 @@ mod tests {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         request_rotation(&mut manager, 0);
         let rotation = manager
-            .begin_rotation(manager.plan_rotation(0).unwrap())
+            .begin_rotation(manager.rotation_candidate(0).unwrap())
             .unwrap();
         manager.finish_rotation(rotation).unwrap();
 
@@ -1748,14 +1748,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_rotation_plan_does_not_consume_the_next_victim_or_seqno() {
+    fn stale_rotation_candidate_does_not_consume_the_next_victim_or_seqno() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         request_rotation(&mut manager, 0);
-        let stale = manager.plan_rotation(0).unwrap();
+        let stale = manager.rotation_candidate(0).unwrap();
 
         request_rotation(&mut manager, 1);
-        let other_plan = manager.plan_rotation(1).unwrap();
-        let other_rotation = manager.begin_rotation(other_plan).unwrap();
+        let other_candidate = manager.rotation_candidate(1).unwrap();
+        let other_rotation = manager.begin_rotation(other_candidate).unwrap();
         manager.finish_rotation(other_rotation).unwrap();
         let next_seqno = manager.next_seqno();
         let active = manager.active_regions().to_vec();
@@ -1770,11 +1770,11 @@ mod tests {
         assert_eq!(manager.active_regions(), active);
         assert_eq!(manager.free_regions(), &free);
         assert_eq!(manager.sealed_regions(), &sealed);
-        assert_eq!(manager.plan_rotation(0).unwrap().victim_region_id, 1);
+        assert_eq!(manager.rotation_candidate(0).unwrap().victim_region_id, 1);
     }
 
     #[test]
-    fn rotation_plan_rejects_a_victim_queue_state_mismatch() {
+    fn rotation_candidate_rejects_a_victim_queue_state_mismatch() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         let next_seqno = manager.next_seqno();
         let active = manager.active_regions().to_vec();
@@ -1784,7 +1784,7 @@ mod tests {
         manager.free_regions[0] = 4;
         request_rotation(&mut manager, 0);
         assert_eq!(
-            manager.plan_rotation(0),
+            manager.rotation_candidate(0),
             Err(RegionMutationError::Invariant(
                 "rotation victim queue is inconsistent"
             ))
@@ -1803,13 +1803,13 @@ mod tests {
         let span = manager.seal_write_span_with_padding(padding).unwrap();
         request_rotation(&mut manager, 0);
         assert_eq!(
-            manager.plan_rotation(0),
+            manager.rotation_candidate(0),
             Err(RegionMutationError::WouldBlock)
         );
         manager.complete_write_span(span).unwrap();
 
-        let plan = manager.plan_rotation(0).unwrap();
-        let rotation = manager.begin_rotation(plan).unwrap();
+        let candidate = manager.rotation_candidate(0).unwrap();
+        let rotation = manager.begin_rotation(candidate).unwrap();
         manager.finish_rotation(rotation).unwrap();
         let activated = manager.regions[rotation.activated_region_id as usize];
         assert_eq!(

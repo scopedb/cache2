@@ -226,9 +226,9 @@ impl EvictionState {
         }
     }
 
-    /// Detaches a resident only from policy metadata while an admission plan
-    /// is assembled. The memory directory and value remain intact so a failed
-    /// plan can restore the entry without losing a cache hit.
+    /// Detaches a resident only from policy metadata while admission gathers
+    /// victims. The memory directory and value remain intact so a failed
+    /// admission can restore the entry without losing a cache hit.
     pub fn detach_for_admission(
         &mut self,
         slots: &mut [PolicySlot],

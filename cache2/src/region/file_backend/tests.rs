@@ -55,8 +55,8 @@ use crate::region::index::storage::IndexSlotState;
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
-use crate::region::reader::ReadPlan;
-use crate::region::reader::plan_read;
+use crate::region::reader::ReadDescriptor;
+use crate::region::reader::describe_read;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::record::codec::hash_key;
 use crate::region::record::codec::required_record_bytes;
@@ -968,13 +968,13 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     assert!(last_entry.location.index_equivalent(last_exact));
     let read = runtime
         .begin_point_read(first_hash)
-        .expect("completed entry must plan a Region read");
+        .expect("completed entry must yield a Region read candidate");
     assert_eq!(read.entry, entry);
 
     let last_read = runtime
         .begin_point_read(last_hash)
-        .expect("completed final entry must plan a Region read");
-    let read_buffer_bytes = plan_read(data.geometry, last_hash, last_read, true)
+        .expect("completed final entry must yield a Region read candidate");
+    let read_buffer_bytes = describe_read(data.geometry, last_hash, last_read, true)
         .unwrap()
         .read_len;
     let memory_before_read = managed_memory.snapshot().current_bytes;
@@ -1022,7 +1022,7 @@ fn read_availability_errors_do_not_latch_miss_only() {
         io::ErrorKind::BrokenPipe,
     ] {
         let completion = ReadCompletion {
-            plan: ReadPlan {
+            descriptor: ReadDescriptor {
                 hash: 7,
                 entry,
                 region_generation: 1,
@@ -1094,17 +1094,17 @@ fn same_hash_candidate_requires_full_key() {
     let entry = runtime
         .begin_point_read(owner_hash)
         .expect("hash lookup must return the collision candidate");
-    let plan = plan_read(data.geometry, owner_hash, entry, true).unwrap();
+    let descriptor = describe_read(data.geometry, owner_hash, entry, true).unwrap();
 
     // Supplying a different key after the hash lookup precisely models a
     // 64-bit collision at the L2 record-validation boundary.
     assert!(
         runtime
-            .read_value_from_plan(
+            .read_value_from_descriptor(
                 &engine,
                 engine.try_reserve_read().unwrap(),
                 read_buffer,
-                plan,
+                descriptor,
                 foreign_key,
             )
             .unwrap()
@@ -1120,14 +1120,15 @@ fn same_hash_candidate_requires_full_key() {
         region_generation: current.region_generation + 1,
         ..current
     };
-    let stale_plan = plan_read(data.geometry, owner_hash, stale_generation, true).unwrap();
+    let stale_descriptor =
+        describe_read(data.geometry, owner_hash, stale_generation, true).unwrap();
     assert!(
         runtime
-            .read_value_from_plan(
+            .read_value_from_descriptor(
                 &engine,
                 engine.try_reserve_read().unwrap(),
                 managed_memory.try_read_buffer(read_buffer_bytes).unwrap(),
-                stale_plan,
+                stale_descriptor,
                 owner_key,
             )
             .unwrap()
@@ -1146,17 +1147,18 @@ fn same_hash_candidate_requires_full_key() {
         },
         ..current
     };
-    let wrong_length_plan = plan_read(data.geometry, owner_hash, wrong_length, true).unwrap();
-    let wrong_length_read_bytes = wrong_length_plan.read_len;
+    let wrong_length_descriptor =
+        describe_read(data.geometry, owner_hash, wrong_length, true).unwrap();
+    let wrong_length_read_bytes = wrong_length_descriptor.read_len;
     assert!(
         runtime
-            .read_value_from_plan(
+            .read_value_from_descriptor(
                 &engine,
                 engine.try_reserve_read().unwrap(),
                 managed_memory
                     .try_read_buffer(wrong_length_read_bytes)
                     .unwrap(),
-                wrong_length_plan,
+                wrong_length_descriptor,
                 owner_key,
             )
             .unwrap()
@@ -1323,7 +1325,7 @@ fn publish_custom_clean_image(
     backend.acquire_exclusive().unwrap();
     assert!(matches!(
         backend.inspect_recovery(index_slots).unwrap(),
-        RecoveryPlan::Fresh
+        RecoveryInspection::Fresh
     ));
     let runtime = FileRegionRuntime::install(
         PartitionedIndexStorage::anonymous(index_slots).unwrap(),

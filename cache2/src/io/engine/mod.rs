@@ -45,7 +45,7 @@ use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 
 #[cfg(unix)]
-use crate::config::runtime::IoEnginePlan;
+use crate::config::runtime::IoEngineConfig;
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
@@ -1977,12 +1977,12 @@ impl Drop for RuntimeInner {
 #[cfg(unix)]
 pub fn build_file_engine(
     files: RuntimeFileSet,
-    plan: IoEnginePlan,
+    config: IoEngineConfig,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
-    match plan {
-        IoEnginePlan::Posix { workers } => BackendIoEngine::new_with_files_and_workers(
+    match config {
+        IoEngineConfig::Posix { workers } => BackendIoEngine::new_with_files_and_workers(
             files,
             workers,
             workers,
@@ -1990,7 +1990,7 @@ pub fn build_file_engine(
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        IoEnginePlan::IoUring(plan) => {
+        IoEngineConfig::IoUring(config) => {
             #[cfg(all(
                 feature = "io-uring",
                 target_os = "linux",
@@ -2005,7 +2005,7 @@ pub fn build_file_engine(
             {
                 uring::UringIoEngine::new_with_files(
                     files,
-                    plan,
+                    config,
                     activity_counters_enabled,
                     read_wait_enabled,
                 )
@@ -2024,7 +2024,7 @@ pub fn build_file_engine(
             )))]
             {
                 let _ = files;
-                let _ = plan;
+                let _ = config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "io_uring is unavailable on this build or platform",

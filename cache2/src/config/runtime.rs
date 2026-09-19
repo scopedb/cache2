@@ -198,7 +198,7 @@ impl IoEngineOptions {
     }
 }
 
-// Pool topology owns aggregate bounds; engine plans contain only one instance's
+// Pool topology owns aggregate bounds; each engine config contains one instance's
 // execution parameters. Both accounting and construction derive from this shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoPoolTopology {
@@ -264,17 +264,17 @@ impl IoPoolTopology {
         }
     }
 
-    pub const fn engine_plan(self, engine: usize) -> IoEnginePlan {
+    pub const fn engine_config(self, engine: usize) -> IoEngineConfig {
         assert!(
             engine < self.engine_count(),
             "engine index exceeds pool topology"
         );
         match self {
-            Self::Posix { workers } => IoEnginePlan::Posix { workers },
+            Self::Posix { workers } => IoEngineConfig::Posix { workers },
             Self::IoUring(options) => {
                 let base = options.max_in_flight / options.rings;
                 let remainder = options.max_in_flight % options.rings;
-                IoEnginePlan::IoUring(IoUringEnginePlan {
+                IoEngineConfig::IoUring(IoUringEngineConfig {
                     max_in_flight: base + if engine < remainder { 1 } else { 0 },
                     sq_poll: options.sq_poll,
                     io_poll: options.io_poll,
@@ -285,13 +285,13 @@ impl IoPoolTopology {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IoEnginePlan {
+pub enum IoEngineConfig {
     Posix { workers: usize },
-    IoUring(IoUringEnginePlan),
+    IoUring(IoUringEngineConfig),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoUringEnginePlan {
+pub struct IoUringEngineConfig {
     pub max_in_flight: usize,
     pub sq_poll: Option<IoUringSqPollOptions>,
     pub io_poll: bool,
@@ -903,9 +903,9 @@ mod tests {
         assert_eq!(read.max_in_flight(), 8);
         assert_eq!(read.worker_threads(), 3);
         let depths: Vec<_> = (0..read.engine_count())
-            .map(|engine| match read.engine_plan(engine) {
-                IoEnginePlan::IoUring(plan) => plan.max_in_flight,
-                IoEnginePlan::Posix { .. } => panic!("expected an io_uring engine"),
+            .map(|engine| match read.engine_config(engine) {
+                IoEngineConfig::IoUring(config) => config.max_in_flight,
+                IoEngineConfig::Posix { .. } => panic!("expected an io_uring engine"),
             })
             .collect();
         assert_eq!(depths, [3, 3, 2]);

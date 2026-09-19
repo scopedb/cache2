@@ -89,7 +89,7 @@ pub struct RegionIndexTurnoverCheckpoint {
 
 #[derive(Debug)]
 pub struct RegionIndexTurnoverReport {
-    pub config: RegionIndexTurnoverOptions,
+    pub options: RegionIndexTurnoverOptions,
     pub physical_entries: usize,
     pub key_space_entries: usize,
     pub index_slots: usize,
@@ -100,10 +100,10 @@ pub struct RegionIndexTurnoverReport {
 }
 
 pub fn run_region_index_turnover(
-    config: RegionIndexTurnoverOptions,
+    options: RegionIndexTurnoverOptions,
 ) -> io::Result<RegionIndexTurnoverReport> {
-    let plan = TurnoverPlan::new(config)?;
-    let mut workload = TurnoverWorkload::new(plan)?;
+    let config = TurnoverConfig::new(options)?;
+    let mut workload = TurnoverWorkload::new(config)?;
     let mut checkpoints = Vec::new();
     checkpoints.try_reserve_exact(6).map_err(|_| {
         io::Error::new(
@@ -114,9 +114,9 @@ pub fn run_region_index_turnover(
 
     let initial_fill = workload.write_turn()?;
     checkpoints.push(workload.checkpoint(0, initial_fill)?);
-    for turn in 1..=config.turns {
+    for turn in 1..=options.turns {
         let publish = workload.write_turn()?;
-        if is_checkpoint(turn, config.turns) {
+        if is_checkpoint(turn, options.turns) {
             checkpoints.push(workload.checkpoint(turn, publish)?);
         }
     }
@@ -138,10 +138,10 @@ pub fn run_region_index_turnover(
         .max()
         .ok_or_else(|| io::Error::other("turnover index has no partitions"))?;
     Ok(RegionIndexTurnoverReport {
-        config,
-        physical_entries: plan.physical_entries,
-        key_space_entries: plan.key_space_entries,
-        index_slots: plan.index_slots,
+        options,
+        physical_entries: config.physical_entries,
+        key_space_entries: config.key_space_entries,
+        index_slots: config.index_slots,
         partition_count: workload.index.storage().partition_count(),
         minimum_partition_slots,
         maximum_partition_slots,
@@ -150,31 +150,31 @@ pub fn run_region_index_turnover(
 }
 
 #[derive(Clone, Copy)]
-struct TurnoverPlan {
-    config: RegionIndexTurnoverOptions,
+struct TurnoverConfig {
+    options: RegionIndexTurnoverOptions,
     physical_entries: usize,
     key_space_entries: usize,
     index_slots: usize,
 }
 
-impl TurnoverPlan {
-    fn new(config: RegionIndexTurnoverOptions) -> io::Result<Self> {
-        if config.region_count == 0
-            || config.entries_per_region == 0
-            || config.turns == 0
-            || config.sample_operations == 0
+impl TurnoverConfig {
+    fn new(options: RegionIndexTurnoverOptions) -> io::Result<Self> {
+        if options.region_count == 0
+            || options.entries_per_region == 0
+            || options.turns == 0
+            || options.sample_operations == 0
         {
             return Err(invalid("turnover counts must be positive"));
         }
-        if config.key_space_multiplier < 2 {
+        if options.key_space_multiplier < 2 {
             return Err(invalid(
                 "index turnover requires a key-space multiplier of at least two",
             ));
         }
-        if config.region_count > MAX_PACKED_REGION_COUNT as usize {
+        if options.region_count > MAX_PACKED_REGION_COUNT as usize {
             return Err(invalid("turnover Region count exceeds packed locations"));
         }
-        let final_offset = config
+        let final_offset = options
             .entries_per_region
             .saturating_sub(1)
             .checked_mul(BENCHMARK_RECORD_BYTES as usize)
@@ -184,9 +184,9 @@ impl TurnoverPlan {
                 "turnover entries do not fit one 32 MiB Region at 16 KiB each",
             ));
         }
-        let physical_entries = config
+        let physical_entries = options
             .region_count
-            .checked_mul(config.entries_per_region)
+            .checked_mul(options.entries_per_region)
             .ok_or_else(|| invalid("turnover physical entry count overflow"))?;
         let index_slots = physical_entries
             .checked_mul(2)
@@ -195,9 +195,9 @@ impl TurnoverPlan {
         validated_index_partition_ranges(index_slots)
             .map_err(|_| invalid("turnover index layout is not representable"))?;
         let key_space_entries = physical_entries
-            .checked_mul(config.key_space_multiplier)
+            .checked_mul(options.key_space_multiplier)
             .ok_or_else(|| invalid("turnover key-space size overflow"))?;
-        let total_writes = config
+        let total_writes = options
             .turns
             .checked_add(1)
             .and_then(|turns| turns.checked_mul(physical_entries))
@@ -206,7 +206,7 @@ impl TurnoverPlan {
             return Err(invalid("turnover sequence space exceeds u64"));
         }
         Ok(Self {
-            config,
+            options,
             physical_entries,
             key_space_entries,
             index_slots,
@@ -215,7 +215,7 @@ impl TurnoverPlan {
 }
 
 struct TurnoverWorkload {
-    plan: TurnoverPlan,
+    config: TurnoverConfig,
     index: RegionIndex,
     hashes: Vec<u64>,
     missing_hashes: Vec<u64>,
@@ -226,34 +226,34 @@ struct TurnoverWorkload {
 }
 
 impl TurnoverWorkload {
-    fn new(plan: TurnoverPlan) -> io::Result<Self> {
-        let storage = PartitionedIndexStorage::anonymous_single_partition(plan.index_slots)
+    fn new(config: TurnoverConfig) -> io::Result<Self> {
+        let storage = PartitionedIndexStorage::anonymous_single_partition(config.index_slots)
             .map_err(index_error)?;
         let index = RegionIndex::from_storage(storage).map_err(index_error)?;
         index.set_activity_counters_enabled(true);
 
         let mut hashes = Vec::new();
         hashes
-            .try_reserve_exact(plan.key_space_entries)
+            .try_reserve_exact(config.key_space_entries)
             .map_err(|_| out_of_memory("turnover key hashes"))?;
-        for ordinal in 0..plan.key_space_entries {
+        for ordinal in 0..config.key_space_entries {
             hashes.push(benchmark_hash(ENTRY_HASH_DOMAIN, ordinal)?);
         }
 
         let mut missing_hashes = Vec::new();
         missing_hashes
-            .try_reserve_exact(plan.config.sample_operations)
+            .try_reserve_exact(config.options.sample_operations)
             .map_err(|_| out_of_memory("turnover missing-key hashes"))?;
-        for ordinal in 0..plan.config.sample_operations {
+        for ordinal in 0..config.options.sample_operations {
             missing_hashes.push(benchmark_hash(MISSING_HASH_DOMAIN, ordinal)?);
         }
 
         let mut locations = Vec::new();
         locations
-            .try_reserve_exact(plan.physical_entries)
+            .try_reserve_exact(config.physical_entries)
             .map_err(|_| out_of_memory("turnover packed locations"))?;
-        for region_id in 0..plan.config.region_count {
-            for slot in 0..plan.config.entries_per_region {
+        for region_id in 0..config.options.region_count {
+            for slot in 0..config.options.entries_per_region {
                 let offset = slot
                     .checked_mul(BENCHMARK_RECORD_BYTES as usize)
                     .and_then(|value| u32::try_from(value).ok())
@@ -267,18 +267,18 @@ impl TurnoverWorkload {
 
         let mut expected_entries = Vec::new();
         expected_entries
-            .try_reserve_exact(plan.key_space_entries)
+            .try_reserve_exact(config.key_space_entries)
             .map_err(|_| out_of_memory("turnover correctness oracle"))?;
-        expected_entries.resize(plan.key_space_entries, None);
+        expected_entries.resize(config.key_space_entries, None);
 
         let mut location_owners = Vec::new();
         location_owners
-            .try_reserve_exact(plan.physical_entries)
+            .try_reserve_exact(config.physical_entries)
             .map_err(|_| out_of_memory("turnover Region owners"))?;
-        location_owners.resize(plan.physical_entries, None);
+        location_owners.resize(config.physical_entries, None);
 
         Ok(Self {
-            plan,
+            config,
             index,
             hashes,
             missing_hashes,
@@ -294,9 +294,10 @@ impl TurnoverWorkload {
         let started = Instant::now();
         let mut checksum = 0_u64;
         let mut installed = 0_usize;
-        for region_id in 0..self.plan.config.region_count {
-            let location_start = region_id * self.plan.config.entries_per_region;
-            for physical in location_start..location_start + self.plan.config.entries_per_region {
+        for region_id in 0..self.config.options.region_count {
+            let location_start = region_id * self.config.options.entries_per_region;
+            for physical in location_start..location_start + self.config.options.entries_per_region
+            {
                 let Some(key_ordinal) = self.location_owners[physical].take() else {
                     continue;
                 };
@@ -310,8 +311,8 @@ impl TurnoverWorkload {
                     self.expected_entries[key_ordinal] = None;
                 }
             }
-            for slot in 0..self.plan.config.entries_per_region {
-                let key_ordinal = self.total_writes % self.plan.key_space_entries;
+            for slot in 0..self.config.options.entries_per_region {
+                let key_ordinal = self.total_writes % self.config.key_space_entries;
                 let entry = IndexEntry {
                     location: self.locations[location_start + slot],
                 };
@@ -335,9 +336,9 @@ impl TurnoverWorkload {
         }
         finish_phase(
             started.elapsed(),
-            self.plan.physical_entries,
+            self.config.physical_entries,
             installed,
-            self.plan.physical_entries.saturating_sub(installed),
+            self.config.physical_entries.saturating_sub(installed),
             checksum,
         )
     }
@@ -349,28 +350,28 @@ impl TurnoverWorkload {
     ) -> io::Result<RegionIndexTurnoverCheckpoint> {
         let recent_start = self
             .total_writes
-            .checked_sub(self.plan.physical_entries)
+            .checked_sub(self.config.physical_entries)
             .ok_or_else(|| io::Error::other("turnover recent window underflow"))?;
         let recent_lookup = measure_lookups(
             &self.index,
-            self.plan.config.sample_operations,
+            self.config.options.sample_operations,
             |operation| {
-                let key_ordinal = (recent_start + operation % self.plan.physical_entries)
-                    % self.plan.key_space_entries;
+                let key_ordinal = (recent_start + operation % self.config.physical_entries)
+                    % self.config.key_space_entries;
                 let expected = self.expected_entries[key_ordinal]
                     .ok_or_else(|| io::Error::other("recent turnover key has no oracle entry"))?;
                 Ok((self.hashes[key_ordinal], LookupExpectation::Live(expected)))
             },
         )?;
 
-        let stale_lookup = if self.total_writes >= 2 * self.plan.physical_entries {
-            let stale_start = self.total_writes - 2 * self.plan.physical_entries;
+        let stale_lookup = if self.total_writes >= 2 * self.config.physical_entries {
+            let stale_start = self.total_writes - 2 * self.config.physical_entries;
             Some(measure_lookups(
                 &self.index,
-                self.plan.config.sample_operations,
+                self.config.options.sample_operations,
                 |operation| {
-                    let key_ordinal = (stale_start + operation % self.plan.physical_entries)
-                        % self.plan.key_space_entries;
+                    let key_ordinal = (stale_start + operation % self.config.physical_entries)
+                        % self.config.key_space_entries;
                     Ok(match self.expected_entries[key_ordinal] {
                         Some(expected) => {
                             (self.hashes[key_ordinal], LookupExpectation::Live(expected))
@@ -385,7 +386,7 @@ impl TurnoverWorkload {
 
         let missing_lookup = measure_lookups(
             &self.index,
-            self.plan.config.sample_operations,
+            self.config.options.sample_operations,
             |operation| Ok((self.missing_hashes[operation], LookupExpectation::Miss)),
         )?;
 

@@ -853,7 +853,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
     let file = TestFile::new();
     let files = RuntimeFileSet::new(file.file(), None);
     let engine =
-        build_file_engine(files, IoEnginePlan::Posix { workers: 4 }, false, false).unwrap();
+        build_file_engine(files, IoEngineConfig::Posix { workers: 4 }, false, false).unwrap();
 
     let reserved: Vec<_> = (0..4).map(|_| engine.try_reserve_read().unwrap()).collect();
     assert_eq!(

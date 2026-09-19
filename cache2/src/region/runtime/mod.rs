@@ -88,8 +88,8 @@ use crate::region::reader::PendingRead;
 #[cfg(test)]
 use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
-use crate::region::reader::ReadPlan;
-use crate::region::reader::plan_read;
+use crate::region::reader::ReadDescriptor;
+use crate::region::reader::describe_read;
 use crate::region::record::MAX_KEY_SIZE;
 #[cfg(test)]
 use crate::region::record::RECORD_HEADER_SIZE;
@@ -320,7 +320,7 @@ struct PendingGet {
 struct WaitingGet {
     engine: Arc<dyn IoEngine>,
     slot_waiter: ReadSlotWaiter,
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
     hash: u64,
     deadline: Instant,
@@ -330,7 +330,7 @@ struct WaitingGet {
 struct ReservedGet {
     engine: Arc<dyn IoEngine>,
     slot: ReadSlot,
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
     hash: u64,
 }
@@ -377,7 +377,7 @@ impl WaitingGet {
         let Self {
             engine,
             slot_waiter,
-            plan,
+            descriptor,
             read_token,
             hash,
             deadline,
@@ -388,7 +388,7 @@ impl WaitingGet {
         Ok(ReservedGet {
             engine,
             slot,
-            plan,
+            descriptor,
             read_token,
             hash,
         })
@@ -516,7 +516,7 @@ impl RunningShared {
     fn try_queue_read(
         &self,
         route: u64,
-        plan: ReadPlan,
+        descriptor: ReadDescriptor,
         read_token: MemoryReadToken,
         timeout: Duration,
     ) -> io::Result<WaitingGet> {
@@ -535,7 +535,7 @@ impl RunningShared {
         Ok(WaitingGet {
             engine,
             slot_waiter,
-            plan,
+            descriptor,
             read_token,
             hash: route,
             deadline,
@@ -958,11 +958,15 @@ impl RegionDataPlane {
         let ReservedGet {
             engine,
             slot,
-            plan,
+            descriptor,
             read_token,
             hash,
         } = reserved;
-        let Some(buffer) = self.shared.managed_memory.try_read_buffer(plan.read_len) else {
+        let Some(buffer) = self
+            .shared
+            .managed_memory
+            .try_read_buffer(descriptor.read_len)
+        else {
             if self.runtime.stats.activity_counters {
                 self.metrics.record_read_overload();
             }
@@ -973,7 +977,7 @@ impl RegionDataPlane {
         };
         match self
             .core
-            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+            .submit_value_read(engine.as_ref(), slot, buffer, descriptor)
         {
             Ok(read) => Ok(Some(PendingGet {
                 engine,
@@ -1047,16 +1051,16 @@ impl RegionDataPlane {
             }
             return Ok(PreparedGet::Complete(None));
         };
-        let plan = match plan_read(
+        let descriptor = match describe_read(
             self.data.geometry,
             hash,
             candidate,
             running.align_reads_for_direct_io,
         ) {
-            Ok(plan) => plan,
+            Ok(descriptor) => descriptor,
             Err(error) => {
                 self.core
-                    .enter_miss_only_with_error("record_read_plan_invalid", &error);
+                    .enter_miss_only_with_error("record_read_descriptor_invalid", &error);
                 if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
@@ -1073,7 +1077,12 @@ impl RegionDataPlane {
                     && !read_io_wait_timeout(&self.runtime).is_zero() =>
             {
                 let waiting = running
-                    .try_queue_read(hash, plan, read_token, read_io_wait_timeout(&self.runtime))
+                    .try_queue_read(
+                        hash,
+                        descriptor,
+                        read_token,
+                        read_io_wait_timeout(&self.runtime),
+                    )
                     .inspect_err(|_| {
                         if running.activity_counters {
                             running.metrics.record_read_overload();
@@ -1100,7 +1109,7 @@ impl RegionDataPlane {
                 return Ok(PreparedGet::Complete(None));
             }
         };
-        let Some(buffer) = running.managed_memory.try_read_buffer(plan.read_len) else {
+        let Some(buffer) = running.managed_memory.try_read_buffer(descriptor.read_len) else {
             if !read_io_wait_timeout(&self.runtime).is_zero() {
                 if running.activity_counters {
                     running.metrics.record_read_overload();
@@ -1118,7 +1127,7 @@ impl RegionDataPlane {
         };
         match self
             .core
-            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+            .submit_value_read(engine.as_ref(), slot, buffer, descriptor)
         {
             Ok(read) => Ok(PreparedGet::Pending(PendingGet {
                 engine,
@@ -1583,7 +1592,7 @@ fn build_engine_pool(
         };
         engines.push(build_file_engine(
             worker_files,
-            topology.engine_plan(engine),
+            topology.engine_config(engine),
             runtime.stats.activity_counters,
             read_wait_enabled,
         )?);
@@ -2553,7 +2562,7 @@ mod tests {
             let result = plane.finish_get(
                 CompletedGet {
                     read: ReadCompletion {
-                        plan: ReadPlan {
+                        descriptor: ReadDescriptor {
                             hash: 7,
                             entry: IndexEntry {
                                 location: PackedLocation::new(0, 0, 64).unwrap(),
@@ -2602,7 +2611,7 @@ mod tests {
             location: PackedLocation::new(0, 0, record_len).unwrap(),
         };
         assert_eq!(
-            plan_read(
+            describe_read(
                 geometry,
                 1,
                 ReadCandidate {

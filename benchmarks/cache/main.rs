@@ -330,7 +330,7 @@ struct WriteAdmission {
 }
 
 #[derive(Clone, Copy)]
-struct HotReadPlan {
+struct HotReadPattern {
     entries: usize,
     interval: usize,
 }
@@ -551,7 +551,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             config.entries - config.hot_entries,
             config.l2_clients(),
             CacheTier::L2,
-            Some(HotReadPlan {
+            Some(HotReadPattern {
                 entries: config.hot_entries,
                 interval: config.hot_read_interval,
             }),
@@ -783,7 +783,7 @@ async fn concurrent_reads(
     operations: usize,
     clients: usize,
     expected_tier: CacheTier,
-    hot_reads: Option<HotReadPlan>,
+    hot_reads: Option<HotReadPattern>,
     latency_sample_interval: usize,
 ) -> io::Result<ReadMeasurement> {
     let first_key = key_range.start;
@@ -830,10 +830,10 @@ async fn concurrent_reads(
                 } else {
                     primary.misses += 1;
                 }
-                if let Some(plan) = hot_reads
-                    && ordinal.is_multiple_of(plan.interval)
+                if let Some(pattern) = hot_reads
+                    && ordinal.is_multiple_of(pattern.interval)
                 {
-                    let hot_key = ordinal / plan.interval % plan.entries;
+                    let hot_key = ordinal / pattern.interval % pattern.entries;
                     sample_tier(&cache, hot_key, ordinal, &mut sampled).await?;
                 }
             }

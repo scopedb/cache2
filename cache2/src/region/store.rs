@@ -30,7 +30,7 @@ use crate::snapshot::StartupMode;
 
 /// Result of inspecting the latest valid state record.
 #[derive(Debug, Eq, PartialEq)]
-pub enum RecoveryPlan<T> {
+pub enum RecoveryInspection<T> {
     Fresh,
     Running,
     Clean(T),
@@ -50,7 +50,7 @@ pub trait RegionBackend {
     fn inspect_recovery(
         &mut self,
         index_slots: usize,
-    ) -> io::Result<RecoveryPlan<Self::CleanImage>>;
+    ) -> io::Result<RecoveryInspection<Self::CleanImage>>;
 
     /// Construct a provisional empty runtime without starting workers.
     fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime>;
@@ -100,13 +100,15 @@ impl<B: RegionBackend> RegionStore<B> {
         backend.acquire_exclusive()?;
 
         let opened = (|| {
-            let plan = backend.inspect_recovery(index_slots)?;
-            let (runtime, startup) = match plan {
-                RecoveryPlan::Fresh => (backend.anonymous_runtime(index_slots)?, StartupMode::Cold),
-                RecoveryPlan::Running => {
+            let inspection = backend.inspect_recovery(index_slots)?;
+            let (runtime, startup) = match inspection {
+                RecoveryInspection::Fresh => {
                     (backend.anonymous_runtime(index_slots)?, StartupMode::Cold)
                 }
-                RecoveryPlan::Clean(clean) => {
+                RecoveryInspection::Running => {
+                    (backend.anonymous_runtime(index_slots)?, StartupMode::Cold)
+                }
+                RecoveryInspection::Clean(clean) => {
                     match backend.map_clean_runtime(clean, index_slots)? {
                         Some(runtime) => (runtime, StartupMode::Warm),
                         None => (backend.anonymous_runtime(index_slots)?, StartupMode::Cold),
@@ -230,7 +232,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum Plan {
+    enum RecoveryScenario {
         Fresh,
         Running,
         Clean,
@@ -238,7 +240,7 @@ mod tests {
     }
 
     struct Backend {
-        plan: Plan,
+        scenario: RecoveryScenario,
         events: Rc<RefCell<Vec<Event>>>,
         fail_at: Option<Event>,
     }
@@ -267,13 +269,13 @@ mod tests {
         fn inspect_recovery(
             &mut self,
             _index_slots: usize,
-        ) -> io::Result<RecoveryPlan<Self::CleanImage>> {
+        ) -> io::Result<RecoveryInspection<Self::CleanImage>> {
             self.record(Event::Inspect)?;
-            Ok(match self.plan {
-                Plan::Fresh => RecoveryPlan::Fresh,
-                Plan::Running => RecoveryPlan::Running,
-                Plan::Clean => RecoveryPlan::Clean(true),
-                Plan::RejectedClean => RecoveryPlan::Clean(false),
+            Ok(match self.scenario {
+                RecoveryScenario::Fresh => RecoveryInspection::Fresh,
+                RecoveryScenario::Running => RecoveryInspection::Running,
+                RecoveryScenario::Clean => RecoveryInspection::Clean(true),
+                RecoveryScenario::RejectedClean => RecoveryInspection::Clean(false),
             })
         }
 
@@ -322,11 +324,14 @@ mod tests {
         }
     }
 
-    fn backend(plan: Plan, fail_at: Option<Event>) -> (Backend, Rc<RefCell<Vec<Event>>>) {
+    fn backend(
+        scenario: RecoveryScenario,
+        fail_at: Option<Event>,
+    ) -> (Backend, Rc<RefCell<Vec<Event>>>) {
         let events = Rc::new(RefCell::new(Vec::new()));
         (
             Backend {
-                plan,
+                scenario,
                 events: Rc::clone(&events),
                 fail_at,
             },
@@ -337,17 +342,17 @@ mod tests {
     #[test]
     fn invalid_capacity_is_rejected_before_ownership_or_allocation() {
         for index_slots in [0, 1, 7, usize::MAX] {
-            let (backend, events) = backend(Plan::Fresh, None);
+            let (backend, events) = backend(RecoveryScenario::Fresh, None);
             assert!(RegionStore::open(index_slots, backend).is_err());
             assert!(events.borrow().is_empty());
         }
     }
 
     #[test]
-    fn recovery_plan_selects_one_runtime_before_the_running_barrier() {
-        for (plan, startup, expected) in [
+    fn recovery_inspection_selects_one_runtime_before_the_running_barrier() {
+        for (scenario, startup, expected) in [
             (
-                Plan::Fresh,
+                RecoveryScenario::Fresh,
                 StartupMode::Cold,
                 vec![
                     Event::Lock,
@@ -358,7 +363,7 @@ mod tests {
                 ],
             ),
             (
-                Plan::Running,
+                RecoveryScenario::Running,
                 StartupMode::Cold,
                 vec![
                     Event::Lock,
@@ -369,7 +374,7 @@ mod tests {
                 ],
             ),
             (
-                Plan::Clean,
+                RecoveryScenario::Clean,
                 StartupMode::Warm,
                 vec![
                     Event::Lock,
@@ -380,7 +385,7 @@ mod tests {
                 ],
             ),
             (
-                Plan::RejectedClean,
+                RecoveryScenario::RejectedClean,
                 StartupMode::Cold,
                 vec![
                     Event::Lock,
@@ -392,7 +397,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (backend, events) = backend(plan, None);
+            let (backend, events) = backend(scenario, None);
             let mut store = RegionStore::open(8, backend).unwrap();
             assert_eq!(store.startup(), startup);
             assert_eq!(*events.borrow(), expected);
@@ -409,7 +414,7 @@ mod tests {
                 vec![Event::Freeze, Event::Persist, Event::Clean, Event::Unlock],
             ),
         ] {
-            let (backend, events) = backend(Plan::Fresh, None);
+            let (backend, events) = backend(RecoveryScenario::Fresh, None);
             let mut store = RegionStore::open(8, backend).unwrap();
             events.borrow_mut().clear();
             if warm {
@@ -423,7 +428,7 @@ mod tests {
 
     #[test]
     fn drop_uses_the_non_recoverable_shutdown_path() {
-        let (backend, events) = backend(Plan::Fresh, None);
+        let (backend, events) = backend(RecoveryScenario::Fresh, None);
         let store = RegionStore::open(8, backend).unwrap();
         events.borrow_mut().clear();
 
@@ -434,24 +439,24 @@ mod tests {
 
     #[test]
     fn open_failure_stops_at_the_failed_stage_and_releases_ownership() {
-        for (plan, failed, expected) in [
+        for (scenario, failed, expected) in [
             (
-                Plan::Fresh,
+                RecoveryScenario::Fresh,
                 Event::Inspect,
                 vec![Event::Lock, Event::Inspect, Event::Unlock],
             ),
             (
-                Plan::Fresh,
+                RecoveryScenario::Fresh,
                 Event::Anonymous,
                 vec![Event::Lock, Event::Inspect, Event::Anonymous, Event::Unlock],
             ),
             (
-                Plan::Clean,
+                RecoveryScenario::Clean,
                 Event::Map,
                 vec![Event::Lock, Event::Inspect, Event::Map, Event::Unlock],
             ),
             (
-                Plan::Fresh,
+                RecoveryScenario::Fresh,
                 Event::Running,
                 vec![
                     Event::Lock,
@@ -462,7 +467,7 @@ mod tests {
                 ],
             ),
             (
-                Plan::Fresh,
+                RecoveryScenario::Fresh,
                 Event::Start,
                 vec![
                     Event::Lock,
@@ -474,7 +479,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (backend, events) = backend(plan, Some(failed));
+            let (backend, events) = backend(scenario, Some(failed));
             assert!(RegionStore::open(8, backend).is_err());
             assert_eq!(*events.borrow(), expected, "failed at {failed:?}");
         }
@@ -496,7 +501,7 @@ mod tests {
                 vec![Event::Freeze, Event::Persist, Event::Clean, Event::Unlock],
             ),
         ] {
-            let (backend, events) = backend(Plan::Fresh, Some(failed));
+            let (backend, events) = backend(RecoveryScenario::Fresh, Some(failed));
             let mut store = RegionStore::open(8, backend).unwrap();
             events.borrow_mut().clear();
             let result = if warm {
