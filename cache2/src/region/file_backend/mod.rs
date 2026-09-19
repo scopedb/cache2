@@ -90,7 +90,6 @@ use crate::region::region_metadata_io_error;
 #[cfg(test)]
 use crate::region::runtime::HybridValueRead;
 use crate::region::runtime::RegionDataPlane;
-use crate::region::store::RecoveryInspection;
 use crate::region::store::RegionBackend;
 use crate::region::store::RegionStore;
 #[cfg(test)]
@@ -502,12 +501,9 @@ where
         );
     }
 
-    fn cold_recovery(
-        &self,
-        reason: &'static str,
-    ) -> io::Result<RecoveryInspection<CleanFileRegionImage>> {
+    fn cold_recovery(&self, reason: &'static str) -> io::Result<Option<CleanFileRegionImage>> {
         self.log_cold_recovery(reason);
-        Ok(RecoveryInspection::Running)
+        Ok(None)
     }
 }
 
@@ -589,10 +585,7 @@ where
         Ok(())
     }
 
-    fn inspect_recovery(
-        &mut self,
-        index_slots: usize,
-    ) -> io::Result<RecoveryInspection<Self::CleanImage>> {
+    fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<Option<Self::CleanImage>> {
         self.file_system
             .remove_file(&recovery_temporary_path(&self.files.image))?;
         let format_data = self.format_data;
@@ -623,8 +616,7 @@ where
         // the greatest decodable record only so RUNNING advances beyond it.
         self.current_state = select_state_for_fence(&pages);
         if fresh {
-            self.log_cold_recovery("fresh_data_file");
-            return Ok(RecoveryInspection::Fresh);
+            return self.cold_recovery("fresh_data_file");
         }
         let Some(selected) = recovery_state else {
             return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"));
@@ -744,7 +736,7 @@ where
         }
         let file = image.try_clone_control_file()?;
         self.cold_reset_needed = false;
-        Ok(RecoveryInspection::Clean(CleanFileRegionImage {
+        Ok(Some(CleanFileRegionImage {
             file,
             header,
             metadata,

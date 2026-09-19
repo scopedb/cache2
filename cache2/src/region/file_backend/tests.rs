@@ -1324,10 +1324,7 @@ fn publish_custom_clean_image(
         runtime_options,
     );
     backend.acquire_exclusive().unwrap();
-    assert!(matches!(
-        backend.inspect_recovery(index_slots).unwrap(),
-        RecoveryInspection::Fresh
-    ));
+    assert!(backend.inspect_recovery(index_slots).unwrap().is_none());
     let runtime = FileRegionRuntime::install(
         PartitionedIndexStorage::anonymous(index_slots).unwrap(),
         metadata,
