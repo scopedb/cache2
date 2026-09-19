@@ -27,6 +27,7 @@ use cache2::PosixIoOptions;
 /// Reads backend-specific pool settings under a benchmark's environment prefix.
 pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
     reject_renamed_env(prefix)?;
+    // Migration scaffolding like `reject_renamed_env`; remove them together.
     for suffix in ["READ_IO_WORKERS", "WRITE_IO_WORKERS", "RECLAIM_WORKERS"] {
         let name = format!("{prefix}_{suffix}");
         if env::var_os(&name).is_some() {
@@ -75,6 +76,9 @@ pub fn reclaim_max_in_flight(options: IoEngineOptions) -> usize {
 }
 
 /// Rejects renamed knobs so old scripts cannot silently select different defaults.
+///
+/// Migration scaffolding for the pre-rename names; remove once those names have
+/// aged out of benchmark runbooks.
 pub fn reject_renamed_env(prefix: &str) -> io::Result<()> {
     for (old, new) in [
         ("STATS", "ACTIVITY_COUNTERS"),
