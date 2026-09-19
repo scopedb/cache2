@@ -79,7 +79,7 @@ pub struct RuntimeIoStatsHandle {
 
 struct RuntimeIoCounters {
     direct_active: bool,
-    statistics_enabled: AtomicBool,
+    activity_counters_enabled: AtomicBool,
     read: RuntimeIoDirectionCounters,
     write: RuntimeIoDirectionCounters,
 }
@@ -131,7 +131,7 @@ impl RuntimeIoStatsHandle {
         Self {
             inner: Arc::new(RuntimeIoCounters {
                 direct_active,
-                statistics_enabled: AtomicBool::new(true),
+                activity_counters_enabled: AtomicBool::new(true),
                 read: RuntimeIoDirectionCounters::new(),
                 write: RuntimeIoDirectionCounters::new(),
             }),
@@ -139,7 +139,7 @@ impl RuntimeIoStatsHandle {
     }
 
     fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
-        if !self.inner.statistics_enabled.load(Ordering::Relaxed) {
+        if !self.inner.activity_counters_enabled.load(Ordering::Relaxed) {
             return;
         }
         let bytes = u64::try_from(length).unwrap_or(u64::MAX);
@@ -155,9 +155,9 @@ impl RuntimeIoStatsHandle {
         path.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn set_statistics_enabled(&self, enabled: bool) {
+    pub fn set_activity_counters_enabled(&self, enabled: bool) {
         self.inner
-            .statistics_enabled
+            .activity_counters_enabled
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -247,8 +247,8 @@ impl RuntimeFileSet {
         self.stats.clone()
     }
 
-    pub fn set_statistics_enabled(&self, enabled: bool) {
-        self.stats.set_statistics_enabled(enabled);
+    pub fn set_activity_counters_enabled(&self, enabled: bool) {
+        self.stats.set_activity_counters_enabled(enabled);
     }
 
     #[cfg_attr(
@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(stats.write.buffered.operations, 1);
         assert_eq!(stats.write.buffered.bytes, 32);
 
-        cloned.set_statistics_enabled(false);
+        cloned.set_activity_counters_enabled(false);
         files.record(
             RuntimeIoDirection::Read,
             RuntimeIoPath::Direct,

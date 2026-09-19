@@ -44,9 +44,8 @@ use std::time::Instant;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
 
-use crate::IoEngineOptions;
 #[cfg(unix)]
-use crate::config::runtime::IoUringPoolOptions;
+use crate::config::runtime::IoEngineConfig;
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
@@ -76,7 +75,7 @@ use crate::io::backend::RuntimeIoDirection;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::WritePoint;
-use crate::resources::BufferLease;
+use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
@@ -105,7 +104,7 @@ pub struct BackendIoEngine {
 const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 // Common bounded command, completion, and request bookkeeping. Payload
-// buffers are charged by ResourceController separately.
+// buffers are charged by ManagedMemory separately.
 pub const IO_QUEUE_ENTRY_RESERVATION_BYTES: usize = 512;
 
 pub fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option<usize> {
@@ -349,7 +348,7 @@ impl OperationKind {
     }
 }
 
-/// An operation owns its buffer from slot reservation until target completion.
+/// An operation owns the buffer from slot reservation until target completion.
 pub enum IoOperation {
     Read {
         buffer: IoBuffer,
@@ -1179,7 +1178,7 @@ const fn active_write_slots(state: u64) -> usize {
 struct RuntimeShared {
     latency: std::sync::OnceLock<crate::stats::recording::IoTiming>,
     max_in_flight: usize,
-    statistics_enabled: bool,
+    activity_counters_enabled: bool,
     accepting: AtomicBool,
     /// Packed total and write counts. A single CAS is the slot reservation
     /// linearization point.
@@ -1207,11 +1206,11 @@ enum SlotWaitError {
 }
 
 impl RuntimeShared {
-    fn new(max_in_flight: usize, statistics_enabled: bool, read_wait_enabled: bool) -> Self {
+    fn new(max_in_flight: usize, activity_counters_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
             latency: std::sync::OnceLock::new(),
             max_in_flight,
-            statistics_enabled,
+            activity_counters_enabled,
             accepting: AtomicBool::new(true),
             slot_state: AtomicU64::new(0),
             in_flight_peak: AtomicUsize::new(0),
@@ -1266,7 +1265,7 @@ impl RuntimeShared {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if self.statistics_enabled {
+                    if self.activity_counters_enabled {
                         update_peak(&self.in_flight_peak, total + 1);
                     }
                     return Some(IoSlot {
@@ -1291,7 +1290,7 @@ impl RuntimeShared {
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available"))?;
         slot.read_permit = permit;
         let reserved_at =
-            (self.statistics_enabled || self.latency.get().is_some()).then(Instant::now);
+            (self.activity_counters_enabled || self.latency.get().is_some()).then(Instant::now);
         Ok(ReadSlot { slot, reserved_at })
     }
 
@@ -1479,7 +1478,7 @@ impl RuntimeShared {
         slot: IoSlot,
         submitted_at: Option<Instant>,
     ) {
-        if self.statistics_enabled {
+        if self.activity_counters_enabled {
             match &status {
                 CompletionStatus::Completed => {
                     self.requests_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -1494,7 +1493,7 @@ impl RuntimeShared {
         }
         if let Some(submitted_at) = submitted_at {
             let elapsed = submitted_at.elapsed();
-            if self.statistics_enabled {
+            if self.activity_counters_enabled {
                 add_duration_ns(&self.request_time_ns, elapsed);
             }
             if let Some(recorder) = self.latency.get() {
@@ -1722,7 +1721,7 @@ impl RuntimeInner {
             return Err(SubmitError { error, operation });
         }
         let write = operation.kind().uses_write_slot();
-        let slot_wait_started = self.shared.statistics_enabled.then(Instant::now);
+        let slot_wait_started = self.shared.activity_counters_enabled.then(Instant::now);
         let slot = match slot_mode {
             #[cfg(test)]
             SlotMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(io::Error::new(
@@ -1765,7 +1764,7 @@ impl RuntimeInner {
             add_duration_ns(&self.shared.slot_wait_ns, slot_wait_started.elapsed());
         }
 
-        let request_started = (self.shared.statistics_enabled
+        let request_started = (self.shared.activity_counters_enabled
             || self.shared.latency.get().is_some())
         .then(Instant::now);
         self.submit_with_slot(operation, slot, request_started, nonblocking)
@@ -1814,7 +1813,7 @@ impl RuntimeInner {
             slot,
             submitted_at: request_started,
         };
-        if self.shared.statistics_enabled {
+        if self.shared.activity_counters_enabled {
             self.shared
                 .requests_submitted
                 .fetch_add(1, Ordering::Release);
@@ -1832,7 +1831,7 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
-                if self.shared.statistics_enabled {
+                if self.shared.activity_counters_enabled {
                     self.shared
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
@@ -1847,7 +1846,7 @@ impl RuntimeInner {
                 })
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
-                if self.shared.statistics_enabled {
+                if self.shared.activity_counters_enabled {
                     self.shared
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
@@ -1978,24 +1977,20 @@ impl Drop for RuntimeInner {
 #[cfg(unix)]
 pub fn build_file_engine(
     files: RuntimeFileSet,
-    max_in_flight: usize,
-    posix_workers: usize,
-    kind: IoEngineOptions,
-    io_uring_config: Option<IoUringPoolOptions>,
-    statistics_enabled: bool,
+    config: IoEngineConfig,
+    activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<dyn IoEngine>> {
-    match kind {
-        IoEngineOptions::Posix(_) => BackendIoEngine::new_with_files_and_workers(
+    match config {
+        IoEngineConfig::Posix { workers } => BackendIoEngine::new_with_files_and_workers(
             files,
-            max_in_flight,
-            posix_workers,
-            statistics_enabled,
+            workers,
+            workers,
+            activity_counters_enabled,
             read_wait_enabled,
         )
         .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
-        IoEngineOptions::IoUring(_) => {
-            let _ = posix_workers;
+        IoEngineConfig::IoUring(config) => {
             #[cfg(all(
                 feature = "io-uring",
                 target_os = "linux",
@@ -2008,17 +2003,10 @@ pub fn build_file_engine(
                 )
             ))]
             {
-                let io_uring_config = io_uring_config.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "io_uring pool configuration is missing",
-                    )
-                })?;
                 uring::UringIoEngine::new_with_files(
                     files,
-                    max_in_flight,
-                    io_uring_config,
-                    statistics_enabled,
+                    config,
+                    activity_counters_enabled,
                     read_wait_enabled,
                 )
                 .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
@@ -2036,7 +2024,7 @@ pub fn build_file_engine(
             )))]
             {
                 let _ = files;
-                let _ = io_uring_config;
+                let _ = config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "io_uring is unavailable on this build or platform",

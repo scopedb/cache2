@@ -17,7 +17,7 @@
 use std::io;
 
 #[cfg(test)]
-use crate::config::CacheConfig;
+use crate::CacheConfig;
 use crate::config::StorageLayout;
 #[cfg(test)]
 use crate::config::runtime::RuntimeOptions;
@@ -41,7 +41,7 @@ const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
 const DEFAULT_EXPECTED_ENTRY_BYTES: u64 = 16 * 1024;
 pub const KEY_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MIN_INDEX_SLOTS: usize = 8;
-const STATIC_FINGERPRINT_SCHEMA: u64 = 3;
+const STORAGE_FINGERPRINT_SCHEMA: u64 = 3;
 
 /// Inputs for a persistent L2 layout, checked by [`Self::build`].
 ///
@@ -168,7 +168,7 @@ fn disk_peak_bytes(geometry: DataGeometry, index_slots: usize) -> io::Result<u64
 fn fingerprint(geometry: DataGeometry, index_slots: usize, hash_algorithm_id: u64) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for value in [
-        STATIC_FINGERPRINT_SCHEMA,
+        STORAGE_FINGERPRINT_SCHEMA,
         geometry.data_file_len,
         geometry.region_size,
         u64::from(geometry.region_count),
@@ -233,7 +233,7 @@ mod tests {
                 data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
                 geometry: storage.geometry,
                 hash_seed: KEY_HASH_SEED,
-                config_fingerprint: storage.fingerprint,
+                storage_fingerprint: storage.fingerprint,
             };
             assert!(data.encode().is_ok());
             assert_ne!(

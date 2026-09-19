@@ -61,7 +61,7 @@ const DATA_REGION_COUNT_OFFSET: usize = 80;
 const DATA_RECORD_ALIGNMENT_OFFSET: usize = 84;
 const DATA_RECORD_FORMAT_OFFSET: usize = 88;
 const DATA_HASH_SEED_OFFSET: usize = 96;
-const DATA_CONFIG_FINGERPRINT_OFFSET: usize = 104;
+const DATA_STORAGE_FINGERPRINT_OFFSET: usize = 104;
 
 const STATE_HEADER_SIZE: u16 = 120;
 const STATE_VERSION_OFFSET: usize = 8;
@@ -74,7 +74,7 @@ const STATE_DATA_IDENTITY_OFFSET: usize = 40;
 const STATE_DATA_GENERATION_OFFSET: usize = 56;
 const STATE_DATA_FILE_LEN_OFFSET: usize = 64;
 const STATE_HASH_SEED_OFFSET: usize = 72;
-const STATE_CONFIG_FINGERPRINT_OFFSET: usize = 80;
+const STATE_STORAGE_FINGERPRINT_OFFSET: usize = 80;
 const STATE_IMAGE_IDENTITY_OFFSET: usize = 88;
 const STATE_IMAGE_GENERATION_OFFSET: usize = 104;
 const STATE_IMAGE_FILE_LEN_OFFSET: usize = 112;
@@ -90,7 +90,7 @@ const IMAGE_CACHE_UUID_OFFSET: usize = 16;
 const IMAGE_DATA_IDENTITY_OFFSET: usize = 32;
 const IMAGE_DATA_GENERATION_OFFSET: usize = 48;
 const IMAGE_HASH_SEED_OFFSET: usize = 56;
-const IMAGE_CONFIG_FINGERPRINT_OFFSET: usize = 64;
+const IMAGE_STORAGE_FINGERPRINT_OFFSET: usize = 64;
 const IMAGE_IDENTITY_OFFSET: usize = 72;
 const IMAGE_GENERATION_OFFSET: usize = 88;
 const IMAGE_FILE_LEN_OFFSET: usize = 96;
@@ -154,7 +154,7 @@ pub struct DataSuperblock {
     pub data_identity: PersistentId,
     pub geometry: DataGeometry,
     pub hash_seed: u64,
-    pub config_fingerprint: u64,
+    pub storage_fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,8 +208,8 @@ impl DataSuperblock {
         put_u64(&mut page, DATA_HASH_SEED_OFFSET, self.hash_seed);
         put_u64(
             &mut page,
-            DATA_CONFIG_FINGERPRINT_OFFSET,
-            self.config_fingerprint,
+            DATA_STORAGE_FINGERPRINT_OFFSET,
+            self.storage_fingerprint,
         );
         write_page_crc(&mut page);
         Ok(page)
@@ -266,7 +266,7 @@ impl DataSuperblock {
                     region_count: get_u32(page, DATA_REGION_COUNT_OFFSET)?,
                 },
                 hash_seed: get_u64(page, DATA_HASH_SEED_OFFSET)?,
-                config_fingerprint: get_u64(page, DATA_CONFIG_FINGERPRINT_OFFSET)?,
+                storage_fingerprint: get_u64(page, DATA_STORAGE_FINGERPRINT_OFFSET)?,
             })
         })() else {
             return DataSuperblockProbe::Corrupt;
@@ -327,7 +327,7 @@ pub struct RecoveryImageHeader {
     pub data_identity: PersistentId,
     pub data_superblock_generation: u64,
     pub hash_seed: u64,
-    pub config_fingerprint: u64,
+    pub storage_fingerprint: u64,
     pub image_identity: PersistentId,
     pub image_generation: u64,
     pub image_file_len: u64,
@@ -361,8 +361,8 @@ impl RecoveryImageHeader {
         put_u64(&mut page, IMAGE_HASH_SEED_OFFSET, self.hash_seed);
         put_u64(
             &mut page,
-            IMAGE_CONFIG_FINGERPRINT_OFFSET,
-            self.config_fingerprint,
+            IMAGE_STORAGE_FINGERPRINT_OFFSET,
+            self.storage_fingerprint,
         );
         put_id(&mut page, IMAGE_IDENTITY_OFFSET, self.image_identity);
         put_u64(&mut page, IMAGE_GENERATION_OFFSET, self.image_generation);
@@ -427,7 +427,7 @@ impl RecoveryImageHeader {
                 data_identity,
                 data_superblock_generation: get_u64(page, IMAGE_DATA_GENERATION_OFFSET)?,
                 hash_seed: get_u64(page, IMAGE_HASH_SEED_OFFSET)?,
-                config_fingerprint: get_u64(page, IMAGE_CONFIG_FINGERPRINT_OFFSET)?,
+                storage_fingerprint: get_u64(page, IMAGE_STORAGE_FINGERPRINT_OFFSET)?,
                 image_identity,
                 image_generation: get_u64(page, IMAGE_GENERATION_OFFSET)?,
                 image_file_len: get_u64(page, IMAGE_FILE_LEN_OFFSET)?,
@@ -459,7 +459,7 @@ impl RecoveryImageHeader {
             && self.data_identity == data.data_identity
             && self.data_superblock_generation == data.generation
             && self.hash_seed == data.hash_seed
-            && self.config_fingerprint == data.config_fingerprint
+            && self.storage_fingerprint == data.storage_fingerprint
     }
 
     fn is_valid(self) -> bool {
@@ -507,7 +507,7 @@ pub struct StateBinding {
     pub data_superblock_generation: u64,
     pub data_file_len: u64,
     pub hash_seed: u64,
-    pub config_fingerprint: u64,
+    pub storage_fingerprint: u64,
     pub image: Option<ImageBinding>,
 }
 
@@ -519,7 +519,7 @@ impl StateBinding {
             data_superblock_generation: data.generation,
             data_file_len: data.geometry.data_file_len,
             hash_seed: data.hash_seed,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             image,
         }
     }
@@ -530,7 +530,7 @@ impl StateBinding {
             && self.data_superblock_generation == data.generation
             && self.data_file_len == data.geometry.data_file_len
             && self.hash_seed == data.hash_seed
-            && self.config_fingerprint == data.config_fingerprint
+            && self.storage_fingerprint == data.storage_fingerprint
     }
 
     fn is_valid(self) -> bool {
@@ -581,8 +581,8 @@ impl StateRecord {
         put_u64(&mut page, STATE_HASH_SEED_OFFSET, self.binding.hash_seed);
         put_u64(
             &mut page,
-            STATE_CONFIG_FINGERPRINT_OFFSET,
-            self.binding.config_fingerprint,
+            STATE_STORAGE_FINGERPRINT_OFFSET,
+            self.binding.storage_fingerprint,
         );
         if let Some(image) = self.binding.image {
             put_id(&mut page, STATE_IMAGE_IDENTITY_OFFSET, image.identity);
@@ -669,7 +669,7 @@ impl StateRecord {
                     data_superblock_generation: get_u64(page, STATE_DATA_GENERATION_OFFSET)?,
                     data_file_len: get_u64(page, STATE_DATA_FILE_LEN_OFFSET)?,
                     hash_seed: get_u64(page, STATE_HASH_SEED_OFFSET)?,
-                    config_fingerprint: get_u64(page, STATE_CONFIG_FINGERPRINT_OFFSET)?,
+                    storage_fingerprint: get_u64(page, STATE_STORAGE_FINGERPRINT_OFFSET)?,
                     image,
                 },
             })
@@ -963,7 +963,7 @@ mod tests {
                 region_count,
             },
             hash_seed: 0x1234_5678_9abc_def0,
-            config_fingerprint: 0x8877_6655_4433_2211,
+            storage_fingerprint: 0x8877_6655_4433_2211,
         }
     }
 
@@ -983,7 +983,7 @@ mod tests {
             data_identity: data.data_identity,
             data_superblock_generation: data.generation,
             hash_seed: data.hash_seed,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             image_identity: image.identity,
             image_generation: image.generation,
             image_file_len: image.file_len,
@@ -1373,7 +1373,7 @@ mod tests {
         assert!(!clean.matches_clean(data, wrong_image));
 
         let mut wrong_config = data;
-        wrong_config.config_fingerprint ^= 1;
+        wrong_config.storage_fingerprint ^= 1;
         assert!(!clean.matches_clean(wrong_config, image));
     }
 

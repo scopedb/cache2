@@ -51,7 +51,8 @@ use crate::io::engine::ShutdownState;
 use crate::io::engine::SubmitError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::lock_unpoisoned;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::stats::recording::IoTiming;
 
 impl BackendIoEngine {
     #[cfg(unix)]
@@ -66,16 +67,16 @@ impl BackendIoEngine {
         files: RuntimeFileSet,
         max_in_flight: usize,
         worker_count: usize,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
-        files.set_statistics_enabled(statistics_enabled);
+        files.set_activity_counters_enabled(activity_counters_enabled);
         let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new_with_workers_and_statistics(
+        Self::new_with_workers_and_activity_counters(
             backend,
             max_in_flight,
             worker_count,
-            statistics_enabled,
+            activity_counters_enabled,
             read_wait_enabled,
         )
     }
@@ -90,7 +91,7 @@ impl BackendIoEngine {
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
     ) -> io::Result<Self> {
-        Self::new_with_workers_and_statistics(
+        Self::new_with_workers_and_activity_counters(
             backend,
             max_in_flight,
             max_in_flight.min(4),
@@ -105,14 +106,20 @@ impl BackendIoEngine {
         max_in_flight: usize,
         worker_count: usize,
     ) -> io::Result<Self> {
-        Self::new_with_workers_and_statistics(backend, max_in_flight, worker_count, true, false)
+        Self::new_with_workers_and_activity_counters(
+            backend,
+            max_in_flight,
+            worker_count,
+            true,
+            false,
+        )
     }
 
-    pub fn new_with_workers_and_statistics(
+    pub fn new_with_workers_and_activity_counters(
         backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
@@ -124,7 +131,7 @@ impl BackendIoEngine {
         }
         let shared = Arc::new(RuntimeShared::new(
             max_in_flight,
-            statistics_enabled,
+            activity_counters_enabled,
             read_wait_enabled,
         ));
         let command_capacity = max_in_flight
@@ -174,7 +181,7 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+    fn set_latency_recorder(&self, recorder: IoTiming) {
         assert!(
             self.inner.shared.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"

@@ -38,9 +38,9 @@ use self::manager::RegionReclaimReceipt;
 use self::reader::PendingRead;
 use self::reader::ReadCandidate;
 use self::reader::ReadCompletion;
-use self::reader::ReadPlan;
+use self::reader::ReadDescriptor;
 #[cfg(test)]
-use self::reader::plan_read;
+use self::reader::describe_read;
 use self::reader::submit_read;
 use self::record::RECORD_ALIGNMENT;
 use self::record::RECORD_HEADER_SIZE;
@@ -58,6 +58,7 @@ use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
+use crate::managed_memory::BufferLease;
 use crate::region::appender::RegionSpanCompletion;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
@@ -76,7 +77,6 @@ use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadataError;
 use crate::region::staging::RegionStaging;
-use crate::resources::BufferLease;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
@@ -323,8 +323,8 @@ impl FileRegionCore {
         self.index.snapshot().map_err(index_storage_io_error)
     }
 
-    pub fn set_index_statistics_enabled(&self, enabled: bool) {
-        self.index.set_statistics_enabled(enabled);
+    pub fn set_index_activity_counters_enabled(&self, enabled: bool) {
+        self.index.set_activity_counters_enabled(enabled);
     }
 
     pub fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {
@@ -624,33 +624,33 @@ impl FileRegionCore {
         let Some(candidate) = self.begin_value_read(hash) else {
             return Ok(None);
         };
-        let plan = plan_read(geometry, hash, candidate, true)?;
+        let descriptor = describe_read(geometry, hash, candidate, true)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_plan(engine, slot, buffer, plan, key)
+        self.read_value_from_descriptor(engine, slot, buffer, descriptor, key)
     }
 
     #[cfg(test)]
-    fn read_value_from_plan(
+    fn read_value_from_descriptor(
         &self,
         engine: &dyn IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        plan: ReadPlan,
+        descriptor: ReadDescriptor,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let pending = self.submit_value_read_from_plan(engine, slot, buffer, plan)?;
+        let pending = self.submit_value_read(engine, slot, buffer, descriptor)?;
         let completion = pending.wait(engine);
         self.finish_value_read(completion, key)
     }
 
-    pub fn submit_value_read_from_plan(
+    pub fn submit_value_read(
         &self,
         engine: &dyn IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        plan: ReadPlan,
+        descriptor: ReadDescriptor,
     ) -> io::Result<PendingRead> {
-        match submit_read(engine, slot, plan, buffer) {
+        match submit_read(engine, slot, descriptor, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
                 if !is_read_availability_error(error.kind()) {
@@ -667,7 +667,7 @@ impl FileRegionCore {
         completion: ReadCompletion,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let hash = completion.plan.hash;
+        let hash = completion.descriptor.hash;
         if let Err(error) = completion.result {
             if !is_read_availability_error(error.kind()) {
                 self.health
@@ -690,11 +690,12 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.region_generation != completion.plan.region_generation || header.key_hash != hash
+        if header.region_generation != completion.descriptor.region_generation
+            || header.key_hash != hash
         {
             return Ok(None);
         }
-        let indexed_location = completion.plan.entry.location;
+        let indexed_location = completion.descriptor.entry.location;
         let Ok(exact_location) = PackedLocation::new(
             indexed_location.region_id(),
             indexed_location.offset(),
@@ -727,7 +728,7 @@ impl FileRegionCore {
         if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
             return Ok(None);
         }
-        let value_start = completion.plan.record_range.start + RECORD_HEADER_SIZE + key_len;
+        let value_start = completion.descriptor.record_range.start + RECORD_HEADER_SIZE + key_len;
         let Some(value_end) = value_start.checked_add(value_len) else {
             return Ok(None);
         };
@@ -742,7 +743,7 @@ impl FileRegionCore {
         };
         Ok(Some(RegionValueRead {
             buffer,
-            buffer_len: completion.plan.read_len,
+            buffer_len: completion.descriptor.read_len,
             value_range: value_start..value_end,
             seqno: header.seqno,
         }))
@@ -904,7 +905,7 @@ impl FileRegionCore {
 
     /// Allocates one ordering sequence and removes the current L2 candidate
     /// with a single non-waiting bounded index probe. No Region bytes are
-    /// reserved or written for a delete.
+    /// reserved or written for a deletion.
     pub fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
         self.health.require_healthy()?;
         let seqno = {
@@ -1110,16 +1111,16 @@ impl FileRegionCore {
                 "Region rotation gate is poisoned",
             )
         })?;
-        let plan = match self.manager.lock()?.plan_rotation(shard_id) {
-            Ok(plan) => plan,
+        let candidate = match self.manager.lock()?.rotation_candidate(shard_id) {
+            Ok(candidate) => candidate,
             Err(RegionMutationError::WouldBlock) => return Ok(false),
-            Err(error) => return Err(region_mutation_context("rotation planning", error)),
+            Err(error) => return Err(region_mutation_context("rotation selection", error)),
         };
 
         let receipt = self
             .manager
             .lock()?
-            .begin_rotation(plan)
+            .begin_rotation(candidate)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
         let access = self
             .region_access

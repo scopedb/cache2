@@ -53,8 +53,8 @@ fn run_benchmark() -> io::Result<()> {
     println!("C² RegionIndex turnover benchmark");
     println!(
         "regions={} entries_per_region={} physical_entries={} key_space={} index_slots={} load={:.1}% partitions={} partition_slots={}..={} turns={} sample_ops={}",
-        report.config.region_count,
-        report.config.entries_per_region,
+        report.options.region_count,
+        report.options.entries_per_region,
         report.physical_entries,
         report.key_space_entries,
         report.index_slots,
@@ -62,8 +62,8 @@ fn run_benchmark() -> io::Result<()> {
         report.partition_count,
         report.minimum_partition_slots,
         report.maximum_partition_slots,
-        report.config.turns,
-        report.config.sample_operations,
+        report.options.turns,
+        report.options.sample_operations,
     );
     println!(
         "production_projection capacity=4TiB average_entry=16KiB partitions=4096 physical_entries_per_partition=65536 index_slots_per_partition=131072"

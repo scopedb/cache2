@@ -131,7 +131,7 @@ pub enum ReclaimIndexAction {
 pub struct RegionIndex {
     storage: PartitionedIndexStorage,
     heat: SlotHeat,
-    statistics_enabled: AtomicBool,
+    activity_counters_enabled: AtomicBool,
     relocations: AtomicU64,
     overflow_evictions: AtomicU64,
     conditional_remove_misses: AtomicU64,
@@ -197,7 +197,7 @@ impl RegionIndex {
         Ok(Self {
             storage,
             heat,
-            statistics_enabled: AtomicBool::new(false),
+            activity_counters_enabled: AtomicBool::new(false),
             relocations: AtomicU64::new(0),
             overflow_evictions: AtomicU64::new(0),
             conditional_remove_misses: AtomicU64::new(0),
@@ -209,8 +209,9 @@ impl RegionIndex {
         &self.storage
     }
 
-    pub fn set_statistics_enabled(&self, enabled: bool) {
-        self.statistics_enabled.store(enabled, Ordering::Relaxed);
+    pub fn set_activity_counters_enabled(&self, enabled: bool) {
+        self.activity_counters_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> Result<CacheIndexSnapshot, IndexStorageError> {
@@ -363,7 +364,7 @@ impl RegionIndex {
                     source,
                     value_state(fingerprint, source_displacement, supplied),
                 )?;
-                if self.statistics_enabled.load(Ordering::Relaxed) {
+                if self.activity_counters_enabled.load(Ordering::Relaxed) {
                     self.relocations.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(true);
@@ -448,7 +449,7 @@ impl RegionIndex {
                         source,
                         value_state(fingerprint, source_displacement, supplied),
                     )?;
-                    if self.statistics_enabled.load(Ordering::Relaxed) {
+                    if self.activity_counters_enabled.load(Ordering::Relaxed) {
                         self.relocations.fetch_add(2, Ordering::Relaxed);
                     }
                     return Ok(true);
@@ -468,7 +469,7 @@ impl RegionIndex {
             observed[victim_displacement],
             value_state(fingerprint, victim_displacement, supplied),
         )?;
-        if self.statistics_enabled.load(Ordering::Relaxed) {
+        if self.activity_counters_enabled.load(Ordering::Relaxed) {
             self.overflow_evictions.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
@@ -550,7 +551,7 @@ impl RegionIndex {
                 return Ok(true);
             }
         }
-        if self.statistics_enabled.load(Ordering::Relaxed) {
+        if self.activity_counters_enabled.load(Ordering::Relaxed) {
             self.conditional_replace_misses
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -595,7 +596,7 @@ impl RegionIndex {
     }
 
     fn record_conditional_remove_miss(&self) {
-        if self.statistics_enabled.load(Ordering::Relaxed) {
+        if self.activity_counters_enabled.load(Ordering::Relaxed) {
             self.conditional_remove_misses
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -746,7 +747,7 @@ mod tests {
     fn full_candidate_window_uses_the_bounded_second_relocation_hop() {
         let trigger = {
             let index = anonymous(128);
-            index.set_statistics_enabled(true);
+            index.set_activity_counters_enabled(true);
             (0..10_000_u64)
                 .find(|ordinal| {
                     let hash = hash_key(7, &ordinal.to_le_bytes());
@@ -760,7 +761,7 @@ mod tests {
         };
 
         let index = anonymous(128);
-        index.set_statistics_enabled(true);
+        index.set_activity_counters_enabled(true);
         let mut published = Vec::new();
         for ordinal in 0..trigger {
             let hash = hash_key(7, &ordinal.to_le_bytes());

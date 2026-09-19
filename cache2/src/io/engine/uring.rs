@@ -42,7 +42,7 @@ use io_uring::opcode;
 use io_uring::squeue;
 use io_uring::types;
 
-use crate::config::runtime::IoUringPoolOptions;
+use crate::config::runtime::IoUringEngineConfig;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStatsHandle;
@@ -73,7 +73,8 @@ use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 #[cfg(test)]
 use crate::io::engine::io_uring_extra_memory_bytes;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::stats::recording::IoTiming;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
@@ -129,13 +130,13 @@ pub struct UringIoEngine {
 impl UringIoEngine {
     pub fn new_with_files(
         files: RuntimeFileSet,
-        max_in_flight: usize,
-        config: IoUringPoolOptions,
-        statistics_enabled: bool,
+        config: IoUringEngineConfig,
+        activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
+        let max_in_flight = config.max_in_flight;
         RuntimeInner::validate_max_in_flight(max_in_flight)?;
-        files.set_statistics_enabled(statistics_enabled);
+        files.set_activity_counters_enabled(activity_counters_enabled);
         let io_stats = files.stats_handle();
         let ring_entries = max_in_flight
             .checked_add(2)
@@ -201,7 +202,7 @@ impl UringIoEngine {
         });
         let shared = Arc::new(RuntimeShared::new(
             max_in_flight,
-            statistics_enabled,
+            activity_counters_enabled,
             read_wait_enabled,
         ));
         let command_capacity = max_in_flight
@@ -245,7 +246,7 @@ impl UringIoEngine {
 }
 
 impl IoEngine for UringIoEngine {
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+    fn set_latency_recorder(&self, recorder: IoTiming) {
         assert!(
             self.inner.shared.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"
@@ -1122,13 +1123,13 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::resources::ResourceController;
-    use crate::resources::ResourceLimits;
+    use crate::managed_memory::ManagedMemory;
+    use crate::managed_memory::ManagedMemoryLimits;
 
     struct CancelledCommandProducer {
         shared: Arc<RuntimeShared>,
         commands: mpsc::SyncSender<DriverCommand>,
-        resources: ResourceController,
+        managed_memory: ManagedMemory,
         next: AtomicU64,
         completed: AtomicUsize,
     }
@@ -1143,7 +1144,7 @@ mod tests {
                 completion.cell.lock().unwrap().waker = Some(Waker::from(Arc::clone(self)));
             }
             let buffer =
-                IoBuffer::for_read(self.resources.try_read_buffer(4096).unwrap(), 1).unwrap();
+                IoBuffer::for_read(self.managed_memory.try_read_buffer(4096).unwrap(), 1).unwrap();
             let task = Task {
                 request_id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 operation: IoOperation::read(buffer, 0),
@@ -1172,7 +1173,7 @@ mod tests {
         let producer = Arc::new(CancelledCommandProducer {
             shared: Arc::clone(&shared),
             commands,
-            resources: ResourceController::try_new(ResourceLimits {
+            managed_memory: ManagedMemory::try_new(ManagedMemoryLimits {
                 memory_limit_bytes: 16 * 1024,
                 reserved_memory_bytes: 0,
             })

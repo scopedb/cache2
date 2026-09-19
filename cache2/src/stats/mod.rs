@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional request accounting and cumulative latency distributions.
+//! Optional activity counters, request accounting, and latency distributions.
 //!
-//! The legacy `RuntimeOptions::statistics` switch retains its existing behavior.
-//! These options add public request outcomes and timing independently. Sampled
+//! Activity counters, public request outcomes, and timing are independent. Sampled
 //! durations describe observed requests only; they are not full-population SLOs.
 
 use std::num::NonZeroU32;
@@ -41,7 +40,7 @@ pub enum LatencyMode {
     },
 }
 
-/// Additional statistics allocated once per open, independent of legacy counters.
+/// Statistics collection selected once per open.
 ///
 /// Defaults allocate no counter or histogram stripes. Enable `request_counters` for complete
 /// terminal accounting even when durations are sampled. All enabled storage is
@@ -49,6 +48,9 @@ pub enum LatencyMode {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatsOptions {
+    /// Count cache, index, reclaim, and I/O activity. Defaults to false;
+    /// health and resource gauges remain available independently.
+    pub activity_counters: bool,
     /// Count every terminal get, put, put_l2 and delete by exclusive result.
     pub request_counters: bool,
     /// Time L1 hits from the first poll to return. L1 misses discard this timer.
@@ -69,6 +71,7 @@ pub struct StatsOptions {
 impl Default for StatsOptions {
     fn default() -> Self {
         Self {
+            activity_counters: false,
             request_counters: false,
             l1_latency: LatencyMode::Off,
             l2_latency: LatencyMode::Off,
@@ -321,15 +324,15 @@ pub struct IoLatencySnapshot {
 
 /// Cumulative monitoring view without metadata scans or recorder locks.
 ///
-/// Legacy activity availability is given by summary.statistics_enabled; new
-/// families use explicit options and optional values. The application owns
+/// Activity availability is given by `summary.activity_counters_enabled`; request
+/// and latency families use explicit options and optional values. The application owns
 /// collection scheduling, timestamp assignment and export to its monitoring SDK. Empty vectors
 /// indicate a disabled family, not a zero-event population. Returned allocations belong to
 /// the caller; cache-owned recorder storage is fixed and charged at open.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheStatsSnapshot {
-    /// Existing health, resource, activity, I/O and reclaim metrics and reset epoch.
+    /// Health, resource, activity, I/O and reclaim metrics and reset epoch.
     pub summary: CacheSnapshot,
     /// Exact collection settings for this open.
     pub options: StatsOptions,

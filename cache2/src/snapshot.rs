@@ -49,7 +49,7 @@ pub struct CacheSnapshot {
     /// Current cache availability.
     pub health: CacheHealth,
     /// Whether optional cumulative activity and I/O counters are enabled.
-    pub statistics_enabled: bool,
+    pub activity_counters_enabled: bool,
     /// Accepted `put` and `put_l2` operations.
     pub puts: u64,
     /// Accepted delete operations.

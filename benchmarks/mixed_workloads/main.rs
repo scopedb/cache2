@@ -29,6 +29,9 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::io_engine_from_env;
+use benchmarks::config::read_max_in_flight;
+use benchmarks::config::reclaim_max_in_flight;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
 use benchmarks::report::RunReporter;
@@ -40,9 +43,7 @@ use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
-use cache2::IoUringOptions;
 use cache2::L1EvictionPolicy;
-use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
 
@@ -105,14 +106,14 @@ impl Scenario {
         }
     }
 
-    const fn default_l1_mib(self) -> usize {
+    const fn default_l1_capacity_mib(self) -> usize {
         match self {
             Self::Mixed => 32,
             Self::Reinsertion | Self::NegativeLookup => 1,
         }
     }
 
-    const fn default_l2_mib(self) -> usize {
+    const fn default_capacity_mib(self) -> usize {
         match self {
             Self::Mixed => 64,
             Self::Reinsertion => 8,
@@ -120,7 +121,7 @@ impl Scenario {
         }
     }
 
-    const fn default_region_mib(self) -> usize {
+    const fn default_region_size_mib(self) -> usize {
         match self {
             Self::Mixed => 4,
             Self::Reinsertion | Self::NegativeLookup => 1,
@@ -197,19 +198,16 @@ enum Operation {
     Delete,
 }
 
-struct HarnessConfig {
+struct HarnessOptions {
     scenarios: Box<[Scenario]>,
     operations_per_thread: Option<usize>,
     threads: Option<usize>,
     key_count: Option<usize>,
-    l1_mib: Option<usize>,
-    l2_mib: Option<usize>,
+    l1_capacity_mib: Option<usize>,
+    capacity_mib: Option<usize>,
     managed_memory_limit_mib: Option<usize>,
-    region_mib: Option<usize>,
+    region_size_mib: Option<usize>,
     append_shards: u32,
-    read_io_workers: usize,
-    write_io_workers: usize,
-    reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
@@ -218,50 +216,21 @@ struct HarnessConfig {
     directory: PathBuf,
 }
 
-impl HarnessConfig {
+impl HarnessOptions {
     fn from_env() -> io::Result<Self> {
         let scenarios = parse_scenarios()?;
         let operations_per_thread = env_optional_usize("CACHE_WORKLOAD_OPS_PER_THREAD")?;
         let threads = env_optional_usize("CACHE_WORKLOAD_THREADS")?;
         let key_count = env_optional_usize("CACHE_WORKLOAD_KEYS")?;
-        let l1_mib = env_optional_usize("CACHE_WORKLOAD_L1_MIB")?;
-        let l2_mib = env_optional_usize("CACHE_WORKLOAD_L2_MIB")?;
+        let l1_capacity_mib = env_optional_usize("CACHE_WORKLOAD_L1_CAPACITY_MIB")?;
+        let capacity_mib = env_optional_usize("CACHE_WORKLOAD_CAPACITY_MIB")?;
         let managed_memory_limit_mib =
             env_optional_usize("CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB")?;
-        let region_mib = env_optional_usize("CACHE_WORKLOAD_REGION_MIB")?;
+        let region_size_mib = env_optional_usize("CACHE_WORKLOAD_REGION_SIZE_MIB")?;
         let append_shards = env_u32("CACHE_WORKLOAD_APPEND_SHARDS", 4)?;
-        let read_io_workers = env_usize("CACHE_WORKLOAD_READ_IO_WORKERS", 4)?;
-        let write_io_workers = env_usize("CACHE_WORKLOAD_WRITE_IO_WORKERS", 4)?;
-        let reclaim_workers = env_usize("CACHE_WORKLOAD_RECLAIM_WORKERS", 1)?;
+        let io_engine = io_engine_from_env("CACHE_WORKLOAD")?;
         let latency_sample_interval = env_usize("CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL", 16)?;
         let seed = env_u64("CACHE_WORKLOAD_SEED", DEFAULT_SEED)?;
-        let io_engine = match env::var("CACHE_WORKLOAD_IO_ENGINE")
-            .unwrap_or_else(|_| "posix".to_owned())
-            .as_str()
-        {
-            "posix" => {
-                let mut options = PosixIoOptions::default();
-                options.read_workers = read_io_workers;
-                options.write_workers = write_io_workers;
-                options.reclaim_workers = reclaim_workers;
-                IoEngineOptions::Posix(options)
-            }
-            "io-uring" => {
-                let mut options = IoUringOptions::default();
-                options.read.rings = read_io_workers;
-                options.read.max_in_flight = read_io_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("read io_uring depth is too large"))?;
-                options.write.rings = write_io_workers;
-                options.write.max_in_flight = write_io_workers
-                    .checked_mul(64)
-                    .ok_or_else(|| invalid("write io_uring depth is too large"))?;
-                options.reclaim.rings = reclaim_workers;
-                options.reclaim.max_in_flight = reclaim_workers;
-                IoEngineOptions::IoUring(options)
-            }
-            value => return Err(invalid(format!("unsupported I/O engine: {value}"))),
-        };
         let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
             .unwrap_or_else(|_| "buffered".to_owned())
             .as_str()
@@ -285,12 +254,8 @@ impl HarnessConfig {
         if operations_per_thread == Some(0)
             || threads == Some(0)
             || key_count == Some(0)
-            || region_mib.is_some_and(|value| value == 0 || value > 32)
+            || region_size_mib.is_some_and(|value| value == 0 || value > 32)
             || append_shards == 0
-            || read_io_workers == 0
-            || write_io_workers == 0
-            || reclaim_workers == 0
-            || reclaim_workers > append_shards as usize
             || !directory.is_dir()
         {
             return Err(invalid(
@@ -303,14 +268,11 @@ impl HarnessConfig {
             operations_per_thread,
             threads,
             key_count,
-            l1_mib,
-            l2_mib,
+            l1_capacity_mib,
+            capacity_mib,
             managed_memory_limit_mib,
-            region_mib,
+            region_size_mib,
             append_shards,
-            read_io_workers,
-            write_io_workers,
-            reclaim_workers,
             latency_sample_interval,
             seed,
             io_engine,
@@ -320,17 +282,21 @@ impl HarnessConfig {
         })
     }
 
-    fn effective(&self, scenario: Scenario) -> io::Result<EffectiveConfig> {
+    fn resolve(&self, scenario: Scenario) -> io::Result<ScenarioConfig> {
         let operations_per_thread = self
             .operations_per_thread
             .unwrap_or_else(|| scenario.default_operations_per_thread());
         let threads = self.threads.unwrap_or_else(|| scenario.default_threads());
         let key_count = self.key_count.unwrap_or_else(|| scenario.default_keys());
-        let l1_mib = self.l1_mib.unwrap_or_else(|| scenario.default_l1_mib());
-        let l2_mib = self.l2_mib.unwrap_or_else(|| scenario.default_l2_mib());
-        let region_mib = self
-            .region_mib
-            .unwrap_or_else(|| scenario.default_region_mib());
+        let l1_capacity_mib = self
+            .l1_capacity_mib
+            .unwrap_or_else(|| scenario.default_l1_capacity_mib());
+        let capacity_mib = self
+            .capacity_mib
+            .unwrap_or_else(|| scenario.default_capacity_mib());
+        let region_size_mib = self
+            .region_size_mib
+            .unwrap_or_else(|| scenario.default_region_size_mib());
         if operations_per_thread == 0 || threads == 0 || key_count == 0 {
             return Err(invalid("effective workload counts must be positive"));
         }
@@ -340,11 +306,11 @@ impl HarnessConfig {
         let total_operations = operations_per_thread
             .checked_mul(threads)
             .ok_or_else(|| invalid("total operation count is too large"))?;
-        let region_bytes = mib_to_usize("CACHE_WORKLOAD_REGION_MIB", region_mib)?;
-        let capacity_bytes = mib_to_u64("CACHE_WORKLOAD_L2_MIB", l2_mib)?;
-        let l1_bytes = mib_to_usize("CACHE_WORKLOAD_L1_MIB", l1_mib)?;
-        if capacity_bytes % region_bytes as u64 != 0
-            || capacity_bytes / region_bytes as u64 <= u64::from(self.append_shards)
+        let region_size_bytes = mib_to_usize("CACHE_WORKLOAD_REGION_SIZE_MIB", region_size_mib)?;
+        let capacity_bytes = mib_to_u64("CACHE_WORKLOAD_CAPACITY_MIB", capacity_mib)?;
+        let l1_capacity_bytes = mib_to_usize("CACHE_WORKLOAD_L1_CAPACITY_MIB", l1_capacity_mib)?;
+        if capacity_bytes % region_size_bytes as u64 != 0
+            || capacity_bytes / region_size_bytes as u64 <= u64::from(self.append_shards)
         {
             return Err(invalid(
                 "L2 capacity must be a Region-size multiple with more Regions than append shards",
@@ -354,40 +320,37 @@ impl HarnessConfig {
             .maximum_value_bytes()
             .checked_add(MAX_KEY_BYTES + RECORD_OVERHEAD_BYTES)
             .ok_or_else(|| invalid("maximum record size overflow"))?;
-        if maximum_record_bytes > region_bytes {
+        if maximum_record_bytes > region_size_bytes {
             return Err(invalid(format!(
-                "{} workload records do not fit CACHE_WORKLOAD_REGION_MIB={}",
+                "{} workload records do not fit CACHE_WORKLOAD_REGION_SIZE_MIB={}",
                 scenario.slug(),
-                region_mib
+                region_size_mib
             )));
         }
 
         let managed_memory_limit_bytes = match self.managed_memory_limit_mib {
             Some(value) => mib_to_usize("CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB", value)?,
             None => default_managed_memory_limit(
-                l1_bytes,
-                region_bytes,
+                l1_capacity_bytes,
+                region_size_bytes,
                 self.append_shards,
-                self.read_io_workers,
-                self.reclaim_workers,
+                read_max_in_flight(self.io_engine),
+                reclaim_max_in_flight(self.io_engine),
                 key_count,
             )?,
         };
 
-        Ok(EffectiveConfig {
+        Ok(ScenarioConfig {
             scenario,
             operations_per_thread,
             threads,
             key_count,
             total_operations,
             capacity_bytes,
-            l1_bytes,
+            l1_capacity_bytes,
             managed_memory_limit_bytes,
-            region_bytes,
+            region_size_bytes,
             append_shards: self.append_shards,
-            read_io_workers: self.read_io_workers,
-            write_io_workers: self.write_io_workers,
-            reclaim_workers: self.reclaim_workers,
             latency_sample_interval: self.latency_sample_interval,
             seed: self.seed,
             io_engine: self.io_engine,
@@ -398,20 +361,17 @@ impl HarnessConfig {
     }
 }
 
-struct EffectiveConfig {
+struct ScenarioConfig {
     scenario: Scenario,
     operations_per_thread: usize,
     threads: usize,
     key_count: usize,
     total_operations: usize,
     capacity_bytes: u64,
-    l1_bytes: usize,
+    l1_capacity_bytes: usize,
     managed_memory_limit_bytes: usize,
-    region_bytes: usize,
+    region_size_bytes: usize,
     append_shards: u32,
-    read_io_workers: usize,
-    write_io_workers: usize,
-    reclaim_workers: usize,
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
@@ -420,10 +380,10 @@ struct EffectiveConfig {
     directory: PathBuf,
 }
 
-impl EffectiveConfig {
+impl ScenarioConfig {
     fn storage_options(&self) -> StorageOptions {
         let mut options = StorageOptions::new(self.capacity_bytes);
-        options.region_size_bytes = self.region_bytes as u64;
+        options.region_size_bytes = self.region_size_bytes as u64;
         options.expected_entries = Some(self.key_count);
         options
     }
@@ -433,10 +393,10 @@ impl EffectiveConfig {
         options.io_engine = self.io_engine;
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
-        options.l1_capacity_bytes = self.l1_bytes;
+        options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
-        options.statistics = true;
+        options.stats.activity_counters = true;
         options
     }
 }
@@ -571,12 +531,12 @@ impl DeterministicRng {
 }
 
 fn main() -> io::Result<()> {
-    let harness = HarnessConfig::from_env()?;
-    let configs = harness
+    let options = HarnessOptions::from_env()?;
+    let configs = options
         .scenarios
         .iter()
         .copied()
-        .map(|scenario| harness.effective(scenario))
+        .map(|scenario| options.resolve(scenario))
         .collect::<io::Result<Vec<_>>>()?;
     let runtime_threads = configs
         .iter()
@@ -597,7 +557,7 @@ fn main() -> io::Result<()> {
     })
 }
 
-async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
+async fn run_scenario(config: ScenarioConfig) -> io::Result<()> {
     let reporter = RunReporter::start("mixed_workloads", Some(config.scenario.slug()));
     let result = run_scenario_inner(config).await;
     reporter.finish(
@@ -609,23 +569,20 @@ async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
     result
 }
 
-async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
+async fn run_scenario_inner(config: ScenarioConfig) -> io::Result<()> {
     let scenario = config.scenario;
     println!("C² mixed workload: {}", scenario.slug());
     println!(
-        "effective threads={} ops_per_thread={} total_ops={} keys={} l1_mib={:.1} l2_mib={:.1} region_mib={:.1} managed_limit_mib={:.1} append_shards={} read_workers={} write_workers={} reclaim_workers={} latency_sample_interval={} seed={} l1_eviction={:?} engine={:?} mode={:?}",
+        "effective threads={} ops_per_thread={} total_ops={} keys={} l1_capacity_mib={:.1} capacity_mib={:.1} region_size_mib={:.1} managed_limit_mib={:.1} append_shards={} latency_sample_interval={} seed={} l1_eviction={:?} engine={:?} mode={:?}",
         config.threads,
         config.operations_per_thread,
         config.total_operations,
         config.key_count,
-        config.l1_bytes as f64 / MIB as f64,
+        config.l1_capacity_bytes as f64 / MIB as f64,
         config.capacity_bytes as f64 / MIB as f64,
-        config.region_bytes as f64 / MIB as f64,
+        config.region_size_bytes as f64 / MIB as f64,
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config.append_shards,
-        config.read_io_workers,
-        config.write_io_workers,
-        config.reclaim_workers,
         config.latency_sample_interval,
         config.seed,
         config.l1_eviction_policy,
@@ -707,7 +664,7 @@ async fn run_worker(
     worker_id: usize,
     cache: &Cache,
     expected: &[AtomicU64],
-    config: &EffectiveConfig,
+    config: &ScenarioConfig,
 ) -> io::Result<WorkloadResult> {
     let worker_seed = mixed(
         config.seed ^ config.scenario.seed_salt() ^ (worker_id as u64).wrapping_mul(RNG_GAMMA),
@@ -991,7 +948,7 @@ fn validate_snapshot(result: &WorkloadResult, snapshot: &CacheSnapshot) -> io::R
 }
 
 fn report(
-    config: &EffectiveConfig,
+    config: &ScenarioConfig,
     result: &WorkloadResult,
     workload_elapsed: Duration,
     drain_elapsed: Duration,
@@ -1196,26 +1153,26 @@ fn parse_scenarios() -> io::Result<Box<[Scenario]>> {
 }
 
 fn default_managed_memory_limit(
-    l1_bytes: usize,
-    region_bytes: usize,
+    l1_capacity_bytes: usize,
+    region_size_bytes: usize,
     append_shards: u32,
-    read_io_workers: usize,
-    reclaim_workers: usize,
+    read_max_in_flight: usize,
+    reclaim_max_in_flight: usize,
     key_count: usize,
 ) -> io::Result<usize> {
     let staging_bytes = usize::try_from(append_shards)
         .ok()
         .and_then(|shards| shards.checked_mul(2))
-        .and_then(|buffers| buffers.checked_mul(region_bytes))
+        .and_then(|buffers| buffers.checked_mul(region_size_bytes))
         .ok_or_else(|| invalid("append staging estimate is too large"))?;
-    let io_buffer_bytes = read_io_workers
-        .checked_add(reclaim_workers)
-        .and_then(|buffers| buffers.checked_mul(region_bytes))
+    let io_buffer_bytes = read_max_in_flight
+        .checked_add(reclaim_max_in_flight)
+        .and_then(|buffers| buffers.checked_mul(region_size_bytes))
         .ok_or_else(|| invalid("I/O buffer estimate is too large"))?;
     let index_bytes = key_count
         .checked_mul(160)
         .ok_or_else(|| invalid("index memory estimate is too large"))?;
-    let bytes = l1_bytes
+    let bytes = l1_capacity_bytes
         .checked_add(staging_bytes)
         .and_then(|total| total.checked_add(io_buffer_bytes))
         .and_then(|total| total.checked_add(index_bytes))

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded write admission and aligned record buffers.
+//! Managed-memory accounting and aligned record buffers.
 //!
 //! Foreground reads allocate one alignment-rounded transient buffer for the
-//! size-class-bounded planned range after an L2 index hit. Write waiting uses
+//! size-class-bounded read range after an L2 index hit. Write waiting uses
 //! a separate request gate.
 
 use std::alloc::Layout;
@@ -34,27 +34,27 @@ pub const BUFFER_ALIGNMENT: usize = 4096;
 pub const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
 pub const MAX_CONFIG_COUNT: usize = 65_536;
 
-pub struct ResourceLimits {
+pub struct ManagedMemoryLimits {
     pub memory_limit_bytes: usize,
     pub reserved_memory_bytes: usize,
 }
 
 #[derive(Debug)]
-pub enum ResourceBuildError {
+pub enum ManagedMemoryError {
     Invalid(&'static str),
     Allocation,
 }
 
-impl fmt::Display for ResourceBuildError {
+impl fmt::Display for ManagedMemoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
-            Self::Allocation => formatter.write_str("resource bookkeeping cannot be allocated"),
+            Self::Allocation => formatter.write_str("managed memory cannot be allocated"),
         }
     }
 }
 
-pub struct ResourceController {
+pub struct ManagedMemory {
     memory: Arc<MemoryTracker>,
 }
 
@@ -72,10 +72,10 @@ impl Drop for RuntimeMemoryReservation {
     }
 }
 
-impl ResourceController {
-    pub fn try_new(limits: ResourceLimits) -> Result<Self, ResourceBuildError> {
+impl ManagedMemory {
+    pub fn try_new(limits: ManagedMemoryLimits) -> Result<Self, ManagedMemoryError> {
         if limits.reserved_memory_bytes > limits.memory_limit_bytes {
-            return Err(ResourceBuildError::Invalid(
+            return Err(ManagedMemoryError::Invalid(
                 "memory limit cannot hold the cache's reserved memory",
             ));
         }
@@ -90,9 +90,9 @@ impl ResourceController {
     pub fn reserve_runtime_memory(
         &self,
         bytes: usize,
-    ) -> Result<RuntimeMemoryReservation, ResourceBuildError> {
+    ) -> Result<RuntimeMemoryReservation, ManagedMemoryError> {
         if !self.memory.try_reserve(bytes) {
-            return Err(ResourceBuildError::Allocation);
+            return Err(ManagedMemoryError::Allocation);
         }
         Ok(RuntimeMemoryReservation {
             memory: Arc::clone(&self.memory),
@@ -107,7 +107,7 @@ impl ResourceController {
         BufferLease::try_standalone(length, Arc::clone(&self.memory))
     }
 
-    pub fn managed_memory_snapshot(&self) -> ManagedMemorySnapshot {
+    pub fn snapshot(&self) -> ManagedMemorySnapshot {
         let current_bytes = self.memory.current.load(Ordering::Relaxed);
         ManagedMemorySnapshot {
             limit_bytes: self.memory.limit,
@@ -135,13 +135,13 @@ enum BufferOwner {
 }
 
 impl BufferLease {
-    pub fn try_fixed(length: usize) -> Result<Self, ResourceBuildError> {
+    pub fn try_fixed(length: usize) -> Result<Self, ManagedMemoryError> {
         if length == 0 || !length.is_multiple_of(BUFFER_ALIGNMENT) || length > isize::MAX as usize {
-            return Err(ResourceBuildError::Invalid(
+            return Err(ManagedMemoryError::Invalid(
                 "fixed buffer size must be a non-zero 4096-byte multiple",
             ));
         }
-        let ptr = allocate_buffer(length).ok_or(ResourceBuildError::Allocation)?;
+        let ptr = allocate_buffer(length).ok_or(ManagedMemoryError::Allocation)?;
         let mut buffer = AlignedBuffer {
             ptr,
             capacity: length,
@@ -408,8 +408,8 @@ const MAX_ATOMIC_UPDATE_ATTEMPTS: usize = 8;
 mod tests {
     use super::*;
 
-    fn limits() -> ResourceLimits {
-        ResourceLimits {
+    fn limits() -> ManagedMemoryLimits {
+        ManagedMemoryLimits {
             memory_limit_bytes: 128 * 1024,
             reserved_memory_bytes: 16 * 1024,
         }
@@ -417,14 +417,14 @@ mod tests {
 
     #[test]
     fn transient_read_buffers_charge_exact_aligned_bytes_and_release_them() {
-        let resources = ResourceController::try_new(limits()).unwrap();
-        let first = resources.try_read_buffer(5000).unwrap();
-        let second = resources.try_read_buffer(9000).unwrap();
+        let managed_memory = ManagedMemory::try_new(limits()).unwrap();
+        let first = managed_memory.try_read_buffer(5000).unwrap();
+        let second = managed_memory.try_read_buffer(9000).unwrap();
         assert_eq!(first.address() % BUFFER_ALIGNMENT, 0);
         assert_eq!(second.address() % BUFFER_ALIGNMENT, 0);
         assert!(first.prepared(5000).is_err());
         assert!(second.prepared(9000).is_err());
-        let snapshot = resources.managed_memory_snapshot();
+        let snapshot = managed_memory.snapshot();
         assert_eq!(
             snapshot.current_bytes,
             16 * 1024 + 2 * BUFFER_ALIGNMENT + 3 * BUFFER_ALIGNMENT
@@ -432,7 +432,7 @@ mod tests {
         assert!(snapshot.peak_bytes <= snapshot.limit_bytes);
         drop(first);
         drop(second);
-        assert_eq!(resources.managed_memory_snapshot().current_bytes, 16 * 1024);
+        assert_eq!(managed_memory.snapshot().current_bytes, 16 * 1024);
     }
 
     #[test]
@@ -469,15 +469,21 @@ mod tests {
         let mut configured = limits();
         configured.memory_limit_bytes = configured.reserved_memory_bytes + 3 * BUFFER_ALIGNMENT;
 
-        let resources = ResourceController::try_new(configured).unwrap();
-        let first = resources.try_read_buffer(BUFFER_ALIGNMENT).unwrap();
-        let second = resources.try_read_buffer(2 * BUFFER_ALIGNMENT).unwrap();
-        assert!(resources.try_read_buffer(1).is_none());
-        let memory = resources.managed_memory_snapshot();
+        let managed_memory = ManagedMemory::try_new(configured).unwrap();
+        let first = managed_memory.try_read_buffer(BUFFER_ALIGNMENT).unwrap();
+        let second = managed_memory
+            .try_read_buffer(2 * BUFFER_ALIGNMENT)
+            .unwrap();
+        assert!(managed_memory.try_read_buffer(1).is_none());
+        let memory = managed_memory.snapshot();
         assert_eq!(memory.current_bytes, memory.limit_bytes);
         assert!(memory.peak_bytes <= memory.limit_bytes);
         drop((first, second));
-        assert!(resources.try_read_buffer(3 * BUFFER_ALIGNMENT).is_some());
+        assert!(
+            managed_memory
+                .try_read_buffer(3 * BUFFER_ALIGNMENT)
+                .is_some()
+        );
     }
 
     #[test]
@@ -485,8 +491,8 @@ mod tests {
         let mut too_small = limits();
         too_small.memory_limit_bytes = too_small.reserved_memory_bytes - 1;
         assert!(matches!(
-            ResourceController::try_new(too_small),
-            Err(ResourceBuildError::Invalid(_))
+            ManagedMemory::try_new(too_small),
+            Err(ManagedMemoryError::Invalid(_))
         ));
     }
 }

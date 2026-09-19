@@ -73,7 +73,7 @@ fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
     options.l1_capacity_bytes = 4 * 1024 * 1024;
     options.managed_memory_limit_bytes = 32 * 1024 * 1024;
     options.write_flush_threshold_bytes = 256 * 1024;
-    options.statistics = true;
+    options.stats.activity_counters = true;
     options
 }
 
@@ -505,7 +505,7 @@ fn unavailable_io_engine_is_rejected_before_file_creation() {
     let mut runtime = test_runtime_options(1, 2);
     runtime.io_engine = IoEngineOptions::IoUring(IoUringOptions::default());
     runtime.write_flush_threshold_bytes = 128 * 1024;
-    runtime.statistics = false;
+    runtime.stats.activity_counters = false;
 
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -521,7 +521,7 @@ fn unavailable_direct_io_is_rejected_before_file_creation() {
     let mut runtime = test_runtime_options(1, 2);
     runtime.io_mode = IoMode::Direct;
     runtime.write_flush_threshold_bytes = 128 * 1024;
-    runtime.statistics = false;
+    runtime.stats.activity_counters = false;
 
     let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -565,7 +565,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     reopened_options.l1_eviction_policy = L1EvictionPolicy::S3Fifo;
     reopened_options.l1_shards = 7;
     reopened_options.write_flush_threshold_bytes = 64 * 1024;
-    reopened_options.statistics = false;
+    reopened_options.stats.activity_counters = false;
     reopened_options.read_admission = ReadAdmission::Wait {
         timeout: Duration::from_millis(10),
         max_waiters: None,
@@ -581,7 +581,7 @@ async fn runtime_options_can_change_across_a_warm_reopen() {
     assert_eq!(first.tier(), CacheTier::L2);
     assert_eq!(first.as_ref(), vec![7_u8; 16 * 1024]);
     drop(first);
-    assert!(!reopened.snapshot().unwrap().statistics_enabled);
+    assert!(!reopened.snapshot().unwrap().activity_counters_enabled);
     reopened.close_fast().await.unwrap();
 }
 
@@ -940,7 +940,7 @@ async fn detailed_snapshot_reports_bounded_resource_state() {
     let detailed = completed_reclaim_snapshot(&cache).await;
     let resources = detailed.summary;
     assert_eq!(resources.health, CacheHealth::Running);
-    assert!(resources.statistics_enabled);
+    assert!(resources.activity_counters_enabled);
     assert!(resources.reclaim.regions > 0);
     assert_eq!(resources.managed_memory_limit_bytes, 32 * 1024 * 1024);
     assert!(resources.managed_memory_bytes <= resources.managed_memory_limit_bytes);
@@ -1280,7 +1280,7 @@ async fn structured_stats_track_original_hit_tier_and_full_distributions() {
 
     let files = TestCache::new("structured-stats");
     let mut options = test_runtime_options(1, 2);
-    options.statistics = false;
+    options.stats.activity_counters = false;
     options.stats.request_counters = true;
     options.stats.l1_latency = LatencyMode::Full;
     options.stats.l2_latency = LatencyMode::Full;
@@ -1311,7 +1311,7 @@ async fn structured_stats_track_original_hit_tier_and_full_distributions() {
     );
     cache.delete(b"l2").unwrap();
     let stats = cache.stats_snapshot().unwrap();
-    assert!(!stats.summary.statistics_enabled);
+    assert!(!stats.summary.activity_counters_enabled);
     assert_eq!(stats.summary.l2_hits, 0);
     for (operation, outcome) in [
         (RequestOperation::PutL2, RequestOutcome::Accepted),
@@ -1361,14 +1361,24 @@ async fn structured_stats_track_original_hit_tier_and_full_distributions() {
 }
 
 #[tokio::test]
-async fn disabled_stats_do_not_allocate_recorders() {
-    let files = TestCache::new("disabled-stats");
-    let cache = Cache::open(&files.data, test_config(1)).await.unwrap();
-    let stats = cache.stats_snapshot().unwrap();
-    assert!(stats.requests.is_empty());
-    assert!(stats.io_latency.is_empty());
-    assert_eq!(stats.recorder_bytes, 0);
-    cache.close_fast().await.unwrap();
+async fn activity_counters_do_not_enable_request_recorders() {
+    for activity_counters in [false, true] {
+        let files = TestCache::new("activity-stats");
+        let mut options = test_runtime_options(1, 2);
+        options.stats.activity_counters = activity_counters;
+        let config = CacheConfig::new(test_storage(), options).unwrap();
+        let cache = Cache::open(&files.data, config).await.unwrap();
+        cache.put(b"key", b"value").unwrap();
+        assert_eq!(cache.get(b"key").await.unwrap().unwrap().as_ref(), b"value");
+        let stats = cache.stats_snapshot().unwrap();
+        assert_eq!(stats.summary.activity_counters_enabled, activity_counters);
+        assert_eq!(stats.summary.puts, u64::from(activity_counters));
+        assert_eq!(stats.summary.l1_hits, u64::from(activity_counters));
+        assert!(stats.requests.is_empty());
+        assert!(stats.io_latency.is_empty());
+        assert_eq!(stats.recorder_bytes, 0);
+        cache.close_fast().await.unwrap();
+    }
 }
 
 #[tokio::test]
