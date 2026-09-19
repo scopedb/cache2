@@ -115,8 +115,8 @@ impl Value {
 pub struct Cache {
     // Keep public reads off the write-mutated admission counter's cache line.
     closed: AtomicBool,
-    read_statistics: bool,
-    mutation_statistics: bool,
+    read_recording: bool,
+    mutation_recording: bool,
     data_plane: RegionDataPlane,
     owner: Arc<Mutex<RegionStore<FileRegionBackend<SystemRegionFileSystem>>>>,
     startup: StartupMode,
@@ -247,10 +247,10 @@ impl Cache {
         let index_slots = config.storage().index_slots();
         let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
         let stats = config.runtime().stats;
-        let read_statistics = stats.request_counters
+        let read_recording = stats.request_counters
             || stats.l1_latency != crate::LatencyMode::Off
             || stats.l2_latency != crate::LatencyMode::Off;
-        let mutation_statistics =
+        let mutation_recording =
             stats.request_counters || stats.mutation_latency != crate::LatencyMode::Off;
         let backend = FileRegionBackend::new(files, format_data, config);
         let store = RegionStore::open(index_slots, backend)?;
@@ -258,8 +258,8 @@ impl Cache {
         let data_plane = store.data_plane_handle()?;
         Ok(Cache {
             closed: AtomicBool::new(false),
-            read_statistics,
-            mutation_statistics,
+            read_recording,
+            mutation_recording,
             data_plane,
             owner: Arc::new(Mutex::new(store)),
             startup,
@@ -348,7 +348,7 @@ impl Cache {
     pub async fn get(&self, key: impl AsRef<[u8]> + Send) -> Result<Option<Value>, Error> {
         // Keep the disabled arm identical to the uninstrumented read path: no
         // recorder access, guard, clock, TLS or terminal-result classification.
-        if !self.read_statistics {
+        if !self.read_recording {
             if self.is_closed() {
                 return Ok(None);
             }
@@ -486,7 +486,7 @@ impl Cache {
         mutation: impl FnOnce() -> io::Result<u64>,
     ) -> Result<u64, Error> {
         let guard = self
-            .mutation_statistics
+            .mutation_recording
             .then(|| self.data_plane.stats_recorder().begin(stats_operation));
         let result = self
             .ensure_open(operation)
