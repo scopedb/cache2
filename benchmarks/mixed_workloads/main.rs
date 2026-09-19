@@ -198,7 +198,7 @@ enum Operation {
     Delete,
 }
 
-struct HarnessConfig {
+struct HarnessOptions {
     scenarios: Box<[Scenario]>,
     operations_per_thread: Option<usize>,
     threads: Option<usize>,
@@ -216,7 +216,7 @@ struct HarnessConfig {
     directory: PathBuf,
 }
 
-impl HarnessConfig {
+impl HarnessOptions {
     fn from_env() -> io::Result<Self> {
         let scenarios = parse_scenarios()?;
         let operations_per_thread = env_optional_usize("CACHE_WORKLOAD_OPS_PER_THREAD")?;
@@ -282,7 +282,7 @@ impl HarnessConfig {
         })
     }
 
-    fn effective(&self, scenario: Scenario) -> io::Result<EffectiveConfig> {
+    fn resolve(&self, scenario: Scenario) -> io::Result<ScenarioConfig> {
         let operations_per_thread = self
             .operations_per_thread
             .unwrap_or_else(|| scenario.default_operations_per_thread());
@@ -340,7 +340,7 @@ impl HarnessConfig {
             )?,
         };
 
-        Ok(EffectiveConfig {
+        Ok(ScenarioConfig {
             scenario,
             operations_per_thread,
             threads,
@@ -361,7 +361,7 @@ impl HarnessConfig {
     }
 }
 
-struct EffectiveConfig {
+struct ScenarioConfig {
     scenario: Scenario,
     operations_per_thread: usize,
     threads: usize,
@@ -380,7 +380,7 @@ struct EffectiveConfig {
     directory: PathBuf,
 }
 
-impl EffectiveConfig {
+impl ScenarioConfig {
     fn storage_options(&self) -> StorageOptions {
         let mut options = StorageOptions::new(self.capacity_bytes);
         options.region_size_bytes = self.region_size_bytes as u64;
@@ -531,12 +531,12 @@ impl DeterministicRng {
 }
 
 fn main() -> io::Result<()> {
-    let harness = HarnessConfig::from_env()?;
-    let configs = harness
+    let options = HarnessOptions::from_env()?;
+    let configs = options
         .scenarios
         .iter()
         .copied()
-        .map(|scenario| harness.effective(scenario))
+        .map(|scenario| options.resolve(scenario))
         .collect::<io::Result<Vec<_>>>()?;
     let runtime_threads = configs
         .iter()
@@ -557,7 +557,7 @@ fn main() -> io::Result<()> {
     })
 }
 
-async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
+async fn run_scenario(config: ScenarioConfig) -> io::Result<()> {
     let reporter = RunReporter::start("mixed_workloads", Some(config.scenario.slug()));
     let result = run_scenario_inner(config).await;
     reporter.finish(
@@ -569,7 +569,7 @@ async fn run_scenario(config: EffectiveConfig) -> io::Result<()> {
     result
 }
 
-async fn run_scenario_inner(config: EffectiveConfig) -> io::Result<()> {
+async fn run_scenario_inner(config: ScenarioConfig) -> io::Result<()> {
     let scenario = config.scenario;
     println!("C² mixed workload: {}", scenario.slug());
     println!(
@@ -664,7 +664,7 @@ async fn run_worker(
     worker_id: usize,
     cache: &Cache,
     expected: &[AtomicU64],
-    config: &EffectiveConfig,
+    config: &ScenarioConfig,
 ) -> io::Result<WorkloadResult> {
     let worker_seed = mixed(
         config.seed ^ config.scenario.seed_salt() ^ (worker_id as u64).wrapping_mul(RNG_GAMMA),
@@ -948,7 +948,7 @@ fn validate_snapshot(result: &WorkloadResult, snapshot: &CacheSnapshot) -> io::R
 }
 
 fn report(
-    config: &EffectiveConfig,
+    config: &ScenarioConfig,
     result: &WorkloadResult,
     workload_elapsed: Duration,
     drain_elapsed: Duration,
