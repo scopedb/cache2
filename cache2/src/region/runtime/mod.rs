@@ -718,10 +718,10 @@ impl ShardControl {
     }
 
     fn fail(&self, error: &io::Error) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state
             .failure
             .get_or_insert_with(|| ShardFailure::from_error(error));
@@ -1235,7 +1235,7 @@ impl RegionDataPlane {
     }
 
     /// Completes and publishes every record admitted before this call. This is
-    /// an I/O completion barrier, not an fdatasync durability boundary.
+    /// an I/O completion barrier, not a fdatasync durability boundary.
     #[cfg(test)]
     pub fn drain(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;

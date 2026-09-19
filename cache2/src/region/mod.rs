@@ -905,7 +905,7 @@ impl FileRegionCore {
 
     /// Allocates one ordering sequence and removes the current L2 candidate
     /// with a single non-waiting bounded index probe. No Region bytes are
-    /// reserved or written for a delete.
+    /// reserved or written for a deletion.
     pub fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
         self.health.require_healthy()?;
         let seqno = {

@@ -382,8 +382,8 @@ impl RegionManager {
                 < self.active_regions.len().max(1)
     }
 
-    /// Hot reinsertion remains best effort when foreground rotation has no
-    /// immediately reusable Region.
+    /// Hot reinsertion remains the best effort when foreground rotation has no immediately
+    /// reusable Region.
     pub fn reclaim_can_reinsert(&self) -> bool {
         !self.free_regions.is_empty()
     }

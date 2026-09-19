@@ -74,6 +74,7 @@ use crate::io::engine::Task;
 #[cfg(test)]
 use crate::io::engine::io_uring_extra_memory_bytes;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::stats::recording::IoTiming;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
@@ -245,7 +246,7 @@ impl UringIoEngine {
 }
 
 impl IoEngine for UringIoEngine {
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+    fn set_latency_recorder(&self, recorder: IoTiming) {
         assert!(
             self.inner.shared.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"

@@ -999,14 +999,12 @@ impl IndexStorageCore {
         };
         loop {
             self.ensure_image_usable(page)?;
-            match state.load(Ordering::Acquire) {
-                PAGE_STATE_VALID | PAGE_STATE_DIRTY => return Ok(()),
-                PAGE_STATE_REJECTED => {
-                    return Err(IndexStorageError::CorruptPage {
-                        page_index: page,
-                        reason: CorruptPageReason::PreviouslyRejected,
-                    });
-                }
+            return match state.load(Ordering::Acquire) {
+                PAGE_STATE_VALID | PAGE_STATE_DIRTY => Ok(()),
+                PAGE_STATE_REJECTED => Err(IndexStorageError::CorruptPage {
+                    page_index: page,
+                    reason: CorruptPageReason::PreviouslyRejected,
+                }),
                 PAGE_STATE_UNCHECKED => {
                     if state
                         .compare_exchange(
@@ -1024,27 +1022,25 @@ impl IndexStorageCore {
                         Ok(()) => {
                             state.store(PAGE_STATE_VALID, Ordering::Release);
                             self.ensure_image_usable(page)?;
-                            return Ok(());
+                            Ok(())
                         }
                         Err(error) => {
                             self.reject_image();
                             state.store(PAGE_STATE_REJECTED, Ordering::Release);
-                            return Err(error);
+                            Err(error)
                         }
                     }
                 }
-                PAGE_STATE_VALIDATING => {
-                    return Err(IndexStorageError::PageBusy { page_index: page });
-                }
+                PAGE_STATE_VALIDATING => Err(IndexStorageError::PageBusy { page_index: page }),
                 _ => {
                     self.reject_image();
                     state.store(PAGE_STATE_REJECTED, Ordering::Release);
-                    return Err(IndexStorageError::CorruptPage {
+                    Err(IndexStorageError::CorruptPage {
                         page_index: page,
                         reason: CorruptPageReason::PreviouslyRejected,
-                    });
+                    })
                 }
-            }
+            };
         }
     }
 

@@ -17,7 +17,7 @@
 use std::io;
 
 #[cfg(test)]
-use crate::config::CacheConfig;
+use crate::CacheConfig;
 use crate::config::StorageLayout;
 #[cfg(test)]
 use crate::config::runtime::RuntimeOptions;

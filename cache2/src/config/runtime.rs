@@ -16,6 +16,7 @@ use std::io;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::StatsOptions;
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
 use crate::error::Error;
@@ -32,6 +33,7 @@ use crate::region::recovery::DataGeometry;
 use crate::region::runtime::metrics::ActivityMetrics;
 use crate::region::runtime_fixed_memory_bytes;
 use crate::region::staging::RegionStaging;
+use crate::stats::recording::Recorder;
 
 const DEFAULT_L1_SHARDS: usize = 32;
 const MAX_APPEND_SHARDS: u32 = 256;
@@ -397,7 +399,7 @@ pub struct RuntimeOptions {
     pub write_flush_threshold_bytes: usize,
     /// Activity counters, request outcomes, and latency distributions.
     /// Defaults disable collection; health and resource gauges remain available.
-    pub stats: crate::StatsOptions,
+    pub stats: StatsOptions,
 }
 
 impl Default for RuntimeOptions {
@@ -413,7 +415,7 @@ impl Default for RuntimeOptions {
             managed_memory_limit_bytes: 1024 * 1024 * 1024,
             l1_shards: DEFAULT_L1_SHARDS,
             write_flush_threshold_bytes: MAX_WRITE_FLUSH_THRESHOLD_BYTES,
-            stats: crate::StatsOptions::default(),
+            stats: StatsOptions::default(),
         }
     }
 }
@@ -481,7 +483,7 @@ impl CacheConfig {
             let geometry = storage.geometry;
             let index_slots = storage.index_slots;
             runtime.resolve()?;
-            let stats_bytes = crate::stats::recording::Recorder::allocation_bytes(runtime.stats)?;
+            let stats_bytes = Recorder::allocation_bytes(runtime.stats)?;
             if geometry.region_count <= runtime.append_shards {
                 return Err(invalid_config(
                     "append shards require valid geometry with one Active Region each plus one spare Region",
@@ -782,12 +784,12 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
+    use crate::StorageOptions;
 
     #[test]
     fn reclaim_timeout_is_validated_at_config_construction() {
-        let storage = crate::StorageOptions::new(1024 * 1024 * 1024)
-            .build()
-            .unwrap();
+        let storage = StorageOptions::new(1024 * 1024 * 1024).build().unwrap();
         assert_eq!(
             RuntimeOptions::default().reclaim_io_timeout,
             Duration::from_secs(5)
@@ -801,7 +803,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert_eq!(error.kind(), crate::error::ErrorKind::InvalidInput);
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
         }
         CacheConfig::new(
             storage,

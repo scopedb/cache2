@@ -35,6 +35,8 @@ use std::time::UNIX_EPOCH;
 
 use tokio::task::JoinError;
 
+use crate::LatencyMode;
+use crate::RequestOperation;
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
 use crate::config::storage_fingerprint;
@@ -248,10 +250,10 @@ impl Cache {
         let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
         let stats = config.runtime().stats;
         let read_recording = stats.request_counters
-            || stats.l1_latency != crate::LatencyMode::Off
-            || stats.l2_latency != crate::LatencyMode::Off;
+            || stats.l1_latency != LatencyMode::Off
+            || stats.l2_latency != LatencyMode::Off;
         let mutation_recording =
-            stats.request_counters || stats.mutation_latency != crate::LatencyMode::Off;
+            stats.request_counters || stats.mutation_latency != LatencyMode::Off;
         let backend = FileRegionBackend::new(files, format_data, config);
         let store = RegionStore::open(index_slots, backend)?;
         let startup = store.startup();
@@ -286,7 +288,7 @@ impl Cache {
     /// close starts. Runtime and device failures use their corresponding structured
     /// classifications.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.mutate(ErrorOperation::Put, crate::RequestOperation::Put, || {
+        self.mutate(ErrorOperation::Put, RequestOperation::Put, || {
             self.data_plane.put(key.as_ref(), value.as_ref())
         })
     }
@@ -294,7 +296,7 @@ impl Cache {
     /// Stages a value directly for L2 and returns its monotonic mutation
     /// sequence.
     ///
-    /// An older L1 value is removed best effort. Success means the value entered
+    /// An older L1 value is removed with the best effort. Success means the value entered
     /// bounded staging; use [`Self::drain`] to wait for L2 publication. Keys are
     /// limited to 4 KiB, and the encoded record must fit one Region.
     ///
@@ -302,19 +304,17 @@ impl Cache {
     ///
     /// Uses the same input, overload, runtime, and device classifications as
     /// [`Self::put`], including unavailable after close starts, with
-    /// [`ErrorOperation::PutL2`](crate::ErrorOperation::PutL2) as its context.
+    /// [`ErrorOperation::PutL2`](ErrorOperation::PutL2) as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.mutate(
-            ErrorOperation::PutL2,
-            crate::RequestOperation::PutL2,
-            || self.data_plane.put_l2(key.as_ref(), value.as_ref()),
-        )
+        self.mutate(ErrorOperation::PutL2, RequestOperation::PutL2, || {
+            self.data_plane.put_l2(key.as_ref(), value.as_ref())
+        })
     }
 
     /// Deletes a key and returns its monotonic mutation sequence.
     ///
-    /// This removes the L2 mapping and cleans L1 best effort using bounded
-    /// in-memory work. Keys are limited to 4 KiB.
+    /// This removes the L2 mapping and cleans L1 on a best-effort basis using bounded in-memory
+    /// work. Keys are limited to 4 KiB.
     ///
     /// # Errors
     ///
@@ -323,11 +323,9 @@ impl Cache {
     /// busy. Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) after close starts.
     /// Runtime and device failures remain explicit.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
-        self.mutate(
-            ErrorOperation::Delete,
-            crate::RequestOperation::Delete,
-            || self.data_plane.delete(key.as_ref()),
-        )
+        self.mutate(ErrorOperation::Delete, RequestOperation::Delete, || {
+            self.data_plane.delete(key.as_ref())
+        })
     }
 
     /// Looks up a value in L1 and then L2.
@@ -363,7 +361,7 @@ impl Cache {
         let mut guard = self
             .data_plane
             .stats_recorder()
-            .begin(crate::RequestOperation::Get);
+            .begin(RequestOperation::Get);
         let result = if self.is_closed() {
             Ok(None)
         } else {
@@ -457,7 +455,7 @@ impl Cache {
     ///
     /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
     /// or a structured runtime, worker, or filesystem failure with
-    /// [`ErrorOperation::CloseFast`](crate::ErrorOperation::CloseFast).
+    /// [`ErrorOperation::CloseFast`].
     pub fn close_fast(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         self.close(false)
     }
@@ -472,7 +470,7 @@ impl Cache {
     ///
     /// Returns [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if close already started,
     /// or a structured runtime, worker, filesystem, or device failure with
-    /// [`ErrorOperation::CloseWarm`](crate::ErrorOperation::CloseWarm). A failed warm close does
+    /// [`ErrorOperation::CloseWarm`](ErrorOperation::CloseWarm). A failed warm close does
     /// not publish a recoverable image.
     pub fn close_warm(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         self.close(true)
@@ -482,7 +480,7 @@ impl Cache {
     fn mutate(
         &self,
         operation: ErrorOperation,
-        stats_operation: crate::RequestOperation,
+        stats_operation: RequestOperation,
         mutation: impl FnOnce() -> io::Result<u64>,
     ) -> Result<u64, Error> {
         let guard = self
@@ -539,10 +537,9 @@ impl Cache {
         });
         async move {
             let result = match close {
-                Some(close) => match close.await {
-                    Ok(result) => result,
-                    Err(error) => Err(blocking_task_error("cache close", error)),
-                },
+                Some(close) => close
+                    .await
+                    .unwrap_or_else(|error| Err(blocking_task_error("cache close", error))),
                 None => Err(cache_closed_error()),
             };
             public_result(operation, result)

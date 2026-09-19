@@ -368,8 +368,8 @@ impl RequestGuard<'_> {
             return;
         };
         let index = REQUEST_INDEX[self.operation as usize][outcome as usize];
-        // Stop the clock before recorder work; caller-side observers measure its
-        // overhead separately. Count once at the same terminal boundary.
+        // Stop the clock before recorder work; caller-side observers measure the overhead
+        // separately. Count once at the same terminal boundary.
         let scope = RequestLatencyScope::for_request(self.operation, outcome);
         let elapsed = self
             .timer
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn sampling_is_independent_of_callers_switching_rates() {
-        THREAD.with(|thread| thread.set((1, 12345)));
+        THREAD.set((1, 12345));
         let mut sampled = [0usize; 2];
         for _ in 0..100_000 {
             for (index, interval) in [16, 64].into_iter().enumerate() {

@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn same_hash_chain_disambiguates_full_key() {
+    fn same_hash_chain_disambiguate_full_key() {
         let store = store(2048, 1);
         let collision_hash = 42;
         assert!(store.publish(collision_hash, b"alpha", b"value-alpha", 1));
@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_chain_disambiguates_full_hash_before_key() {
+    fn fingerprint_chain_disambiguate_full_hash_before_key() {
         let store = store(2048, 1);
         let first = 1_u64;
         let colliding = 1_u64 << 45;

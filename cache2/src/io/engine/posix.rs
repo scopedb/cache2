@@ -52,6 +52,7 @@ use crate::io::engine::SubmitError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::lock_unpoisoned;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::stats::recording::IoTiming;
 
 impl BackendIoEngine {
     #[cfg(unix)]
@@ -180,7 +181,7 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+    fn set_latency_recorder(&self, recorder: IoTiming) {
         assert!(
             self.inner.shared.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"

@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::IoEngineOptions;
+use crate::StatsOptions;
 use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
@@ -415,7 +416,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
             reclaim_workers: 1,
         }),
         l1_capacity_bytes: 0,
-        stats: crate::StatsOptions {
+        stats: StatsOptions {
             activity_counters: true,
             ..Default::default()
         },
@@ -564,7 +565,7 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
         l1_capacity_bytes: 0,
-        stats: crate::StatsOptions {
+        stats: StatsOptions {
             activity_counters: true,
             ..Default::default()
         },

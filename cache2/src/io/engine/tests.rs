@@ -22,12 +22,16 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
+use crate::IoOutcome;
+use crate::IoRole;
+use crate::StatsOptions;
 use crate::io::backend::FileBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
+use crate::stats::recording::Recorder;
 
 static FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -403,13 +407,13 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
     let backend = Arc::new(BlockingBackend::default());
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
     let recorder = Arc::new(
-        crate::stats::recording::Recorder::new(crate::StatsOptions {
+        Recorder::new(StatsOptions {
             io_latency: true,
-            ..crate::StatsOptions::default()
+            ..StatsOptions::default()
         })
         .unwrap(),
     );
-    engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
+    engine.set_latency_recorder(recorder.io_timing(IoRole::Read).unwrap());
     let managed_memory = managed_memory();
     let request = submit_cache_io(
         engine.as_ref(),
@@ -460,13 +464,13 @@ async fn reserved_read_latency_includes_time_before_submission() {
         )
         .unwrap();
         let recorder = Arc::new(
-            crate::stats::recording::Recorder::new(crate::StatsOptions {
+            Recorder::new(StatsOptions {
                 io_latency: true,
-                ..crate::StatsOptions::default()
+                ..StatsOptions::default()
             })
             .unwrap(),
         );
-        engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
+        engine.set_latency_recorder(recorder.io_timing(IoRole::Read).unwrap());
         drop(engine.try_reserve_read().unwrap());
         let slot = engine.try_reserve_read().unwrap();
         let reserved_at = slot.reserved_at.unwrap();
@@ -491,9 +495,7 @@ async fn reserved_read_latency_includes_time_before_submission() {
         let snapshots = recorder.io_snapshot();
         let completed = snapshots
             .iter()
-            .find(|row| {
-                row.role == crate::IoRole::Read && row.outcome == crate::IoOutcome::Completed
-            })
+            .find(|row| row.role == IoRole::Read && row.outcome == IoOutcome::Completed)
             .unwrap();
         assert_eq!(completed.latency.count, 1);
         assert!(completed.latency.sum_ns >= before_submit.as_nanos());
@@ -1145,13 +1147,13 @@ fn io_histograms_include_failures_when_activity_counters_are_disabled() {
         BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
             .unwrap();
     let recorder = Arc::new(
-        crate::stats::recording::Recorder::new(crate::StatsOptions {
+        Recorder::new(StatsOptions {
             io_latency: true,
-            ..crate::StatsOptions::default()
+            ..StatsOptions::default()
         })
         .unwrap(),
     );
-    engine.set_latency_recorder(recorder.io_timing(crate::IoRole::Read).unwrap());
+    engine.set_latency_recorder(recorder.io_timing(IoRole::Read).unwrap());
     let managed_memory = managed_memory();
     let completion = engine
         .read_exact_at(read_buffer(&managed_memory, 4096), 0)
@@ -1162,7 +1164,7 @@ fn io_histograms_include_failures_when_activity_counters_are_disabled() {
     let snapshot = recorder.io_snapshot();
     let failed = snapshot
         .iter()
-        .find(|row| row.role == crate::IoRole::Read && row.outcome == crate::IoOutcome::Failed)
+        .find(|row| row.role == IoRole::Read && row.outcome == IoOutcome::Failed)
         .unwrap();
     assert_eq!(failed.latency.count, 1);
     assert!(failed.latency.valid);

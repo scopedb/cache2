@@ -348,7 +348,7 @@ impl OperationKind {
     }
 }
 
-/// An operation owns its buffer from slot reservation until target completion.
+/// An operation owns the buffer from slot reservation until target completion.
 pub enum IoOperation {
     Read {
         buffer: IoBuffer,
