@@ -124,7 +124,7 @@ Every encoded key/value record must fit in one Region. Region size also scales s
 | More opportunities to separate hot and cold records         | Coarser reclaim units and more hot/cold mixing                                     |
 | Smaller absolute reinsertion allowance per reclaimed Region | Larger absolute reinsertion allowance, still roughly one eighth of reclaimed bytes |
 
-For `A` append shards and `R`-byte Regions, append staging alone is `2 * A * R`. Changing from 24 MiB to 32 MiB with four append shards, for example, adds 64 MiB of fixed staging. Each reclaim worker adds another `R`-byte scan buffer, and the memory plan keeps one additional `R`-byte read allowance.
+For `A` append shards and `R`-byte Regions, append staging alone is `2 * A * R`. Changing from 24 MiB to 32 MiB with four append shards, for example, adds 64 MiB of fixed staging. Each reclaim worker adds another `R`-byte scan buffer, and the memory budget keeps one additional `R`-byte read allowance.
 
 Choose the smallest Region that safely holds the largest cacheable record, then increase it only when fewer rotations or more burst absorption justifies the memory and reclaim granularity. The valid range is 4 KiB-aligned through 32 MiB.
 
@@ -169,7 +169,7 @@ Start with CLOCK when metadata and minimal hit-path work matter. Try S3-FIFO whe
 
 ### Read execution, waiting, and memory
 
-The read path first selects an index candidate, then admits one bounded read. Three resources can reject that plan independently:
+The read path first selects an index candidate, then admits one bounded read. Three resources can reject that read independently:
 
 1. read execution capacity;
 2. the optional wait queue;

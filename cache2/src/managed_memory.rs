@@ -15,7 +15,7 @@
 //! Managed-memory accounting and aligned record buffers.
 //!
 //! Foreground reads allocate one alignment-rounded transient buffer for the
-//! size-class-bounded planned range after an L2 index hit. Write waiting uses
+//! size-class-bounded read range after an L2 index hit. Write waiting uses
 //! a separate request gate.
 
 use std::alloc::Layout;

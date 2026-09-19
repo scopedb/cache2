@@ -42,7 +42,7 @@ The compact L2 index deliberately stores no sequence number or full key. A delay
 
 L1 is process-local and always starts empty. It is split into independently locked shards so each operation touches one short critical section. Lookups use a small try-lock retry budget and then continue to L2 on contention. Admission, promotion, and cleanup also use bounded try-lock work; contention bypasses L1 instead of delaying the foreground operation.
 
-Entry slots, directories, free lists, and eviction metadata are allocated at open. Retained key/value bytes plus a fixed ownership charge consume a fixed byte capacity, while the fixed metadata is charged separately to the managed memory plan. A complete charged entry above 256 KiB bypasses L1 so a large Region record cannot dominate a shard lock or require a large in-lock copy. Same-hash chains, compare-exchange attempts, victim scans, and the number of victims per admission all have small fixed limits. If those limits cannot produce a slot and enough bytes, the candidate continues through Region without an L1 copy.
+Entry slots, directories, free lists, and eviction metadata are allocated at open. Retained key/value bytes plus a fixed ownership charge consume a fixed byte capacity, while the fixed metadata is charged separately to the managed memory budget. A complete charged entry above 256 KiB bypasses L1 so a large Region record cannot dominate a shard lock or require a large in-lock copy. Same-hash chains, compare-exchange attempts, victim scans, and the number of victims per admission all have small fixed limits. If those limits cannot produce a slot and enough bytes, the candidate continues through Region without an L1 copy.
 
 The eviction policies share those bounds but spend metadata differently:
 
@@ -61,7 +61,7 @@ Each hash has four deterministic candidates in one canonical partition. An upser
 
 Lookups take one partition try-read guard and inspect at most the four candidates. Partition contention, a page currently being validated, or an absent fingerprint returns a miss before read-buffer allocation. A fingerprint match is only a read candidate: Region generation, hash, full key, lengths, and checksums remain the correctness authority.
 
-The index image stores 504 slots plus a checksummed header in each 4 KiB page, or about 8.13 bytes per slot. Two volatile heat bits add 0.25 bytes per slot. A 4 TiB cache averaging 16 KiB per entry therefore uses about 4.06 GiB for its 536,870,912-slot index image and 128 MiB for heat. That example is not a global slot cap; larger indexes are accepted when their complete mapping and recovery layout is representable and the managed-memory plan fits.
+The index image stores 504 slots plus a checksummed header in each 4 KiB page, or about 8.13 bytes per slot. Two volatile heat bits add 0.25 bytes per slot. A 4 TiB cache averaging 16 KiB per entry therefore uses about 4.06 GiB for its 536,870,912-slot index image and 128 MiB for heat. That example is not a global slot cap; larger indexes are accepted when their complete mapping and recovery layout is representable and the managed-memory budget fits.
 
 ### Region store
 
@@ -86,10 +86,10 @@ Full staging or short-path contention returns structured `ErrorKind::Overloaded`
 
 1. Probe one L1 shard under a short critical section.
 2. On miss, try one L2 index partition. Contention or an absent candidate returns a miss before buffer allocation.
-3. Build one Region-bounded read plan from the candidate.
-4. Reserve read execution. By default, unavailable capacity is a miss. `ReadAdmission::Wait` bounds queued reads by `max_waiters` and a positive timeout; wait capacity is independent of execution capacity and defaults to the aggregate read-pool depth. A queued request retains the plan and acquires the data buffer after admission.
+3. Build one Region-bounded read descriptor from the candidate.
+4. Reserve read execution. By default, unavailable capacity is a miss. `ReadAdmission::Wait` bounds queued reads by `max_waiters` and a positive timeout; wait capacity is independent of execution capacity and defaults to the aggregate read-pool depth. A queued request retains the descriptor and acquires the data buffer after admission.
 5. Allocate one managed, alignment-rounded buffer and submit one record read.
-6. Validate the planned address, Region generation, size class, hash, full key, lengths, sequence structure, and checksums.
+6. Validate the descriptor address, Region generation, size class, hash, full key, lengths, sequence structure, and checksums.
 7. Attempt bounded L1 promotion. Otherwise, return a Region-backed value that owns the read allocation until dropped.
 
 With read waiting enabled, a full wait queue, unavailable buffer, or expired deadline is an explicit overload. Each request uses one index lookup and one record read, so a concurrently superseded valid record may be returned.
@@ -134,7 +134,7 @@ C² owns three distinct files in one directory:
 
 | File        | Authority                                                                                                                                                                                                                       |
 |-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Data        | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and storage-layout fingerprint. It has no session-state bit.             |
+| Data        | A checksummed 4 KiB superblock followed by fixed Region extents. The superblock fixes cache/data identities, geometry, hash seed, record format, and storage-layout fingerprint. It has no session-state bit.                   |
 | State       | Two checksummed 4 KiB slots. The newest valid generation is the sole authority for `EMPTY`, `RUNNING`, or `CLEAN` and binds an exact data identity; `CLEAN` additionally binds an exact image identity, generation, and length. |
 | Clean image | An immutable 4 KiB header followed by checksummed L2 index pages and mandatory Region metadata. It is produced only by a successful warm close.                                                                                 |
 
