@@ -31,6 +31,8 @@ Cover observable behavior changes with tests. See [BENCHMARK.md](BENCHMARK.md) f
 
 Follow the surrounding code and the design constraints in [ARCHITECTURE.md](ARCHITECTURE.md), including bounded resource use, best-effort consistency, request-path priorities, and recovery guarantees.
 
+Name types by their concrete domain role. Use `Options` for editable inputs awaiting validation and `Config` for validated or resolved configuration. Keep names such as `Layout` for geometry and use specific domain nouns such as `Descriptor`, `Candidate`, `Victims`, or `Inspection` for runtime data. Avoid `Plan` as a type-name suffix; computing data before using it does not by itself make that data a plan. Keep related fields, local variables, and functions consistent with the type's role.
+
 Declare restricted visibility at module boundaries and use `pub` for items in those modules' APIs. Keep items private when only their defining module and its descendants need them. For items reachable through public modules or re-exported public types, reserve `pub` for intentional public API and use narrower visibility for internal callers.
 
 ## Documentation

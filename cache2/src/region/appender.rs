@@ -246,7 +246,7 @@ mod tests {
     use crate::io::backend::SyncMode;
     use crate::io::backend::SyncPoint;
     use crate::io::engine::BackendIoEngine;
-    use crate::resources::BufferLease;
+    use crate::managed_memory::BufferLease;
 
     #[derive(Default)]
     struct RecordingBackend {

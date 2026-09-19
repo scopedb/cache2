@@ -90,7 +90,7 @@ use crate::region::region_metadata_io_error;
 #[cfg(test)]
 use crate::region::runtime::HybridValueRead;
 use crate::region::runtime::RegionDataPlane;
-use crate::region::store::RecoveryPlan;
+use crate::region::store::RecoveryInspection;
 use crate::region::store::RegionBackend;
 use crate::region::store::RegionStore;
 #[cfg(test)]
@@ -368,7 +368,7 @@ where
     files: RegionFiles,
     /// Used when the data file is missing or empty. Existing
     /// files retain their on-disk identities but must match this geometry and
-    /// configuration fingerprint.
+    /// storage-layout fingerprint.
     format_data: DataSuperblock,
     config: CacheConfig,
     file_system: F,
@@ -393,9 +393,9 @@ impl FileRegionBackend<SystemRegionFileSystem> {
         files: RegionFiles,
         format_data: DataSuperblock,
         index_slots: usize,
-        runtime_config: RuntimeOptions,
+        runtime_options: RuntimeOptions,
     ) -> Self {
-        let config = cache_config(format_data.geometry, index_slots, runtime_config);
+        let config = cache_config(format_data.geometry, index_slots, runtime_options);
         Self::new(files, format_data, config)
     }
 
@@ -505,9 +505,9 @@ where
     fn cold_recovery(
         &self,
         reason: &'static str,
-    ) -> io::Result<RecoveryPlan<CleanFileRegionImage>> {
+    ) -> io::Result<RecoveryInspection<CleanFileRegionImage>> {
         self.log_cold_recovery(reason);
-        Ok(RecoveryPlan::Running)
+        Ok(RecoveryInspection::Running)
     }
 }
 
@@ -592,7 +592,7 @@ where
     fn inspect_recovery(
         &mut self,
         index_slots: usize,
-    ) -> io::Result<RecoveryPlan<Self::CleanImage>> {
+    ) -> io::Result<RecoveryInspection<Self::CleanImage>> {
         self.file_system
             .remove_file(&recovery_temporary_path(&self.files.image))?;
         let format_data = self.format_data;
@@ -624,7 +624,7 @@ where
         self.current_state = select_state_for_fence(&pages);
         if fresh {
             self.log_cold_recovery("fresh_data_file");
-            return Ok(RecoveryPlan::Fresh);
+            return Ok(RecoveryInspection::Fresh);
         }
         let Some(selected) = recovery_state else {
             return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"));
@@ -744,7 +744,7 @@ where
         }
         let file = image.try_clone_control_file()?;
         self.cold_reset_needed = false;
-        Ok(RecoveryPlan::Clean(CleanFileRegionImage {
+        Ok(RecoveryInspection::Clean(CleanFileRegionImage {
             file,
             header,
             metadata,
@@ -998,7 +998,7 @@ where
             data_identity: data.data_identity,
             data_superblock_generation: data.generation,
             hash_seed: data.hash_seed,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             image_identity,
             image_generation,
             image_file_len,
@@ -1152,7 +1152,7 @@ where
             DataSuperblockProbe::Valid(data) => {
                 if data.geometry != format_data.geometry
                     || data.hash_seed != format_data.hash_seed
-                    || data.config_fingerprint != format_data.config_fingerprint
+                    || data.storage_fingerprint != format_data.storage_fingerprint
                     || file_len != data.geometry.data_file_len
                 {
                     format_empty_data(file, state, format_data)?;
@@ -1428,7 +1428,7 @@ fn empty_region_metadata(
             data_superblock_generation: data.generation,
             image_identity: data.data_identity,
             image_generation: 1,
-            config_fingerprint: data.config_fingerprint,
+            storage_fingerprint: data.storage_fingerprint,
             index_slots,
             index_page_count,
             region_size: data.geometry.region_size,

@@ -23,6 +23,11 @@ use std::sync::MutexGuard;
 
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
+use crate::managed_memory::BUFFER_ALIGNMENT;
+use crate::managed_memory::BufferLease;
+use crate::managed_memory::ManagedMemory;
+use crate::managed_memory::ManagedMemoryError;
+use crate::managed_memory::RuntimeMemoryReservation;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_RECORD_LEN;
 use crate::region::index::packed::PackedLocation;
@@ -34,11 +39,6 @@ use crate::region::record::RECORD_HEADER_SIZE;
 use crate::region::record::RecordHeader;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::RECOVERY_PAGE_SIZE;
-use crate::resources::BUFFER_ALIGNMENT;
-use crate::resources::BufferLease;
-use crate::resources::ResourceBuildError;
-use crate::resources::ResourceController;
-use crate::resources::RuntimeMemoryReservation;
 
 const MAX_STAGING_RECORDS: usize = 4096;
 const UPSERT_PUBLICATION: u64 = 1_u64 << (u64::BITS - 1);
@@ -271,43 +271,43 @@ impl RegionStaging {
         shard_count: usize,
         chunk_bytes: usize,
         region_size: u64,
-        resources: &ResourceController,
-    ) -> Result<Self, ResourceBuildError> {
+        managed_memory: &ManagedMemory,
+    ) -> Result<Self, ManagedMemoryError> {
         if shard_count == 0 {
-            return Err(ResourceBuildError::Invalid(
+            return Err(ManagedMemoryError::Invalid(
                 "Region staging requires at least one shard",
             ));
         }
         if region_size < RECOVERY_PAGE_SIZE as u64
             || !region_size.is_multiple_of(BUFFER_ALIGNMENT as u64)
         {
-            return Err(ResourceBuildError::Invalid(
+            return Err(ManagedMemoryError::Invalid(
                 "Region staging Region size is invalid",
             ));
         }
         let region_bytes = usize::try_from(region_size).map_err(|_| {
-            ResourceBuildError::Invalid("Region staging Region size does not fit usize")
+            ManagedMemoryError::Invalid("Region staging Region size does not fit usize")
         })?;
         if chunk_bytes == 0
             || chunk_bytes > region_bytes
             || !chunk_bytes.is_multiple_of(BUFFER_ALIGNMENT)
             || !chunk_bytes.is_multiple_of(RECORD_ALIGNMENT as usize)
         {
-            return Err(ResourceBuildError::Invalid(
+            return Err(ManagedMemoryError::Invalid(
                 "Region staging chunk must be a bounded aligned size",
             ));
         }
 
         let reserved = Self::reservation_bytes(shard_count, chunk_bytes)
-            .ok_or(ResourceBuildError::Allocation)?;
+            .ok_or(ManagedMemoryError::Allocation)?;
         // Keep the aggregate reservation alive so eager buffers and record
         // vectors participate in the hard memory limit.
-        let memory = resources.reserve_runtime_memory(reserved)?;
+        let memory = managed_memory.reserve_runtime_memory(reserved)?;
 
         let mut shards = Vec::new();
         shards
             .try_reserve_exact(shard_count)
-            .map_err(|_| ResourceBuildError::Allocation)?;
+            .map_err(|_| ManagedMemoryError::Allocation)?;
         for _ in 0..shard_count {
             let fill_buffer = BufferLease::try_fixed(chunk_bytes)?;
             let spare_buffer = BufferLease::try_fixed(chunk_bytes)?;
@@ -846,11 +846,11 @@ impl RegionStaging {
     }
 }
 
-fn try_staged_records() -> Result<Vec<StagedRecord>, ResourceBuildError> {
+fn try_staged_records() -> Result<Vec<StagedRecord>, ManagedMemoryError> {
     let mut records = Vec::new();
     records
         .try_reserve_exact(MAX_STAGING_RECORDS)
-        .map_err(|_| ResourceBuildError::Allocation)?;
+        .map_err(|_| ManagedMemoryError::Allocation)?;
     Ok(records)
 }
 
@@ -905,11 +905,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
-    use crate::resources::ResourceLimits;
 
-    fn resources(memory_limit_bytes: usize) -> ResourceController {
-        ResourceController::try_new(ResourceLimits {
+    fn managed_memory(memory_limit_bytes: usize) -> ManagedMemory {
+        ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes,
             reserved_memory_bytes: 0,
         })
@@ -977,11 +977,11 @@ mod tests {
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
         assert_eq!(size_of::<StagedRecord>(), 32);
-        let resources = resources(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let managed_memory = managed_memory(4 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
-            resources.managed_memory_snapshot().current_bytes,
+            managed_memory.snapshot().current_bytes,
             2 * 4096 + 2 * MAX_STAGING_RECORDS * size_of::<StagedRecord>()
         );
 
@@ -1047,8 +1047,8 @@ mod tests {
 
     #[test]
     fn fill_snapshot_distinguishes_empty_ready_submitted_and_terminal_shards() {
-        let resources = resources(8 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let managed_memory = managed_memory(8 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.shard_fill_snapshot(0).unwrap(), None);
         assert_eq!(
             staging.shard_fill_snapshot(1),
@@ -1084,7 +1084,7 @@ mod tests {
         staging.close();
         assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Closed));
 
-        let failed = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let failed = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         failed
             .encode_reserved(receipt, |target| {
                 target.fill(0x32);
@@ -1102,8 +1102,9 @@ mod tests {
 
     #[test]
     fn fill_snapshot_never_observes_a_partially_encoded_record() {
-        let resources = resources(4 * 1024 * 1024);
-        let staging = Arc::new(RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap());
+        let managed_memory = managed_memory(4 * 1024 * 1024);
+        let staging =
+            Arc::new(RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap());
         let (receipt, record) = reservation(4096, 64, 11);
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -1138,8 +1139,8 @@ mod tests {
 
     #[test]
     fn padding_receipt_expands_only_the_final_record_without_copying() {
-        let resources = resources(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let managed_memory = managed_memory(4 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         let first_len = RecordHeader::aligned_len(0, 0).unwrap();
         let (first, first_record) = reservation(4096, first_len, 11);
         let mut pointer = 0_usize;
@@ -1216,9 +1217,9 @@ mod tests {
 
     #[test]
     fn fixed_record_and_byte_bounds_request_a_seal_without_running_encoder() {
-        let resources = resources(8 * 1024 * 1024);
+        let managed_memory = managed_memory(8 * 1024 * 1024);
         let chunk_bytes = 256 * 1024;
-        let staging = RegionStaging::try_new(1, chunk_bytes, 512 * 1024, &resources).unwrap();
+        let staging = RegionStaging::try_new(1, chunk_bytes, 512 * 1024, &managed_memory).unwrap();
         let mut offset = 0;
         for index in 0..MAX_STAGING_RECORDS {
             let (receipt, record) = reservation(offset, RECORD_ALIGNMENT, index as u64 + 1);
@@ -1279,8 +1280,8 @@ mod tests {
 
     #[test]
     fn completion_fences_stale_receipts_and_write_failure_is_sticky() {
-        let resources = resources(8 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let managed_memory = managed_memory(8 * 1024 * 1024);
+        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         let (receipt, record) = reservation(4096, 64, 11);
         let entry = record.entry();
         let mismatched = StagedRecord::new(
@@ -1320,7 +1321,7 @@ mod tests {
             Err(StagingEncodeError::Staging(StagingError::Failed))
         );
 
-        let other = RegionStaging::try_new(1, 4096, 64 * 1024, &resources).unwrap();
+        let other = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         other
             .encode_reserved(receipt, |target| {
                 target.fill(0x44);

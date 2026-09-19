@@ -34,11 +34,11 @@ use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
+use crate::managed_memory::BufferLease;
 use crate::region::index::packed::IndexEntry;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
-use crate::resources::BufferLease;
 
 const _READ_ALIGNMENT: usize = 4096;
 const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
@@ -50,7 +50,7 @@ pub struct ReadCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadPlan {
+pub struct ReadDescriptor {
     pub hash: u64,
     pub entry: IndexEntry,
     pub region_generation: u64,
@@ -60,13 +60,13 @@ pub struct ReadPlan {
 }
 
 pub struct PendingRead {
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
 pub struct ReadCompletion {
-    pub plan: ReadPlan,
+    pub descriptor: ReadDescriptor,
     pub result: io::Result<()>,
     pub buffer: Option<BufferLease>,
 }
@@ -80,9 +80,9 @@ impl ReadCompletion {
         }
         self.buffer
             .as_ref()?
-            .prepared(self.plan.read_len)
+            .prepared(self.descriptor.read_len)
             .ok()?
-            .get(self.plan.record_range.clone())
+            .get(self.descriptor.record_range.clone())
     }
 }
 
@@ -90,12 +90,12 @@ impl PendingRead {
     #[cfg(test)]
     pub fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
         let Self {
-            plan,
+            descriptor,
             request_id,
             request,
         } = self;
         let completion = request.wait(engine);
-        Self::finish(plan, request_id, completion)
+        Self::finish(descriptor, request_id, completion)
     }
 
     pub async fn wait_async(
@@ -104,16 +104,16 @@ impl PendingRead {
         tokio_handle: &tokio::runtime::Handle,
     ) -> ReadCompletion {
         let Self {
-            plan,
+            descriptor,
             request_id,
             request,
         } = self;
         let completion = request.wait_async(engine, tokio_handle).await;
-        Self::finish(plan, request_id, completion)
+        Self::finish(descriptor, request_id, completion)
     }
 
     fn finish(
-        plan: ReadPlan,
+        descriptor: ReadDescriptor,
         request_id: RequestId,
         completion: Result<IoCompletion, IoDeadlineExceeded>,
     ) -> ReadCompletion {
@@ -122,7 +122,7 @@ impl PendingRead {
             Err(timeout) => {
                 let (error, buffer) = timeout.into_lease();
                 return ReadCompletion {
-                    plan,
+                    descriptor,
                     result: Err(error),
                     buffer,
                 };
@@ -145,7 +145,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(plan.read_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(descriptor.read_len).is_err())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -158,7 +158,7 @@ impl PendingRead {
         let result = match protocol_error {
             Some(error) => Err(error),
             None => io_result.and_then(|completed| {
-                if completed != plan.read_len || bytes_transferred != plan.read_len {
+                if completed != descriptor.read_len || bytes_transferred != descriptor.read_len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Region record read completed with the wrong byte count",
@@ -168,39 +168,39 @@ impl PendingRead {
             }),
         };
         ReadCompletion {
-            plan,
+            descriptor,
             result,
             buffer,
         }
     }
 }
 
-/// Submits one bounded planned range using an owned alignment-rounded buffer.
+/// Submits one bounded read range using an owned alignment-rounded buffer.
 ///
 /// Validation happens before the lease is prepared or submitted. Any rejected
 /// operation drops its lease immediately.
 pub fn submit_read(
     engine: &dyn IoEngine,
     slot: ReadSlot,
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     buffer: BufferLease,
 ) -> io::Result<PendingRead> {
-    let buffer = IoBuffer::for_read(buffer, plan.read_len).map_err(|error| error.error)?;
-    let request = submit_cache_read(engine, slot, IoOperation::read(buffer, plan.absolute))
+    let buffer = IoBuffer::for_read(buffer, descriptor.read_len).map_err(|error| error.error)?;
+    let request = submit_cache_read(engine, slot, IoOperation::read(buffer, descriptor.absolute))
         .map_err(|error| error.into_lease().0)?;
     Ok(PendingRead {
-        plan,
+        descriptor,
         request_id: request.id(),
         request,
     })
 }
 
-pub fn plan_read(
+pub fn describe_read(
     geometry: DataGeometry,
     hash: u64,
     candidate: ReadCandidate,
     align_for_direct_io: bool,
-) -> io::Result<ReadPlan> {
+) -> io::Result<ReadDescriptor> {
     let ReadCandidate {
         entry,
         region_generation,
@@ -298,7 +298,7 @@ pub fn plan_read(
         ));
     }
 
-    Ok(ReadPlan {
+    Ok(ReadDescriptor {
         hash,
         entry,
         region_generation,
@@ -325,9 +325,9 @@ mod tests {
     use crate::io::backend::SyncPoint;
     use crate::io::backend::WritePoint;
     use crate::io::engine::BackendIoEngine;
+    use crate::managed_memory::ManagedMemory;
+    use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
-    use crate::resources::ResourceController;
-    use crate::resources::ResourceLimits;
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -396,26 +396,26 @@ mod tests {
     fn unaligned_record_uses_one_aligned_read_and_returns_its_exact_slice() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let resources = ResourceController::try_new(ResourceLimits {
+        let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
-        let plan = plan_read(geometry(), 7, candidate(entry), true).unwrap();
+        let descriptor = describe_read(geometry(), 7, candidate(entry), true).unwrap();
 
         let slot = engine.try_reserve_read().unwrap();
         let completion = submit_read(
             &engine,
             slot,
-            plan,
-            resources.try_read_buffer(_READ_ALIGNMENT).unwrap(),
+            descriptor,
+            managed_memory.try_read_buffer(_READ_ALIGNMENT).unwrap(),
         )
         .unwrap()
         .wait(&engine);
         assert!(completion.result.is_ok());
-        assert_eq!(completion.plan.record_range, 32..96);
+        assert_eq!(completion.descriptor.record_range, 32..96);
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
 
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
@@ -431,32 +431,32 @@ mod tests {
         drop(reads);
         drop(completion.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+        assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
 
     #[test]
     fn buffered_record_uses_one_size_class_upper_bound_read() {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
-        let resources = ResourceController::try_new(ResourceLimits {
+        let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: _READ_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
         .unwrap();
         let entry = entry(PackedLocation::new(1, 32, 1120).unwrap());
-        let plan = plan_read(geometry(), 7, candidate(entry), false).unwrap();
+        let descriptor = describe_read(geometry(), 7, candidate(entry), false).unwrap();
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
 
         let completion = submit_read(
             &engine,
             engine.try_reserve_read().unwrap(),
-            plan,
-            resources.try_read_buffer(1120).unwrap(),
+            descriptor,
+            managed_memory.try_read_buffer(1120).unwrap(),
         )
         .unwrap()
         .wait(&engine);
         assert!(completion.result.is_ok());
-        assert_eq!(completion.plan.record_range, 0..1120);
+        assert_eq!(completion.descriptor.record_range, 0..1120);
         assert_eq!(completion.record_bytes().unwrap().len(), 1120);
         assert_eq!(
             backend
@@ -468,7 +468,7 @@ mod tests {
         );
         drop(completion.buffer);
         engine.shutdown().unwrap();
-        assert_eq!(resources.managed_memory_snapshot().current_bytes, 0);
+        assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
 
     #[test]
@@ -476,12 +476,12 @@ mod tests {
         let record_len = 1056;
         let offset = geometry().region_size as u32 - record_len;
         let entry = entry(PackedLocation::new(1, offset, 1120).unwrap());
-        let plan = plan_read(geometry(), 7, candidate(entry), false).unwrap();
+        let descriptor = describe_read(geometry(), 7, candidate(entry), false).unwrap();
 
-        assert_eq!(plan.record_range, 0..record_len as usize);
-        assert_eq!(plan.read_len, record_len as usize);
+        assert_eq!(descriptor.record_range, 0..record_len as usize);
+        assert_eq!(descriptor.read_len, record_len as usize);
         assert_eq!(
-            plan.absolute,
+            descriptor.absolute,
             DATA_REGION_AREA_OFFSET + geometry().region_size + u64::from(offset)
         );
     }
@@ -492,7 +492,7 @@ mod tests {
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
-        let error = plan_read(geometry(), 7, candidate(invalid), true).unwrap_err();
+        let error = describe_read(geometry(), 7, candidate(invalid), true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend
@@ -507,7 +507,7 @@ mod tests {
             region_generation: 0,
         };
         assert_eq!(
-            plan_read(geometry(), 7, generation_zero, true)
+            describe_read(geometry(), 7, generation_zero, true)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput

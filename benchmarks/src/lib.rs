@@ -14,4 +14,5 @@
 
 //! Shared support for the standalone C² benchmark targets.
 
+pub mod config;
 pub mod report;

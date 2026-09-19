@@ -219,7 +219,7 @@ fn exercise_region_index_operations(input: &[u8]) {
     let slot_count = 8_usize << usize::from(input.first().copied().unwrap_or(0) & 3);
     let storage = PartitionedIndexStorage::anonymous(slot_count).unwrap();
     let index = RegionIndex::from_storage(storage).unwrap();
-    index.set_statistics_enabled(true);
+    index.set_activity_counters_enabled(true);
 
     for chunk in input
         .get(1..)

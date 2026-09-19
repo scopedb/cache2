@@ -40,7 +40,6 @@ use asyncband::semaphore::Semaphore;
 use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
-use crate::IoEngineOptions;
 use crate::config::CacheConfig;
 use crate::config::l1_entry_capacity;
 use crate::config::reserved_memory_bytes;
@@ -61,6 +60,13 @@ use crate::io::engine::ReadSlot;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::submit_cache_io_with_timeout;
+use crate::managed_memory::BufferLease;
+use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
+use crate::managed_memory::ManagedMemory;
+use crate::managed_memory::ManagedMemoryError;
+use crate::managed_memory::ManagedMemoryLimits;
+#[cfg(test)]
+use crate::managed_memory::ManagedMemorySnapshot;
 use crate::memory::MemoryLookup;
 #[cfg(test)]
 use crate::memory::MemoryMetricsSnapshot;
@@ -82,8 +88,8 @@ use crate::region::reader::PendingRead;
 #[cfg(test)]
 use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
-use crate::region::reader::ReadPlan;
-use crate::region::reader::plan_read;
+use crate::region::reader::ReadDescriptor;
+use crate::region::reader::describe_read;
 use crate::region::record::MAX_KEY_SIZE;
 #[cfg(test)]
 use crate::region::record::RECORD_HEADER_SIZE;
@@ -96,13 +102,6 @@ use crate::region::recovery::DataSuperblock;
 use crate::region::runtime_fixed_memory_bytes;
 use crate::region::staging::RegionStaging;
 use crate::region::staging::StagingError;
-use crate::resources::BufferLease;
-use crate::resources::CACHE_THREAD_STACK_BYTES;
-#[cfg(test)]
-use crate::resources::ManagedMemorySnapshot;
-use crate::resources::ResourceBuildError;
-use crate::resources::ResourceController;
-use crate::resources::ResourceLimits;
 use crate::snapshot::CacheIoDirectionSnapshot;
 use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheSnapshot;
@@ -321,7 +320,7 @@ struct PendingGet {
 struct WaitingGet {
     engine: Arc<dyn IoEngine>,
     slot_waiter: ReadSlotWaiter,
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
     hash: u64,
     deadline: Instant,
@@ -331,7 +330,7 @@ struct WaitingGet {
 struct ReservedGet {
     engine: Arc<dyn IoEngine>,
     slot: ReadSlot,
-    plan: ReadPlan,
+    descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
     hash: u64,
 }
@@ -378,7 +377,7 @@ impl WaitingGet {
         let Self {
             engine,
             slot_waiter,
-            plan,
+            descriptor,
             read_token,
             hash,
             deadline,
@@ -389,7 +388,7 @@ impl WaitingGet {
         Ok(ReservedGet {
             engine,
             slot,
-            plan,
+            descriptor,
             read_token,
             hash,
         })
@@ -413,7 +412,7 @@ impl HybridValueRead {
 pub struct RegionDataPlane {
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    config: RuntimeOptions,
+    runtime: RuntimeOptions,
     metrics: Arc<RuntimeMetrics>,
     shared: Arc<RunningShared>,
     owner: Arc<Mutex<Option<RunningOwner>>>,
@@ -437,7 +436,7 @@ struct RunningShared {
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
-    resources: Arc<ResourceController>,
+    managed_memory: Arc<ManagedMemory>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
     staging: Arc<RegionStaging>,
@@ -445,7 +444,7 @@ struct RunningShared {
     shards: Box<[Arc<ShardControl>]>,
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
-    statistics: bool,
+    activity_counters: bool,
 }
 
 #[derive(Default)]
@@ -517,7 +516,7 @@ impl RunningShared {
     fn try_queue_read(
         &self,
         route: u64,
-        plan: ReadPlan,
+        descriptor: ReadDescriptor,
         read_token: MemoryReadToken,
         timeout: Duration,
     ) -> io::Result<WaitingGet> {
@@ -536,7 +535,7 @@ impl RunningShared {
         Ok(WaitingGet {
             engine,
             slot_waiter,
-            plan,
+            descriptor,
             read_token,
             hash: route,
             deadline,
@@ -745,31 +744,31 @@ impl RegionDataPlane {
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
         files: RuntimeFileSet,
-        configuration: CacheConfig,
+        config: CacheConfig,
     ) -> io::Result<Self> {
         // Recovery supplies independently validated metadata. It must still
         // match the configuration selected for this open.
-        let storage = configuration.storage();
+        let storage = config.storage();
         if data.geometry != storage_geometry(storage)
             || core.region_count()? != storage.region_count() as usize
             || core.index_slot_count() != storage.index_slots()
-            || core.shard_count() != configuration.runtime().append_shards as usize
+            || core.shard_count() != config.runtime().append_shards as usize
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "recovered layout does not match the cache configuration",
             ));
         }
-        let config = configuration.runtime().clone();
-        core.configure_reclaim_workers(IoPoolTopology::reclaim(config.io_engine).max_in_flight)?;
-        core.set_index_statistics_enabled(config.statistics);
-        let metrics = Arc::new(RuntimeMetrics::new(core.shard_count(), config.stats)?);
+        let runtime = config.runtime().clone();
+        core.configure_reclaim_workers(IoPoolTopology::reclaim(runtime.io_engine).max_in_flight())?;
+        core.set_index_activity_counters_enabled(runtime.stats.activity_counters);
+        let metrics = Arc::new(RuntimeMetrics::new(core.shard_count(), runtime.stats)?);
         let operations = Arc::new(MutationGate::new());
         let running = start_running(
             Arc::clone(&core),
             data,
             files,
-            configuration,
+            config,
             Arc::clone(&metrics),
             Arc::clone(&operations),
         )?;
@@ -777,7 +776,7 @@ impl RegionDataPlane {
         Ok(Self {
             core,
             data,
-            config,
+            runtime,
             metrics,
             shared,
             owner: Arc::new(Mutex::new(Some(running))),
@@ -817,12 +816,12 @@ impl RegionDataPlane {
         let shard_id = self.core.append_shard(hash);
         let control = &running.shards[shard_id];
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let operation = match self.operations.try_enter() {
             Some(operation) => operation,
             None => {
-                if running.statistics {
+                if running.activity_counters {
                     running.metrics.record_write_rejection();
                 }
                 return Err(write_overload_error());
@@ -882,12 +881,12 @@ impl RegionDataPlane {
         let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let operation = match self.operations.try_enter() {
             Some(operation) => operation,
             None => {
-                if running.statistics {
+                if running.activity_counters {
                     running.metrics.record_write_rejection();
                 }
                 return Err(write_overload_error());
@@ -895,7 +894,7 @@ impl RegionDataPlane {
         };
         let Some(seqno) = self.core.try_delete_value(hash)? else {
             drop(operation);
-            if running.statistics {
+            if running.activity_counters {
                 running.metrics.record_write_rejection();
             }
             return Err(write_overload_error());
@@ -930,7 +929,7 @@ impl RegionDataPlane {
                 self.finish_get(pending.wait_async(tokio_handle).await, key)
             }
             PreparedGet::Waiting(waiting) => {
-                let wait_started = self.config.statistics.then(Instant::now);
+                let wait_started = self.runtime.stats.activity_counters.then(Instant::now);
                 let reserved = waiting.reserve_async(tokio_handle).await;
                 if let Some(wait_started) = wait_started {
                     self.metrics.record_read_wait(wait_started.elapsed());
@@ -945,7 +944,7 @@ impl RegionDataPlane {
     }
 
     fn record_read_wait_error(&self, error: &io::Error) {
-        if !self.config.statistics {
+        if !self.runtime.stats.activity_counters {
             return;
         }
         if is_read_pressure(error.kind()) {
@@ -959,12 +958,16 @@ impl RegionDataPlane {
         let ReservedGet {
             engine,
             slot,
-            plan,
+            descriptor,
             read_token,
             hash,
         } = reserved;
-        let Some(buffer) = self.shared.resources.try_read_buffer(plan.read_len) else {
-            if self.config.statistics {
+        let Some(buffer) = self
+            .shared
+            .managed_memory
+            .try_read_buffer(descriptor.read_len)
+        else {
+            if self.runtime.stats.activity_counters {
                 self.metrics.record_read_overload();
             }
             return Err(io::Error::new(
@@ -974,7 +977,7 @@ impl RegionDataPlane {
         };
         match self
             .core
-            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+            .submit_value_read(engine.as_ref(), slot, buffer, descriptor)
         {
             Ok(read) => Ok(Some(PendingGet {
                 engine,
@@ -983,7 +986,7 @@ impl RegionDataPlane {
                 hash,
             })),
             Err(_) if !self.core.is_healthy() => {
-                if self.config.statistics {
+                if self.runtime.stats.activity_counters {
                     RuntimeMetrics::increment(&self.metrics.io_failures);
                     RuntimeMetrics::increment(&self.metrics.activity_for_hash(hash).l2_misses);
                 }
@@ -1002,7 +1005,7 @@ impl RegionDataPlane {
         guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
     ) -> io::Result<PreparedGet> {
         if key.len() > MAX_KEY_SIZE {
-            if self.config.statistics {
+            if self.runtime.stats.activity_counters {
                 let activity = self.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
@@ -1012,7 +1015,7 @@ impl RegionDataPlane {
         let running = &self.shared;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         if !self.core.is_healthy() {
             if let Some(activity) = activity {
@@ -1048,17 +1051,17 @@ impl RegionDataPlane {
             }
             return Ok(PreparedGet::Complete(None));
         };
-        let plan = match plan_read(
+        let descriptor = match describe_read(
             self.data.geometry,
             hash,
             candidate,
             running.align_reads_for_direct_io,
         ) {
-            Ok(plan) => plan,
+            Ok(descriptor) => descriptor,
             Err(error) => {
                 self.core
-                    .enter_miss_only_with_error("record_read_plan_invalid", &error);
-                if running.statistics {
+                    .enter_miss_only_with_error("record_read_descriptor_invalid", &error);
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 if let Some(activity) = activity {
@@ -1071,12 +1074,17 @@ impl RegionDataPlane {
             Ok(reservation) => reservation,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    && !read_io_wait_timeout(&self.config).is_zero() =>
+                    && !read_io_wait_timeout(&self.runtime).is_zero() =>
             {
                 let waiting = running
-                    .try_queue_read(hash, plan, read_token, read_io_wait_timeout(&self.config))
+                    .try_queue_read(
+                        hash,
+                        descriptor,
+                        read_token,
+                        read_io_wait_timeout(&self.runtime),
+                    )
                     .inspect_err(|_| {
-                        if running.statistics {
+                        if running.activity_counters {
                             running.metrics.record_read_overload();
                         }
                     })?;
@@ -1092,7 +1100,7 @@ impl RegionDataPlane {
             Err(error) => {
                 self.core
                     .enter_miss_only_with_error("read_engine_reservation_failed", &error);
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 if let Some(activity) = activity {
@@ -1101,9 +1109,9 @@ impl RegionDataPlane {
                 return Ok(PreparedGet::Complete(None));
             }
         };
-        let Some(buffer) = running.resources.try_read_buffer(plan.read_len) else {
-            if !read_io_wait_timeout(&self.config).is_zero() {
-                if running.statistics {
+        let Some(buffer) = running.managed_memory.try_read_buffer(descriptor.read_len) else {
+            if !read_io_wait_timeout(&self.runtime).is_zero() {
+                if running.activity_counters {
                     running.metrics.record_read_overload();
                 }
                 return Err(io::Error::new(
@@ -1119,7 +1127,7 @@ impl RegionDataPlane {
         };
         match self
             .core
-            .submit_value_read_from_plan(engine.as_ref(), slot, buffer, plan)
+            .submit_value_read(engine.as_ref(), slot, buffer, descriptor)
         {
             Ok(read) => Ok(PreparedGet::Pending(PendingGet {
                 engine,
@@ -1139,8 +1147,8 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !read_io_wait_timeout(&self.config).is_zero() {
-                    if running.statistics {
+                if !read_io_wait_timeout(&self.runtime).is_zero() {
+                    if running.activity_counters {
                         running.metrics.record_read_overload();
                     }
                     return Err(error);
@@ -1152,7 +1160,7 @@ impl RegionDataPlane {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) => {
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 Err(error)
@@ -1172,7 +1180,7 @@ impl RegionDataPlane {
             hash,
         } = completed;
         let activity = running
-            .statistics
+            .activity_counters
             .then(|| running.metrics.activity_for_hash(hash));
         let result = self.core.finish_value_read(read, key);
         match result {
@@ -1207,7 +1215,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !read_io_wait_timeout(&self.config).is_zero() {
+                if !read_io_wait_timeout(&self.runtime).is_zero() {
                     self.record_read_wait_error(&error);
                     return Err(error);
                 }
@@ -1218,7 +1226,7 @@ impl RegionDataPlane {
                 Ok(None)
             }
             Err(error) => {
-                if running.statistics {
+                if running.activity_counters {
                     RuntimeMetrics::increment(&running.metrics.io_failures);
                 }
                 Err(error)
@@ -1267,8 +1275,8 @@ impl RegionDataPlane {
     fn snapshot_running(&self, running: &RunningShared) -> CacheSnapshot {
         let mut snapshot = self.metrics.snapshot(
             self.core.is_healthy(),
-            self.config.statistics,
-            running.resources.managed_memory_snapshot(),
+            self.runtime.stats.activity_counters,
+            running.managed_memory.snapshot(),
             running.memory.metrics_snapshot(),
         );
         snapshot.io = aggregate_io_stats(
@@ -1377,20 +1385,20 @@ fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
     files: RuntimeFileSet,
-    configuration: CacheConfig,
+    config: CacheConfig,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
 ) -> io::Result<RunningOwner> {
     let shard_count = core.shard_count();
-    let config = configuration.runtime();
-    let l1_entry_capacity = l1_entry_capacity(&configuration);
-    let memory_limit = config.managed_memory_limit_bytes;
-    let resources = Arc::new(
-        ResourceController::try_new(ResourceLimits {
+    let runtime = config.runtime();
+    let l1_entry_capacity = l1_entry_capacity(&config);
+    let memory_limit = runtime.managed_memory_limit_bytes;
+    let managed_memory = Arc::new(
+        ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: memory_limit,
-            reserved_memory_bytes: reserved_memory_bytes(&configuration),
+            reserved_memory_bytes: reserved_memory_bytes(&config),
         })
-        .map_err(resource_build_io_error)?,
+        .map_err(managed_memory_io_error)?,
     );
     let usable_region = usize::try_from(data.geometry.region_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region size is too large"))?;
@@ -1400,18 +1408,18 @@ fn start_running(
             shard_count,
             chunk_bytes,
             data.geometry.region_size,
-            &resources,
+            &managed_memory,
         )
-        .map_err(resource_build_io_error)?,
+        .map_err(managed_memory_io_error)?,
     );
     let memory = Arc::new(MemoryStore::new(
-        config.l1_capacity_bytes,
+        runtime.l1_capacity_bytes,
         l1_entry_capacity,
-        config.l1_shards,
-        config.l1_eviction_policy,
-        config.statistics,
+        runtime.l1_shards,
+        runtime.l1_eviction_policy,
+        runtime.stats.activity_counters,
     )?);
-    let reclaim_worker_count = IoPoolTopology::reclaim(config.io_engine).max_in_flight;
+    let reclaim_worker_count = IoPoolTopology::reclaim(runtime.io_engine).max_in_flight();
     let mut reclaim_buffers = Vec::new();
     reclaim_buffers
         .try_reserve_exact(reclaim_worker_count)
@@ -1422,34 +1430,38 @@ fn start_running(
             )
         })?;
     for _ in 0..reclaim_worker_count {
-        reclaim_buffers.push(resources.try_read_buffer(usable_region).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate a fixed Region reclaim buffer",
-            )
-        })?);
+        reclaim_buffers.push(
+            managed_memory
+                .try_read_buffer(usable_region)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "cannot allocate a fixed Region reclaim buffer",
+                    )
+                })?,
+        );
     }
     let reclaim_files = files.try_clone()?;
     let write_files = files.try_clone()?;
-    let read_wait_enabled = !read_io_wait_timeout(config).is_zero();
+    let read_wait_enabled = !read_io_wait_timeout(runtime).is_zero();
     let read_engines = build_engine_pool(
         files,
-        config,
-        IoPoolTopology::read(config.io_engine),
+        runtime,
+        IoPoolTopology::read(runtime.io_engine),
         read_wait_enabled,
     )?;
     let read_waiters =
-        read_wait_enabled.then(|| Arc::new(Semaphore::new(read_io_wait_capacity(config))));
+        read_wait_enabled.then(|| Arc::new(Semaphore::new(read_io_wait_capacity(runtime))));
     let write_engines = build_engine_pool(
         write_files,
-        config,
-        IoPoolTopology::write(config.io_engine),
+        runtime,
+        IoPoolTopology::write(runtime.io_engine),
         false,
     )?;
     let reclaim_engines = build_engine_pool(
         reclaim_files,
-        config,
-        IoPoolTopology::reclaim(config.io_engine),
+        runtime,
+        IoPoolTopology::reclaim(runtime.io_engine),
         false,
     )?;
     for (engines, role) in [
@@ -1476,16 +1488,16 @@ fn start_running(
         write_engines,
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
-        reclaim_io_timeout: config.reclaim_io_timeout,
-        resources,
+        reclaim_io_timeout: runtime.reclaim_io_timeout,
+        managed_memory,
         metrics,
         memory,
         staging,
         operations,
         shards: shards.into_boxed_slice(),
-        write_flush_threshold_bytes: config.write_flush_threshold_bytes,
-        align_reads_for_direct_io: config.io_mode == IoMode::Direct,
-        statistics: config.statistics,
+        write_flush_threshold_bytes: runtime.write_flush_threshold_bytes,
+        align_reads_for_direct_io: runtime.io_mode == IoMode::Direct,
+        activity_counters: runtime.stats.activity_counters,
     });
     // Inspect the recovered queue before workers can contend with foreground
     // mutations. Fresh caches have no sealed Regions and need no wakeup.
@@ -1562,21 +1574,16 @@ fn start_running(
 
 fn build_engine_pool(
     files: RuntimeFileSet,
-    config: &RuntimeOptions,
+    runtime: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
     let mut source = Some(files);
-    let engine_count = topology.engine_count;
+    let engine_count = topology.engine_count();
     let mut engines = Vec::new();
     engines
         .try_reserve_exact(engine_count)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate I/O workers"))?;
-    let posix_workers = if matches!(config.io_engine, IoEngineOptions::Posix(_)) {
-        topology.max_in_flight
-    } else {
-        1
-    };
     for engine in 0..engine_count {
         let worker_files = if engine + 1 == engine_count {
             source.take().expect("last I/O worker owns file set")
@@ -1585,11 +1592,8 @@ fn build_engine_pool(
         };
         engines.push(build_file_engine(
             worker_files,
-            topology.depth_for_engine(engine),
-            posix_workers,
-            config.io_engine,
-            topology.io_uring,
-            config.statistics,
+            topology.engine_config(engine),
+            runtime.stats.activity_counters,
             read_wait_enabled,
         )?);
     }
@@ -1606,7 +1610,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("shard worker panicked"),
     };
-    if shared.statistics {
+    if shared.activity_counters {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
     let first_failure = shared
@@ -1682,7 +1686,7 @@ fn reclaim_worker(
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("Region reclaim worker panicked"),
     };
-    if shared.statistics {
+    if shared.activity_counters {
         RuntimeMetrics::increment(&shared.metrics.io_failures);
     }
     shared
@@ -1820,7 +1824,7 @@ fn reclaim_worker_result(
             }
             shared.core.complete_reclaim(receipt)?;
             drop(reinsert_operation);
-            if shared.statistics {
+            if shared.activity_counters {
                 shared.metrics.record_reclaim(stats);
             }
             log::debug!(
@@ -1878,7 +1882,7 @@ fn shard_worker_result(
                 deadline = None;
                 if rotate {
                     let rotated = shared.core.rotate_shard(shard_id)?;
-                    if rotated && shared.statistics {
+                    if rotated && shared.activity_counters {
                         RuntimeMetrics::increment(&shared.metrics.region_rotations);
                     }
                     if rotated {
@@ -1970,7 +1974,7 @@ fn reject_staged_write<Operation>(
 ) -> io::Result<u64> {
     control.notify(flags)?;
     drop(operation);
-    if running.statistics {
+    if running.activity_counters {
         RuntimeMetrics::increment(&running.metrics.write_buffer_rejections);
         running.metrics.record_write_rejection();
     }
@@ -2141,10 +2145,10 @@ fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
     }
 }
 
-fn resource_build_io_error(error: ResourceBuildError) -> io::Error {
+fn managed_memory_io_error(error: ManagedMemoryError) -> io::Error {
     let kind = match error {
-        ResourceBuildError::Invalid(_) => io::ErrorKind::InvalidInput,
-        ResourceBuildError::Allocation => io::ErrorKind::OutOfMemory,
+        ManagedMemoryError::Invalid(_) => io::ErrorKind::InvalidInput,
+        ManagedMemoryError::Allocation => io::ErrorKind::OutOfMemory,
     };
     io::Error::new(kind, error.to_string())
 }
@@ -2521,7 +2525,7 @@ mod tests {
                 region_count: 2,
             },
             hash_seed: 3,
-            config_fingerprint: 4,
+            storage_fingerprint: 4,
         };
         for wait in [Duration::ZERO, Duration::from_millis(1)] {
             let config = RuntimeOptions {
@@ -2532,7 +2536,10 @@ mod tests {
                 }),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
-                statistics: true,
+                stats: crate::StatsOptions {
+                    activity_counters: true,
+                    ..Default::default()
+                },
                 read_admission: if wait.is_zero() {
                     ReadAdmission::Immediate
                 } else {
@@ -2555,7 +2562,7 @@ mod tests {
             let result = plane.finish_get(
                 CompletedGet {
                     read: ReadCompletion {
-                        plan: ReadPlan {
+                        descriptor: ReadDescriptor {
                             hash: 7,
                             entry: IndexEntry {
                                 location: PackedLocation::new(0, 0, 64).unwrap(),
@@ -2604,7 +2611,7 @@ mod tests {
             location: PackedLocation::new(0, 0, record_len).unwrap(),
         };
         assert_eq!(
-            plan_read(
+            describe_read(
                 geometry,
                 1,
                 ReadCandidate {

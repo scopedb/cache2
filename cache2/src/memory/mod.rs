@@ -273,13 +273,13 @@ struct DetachedAdmissionEntry {
     transfers_charge: bool,
 }
 
-struct AdmissionPlan {
+struct AdmissionVictims {
     victims: [Option<DetachedAdmissionEntry>; MAX_EVICTIONS_PER_INSERT],
     len: usize,
     released_bytes: usize,
 }
 
-impl AdmissionPlan {
+impl AdmissionVictims {
     const fn new() -> Self {
         Self {
             victims: [None; MAX_EVICTIONS_PER_INSERT],
@@ -292,7 +292,7 @@ impl AdmissionPlan {
         let slot = self
             .victims
             .get_mut(self.len)
-            .expect("admission plan exceeds its fixed victim budget");
+            .expect("admission victims exceed their fixed budget");
         *slot = Some(victim);
         self.len += 1;
         self.released_bytes = self.released_bytes.saturating_add(victim.weight);
@@ -301,14 +301,14 @@ impl AdmissionPlan {
     fn iter(&self) -> impl Iterator<Item = DetachedAdmissionEntry> + '_ {
         self.victims[..self.len]
             .iter()
-            .map(|victim| victim.expect("planned victim slot is populated"))
+            .map(|victim| victim.expect("selected victim slot is populated"))
     }
 
     fn iter_rev(&self) -> impl Iterator<Item = DetachedAdmissionEntry> + '_ {
         self.victims[..self.len]
             .iter()
             .rev()
-            .map(|victim| victim.expect("planned victim slot is populated"))
+            .map(|victim| victim.expect("selected victim slot is populated"))
     }
 }
 
@@ -543,9 +543,9 @@ impl MemoryShard {
     fn restore_admission(
         &mut self,
         replacement: Option<DetachedAdmissionEntry>,
-        plan: &AdmissionPlan,
+        victims: &AdmissionVictims,
     ) {
-        for victim in plan.iter_rev() {
+        for victim in victims.iter_rev() {
             self.restore_detached(victim);
         }
         if let Some(replacement) = replacement {
@@ -584,11 +584,11 @@ impl MemoryShard {
         let replacement_bytes = replacement
             .filter(|entry| entry.transfers_charge)
             .map_or(0, |entry| entry.weight);
-        let mut plan = AdmissionPlan::new();
+        let mut victims = AdmissionVictims::new();
         let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
-        while replacement_bytes.saturating_add(plan.released_bytes)
+        while replacement_bytes.saturating_add(victims.released_bytes)
             < required.saturating_sub(self.budget.available_bytes())
-            && plan.len < MAX_EVICTIONS_PER_INSERT
+            && victims.len < MAX_EVICTIONS_PER_INSERT
             && remaining_steps > 0
         {
             let candidate = {
@@ -607,19 +607,19 @@ impl MemoryShard {
             };
             let detached = self.detach_for_admission(candidate);
             debug_assert!(detached.transfers_charge);
-            plan.push(detached);
+            victims.push(detached);
         }
-        let released = replacement_bytes.saturating_add(plan.released_bytes);
+        let released = replacement_bytes.saturating_add(victims.released_bytes);
         let required_release = required.saturating_sub(self.budget.available_bytes());
         if released < required_release {
-            self.restore_admission(replacement, &plan);
+            self.restore_admission(replacement, &victims);
             return ChargeResult::Rejected { evictions: 0 };
         }
 
         let charge = match self.budget.try_transfer_charge(released, required) {
             MemoryChargeAttempt::Charged(charge) => charge,
             MemoryChargeAttempt::Full | MemoryChargeAttempt::Contended => {
-                self.restore_admission(replacement, &plan);
+                self.restore_admission(replacement, &victims);
                 return ChargeResult::Rejected { evictions: 0 };
             }
         };
@@ -627,12 +627,12 @@ impl MemoryShard {
         if let Some(replacement) = replacement {
             self.commit_detached(replacement, false);
         }
-        for victim in plan.iter() {
+        for victim in victims.iter() {
             self.commit_detached(victim, true);
         }
         ChargeResult::Charged {
             charge,
-            evictions: plan.len,
+            evictions: victims.len,
         }
     }
 
@@ -802,7 +802,7 @@ impl MemoryStore {
         entry_capacity: usize,
         shard_count: usize,
         eviction_policy: L1EvictionPolicy,
-        statistics_enabled: bool,
+        activity_counters_enabled: bool,
     ) -> io::Result<Self> {
         if shard_count == 0 {
             return Err(io::Error::new(
@@ -837,7 +837,7 @@ impl MemoryStore {
         Ok(Self {
             shards: shards.into_boxed_slice(),
             metrics: MemoryMetrics {
-                enabled: statistics_enabled,
+                enabled: activity_counters_enabled,
                 evictions: AtomicU64::new(0),
                 bypasses: AtomicU64::new(0),
             },
