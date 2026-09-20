@@ -422,7 +422,8 @@ pub struct RuntimeOptions {
     /// completions still fail the instance.
     pub io_recovery_timeout: Option<Duration>,
     /// Optional pre-timeout fill pressure control. Disabled by default.
-    /// Enabled modes reserve a monitoring thread and bounded worker observations.
+    /// Enabled modes reserve bounded worker observations; Adaptive paces
+    /// background flush and pauses new fills when outstanding work is old.
     pub fill_control: FillControlOptions,
     /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
     /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
@@ -847,7 +848,7 @@ mod tests {
     use crate::StorageOptions;
 
     #[test]
-    fn fill_control_validates_ceilings_and_accounts_monitor_memory() {
+    fn fill_control_validates_ceilings_and_accounts_observation_memory() {
         let storage = StorageOptions::new(1024 * 1024 * 1024).build().unwrap();
         let base = CacheConfig::new(storage.clone(), RuntimeOptions::default()).unwrap();
         assert_eq!(base.runtime().fill_control, FillControlOptions::Disabled);
@@ -874,7 +875,8 @@ mod tests {
             )
             .unwrap();
             let extra = config.minimum_memory_bytes() - base.minimum_memory_bytes();
-            assert!(extra > CACHE_THREAD_STACK_BYTES);
+            assert!(extra > 0);
+            assert!(extra < CACHE_THREAD_STACK_BYTES);
             if let Some(previous) = minimum {
                 assert_eq!(extra, previous);
             }

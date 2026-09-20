@@ -53,6 +53,9 @@ impl BackgroundRecovery {
         RecoveryAttempt {
             recovery: self,
             entered: false,
+            slow: false,
+            started: None,
+            io_timeout: Duration::ZERO,
             observation: None,
         }
     }
@@ -74,24 +77,49 @@ impl BackgroundRecovery {
 pub struct RecoveryAttempt<'a> {
     recovery: &'a BackgroundRecovery,
     entered: bool,
+    slow: bool,
+    started: Option<Instant>,
+    io_timeout: Duration,
     observation: Option<Observation<'a>>,
 }
 
 impl RecoveryAttempt<'_> {
     pub fn start(&mut self, bytes: u64, timeout: Duration) {
+        self.started = Some(Instant::now());
+        self.io_timeout = timeout;
         if let Some(fill) = &self.recovery.fill {
             self.observation = fill.observe(bytes, timeout);
         }
     }
 
-    pub fn admitted(&self) {
-        if let Some(observation) = &self.observation {
-            observation.admitted();
+    /// First wait bound: a fill checkpoint before the normal I/O timeout.
+    pub fn wait_cap(&self, original: Instant) -> Instant {
+        if self.recovery.fill.is_none() || self.slow {
+            return original;
+        }
+        let Some(start) = self.started else {
+            return original;
+        };
+        FillController::checkpoint(start, self.io_timeout).min(original)
+    }
+
+    pub fn note_slow(&mut self) {
+        if self.slow {
+            return;
+        }
+        self.slow = true;
+        if let Some(observation) = &mut self.observation {
+            observation.note_slow();
         }
     }
-    pub fn completed(&self) {
-        if let Some(observation) = &self.observation {
-            observation.completed();
+
+    pub fn clear_slow(&mut self) {
+        if !self.slow {
+            return;
+        }
+        self.slow = false;
+        if let Some(observation) = &mut self.observation {
+            observation.clear_slow();
         }
     }
 
@@ -131,12 +159,15 @@ impl RecoveryAttempt<'_> {
         if let Some(observation) = self.observation.take() {
             observation.finish();
         }
-        if self.entered && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.entered {
+            let last = self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1;
             if let Some(fill) = &self.recovery.fill {
                 fill.set_recovering(false);
             }
-            log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
+            if last {
+                log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
                 "all timed-out background operations recovered and passed validation");
+            }
         }
     }
 }

@@ -396,8 +396,7 @@ impl Cache {
         public_result(ErrorOperation::Drain, self.data_plane.drain_async().await)
     }
 
-    /// Returns an operational snapshot using atomics and, when enabled, a short
-    /// fill-controller lock. Activity and I/O counters are
+    /// Returns an operational snapshot using atomics. Activity and I/O counters are
     /// cumulative for this open and are populated only when
     /// `RuntimeOptions::stats.activity_counters` is enabled; health and resource gauges are
     /// always available.

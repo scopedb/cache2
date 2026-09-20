@@ -61,8 +61,8 @@ use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::submit_background_io;
+use crate::io::fill_control::FLUSH_RETRY;
 use crate::io::fill_control::FillController;
-use crate::io::fill_control::FillMonitor;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -429,7 +429,6 @@ struct RunningOwner {
     shared: Arc<RunningShared>,
     shard_workers: Vec<JoinHandle<()>>,
     reclaim_workers: Vec<JoinHandle<()>>,
-    fill_monitor: Option<FillMonitor>,
 }
 
 struct RunningShared {
@@ -842,19 +841,14 @@ impl RegionDataPlane {
                 return Err(write_overload_error());
             }
         };
-        let fill_permit = if let Some(fill) = &running.recovery.fill {
-            match fill.try_admit(u64::from(record_bytes)) {
-                Some(permit) => Some(permit),
-                None => {
-                    if running.activity_counters {
-                        running.metrics.record_write_rejection();
-                    }
-                    return Err(write_overload_error());
-                }
+        if let Some(fill) = &running.recovery.fill
+            && !fill.try_admit()
+        {
+            if running.activity_counters {
+                running.metrics.record_write_rejection();
             }
-        } else {
-            None
-        };
+            return Err(write_overload_error());
+        }
         let staged = self.core.try_stage_value(
             &running.staging,
             shard_id,
@@ -869,9 +863,6 @@ impl RegionDataPlane {
                 previous_bytes,
                 current_bytes,
             } => {
-                if let Some(permit) = fill_permit {
-                    permit.commit();
-                }
                 if ADMIT_L1 {
                     let _published = running.memory.publish(hash, key, value, seqno);
                 } else {
@@ -894,15 +885,9 @@ impl RegionDataPlane {
                 Ok(seqno)
             }
             RegionStageValue::NeedsProgress => {
-                if let Some(fill) = &running.recovery.fill {
-                    fill.note_staging_pressure();
-                }
                 reject_staged_write(running, control, WAKE_URGENT, operation)
             }
             RegionStageValue::NeedsRotation => {
-                if let Some(fill) = &running.recovery.fill {
-                    fill.note_staging_pressure();
-                }
                 reject_staged_write(running, control, WAKE_ROTATE | WAKE_URGENT, operation)
             }
         }
@@ -1530,7 +1515,6 @@ fn start_running(
         shard_count + reclaim_worker_count,
         data.geometry.region_size,
     )?;
-    let fill_monitor = fill.as_ref().map(FillController::start).transpose()?;
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
@@ -1623,7 +1607,6 @@ fn start_running(
         shared,
         shard_workers,
         reclaim_workers,
-        fill_monitor,
     })
 }
 
@@ -1936,14 +1919,33 @@ fn shard_worker_result(
                     )?);
                 }
                 if force_flush || fill.bytes >= shared.write_flush_threshold_bytes {
-                    let engine = shared.write_engine_for(shard_id as u64);
-                    shared.core.flush_staging_shard(
-                        &shared.staging,
-                        engine.as_ref(),
-                        shard_id,
-                        &shared.recovery,
-                    )?;
-                    deadline = None;
+                    let essential = flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining;
+                    let bytes = fill.bytes as u64;
+                    let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
+                    let allow = shared
+                        .recovery
+                        .fill
+                        .as_ref()
+                        .is_none_or(|control| control.try_flush(bytes, records, essential));
+                    if !allow {
+                        deadline = Some(Instant::now() + FLUSH_RETRY);
+                    } else {
+                        let engine = shared.write_engine_for(shard_id as u64);
+                        match shared.core.flush_staging_shard(
+                            &shared.staging,
+                            engine.as_ref(),
+                            shard_id,
+                            &shared.recovery,
+                        )? {
+                            Some(_) => deadline = None,
+                            None => {
+                                if !essential && let Some(control) = &shared.recovery.fill {
+                                    control.refund_flush(bytes, records);
+                                }
+                                deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
+                            }
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -2113,7 +2115,6 @@ async fn drain_shards_async(shared: &RunningShared, stop: bool) -> io::Result<()
 
 fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     owner.shared.recovery.stop();
-    drop(owner.fill_monitor.take());
     let drain = drain_shards(&owner.shared, true);
     let mut join_error = None;
     for worker in owner.shard_workers.drain(..) {

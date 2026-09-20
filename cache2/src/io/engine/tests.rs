@@ -1393,7 +1393,7 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
 }
 
 #[test]
-fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validation() {
+fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_completes() {
     use crate::FillControlOptions;
     use crate::FillLimits;
     use crate::FillPressure;
@@ -1406,7 +1406,6 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validat
             FillControlOptions::Observe(settings)
         };
         let control = FillController::new(mode, 1, 4096).unwrap().unwrap();
-        let monitor = control.start().unwrap();
         let recovery = BackgroundRecovery::with_fill(None, Some(Arc::clone(&control)));
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
@@ -1438,7 +1437,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validat
             }
             let paused = control.snapshot();
             let recovered = recovery.is_recovering();
-            let admission = control.try_admit(64).is_some();
+            let admission = control.try_admit();
             backend.release();
             let completion = returned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(paused.pressure, FillPressure::Paused);
@@ -1446,16 +1445,17 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validat
             assert_eq!(admission, !enforcing);
             assert_eq!(paused.outstanding_bytes, 4096);
             assert!(completion.into_io_result().0.is_ok());
+            assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
+            assert!(control.try_admit());
             validate_tx.send(()).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while control.snapshot().pressure == FillPressure::Paused && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(control.snapshot().pressure, FillPressure::Throttled);
-        assert!(control.try_admit(64).is_some());
+        assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
+        assert!(control.try_admit());
         assert_eq!(lock_unpoisoned(&backend.state).entered, 1);
         engine.shutdown().unwrap();
-        drop(monitor);
     }
 }

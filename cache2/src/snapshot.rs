@@ -46,10 +46,8 @@ pub enum FillPressure {
     /// Pressure observation is disabled.
     #[default]
     Disabled,
-    /// Configured rate ceilings apply without a pressure reduction.
+    /// Configured rate ceilings apply.
     Healthy,
-    /// Fill rate has been reduced while accepted work drains.
-    Throttled,
     /// New fills are paused while outstanding work is old or stalled.
     Paused,
 }
@@ -62,13 +60,13 @@ pub struct FillControlSnapshot {
     pub pressure: FillPressure,
     /// Whether the controller enforces its admission decisions.
     pub enforcing: bool,
-    /// Current encoded-byte admission rate.
+    /// Configured encoded-byte ceiling when healthy; zero while paused.
     pub bytes_per_second: u64,
-    /// Current fill-record admission rate.
+    /// Configured fill-record ceiling when healthy; zero while paused.
     pub records_per_second: u32,
-    /// Fills rejected by Adaptive, including bounded CAS contention.
+    /// Fills rejected by Adaptive while paused.
     pub rejections: u64,
-    /// Observe-mode pause or budget refusals; excludes CAS/epoch contention.
+    /// Observe-mode pause refusals.
     pub would_reject: u64,
     /// Background observations skipped because the table was full.
     pub dropped_observations: u64,
@@ -76,22 +74,15 @@ pub struct FillControlSnapshot {
     pub outstanding_operations: u64,
     /// Bytes held by those background operations; excludes unflushed staging.
     pub outstanding_bytes: u64,
-    /// Age of the oldest background operation, including admission/validation.
+    /// Age of the oldest background operation.
     pub oldest_operation_ns: u64,
-    /// Estimated drain time using recent validated background throughput.
+    /// Estimated drain time using validated background throughput since open.
     pub estimated_drain_ns: u64,
-    /// Accumulated background admission time in nanoseconds.
-    pub admission_ns: u64,
-    /// Accumulated time from admission to result consumption, including scheduling.
-    pub completion_wait_ns: u64,
-    /// Accumulated time from result consumption through validation/publication.
-    pub validation_ns: u64,
 }
 
 /// Point-in-time operational counters and cache-owned resource accounting.
-/// Sampling uses atomics, plus a short controller lock when fill control is enabled. Counters are
-/// process-local and reset on every open. Concurrent updates may appear across fields at slightly
-/// different instants.
+/// Sampling uses atomics. Counters are process-local and reset on every open.
+/// Concurrent updates may appear across fields at slightly different instants.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {

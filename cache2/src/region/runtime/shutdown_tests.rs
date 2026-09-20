@@ -178,7 +178,6 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
             shared,
             shard_workers: vec![],
             reclaim_workers: vec![],
-            fill_monitor: None,
         });
         tx.send(result).unwrap();
     });
@@ -314,7 +313,7 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     fill.set_recovering(true);
     let deadline = Instant::now() + Duration::from_secs(2);
     while fill.snapshot().pressure != crate::FillPressure::Paused {
-        assert!(Instant::now() < deadline, "monitor did not pause fills");
+        assert!(Instant::now() < deadline, "controller did not pause fills");
         std::thread::sleep(Duration::from_millis(1));
     }
     let snapshot = plane.snapshot().unwrap();

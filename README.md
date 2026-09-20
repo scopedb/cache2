@@ -83,7 +83,7 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 | Memory      | `managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                       |
 | I/O mode    | `io_mode`                                                                    | Buffered I/O.                                                                                 |
 | Metrics     | `stats: StatsOptions`                                                        | Health/resource gauges always available; activity, request, and latency collection opt in.    |
-| Fill control | `fill_control: FillControlOptions`                                          | Disabled. `Observe` reports pause/budget pressure; `Adaptive` rejects new fills before timeout. |
+| Fill control | `fill_control: FillControlOptions`                                          | Disabled. `Observe` reports pause pressure; `Adaptive` rejects new fills before timeout. |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm open. Growth uses available Free Regions; when there are not enough, the disposable cache safely starts empty.
 
@@ -107,7 +107,7 @@ The on-disk format is versioned. During 0.x, deployments should expect cold star
 
 ### Metrics
 
-`Cache::snapshot()` provides health and resource gauges using atomics and, when enabled, a short fill-controller lock. Setting `RuntimeOptions::stats.activity_counters` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
+`Cache::snapshot()` provides health and resource gauges using atomics. Setting `RuntimeOptions::stats.activity_counters` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
 
 `RuntimeOptions::stats` independently enables complete public request outcomes, L1-hit, L2-lookup and mutation latency (each `Off`, `Full`, or `Sampled`), and full I/O latency by read/write/reclaim role. `Cache::stats_snapshot()` combines these with the existing summary without metadata scans. Structured request rows include their timing scope and collection mode. Applications own metric conversion, timestamps, scheduling and transport. Run `cargo run --example stats -- <cache-data-path>` for an example. Full timing avoids sampling work; sampled histograms retain actual sample counts and cannot guarantee observation of rare tail events. Recorder storage is preallocated, bounded and charged to managed memory.
 
@@ -160,4 +160,4 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 Set `RuntimeOptions::reclaim_io_timeout` to change the normal background reclaim deadline, for example `Duration::from_secs(30)` (default five seconds). Background write and reclaim timeouts enter `CacheHealth::Recovering`: new fills return overload while reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` defaults to `None`, allowing recovery until completion or close. Use `Some(Duration::from_secs(300))` to limit the additional wait, or `Some(Duration::ZERO)` for immediate cancellation. Original requests retain their resources and are never resubmitted; fills resume after validation and publication of all affected work. Close interrupts recovery; drain may wait indefinitely. Actual I/O errors and invalid completions still fail the cache.
 
-Optional [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) detects slow background progress before timeout and limits new fills by encoded bytes and record count. Start with `FillControlOptions::Observe` to inspect pressure and hypothetical rejections, then use `Adaptive` to enforce the configured limits. It is disabled by default; reads, deletes, accepted writes, and essential reclaim retain their existing paths.
+Optional [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) detects slow background progress before timeout. `Adaptive` pauses new fills immediately and paces non-essential flush by encoded bytes and record count. Start with `FillControlOptions::Observe` to inspect pause pressure and hypothetical rejections, then use `Adaptive` to enforce. It is disabled by default; reads, deletes, accepted writes, and essential reclaim retain their existing paths.
