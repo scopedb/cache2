@@ -26,8 +26,8 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     crc32_iscsi(bytes)
 }
 
-/// Incremental CRC32C state, useful for checksum a key and value without first joining them in a
-/// temporary allocation.
+/// Incremental CRC32C state, useful for checksumming a key and value without first joining them in
+/// a temporary allocation.
 pub struct Crc32c {
     digest: Crc32Iscsi,
 }
@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_checksums_match_the_previous_implementation() {
+    fn fragmented_checksums_match_the_crc_fast_reference() {
         let bytes: Vec<_> = (0..65_544).map(|index| (index * 37) as u8).collect();
         for offset in [0, 1, 7] {
             for len in [0, 1, 44, 48, 4092, 4096, 65_537] {

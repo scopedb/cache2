@@ -552,7 +552,7 @@ impl RuntimeOptions {
                 .checked_add(self.reclaim_io_timeout)
                 .is_none()
         {
-            return Err(invalid_runtime_config(
+            return Err(invalid_config(
                 "reclaim I/O timeout must be positive and fit an absolute deadline",
             ));
         }
@@ -591,15 +591,13 @@ impl RuntimeOptions {
         } = &mut self.read_admission
         {
             if timeout.is_zero() || *timeout > MAX_READ_IO_WAIT_TIMEOUT {
-                return Err(invalid_runtime_config(
+                return Err(invalid_config(
                     "read wait timeout must be greater than zero and at most five seconds",
                 ));
             }
             let capacity = max_waiters.unwrap_or(read_topology.max_in_flight());
             if !(1..=MAX_CONFIG_COUNT).contains(&capacity) {
-                return Err(invalid_runtime_config(
-                    "maximum read waiters must be in 1..=65536",
-                ));
+                return Err(invalid_config("maximum read waiters must be in 1..=65536"));
             }
             *max_waiters = Some(capacity);
         }
@@ -642,14 +640,14 @@ impl RuntimeOptions {
         let l2_capacity = u128::from(geometry.region_size)
             .checked_mul(u128::from(geometry.region_count))
             .filter(|capacity| *capacity != 0)
-            .ok_or_else(|| invalid_runtime_config("L2 capacity does not fit the L1 sizing"))?;
+            .ok_or_else(|| invalid_config("L2 capacity does not fit the L1 sizing"))?;
         let expected_entries = index_slots.div_ceil(2).max(1);
         let proportional = (expected_entries as u128)
             .checked_mul(self.l1_capacity_bytes as u128)
             .and_then(|entries| entries.checked_add(l2_capacity - 1))
             .map(|entries| entries / l2_capacity)
             .and_then(|entries| usize::try_from(entries).ok())
-            .ok_or_else(|| invalid_runtime_config("L1 entry capacity does not fit usize"))?;
+            .ok_or_else(|| invalid_config("L1 entry capacity does not fit usize"))?;
         let four_kib_density = self.l1_capacity_bytes.div_ceil(MIN_L1_SIZING_ENTRY_BYTES);
         let maximum = MemoryStore::maximum_entry_capacity(self.l1_capacity_bytes, self.l1_shards);
         let minimum = self.l1_shards.min(maximum);
@@ -666,31 +664,28 @@ impl RuntimeOptions {
         fixed_bytes: usize,
     ) -> io::Result<(usize, usize)> {
         let shard_count = self.append_shards as usize;
-        let topology_bytes = runtime_topology_memory_bytes(self).ok_or_else(|| {
-            invalid_runtime_config("runtime topology memory requirements overflow")
-        })?;
-        let usable_region = usize::try_from(geometry.region_size).map_err(|_| {
-            invalid_runtime_config("Region size does not fit the memory requirements")
-        })?;
+        let topology_bytes = runtime_topology_memory_bytes(self)
+            .ok_or_else(|| invalid_config("runtime topology memory requirements overflow"))?;
+        let usable_region = usize::try_from(geometry.region_size)
+            .map_err(|_| invalid_config("Region size does not fit the memory requirements"))?;
         let chunk_bytes = usable_region;
-        let write_buffer_reservation = RegionStaging::reservation_bytes(shard_count, chunk_bytes)
-            .ok_or_else(|| {
-            invalid_runtime_config("write buffer memory requirements overflow")
-        })?;
+        let write_buffer_reservation =
+            RegionStaging::reservation_bytes(shard_count, chunk_bytes)
+                .ok_or_else(|| invalid_config("write buffer memory requirements overflow"))?;
         let reserved_memory = fixed_bytes
             .checked_add(self.l1_capacity_bytes)
             .and_then(|bytes| bytes.checked_add(topology_bytes))
-            .ok_or_else(|| invalid_runtime_config("reserved memory requirements overflow"))?;
+            .ok_or_else(|| invalid_config("reserved memory requirements overflow"))?;
         let reclaim_buffers = usable_region
             .checked_mul(IoPoolTopology::reclaim(self.io_engine).max_in_flight())
-            .ok_or_else(|| invalid_runtime_config("reclaim buffer memory requirements overflow"))?;
+            .ok_or_else(|| invalid_config("reclaim buffer memory requirements overflow"))?;
         let minimum = reserved_memory
             .checked_add(write_buffer_reservation)
             // Every reclaimer permanently owns one Region-sized buffer. Keep
             // one additional maximum-size bounded read for the foreground.
             .and_then(|bytes| bytes.checked_add(reclaim_buffers))
             .and_then(|bytes| bytes.checked_add(usable_region))
-            .ok_or_else(|| invalid_runtime_config("minimum memory requirements overflow"))?;
+            .ok_or_else(|| invalid_config("minimum memory requirements overflow"))?;
         Ok((reserved_memory, minimum))
     }
 }
@@ -775,10 +770,6 @@ fn validate_io_uring_pool(name: &str, options: IoUringPoolOptions) -> io::Result
         ));
     }
     Ok(())
-}
-
-fn invalid_runtime_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]

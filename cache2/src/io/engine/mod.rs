@@ -962,11 +962,7 @@ pub trait IoEngine: Send + Sync {
         operation: IoOperation,
     ) -> Result<IoRequest, SubmitError>;
     #[cfg(test)]
-    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.submit_nowait(operation)
-    }
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     #[cfg(test)]
     fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
     fn submit_wait_controlled(
@@ -1642,7 +1638,7 @@ impl RuntimeInner {
     }
 
     #[cfg(test)]
-    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, SlotMode::Try)
     }
 

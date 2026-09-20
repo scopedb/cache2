@@ -27,7 +27,7 @@ use cache2::PosixIoOptions;
 /// Reads backend-specific pool settings under a benchmark's environment prefix.
 pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
     reject_renamed_env(prefix)?;
-    // Migration scaffolding like `reject_renamed_env`; remove them together.
+    // Migration scaffolding tied to `reject_renamed_env`; remove both together.
     for suffix in ["READ_IO_WORKERS", "WRITE_IO_WORKERS", "RECLAIM_WORKERS"] {
         let name = format!("{prefix}_{suffix}");
         if env::var_os(&name).is_some() {

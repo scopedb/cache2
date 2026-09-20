@@ -834,7 +834,6 @@ fn decode_page_envelope(page: &[u8]) -> Result<PageEnvelope, RegionMetadataError
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_envelope_shape(
     envelope: PageEnvelope,
     kind: PageKind,

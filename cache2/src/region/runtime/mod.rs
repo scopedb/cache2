@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Self-owned steady-state runtime for RegionStore .
+//! Steady-state runtime that owns the RegionStore shard and reclaim workers.
 //!
 //! Foreground writers encode directly into the fixed per-shard write
 //! buffers. Shard workers carry only coalesced control state, so queueing cannot
@@ -110,7 +110,7 @@ use crate::snapshot::DetailedCacheSnapshot;
 pub mod metrics;
 
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
-const _RETRY_AGE: Duration = Duration::from_micros(50);
+const STAGING_RETRY_DELAY: Duration = Duration::from_micros(50);
 const LIFECYCLE_RUNNING: u8 = 0;
 const LIFECYCLE_DRAINING: u8 = 1;
 const LIFECYCLE_FAILED: u8 = 2;
@@ -1045,7 +1045,7 @@ impl RegionDataPlane {
                 token
             }
         };
-        let Some(candidate) = self.core.begin_value_read(hash) else {
+        let Some(candidate) = self.core.begin_point_read(hash) else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
@@ -1891,7 +1891,7 @@ fn shard_worker_result(
                 }
             }
             Err(StagingError::WouldBlock) => {
-                deadline = Some(Instant::now() + _RETRY_AGE);
+                deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
             }
             Err(error) => return Err(staging_runtime_error(error)),
         }
@@ -1910,7 +1910,7 @@ fn shard_worker_result(
                 }
                 Ok(None) => {}
                 Err(StagingError::WouldBlock) => {
-                    deadline = Some(Instant::now() + _RETRY_AGE);
+                    deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
                     continue;
                 }
                 Err(error) => return Err(staging_runtime_error(error)),
@@ -1966,11 +1966,11 @@ fn wait_for_shard_work(
     Ok((flags, drain_generation, state.stop, timed_out))
 }
 
-fn reject_staged_write<Operation>(
+fn reject_staged_write(
     running: &RunningShared,
     control: &ShardControl,
     flags: u8,
-    operation: Operation,
+    operation: MutationGuard<'_>,
 ) -> io::Result<u64> {
     control.notify(flags)?;
     drop(operation);

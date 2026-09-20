@@ -83,7 +83,13 @@ impl BackendIoEngine {
 
     #[cfg(test)]
     pub fn new(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
-        Self::new_with_workers(backend, max_in_flight, max_in_flight.min(4))
+        Self::new_with_workers_and_activity_counters(
+            backend,
+            max_in_flight,
+            max_in_flight.min(4),
+            true,
+            false,
+        )
     }
 
     #[cfg(test)]
@@ -97,21 +103,6 @@ impl BackendIoEngine {
             max_in_flight.min(4),
             true,
             true,
-        )
-    }
-
-    #[cfg(test)]
-    fn new_with_workers(
-        backend: Arc<dyn IoBackend>,
-        max_in_flight: usize,
-        worker_count: usize,
-    ) -> io::Result<Self> {
-        Self::new_with_workers_and_activity_counters(
-            backend,
-            max_in_flight,
-            worker_count,
-            true,
-            false,
         )
     }
 
@@ -205,8 +196,8 @@ impl IoEngine for BackendIoEngine {
     }
 
     #[cfg(test)]
-    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_nowait(operation)
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner.submit(operation)
     }
 
     #[cfg(test)]
