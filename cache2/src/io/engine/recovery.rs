@@ -14,17 +14,22 @@
 
 //! Reversible background timeout recovery, separate from the health latch.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::io::fill_control::FillController;
+use crate::io::fill_control::Progress;
+
 /// Shared across background workers. Resource ownership remains with each worker.
 pub struct BackgroundRecovery {
     timeout: Option<Duration>,
     pending: AtomicUsize,
     stopped: AtomicBool,
+    pub controller: Option<Arc<FillController>>,
 }
 
 impl BackgroundRecovery {
@@ -33,6 +38,17 @@ impl BackgroundRecovery {
             timeout,
             pending: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
+            controller: None,
+        }
+    }
+
+    pub fn with_controller(
+        timeout: Option<Duration>,
+        controller: Option<Arc<FillController>>,
+    ) -> Self {
+        Self {
+            controller,
+            ..Self::new(timeout)
         }
     }
 
@@ -40,6 +56,7 @@ impl BackgroundRecovery {
         RecoveryAttempt {
             recovery: self,
             entered: false,
+            progress: None,
         }
     }
 
@@ -49,6 +66,9 @@ impl BackgroundRecovery {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(control) = &self.controller {
+            control.stop();
+        }
     }
 }
 
@@ -57,9 +77,28 @@ impl BackgroundRecovery {
 pub struct RecoveryAttempt<'a> {
     recovery: &'a BackgroundRecovery,
     entered: bool,
+    progress: Option<Progress<'a>>,
 }
 
 impl RecoveryAttempt<'_> {
+    pub fn start(&mut self, bytes: u64, timeout: Duration) -> std::io::Result<()> {
+        if let Some(control) = &self.recovery.controller {
+            self.progress = Some(control.observe(bytes, timeout)?);
+        }
+        Ok(())
+    }
+
+    pub fn admitted(&self) {
+        if let Some(progress) = &self.progress {
+            progress.admitted();
+        }
+    }
+    pub fn returned(&self) {
+        if let Some(progress) = &self.progress {
+            progress.returned();
+        }
+    }
+
     /// Poll completion/admission at fixed one-second intervals, without extending
     /// a configured total budget. Shutdown also terminates unlimited recovery.
     pub fn next_deadline(&mut self, original: Instant) -> Option<Instant> {
@@ -80,6 +119,9 @@ impl RecoveryAttempt<'_> {
         };
         if !self.entered {
             self.entered = true;
+            if let Some(control) = &self.recovery.controller {
+                control.set_recovering(true);
+            }
             if self.recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
                 log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
                 "background I/O timed out; pausing cache fills while retaining owned requests");
@@ -89,8 +131,14 @@ impl RecoveryAttempt<'_> {
     }
 
     /// Called only after operation-result validation and publication succeed.
-    pub fn finish(self) {
+    pub fn finish(mut self) {
+        if let Some(progress) = self.progress.take() {
+            progress.finish();
+        }
         if self.entered && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(control) = &self.recovery.controller {
+                control.set_recovering(false);
+            }
             log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
                 "all timed-out background operations recovered and passed validation");
         }

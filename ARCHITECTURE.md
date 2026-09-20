@@ -80,7 +80,7 @@ This layout converts small foreground mutations into ordered, batched Region wri
 5. Return after bounded in-memory admission.
 6. The shard worker writes sealed batches and publishes their L2 mappings only after write completion.
 
-Full staging or short-path contention returns structured `ErrorKind::Overloaded`. Admission is shard-local. Success means accepted staging; `put_l2` becomes visible when publication completes. `drain` fences all mutations accepted before its operation barrier and waits for their Region writes and L2 publication, but does not issue the recovery durability syncs.
+Full staging or short-path contention returns structured `ErrorKind::Overloaded`. Staging admission is shard-local; optional adaptive fill budgets are shared across shards. Success means accepted staging; `put_l2` becomes visible when publication completes. `drain` fences all mutations accepted before its operation barrier and waits for their Region writes and L2 publication, but does not issue the recovery durability syncs.
 
 ### `get`
 
@@ -113,6 +113,14 @@ The source Region stays pinned until accepted replacement writes finish. Conditi
 Reads and writes use independent bounded engine pools. Reclaim has separate read lanes. POSIX uses positioned worker I/O; optional io_uring uses fixed-depth rings. Buffered I/O is the default. Direct mode aligns runtime record I/O and keeps control, recovery, and unavoidable remainder operations buffered. Locks cover bounded in-memory work and release before device I/O.
 
 Each lane uses one concrete `IoEngine` for admission, submission, cancellation, statistics, and shutdown. Driver-specific constructors start POSIX workers or an io_uring driver behind the same bounded command and completion protocol. Callers share the engine through `Arc`; its final owner joins the workers. Submitted requests retain their buffers and capacity until actual completion, independently of the caller's wait deadline.
+
+### Pre-timeout fill pressure
+
+`io::fill_control` owns optional background observations and adaptive fill admission. `Disabled` retains the existing path. Enabled modes preallocate a fixed observation table sized by append and reclaim worker counts and run one accounted monitoring thread. Background workers register before engine admission and retain their observations through completion validation and publication. A 100 ms monitor can detect old or stalled work without requiring another completion; aggregate validated throughput provides an approximate drain estimate. Pressure does not change terminal health or prove a device fault.
+
+A packed atomic token bucket reserves both encoded bytes and record count before foreground staging. Each reservation/refund makes at most four CAS attempts; full refill epochs prevent stale permits from refunding a later budget. No per-fill clock, allocation, or controller mutex is required. Failed staging can refund its reservation; accepted work always keeps its resources and proceeds without reacquiring rate credit. `Observe` records hypothetical rejection only; `Adaptive` rejects new fills immediately and skips optional reinsertion under pressure. Reads, deletes, and essential reclaim bypass fill budgets. A short mutex protects only background observations, monitor decisions, and the optional controller snapshot. Close signals and joins the monitor independently of I/O completion.
+
+See [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for rate ceilings, pause/resume thresholds, bounded bursts, phase accounting, and tuning limits.
 
 ### Memory
 

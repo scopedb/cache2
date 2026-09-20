@@ -217,6 +217,7 @@ struct HarnessOptions {
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
+    fill_control: cache2::FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -268,6 +269,7 @@ impl HarnessOptions {
             latency_sample_interval,
             seed,
             io_engine,
+            fill_control: benchmarks::config::fill_control_from_env("CACHE_WORKLOAD")?,
             io_mode,
             l1_eviction_policy,
             directory,
@@ -346,6 +348,7 @@ impl HarnessOptions {
             latency_sample_interval: self.latency_sample_interval,
             seed: self.seed,
             io_engine: self.io_engine,
+            fill_control: self.fill_control,
             io_mode: self.io_mode,
             l1_eviction_policy: self.l1_eviction_policy,
             directory: self.directory.clone(),
@@ -367,6 +370,7 @@ struct ScenarioConfig {
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
+    fill_control: cache2::FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -383,6 +387,8 @@ impl ScenarioConfig {
     fn runtime_options(&self) -> RuntimeOptions {
         let mut options = RuntimeOptions::default();
         options.io_engine = self.io_engine;
+        options.fill_control = self.fill_control;
+        println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
         options.l1_capacity_bytes = self.l1_capacity_bytes;

@@ -215,6 +215,7 @@ impl RuntimeMetrics {
         CacheSnapshot {
             metrics_epoch: self.metrics_epoch,
             health,
+            fill_control: crate::snapshot::FillControlSnapshot::default(),
             activity_counters_enabled,
             puts,
             deletes,

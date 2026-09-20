@@ -39,9 +39,57 @@ pub enum CacheHealth {
     Failed,
 }
 
-/// Lock-free point-in-time operational counters and cache-owned resource
-/// accounting. Counters are process-local and reset on every open. Concurrent
-/// updates may appear across fields at slightly different instants.
+/// Admission pressure, independent of terminal cache health.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FillPressure {
+    /// Pressure observation is disabled.
+    #[default]
+    Disabled,
+    /// Configured rate ceilings apply without a pressure reduction.
+    Healthy,
+    /// Fill rate has been reduced while accepted work drains.
+    Throttled,
+    /// New fills are paused while outstanding work recovers.
+    Paused,
+}
+
+/// Always available when fill control is enabled, independent of statistics.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FillControlSnapshot {
+    /// Current measured pressure; Observe mode does not enforce it.
+    pub pressure: FillPressure,
+    /// Whether the controller enforces its admission decisions.
+    pub enforcing: bool,
+    /// Current encoded-byte admission rate.
+    pub bytes_per_second: u64,
+    /// Current record admission rate.
+    pub operations_per_second: u32,
+    /// Fills rejected by the controller, including bounded CAS contention.
+    pub rejections: u64,
+    /// Fills that Observe mode would have rejected.
+    pub would_reject: u64,
+    /// Background operations awaiting completion or validation.
+    pub outstanding_operations: u64,
+    /// Bytes held by those background operations; excludes unflushed staging.
+    pub outstanding_bytes: u64,
+    /// Age of the oldest background operation, including admission/validation.
+    pub oldest_operation_ns: u64,
+    /// Estimated drain time using recent validated background throughput.
+    pub estimated_drain_ns: u64,
+    /// Accumulated background admission time in nanoseconds.
+    pub admission_ns: u64,
+    /// Accumulated time from admission to result consumption, including scheduling.
+    pub completion_wait_ns: u64,
+    /// Accumulated time from result consumption through validation/publication.
+    pub validation_ns: u64,
+}
+
+/// Point-in-time operational counters and cache-owned resource accounting.
+/// Sampling uses atomics, plus a short controller lock when fill control is enabled. Counters are
+/// process-local and reset on every open. Concurrent updates may appear across fields at slightly
+/// different instants.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {
@@ -51,6 +99,8 @@ pub struct CacheSnapshot {
     pub metrics_epoch: u64,
     /// Current cache availability.
     pub health: CacheHealth,
+    /// Pre-timeout fill pressure and controller accounting.
+    pub fill_control: FillControlSnapshot,
     /// Whether optional cumulative activity and I/O counters are enabled.
     pub activity_counters_enabled: bool,
     /// Accepted `put` and `put_l2` operations.
@@ -245,7 +295,7 @@ pub struct RegionSnapshot {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {
-    /// Lock-free summary sampled for this diagnostic.
+    /// Operational summary sampled for this diagnostic.
     pub summary: CacheSnapshot,
     /// Mutations rejected specifically because an append buffer needed progress.
     pub write_buffer_rejections: u64,

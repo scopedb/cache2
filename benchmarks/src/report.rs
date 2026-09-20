@@ -479,6 +479,23 @@ pub fn emit_cache_report(
         detailed.region.physical_record_count,
         format_bytes(cache.logical_disk_peak_bytes as f64),
     );
+    let fill = cache.fill_control;
+    println!(
+        "report version=2 type=fill_control benchmark={} scenario={} phase={} pressure={:?} enforcing={} bytes_per_second={} operations_per_second={} rejections={} would_reject={} outstanding_operations={} outstanding_bytes={} oldest_operation_ns={} estimated_drain_ns={}",
+        benchmark,
+        scenario,
+        phase,
+        fill.pressure,
+        fill.enforcing,
+        fill.bytes_per_second,
+        fill.operations_per_second,
+        fill.rejections,
+        fill.would_reject,
+        fill.outstanding_operations,
+        fill.outstanding_bytes,
+        fill.oldest_operation_ns,
+        fill.estimated_drain_ns,
+    );
     println!(
         "report version=2 type=cache benchmark={} scenario={} phase={} health={:?} activity_counters_enabled={} puts={} deletes={} written_bytes={} served_bytes={} l1_hits={} l1_misses={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} l2_read_overloads={} l2_read_wait_ns={} promotions={} l1_evictions={} l1_bypasses={} write_rejections={} io_failures={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reinsert_records={} reinsert_bytes={} reinsert_skipped={} reinsert_budget_skipped={}",
         benchmark,

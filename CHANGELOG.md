@@ -9,6 +9,8 @@
 
 ### Improvements
 
+- Optional `RuntimeOptions::fill_control` observes background request age, validated progress, and estimated drain time before timeout. `Observe` reports hypothetical rejections; `Adaptive` bounds new fills by encoded bytes and record count, pauses on stalled work, resumes gradually, and suppresses optional reinsertion under pressure. Reads, deletes, accepted writes, and essential reclaim retain their paths. `CacheSnapshot::fill_control` exposes pressure and accounting independently of statistics; enabled snapshots take a short controller lock. Controller storage and its monitoring stack are included in managed memory. Disabled by default; see [configuration](CONFIGURATION.md#adaptive-fill-admission) for ceilings and measurement limits.
+
 - Background write and reclaim timeouts now enter a reversible `CacheHealth::Recovering` state: new cache fills return overload while existing reads and deletes remain available. Original requests keep their bounded buffers and Regions and are never resubmitted; all affected work must complete validation and publication before fills resume. `RuntimeOptions::io_recovery_timeout` defaults to `None` for recovery until completion or close; use `Some(duration)` to bound recovery or `Some(Duration::ZERO)` for immediate cancellation. Recovery checks at fixed one-second intervals. Close interrupts recovery and preserves the existing unfenced-write safeguards; drain may wait indefinitely. Actual I/O errors and invalid completions remain terminal.
 
 ## v0.5.0 (2026-09-16)

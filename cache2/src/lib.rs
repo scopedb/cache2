@@ -35,6 +35,8 @@ pub use self::cache::Value;
 mod config;
 pub use self::config::CacheConfig;
 pub use self::config::StorageLayout;
+pub use self::config::runtime::AdaptiveFillOptions;
+pub use self::config::runtime::FillControlOptions;
 pub use self::config::runtime::IoEngineOptions;
 pub use self::config::runtime::IoMode;
 pub use self::config::runtime::IoUringOptions;
@@ -56,6 +58,8 @@ pub use self::snapshot::CacheL1Snapshot;
 pub use self::snapshot::CacheReclaimSnapshot;
 pub use self::snapshot::CacheSnapshot;
 pub use self::snapshot::DetailedCacheSnapshot;
+pub use self::snapshot::FillControlSnapshot;
+pub use self::snapshot::FillPressure;
 pub use self::snapshot::RegionSnapshot;
 pub use self::snapshot::StartupMode;
 

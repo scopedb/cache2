@@ -114,6 +114,8 @@ Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution. Us
 | io_uring  | `_IO_URING_<ROLE>_SQPOLL_MS`     | absent (disabled)                 |
 | io_uring  | `_IO_URING_<ROLE>_SQPOLL_CPU`    | absent (unpinned)                 |
 
+Optional fill admission uses `_FILL_CONTROL=disabled|observe|adaptive` under the same three prefixes. Enabled modes require explicit `_FILL_BYTES_PER_SECOND` and `_FILL_OPERATIONS_PER_SECOND` ceilings. The harness prints the effective options and adds a `type=fill_control` report beside cache records. Compare the modes in alternating order with identical ceilings and traffic; record rejected and hypothetical fills alongside completed throughput. High ceilings help measure instrumentation overhead, while lower ceilings and injected storage stalls exercise admission behavior. Buffered macOS results do not qualify Linux NVMe or cgroup throttling.
+
 Select the backend with `_IO_ENGINE=posix|io-uring`. POSIX workers bound concurrent operations. io_uring ring count and aggregate in-flight limit are independent; changing one does not rewrite the other. Ring count must not exceed the in-flight limit. IOPOLL requires `_IO_MODE=direct`; SQPOLL CPU requires an idle timeout. Only the selected backend's settings are read. Each harness prints the resulting `IoEngineOptions`, and buffer estimates use its actual concurrency. The request benchmark's default read-wait capacity follows the selected read pool's in-flight limit.
 
 `CACHE_BENCH_STATS` is now `CACHE_BENCH_ACTIVITY_COUNTERS`. Machine-readable reports use `version=2`, renaming the cache record field `statistics_enabled` to `activity_counters_enabled`; the counter population is unchanged.

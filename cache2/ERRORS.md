@@ -32,6 +32,8 @@ fn cache_value(cache: &Cache, key: &[u8], value: &[u8]) -> Result<(), Error> {
 
 Do not retry without a bound. C² deliberately exposes pressure instead of building unbounded queues. With the default immediate-read policy, read-pool or buffer pressure is `Ok(None)`. When read waiting is enabled, queue saturation, buffer pressure, and deadline expiry are `ErrorKind::Overloaded`.
 
+With `FillControlOptions::Adaptive`, new fills also return `Overloaded` when the controller pauses or exhausts its byte/record budget. Inspect `CacheSnapshot::fill_control` to distinguish controller rejection from other admission pressure. Pre-timeout pressure does not change `CacheHealth::Running` or identify a hardware failure. `Observe` only counts hypothetical controller rejections. Reads, deletes, accepted writes, and essential reclaim retain their ordinary paths.
+
 ## Classifications
 
 | `ErrorKind` | Meaning | Usual response |

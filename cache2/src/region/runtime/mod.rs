@@ -61,6 +61,8 @@ use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::submit_background_io;
+use crate::io::fill_control::FillController;
+use crate::io::fill_control::FillMonitor;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -427,6 +429,7 @@ struct RunningOwner {
     shared: Arc<RunningShared>,
     shard_workers: Vec<JoinHandle<()>>,
     reclaim_workers: Vec<JoinHandle<()>>,
+    fill_monitor: Option<FillMonitor>,
 }
 
 struct RunningShared {
@@ -839,6 +842,19 @@ impl RegionDataPlane {
                 return Err(write_overload_error());
             }
         };
+        let fill_permit = if let Some(controller) = &running.recovery.controller {
+            match controller.try_admit(u64::from(record_bytes)) {
+                Some(permit) => Some(permit),
+                None => {
+                    if running.activity_counters {
+                        running.metrics.record_write_rejection();
+                    }
+                    return Err(write_overload_error());
+                }
+            }
+        } else {
+            None
+        };
         let staged = self.core.try_stage_value(
             &running.staging,
             shard_id,
@@ -853,6 +869,9 @@ impl RegionDataPlane {
                 previous_bytes,
                 current_bytes,
             } => {
+                if let Some(permit) = fill_permit {
+                    permit.commit();
+                }
                 if ADMIT_L1 {
                     let _published = running.memory.publish(hash, key, value, seqno);
                 } else {
@@ -875,9 +894,15 @@ impl RegionDataPlane {
                 Ok(seqno)
             }
             RegionStageValue::NeedsProgress => {
+                if let Some(controller) = &running.recovery.controller {
+                    controller.staging_busy();
+                }
                 reject_staged_write(running, control, WAKE_URGENT, operation)
             }
             RegionStageValue::NeedsRotation => {
+                if let Some(controller) = &running.recovery.controller {
+                    controller.staging_busy();
+                }
                 reject_staged_write(running, control, WAKE_ROTATE | WAKE_URGENT, operation)
             }
         }
@@ -1296,6 +1321,9 @@ impl RegionDataPlane {
         {
             snapshot.health = crate::snapshot::CacheHealth::Recovering;
         }
+        if let Some(controller) = &running.recovery.controller {
+            snapshot.fill_control = controller.snapshot();
+        }
         snapshot.io = aggregate_io_stats(
             &running.read_engines,
             &running.write_engines,
@@ -1497,6 +1525,12 @@ fn start_running(
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
     })?;
     shards.resize_with(shard_count, || Arc::new(ShardControl::new()));
+    let controller = FillController::new(
+        runtime.fill_control,
+        shard_count + reclaim_worker_count,
+        data.geometry.region_size,
+    )?;
+    let fill_monitor = controller.as_ref().map(FillController::start).transpose()?;
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
@@ -1506,7 +1540,7 @@ fn start_running(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: runtime.reclaim_io_timeout,
-        recovery: BackgroundRecovery::new(runtime.io_recovery_timeout),
+        recovery: BackgroundRecovery::with_controller(runtime.io_recovery_timeout, controller),
         managed_memory,
         metrics,
         memory,
@@ -1589,6 +1623,7 @@ fn start_running(
         shared,
         shard_workers,
         reclaim_workers,
+        fill_monitor,
     })
 }
 
@@ -1816,7 +1851,12 @@ fn reclaim_worker_result(
             // Keep one completion boundary per source Region while each
             // reclaimer rotates through a disjoint subset of append shards.
             let reinsert_shard = reinsert_shards.take();
-            let preserve_hot = shared.core.reclaim_can_reinsert()?;
+            let preserve_hot = shared.core.reclaim_can_reinsert()?
+                && !shared
+                    .recovery
+                    .controller
+                    .as_ref()
+                    .is_some_and(|control| control.suppress_reinsertion());
             let reinsert_operation = if preserve_hot {
                 shared.operations.try_enter()
             } else {
@@ -2073,6 +2113,7 @@ async fn drain_shards_async(shared: &RunningShared, stop: bool) -> io::Result<()
 
 fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     owner.shared.recovery.stop();
+    drop(owner.fill_monitor.take());
     let drain = drain_shards(&owner.shared, true);
     let mut join_error = None;
     for worker in owner.shard_workers.drain(..) {

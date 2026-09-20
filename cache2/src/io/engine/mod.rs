@@ -778,7 +778,10 @@ impl BoundedIoRequest {
         let original = self.deadline;
         loop {
             self.request = match self.request.wait_until(self.deadline) {
-                Ok(completion) => return Ok(completion),
+                Ok(completion) => {
+                    recovery.returned();
+                    return Ok(completion);
+                }
                 Err(request) => request,
             };
             match recovery.next_deadline(original) {
@@ -958,6 +961,12 @@ pub fn submit_background_io(
     timeout: Duration,
     recovery: &mut RecoveryAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
+    let bytes = match &operation {
+        IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len() as u64,
+    };
+    if let Err(error) = recovery.start(bytes, timeout) {
+        return Err(SubmitError { error, operation });
+    }
     let original = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
@@ -965,6 +974,7 @@ pub fn submit_background_io(
     loop {
         match submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE) {
             Ok(mut request) => {
+                recovery.admitted();
                 request.deadline = original;
                 return Ok(request);
             }
