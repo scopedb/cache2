@@ -1408,7 +1408,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
         let control = FillController::new(mode, 1, 4096).unwrap().unwrap();
         let recovery = BackgroundRecovery::with_fill(None, Some(Arc::clone(&control)));
         let backend = Arc::new(BlockingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let memory = managed_memory();
         std::thread::scope(|scope| {
             let (returned_tx, returned_rx) = mpsc::channel();
