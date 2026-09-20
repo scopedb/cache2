@@ -40,16 +40,16 @@ use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 
-pub struct RegionSpanSubmitError {
+pub struct WriteSubmitError {
     pub error: io::Error,
     pub span: RegionWriteSpan,
     pub buffer: Option<IoBuffer>,
 }
 
-impl fmt::Debug for RegionSpanSubmitError {
+impl fmt::Debug for WriteSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RegionSpanSubmitError")
+            .debug_struct("WriteSubmitError")
             .field("error", &self.error)
             .field("span", &self.span)
             .field("buffer_returned", &self.buffer.is_some())
@@ -57,42 +57,38 @@ impl fmt::Debug for RegionSpanSubmitError {
     }
 }
 
-impl fmt::Display for RegionSpanSubmitError {
+impl fmt::Display for WriteSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.error.fmt(formatter)
     }
 }
 
-impl std::error::Error for RegionSpanSubmitError {
+impl std::error::Error for WriteSubmitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
-pub struct RegionSpanFlight {
+pub struct PendingWrite {
     span: RegionWriteSpan,
     expected_len: usize,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
-pub struct RegionSpanCompletion {
+pub struct WriteCompletion {
     pub span: RegionWriteSpan,
     pub result: io::Result<()>,
     pub buffer: Option<IoBuffer>,
 }
 
-impl RegionSpanFlight {
-    pub fn wait(
-        self,
-        engine: &IoEngine,
-        attempt: &mut IoRecoveryAttempt<'_>,
-    ) -> RegionSpanCompletion {
+impl PendingWrite {
+    pub fn wait(self, engine: &IoEngine, attempt: &mut IoRecoveryAttempt<'_>) -> WriteCompletion {
         let completion = match self.request.wait_with_io_recovery(engine, attempt) {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_buffer();
-                return RegionSpanCompletion {
+                return WriteCompletion {
                     span: self.span,
                     result: Err(error),
                     buffer,
@@ -130,7 +126,7 @@ impl RegionSpanFlight {
             }
             Ok(())
         });
-        RegionSpanCompletion {
+        WriteCompletion {
             span: self.span,
             result,
             buffer,
@@ -141,18 +137,18 @@ impl RegionSpanFlight {
 // The error returns the owned aligned buffer without another fallible
 // allocation; boxing it would violate that overload-path property.
 #[allow(clippy::result_large_err)]
-pub fn submit_span(
+pub fn submit_write(
     engine: &IoEngine,
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
     attempt: &mut IoRecoveryAttempt<'_>,
-) -> Result<RegionSpanFlight, RegionSpanSubmitError> {
+) -> Result<PendingWrite, WriteSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
         Err(error) => {
-            return Err(RegionSpanSubmitError {
+            return Err(WriteSubmitError {
                 error,
                 span,
                 buffer: Some(buffer),
@@ -160,7 +156,7 @@ pub fn submit_span(
         }
     };
     if buffer.len() != expected_len || absolute != expected_absolute {
-        return Err(RegionSpanSubmitError {
+        return Err(WriteSubmitError {
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "staging job does not match its Region span",
@@ -174,7 +170,7 @@ pub fn submit_span(
             && bytes.len() % DIRECT_IO_ALIGNMENT == 0
     });
     if !buffer_is_direct_aligned {
-        return Err(RegionSpanSubmitError {
+        return Err(WriteSubmitError {
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Region span buffer is not direct-I/O aligned",
@@ -192,14 +188,14 @@ pub fn submit_span(
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_buffer();
-            return Err(RegionSpanSubmitError {
+            return Err(WriteSubmitError {
                 error,
                 span,
                 buffer,
             });
         }
     };
-    Ok(RegionSpanFlight {
+    Ok(PendingWrite {
         span,
         expected_len,
         request_id: request.id(),
@@ -313,7 +309,7 @@ mod tests {
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
         let mut attempt = io_recovery.attempt();
-        let completion = submit_span(
+        let completion = submit_write(
             &engine,
             geometry(),
             span(),
@@ -347,7 +343,7 @@ mod tests {
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::ZERO));
         let mut attempt = io_recovery.attempt();
-        let completion = submit_span(&engine, geometry(), span(), buffer, absolute, &mut attempt)
+        let completion = submit_write(&engine, geometry(), span(), buffer, absolute, &mut attempt)
             .unwrap()
             .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
@@ -377,7 +373,7 @@ mod tests {
         let mut invalid = span();
         invalid.end_offset += 1;
         let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();
-        let error = match submit_span(
+        let error = match submit_write(
             &engine,
             geometry(),
             invalid,

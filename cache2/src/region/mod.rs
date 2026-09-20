@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use self::appender::submit_span;
+use self::appender::submit_write;
 use self::index::ReclaimIndexAction;
 use self::index::RegionIndex;
 use self::index::heat_memory_bytes;
@@ -59,7 +59,7 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
-use crate::region::appender::RegionSpanCompletion;
+use crate::region::appender::WriteCompletion;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
@@ -1126,16 +1126,16 @@ impl RegionStore {
             absolute,
             records,
         } = job;
-        let flight = match submit_span(engine, geometry, span, buffer, absolute, &mut attempt) {
-            Ok(flight) => flight,
+        let pending = match submit_write(engine, geometry, span, buffer, absolute, &mut attempt) {
+            Ok(pending) => pending,
             Err(error) => {
                 let original = error.error;
                 self.fail_staged_span(staging, span, error.buffer, records);
                 return Err(original);
             }
         };
-        let completion = flight.wait(engine, &mut attempt);
-        let RegionSpanCompletion {
+        let completion = pending.wait(engine, &mut attempt);
+        let WriteCompletion {
             span,
             result,
             buffer,

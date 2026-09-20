@@ -164,7 +164,7 @@ struct OpenWriteSpan {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ShardMutation {
+struct AppendShardState {
     tail: Option<RegionAppendReservation>,
     open_span: Option<OpenWriteSpan>,
     pending_padding: Option<RegionPaddingReceipt>,
@@ -173,7 +173,7 @@ struct ShardMutation {
     rotation: Option<RegionRotationReceipt>,
 }
 
-impl ShardMutation {
+impl AppendShardState {
     const fn is_quiescent(self) -> bool {
         self.tail.is_none()
             && self.open_span.is_none()
@@ -203,7 +203,7 @@ pub struct RegionManager {
     next_seqno: u64,
     regions: Vec<RegionDesc>,
     active_regions: Vec<u32>,
-    shard_mutations: Vec<ShardMutation>,
+    append_states: Vec<AppendShardState>,
     free_regions: VecDeque<u32>,
     sealed_regions: VecDeque<u32>,
     reclaiming: Vec<RegionReclaimReceipt>,
@@ -240,8 +240,8 @@ impl RegionManager {
 
         let mut regions = try_vec(region_count)?;
         let mut active_regions = try_unassigned_vec(active_count)?;
-        let mut shard_mutations = try_vec(active_count)?;
-        shard_mutations.resize(active_count, ShardMutation::default());
+        let mut append_states = try_vec(active_count)?;
+        append_states.resize(active_count, AppendShardState::default());
         let mut free_regions = try_unassigned_queue(free_count, free_count.max(active_count))?;
         let mut sealed_regions = try_unassigned_queue(sealed_count, sealed_capacity)?;
         let reclaiming = try_vec(1)?;
@@ -292,7 +292,7 @@ impl RegionManager {
             next_seqno,
             regions,
             active_regions,
-            shard_mutations,
+            append_states,
             free_regions,
             sealed_regions,
             reclaiming,
@@ -412,7 +412,7 @@ impl RegionManager {
             return Err(RegionMutationError::InvalidRecordLength);
         }
         let shard = self
-            .shard_mutations
+            .append_states
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.tail.is_some() || shard.pending_padding.is_some() || shard.rotation.is_some() {
@@ -449,7 +449,7 @@ impl RegionManager {
                 RegionMutationError::RegionFull
             };
             if error == RegionMutationError::RegionFull {
-                self.shard_mutations[shard_id].rotation_requested = true;
+                self.append_states[shard_id].rotation_requested = true;
             }
             return Err(error);
         }
@@ -465,7 +465,7 @@ impl RegionManager {
             seqno,
         };
         self.regions[region_index].reserved_used = end;
-        self.shard_mutations[shard_id].tail = Some(receipt);
+        self.append_states[shard_id].tail = Some(receipt);
         Ok(receipt)
     }
 
@@ -481,7 +481,7 @@ impl RegionManager {
         receipt: RegionAppendReservation,
     ) -> Result<(), RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.tail != Some(receipt) {
@@ -519,8 +519,8 @@ impl RegionManager {
                 ));
             }
         };
-        self.shard_mutations[receipt.shard_id].open_span = Some(next_span);
-        self.shard_mutations[receipt.shard_id].tail = None;
+        self.append_states[receipt.shard_id].open_span = Some(next_span);
+        self.append_states[receipt.shard_id].tail = None;
         Ok(())
     }
 
@@ -533,7 +533,7 @@ impl RegionManager {
         shard_id: usize,
     ) -> Result<Option<RegionPaddingReceipt>, RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(shard_id)
             .copied()
             .ok_or(RegionMutationError::InvalidShard)?;
@@ -604,7 +604,7 @@ impl RegionManager {
             max_seqno: open.max_seqno,
         };
         self.regions[region_index].reserved_used = padded_end_offset;
-        self.shard_mutations[shard_id].pending_padding = Some(receipt);
+        self.append_states[shard_id].pending_padding = Some(receipt);
         Ok(Some(receipt))
     }
 
@@ -617,7 +617,7 @@ impl RegionManager {
         receipt: RegionAppendReservation,
     ) -> Result<(), RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.tail != Some(receipt) {
@@ -640,7 +640,7 @@ impl RegionManager {
             return Err(RegionMutationError::StaleReceipt);
         }
         self.regions[region_index].reserved_used = u64::from(receipt.offset);
-        self.shard_mutations[receipt.shard_id].tail = None;
+        self.append_states[receipt.shard_id].tail = None;
         Ok(())
     }
 
@@ -652,7 +652,7 @@ impl RegionManager {
         shard_id: usize,
     ) -> Result<RegionWriteSpan, RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.tail.is_some()
@@ -676,7 +676,7 @@ impl RegionManager {
         padding: RegionPaddingReceipt,
     ) -> Result<RegionWriteSpan, RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(padding.shard_id)
             .copied()
             .ok_or(RegionMutationError::InvalidShard)?;
@@ -724,7 +724,7 @@ impl RegionManager {
         end_offset: u64,
     ) -> Result<RegionWriteSpan, RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(shard_id)
             .copied()
             .ok_or(RegionMutationError::InvalidShard)?;
@@ -747,7 +747,7 @@ impl RegionManager {
             record_count: open.record_count,
             max_seqno: open.max_seqno,
         };
-        let shard = &mut self.shard_mutations[shard_id];
+        let shard = &mut self.append_states[shard_id];
         shard.open_span = None;
         shard.pending_padding = None;
         shard.submitted_span = Some(receipt);
@@ -762,7 +762,7 @@ impl RegionManager {
         receipt: RegionWriteSpan,
     ) -> Result<(), RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.submitted_span != Some(receipt) {
@@ -792,7 +792,7 @@ impl RegionManager {
         let region = &mut self.regions[region_index];
         region.completed_used = receipt.end_offset;
         region.physical_record_count = physical_record_count;
-        self.shard_mutations[receipt.shard_id].submitted_span = None;
+        self.append_states[receipt.shard_id].submitted_span = None;
         Ok(())
     }
 
@@ -813,7 +813,7 @@ impl RegionManager {
         shard_id: usize,
     ) -> Result<(), RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get_mut(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         shard.rotation_requested = true;
@@ -866,8 +866,8 @@ impl RegionManager {
             activated_region_id: victim_region_id,
             activated_created_seqno: created_seqno,
         };
-        self.shard_mutations[shard_id].rotation_requested = false;
-        self.shard_mutations[shard_id].rotation = Some(receipt);
+        self.append_states[shard_id].rotation_requested = false;
+        self.append_states[shard_id].rotation = Some(receipt);
         Ok(receipt)
     }
 
@@ -876,7 +876,7 @@ impl RegionManager {
         shard_id: usize,
     ) -> Result<RegionRotationSelection, RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if !shard.rotation_requested
@@ -943,7 +943,7 @@ impl RegionManager {
         receipt: RegionRotationReceipt,
     ) -> Result<(), RegionMutationError> {
         let shard = self
-            .shard_mutations
+            .append_states
             .get(receipt.shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.rotation != Some(receipt) {
@@ -980,7 +980,7 @@ impl RegionManager {
         }
         self.sealed_regions.push_back(receipt.sealed_region_id);
         self.rotations = self.rotations.saturating_add(1);
-        self.shard_mutations[receipt.shard_id].rotation = None;
+        self.append_states[receipt.shard_id].rotation = None;
         Ok(())
     }
 
@@ -1078,10 +1078,7 @@ impl RegionManager {
         partitions: Box<[PartitionMetadataRecord]>,
     ) -> Result<RegionMetadata, RegionMetadataError> {
         if !self.reclaiming.is_empty()
-            || self
-                .shard_mutations
-                .iter()
-                .any(|shard| !shard.is_quiescent())
+            || self.append_states.iter().any(|shard| !shard.is_quiescent())
         {
             return Err(RegionMetadataError::InvalidField("live_region_authority"));
         }

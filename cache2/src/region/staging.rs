@@ -62,7 +62,6 @@ pub struct ShardFillSnapshot {
 /// containing device span completes. The descriptor stays owned by the
 /// completion path; staging never calls into the index while holding a shard
 /// lock.
-/// Compact transient completion descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StagedRecord {
     hash: u64,
