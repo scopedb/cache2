@@ -459,7 +459,7 @@ impl FileRegionCore {
                             )
                         })?;
                     let payload_valid =
-                        crc32c(&bytes[header_end..payload_end]) == header.payload_crc;
+                        crc32c(&[&bytes[header_end..payload_end]]) == header.payload_crc;
                     let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
                     let budget_exhausted = payload_valid && !within_budget;
                     let reinserted = payload_valid
@@ -719,7 +719,7 @@ impl FileRegionCore {
         if encoded_key != key {
             return Ok(None);
         }
-        if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
+        if crc32c(&[&record[RECORD_HEADER_SIZE..payload_end]]) != header.payload_crc {
             return Ok(None);
         }
         let value_start = completion.descriptor.record_range.start + RECORD_HEADER_SIZE + key_len;

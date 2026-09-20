@@ -19,8 +19,6 @@
 //! input instead of panicking, while writes panic because encoders size their
 //! buffers from the same constants as their field offsets.
 
-use crate::checksum::Crc32c;
-
 /// Reads the little-endian `u16` at `offset`, or returns `None` when the field
 /// range falls outside `input`.
 pub fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
@@ -73,30 +71,4 @@ pub fn put_u32(output: &mut [u8], offset: usize, value: u32) {
 /// buffers from the same constants as their field offsets.
 pub fn put_u64(output: &mut [u8], offset: usize, value: u64) {
     output[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-}
-
-/// Returns the CRC32C of `input` with the little-endian `u32` checksum field at
-/// `checksum_offset` treated as zero, or `None` when the field range falls
-/// outside `input`.
-///
-/// Persistent headers and pages checksum their image with the checksum field
-/// itself zeroed, so writers and readers cover the same bytes without copying.
-pub fn crc32c_with_zeroed_u32(input: &[u8], checksum_offset: usize) -> Option<u32> {
-    let field_end = checksum_offset.checked_add(size_of::<u32>())?;
-    let before = input.get(..checksum_offset)?;
-    let after = input.get(field_end..)?;
-    let mut checksum = Crc32c::new();
-    checksum.update(before);
-    checksum.update(&[0; size_of::<u32>()]);
-    checksum.update(after);
-    Some(checksum.finish())
-}
-
-/// Returns whether the stored checksum field at `checksum_offset` matches
-/// [`crc32c_with_zeroed_u32`].
-pub fn crc32c_with_zeroed_u32_matches(input: &[u8], checksum_offset: usize) -> bool {
-    let Some(expected) = get_u32(input, checksum_offset) else {
-        return false;
-    };
-    crc32c_with_zeroed_u32(input, checksum_offset) == Some(expected)
 }

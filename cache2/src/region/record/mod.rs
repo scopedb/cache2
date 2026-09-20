@@ -18,7 +18,6 @@
 //! not part of the disk format.
 
 use crate::checksum::crc32c;
-use crate::codec::crc32c_with_zeroed_u32_matches;
 use crate::codec::get_u16;
 use crate::codec::get_u32;
 use crate::codec::get_u64;
@@ -87,7 +86,7 @@ impl RecordHeader {
         );
         put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
 
-        let checksum = crc32c(&output);
+        let checksum = header_crc(&output);
         put_u32(&mut output, RECORD_HEADER_CRC_OFFSET, checksum);
         output
     }
@@ -96,7 +95,7 @@ impl RecordHeader {
         if input.len() != RECORD_HEADER_SIZE
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != RECORD_FORMAT_VERSION
-            || !crc32c_with_zeroed_u32_matches(input, RECORD_HEADER_CRC_OFFSET)
+            || get_u32(input, RECORD_HEADER_CRC_OFFSET)? != header_crc(input)
         {
             return None;
         }
@@ -133,6 +132,10 @@ impl RecordHeader {
     }
 }
 
+fn header_crc(header: &[u8]) -> u32 {
+    crc32c(&[&header[..RECORD_HEADER_CRC_OFFSET], &[0; 4]])
+}
+
 fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     if !alignment.is_power_of_two() {
         return None;
@@ -158,7 +161,7 @@ mod tests {
             value_len: value.len() as u32,
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
-            payload_crc: crc32c(&payload),
+            payload_crc: crc32c(&[&payload]),
             region_generation: 17,
             record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
         };
@@ -200,8 +203,7 @@ mod tests {
             RECORD_VERSION_OFFSET,
             RECORD_FORMAT_VERSION + 1,
         );
-        put_u32(&mut wrong_version, RECORD_HEADER_CRC_OFFSET, 0);
-        let checksum = crc32c(&wrong_version);
+        let checksum = header_crc(&wrong_version);
         put_u32(&mut wrong_version, RECORD_HEADER_CRC_OFFSET, checksum);
         assert_eq!(RecordHeader::decode(&wrong_version), None);
 

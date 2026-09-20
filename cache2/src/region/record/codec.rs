@@ -23,7 +23,7 @@ use std::fmt;
 
 use hashcrew::xxhash::xxh3_64_with_seed;
 
-use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
 #[cfg(test)]
 use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::region::index::packed::IndexEntry;
@@ -94,13 +94,10 @@ pub struct RecordPayload<'a> {
 
 impl<'a> RecordPayload<'a> {
     pub fn new(key: &'a [u8], value: &'a [u8]) -> Self {
-        let mut crc = Crc32c::new();
-        crc.update(key);
-        crc.update(value);
         Self {
             key,
             value,
-            crc: crc.finish(),
+            crc: crc32c(&[key, value]),
         }
     }
 }

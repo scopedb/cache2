@@ -12,57 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! CRC32C used by the on-disk format.
+//! CRC32C over borrowed byte segments used by the on-disk formats.
 //!
 //! The dependency selects hardware acceleration when the host supports it and
-//! retains a portable software fallback. This wrapper keeps the cache's codec
-//! API and checksum values independent of that implementation detail.
+//! retains a portable software fallback. Each format selects its checksum
+//! input, including any fields represented as zero bytes.
 
 use hashcrew::crc::Crc32Iscsi;
-use hashcrew::crc::crc32_iscsi;
 
-/// Computes the standard CRC32C checksum of `bytes`.
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    crc32_iscsi(bytes)
-}
-
-/// Incremental CRC32C state, useful for checksumming a key and value without first joining them in
-/// a temporary allocation.
-pub struct Crc32c {
-    digest: Crc32Iscsi,
-}
-
-impl Crc32c {
-    pub fn new() -> Self {
-        Self {
-            digest: Crc32Iscsi::new(),
-        }
+/// Computes CRC32C over the concatenation of `parts` without allocating or copying.
+/// Segment boundaries do not affect the result; empty input returns zero.
+pub fn crc32c(parts: &[&[u8]]) -> u32 {
+    let mut checksum = Crc32Iscsi::new();
+    for part in parts {
+        checksum.update(part);
     }
-
-    pub fn update(&mut self, bytes: &[u8]) {
-        self.digest.update(bytes);
-    }
-
-    pub fn finish(self) -> u32 {
-        self.digest.digest()
-    }
-}
-
-impl Default for Crc32c {
-    fn default() -> Self {
-        Self::new()
-    }
+    checksum.digest()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::checksum::Crc32c;
     use crate::checksum::crc32c;
 
     #[test]
     fn matches_the_crc32c_check_value() {
-        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
-        assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c(&[b"123456789"]), 0xe306_9283);
+        assert_eq!(crc32c(&[b""]), 0);
+        assert_eq!(crc32c(&[]), 0);
     }
 
     #[test]
@@ -72,13 +48,10 @@ mod tests {
             for len in [0, 1, 44, 48, 4092, 4096, 65_537] {
                 let input = &bytes[offset..offset + len];
                 let expected = crc_fast::crc32_iscsi(input);
-                assert_eq!(crc32c(input), expected);
+                assert_eq!(crc32c(&[input]), expected);
                 for split in [0, len.min(44), len.min(56), len / 2, len] {
-                    let mut checksum = Crc32c::new();
-                    checksum.update(&input[..split]);
-                    checksum.update(&[]);
-                    checksum.update(&input[split..]);
-                    assert_eq!(checksum.finish(), expected, "len={len}, split={split}");
+                    let checksum = crc32c(&[&input[..split], &[], &input[split..]]);
+                    assert_eq!(checksum, expected, "len={len}, split={split}");
                 }
             }
         }
@@ -86,13 +59,15 @@ mod tests {
         // Record headers, index pages, and recovery pages zero their checksum
         // field without concatenating the surrounding slices.
         for (len, checksum_offset) in [(48, 44), (4096, 56), (4096, 4092)] {
-            let mut page = bytes[..len].to_vec();
-            page[checksum_offset..checksum_offset + 4].fill(0);
-            let mut checksum = Crc32c::new();
-            checksum.update(&page[..checksum_offset]);
-            checksum.update(&[0; 4]);
-            checksum.update(&page[checksum_offset + 4..]);
-            assert_eq!(checksum.finish(), crc_fast::crc32_iscsi(&page));
+            let page = &bytes[..len];
+            let mut expected = page.to_vec();
+            expected[checksum_offset..checksum_offset + 4].fill(0);
+            let checksum = crc32c(&[
+                &page[..checksum_offset],
+                &[0; 4],
+                &page[checksum_offset + 4..],
+            ]);
+            assert_eq!(checksum, crc_fast::crc32_iscsi(&expected));
         }
     }
 }

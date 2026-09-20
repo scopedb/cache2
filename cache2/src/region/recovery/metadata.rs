@@ -21,7 +21,7 @@
 use std::fmt;
 use std::mem;
 
-use crate::codec::crc32c_with_zeroed_u32;
+use crate::checksum::crc32c;
 use crate::codec::put_u16;
 use crate::codec::put_u32;
 use crate::codec::put_u64;
@@ -863,7 +863,11 @@ fn finish_page(page: &mut [u8]) {
 }
 
 fn page_crc(page: &[u8]) -> u32 {
-    crc32c_with_zeroed_u32(page, PAGE_CRC_OFFSET).expect("metadata page CRC field is in bounds")
+    crc32c(&[
+        &page[..PAGE_CRC_OFFSET],
+        &[0; 4],
+        &page[PAGE_CRC_OFFSET + 4..],
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]

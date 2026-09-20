@@ -20,8 +20,7 @@
 //! `CLEAN`. This module performs no I/O; callers must write the returned page
 //! to the selected slot and provide the required `fdatasync` barrier.
 
-use crate::codec::crc32c_with_zeroed_u32;
-use crate::codec::crc32c_with_zeroed_u32_matches;
+use crate::checksum::crc32c;
 use crate::codec::get_u16;
 use crate::codec::get_u32;
 use crate::codec::get_u64;
@@ -884,13 +883,16 @@ fn get_id(input: &[u8], offset: usize) -> Option<PersistentId> {
 }
 
 fn write_page_crc(page: &mut [u8; RECOVERY_PAGE_SIZE]) {
-    let checksum = crc32c_with_zeroed_u32(page, PAGE_CRC_OFFSET)
-        .expect("recovery page CRC field is in bounds");
+    let checksum = page_crc(page);
     put_u32(page, PAGE_CRC_OFFSET, checksum);
 }
 
 fn page_crc_matches(page: &[u8]) -> bool {
-    page.len() == RECOVERY_PAGE_SIZE && crc32c_with_zeroed_u32_matches(page, PAGE_CRC_OFFSET)
+    page.len() == RECOVERY_PAGE_SIZE && get_u32(page, PAGE_CRC_OFFSET) == Some(page_crc(page))
+}
+
+fn page_crc(page: &[u8]) -> u32 {
+    crc32c(&[&page[..PAGE_CRC_OFFSET], &[0; 4]])
 }
 
 #[cfg(test)]

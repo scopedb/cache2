@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::codec::crc32c_with_zeroed_u32;
+use crate::checksum::crc32c;
 use crate::codec::get_u16;
 use crate::codec::get_u32;
 use crate::codec::get_u64;
@@ -201,8 +201,11 @@ pub fn validate_page_header(
 }
 
 pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
-    crc32c_with_zeroed_u32(page, PAGE_CHECKSUM_OFFSET)
-        .expect("index page checksum field is in bounds")
+    crc32c(&[
+        &page[..PAGE_CHECKSUM_OFFSET],
+        &[0; 4],
+        &page[PAGE_CHECKSUM_OFFSET + 4..],
+    ])
 }
 
 fn read_u16(input: &[u8], offset: usize) -> u16 {
