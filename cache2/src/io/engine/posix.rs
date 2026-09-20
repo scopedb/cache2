@@ -27,7 +27,6 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
 use crate::io::engine::lock_unpoisoned;
 #[cfg(unix)]
-#[cfg(unix)]
 use crate::io::file::DataFileHandles;
 use crate::io::file::FileIoStatsHandle;
 use crate::io::file::PositionedIo;

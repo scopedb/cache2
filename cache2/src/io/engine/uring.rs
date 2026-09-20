@@ -153,7 +153,7 @@ pub fn start(
     if config.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "kernel io_uring SQPOLL requires registered handles",
+            "kernel io_uring SQPOLL requires registered files",
         ));
     }
     let mut probe = Probe::new();

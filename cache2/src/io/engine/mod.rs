@@ -77,12 +77,11 @@ use crate::io::file::FileIoPath;
 use crate::io::file::FileIoStats;
 use crate::io::file::FileIoStatsHandle;
 use crate::io::file::WritePoint;
+use crate::io::recovery::IoRecoveryAttempt;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
-
-use crate::io::recovery::IoRecoveryAttempt;
 
 #[cfg(all(
     feature = "io-uring",
