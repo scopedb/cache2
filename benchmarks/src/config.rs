@@ -158,10 +158,7 @@ pub fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>>
 
 /// Reads an I/O mode setting (`buffered` or `direct`, default `buffered`).
 pub fn parse_io_mode(name: &str) -> io::Result<IoMode> {
-    match env::var(name)
-        .unwrap_or_else(|_| "buffered".to_owned())
-        .as_str()
-    {
+    match setting::<String>(name)?.as_deref().unwrap_or("buffered") {
         "buffered" => Ok(IoMode::Buffered),
         "direct" => Ok(IoMode::Direct),
         value => Err(invalid(format!("unsupported I/O mode: {value}"))),
@@ -170,10 +167,7 @@ pub fn parse_io_mode(name: &str) -> io::Result<IoMode> {
 
 /// Reads an L1 eviction policy setting (`clock` or `s3-fifo`, default `clock`).
 pub fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
-    match env::var(name)
-        .unwrap_or_else(|_| "clock".to_owned())
-        .as_str()
-    {
+    match setting::<String>(name)?.as_deref().unwrap_or("clock") {
         "clock" => Ok(L1EvictionPolicy::Clock),
         "s3-fifo" => Ok(L1EvictionPolicy::S3Fifo),
         value => Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
@@ -190,15 +184,7 @@ fn io_uring_pool(
     let mut options = IoUringPoolOptions::default();
     options.rings = setting(&format!("{prefix}_RINGS"))?.unwrap_or(rings);
     options.max_in_flight = setting(&format!("{prefix}_MAX_IN_FLIGHT"))?.unwrap_or(max_in_flight);
-    options.io_poll = match setting::<String>(&format!("{prefix}_IOPOLL"))?.as_deref() {
-        None | Some("false" | "0") => false,
-        Some("true" | "1") => true,
-        Some(_) => {
-            return Err(invalid(format!(
-                "{prefix}_IOPOLL must be true, false, 1, or 0"
-            )));
-        }
-    };
+    options.io_poll = env_bool(&format!("{prefix}_IOPOLL"), false)?;
     let idle = setting(&format!("{prefix}_SQPOLL_MS"))?;
     let cpu = setting(&format!("{prefix}_SQPOLL_CPU"))?;
     if let Some(idle) = idle {
@@ -214,7 +200,7 @@ fn io_uring_pool(
 }
 
 /// Reads an optional typed setting, reporting the raw value on parse failure.
-pub fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
+fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
     match env::var(name) {
         Ok(value) => value
             .parse()
@@ -228,4 +214,46 @@ pub fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
 /// Builds an `InvalidInput` error for a rejected benchmark setting.
 pub fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn non_utf8_enum_settings_are_rejected() {
+        const SETTING: &str = "CACHE2_TEST_NON_UTF8_ENUM_SETTING";
+
+        if env::var_os(SETTING).is_some() {
+            assert_eq!(
+                parse_io_mode(SETTING).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                parse_l1_eviction_policy(SETTING).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            return;
+        }
+
+        // Set the child's environment without mutating the parallel test process.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::non_utf8_enum_settings_are_rejected",
+            ])
+            .env(SETTING, OsStr::from_bytes(b"\xff"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
