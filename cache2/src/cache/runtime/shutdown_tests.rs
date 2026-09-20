@@ -204,8 +204,8 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     let runtime = session.runtime().unwrap().clone();
     runtime.put(b"existing", b"value").unwrap();
     runtime.drain().unwrap();
-    let mut first = runtime.state.recovery.attempt();
-    let mut second = runtime.state.recovery.attempt();
+    let mut first = runtime.state.io_recovery.attempt();
+    let mut second = runtime.state.io_recovery.attempt();
     assert!(first.next_deadline(Instant::now()).is_some());
     assert!(second.next_deadline(Instant::now()).is_some());
     assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Recovering);

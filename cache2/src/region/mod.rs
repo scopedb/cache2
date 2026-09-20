@@ -1029,9 +1029,9 @@ impl RegionStore {
         staging: &AppendStaging,
         engine: &IoEngine,
         shard_id: usize,
-        recovery: &crate::io::engine::recovery::BackgroundRecovery,
+        io_recovery: &crate::io::recovery::IoRecovery,
     ) -> io::Result<Option<RegionWriteSpan>> {
-        let mut recovery = recovery.attempt();
+        let mut attempt = io_recovery.attempt();
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
@@ -1126,7 +1126,7 @@ impl RegionStore {
             absolute,
             records,
         } = job;
-        let flight = match submit_span(engine, geometry, span, buffer, absolute, &mut recovery) {
+        let flight = match submit_span(engine, geometry, span, buffer, absolute, &mut attempt) {
             Ok(flight) => flight,
             Err(error) => {
                 let original = error.error;
@@ -1134,7 +1134,7 @@ impl RegionStore {
                 return Err(original);
             }
         };
-        let completion = flight.wait(engine, &mut recovery);
+        let completion = flight.wait(engine, &mut attempt);
         let RegionSpanCompletion {
             span,
             result,
@@ -1176,7 +1176,7 @@ impl RegionStore {
             self.health.enter_miss_only();
             return Err(staging_io_error(error));
         }
-        recovery.finish();
+        attempt.finish();
         Ok(Some(span))
     }
 

@@ -57,9 +57,9 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
-use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DataFileHandles;
+use crate::io::recovery::IoRecovery;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -437,7 +437,7 @@ struct RuntimeState {
     reclaim_engines: Box<[Arc<IoEngine>]>,
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
-    recovery: BackgroundRecovery,
+    io_recovery: IoRecovery,
     managed_memory: Arc<ManagedMemory>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -795,7 +795,7 @@ impl CacheRuntime {
     }
 
     pub fn start_close(&self) {
-        self.state.recovery.stop();
+        self.state.io_recovery.stop();
         self.operations.start_close();
     }
 
@@ -823,7 +823,7 @@ impl CacheRuntime {
             ));
         }
         let state = &self.state;
-        if state.recovery.is_recovering() {
+        if state.io_recovery.is_recovering() {
             if state.activity_counters {
                 state.metrics.record_write_rejection();
             }
@@ -1284,7 +1284,7 @@ impl CacheRuntime {
             state.memory.metrics_snapshot(),
         );
         if snapshot.health == crate::snapshot::CacheHealth::Running
-            && state.recovery.is_recovering()
+            && state.io_recovery.is_recovering()
         {
             snapshot.health = crate::snapshot::CacheHealth::Recovering;
         }
@@ -1504,7 +1504,7 @@ fn start_workers(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: options.reclaim_io_timeout,
-        recovery: BackgroundRecovery::new(options.io_recovery_timeout),
+        io_recovery: IoRecovery::new(options.io_recovery_timeout),
         managed_memory,
         metrics,
         memory,
@@ -1646,7 +1646,7 @@ fn append_worker(state: Arc<RuntimeState>, shard_id: usize) {
         );
     }
     state.regions.enter_miss_only();
-    state.recovery.stop();
+    state.io_recovery.stop();
     control.fail(&error);
     // Wake engine admission in case another shard is blocked behind work that
     // can no longer make progress after this runtime entered miss-only.
@@ -1713,7 +1713,7 @@ fn reclaim_worker(
         .lifecycle
         .store(LIFECYCLE_FAILED, Ordering::Release);
     state.regions.enter_miss_only();
-    state.recovery.stop();
+    state.io_recovery.stop();
     log::error!(
         target: "cache2::health",
         event = "cache_reclaim_worker_failed",
@@ -1750,7 +1750,7 @@ fn reclaim_worker_result(
             if state.reclaim_control.is_stopped()? {
                 return Ok(());
             }
-            let mut recovery = state.recovery.attempt();
+            let mut attempt = state.io_recovery.attempt();
             let Some(receipt) = state.regions.begin_reclaim()? else {
                 break;
             };
@@ -1777,11 +1777,11 @@ fn reclaim_worker_result(
                     engine.as_ref(),
                     IoOperation::read(io_buffer, absolute),
                     state.reclaim_io_timeout,
-                    &mut recovery,
+                    &mut attempt,
                 )
                 .map_err(|error| error.into_lease().0)?;
                 let completion = request
-                    .wait_with_recovery(engine.as_ref(), &mut recovery)
+                    .wait_with_io_recovery(engine.as_ref(), &mut attempt)
                     .map_err(|error| error.into_lease().0)?;
                 let (result, returned) = completion.into_lease();
                 let transferred = result?;
@@ -1845,7 +1845,7 @@ fn reclaim_worker_result(
                 state.append_controls[reinsert_shard].wait_for_drain(generation)?;
             }
             state.regions.complete_reclaim(receipt)?;
-            recovery.finish();
+            attempt.finish();
             drop(reinsert_operation);
             if state.activity_counters {
                 state.metrics.record_reclaim(stats);
@@ -1899,7 +1899,7 @@ fn append_worker_result(
                         &state.staging,
                         engine.as_ref(),
                         shard_id,
-                        &state.recovery,
+                        &state.io_recovery,
                     )?;
                     deadline = None;
                 }
@@ -1934,7 +1934,7 @@ fn append_worker_result(
                         &state.staging,
                         engine.as_ref(),
                         shard_id,
-                        &state.recovery,
+                        &state.io_recovery,
                     )?;
                 }
                 Ok(None) => {}
@@ -2070,7 +2070,7 @@ async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> 
 }
 
 fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<bool> {
-    workers.state.recovery.stop();
+    workers.state.io_recovery.stop();
     let drain = drain_shards(&workers.state, true);
     let mut join_error = None;
     for worker in workers.append_workers.drain(..) {

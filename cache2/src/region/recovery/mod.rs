@@ -288,15 +288,16 @@ impl DataSuperblock {
     }
 }
 
+/// Durable session status; CLEAN alone makes a recovery image eligible.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryState {
+pub enum SessionState {
     Empty = 0,
     Running = 1,
     Clean = 2,
 }
 
-impl RecoveryState {
+impl SessionState {
     fn decode(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Empty),
@@ -548,7 +549,7 @@ impl StateBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateRecord {
     pub generation: u64,
-    pub state: RecoveryState,
+    pub state: SessionState,
     pub binding: StateBinding,
 }
 
@@ -635,7 +636,7 @@ impl StateRecord {
             return StateSlotProbe::Corrupt;
         }
 
-        let Some(state) = RecoveryState::decode(page[STATE_KIND_OFFSET]) else {
+        let Some(state) = SessionState::decode(page[STATE_KIND_OFFSET]) else {
             return StateSlotProbe::Corrupt;
         };
         let Some(cache_uuid) = get_id(page, STATE_CACHE_UUID_OFFSET) else {
@@ -689,7 +690,7 @@ impl StateRecord {
     }
 
     fn matches_clean(self, data: DataSuperblock, image: ImageBinding) -> bool {
-        self.state == RecoveryState::Clean
+        self.state == SessionState::Clean
             && self.binding.matches_data(data)
             && self.binding.image == Some(image)
     }
@@ -697,7 +698,7 @@ impl StateRecord {
     fn is_valid(self) -> bool {
         self.generation != 0
             && self.binding.is_valid()
-            && (self.state != RecoveryState::Clean || self.binding.image.is_some())
+            && (self.state != SessionState::Clean || self.binding.image.is_some())
     }
 }
 
@@ -817,7 +818,7 @@ pub enum PrepareStateError {
 /// write followed by `fdatasync` before the caller acts on the transition.
 pub fn prepare_next_state(
     current: Option<SelectedState>,
-    state: RecoveryState,
+    state: SessionState,
     binding: StateBinding,
 ) -> Result<StatePageWrite, PrepareStateError> {
     let (slot, generation) = match current {
@@ -858,12 +859,12 @@ pub fn prepare_running_barrier(
     current: Option<SelectedState>,
     binding: StateBinding,
 ) -> Result<RunningBarrierWrite, PrepareStateError> {
-    let first = prepare_next_state(current, RecoveryState::Running, binding)?;
+    let first = prepare_next_state(current, SessionState::Running, binding)?;
     let first_selected = SelectedState {
         slot: first.slot,
         record: first.record,
     };
-    let second = prepare_next_state(Some(first_selected), RecoveryState::Running, binding)?;
+    let second = prepare_next_state(Some(first_selected), SessionState::Running, binding)?;
     Ok(RunningBarrierWrite { first, second })
 }
 
@@ -955,13 +956,13 @@ mod tests {
         }
     }
 
-    fn record(generation: u64, state: RecoveryState) -> StateRecord {
+    fn record(generation: u64, state: SessionState) -> StateRecord {
         StateRecord {
             generation,
             state,
             binding: StateBinding::from_data(
                 data_superblock(),
-                (state == RecoveryState::Clean).then_some(image()),
+                (state == SessionState::Clean).then_some(image()),
             ),
         }
     }
@@ -981,7 +982,7 @@ mod tests {
 
     #[test]
     fn clean_state_matches_committed_golden_bytes() {
-        let clean = record(19, RecoveryState::Clean);
+        let clean = record(19, SessionState::Clean);
         let clean_golden = assert_golden(
             &clean.encode().unwrap(),
             include_str!("format_v1/clean_state.golden"),
@@ -1071,9 +1072,9 @@ mod tests {
     #[test]
     fn state_records_round_trip_all_states() {
         for state in [
-            RecoveryState::Empty,
-            RecoveryState::Running,
-            RecoveryState::Clean,
+            SessionState::Empty,
+            SessionState::Running,
+            SessionState::Clean,
         ] {
             let expected = record(19, state);
             let encoded = expected.encode().unwrap();
@@ -1136,15 +1137,15 @@ mod tests {
 
     #[test]
     fn clean_requires_an_image_binding() {
-        let mut invalid = record(1, RecoveryState::Running);
-        invalid.state = RecoveryState::Clean;
+        let mut invalid = record(1, SessionState::Running);
+        invalid.state = SessionState::Clean;
         assert_eq!(invalid.encode(), Err(CodecError::StateRecord));
     }
 
     #[test]
     fn latest_valid_ignores_a_torn_or_corrupt_newer_slot() {
-        let older = record(8, RecoveryState::Clean).encode().unwrap();
-        let newer = record(9, RecoveryState::Running).encode().unwrap();
+        let older = record(8, SessionState::Clean).encode().unwrap();
+        let newer = record(9, SessionState::Running).encode().unwrap();
         let mut corrupt = newer;
         corrupt[72] ^= 1;
 
@@ -1152,14 +1153,14 @@ mod tests {
             let selected = latest_state([&older, invalid_newer]).unwrap().unwrap();
             assert_eq!(selected.slot, 0);
             assert_eq!(selected.record.generation, 8);
-            assert_eq!(selected.record.state, RecoveryState::Clean);
+            assert_eq!(selected.record.state, SessionState::Clean);
         }
     }
 
     #[test]
     fn latest_valid_uses_monotonic_generation_not_slot_number() {
-        let newer = record(42, RecoveryState::Running).encode().unwrap();
-        let older = record(41, RecoveryState::Clean).encode().unwrap();
+        let newer = record(42, SessionState::Running).encode().unwrap();
+        let older = record(41, SessionState::Clean).encode().unwrap();
 
         let selected = latest_state([&newer, &older]).unwrap().unwrap();
         assert_eq!(selected.slot, 0);
@@ -1168,8 +1169,8 @@ mod tests {
 
     #[test]
     fn equal_generation_with_different_records_is_ambiguous() {
-        let first = record(5, RecoveryState::Running).encode().unwrap();
-        let second = record(5, RecoveryState::Clean).encode().unwrap();
+        let first = record(5, SessionState::Running).encode().unwrap();
+        let second = record(5, SessionState::Clean).encode().unwrap();
 
         assert_eq!(
             latest_state([&first, &second]),
@@ -1179,8 +1180,8 @@ mod tests {
 
     #[test]
     fn unsupported_state_version_never_falls_back_to_old_clean() {
-        let old_clean = record(7, RecoveryState::Clean).encode().unwrap();
-        let mut unsupported = record(8, RecoveryState::Running).encode().unwrap();
+        let old_clean = record(7, SessionState::Clean).encode().unwrap();
+        let mut unsupported = record(8, SessionState::Running).encode().unwrap();
         put_u16(&mut unsupported, STATE_VERSION_OFFSET, 99);
         write_page_crc(&mut unsupported);
 
@@ -1216,7 +1217,7 @@ mod tests {
             RecoveryImageHeaderProbe::Unsupported(99)
         );
 
-        let mut state = record(8, RecoveryState::Running).encode().unwrap();
+        let mut state = record(8, SessionState::Running).encode().unwrap();
         put_u16(&mut state, STATE_VERSION_OFFSET, 99);
         assert_eq!(StateRecord::probe(&state), StateSlotProbe::Corrupt);
         write_page_crc(&mut state);
@@ -1226,7 +1227,7 @@ mod tests {
     #[test]
     fn prepare_next_state_alternates_slots_and_increments_generation() {
         let binding = StateBinding::from_data(data_superblock(), None);
-        let first = prepare_next_state(None, RecoveryState::Running, binding).unwrap();
+        let first = prepare_next_state(None, SessionState::Running, binding).unwrap();
         assert_eq!(first.slot, 0);
         assert_eq!(first.offset(), 0);
         assert_eq!(first.record.generation, 1);
@@ -1235,7 +1236,7 @@ mod tests {
             slot: first.slot,
             record: first.record,
         };
-        let second = prepare_next_state(Some(selected), RecoveryState::Empty, binding).unwrap();
+        let second = prepare_next_state(Some(selected), SessionState::Empty, binding).unwrap();
         assert_eq!(second.slot, 1);
         assert_eq!(second.offset(), RECOVERY_PAGE_SIZE as u64);
         assert_eq!(second.record.generation, 2);
@@ -1246,22 +1247,18 @@ mod tests {
     fn prepare_next_state_rejects_an_invalid_selected_slot() {
         let current = SelectedState {
             slot: 2,
-            record: record(10, RecoveryState::Running),
+            record: record(10, SessionState::Running),
         };
         assert_eq!(
-            prepare_next_state(
-                Some(current),
-                RecoveryState::Running,
-                current.record.binding
-            ),
+            prepare_next_state(Some(current), SessionState::Running, current.record.binding),
             Err(PrepareStateError::InvalidSlot(2))
         );
     }
 
     #[test]
     fn running_barrier_replaces_both_slots_before_open() {
-        let old_clean = record(9, RecoveryState::Clean);
-        let old_running = record(8, RecoveryState::Running);
+        let old_clean = record(9, SessionState::Clean);
+        let old_running = record(8, SessionState::Running);
         let current = SelectedState {
             slot: 0,
             record: old_clean,
@@ -1273,19 +1270,19 @@ mod tests {
         assert_eq!(barrier.first.record.generation, 10);
         assert_eq!(barrier.second.slot, 0);
         assert_eq!(barrier.second.record.generation, 11);
-        assert_eq!(barrier.first.record.state, RecoveryState::Running);
-        assert_eq!(barrier.second.record.state, RecoveryState::Running);
+        assert_eq!(barrier.first.record.state, SessionState::Running);
+        assert_eq!(barrier.second.record.state, SessionState::Running);
 
         let mut slot0 = barrier.second.page;
         let mut slot1 = barrier.first.page;
         slot0[200] ^= 1;
         let selected = latest_state([&slot0, &slot1]).unwrap().unwrap();
-        assert_eq!(selected.record.state, RecoveryState::Running);
+        assert_eq!(selected.record.state, SessionState::Running);
 
         slot0 = barrier.second.page;
         slot1[201] ^= 1;
         let selected = latest_state([&slot0, &slot1]).unwrap().unwrap();
-        assert_eq!(selected.record.state, RecoveryState::Running);
+        assert_eq!(selected.record.state, SessionState::Running);
 
         // Before either new page reaches storage, the old CLEAN remains safe:
         // this session has not yet admitted mutations.
@@ -1297,7 +1294,7 @@ mod tests {
                 .unwrap()
                 .record
                 .state,
-            RecoveryState::Clean
+            SessionState::Clean
         );
     }
 
@@ -1305,12 +1302,12 @@ mod tests {
     fn generation_overflow_is_rejected() {
         let selected = SelectedState {
             slot: 1,
-            record: record(u64::MAX, RecoveryState::Running),
+            record: record(u64::MAX, SessionState::Running),
         };
         assert_eq!(
             prepare_next_state(
                 Some(selected),
-                RecoveryState::Running,
+                SessionState::Running,
                 selected.record.binding
             ),
             Err(PrepareStateError::GenerationExhausted)
@@ -1321,7 +1318,7 @@ mod tests {
     fn clean_match_binds_every_identity_and_generation() {
         let data = data_superblock();
         let image = image();
-        let clean = record(23, RecoveryState::Clean);
+        let clean = record(23, SessionState::Clean);
         assert!(clean.matches_clean(data, image));
 
         let mut wrong_data = data;
@@ -1340,7 +1337,7 @@ mod tests {
     #[test]
     fn clean_image_match_checks_the_complete_identity_triad() {
         let data = data_superblock();
-        let clean = record(23, RecoveryState::Clean);
+        let clean = record(23, SessionState::Clean);
         let header = image_header();
         assert!(clean_image_matches(
             clean,
@@ -1367,7 +1364,7 @@ mod tests {
             TEST_INDEX_LEN
         ));
         assert!(!clean_image_matches(
-            record(24, RecoveryState::Running),
+            record(24, SessionState::Running),
             data,
             header,
             TEST_IMAGE_FILE_LEN,

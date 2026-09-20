@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reversible background timeout recovery, separate from the health latch.
+//! Recovery of timed-out background I/O while retaining issued requests.
+//! This admission fence is separate from restart recovery and the terminal health latch.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -21,13 +22,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 /// Shared across background workers. Resource ownership remains with each worker.
-pub struct BackgroundRecovery {
+pub struct IoRecovery {
     timeout: Option<Duration>,
     pending: AtomicUsize,
     stopped: AtomicBool,
 }
 
-impl BackgroundRecovery {
+impl IoRecovery {
     pub const fn new(timeout: Option<Duration>) -> Self {
         Self {
             timeout,
@@ -36,9 +37,9 @@ impl BackgroundRecovery {
         }
     }
 
-    pub fn attempt(&self) -> RecoveryAttempt<'_> {
-        RecoveryAttempt {
-            recovery: self,
+    pub fn attempt(&self) -> IoRecoveryAttempt<'_> {
+        IoRecoveryAttempt {
+            io_recovery: self,
             entered: false,
         }
     }
@@ -54,21 +55,21 @@ impl BackgroundRecovery {
 
 /// Retains the admission fence until the caller validates and publishes success.
 /// Failed attempts deliberately leave the fence raised until instance teardown.
-pub struct RecoveryAttempt<'a> {
-    recovery: &'a BackgroundRecovery,
+pub struct IoRecoveryAttempt<'a> {
+    io_recovery: &'a IoRecovery,
     entered: bool,
 }
 
-impl RecoveryAttempt<'_> {
+impl IoRecoveryAttempt<'_> {
     /// Poll completion/admission at fixed one-second intervals, without extending
     /// a configured total budget. Shutdown also terminates unlimited recovery.
     pub fn next_deadline(&mut self, original: Instant) -> Option<Instant> {
-        if self.recovery.stopped.load(Ordering::Acquire) {
+        if self.io_recovery.stopped.load(Ordering::Acquire) {
             return None;
         }
         let now = Instant::now();
         let deadline = now.checked_add(Duration::from_secs(1))?;
-        let deadline = match self.recovery.timeout {
+        let deadline = match self.io_recovery.timeout {
             Some(timeout) => {
                 let end = original.checked_add(timeout)?;
                 if now >= end {
@@ -80,7 +81,7 @@ impl RecoveryAttempt<'_> {
         };
         if !self.entered {
             self.entered = true;
-            if self.recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
+            if self.io_recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
                 log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
                 "background I/O timed out; pausing cache fills while retaining owned requests");
             }
@@ -90,7 +91,7 @@ impl RecoveryAttempt<'_> {
 
     /// Called only after operation-result validation and publication succeed.
     pub fn finish(self) {
-        if self.entered && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.entered && self.io_recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
                 "all timed-out background operations recovered and passed validation");
         }

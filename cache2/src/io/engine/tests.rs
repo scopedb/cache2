@@ -15,13 +15,13 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::recovery::BackgroundRecovery;
 use super::*;
 use crate::IoOutcome;
 use crate::IoRole;
 use crate::StatsOptions;
 use crate::fixtures::TestFile;
 use crate::io::file::PositionedIo;
+use crate::io::recovery::IoRecovery;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
@@ -1128,9 +1128,9 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
             scope.spawn(move || {
-                tx.send(request.wait_with_recovery(
+                tx.send(request.wait_with_io_recovery(
                     engine,
-                    &mut BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
+                    &mut IoRecovery::new(Some(Duration::from_secs(2))).attempt(),
                 ))
                 .unwrap();
             });
@@ -1175,9 +1175,9 @@ fn exhausted_background_recovery_still_fences_unfinished_writes() {
     assert!(io.wait_for_entered(1));
     request.deadline = Instant::now();
     request.cancel_grace = Duration::from_millis(10);
-    let result = request.wait_with_recovery(
+    let result = request.wait_with_io_recovery(
         &engine,
-        &mut BackgroundRecovery::new(Some(Duration::from_millis(20))).attempt(),
+        &mut IoRecovery::new(Some(Duration::from_millis(20))).attempt(),
     );
     let pending = engine.writes_in_flight();
     let rejected = engine.submit(IoOperation::write(
@@ -1211,15 +1211,15 @@ fn background_admission_recovers_without_duplicate_submission() {
         let engine = &engine;
         let managed_memory = &managed_memory;
         scope.spawn(move || {
-            let recovery = BackgroundRecovery::new(Some(Duration::from_secs(2)));
-            let mut attempt = recovery.attempt();
+            let io_recovery = IoRecovery::new(Some(Duration::from_secs(2)));
+            let mut attempt = io_recovery.attempt();
             let result = submit_background_io(
                 engine,
                 IoOperation::read(read_buffer(managed_memory, 4096), 0),
                 Duration::from_millis(10),
                 &mut attempt,
             )
-            .map(|request| request.wait_with_recovery(engine, &mut attempt));
+            .map(|request| request.wait_with_io_recovery(engine, &mut attempt));
             tx.send(result).unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(50));
@@ -1245,7 +1245,7 @@ fn unlimited_recovery_keeps_admission_paused_until_validation() {
     let io = Arc::new(BlockingIo::default());
     let engine = IoEngine::for_test(io.clone(), 1).unwrap();
     let managed_memory = managed_memory();
-    let recovery = BackgroundRecovery::new(None);
+    let io_recovery = IoRecovery::new(None);
     let mut request = submit_cache_io(
         &engine,
         IoOperation::write(
@@ -1260,30 +1260,30 @@ fn unlimited_recovery_keeps_admission_paused_until_validation() {
     std::thread::scope(|scope| {
         let (completed_tx, completed_rx) = mpsc::channel();
         let (validate_tx, validate_rx) = mpsc::channel();
-        let recovery = &recovery;
+        let io_recovery = &io_recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let mut attempt = recovery.attempt();
-            let completion = request.wait_with_recovery(engine, &mut attempt).unwrap();
+            let mut attempt = io_recovery.attempt();
+            let completion = request.wait_with_io_recovery(engine, &mut attempt).unwrap();
             completed_tx.send(completion).unwrap();
             validate_rx.recv().unwrap();
             attempt.finish();
         });
         // Cross more than one polling interval while preserving the same I/O.
         let early = completed_rx.recv_timeout(Duration::from_millis(1100));
-        let paused = recovery.is_recovering();
+        let paused = io_recovery.is_recovering();
         io.release();
         assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
         assert!(paused);
         let completion = completed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(
-            recovery.is_recovering(),
+            io_recovery.is_recovering(),
             "completion delivery alone must not resume fills"
         );
         assert!(completion.into_io_result().0.is_ok());
         validate_tx.send(()).unwrap();
     });
-    assert!(!recovery.is_recovering());
+    assert!(!io_recovery.is_recovering());
     assert_eq!(lock_unpoisoned(&io.state).entered, 1);
     engine.shutdown().unwrap();
 }
@@ -1293,7 +1293,7 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
     let io = Arc::new(BlockingIo::default());
     let engine = IoEngine::for_test(io.clone(), 1).unwrap();
     let managed_memory = managed_memory();
-    let recovery = BackgroundRecovery::new(None);
+    let io_recovery = IoRecovery::new(None);
     let mut request = submit_cache_io(
         &engine,
         IoOperation::write(
@@ -1307,15 +1307,15 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
     request.deadline = Instant::now();
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
-        let recovery = &recovery;
+        let io_recovery = &io_recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let mut attempt = recovery.attempt();
-            tx.send(request.wait_with_recovery(engine, &mut attempt))
+            let mut attempt = io_recovery.attempt();
+            tx.send(request.wait_with_io_recovery(engine, &mut attempt))
                 .unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(30));
-        recovery.stop();
+        io_recovery.stop();
         let stopped = rx.recv_timeout(Duration::from_secs(2));
         let pending = engine.writes_in_flight();
         let charged = managed_memory.snapshot().current_bytes;

@@ -30,12 +30,12 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
-#[cfg(test)]
-use crate::io::engine::recovery::BackgroundRecovery;
-use crate::io::engine::recovery::RecoveryAttempt;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::io::file::WritePoint;
+#[cfg(test)]
+use crate::io::recovery::IoRecovery;
+use crate::io::recovery::IoRecoveryAttempt;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
@@ -86,9 +86,9 @@ impl RegionSpanFlight {
     pub fn wait(
         self,
         engine: &IoEngine,
-        recovery: &mut RecoveryAttempt<'_>,
+        attempt: &mut IoRecoveryAttempt<'_>,
     ) -> RegionSpanCompletion {
-        let completion = match self.request.wait_with_recovery(engine, recovery) {
+        let completion = match self.request.wait_with_io_recovery(engine, attempt) {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_buffer();
@@ -147,7 +147,7 @@ pub fn submit_span(
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
-    recovery: &mut RecoveryAttempt<'_>,
+    attempt: &mut IoRecoveryAttempt<'_>,
 ) -> Result<RegionSpanFlight, RegionSpanSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
@@ -187,7 +187,7 @@ pub fn submit_span(
         engine,
         IoOperation::write(WritePoint::Record, buffer, absolute),
         CACHE_IO_COMPLETION_TIMEOUT,
-        recovery,
+        attempt,
     ) {
         Ok(request) => request,
         Err(error) => {
@@ -311,8 +311,8 @@ mod tests {
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
-        let recovery = BackgroundRecovery::new(Some(Duration::from_secs(5)));
-        let mut attempt = recovery.attempt();
+        let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
+        let mut attempt = io_recovery.attempt();
         let completion = submit_span(
             &engine,
             geometry(),
@@ -325,7 +325,7 @@ mod tests {
         .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
         attempt.finish();
-        assert!(!recovery.is_recovering());
+        assert!(!io_recovery.is_recovering());
         assert_eq!(completion.span, span());
         assert_eq!(
             completion.buffer.unwrap().as_slice().unwrap(),
@@ -345,8 +345,8 @@ mod tests {
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
-        let recovery = BackgroundRecovery::new(Some(Duration::ZERO));
-        let mut attempt = recovery.attempt();
+        let io_recovery = IoRecovery::new(Some(Duration::ZERO));
+        let mut attempt = io_recovery.attempt();
         let completion = submit_span(&engine, geometry(), span(), buffer, absolute, &mut attempt)
             .unwrap()
             .wait(&engine, &mut attempt);
@@ -383,7 +383,7 @@ mod tests {
             invalid,
             buffer,
             0,
-            &mut BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
+            &mut IoRecovery::new(Some(Duration::ZERO)).attempt(),
         ) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),

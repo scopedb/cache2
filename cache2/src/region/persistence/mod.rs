@@ -53,10 +53,10 @@ use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
 use crate::region::recovery::RECOVERY_PAGE_SIZE;
 use crate::region::recovery::RecoveryImageHeader;
 use crate::region::recovery::RecoveryImageHeaderProbe;
-use crate::region::recovery::RecoveryState;
 use crate::region::recovery::STATE_FILE_SIZE;
 use crate::region::recovery::STATE_SLOT_COUNT;
 use crate::region::recovery::SelectedState;
+use crate::region::recovery::SessionState;
 use crate::region::recovery::StateBinding;
 use crate::region::recovery::StatePageWrite;
 use crate::region::recovery::StateRecord;
@@ -325,7 +325,7 @@ impl<F: FileSystem> RegionPersistence<F> {
         let Some(selected) = recovery_state else {
             return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"));
         };
-        if selected.record.state != RecoveryState::Clean {
+        if selected.record.state != SessionState::Clean {
             return self.cold_recovery("unclean_shutdown");
         }
         if !selected.record.binding.matches_data(data) {
@@ -667,7 +667,7 @@ impl<F: FileSystem> RegionPersistence<F> {
         })?;
         let clean_state = prepare_next_state(
             self.current_state,
-            RecoveryState::Clean,
+            SessionState::Clean,
             StateBinding::from_data(data, Some(header.image_binding())),
         )
         .map_err(|_| io::Error::other("CLEAN generation cannot advance"))?;
@@ -741,7 +741,7 @@ impl<F: FileSystem> RegionPersistence<F> {
         let data = self.data_superblock()?;
         let expected = prepare_next_state(
             self.current_state,
-            RecoveryState::Clean,
+            SessionState::Clean,
             prepared.state.record.binding,
         )
         .map_err(|_| io::Error::other("CLEAN generation cannot advance"))?;

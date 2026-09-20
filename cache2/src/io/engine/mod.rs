@@ -81,9 +81,8 @@ use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
-pub mod recovery;
 
-use self::recovery::RecoveryAttempt;
+use crate::io::recovery::IoRecoveryAttempt;
 
 #[cfg(all(
     feature = "io-uring",
@@ -770,10 +769,10 @@ impl BoundedIoRequest {
     /// Allows an issued background operation to finish without cancelling it
     /// at the normal deadline. The same request keeps its slot and buffer;
     /// callers must still validate completion before publishing or reusing it.
-    pub fn wait_with_recovery(
+    pub fn wait_with_io_recovery(
         mut self,
         engine: &IoEngine,
-        recovery: &mut RecoveryAttempt<'_>,
+        attempt: &mut IoRecoveryAttempt<'_>,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let original = self.deadline;
         loop {
@@ -781,7 +780,7 @@ impl BoundedIoRequest {
                 Ok(completion) => return Ok(completion),
                 Err(request) => request,
             };
-            match recovery.next_deadline(original) {
+            match attempt.next_deadline(original) {
                 Some(deadline) => self.deadline = deadline,
                 None => return self.wait(engine),
             }
@@ -956,7 +955,7 @@ pub fn submit_background_io(
     engine: &IoEngine,
     mut operation: IoOperation,
     timeout: Duration,
-    recovery: &mut RecoveryAttempt<'_>,
+    attempt: &mut IoRecoveryAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
     let original = Instant::now()
         .checked_add(timeout)
@@ -969,7 +968,7 @@ pub fn submit_background_io(
                 return Ok(request);
             }
             Err(error) if error.error.kind() == io::ErrorKind::TimedOut => {
-                let Some(next) = recovery.next_deadline(original) else {
+                let Some(next) = attempt.next_deadline(original) else {
                     return Err(error);
                 };
                 deadline = next;
