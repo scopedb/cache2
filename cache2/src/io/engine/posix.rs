@@ -163,7 +163,7 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
-    fn inner(&self) -> &Arc<RuntimeInner> {
+    fn inner(&self) -> &RuntimeInner {
         &self.inner
     }
 

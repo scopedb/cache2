@@ -954,7 +954,7 @@ fn submit_cache_io_until(
 pub trait IoEngine: Send + Sync {
     /// Shared submission, completion, and bookkeeping state behind the
     /// engine-specific driver.
-    fn inner(&self) -> &Arc<RuntimeInner>;
+    fn inner(&self) -> &RuntimeInner;
     /// Backend path and direct-I/O counters reported with the engine stats.
     fn runtime_io_stats(&self) -> RuntimeIoStats;
 

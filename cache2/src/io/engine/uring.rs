@@ -241,7 +241,7 @@ impl UringIoEngine {
 }
 
 impl IoEngine for UringIoEngine {
-    fn inner(&self) -> &Arc<RuntimeInner> {
+    fn inner(&self) -> &RuntimeInner {
         &self.inner
     }
 

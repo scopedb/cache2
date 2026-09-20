@@ -101,7 +101,7 @@ struct RacingEngine {
 }
 
 impl IoEngine for RacingEngine {
-    fn inner(&self) -> &Arc<RuntimeInner> {
+    fn inner(&self) -> &RuntimeInner {
         self.inner.inner()
     }
 
