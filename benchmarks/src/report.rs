@@ -29,6 +29,13 @@ use cache2::DetailedCacheSnapshot;
 
 const LATENCY_BUCKETS: usize = 65;
 
+/// Returns true when an operation ordinal falls on the sampling interval.
+///
+/// Interval 0 disables sampling.
+pub fn should_sample(ordinal: u64, interval: usize) -> bool {
+    interval != 0 && ordinal.is_multiple_of(interval as u64)
+}
+
 /// A fixed-size log2 latency histogram.
 ///
 /// Percentiles are reported as bucket upper bounds. Mean and standard
@@ -61,6 +68,13 @@ impl LatencyHistogram {
         self.samples = self.samples.saturating_add(1);
         self.minimum_ns = self.minimum_ns.min(nanos);
         self.maximum_ns = self.maximum_ns.max(nanos);
+    }
+
+    /// Records one sample when `started` carries a sampling instant.
+    pub fn record_sampled(&mut self, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.record(started.elapsed());
+        }
     }
 
     /// Merges another bounded histogram.
@@ -160,6 +174,13 @@ impl AtomicLatencyHistogram {
         self.buckets[latency_bucket(nanos)].fetch_add(1, Ordering::Relaxed);
         self.minimum_ns.fetch_min(nanos, Ordering::Relaxed);
         self.maximum_ns.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Records one sample when `started` carries a sampling instant.
+    pub fn record_sampled(&self, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.record(started.elapsed());
+        }
     }
 
     /// Takes a non-transactional snapshot suitable for periodic reporting.

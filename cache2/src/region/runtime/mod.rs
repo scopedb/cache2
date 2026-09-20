@@ -85,6 +85,7 @@ use crate::region::index::packed::PackedLocation;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 #[cfg(test)]
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::is_read_pressure;
 use crate::region::reader::PendingRead;
 #[cfg(test)]
 use crate::region::reader::ReadCandidate;
@@ -312,14 +313,14 @@ enum PreparedGet {
 }
 
 struct PendingGet {
-    engine: Arc<dyn IoEngine>,
+    engine: Arc<IoEngine>,
     read: PendingRead,
     read_token: MemoryReadToken,
     hash: u64,
 }
 
 struct WaitingGet {
-    engine: Arc<dyn IoEngine>,
+    engine: Arc<IoEngine>,
     slot_waiter: ReadSlotWaiter,
     descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
@@ -329,7 +330,7 @@ struct WaitingGet {
 }
 
 struct ReservedGet {
-    engine: Arc<dyn IoEngine>,
+    engine: Arc<IoEngine>,
     slot: ReadSlot,
     descriptor: ReadDescriptor,
     read_token: MemoryReadToken,
@@ -430,11 +431,11 @@ struct RunningOwner {
 
 struct RunningShared {
     core: Arc<FileRegionCore>,
-    read_engines: Box<[Arc<dyn IoEngine>]>,
+    read_engines: Box<[Arc<IoEngine>]>,
     read_lane_cursor: AtomicUsize,
     read_waiters: Option<Arc<Semaphore>>,
-    write_engines: Box<[Arc<dyn IoEngine>]>,
-    reclaim_engines: Box<[Arc<dyn IoEngine>]>,
+    write_engines: Box<[Arc<IoEngine>]>,
+    reclaim_engines: Box<[Arc<IoEngine>]>,
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
     recovery: BackgroundRecovery,
@@ -447,6 +448,8 @@ struct RunningShared {
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
     activity_counters: bool,
+    #[cfg(test)]
+    after_io_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Default)]
@@ -507,11 +510,11 @@ impl ReclaimControl {
 }
 
 impl RunningShared {
-    fn write_engine_for(&self, route: u64) -> &Arc<dyn IoEngine> {
+    fn write_engine_for(&self, route: u64) -> &Arc<IoEngine> {
         &self.write_engines[route_hash(route, self.write_engines.len())]
     }
 
-    fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+    fn try_reserve_read(&self, route: u64) -> io::Result<(Arc<IoEngine>, ReadSlot)> {
         try_reserve_read_lane(&self.read_engines, route, &self.read_lane_cursor)
     }
 
@@ -545,7 +548,7 @@ impl RunningShared {
         })
     }
 
-    fn engines(&self) -> impl Iterator<Item = &Arc<dyn IoEngine>> {
+    fn engines(&self) -> impl Iterator<Item = &Arc<IoEngine>> {
         self.read_engines
             .iter()
             .chain(self.write_engines.iter())
@@ -554,11 +557,11 @@ impl RunningShared {
 }
 
 fn try_reserve_read_lane(
-    engines: &[Arc<dyn IoEngine>],
+    engines: &[Arc<IoEngine>],
     route: u64,
     pressure_cursor: &AtomicUsize,
-) -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
-    let reserve = |lane: usize| -> io::Result<(Arc<dyn IoEngine>, ReadSlot)> {
+) -> io::Result<(Arc<IoEngine>, ReadSlot)> {
+    let reserve = |lane: usize| -> io::Result<(Arc<IoEngine>, ReadSlot)> {
         let slot = engines[lane].try_reserve_read()?;
         Ok((Arc::clone(&engines[lane]), slot))
     };
@@ -1343,9 +1346,9 @@ impl RegionDataPlane {
 }
 
 fn aggregate_io_stats(
-    read_engines: &[Arc<dyn IoEngine>],
-    write_engines: &[Arc<dyn IoEngine>],
-    reclaim_engines: &[Arc<dyn IoEngine>],
+    read_engines: &[Arc<IoEngine>],
+    write_engines: &[Arc<IoEngine>],
+    reclaim_engines: &[Arc<IoEngine>],
 ) -> CacheIoSnapshot {
     let mut aggregate = CacheIoSnapshot::default();
     for (engine_index, engine) in read_engines.iter().chain(write_engines).enumerate() {
@@ -1513,6 +1516,8 @@ fn start_running(
         write_flush_threshold_bytes: runtime.write_flush_threshold_bytes,
         align_reads_for_direct_io: runtime.io_mode == IoMode::Direct,
         activity_counters: runtime.stats.activity_counters,
+        #[cfg(test)]
+        after_io_snapshot: Mutex::new(None),
     });
     // Inspect the recovered queue before workers can contend with foreground
     // mutations. Fresh caches have no sealed Regions and need no wakeup.
@@ -1592,7 +1597,7 @@ fn build_engine_pool(
     runtime: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
-) -> io::Result<Box<[Arc<dyn IoEngine>]>> {
+) -> io::Result<Box<[Arc<IoEngine>]>> {
     let mut source = Some(files);
     let engine_count = topology.engine_count();
     let mut engines = Vec::new();
@@ -2095,6 +2100,13 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         .engines()
         .map(|engine| engine.in_flight())
         .sum::<usize>();
+    #[cfg(test)]
+    {
+        let after_snapshot = owner.shared.after_io_snapshot.lock().unwrap().take();
+        if let Some(after_snapshot) = after_snapshot {
+            after_snapshot();
+        }
+    }
     let writes_in_flight = owner
         .shared
         .engines()
@@ -2156,7 +2168,7 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
     result.map(|()| false)
 }
 
-fn reap_engine_after_target_fence(engine: &Arc<dyn IoEngine>) {
+fn reap_engine_after_target_fence(engine: &Arc<IoEngine>) {
     let reaper_engine = Arc::clone(engine);
     let spawn = std::thread::Builder::new()
         .name("cache2-io-reaper".to_owned())
@@ -2182,17 +2194,6 @@ fn managed_memory_io_error(error: ManagedMemoryError) -> io::Error {
 
 fn write_overload_error() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "write path is busy")
-}
-
-fn is_read_pressure(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::OutOfMemory
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::BrokenPipe
-    )
 }
 
 fn staging_runtime_error(error: StagingError) -> io::Error {
@@ -2225,9 +2226,8 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::io::backend::FileBackend;
-    use crate::io::backend::IoBackend;
-    use crate::io::engine::BackendIoEngine;
+    use crate::fixtures::TestFile;
+    use crate::io::engine::IoEngine;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2245,15 +2245,11 @@ mod tests {
 
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
-            "cache2-read-lane-{}-{id}.cache",
-            std::process::id()
-        ));
-        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
-        let engines: Box<[Arc<dyn IoEngine>]> = vec![
-            Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
-            Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
+        let file = TestFile::new("read-lane");
+        let backend = file.backend();
+        let engines: Box<[Arc<IoEngine>]> = vec![
+            Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()),
+            Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()),
         ]
         .into_boxed_slice();
         let pressure_cursor = AtomicUsize::new(0);
@@ -2282,22 +2278,14 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
-            "cache2-read-lane-rotation-{}-{id}.cache",
-            std::process::id()
-        ));
-        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
-        let engines: Box<[Arc<dyn IoEngine>]> = (0..4)
-            .map(|_| {
-                Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap())
-                    as Arc<dyn IoEngine>
-            })
+        let file = TestFile::new("read-lane-rotation");
+        let backend = file.backend();
+        let engines: Box<[Arc<IoEngine>]> = (0..4)
+            .map(|_| Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let pressure_cursor = AtomicUsize::new(0);
@@ -2316,7 +2304,6 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

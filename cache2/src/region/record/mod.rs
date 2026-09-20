@@ -17,8 +17,13 @@
 //! These types are deliberately encoded field-by-field. Their Rust layout is
 //! not part of the disk format.
 
-use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
+use crate::codec::get_u16;
+use crate::codec::get_u32;
+use crate::codec::get_u64;
+use crate::codec::put_u16;
+use crate::codec::put_u32;
+use crate::codec::put_u64;
 
 pub mod codec;
 
@@ -81,7 +86,7 @@ impl RecordHeader {
         );
         put_u32(&mut output, RECORD_LEN_OFFSET, self.record_len);
 
-        let checksum = crc32c(&output);
+        let checksum = header_crc(&output);
         put_u32(&mut output, RECORD_HEADER_CRC_OFFSET, checksum);
         output
     }
@@ -90,7 +95,7 @@ impl RecordHeader {
         if input.len() != RECORD_HEADER_SIZE
             || input.get(..RECORD_HEADER_MAGIC.len())? != RECORD_HEADER_MAGIC
             || get_u16(input, RECORD_VERSION_OFFSET)? != RECORD_FORMAT_VERSION
-            || !checksum_matches(input, RECORD_HEADER_CRC_OFFSET)
+            || get_u32(input, RECORD_HEADER_CRC_OFFSET)? != header_crc(input)
         {
             return None;
         }
@@ -127,6 +132,10 @@ impl RecordHeader {
     }
 }
 
+fn header_crc(header: &[u8]) -> u32 {
+    crc32c(&[&header[..RECORD_HEADER_CRC_OFFSET], &[0; 4]])
+}
+
 fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     if !alignment.is_power_of_two() {
         return None;
@@ -134,61 +143,6 @@ fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment.checked_sub(1)?)
         .map(|rounded| rounded & !(alignment - 1))
-}
-
-fn checksum_matches(input: &[u8], checksum_offset: usize) -> bool {
-    let Some(expected) = get_u32(input, checksum_offset) else {
-        return false;
-    };
-    let Some(after_checksum) = checksum_offset.checked_add(size_of::<u32>()) else {
-        return false;
-    };
-    let (Some(before), Some(after)) = (input.get(..checksum_offset), input.get(after_checksum..))
-    else {
-        return false;
-    };
-
-    let mut checksum = Crc32c::new();
-    checksum.update(before);
-    checksum.update(&[0; size_of::<u32>()]);
-    checksum.update(after);
-    checksum.finish() == expected
-}
-
-fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
-    let bytes: [u8; size_of::<u16>()] = input
-        .get(offset..offset.checked_add(size_of::<u16>())?)?
-        .try_into()
-        .ok()?;
-    Some(u16::from_le_bytes(bytes))
-}
-
-fn get_u32(input: &[u8], offset: usize) -> Option<u32> {
-    let bytes: [u8; size_of::<u32>()] = input
-        .get(offset..offset.checked_add(size_of::<u32>())?)?
-        .try_into()
-        .ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn get_u64(input: &[u8], offset: usize) -> Option<u64> {
-    let bytes: [u8; size_of::<u64>()] = input
-        .get(offset..offset.checked_add(size_of::<u64>())?)?
-        .try_into()
-        .ok()?;
-    Some(u64::from_le_bytes(bytes))
-}
-
-fn put_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(output: &mut [u8], offset: usize, value: u64) {
-    output[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -207,7 +161,7 @@ mod tests {
             value_len: value.len() as u32,
             seqno: 34,
             key_hash: 0x1122_3344_5566_7788,
-            payload_crc: crc32c(&payload),
+            payload_crc: crc32c(&[&payload]),
             region_generation: 17,
             record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
         };
@@ -249,8 +203,7 @@ mod tests {
             RECORD_VERSION_OFFSET,
             RECORD_FORMAT_VERSION + 1,
         );
-        put_u32(&mut wrong_version, RECORD_HEADER_CRC_OFFSET, 0);
-        let checksum = crc32c(&wrong_version);
+        let checksum = header_crc(&wrong_version);
         put_u32(&mut wrong_version, RECORD_HEADER_CRC_OFFSET, checksum);
         assert_eq!(RecordHeader::decode(&wrong_version), None);
 

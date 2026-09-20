@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
+use crate::codec::get_u16;
+use crate::codec::get_u32;
+use crate::codec::get_u64;
+use crate::codec::put_u16;
+use crate::codec::put_u32;
+use crate::codec::put_u64;
 use crate::region::index::storage::CorruptPageReason;
 use crate::region::index::storage::IndexImageBinding;
 use crate::region::index::storage::IndexStorageError;
@@ -195,45 +201,21 @@ pub fn validate_page_header(
 }
 
 pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
-    let mut checksum = Crc32c::new();
-    checksum.update(&page[..PAGE_CHECKSUM_OFFSET]);
-    checksum.update(&[0_u8; size_of::<u32>()]);
-    checksum.update(&page[PAGE_CHECKSUM_OFFSET + size_of::<u32>()..]);
-    checksum.finish()
+    crc32c(&[
+        &page[..PAGE_CHECKSUM_OFFSET],
+        &[0; 4],
+        &page[PAGE_CHECKSUM_OFFSET + 4..],
+    ])
 }
 
 fn read_u16(input: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        input[offset..offset + 2]
-            .try_into()
-            .expect("fixed u16 field is in bounds"),
-    )
+    get_u16(input, offset).expect("fixed u16 field is in bounds")
 }
 
 fn read_u32(input: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        input[offset..offset + 4]
-            .try_into()
-            .expect("fixed u32 field is in bounds"),
-    )
+    get_u32(input, offset).expect("fixed u32 field is in bounds")
 }
 
 pub fn read_u64(input: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        input[offset..offset + 8]
-            .try_into()
-            .expect("fixed u64 field is in bounds"),
-    )
-}
-
-fn put_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u64(output: &mut [u8], offset: usize, value: u64) {
-    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    get_u64(input, offset).expect("fixed u64 field is in bounds")
 }

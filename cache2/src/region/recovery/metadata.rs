@@ -21,7 +21,10 @@
 use std::fmt;
 use std::mem;
 
-use crate::checksum::Crc32c;
+use crate::checksum::crc32c;
+use crate::codec::put_u16;
+use crate::codec::put_u32;
+use crate::codec::put_u64;
 use crate::region::index::packed::MAX_INDEX_PARTITIONS;
 use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
 use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
@@ -855,17 +858,16 @@ fn validate_envelope_shape(
 }
 
 fn finish_page(page: &mut [u8]) {
-    put_u32(page, PAGE_CRC_OFFSET, 0);
     let checksum = page_crc(page);
     put_u32(page, PAGE_CRC_OFFSET, checksum);
 }
 
 fn page_crc(page: &[u8]) -> u32 {
-    let mut checksum = Crc32c::new();
-    checksum.update(&page[..PAGE_CRC_OFFSET]);
-    checksum.update(&[0_u8; 4]);
-    checksum.update(&page[PAGE_CRC_OFFSET + 4..]);
-    checksum.finish()
+    crc32c(&[
+        &page[..PAGE_CRC_OFFSET],
+        &[0; 4],
+        &page[PAGE_CRC_OFFSET + 4..],
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1175,42 +1177,15 @@ fn put_id(output: &mut [u8], offset: usize, id: PersistentId) {
 }
 
 fn get_u16(input: &[u8], offset: usize) -> Result<u16, RegionMetadataError> {
-    let bytes = input
-        .get(offset..offset + 2)
-        .ok_or(RegionMetadataError::InvalidLength)?
-        .try_into()
-        .map_err(|_| RegionMetadataError::InvalidLength)?;
-    Ok(u16::from_le_bytes(bytes))
+    crate::codec::get_u16(input, offset).ok_or(RegionMetadataError::InvalidLength)
 }
 
 fn get_u32(input: &[u8], offset: usize) -> Result<u32, RegionMetadataError> {
-    let bytes = input
-        .get(offset..offset + 4)
-        .ok_or(RegionMetadataError::InvalidLength)?
-        .try_into()
-        .map_err(|_| RegionMetadataError::InvalidLength)?;
-    Ok(u32::from_le_bytes(bytes))
+    crate::codec::get_u32(input, offset).ok_or(RegionMetadataError::InvalidLength)
 }
 
 fn get_u64(input: &[u8], offset: usize) -> Result<u64, RegionMetadataError> {
-    let bytes = input
-        .get(offset..offset + 8)
-        .ok_or(RegionMetadataError::InvalidLength)?
-        .try_into()
-        .map_err(|_| RegionMetadataError::InvalidLength)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn put_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(output: &mut [u8], offset: usize, value: u64) {
-    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    crate::codec::get_u64(input, offset).ok_or(RegionMetadataError::InvalidLength)
 }
 
 #[cfg(test)]

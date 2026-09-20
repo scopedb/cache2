@@ -15,27 +15,33 @@
 use std::env;
 use std::f64::consts::TAU;
 use std::fmt;
-use std::fs;
 use std::hint::black_box;
 use std::io;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::env_optional_usize;
+use benchmarks::config::env_u32;
+use benchmarks::config::env_u64;
+use benchmarks::config::env_usize;
+use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
+use benchmarks::config::parse_io_mode;
+use benchmarks::config::parse_l1_eviction_policy;
 use benchmarks::config::read_max_in_flight;
 use benchmarks::config::reclaim_max_in_flight;
+use benchmarks::harness::BenchFiles;
+use benchmarks::harness::splitmix64;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
 use benchmarks::report::RunReporter;
 use benchmarks::report::emit_cache_report;
+use benchmarks::report::should_sample;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
@@ -157,8 +163,8 @@ impl Scenario {
     }
 
     fn key_size(self, seed: u64, key_index: usize) -> usize {
-        let first = mixed(seed ^ key_index as u64 ^ 0x1319_8a2e_0370_7344);
-        let second = mixed(first);
+        let first = splitmix64(seed ^ key_index as u64 ^ 0x1319_8a2e_0370_7344);
+        let second = splitmix64(first);
         let sampled = match self {
             Self::Mixed | Self::NegativeLookup => {
                 sample_piecewise(&MIXED_KEY_BOUNDS, &MIXED_KEY_WEIGHTS, first, second)
@@ -174,8 +180,8 @@ impl Scenario {
     }
 
     fn value_size(self, seed: u64, key_index: usize) -> usize {
-        let first = mixed(seed ^ key_index as u64 ^ 0xbe54_66cf_34e9_0c6c);
-        let second = mixed(first);
+        let first = splitmix64(seed ^ key_index as u64 ^ 0xbe54_66cf_34e9_0c6c);
+        let second = splitmix64(first);
         let sampled = match self {
             Self::Mixed | Self::NegativeLookup => {
                 sample_piecewise(&MIXED_VALUE_BOUNDS, &MIXED_VALUE_WEIGHTS, first, second)
@@ -231,22 +237,8 @@ impl HarnessOptions {
         let io_engine = io_engine_from_env("CACHE_WORKLOAD")?;
         let latency_sample_interval = env_usize("CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL", 16)?;
         let seed = env_u64("CACHE_WORKLOAD_SEED", DEFAULT_SEED)?;
-        let io_mode = match env::var("CACHE_WORKLOAD_IO_MODE")
-            .unwrap_or_else(|_| "buffered".to_owned())
-            .as_str()
-        {
-            "buffered" => IoMode::Buffered,
-            "direct" => IoMode::Direct,
-            value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
-        };
-        let l1_eviction_policy = match env::var("CACHE_WORKLOAD_L1_EVICTION")
-            .unwrap_or_else(|_| "clock".to_owned())
-            .as_str()
-        {
-            "clock" => L1EvictionPolicy::Clock,
-            "s3-fifo" => L1EvictionPolicy::S3Fifo,
-            value => return Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
-        };
+        let io_mode = parse_io_mode("CACHE_WORKLOAD_IO_MODE")?;
+        let l1_eviction_policy = parse_l1_eviction_policy("CACHE_WORKLOAD_L1_EVICTION")?;
         let directory = env::var_os("CACHE_WORKLOAD_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
@@ -401,39 +393,6 @@ impl ScenarioConfig {
     }
 }
 
-struct BenchFiles {
-    data: PathBuf,
-}
-
-impl BenchFiles {
-    fn new(directory: &Path, scenario: Scenario) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Self {
-            data: directory.join(format!(
-                "cache2-mixed-workload-{}-{}-{timestamp}.cache",
-                scenario.slug(),
-                std::process::id()
-            )),
-        }
-    }
-}
-
-impl Drop for BenchFiles {
-    fn drop(&mut self) {
-        for file in [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ] {
-            let _ = fs::remove_file(file);
-        }
-    }
-}
-
 #[derive(Default)]
 struct WorkloadResult {
     gets: u64,
@@ -517,7 +476,7 @@ impl DeterministicRng {
 
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(RNG_GAMMA);
-        mixed(self.state)
+        splitmix64(self.state)
     }
 
     fn bounded(&mut self, upper: u64) -> u64 {
@@ -590,10 +549,13 @@ async fn run_scenario_inner(config: ScenarioConfig) -> io::Result<()> {
         config.io_mode,
     );
 
-    let files = BenchFiles::new(&config.directory, scenario);
+    let files = BenchFiles::new(
+        &config.directory,
+        &format!("mixed-workload-{}", scenario.slug()),
+    );
     let storage = config.storage_options().build()?;
     let cache_config = CacheConfig::new(storage, config.runtime_options())?;
-    let cache = Arc::new(Cache::open(&files.data, cache_config).await?);
+    let cache = Arc::new(Cache::open(files.data(), cache_config).await?);
     let expected: Arc<[AtomicU64]> = (0..config.key_count)
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>()
@@ -666,7 +628,7 @@ async fn run_worker(
     expected: &[AtomicU64],
     config: &ScenarioConfig,
 ) -> io::Result<WorkloadResult> {
-    let worker_seed = mixed(
+    let worker_seed = splitmix64(
         config.seed ^ config.scenario.seed_salt() ^ (worker_id as u64).wrapping_mul(RNG_GAMMA),
     );
     let mut rng = DeterministicRng::new(worker_seed);
@@ -687,14 +649,19 @@ async fn run_worker(
             .and_then(|base| base.checked_add(operation_index))
             .ok_or_else(|| invalid("worker operation ordinal overflow"))?;
         let operation = config.scenario.operation(rng.bounded(100));
-        let sample_latency = should_sample(operation, &result, config.latency_sample_interval);
+        let completed = match operation {
+            Operation::Get => result.gets,
+            Operation::Set => result.sets,
+            Operation::Delete => result.deletes,
+        };
+        let sample_latency = should_sample(completed, config.latency_sample_interval);
 
         if config.scenario == Scenario::NegativeLookup {
             write_negative_lookup_key(&mut miss_key, config.seed, global_index as u64);
             result.gets = result.gets.saturating_add(1);
             let started = sample_latency.then(Instant::now);
             let outcome = cache.get(miss_key).await;
-            record_sample(&mut result.get_latency, started);
+            result.get_latency.record_sampled(started);
             match outcome {
                 Ok(Some(_)) => {
                     return Err(io::Error::new(
@@ -721,7 +688,7 @@ async fn run_worker(
                 result.gets = result.gets.saturating_add(1);
                 let started = sample_latency.then(Instant::now);
                 let outcome = cache.get(key).await;
-                record_sample(&mut result.get_latency, started);
+                result.get_latency.record_sampled(started);
                 match outcome {
                     Ok(Some(observed)) => {
                         let latest = expected[key_index].load(Ordering::SeqCst);
@@ -733,7 +700,7 @@ async fn run_worker(
                         result.served_value_bytes = result
                             .served_value_bytes
                             .saturating_add(observed.len() as u64);
-                        result.checksum ^= black_box(mixed(
+                        result.checksum ^= black_box(splitmix64(
                             key_index as u64
                                 ^ observed_version.rotate_left(17)
                                 ^ observed.len() as u64,
@@ -759,7 +726,7 @@ async fn run_worker(
                     .saturating_add(value_size as u64);
                 let started = sample_latency.then(Instant::now);
                 let outcome = cache.put(key, &value[..value_size]);
-                record_sample(&mut result.set_latency, started);
+                result.set_latency.record_sampled(started);
                 match outcome {
                     Ok(_) => {
                         result.set_accepted = result.set_accepted.saturating_add(1);
@@ -777,7 +744,7 @@ async fn run_worker(
                 result.deletes = result.deletes.saturating_add(1);
                 let started = sample_latency.then(Instant::now);
                 let outcome = cache.delete(key);
-                record_sample(&mut result.delete_latency, started);
+                result.delete_latency.record_sampled(started);
                 match outcome {
                     Ok(_) => {
                         result.delete_accepted = result.delete_accepted.saturating_add(1);
@@ -902,22 +869,7 @@ fn validate_value(key_index: usize, value: &[u8], latest: u64) -> io::Result<u64
 }
 
 fn value_pattern(key_index: u64, version: u64, length: usize) -> u8 {
-    mixed(key_index ^ version.rotate_left(29) ^ length as u64) as u8
-}
-
-fn record_sample(histogram: &mut LatencyHistogram, started: Option<Instant>) {
-    if let Some(started) = started {
-        histogram.record(started.elapsed());
-    }
-}
-
-fn should_sample(operation: Operation, result: &WorkloadResult, interval: usize) -> bool {
-    interval != 0
-        && match operation {
-            Operation::Get => result.gets.is_multiple_of(interval as u64),
-            Operation::Set => result.sets.is_multiple_of(interval as u64),
-            Operation::Delete => result.deletes.is_multiple_of(interval as u64),
-        }
+    splitmix64(key_index ^ version.rotate_left(29) ^ length as u64) as u8
 }
 
 fn validate_snapshot(result: &WorkloadResult, snapshot: &CacheSnapshot) -> io::Result<()> {
@@ -1184,44 +1136,6 @@ fn default_managed_memory_limit(
         .ok_or_else(|| invalid("managed-memory estimate rounding overflow"))
 }
 
-fn mixed(mut value: u64) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn env_optional_usize(name: &str) -> io::Result<Option<usize>> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<usize>()
-            .map(Some)
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    env_u64(name, default as u64).and_then(|value| {
-        usize::try_from(value).map_err(|_| invalid(format!("{name} does not fit usize")))
-    })
-}
-
-fn env_u32(name: &str, default: u32) -> io::Result<u32> {
-    env_u64(name, u64::from(default))
-        .and_then(|value| u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds u32"))))
-}
-
 fn mib_to_usize(name: &str, value: usize) -> io::Result<usize> {
     value
         .checked_mul(MIB)
@@ -1233,16 +1147,6 @@ fn mib_to_u64(name: &str, value: usize) -> io::Result<u64> {
         .ok()
         .and_then(|mib| mib.checked_mul(MIB as u64))
         .ok_or_else(|| invalid(format!("{name} is too large")))
-}
-
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {

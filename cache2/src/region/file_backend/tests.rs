@@ -44,7 +44,6 @@ use crate::io::backend::testing::FaultBackend;
 use crate::io::backend::testing::FaultEvent;
 use crate::io::backend::testing::FaultHandle;
 use crate::io::backend::testing::kill_process;
-use crate::io::engine::BackendIoEngine;
 use crate::io::engine::IoEngine;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
@@ -902,7 +901,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     let directory = TestDirectory::new();
     let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = BackendIoEngine::new(Arc::new(backend), 2).unwrap();
+    let engine = IoEngine::for_test(Arc::new(backend), 2).unwrap();
     let value = vec![0x5a; 16 * 1024];
     let mut first = None;
     let mut last = None;
@@ -1066,7 +1065,7 @@ fn same_hash_candidate_requires_full_key() {
     let directory = TestDirectory::new();
     let (backend, _) = FaultBackend::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
+    let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
     let owner_key = b"collision-owner";
     let foreign_key = b"collision-foreign";
     let value = b"owner-value-must-not-leak";
@@ -1211,7 +1210,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     let directory = TestDirectory::new();
     let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = BackendIoEngine::new(Arc::new(backend), 1).unwrap();
+    let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
     let RegionStageValue::Staged { .. } = runtime

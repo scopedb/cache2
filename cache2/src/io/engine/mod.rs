@@ -32,6 +32,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::TrySendError;
 use std::task::Context;
@@ -46,7 +48,6 @@ use asyncband::semaphore::Semaphore;
 
 #[cfg(unix)]
 use crate::config::runtime::IoEngineConfig;
-use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
 #[cfg(all(
@@ -74,6 +75,7 @@ use crate::io::backend::RuntimeIoDirection;
 ))]
 use crate::io::backend::RuntimeIoPath;
 use crate::io::backend::RuntimeIoStats;
+use crate::io::backend::RuntimeIoStatsHandle;
 use crate::io::backend::WritePoint;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
@@ -96,12 +98,18 @@ use self::recovery::RecoveryAttempt;
 ))]
 mod uring;
 
-/// Reference engine: a small fixed worker pool executes exact operations
-/// through the existing fault-injectable positioned-I/O backend.
-#[derive(Clone)]
-pub struct BackendIoEngine {
-    inner: Arc<RuntimeInner>,
-    backend: Arc<dyn IoBackend>,
+/// Bounded request admission, submission, and driver lifecycle for one I/O lane.
+/// POSIX workers and io_uring drivers share this command and completion protocol.
+/// Callers share the engine through `Arc`; the final owner shuts down its workers.
+pub struct IoEngine {
+    shared: Arc<RuntimeShared>,
+    commands: SyncSender<DriverCommand>,
+    submit_state: Arc<RwLock<SubmitState>>,
+    next_request_id: AtomicU64,
+    wake: Option<Arc<dyn DriverWake>>,
+    workers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
+    shutdown: ShutdownState,
+    io_stats: RuntimeIoStatsHandle,
 }
 
 const IO_BUFFER_ALIGNMENT: usize = 4096;
@@ -764,7 +772,7 @@ impl BoundedIoRequest {
     /// callers must still validate completion before publishing or reusing it.
     pub fn wait_with_recovery(
         mut self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         recovery: &mut RecoveryAttempt<'_>,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let original = self.deadline;
@@ -780,7 +788,7 @@ impl BoundedIoRequest {
         }
     }
 
-    pub fn wait(self, engine: &dyn IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
+    pub fn wait(self, engine: &IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
         let request = match self.request.wait_until(self.deadline) {
             Ok(completion) => return Ok(completion),
             Err(request) => request,
@@ -810,7 +818,7 @@ impl BoundedIoRequest {
 
     pub async fn wait_async(
         self,
-        engine: Arc<dyn IoEngine>,
+        engine: Arc<IoEngine>,
         tokio_handle: &tokio::runtime::Handle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
@@ -846,11 +854,11 @@ impl BoundedIoRequest {
 
 struct AsyncRequestGuard {
     request: Option<IoRequest>,
-    engine: Arc<dyn IoEngine>,
+    engine: Arc<IoEngine>,
 }
 
 impl AsyncRequestGuard {
-    fn new(request: IoRequest, engine: Arc<dyn IoEngine>) -> Self {
+    fn new(request: IoRequest, engine: Arc<IoEngine>) -> Self {
         Self {
             request: Some(request),
             engine,
@@ -923,7 +931,7 @@ impl IoDeadlineExceeded {
 /// Submit one cache-device request with a hard end-to-end deadline.
 #[cfg(test)]
 pub fn submit_cache_io(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     operation: IoOperation,
 ) -> Result<BoundedIoRequest, SubmitError> {
     submit_cache_io_with_timeout(engine, operation, CACHE_IO_COMPLETION_TIMEOUT)
@@ -932,7 +940,7 @@ pub fn submit_cache_io(
 /// Submits background I/O with its configured admission and completion budget.
 #[cfg(test)]
 pub fn submit_cache_io_with_timeout(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     operation: IoOperation,
     timeout: Duration,
 ) -> Result<BoundedIoRequest, SubmitError> {
@@ -945,7 +953,7 @@ pub fn submit_cache_io_with_timeout(
 /// Retries admission only when ownership of an unsubmitted operation returns.
 /// Issued I/O is never resubmitted; both stages share the original deadline.
 pub fn submit_background_io(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     mut operation: IoOperation,
     timeout: Duration,
     recovery: &mut RecoveryAttempt<'_>,
@@ -974,7 +982,7 @@ pub fn submit_background_io(
 
 /// Submits a read whose engine slot was reserved before allocating its buffer.
 pub fn submit_cache_read(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     slot: ReadSlot,
     operation: IoOperation,
 ) -> Result<BoundedIoRequest, SubmitError> {
@@ -991,7 +999,7 @@ pub fn submit_cache_read(
 }
 
 fn submit_cache_io_until(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     operation: IoOperation,
     deadline: Instant,
     cancel_grace: Duration,
@@ -1005,59 +1013,6 @@ fn submit_cache_io_until(
         cancel_grace,
         stop_engine_on_deadline,
     })
-}
-
-pub trait IoEngine: Send + Sync {
-    /// Installed once during construction, before any requests are admitted.
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming);
-    fn try_reserve_read(&self) -> io::Result<ReadSlot>;
-    fn read_slot_waiter(&self) -> ReadSlotWaiter;
-    fn submit_reserved_read(
-        &self,
-        slot: ReadSlot,
-        operation: IoOperation,
-    ) -> Result<IoRequest, SubmitError>;
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
-    #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
-    fn submit_wait_controlled(
-        &self,
-        operation: IoOperation,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError>;
-    fn wake_slot_waiters(&self);
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool>;
-    fn shutdown(&self) -> io::Result<()>;
-    fn in_flight(&self) -> usize;
-    #[cfg(test)]
-    fn direct_active(&self) -> bool;
-    /// Permanently stop accepting requests after a target operation missed both its
-    /// deadline and cancellation grace period.
-    fn stop_accepting_requests(&self);
-    fn writes_in_flight(&self) -> usize;
-    /// True means a failed driver could not fence an issued write.
-    /// The cache must retain its exclusive file lock for process lifetime.
-    fn has_unfenced_writes(&self) -> bool;
-    #[cfg(test)]
-    fn mark_unfenced_writes_for_test(&self);
-    fn stats(&self) -> EngineIoSnapshot;
-
-    #[cfg(test)]
-    fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
-        self.submit(IoOperation::read(buffer, offset))
-    }
-
-    #[cfg(test)]
-    fn write_all_at(
-        &self,
-        point: WritePoint,
-        buffer: IoBuffer,
-        offset: u64,
-    ) -> Result<IoRequest, SubmitError> {
-        self.submit(IoOperation::write(point, buffer, offset))
-    }
 }
 
 struct IoSlot {
@@ -1645,16 +1600,6 @@ struct ShutdownState {
     stopped: Condvar,
 }
 
-struct RuntimeInner {
-    shared: Arc<RuntimeShared>,
-    commands: SyncSender<DriverCommand>,
-    submit_state: Arc<RwLock<SubmitState>>,
-    next_request_id: AtomicU64,
-    wake: Option<Arc<dyn DriverWake>>,
-    workers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
-    shutdown: ShutdownState,
-}
-
 #[derive(Clone, Copy)]
 enum SlotMode<'a> {
     #[cfg(test)]
@@ -1667,15 +1612,98 @@ enum SlotMode<'a> {
     },
 }
 
-impl RuntimeInner {
-    fn validate_max_in_flight(max_in_flight: usize) -> io::Result<()> {
+impl IoEngine {
+    /// Installed once during construction, before any requests are admitted.
+    pub fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+        assert!(
+            self.shared.latency.set(recorder).is_ok(),
+            "I/O recorder installed twice"
+        );
+    }
+
+    pub fn wake_slot_waiters(&self) {
+        self.shared.wake_slot_waiters();
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.shared.total_in_flight()
+    }
+
+    pub fn writes_in_flight(&self) -> usize {
+        self.shared.writes_in_flight()
+    }
+
+    /// True means a failed driver could not fence an issued write.
+    /// The cache must retain its exclusive file lock for process lifetime.
+    pub fn has_unfenced_writes(&self) -> bool {
+        self.shared.has_unfenced_writes()
+    }
+
+    #[cfg(test)]
+    pub fn mark_unfenced_writes_for_test(&self) {
+        self.shared.mark_unfenced_writes();
+    }
+
+    pub fn stats(&self) -> EngineIoSnapshot {
+        EngineIoSnapshot {
+            requests: self.shared.snapshot(),
+            runtime: self.io_stats.snapshot(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
+        self.submit(IoOperation::read(buffer, offset))
+    }
+
+    #[cfg(test)]
+    pub fn write_all_at(
+        &self,
+        point: WritePoint,
+        buffer: IoBuffer,
+        offset: u64,
+    ) -> Result<IoRequest, SubmitError> {
+        self.submit(IoOperation::write(point, buffer, offset))
+    }
+
+    fn with_command_channel(
+        max_in_flight: usize,
+        activity_counters_enabled: bool,
+        read_wait_enabled: bool,
+        io_stats: RuntimeIoStatsHandle,
+    ) -> io::Result<(Self, Receiver<DriverCommand>)> {
         if !(1..=MAX_IO_REQUESTS_PER_ENGINE).contains(&max_in_flight) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("I/O requests per engine must be in 1..={MAX_IO_REQUESTS_PER_ENGINE}"),
             ));
         }
-        Ok(())
+        let command_capacity = max_in_flight
+            .checked_mul(2)
+            .and_then(|depth| depth.checked_add(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow"))?;
+        let (commands, receiver) = mpsc::sync_channel(command_capacity);
+        io_stats.set_activity_counters_enabled(activity_counters_enabled);
+        Ok((
+            Self {
+                shared: Arc::new(RuntimeShared::new(
+                    max_in_flight,
+                    activity_counters_enabled,
+                    read_wait_enabled,
+                )),
+                commands,
+                submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
+                next_request_id: AtomicU64::new(1),
+                wake: None,
+                workers: Mutex::new(Vec::new()),
+                shutdown: ShutdownState {
+                    phase: Mutex::new(ShutdownPhase::Running),
+                    stopped: Condvar::new(),
+                },
+                io_stats,
+            },
+            receiver,
+        ))
     }
 
     fn next_request_id(&self) -> RequestId {
@@ -1694,11 +1722,11 @@ impl RuntimeInner {
     }
 
     #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+    pub fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, SlotMode::Try)
     }
 
-    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
+    pub fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         let permit = self
             .shared
             .read_slot_admission
@@ -1708,13 +1736,13 @@ impl RuntimeInner {
         self.shared.try_reserve_read_slot(permit)
     }
 
-    fn read_slot_waiter(&self) -> ReadSlotWaiter {
+    pub fn read_slot_waiter(&self) -> ReadSlotWaiter {
         ReadSlotWaiter {
             shared: Arc::clone(&self.shared),
         }
     }
 
-    fn submit_reserved_read(
+    pub fn submit_reserved_read(
         &self,
         slot: ReadSlot,
         operation: IoOperation,
@@ -1738,11 +1766,11 @@ impl RuntimeInner {
     }
 
     #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+    pub fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
         self.submit_inner(operation, SlotMode::Wait)
     }
 
-    fn submit_wait_controlled(
+    pub fn submit_wait_controlled(
         &self,
         operation: IoOperation,
         cancelled: &AtomicBool,
@@ -1942,7 +1970,8 @@ impl RuntimeInner {
         Ok(true)
     }
 
-    fn stop_accepting_requests(&self) {
+    /// Permanently stop accepting requests before shutdown or after an unfenced timeout.
+    pub fn stop_accepting_requests(&self) {
         let mut submit_state = self
             .submit_state
             .write()
@@ -1955,7 +1984,7 @@ impl RuntimeInner {
         }
     }
 
-    fn shutdown(&self) -> io::Result<()> {
+    pub fn shutdown(&self) -> io::Result<()> {
         let leader = {
             let mut phase = lock_unpoisoned(&self.shutdown.phase);
             loop {
@@ -2020,7 +2049,7 @@ impl RuntimeInner {
     }
 }
 
-impl Drop for RuntimeInner {
+impl Drop for IoEngine {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -2032,16 +2061,16 @@ pub fn build_file_engine(
     config: IoEngineConfig,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
-) -> io::Result<Arc<dyn IoEngine>> {
+) -> io::Result<Arc<IoEngine>> {
     match config {
-        IoEngineConfig::Posix { workers } => BackendIoEngine::new_with_files_and_workers(
+        IoEngineConfig::Posix { workers } => posix::start(
             files,
             workers,
             workers,
             activity_counters_enabled,
             read_wait_enabled,
         )
-        .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>),
+        .map(Arc::new),
         IoEngineConfig::IoUring(config) => {
             #[cfg(all(
                 feature = "io-uring",
@@ -2055,13 +2084,8 @@ pub fn build_file_engine(
                 )
             ))]
             {
-                uring::UringIoEngine::new_with_files(
-                    files,
-                    config,
-                    activity_counters_enabled,
-                    read_wait_enabled,
-                )
-                .map(|engine| Arc::new(engine) as Arc<dyn IoEngine>)
+                uring::start(files, config, activity_counters_enabled, read_wait_enabled)
+                    .map(Arc::new)
             }
             #[cfg(not(all(
                 feature = "io-uring",

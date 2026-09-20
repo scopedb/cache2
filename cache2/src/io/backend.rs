@@ -127,7 +127,7 @@ impl RuntimeIoDirectionCounters {
 }
 
 impl RuntimeIoStatsHandle {
-    fn new(direct_active: bool) -> Self {
+    pub fn new(direct_active: bool) -> Self {
         Self {
             inner: Arc::new(RuntimeIoCounters {
                 direct_active,
@@ -229,26 +229,8 @@ impl RuntimeFileSet {
         self.stats.record(direction, path, length);
     }
 
-    #[cfg(any(
-        test,
-        all(
-            feature = "io-uring",
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            )
-        )
-    ))]
     pub fn stats_handle(&self) -> RuntimeIoStatsHandle {
         self.stats.clone()
-    }
-
-    pub fn set_activity_counters_enabled(&self, enabled: bool) {
-        self.stats.set_activity_counters_enabled(enabled);
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -340,9 +322,6 @@ pub trait IoBackend: Send + Sync {
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
     fn unlock(&self) -> io::Result<()>;
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        RuntimeIoStats::default()
-    }
 }
 
 /// Buffered descriptor access needed by recovery-control code.
@@ -449,10 +428,6 @@ impl FileBackend {
         let buffered = self.file.try_clone()?;
         let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
         Ok(RuntimeFileSet::with_direct(buffered, direct))
-    }
-
-    pub const fn direct_active(&self) -> bool {
-        self.direct.is_some()
     }
 }
 
@@ -611,13 +586,6 @@ impl IoBackend for FileBackend {
             Err(io::Error::last_os_error())
         }
     }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        RuntimeIoStats {
-            direct_active: self.direct_active(),
-            ..RuntimeIoStats::default()
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -704,10 +672,6 @@ impl IoBackend for RuntimeFileBackend {
             io::ErrorKind::Unsupported,
             "runtime file backend does not own cache locking",
         ))
-    }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        self.files.stats.snapshot()
     }
 }
 
@@ -922,7 +886,7 @@ pub fn write_all_at_with_progress(
     (Ok(()), transferred)
 }
 
-fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut retries = 0_usize;
     loop {
         match operation() {
@@ -949,43 +913,11 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use super::*;
-
-    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
-
-    struct TestFile(PathBuf);
-
-    impl TestFile {
-        fn new(label: &str) -> Self {
-            let nonce = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-            Self(env::temp_dir().join(format!(
-                "cache2-{label}-{}-{nonce}.cache",
-                std::process::id()
-            )))
-        }
-
-        fn open(&self) -> File {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&self.0)
-                .unwrap()
-        }
-    }
-
-    impl Drop for TestFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+    use crate::fixtures::TestFile;
 
     #[repr(align(4096))]
     struct AlignedBytes([u8; 2 * DIRECT_IO_ALIGNMENT]);
@@ -1146,7 +1078,7 @@ mod tests {
         assert_eq!(stats.write.buffered.operations, 1);
         assert_eq!(stats.write.buffered.bytes, 32);
 
-        cloned.set_activity_counters_enabled(false);
+        cloned.stats_handle().set_activity_counters_enabled(false);
         files.record(
             RuntimeIoDirection::Read,
             RuntimeIoPath::Direct,
@@ -1202,7 +1134,7 @@ mod tests {
         assert_eq!(backend.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
 
         assert_eq!(
-            backend.runtime_io_stats(),
+            backend.files.stats_handle().snapshot(),
             RuntimeIoStats {
                 direct_active: true,
                 write: RuntimeIoDirectionStats {
@@ -1227,7 +1159,7 @@ mod tests {
     #[test]
     fn preallocate_sets_the_exact_file_extent() {
         let file = TestFile::new("preallocate");
-        let backend = FileBackend::open(&file.0).unwrap();
+        let backend = FileBackend::open(file.path()).unwrap();
         let len = 2 * DIRECT_IO_ALIGNMENT as u64;
         backend.preallocate(len).unwrap();
         assert_eq!(backend.len().unwrap(), len);
@@ -1242,7 +1174,7 @@ mod tests {
     #[test]
     fn unsupported_physical_preallocation_fails_closed() {
         let file = TestFile::new("preallocate-unsupported");
-        let backend = FileBackend::open(&file.0).unwrap();
+        let backend = FileBackend::open(file.path()).unwrap();
         let error = backend.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert_eq!(backend.len().unwrap(), 0);
@@ -1254,11 +1186,11 @@ mod tests {
         let alias = TestFile::new("control-alias");
         let other = TestFile::new("control-other");
         drop(primary.open());
-        std::fs::hard_link(&primary.0, &alias.0).unwrap();
+        std::fs::hard_link(primary.path(), alias.path()).unwrap();
 
-        let primary = FileBackend::open(&primary.0).unwrap();
-        let alias = FileBackend::open(&alias.0).unwrap();
-        let other = FileBackend::open(&other.0).unwrap();
+        let primary = FileBackend::open(primary.path()).unwrap();
+        let alias = FileBackend::open(alias.path()).unwrap();
+        let other = FileBackend::open(other.path()).unwrap();
         let cloned = ControlIoBackend::try_clone_control_file(&primary).unwrap();
 
         primary
@@ -1274,12 +1206,12 @@ mod tests {
     #[test]
     fn recovery_temp_creation_never_reopens_an_existing_target() {
         let image = TestFile::new("recovery-create-new");
-        let backend = FileBackend::create_new_buffered(&image.0).unwrap();
+        let backend = FileBackend::create_new_buffered(image.path()).unwrap();
         backend
             .write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
             .unwrap();
 
-        let error = FileBackend::create_new_buffered(&image.0)
+        let error = FileBackend::create_new_buffered(image.path())
             .err()
             .expect("create_new must reject an existing recovery target");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
@@ -1296,9 +1228,10 @@ mod tests {
         let image = TestFile::new("shared-fault-image");
         let temp = TestFile::new("shared-fault-temp");
         let faults = FaultHandle::default();
-        let state = FaultBackend::open_with_handle(&state.0, faults.clone()).unwrap();
-        let image = FaultBackend::open_with_handle(&image.0, faults.clone()).unwrap();
-        let temp = FaultBackend::create_new_buffered_with_handle(&temp.0, faults.clone()).unwrap();
+        let state = FaultBackend::open_with_handle(state.path(), faults.clone()).unwrap();
+        let image = FaultBackend::open_with_handle(image.path(), faults.clone()).unwrap();
+        let temp =
+            FaultBackend::create_new_buffered_with_handle(temp.path(), faults.clone()).unwrap();
 
         faults.arm(
             FaultEvent::Write(WritePoint::State),
@@ -1338,9 +1271,9 @@ mod tests {
         let target = TestFile::new("symlink-target");
         let link = TestFile::new("symlink-link");
         drop(target.open());
-        symlink(&target.0, &link.0).unwrap();
+        symlink(target.path(), link.path()).unwrap();
 
-        assert!(FileBackend::open(&link.0).is_err());
+        assert!(FileBackend::open(link.path()).is_err());
     }
 }
 

@@ -16,249 +16,115 @@ use std::io;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::Condvar;
 use std::sync::Mutex;
-use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
 
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
+use crate::io::backend::RuntimeIoStatsHandle;
 use crate::io::backend::read_exact_at_uninit_with_progress;
 use crate::io::backend::write_all_at_with_progress;
-use crate::io::engine::BackendIoEngine;
-use crate::io::engine::CompletionState;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
-use crate::io::engine::EngineIoSnapshot;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::IoRequest;
-use crate::io::engine::ReadSlot;
-use crate::io::engine::ReadSlotWaiter;
-use crate::io::engine::RequestId;
-use crate::io::engine::RuntimeInner;
 use crate::io::engine::RuntimeShared;
-use crate::io::engine::ShutdownPhase;
-use crate::io::engine::ShutdownState;
-use crate::io::engine::SubmitError;
-use crate::io::engine::SubmitState;
 use crate::io::engine::lock_unpoisoned;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
-use crate::stats::recording::IoTiming;
 
-impl BackendIoEngine {
-    #[cfg(unix)]
-    #[cfg(test)]
-    pub fn new_with_files(files: RuntimeFileSet, max_in_flight: usize) -> io::Result<Self> {
-        let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new(backend, max_in_flight)
+#[cfg(unix)]
+pub fn start(
+    files: RuntimeFileSet,
+    max_in_flight: usize,
+    worker_count: usize,
+    activity_counters_enabled: bool,
+    read_wait_enabled: bool,
+) -> io::Result<IoEngine> {
+    let io_stats = files.stats_handle();
+    let backend = Arc::new(RuntimeFileBackend::new(files));
+    start_backend(
+        backend,
+        io_stats,
+        max_in_flight,
+        worker_count,
+        activity_counters_enabled,
+        read_wait_enabled,
+    )
+}
+
+#[cfg(test)]
+impl IoEngine {
+    pub fn for_test(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
+        Self::for_test_with_options(backend, max_in_flight, max_in_flight.min(4), true, false)
     }
 
-    #[cfg(unix)]
-    pub fn new_with_files_and_workers(
-        files: RuntimeFileSet,
+    pub fn for_test_with_read_wait(
+        backend: Arc<dyn IoBackend>,
+        max_in_flight: usize,
+    ) -> io::Result<Self> {
+        Self::for_test_with_options(backend, max_in_flight, max_in_flight.min(4), true, true)
+    }
+
+    pub fn for_test_with_options(
+        backend: Arc<dyn IoBackend>,
         max_in_flight: usize,
         worker_count: usize,
         activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
-        files.set_activity_counters_enabled(activity_counters_enabled);
-        let backend: Arc<dyn IoBackend> = Arc::new(RuntimeFileBackend::new(files));
-        Self::new_with_workers_and_activity_counters(
+        start_backend(
             backend,
+            RuntimeIoStatsHandle::new(false),
             max_in_flight,
             worker_count,
             activity_counters_enabled,
             read_wait_enabled,
         )
     }
-
-    #[cfg(test)]
-    pub fn new(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
-        Self::new_with_workers_and_activity_counters(
-            backend,
-            max_in_flight,
-            max_in_flight.min(4),
-            true,
-            false,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn new_with_read_wait(
-        backend: Arc<dyn IoBackend>,
-        max_in_flight: usize,
-    ) -> io::Result<Self> {
-        Self::new_with_workers_and_activity_counters(
-            backend,
-            max_in_flight,
-            max_in_flight.min(4),
-            true,
-            true,
-        )
-    }
-
-    pub fn new_with_workers_and_activity_counters(
-        backend: Arc<dyn IoBackend>,
-        max_in_flight: usize,
-        worker_count: usize,
-        activity_counters_enabled: bool,
-        read_wait_enabled: bool,
-    ) -> io::Result<Self> {
-        RuntimeInner::validate_max_in_flight(max_in_flight)?;
-        if worker_count == 0 || worker_count > max_in_flight {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "POSIX I/O worker count must not exceed the request limit",
-            ));
-        }
-        let shared = Arc::new(RuntimeShared::new(
-            max_in_flight,
-            activity_counters_enabled,
-            read_wait_enabled,
-        ));
-        let command_capacity = max_in_flight
-            .checked_mul(2)
-            .and_then(|depth| depth.checked_add(1))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow"))?;
-        let (commands, receiver) = mpsc::sync_channel(command_capacity);
-        let receiver = Arc::new(Mutex::new(receiver));
-        let mut workers = Vec::with_capacity(worker_count);
-        for worker_index in 0..worker_count {
-            let worker_backend = Arc::clone(&backend);
-            let worker_shared = Arc::clone(&shared);
-            let worker_receiver = Arc::clone(&receiver);
-            let spawn_result = std::thread::Builder::new()
-                .name(format!("cache2-sync-io-{worker_index}"))
-                .stack_size(CACHE_THREAD_STACK_BYTES)
-                .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver));
-            match spawn_result {
-                Ok(worker) => workers.push(worker),
-                Err(error) => {
-                    for _ in 0..workers.len() {
-                        let _ = commands.send(DriverCommand::Shutdown);
-                    }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(Self {
-            inner: Arc::new(RuntimeInner {
-                shared,
-                commands,
-                submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
-                next_request_id: AtomicU64::new(1),
-                wake: None,
-                workers: Mutex::new(workers),
-                shutdown: ShutdownState {
-                    phase: Mutex::new(ShutdownPhase::Running),
-                    stopped: Condvar::new(),
-                },
-            }),
-            backend,
-        })
-    }
 }
 
-impl IoEngine for BackendIoEngine {
-    fn set_latency_recorder(&self, recorder: IoTiming) {
-        assert!(
-            self.inner.shared.latency.set(recorder).is_ok(),
-            "I/O recorder installed twice"
-        );
+fn start_backend(
+    backend: Arc<dyn IoBackend>,
+    io_stats: RuntimeIoStatsHandle,
+    max_in_flight: usize,
+    worker_count: usize,
+    activity_counters_enabled: bool,
+    read_wait_enabled: bool,
+) -> io::Result<IoEngine> {
+    let (mut engine, receiver) = IoEngine::with_command_channel(
+        max_in_flight,
+        activity_counters_enabled,
+        read_wait_enabled,
+        io_stats,
+    )?;
+    if worker_count == 0 || worker_count > max_in_flight {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "POSIX I/O worker count must not exceed the request limit",
+        ));
     }
-
-    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
-        self.inner.try_reserve_read()
+    let receiver = Arc::new(Mutex::new(receiver));
+    engine
+        .workers
+        .get_mut()
+        .unwrap()
+        .reserve_exact(worker_count);
+    for worker_index in 0..worker_count {
+        let worker_backend = Arc::clone(&backend);
+        let worker_shared = Arc::clone(&engine.shared);
+        let worker_receiver = Arc::clone(&receiver);
+        let worker = std::thread::Builder::new()
+            .name(format!("cache2-sync-io-{worker_index}"))
+            .stack_size(CACHE_THREAD_STACK_BYTES)
+            .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver))?;
+        // Retain each worker immediately so engine Drop joins it if a later spawn fails.
+        engine.workers.get_mut().unwrap().push(worker);
     }
-
-    fn read_slot_waiter(&self) -> ReadSlotWaiter {
-        self.inner.read_slot_waiter()
-    }
-
-    fn submit_reserved_read(
-        &self,
-        slot: ReadSlot,
-        operation: IoOperation,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_reserved_read(slot, operation)
-    }
-
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit(operation)
-    }
-
-    #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_wait(operation)
-    }
-
-    fn submit_wait_controlled(
-        &self,
-        operation: IoOperation,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner
-            .submit_wait_controlled(operation, cancelled, deadline)
-    }
-
-    fn wake_slot_waiters(&self) {
-        self.inner.shared.wake_slot_waiters();
-    }
-
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        self.inner.cancel(request_id, state)
-    }
-
-    fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown()
-    }
-
-    fn in_flight(&self) -> usize {
-        self.inner.shared.total_in_flight()
-    }
-
-    #[cfg(test)]
-    fn direct_active(&self) -> bool {
-        self.backend.runtime_io_stats().direct_active
-    }
-
-    fn stop_accepting_requests(&self) {
-        self.inner.stop_accepting_requests();
-    }
-
-    fn writes_in_flight(&self) -> usize {
-        self.inner.shared.writes_in_flight()
-    }
-
-    fn has_unfenced_writes(&self) -> bool {
-        self.inner.shared.has_unfenced_writes()
-    }
-
-    #[cfg(test)]
-    fn mark_unfenced_writes_for_test(&self) {
-        self.inner.shared.mark_unfenced_writes();
-    }
-
-    fn stats(&self) -> EngineIoSnapshot {
-        EngineIoSnapshot {
-            requests: self.inner.shared.snapshot(),
-            runtime: self.backend.runtime_io_stats(),
-        }
-    }
+    Ok(engine)
 }
 
 fn backend_driver(

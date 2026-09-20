@@ -40,11 +40,11 @@ use std::sync::atomic::Ordering;
 use self::page_format::PAGE_CHECKSUM_OFFSET;
 use self::page_format::encode_page_header;
 use self::page_format::page_checksum;
-use self::page_format::put_u32;
-#[cfg(test)]
-use self::page_format::put_u64;
 use self::page_format::read_u64;
 use self::page_format::validate_page_header;
+use crate::codec::put_u32;
+#[cfg(test)]
+use crate::codec::put_u64;
 use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_INDEX_PARTITIONS;
@@ -115,6 +115,33 @@ pub struct IndexPartitionRange {
     pub page_count: usize,
     pub first_slot: usize,
     pub slot_count: usize,
+}
+
+impl IndexPartitionRange {
+    fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
+        if slot >= self.slot_count {
+            return Err(IndexStorageError::SlotOutOfBounds {
+                slot,
+                slot_count: self.slot_count,
+            });
+        }
+        self.first_slot
+            .checked_add(slot)
+            .ok_or(IndexStorageError::SizeOverflow)
+    }
+
+    #[cfg(test)]
+    fn global_page(&self, page: usize) -> Result<usize, IndexStorageError> {
+        if page >= self.page_count {
+            return Err(IndexStorageError::PageOutOfBounds {
+                page,
+                page_count: self.page_count,
+            });
+        }
+        self.first_page
+            .checked_add(page)
+            .ok_or(IndexStorageError::SizeOverflow)
+    }
 }
 
 /// Builds the stable page-balanced partition directory for one slot capacity.
@@ -883,30 +910,12 @@ impl IndexStorage {
     }
 
     fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
-        if slot >= self.range.slot_count {
-            return Err(IndexStorageError::SlotOutOfBounds {
-                slot,
-                slot_count: self.range.slot_count,
-            });
-        }
-        self.range
-            .first_slot
-            .checked_add(slot)
-            .ok_or(IndexStorageError::SizeOverflow)
+        self.range.global_slot(slot)
     }
 
     #[cfg(test)]
     fn global_page(&self, page: usize) -> Result<usize, IndexStorageError> {
-        if page >= self.range.page_count {
-            return Err(IndexStorageError::PageOutOfBounds {
-                page,
-                page_count: self.range.page_count,
-            });
-        }
-        self.range
-            .first_page
-            .checked_add(page)
-            .ok_or(IndexStorageError::SizeOverflow)
+        self.range.global_page(page)
     }
 }
 
@@ -1193,16 +1202,7 @@ impl IndexPartitionReadGuard<'_> {
     }
 
     pub fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
-        if slot >= self.range.slot_count {
-            return Err(IndexStorageError::SlotOutOfBounds {
-                slot,
-                slot_count: self.range.slot_count,
-            });
-        }
-        self.range
-            .first_slot
-            .checked_add(slot)
-            .ok_or(IndexStorageError::SizeOverflow)
+        self.range.global_slot(slot)
     }
 }
 
@@ -1221,16 +1221,7 @@ impl IndexPartitionWriteGuard<'_> {
     }
 
     pub fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
-        if slot >= self.range.slot_count {
-            return Err(IndexStorageError::SlotOutOfBounds {
-                slot,
-                slot_count: self.range.slot_count,
-            });
-        }
-        self.range
-            .first_slot
-            .checked_add(slot)
-            .ok_or(IndexStorageError::SizeOverflow)
+        self.range.global_slot(slot)
     }
 
     pub fn replace_observed(
@@ -1828,52 +1819,18 @@ unsafe impl Sync for Mapping {}
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::fs::OpenOptions;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
 
     use super::*;
+    use crate::fixtures::TestFile;
     use crate::fixtures::assert_golden;
-
-    static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
     const fn binding(generation: u64) -> IndexImageBinding {
         IndexImageBinding {
             generation,
             image_tag: 0x0102_0304_0506_0708,
-        }
-    }
-
-    struct TestFile {
-        path: PathBuf,
-        file: File,
-    }
-
-    impl TestFile {
-        fn create() -> Self {
-            let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = env::temp_dir().join(format!(
-                "cache2-index-image-{}-{id}.tmp",
-                std::process::id()
-            ));
-            let file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            Self { path, file }
-        }
-    }
-
-    impl Drop for TestFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
         }
     }
 
@@ -2023,18 +1980,19 @@ mod tests {
         let (source, values) = populated_partitioned_storage();
         let expected_partition_stats = source.partition_stats().unwrap();
 
-        let mut test_file = TestFile::create();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
         let written = source
-            .write_warm_image(&mut test_file.file, binding(GENERATION))
+            .write_warm_image(&mut file, binding(GENERATION))
             .unwrap();
         assert_eq!(written.pages_written, 3);
         assert_eq!(written.slots_written, PARTITIONED_SLOT_COUNT);
         assert_eq!(written.bytes_written, (3 * INDEX_IMAGE_PAGE_SIZE) as u64);
         assert_eq!(written.physical_stats, source.physical_stats().unwrap());
-        test_file.file.sync_all().unwrap();
+        file.sync_all().unwrap();
 
         let recovered = PartitionedIndexStorage::map_private(
-            &test_file.file,
+            &file,
             0,
             PARTITIONED_SLOT_COUNT,
             binding(GENERATION),
@@ -2158,11 +2116,12 @@ mod tests {
             .unwrap();
         image[INDEX_IMAGE_PAGE_SIZE + INDEX_IMAGE_PAGE_HEADER_SIZE + 7] ^= 0x80;
 
-        let mut test_file = TestFile::create();
-        test_file.file.write_all(&image).unwrap();
-        test_file.file.sync_all().unwrap();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
+        file.write_all(&image).unwrap();
+        file.sync_all().unwrap();
         let recovered = PartitionedIndexStorage::map_private(
-            &test_file.file,
+            &file,
             0,
             SLOT_COUNT,
             binding(GENERATION),
@@ -2209,11 +2168,12 @@ mod tests {
         let checksum = page_checksum(page);
         put_u32(page, PAGE_CHECKSUM_OFFSET, checksum);
 
-        let mut test_file = TestFile::create();
-        test_file.file.write_all(&image).unwrap();
-        test_file.file.sync_all().unwrap();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
+        file.write_all(&image).unwrap();
+        file.sync_all().unwrap();
         let recovered = PartitionedIndexStorage::map_private(
-            &test_file.file,
+            &file,
             0,
             SLOT_COUNT,
             binding(GENERATION),
@@ -2300,10 +2260,11 @@ mod tests {
 
     #[test]
     fn mapped_physical_stats_must_fit_the_slot_capacity() {
-        let test_file = TestFile::create();
+        let test_file = TestFile::new("index-image");
+        let file = test_file.create_new();
         assert!(matches!(
             IndexStorage::map_private(
-                &test_file.file,
+                &file,
                 0,
                 1,
                 binding(1),
@@ -2321,17 +2282,16 @@ mod tests {
         const PREFIX: usize = INDEX_IMAGE_PAGE_SIZE;
 
         let source = IndexStorage::anonymous(1).unwrap();
-        let mut test_file = TestFile::create();
-        test_file.file.set_len(PREFIX as u64).unwrap();
-        test_file.file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
-        source
-            .write_warm_image(&mut test_file.file, binding(47))
-            .unwrap();
-        test_file.file.sync_all().unwrap();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
+        file.set_len(PREFIX as u64).unwrap();
+        file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
+        source.write_warm_image(&mut file, binding(47)).unwrap();
+        file.sync_all().unwrap();
 
         assert!(matches!(
             IndexStorage::map_private(
-                &test_file.file,
+                &file,
                 (PREFIX + 1) as u64,
                 1,
                 binding(47),
@@ -2343,7 +2303,7 @@ mod tests {
         ));
         assert!(matches!(
             IndexStorage::map_private(
-                &test_file.file,
+                &file,
                 PREFIX as u64,
                 1,
                 IndexImageBinding {
@@ -2370,16 +2330,17 @@ mod tests {
             .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE + 2, sample_slot(2))
             .unwrap();
 
-        let mut test_file = TestFile::create();
-        test_file.file.set_len(PREFIX as u64).unwrap();
-        test_file.file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
+        file.set_len(PREFIX as u64).unwrap();
+        file.seek(SeekFrom::Start(PREFIX as u64)).unwrap();
         source
-            .write_warm_image(&mut test_file.file, binding(GENERATION))
+            .write_warm_image(&mut file, binding(GENERATION))
             .unwrap();
-        test_file.file.sync_all().unwrap();
+        file.sync_all().unwrap();
 
         let mut recovered = IndexStorage::map_private(
-            &test_file.file,
+            &file,
             PREFIX as u64,
             SLOT_COUNT,
             binding(GENERATION),
@@ -2403,14 +2364,12 @@ mod tests {
         assert_eq!(recovered.read_slot(0).unwrap(), private_value);
         drop(recovered);
 
-        test_file
-            .file
-            .seek(SeekFrom::Start(
-                (PREFIX + INDEX_IMAGE_PAGE_HEADER_SIZE) as u64,
-            ))
-            .unwrap();
+        file.seek(SeekFrom::Start(
+            (PREFIX + INDEX_IMAGE_PAGE_HEADER_SIZE) as u64,
+        ))
+        .unwrap();
         let mut encoded = [0_u8; INDEX_IMAGE_SLOT_SIZE];
-        test_file.file.read_exact(&mut encoded).unwrap();
+        file.read_exact(&mut encoded).unwrap();
         assert_eq!(IndexSlot::decode(&encoded), expected);
     }
 
@@ -2431,18 +2390,14 @@ mod tests {
         ));
         let mut image = Vec::new();
         source.write_warm_image(&mut image, binding(7)).unwrap();
-        let mut test_file = TestFile::create();
-        test_file.file.write_all(&image).unwrap();
-        test_file.file.sync_all().unwrap();
+        let test_file = TestFile::new("index-image");
+        let mut file = test_file.create_new();
+        file.write_all(&image).unwrap();
+        file.sync_all().unwrap();
 
-        let recovered = IndexStorage::map_private(
-            &test_file.file,
-            0,
-            1,
-            binding(8),
-            IndexPhysicalStats::default(),
-        )
-        .unwrap();
+        let recovered =
+            IndexStorage::map_private(&file, 0, 1, binding(8), IndexPhysicalStats::default())
+                .unwrap();
         assert_eq!(
             recovered.page_validation_state(0).unwrap(),
             PageValidationState::Unchecked
@@ -2459,7 +2414,7 @@ mod tests {
         ));
 
         let recovered = IndexStorage::map_private(
-            &test_file.file,
+            &file,
             0,
             1,
             IndexImageBinding {

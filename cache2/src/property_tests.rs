@@ -20,7 +20,6 @@ use std::collections::BTreeSet;
 use quickcheck::Gen;
 use quickcheck::QuickCheck;
 
-use crate::checksum::Crc32c;
 use crate::checksum::crc32c;
 use crate::hashing::FixedPrehashedMap;
 use crate::region::index::ReclaimIndexAction;
@@ -142,11 +141,11 @@ fn exercise_record_roundtrip(input: &[u8]) {
     assert_eq!(header.value_len as usize, value.len());
     assert_eq!(header.seqno, expected_seqno);
     assert_eq!(header.key_hash, hash);
-    assert_eq!(header.payload_crc, crc32c(&payload));
+    assert_eq!(header.payload_crc, crc32c(&[&payload]));
     assert_eq!(header.region_generation, region_created_seqno);
     assert_eq!(header.record_len, record_bytes);
 
-    let mut chunked_crc = Crc32c::new();
+    let mut chunks = Vec::new();
     let mut remaining = payload.as_slice();
     for control_byte in control {
         if remaining.is_empty() {
@@ -154,11 +153,11 @@ fn exercise_record_roundtrip(input: &[u8]) {
         }
         let chunk_len = usize::from(control_byte) % remaining.len() + 1;
         let (chunk, tail) = remaining.split_at(chunk_len);
-        chunked_crc.update(chunk);
+        chunks.push(chunk);
         remaining = tail;
     }
-    chunked_crc.update(remaining);
-    assert_eq!(chunked_crc.finish(), header.payload_crc);
+    chunks.push(remaining);
+    assert_eq!(crc32c(&chunks), header.payload_crc);
 
     let payload_end = RECORD_HEADER_SIZE + payload.len();
     assert_eq!(&destination[RECORD_HEADER_SIZE..payload_end], payload);

@@ -14,25 +14,31 @@
 
 use std::env;
 use std::fmt;
-use std::fs;
 use std::hint::black_box;
 use std::io;
 use std::ops::Range;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::env_bool;
+use benchmarks::config::env_optional_f64;
+use benchmarks::config::env_u32;
+use benchmarks::config::env_usize;
+use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
+use benchmarks::config::parse_io_mode;
+use benchmarks::config::parse_l1_eviction_policy;
 use benchmarks::config::read_max_in_flight;
+use benchmarks::harness::BenchFiles;
+use benchmarks::harness::put_eventually;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
 use benchmarks::report::RunReporter;
 use benchmarks::report::emit_cache_report;
+use benchmarks::report::should_sample;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheTier;
@@ -56,7 +62,6 @@ const MAX_VALUE_BYTES: usize = REGION_BYTES - 64;
 const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_micros(50);
-const WRITE_YIELD_RETRIES: usize = 8;
 
 struct BenchConfig {
     entries: usize,
@@ -105,24 +110,8 @@ impl BenchConfig {
             env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 16)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
-        let io_mode = match env::var("CACHE_BENCH_IO_MODE")
-            .unwrap_or_else(|_| "buffered".to_owned())
-            .as_str()
-        {
-            "buffered" => IoMode::Buffered,
-            "direct" => IoMode::Direct,
-            value => return Err(invalid(format!("unsupported I/O mode: {value}"))),
-        };
-        let l1_eviction_policy = match env::var("CACHE_BENCH_L1_EVICTION")
-            .unwrap_or_else(|_| "clock".to_owned())
-            .as_str()
-        {
-            "clock" => L1EvictionPolicy::Clock,
-            "s3-fifo" => L1EvictionPolicy::S3Fifo,
-            value => {
-                return Err(invalid(format!("unsupported L1 eviction policy: {value}")));
-            }
-        };
+        let io_mode = parse_io_mode("CACHE_BENCH_IO_MODE")?;
+        let l1_eviction_policy = parse_l1_eviction_policy("CACHE_BENCH_L1_EVICTION")?;
         let latency = |name| -> io::Result<cache2::LatencyMode> {
             Ok(match env_u32(name, 0)? {
                 0 => cache2::LatencyMode::Off,
@@ -284,38 +273,6 @@ impl BenchConfig {
     }
 }
 
-struct BenchFiles {
-    data: PathBuf,
-}
-
-impl BenchFiles {
-    fn new(directory: &Path) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Self {
-            data: directory.join(format!(
-                "cache2-bench-{}-{timestamp}.cache",
-                std::process::id()
-            )),
-        }
-    }
-}
-
-impl Drop for BenchFiles {
-    fn drop(&mut self) {
-        for path in [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ] {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 struct Measurement {
     elapsed: Duration,
     operations: usize,
@@ -375,7 +332,7 @@ fn run_benchmark() -> io::Result<()> {
 }
 
 async fn run(config: BenchConfig) -> io::Result<()> {
-    let files = BenchFiles::new(&config.directory);
+    let files = BenchFiles::new(&config.directory, "bench");
     let l1_entry_eligible = benchmark_entry_is_l1_eligible(config.value_bytes);
     let cache_config =
         CacheConfig::new(config.storage_options().build()?, config.runtime_options())?;
@@ -415,11 +372,11 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.io_mode,
         config.stats.activity_counters,
     );
-    println!("file={}", files.data.display());
+    println!("file={}", files.data().display());
 
     let cache = Arc::new(
         Cache::open(
-            &files.data,
+            files.data(),
             if initial_l1_bytes == config.l1_capacity_bytes {
                 cache_config.clone()
             } else {
@@ -477,7 +434,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     let warm_close = started.elapsed();
     report_latency("warm_close", "warm close", warm_close);
 
-    let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
+    let cache = Arc::new(Cache::open(files.data(), cache_config.clone()).await?);
     if cache.startup_mode() != StartupMode::Warm {
         return Err(io::Error::other(
             "benchmark did not reopen from a clean image",
@@ -659,7 +616,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     drop(cache);
 
     let resident = if l1_entry_eligible {
-        let cache = Arc::new(Cache::open(&files.data, cache_config.clone()).await?);
+        let cache = Arc::new(Cache::open(files.data(), cache_config.clone()).await?);
         if cache.startup_mode() != StartupMode::Cold {
             return Err(io::Error::other(
                 "fast-closed benchmark did not reopen empty",
@@ -741,8 +698,12 @@ fn concurrent_writes(
                 for ordinal in (client..entries).step_by(clients) {
                     let key = benchmark_key(ordinal);
                     value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-                    let (receipt, operation_attempts) =
-                        put_eventually(&cache, black_box(&key), black_box(&value))?;
+                    let (receipt, operation_attempts) = put_eventually(
+                        &cache,
+                        black_box(&key),
+                        black_box(&value),
+                        WRITE_RETRY_TIMEOUT,
+                    )?;
                     attempts = attempts.saturating_add(operation_attempts);
                     throttled_writes =
                         throttled_writes.saturating_add(usize::from(operation_attempts > 1));
@@ -804,17 +765,14 @@ async fn concurrent_reads(
             let mut latency = LatencyHistogram::default();
             for ordinal in (client..operations).step_by(clients) {
                 let key_ordinal = first_key + ordinal % key_count;
-                let started = (latency_sample_interval != 0
-                    && ordinal.is_multiple_of(latency_sample_interval))
-                .then(Instant::now);
+                let started =
+                    should_sample(ordinal as u64, latency_sample_interval).then(Instant::now);
                 let value = if expected_tier == CacheTier::L2 {
                     read_l2_once(&cache, key_ordinal).await?
                 } else {
                     Some(read_l1_eventually(&cache, key_ordinal, client).await?)
                 };
-                if let Some(started) = started {
-                    latency.record(started.elapsed());
-                }
+                latency.record_sampled(started);
                 primary.operations += 1;
                 if let Some(value) = value {
                     primary.bytes += value.len() as u128;
@@ -950,31 +908,6 @@ async fn read_l1_eventually(cache: &Cache, key_ordinal: usize, client: usize) ->
         }
         attempts += 1;
         tokio::time::sleep(RETRY_DELAY).await;
-    }
-}
-
-fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<(u64, usize)> {
-    let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
-    let mut attempts = 0_usize;
-    loop {
-        attempts = attempts.saturating_add(1);
-        match cache.put(key, value) {
-            Ok(receipt) => return Ok((receipt, attempts)),
-            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "benchmark write did not enter bounded staging",
-                    ));
-                }
-                if attempts <= WRITE_YIELD_RETRIES {
-                    std::thread::yield_now();
-                } else {
-                    std::thread::sleep(RETRY_DELAY);
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
     }
 }
 
@@ -1137,62 +1070,4 @@ fn require_minimum_rate(name: &str, measurement: &Measurement) -> io::Result<()>
         )));
     }
     Ok(())
-}
-
-fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
-    match env::var(name) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<f64>()
-                .map_err(|_| invalid(format!("{name} must be a finite non-negative number")))?;
-            if !parsed.is_finite() || parsed < 0.0 {
-                return Err(invalid(format!(
-                    "{name} must be a finite non-negative number"
-                )));
-            }
-            Ok(Some(parsed))
-        }
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_u32(name: &str, default: u32) -> io::Result<u32> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match env::var(name) {
-        Ok(value) if value == "true" || value == "1" => Ok(true),
-        Ok(value) if value == "false" || value == "0" => Ok(false),
-        Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

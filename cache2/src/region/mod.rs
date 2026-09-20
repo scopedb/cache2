@@ -459,7 +459,7 @@ impl FileRegionCore {
                             )
                         })?;
                     let payload_valid =
-                        crc32c(&bytes[header_end..payload_end]) == header.payload_crc;
+                        crc32c(&[&bytes[header_end..payload_end]]) == header.payload_crc;
                     let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
                     let budget_exhausted = payload_valid && !within_budget;
                     let reinserted = payload_valid
@@ -608,7 +608,7 @@ impl FileRegionCore {
     #[cfg(test)]
     fn read_value(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         geometry: DataGeometry,
         buffer: BufferLease,
         hash_seed: u64,
@@ -626,7 +626,7 @@ impl FileRegionCore {
     #[cfg(test)]
     fn read_value_from_descriptor(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
         descriptor: ReadDescriptor,
@@ -639,7 +639,7 @@ impl FileRegionCore {
 
     pub fn submit_value_read(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
         descriptor: ReadDescriptor,
@@ -647,7 +647,7 @@ impl FileRegionCore {
         match submit_read(engine, slot, descriptor, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
-                if !is_read_availability_error(error.kind()) {
+                if !is_read_pressure(error.kind()) {
                     self.health
                         .enter_miss_only_with_error("record_read_submit_failed", &error);
                 }
@@ -663,7 +663,7 @@ impl FileRegionCore {
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.descriptor.hash;
         if let Err(error) = completion.result {
-            if !is_read_availability_error(error.kind()) {
+            if !is_read_pressure(error.kind()) {
                 self.health
                     .enter_miss_only_with_error("record_read_completion_failed", &error);
             }
@@ -719,7 +719,7 @@ impl FileRegionCore {
         if encoded_key != key {
             return Ok(None);
         }
-        if crc32c(&record[RECORD_HEADER_SIZE..payload_end]) != header.payload_crc {
+        if crc32c(&[&record[RECORD_HEADER_SIZE..payload_end]]) != header.payload_crc {
             return Ok(None);
         }
         let value_start = completion.descriptor.record_range.start + RECORD_HEADER_SIZE + key_len;
@@ -943,7 +943,7 @@ impl FileRegionCore {
     pub fn flush_staging_shard(
         &self,
         staging: &RegionStaging,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         shard_id: usize,
         recovery: &crate::io::engine::recovery::BackgroundRecovery,
     ) -> io::Result<Option<RegionWriteSpan>> {
@@ -1175,7 +1175,10 @@ impl FileRegionCore {
     }
 }
 
-fn is_read_availability_error(kind: io::ErrorKind) -> bool {
+/// Classifies transient read-availability failures: the caller may retry on an
+/// alternate lane or surface a busy miss, but the failure says nothing about
+/// the stored data and must not trip Region health.
+pub fn is_read_pressure(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::OutOfMemory
