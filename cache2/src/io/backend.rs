@@ -127,7 +127,7 @@ impl RuntimeIoDirectionCounters {
 }
 
 impl RuntimeIoStatsHandle {
-    fn new(direct_active: bool) -> Self {
+    pub fn new(direct_active: bool) -> Self {
         Self {
             inner: Arc::new(RuntimeIoCounters {
                 direct_active,
@@ -229,26 +229,8 @@ impl RuntimeFileSet {
         self.stats.record(direction, path, length);
     }
 
-    #[cfg(any(
-        test,
-        all(
-            feature = "io-uring",
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            )
-        )
-    ))]
     pub fn stats_handle(&self) -> RuntimeIoStatsHandle {
         self.stats.clone()
-    }
-
-    pub fn set_activity_counters_enabled(&self, enabled: bool) {
-        self.stats.set_activity_counters_enabled(enabled);
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -340,9 +322,6 @@ pub trait IoBackend: Send + Sync {
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
     fn unlock(&self) -> io::Result<()>;
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        RuntimeIoStats::default()
-    }
 }
 
 /// Buffered descriptor access needed by recovery-control code.
@@ -449,10 +428,6 @@ impl FileBackend {
         let buffered = self.file.try_clone()?;
         let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
         Ok(RuntimeFileSet::with_direct(buffered, direct))
-    }
-
-    pub const fn direct_active(&self) -> bool {
-        self.direct.is_some()
     }
 }
 
@@ -611,13 +586,6 @@ impl IoBackend for FileBackend {
             Err(io::Error::last_os_error())
         }
     }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        RuntimeIoStats {
-            direct_active: self.direct_active(),
-            ..RuntimeIoStats::default()
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -704,10 +672,6 @@ impl IoBackend for RuntimeFileBackend {
             io::ErrorKind::Unsupported,
             "runtime file backend does not own cache locking",
         ))
-    }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        self.files.stats.snapshot()
     }
 }
 
@@ -1114,7 +1078,7 @@ mod tests {
         assert_eq!(stats.write.buffered.operations, 1);
         assert_eq!(stats.write.buffered.bytes, 32);
 
-        cloned.set_activity_counters_enabled(false);
+        cloned.stats_handle().set_activity_counters_enabled(false);
         files.record(
             RuntimeIoDirection::Read,
             RuntimeIoPath::Direct,
@@ -1170,7 +1134,7 @@ mod tests {
         assert_eq!(backend.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
 
         assert_eq!(
-            backend.runtime_io_stats(),
+            backend.files.stats_handle().snapshot(),
             RuntimeIoStats {
                 direct_active: true,
                 write: RuntimeIoDirectionStats {

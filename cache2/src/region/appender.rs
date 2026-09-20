@@ -77,7 +77,7 @@ pub struct RegionSpanCompletion {
 }
 
 impl RegionSpanFlight {
-    pub fn wait(self, engine: &dyn IoEngine) -> RegionSpanCompletion {
+    pub fn wait(self, engine: &IoEngine) -> RegionSpanCompletion {
         let completion = match self.request.wait(engine) {
             Ok(completion) => completion,
             Err(timeout) => {
@@ -132,7 +132,7 @@ impl RegionSpanFlight {
 // allocation; boxing it would violate that overload-path property.
 #[allow(clippy::result_large_err)]
 pub fn submit_span(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
@@ -245,7 +245,7 @@ mod tests {
     use crate::io::backend::IoBackend;
     use crate::io::backend::SyncMode;
     use crate::io::backend::SyncPoint;
-    use crate::io::engine::BackendIoEngine;
+    use crate::io::engine::IoEngine;
     use crate::managed_memory::BufferLease;
 
     #[derive(Default)]
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn span_write_preserves_owned_buffer_and_maps_region_offset_exactly() {
         let backend = Arc::new(RecordingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
 
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn invalid_span_returns_the_only_buffer_without_submitting_io() {
         let backend = Arc::new(RecordingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let mut invalid = span();
         invalid.end_offset += 1;
         let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();

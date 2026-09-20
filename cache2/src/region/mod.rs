@@ -608,7 +608,7 @@ impl FileRegionCore {
     #[cfg(test)]
     fn read_value(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         geometry: DataGeometry,
         buffer: BufferLease,
         hash_seed: u64,
@@ -626,7 +626,7 @@ impl FileRegionCore {
     #[cfg(test)]
     fn read_value_from_descriptor(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
         descriptor: ReadDescriptor,
@@ -639,7 +639,7 @@ impl FileRegionCore {
 
     pub fn submit_value_read(
         &self,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
         descriptor: ReadDescriptor,
@@ -943,7 +943,7 @@ impl FileRegionCore {
     pub fn flush_staging_shard(
         &self,
         staging: &RegionStaging,
-        engine: &dyn IoEngine,
+        engine: &IoEngine,
         shard_id: usize,
     ) -> io::Result<Option<RegionWriteSpan>> {
         let shard_mutation = self.lock_shard_mutation(shard_id)?;

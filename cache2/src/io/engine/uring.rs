@@ -23,11 +23,8 @@ use std::os::unix::net::UnixStream;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::Condvar;
-use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -44,8 +41,6 @@ use io_uring::types;
 use crate::config::runtime::IoUringEngineConfig;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
-use crate::io::backend::RuntimeIoStats;
-use crate::io::backend::RuntimeIoStatsHandle;
 use crate::io::backend::retry_interrupted;
 #[cfg(test)]
 use crate::io::engine::CompletionState;
@@ -62,10 +57,7 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
-use crate::io::engine::RuntimeInner;
 use crate::io::engine::RuntimeShared;
-use crate::io::engine::ShutdownPhase;
-use crate::io::engine::ShutdownState;
 use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 #[cfg(test)]
@@ -114,140 +106,98 @@ impl DriverWake for SocketWake {
     }
 }
 
-/// Linux `io_uring` engine. The ring and every raw buffer pointer are owned
-/// by one driver thread; callers communicate only through bounded commands.
-#[derive(Clone)]
-pub struct UringIoEngine {
-    inner: Arc<RuntimeInner>,
-    io_stats: RuntimeIoStatsHandle,
-}
+/// Starts a driver that owns the ring and all submitted buffer pointers.
+pub fn start(
+    files: RuntimeFileSet,
+    config: IoUringEngineConfig,
+    activity_counters_enabled: bool,
+    read_wait_enabled: bool,
+) -> io::Result<IoEngine> {
+    let max_in_flight = config.max_in_flight;
+    let (mut engine, receiver) = IoEngine::with_command_channel(
+        max_in_flight,
+        activity_counters_enabled,
+        read_wait_enabled,
+        files.stats_handle(),
+    )?;
+    let ring_entries = max_in_flight
+        .checked_add(2)
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ring queue size overflow"))?;
+    let ring_entries = u32::try_from(ring_entries)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ring queue size exceeds u32"))?;
+    let completion_entries = ring_entries.checked_mul(2).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "completion queue size overflow",
+        )
+    })?;
+    let mut builder = IoUring::builder();
+    builder.setup_cqsize(completion_entries).dontfork();
+    if config.io_poll {
+        builder.setup_iopoll();
+    }
+    if let Some(sq_poll) = config.sq_poll {
+        builder.setup_sqpoll(sq_poll.idle_millis);
+        if let Some(cpu) = sq_poll.cpu {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+    }
+    let ring = builder.build(ring_entries)?;
+    if !ring.params().is_feature_nodrop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel io_uring can drop completion entries",
+        ));
+    }
+    if config.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel io_uring SQPOLL requires registered files",
+        ));
+    }
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    let required = [
+        opcode::Read::CODE,
+        opcode::Write::CODE,
+        opcode::AsyncCancel::CODE,
+        opcode::PollAdd::CODE,
+    ];
+    if required.iter().any(|opcode| !probe.is_supported(*opcode)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel io_uring lacks a required file opcode",
+        ));
+    }
 
-impl UringIoEngine {
-    pub fn new_with_files(
-        files: RuntimeFileSet,
-        config: IoUringEngineConfig,
-        activity_counters_enabled: bool,
-        read_wait_enabled: bool,
-    ) -> io::Result<Self> {
-        let max_in_flight = config.max_in_flight;
-        RuntimeInner::validate_max_in_flight(max_in_flight)?;
-        files.set_activity_counters_enabled(activity_counters_enabled);
-        let io_stats = files.stats_handle();
-        let ring_entries = max_in_flight
-            .checked_add(2)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "ring queue size overflow")
-            })?;
-        let ring_entries = u32::try_from(ring_entries).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "ring queue size exceeds u32")
-        })?;
-        let completion_entries = ring_entries.checked_mul(2).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "completion queue size overflow",
+    let (wake_sender, wake_receiver) = UnixStream::pair()?;
+    wake_sender.set_nonblocking(true)?;
+    wake_receiver.set_nonblocking(true)?;
+    let wake_pending = Arc::new(AtomicBool::new(false));
+    let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
+        sender: wake_sender,
+        pending: Arc::clone(&wake_pending),
+    });
+    engine.wake = Some(wake);
+    let worker_shared = Arc::clone(&engine.shared);
+    let worker_submit_state = Arc::clone(&engine.submit_state);
+    let worker = std::thread::Builder::new()
+        .name("cache2-uring-io".into())
+        .stack_size(CACHE_THREAD_STACK_BYTES)
+        .spawn(move || {
+            uring_driver(
+                files,
+                ring,
+                wake_receiver,
+                wake_pending,
+                worker_shared,
+                worker_submit_state,
+                receiver,
             )
         })?;
-        let mut builder = IoUring::builder();
-        builder.setup_cqsize(completion_entries).dontfork();
-        if config.io_poll {
-            builder.setup_iopoll();
-        }
-        if let Some(sq_poll) = config.sq_poll {
-            builder.setup_sqpoll(sq_poll.idle_millis);
-            if let Some(cpu) = sq_poll.cpu {
-                builder.setup_sqpoll_cpu(cpu);
-            }
-        }
-        let ring = builder.build(ring_entries)?;
-        if !ring.params().is_feature_nodrop() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kernel io_uring can drop completion entries",
-            ));
-        }
-        if config.sq_poll.is_some() && !ring.params().is_feature_sqpoll_nonfixed() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kernel io_uring SQPOLL requires registered files",
-            ));
-        }
-        let mut probe = Probe::new();
-        ring.submitter().register_probe(&mut probe)?;
-        let required = [
-            opcode::Read::CODE,
-            opcode::Write::CODE,
-            opcode::AsyncCancel::CODE,
-            opcode::PollAdd::CODE,
-        ];
-        if required.iter().any(|opcode| !probe.is_supported(*opcode)) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kernel io_uring lacks a required file opcode",
-            ));
-        }
-
-        let (wake_sender, wake_receiver) = UnixStream::pair()?;
-        wake_sender.set_nonblocking(true)?;
-        wake_receiver.set_nonblocking(true)?;
-        let wake_pending = Arc::new(AtomicBool::new(false));
-        let wake: Arc<dyn DriverWake> = Arc::new(SocketWake {
-            sender: wake_sender,
-            pending: Arc::clone(&wake_pending),
-        });
-        let shared = Arc::new(RuntimeShared::new(
-            max_in_flight,
-            activity_counters_enabled,
-            read_wait_enabled,
-        ));
-        let command_capacity = max_in_flight
-            .checked_mul(2)
-            .and_then(|depth| depth.checked_add(1))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "queue size overflow"))?;
-        let (commands, receiver) = mpsc::sync_channel(command_capacity);
-        let submit_state = Arc::new(RwLock::new(SubmitState { accepting: true }));
-        let worker_shared = Arc::clone(&shared);
-        let worker_submit_state = Arc::clone(&submit_state);
-        let worker = std::thread::Builder::new()
-            .name("cache2-uring-io".into())
-            .stack_size(CACHE_THREAD_STACK_BYTES)
-            .spawn(move || {
-                uring_driver(
-                    files,
-                    ring,
-                    wake_receiver,
-                    wake_pending,
-                    worker_shared,
-                    worker_submit_state,
-                    receiver,
-                )
-            })?;
-        Ok(Self {
-            inner: Arc::new(RuntimeInner {
-                shared,
-                commands,
-                submit_state,
-                next_request_id: AtomicU64::new(1),
-                wake: Some(wake),
-                workers: Mutex::new(vec![worker]),
-                shutdown: ShutdownState {
-                    phase: Mutex::new(ShutdownPhase::Running),
-                    stopped: Condvar::new(),
-                },
-            }),
-            io_stats,
-        })
-    }
-}
-
-impl IoEngine for UringIoEngine {
-    fn inner(&self) -> &RuntimeInner {
-        &self.inner
-    }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        self.io_stats.snapshot()
-    }
+    engine.workers.get_mut().unwrap().push(worker);
+    Ok(engine)
 }
 
 struct Flight {
@@ -1019,6 +969,7 @@ fn build_target_entry(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
     use std::task::Wake;
     use std::task::Waker;
 

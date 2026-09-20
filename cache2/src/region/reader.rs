@@ -88,7 +88,7 @@ impl ReadCompletion {
 
 impl PendingRead {
     #[cfg(test)]
-    pub fn wait(self, engine: &dyn IoEngine) -> ReadCompletion {
+    pub fn wait(self, engine: &IoEngine) -> ReadCompletion {
         let Self {
             descriptor,
             request_id,
@@ -100,7 +100,7 @@ impl PendingRead {
 
     pub async fn wait_async(
         self,
-        engine: Arc<dyn IoEngine>,
+        engine: Arc<IoEngine>,
         tokio_handle: &tokio::runtime::Handle,
     ) -> ReadCompletion {
         let Self {
@@ -180,7 +180,7 @@ impl PendingRead {
 /// Validation happens before the lease is prepared or submitted. Any rejected
 /// operation drops its lease immediately.
 pub fn submit_read(
-    engine: &dyn IoEngine,
+    engine: &IoEngine,
     slot: ReadSlot,
     descriptor: ReadDescriptor,
     buffer: BufferLease,
@@ -326,7 +326,7 @@ mod tests {
     use crate::io::backend::SyncMode;
     use crate::io::backend::SyncPoint;
     use crate::io::backend::WritePoint;
-    use crate::io::engine::BackendIoEngine;
+    use crate::io::engine::IoEngine;
     use crate::managed_memory::ManagedMemory;
     use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn unaligned_record_uses_one_aligned_read_and_returns_its_exact_slice() {
         let backend = Arc::new(RecordingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn buffered_record_uses_one_size_class_upper_bound_read() {
         let backend = Arc::new(RecordingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn invalid_entry_is_rejected_before_allocating_or_issuing_io() {
         let backend = Arc::new(RecordingBackend::default());
-        let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
         let error = describe_read(geometry(), 7, candidate(invalid), true).unwrap_err();

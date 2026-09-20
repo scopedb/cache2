@@ -21,7 +21,7 @@ use crate::io::backend::IoBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::io::backend::WritePoint;
-use crate::io::engine::BackendIoEngine;
+use crate::io::engine::IoEngine;
 use crate::io::engine::IoRequest;
 
 #[derive(Default)]
@@ -143,7 +143,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     // Reuse a stopped runtime's fixed resources without unrelated workers.
     let shared = Arc::get_mut(&mut plane.shared).unwrap();
     let backend = Arc::new(BlockedRead::default());
-    let engine = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test(backend.clone(), 1).unwrap());
     let read_engine = Arc::clone(&engine);
     let read_backend = Arc::clone(&backend);
     let managed_memory = Arc::clone(&shared.managed_memory);
@@ -167,7 +167,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
             submitted.send(submit_read()).unwrap();
         }));
     }
-    shared.read_engines = vec![engine.clone() as Arc<dyn IoEngine>].into_boxed_slice();
+    shared.read_engines = vec![engine.clone()].into_boxed_slice();
     shared.write_engines = Box::new([]);
     shared.reclaim_engines = Box::new([]);
     shared.shards = Box::new([]);

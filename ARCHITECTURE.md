@@ -112,6 +112,8 @@ The source Region stays pinned until accepted replacement writes finish. Conditi
 
 Reads and writes use independent bounded engine pools. Reclaim has separate read lanes. POSIX uses positioned worker I/O; optional io_uring uses fixed-depth rings. Buffered I/O is the default. Direct mode aligns runtime record I/O and keeps control, recovery, and unavoidable remainder operations buffered. Locks cover bounded in-memory work and release before device I/O.
 
+Each lane uses one concrete `IoEngine` for admission, submission, cancellation, statistics, and shutdown. Driver-specific constructors start POSIX workers or an io_uring driver behind the same bounded command and completion protocol. Callers share the engine through `Arc`; its final owner joins the workers. Submitted requests retain their buffers and capacity until actual completion, independently of the caller's wait deadline.
+
 ### Memory
 
 The managed-memory limit covers the index mapping, heat bits, L1, append buffers, reclaim buffers, metadata, cache-owned thread stacks, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, Tokio, process overhead, and the kernel page cache. `CacheConfig::new` rejects invalid or insufficient memory budgets before file access; actual allocation can still fail during open.

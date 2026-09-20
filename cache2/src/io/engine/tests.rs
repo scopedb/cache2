@@ -20,6 +20,7 @@ use crate::IoOutcome;
 use crate::IoRole;
 use crate::StatsOptions;
 use crate::fixtures::TestFile;
+use crate::io::backend::IoBackend;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::managed_memory::ManagedMemory;
@@ -27,10 +28,9 @@ use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
 use crate::stats::recording::Recorder;
 
-async fn wait_for_registered_read_waiters(engine: &BackendIoEngine, expected: usize) {
+async fn wait_for_registered_read_waiters(engine: &IoEngine, expected: usize) {
     for _ in 0..100 {
         let actual = engine
-            .inner
             .shared
             .read_slot_admission
             .as_ref()
@@ -44,7 +44,7 @@ async fn wait_for_registered_read_waiters(engine: &BackendIoEngine, expected: us
 }
 
 async fn spawn_registered_read_slot_waiter(
-    engine: &BackendIoEngine,
+    engine: &IoEngine,
     timeout: Duration,
     expected_waiters: usize,
 ) -> tokio::task::JoinHandle<io::Result<ReadSlot>> {
@@ -277,7 +277,7 @@ fn aligned_buffer_has_stable_alignment() {
 #[test]
 fn posix_engine_round_trips_owned_buffers_and_drains() {
     let file = TestFile::new("io-engine");
-    let engine = BackendIoEngine::new(file.backend(), 4).unwrap();
+    let engine = IoEngine::for_test(file.backend(), 4).unwrap();
     let managed_memory = managed_memory();
     let input = b"owned async positioned I/O";
     let write = engine
@@ -316,7 +316,7 @@ fn posix_engine_round_trips_owned_buffers_and_drains() {
 
 #[test]
 fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
-    let engine = BackendIoEngine::new(Arc::new(ShortThenErrorBackend::default()), 2).unwrap();
+    let engine = IoEngine::for_test(Arc::new(ShortThenErrorBackend::default()), 2).unwrap();
     let managed_memory = managed_memory();
 
     let read = engine
@@ -343,7 +343,7 @@ fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
 async fn async_request_is_woken_by_driver_completion() {
     let file = TestFile::new("io-engine");
     file.open().set_len(4096).unwrap();
-    let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
+    let engine = Arc::new(IoEngine::for_test(file.backend(), 2).unwrap());
     let managed_memory = managed_memory();
     let request = submit_cache_io(
         engine.as_ref(),
@@ -364,7 +364,7 @@ async fn async_request_is_woken_by_driver_completion() {
 #[tokio::test]
 async fn dropping_async_wait_requests_bounded_cancellation() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test(backend.clone(), 1).unwrap());
     let recorder = Arc::new(
         Recorder::new(StatsOptions {
             io_latency: true,
@@ -414,14 +414,9 @@ async fn reserved_read_latency_includes_time_before_submission() {
     for activity_counters_enabled in [false, true] {
         let file = TestFile::new("io-engine");
         file.open().set_len(4096).unwrap();
-        let engine = BackendIoEngine::new_with_workers_and_activity_counters(
-            file.backend(),
-            1,
-            1,
-            activity_counters_enabled,
-            true,
-        )
-        .unwrap();
+        let engine =
+            IoEngine::for_test_with_options(file.backend(), 1, 1, activity_counters_enabled, true)
+                .unwrap();
         let recorder = Arc::new(
             Recorder::new(StatsOptions {
                 io_latency: true,
@@ -469,8 +464,7 @@ async fn reserved_read_latency_includes_time_before_submission() {
 #[tokio::test]
 async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine: Arc<dyn IoEngine> =
-        Arc::new(BackendIoEngine::new_with_read_wait(backend.clone(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(backend.clone(), 1).unwrap());
     let managed_memory = managed_memory();
     let slot = engine.try_reserve_read().unwrap();
     let request = submit_cache_read(
@@ -513,7 +507,7 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
 #[tokio::test]
 async fn read_slot_wait_is_woken_by_engine_shutdown() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 1).unwrap());
     let slot = engine.try_reserve_read().unwrap();
     let mut waiters = Vec::new();
     for expected in 1..=3 {
@@ -536,7 +530,7 @@ async fn read_slot_wait_is_woken_by_engine_shutdown() {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_read_reservation_precedes_new_immediate_read() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
     let queued = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
 
@@ -555,7 +549,7 @@ async fn queued_read_reservation_precedes_new_immediate_read() {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_read_reservations_are_fifo() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
     let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
@@ -578,7 +572,7 @@ async fn queued_read_reservations_are_fifo() {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_reads_use_every_released_engine_slot() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 2).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 2).unwrap());
     let held: Vec<_> = (0..2).map(|_| engine.try_reserve_read().unwrap()).collect();
     let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
     let second = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 2).await;
@@ -597,7 +591,7 @@ async fn queued_reads_use_every_released_engine_slot() {
 #[tokio::test(flavor = "current_thread")]
 async fn timed_out_queue_head_passes_priority_to_next_read() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
     let first = spawn_registered_read_slot_waiter(&engine, Duration::from_millis(20), 1).await;
@@ -615,7 +609,7 @@ async fn timed_out_queue_head_passes_priority_to_next_read() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_queue_head_passes_priority_to_next_read() {
     let file = TestFile::new("io-engine");
-    let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
+    let engine = Arc::new(IoEngine::for_test_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
     let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
@@ -637,7 +631,7 @@ async fn cancelled_queue_head_passes_priority_to_next_read() {
 #[tokio::test]
 async fn async_read_deadline_keeps_other_slots_available() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(backend.clone(), 2).unwrap());
+    let engine = Arc::new(IoEngine::for_test(backend.clone(), 2).unwrap());
     let managed_memory = managed_memory();
     let request = submit_cache_io_until(
         engine.as_ref(),
@@ -671,9 +665,14 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
     let direct_file = direct.open();
     buffered_file.set_len(8192).unwrap();
     direct_file.set_len(8192).unwrap();
-    let engine =
-        BackendIoEngine::new_with_files(RuntimeFileSet::new(buffered_file, Some(direct_file)), 2)
-            .unwrap();
+    let engine = posix::start(
+        RuntimeFileSet::new(buffered_file, Some(direct_file)),
+        2,
+        2,
+        true,
+        false,
+    )
+    .unwrap();
     let managed_memory = managed_memory();
 
     let aligned = vec![0x5a; 4096];
@@ -702,7 +701,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
         CompletionStatus::Completed
     ));
 
-    assert!(engine.direct_active());
+    assert!(engine.stats().runtime.direct_active);
     let stats = engine.stats();
     assert_eq!(stats.runtime.write.direct.operations, 1);
     assert_eq!(stats.runtime.write.direct.bytes, 4096);
@@ -714,7 +713,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
 #[test]
 fn unfenced_write_state_remains_unsafe_after_shutdown() {
     let file = TestFile::new("io-engine");
-    let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
+    let engine = IoEngine::for_test(file.backend(), 1).unwrap();
     assert!(!engine.has_unfenced_writes());
 
     engine.mark_unfenced_writes_for_test();
@@ -727,7 +726,7 @@ fn unfenced_write_state_remains_unsafe_after_shutdown() {
 #[test]
 fn read_completion_deadline_retains_only_its_bounded_slot() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
     let managed_memory = managed_memory();
     let deadline = Instant::now() + Duration::from_millis(20);
     let request = submit_cache_io_until(
@@ -761,7 +760,7 @@ fn read_completion_deadline_retains_only_its_bounded_slot() {
 #[test]
 fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
     let managed_memory = managed_memory();
     let request = submit_cache_io_until(
         &engine,
@@ -803,7 +802,7 @@ fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
 fn engine_request_capacity_is_hard_bounded() {
     let file = TestFile::new("io-engine");
     assert!(matches!(
-        BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_ENGINE + 1),
+        IoEngine::for_test(file.backend(), MAX_IO_REQUESTS_PER_ENGINE + 1),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
 }
@@ -829,9 +828,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
 #[test]
 fn disabled_io_statistics_skip_cumulative_engine_counters() {
     let file = TestFile::new("io-engine");
-    let engine =
-        BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
-            .unwrap();
+    let engine = IoEngine::for_test_with_options(file.backend(), 1, 1, false, false).unwrap();
     let managed_memory = managed_memory();
     let completion = engine
         .write_all_at(
@@ -862,7 +859,7 @@ fn slot_state_tracks_full_write_capacity() {
 #[test]
 fn unused_read_reservation_releases_its_engine_slot() {
     let file = TestFile::new("io-engine");
-    let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
+    let engine = IoEngine::for_test(file.backend(), 1).unwrap();
     let slot = engine.try_reserve_read().unwrap();
     assert_eq!(engine.in_flight(), 1);
     assert_eq!(
@@ -878,10 +875,9 @@ fn unused_read_reservation_releases_its_engine_slot() {
 #[test]
 fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
     let file = TestFile::new("io-engine");
-    let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
+    let engine = IoEngine::for_test(file.backend(), 1).unwrap();
     let managed_memory = managed_memory();
     let fence = engine
-        .inner
         .submit_state
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -899,7 +895,7 @@ fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
 #[test]
 fn backend_workers_execute_independent_reads_concurrently() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
+    let engine = IoEngine::for_test(backend.clone(), 2).unwrap();
     let managed_memory = managed_memory();
     let first = engine
         .read_exact_at(read_buffer(&managed_memory, 1), 0)
@@ -923,7 +919,7 @@ fn backend_workers_execute_independent_reads_concurrently() {
 #[test]
 fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let engine = Arc::new(IoEngine::for_test(backend.clone(), 1).unwrap());
     let managed_memory = managed_memory();
     let first = engine
         .read_exact_at(read_buffer(&managed_memory, 1), 0)
@@ -972,7 +968,7 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
 #[test]
 fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let engine = Arc::new(IoEngine::for_test(backend.clone(), 1).unwrap());
     let managed_memory = managed_memory();
     let first = engine
         .read_exact_at(read_buffer(&managed_memory, 1), 0)
@@ -1028,7 +1024,7 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
 
 #[test]
 fn backend_panic_completes_the_request_and_worker_survives() {
-    let engine = BackendIoEngine::new(Arc::new(PanicOnceBackend::new()), 1).unwrap();
+    let engine = IoEngine::for_test(Arc::new(PanicOnceBackend::new()), 1).unwrap();
     let managed_memory = managed_memory();
     let failed = engine
         .read_exact_at(read_buffer(&managed_memory, 1), 0)
@@ -1102,9 +1098,7 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
 #[test]
 fn io_histograms_include_failures_when_activity_counters_are_disabled() {
     let file = TestFile::new("io-engine");
-    let engine =
-        BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
-            .unwrap();
+    let engine = IoEngine::for_test_with_options(file.backend(), 1, 1, false, false).unwrap();
     let recorder = Arc::new(
         Recorder::new(StatsOptions {
             io_latency: true,
@@ -1133,7 +1127,7 @@ fn io_histograms_include_failures_when_activity_counters_are_disabled() {
 #[test]
 fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 2).unwrap();
+    let engine = IoEngine::for_test(backend.clone(), 2).unwrap();
     let managed_memory = managed_memory();
     let request = submit_cache_io_with_timeout(
         &engine,
@@ -1152,7 +1146,7 @@ fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
 #[test]
 fn background_read_can_complete_after_default_deadline() {
     let backend = Arc::new(BlockingBackend::default());
-    let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
     let managed_memory = managed_memory();
     let request = submit_cache_io_with_timeout(
         &engine,
