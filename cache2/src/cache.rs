@@ -46,7 +46,6 @@ use crate::error::ErrorOperation;
 use crate::error::from_io;
 use crate::region::file_backend::FileRegionBackend;
 use crate::region::file_backend::RegionFiles;
-use crate::region::file_backend::SystemRegionFileSystem;
 use crate::region::recovery::DataSuperblock;
 use crate::region::recovery::PersistentId;
 use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
@@ -120,7 +119,7 @@ pub struct Cache {
     read_recording: bool,
     mutation_recording: bool,
     data_plane: RegionDataPlane,
-    owner: Arc<Mutex<RegionStore<FileRegionBackend<SystemRegionFileSystem>>>>,
+    owner: Arc<Mutex<RegionStore>>,
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,

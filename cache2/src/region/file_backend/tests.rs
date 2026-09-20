@@ -63,9 +63,46 @@ use crate::region::record::codec::required_record_bytes;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::PersistentId;
+use crate::region::runtime::HybridValueRead;
 use crate::region::staging::RegionStaging;
 use crate::region::staging::StagedRecord;
+use crate::region::store::RegionStore;
+use crate::snapshot::CacheSnapshot;
+use crate::snapshot::DetailedCacheSnapshot;
 use crate::snapshot::StartupMode;
+
+impl RegionStore {
+    fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.runtime()?.data_plane()?.put(key, value)
+    }
+
+    fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
+        self.runtime()?.data_plane()?.get(key)
+    }
+
+    async fn get_value_async(
+        &self,
+        key: &[u8],
+        tokio_handle: &tokio::runtime::Handle,
+    ) -> io::Result<Option<HybridValueRead>> {
+        self.runtime()?
+            .data_plane()?
+            .get_async(key, tokio_handle, None)
+            .await
+    }
+
+    pub fn drain(&self) -> io::Result<()> {
+        self.runtime()?.data_plane()?.drain()
+    }
+
+    pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
+        self.runtime()?.data_plane()?.snapshot()
+    }
+
+    pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
+        self.runtime()?.data_plane()?.detailed_snapshot()
+    }
+}
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -142,6 +179,7 @@ fn state_page_reads_stop_after_the_interrupted_retry_budget() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileSystemFault {
+    CloneRuntimeFiles,
     Rename,
     SyncParent,
 }
@@ -197,6 +235,11 @@ impl RegionFileSystem for FaultRegionFileSystem {
         } else {
             FaultBackend::open_existing_with_handle(path, self.io.clone())
         }
+    }
+
+    fn try_clone_runtime_files(&self, _file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
+        self.file_system.check(FileSystemFault::CloneRuntimeFiles)?;
+        Ok(None)
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File> {
@@ -1464,6 +1507,47 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
 }
 
 #[test]
+fn invalid_capacity_is_rejected_before_creating_files() {
+    for index_slots in [0, 1, 7, usize::MAX] {
+        let directory = TestDirectory::new();
+        let opened = RegionStore::open(
+            index_slots,
+            FileRegionBackend::for_test(directory.files.clone(), test_data_superblock(), 8),
+        );
+        assert_eq!(opened.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read_dir(&directory.root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn dropping_a_warm_runtime_releases_ownership_and_reopens_cold() {
+    let directory = TestDirectory::new();
+    let data = test_data_superblock();
+    let mut initial = RegionStore::open(
+        8,
+        FileRegionBackend::for_test(directory.files.clone(), data, 8),
+    )
+    .unwrap();
+    initial.close_warm().unwrap();
+
+    let recovered = RegionStore::open(
+        8,
+        FileRegionBackend::for_test(directory.files.clone(), data, 8),
+    )
+    .unwrap();
+    assert_eq!(recovered.startup(), StartupMode::Warm);
+    drop(recovered);
+
+    let mut cold = RegionStore::open(
+        8,
+        FileRegionBackend::for_test(directory.files.clone(), data, 8),
+    )
+    .unwrap();
+    assert_eq!(cold.startup(), StartupMode::Cold);
+    cold.close_fast().unwrap();
+}
+
+#[test]
 fn complete_warm_image_maps_without_rebuilding_index_slots() {
     let directory = TestDirectory::new();
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
@@ -1490,6 +1574,13 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
         .unwrap();
     first.close_warm().unwrap();
     assert!(directory.files.image.exists());
+    first.close_warm().unwrap();
+    first.close_fast().unwrap();
+    assert_eq!(
+        first.runtime().err().unwrap().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    drop(first);
 
     let mut recovered = RegionStore::open(
         config,
@@ -1717,8 +1808,9 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
         let directory = TestDirectory::new();
         let config = 8;
         let data = test_data_superblock();
-        let (file_system, faults, _) = FaultRegionFileSystem::new();
+        let (file_system, faults, file_system_faults) = FaultRegionFileSystem::new();
         faults.arm(event, occurrence, action);
+        file_system_faults.arm(FileSystemFault::CloneRuntimeFiles);
         let opened = RegionStore::open(
             config,
             FileRegionBackend::for_test_with_file_system(
@@ -1729,6 +1821,11 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
             ),
         );
         assert!(opened.is_err(), "RUNNING barrier case {case}");
+        assert_eq!(
+            *file_system_faults.armed.lock().unwrap(),
+            Some(FileSystemFault::CloneRuntimeFiles),
+            "runtime files must not be requested before RUNNING is durable"
+        );
 
         let mut cold = RegionStore::open(
             config,
@@ -1738,6 +1835,33 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
         assert!(matches!(cold.startup(), StartupMode::Cold));
         cold.close_fast().unwrap();
     }
+}
+
+#[test]
+fn runtime_file_failure_after_running_releases_ownership_and_reopens_cold() {
+    let directory = TestDirectory::new();
+    let data = test_data_superblock();
+    let (file_system, faults, file_system_faults) = FaultRegionFileSystem::new();
+    file_system_faults.arm(FileSystemFault::CloneRuntimeFiles);
+    let opened = RegionStore::open(
+        8,
+        FileRegionBackend::for_test_with_file_system(directory.files.clone(), data, 8, file_system),
+    );
+    assert_eq!(opened.err().unwrap().raw_os_error(), Some(5));
+    assert_eq!(*file_system_faults.armed.lock().unwrap(), None);
+    assert!(
+        faults
+            .events()
+            .contains(&FaultEvent::Sync(SyncPoint::RunningState))
+    );
+
+    let mut cold = RegionStore::open(
+        8,
+        FileRegionBackend::for_test(directory.files.clone(), data, 8),
+    )
+    .unwrap();
+    assert_eq!(cold.startup(), StartupMode::Cold);
+    cold.close_fast().unwrap();
 }
 
 #[test]

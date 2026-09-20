@@ -87,15 +87,7 @@ use crate::region::recovery::prepare_next_state;
 use crate::region::recovery::prepare_running_barrier;
 use crate::region::recovery::recovery_image_index_len;
 use crate::region::region_metadata_io_error;
-#[cfg(test)]
-use crate::region::runtime::HybridValueRead;
 use crate::region::runtime::RegionDataPlane;
-use crate::region::store::RegionBackend;
-use crate::region::store::RegionStore;
-#[cfg(test)]
-use crate::snapshot::CacheSnapshot;
-#[cfg(test)]
-use crate::snapshot::DetailedCacheSnapshot;
 
 /// Shared shard count for compact concrete-backend fixtures.
 #[cfg(test)]
@@ -245,48 +237,6 @@ impl FileRegionRuntime {
     }
 }
 
-impl RegionStore<FileRegionBackend<SystemRegionFileSystem>> {
-    pub fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
-        Ok(self.runtime()?.data_plane()?.clone())
-    }
-
-    #[cfg(test)]
-    fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.put(key, value)
-    }
-
-    #[cfg(test)]
-    fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?.data_plane()?.get(key)
-    }
-
-    #[cfg(test)]
-    async fn get_value_async(
-        &self,
-        key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?
-            .data_plane()?
-            .get_async(key, tokio_handle, None)
-            .await
-    }
-
-    #[cfg(test)]
-    pub fn drain(&self) -> io::Result<()> {
-        self.runtime()?.data_plane()?.drain()
-    }
-
-    #[cfg(test)]
-    pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
-        self.runtime()?.data_plane()?.snapshot()
-    }
-
-    #[cfg(test)]
-    pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
-        self.runtime()?.data_plane()?.detailed_snapshot()
-    }
-}
 pub trait RegionFileSystem {
     type File: ControlIoBackend;
 
@@ -505,18 +455,9 @@ where
         self.log_cold_recovery(reason);
         Ok(None)
     }
-}
 
-impl<F> RegionBackend for FileRegionBackend<F>
-where
-    F: RegionFileSystem,
-{
-    type Runtime = FileRegionRuntime;
-    type CleanImage = CleanFileRegionImage;
-    type FrozenView = FrozenFileRegionView;
-    type PreparedClean = PreparedFileRegionClean;
-
-    fn acquire_exclusive(&mut self) -> io::Result<()> {
+    /// Acquire exclusive ownership of all files before inspection.
+    pub fn acquire_exclusive(&mut self) -> io::Result<()> {
         if self.locked {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -585,7 +526,12 @@ where
         Ok(())
     }
 
-    fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<Option<Self::CleanImage>> {
+    /// Return an eligible clean image, or `None` to select a cold start.
+    /// This must not allocate or scan the full index or Region data extents.
+    pub fn inspect_recovery(
+        &mut self,
+        index_slots: usize,
+    ) -> io::Result<Option<CleanFileRegionImage>> {
         self.file_system
             .remove_file(&recovery_temporary_path(&self.files.image))?;
         let format_data = self.format_data;
@@ -743,7 +689,8 @@ where
         }))
     }
 
-    fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime> {
+    /// Construct a provisional empty runtime without starting workers.
+    pub fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<FileRegionRuntime> {
         self.file_system.remove_file(&self.files.image)?;
         self.file_system
             .remove_file(&recovery_temporary_path(&self.files.image))?;
@@ -785,11 +732,12 @@ where
         Ok(runtime)
     }
 
-    fn map_clean_runtime(
+    /// `Ok(None)` rejects the complete image and selects a cold start.
+    pub fn map_clean_runtime(
         &mut self,
-        mut clean: Self::CleanImage,
+        mut clean: CleanFileRegionImage,
         index_slots: usize,
-    ) -> io::Result<Option<Self::Runtime>> {
+    ) -> io::Result<Option<FileRegionRuntime>> {
         let data = self.data_superblock()?;
         let expected_slots = u64::try_from(index_slots).map_err(|_| {
             io::Error::new(
@@ -859,7 +807,9 @@ where
         Ok(Some(runtime))
     }
 
-    fn publish_running(&mut self) -> io::Result<()> {
+    /// Replace both state slots with durable `RUNNING` generations so a torn
+    /// page cannot revive a previous `CLEAN` generation after Region reuse.
+    pub fn publish_running(&mut self) -> io::Result<()> {
         let binding = StateBinding::from_data(self.data_superblock()?, None);
         let barrier = prepare_running_barrier(self.current_state, binding)
             .map_err(|_| io::Error::other("RUNNING generation cannot advance"))?;
@@ -877,7 +827,11 @@ where
         Ok(())
     }
 
-    fn start_runtime(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::Runtime> {
+    /// Start workers only after `RUNNING`; an error must tear them down.
+    pub fn start_runtime(
+        &mut self,
+        mut runtime: FileRegionRuntime,
+    ) -> io::Result<FileRegionRuntime> {
         let data = self.data_superblock()?;
         let data_file = self
             .data_file
@@ -889,7 +843,8 @@ where
         Ok(runtime)
     }
 
-    fn stop_fast(&mut self, mut runtime: Self::Runtime) -> io::Result<()> {
+    /// Quiesce all mutation sources without constructing recovery metadata.
+    pub fn stop_fast(&mut self, mut runtime: FileRegionRuntime) -> io::Result<()> {
         match runtime.shutdown_data_plane() {
             Ok(false) => Ok(()),
             Ok(true) => {
@@ -905,7 +860,11 @@ where
         }
     }
 
-    fn freeze_warm(&mut self, mut runtime: Self::Runtime) -> io::Result<Self::FrozenView> {
+    /// Quiesce the runtime and return its immutable recovery authority.
+    pub fn freeze_warm(
+        &mut self,
+        mut runtime: FileRegionRuntime,
+    ) -> io::Result<FrozenFileRegionView> {
         match runtime.shutdown_data_plane() {
             Ok(false) => {}
             Ok(true) => {
@@ -941,7 +900,11 @@ where
         Ok(FrozenFileRegionView { core, metadata })
     }
 
-    fn persist_frozen(&mut self, view: &Self::FrozenView) -> io::Result<Self::PreparedClean> {
+    /// Make completed data and one complete image durable.
+    pub fn persist_frozen(
+        &mut self,
+        view: &FrozenFileRegionView,
+    ) -> io::Result<PreparedFileRegionClean> {
         let health = &view.core.health;
         health.require_healthy()?;
         let source_metadata = &view.metadata;
@@ -1067,7 +1030,8 @@ where
         })
     }
 
-    fn publish_clean(&mut self, prepared: Self::PreparedClean) -> io::Result<()> {
+    /// Publish `CLEAN` durably using the token returned after persistence.
+    pub fn publish_clean(&mut self, prepared: PreparedFileRegionClean) -> io::Result<()> {
         prepared.health.require_healthy()?;
         if self.prepared_clean.take() != Some((prepared.state.slot, prepared.state.record)) {
             return Err(io::Error::new(
@@ -1102,7 +1066,8 @@ where
         Ok(())
     }
 
-    fn release_exclusive(&mut self) -> io::Result<()> {
+    /// Release ownership, including during error unwinding after acquisition.
+    pub fn release_exclusive(&mut self) -> io::Result<()> {
         if !self.locked {
             return Ok(());
         }

@@ -15,7 +15,7 @@
 //! Recovery and shutdown state machine for the Region-backed cache.
 //!
 //! The coordinator owns no file-format or data-plane logic. A
-//! [`RegionBackend`] supplies those operations, while this module enforces the
+//! [`FileRegionBackend`] supplies those operations, while this module enforces the
 //! order that makes warm recovery safe:
 //!
 //! - inspect recovery before constructing an index;
@@ -25,67 +25,24 @@
 
 use std::io;
 
+use crate::region::file_backend::FileRegionBackend;
+use crate::region::file_backend::FileRegionRuntime;
+use crate::region::file_backend::RegionFileSystem;
+use crate::region::file_backend::SystemRegionFileSystem;
 use crate::region::index::storage::validated_index_partition_ranges;
+use crate::region::runtime::RegionDataPlane;
 use crate::snapshot::StartupMode;
 
-/// Physical lifecycle operations required by [`RegionStore`].
-pub trait RegionBackend {
-    type Runtime;
-    type CleanImage;
-    type FrozenView;
-    type PreparedClean;
-
-    /// Acquire exclusive ownership of all files before inspection.
-    fn acquire_exclusive(&mut self) -> io::Result<()>;
-
-    /// Return an eligible clean image, or `None` to select a cold start.
-    /// This must not allocate or scan the full index or Region data extents.
-    fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<Option<Self::CleanImage>>;
-
-    /// Construct a provisional empty runtime without starting workers.
-    fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime>;
-
-    /// `Ok(None)` rejects the complete image and selects a cold start.
-    fn map_clean_runtime(
-        &mut self,
-        clean: Self::CleanImage,
-        index_slots: usize,
-    ) -> io::Result<Option<Self::Runtime>>;
-
-    /// Publish `RUNNING` durably before the runtime can be observed. The
-    /// concrete backend replaces both state slots so a torn page cannot revive
-    /// a previous `CLEAN` generation after Region reuse starts.
-    fn publish_running(&mut self) -> io::Result<()>;
-
-    /// Start workers only after `RUNNING`; an error must tear them down.
-    fn start_runtime(&mut self, runtime: Self::Runtime) -> io::Result<Self::Runtime>;
-
-    /// Quiesce all mutation sources without constructing recovery metadata.
-    fn stop_fast(&mut self, runtime: Self::Runtime) -> io::Result<()>;
-
-    /// Quiesce the runtime and return its immutable recovery authority.
-    fn freeze_warm(&mut self, runtime: Self::Runtime) -> io::Result<Self::FrozenView>;
-
-    /// Make completed data and one complete image durable.
-    fn persist_frozen(&mut self, view: &Self::FrozenView) -> io::Result<Self::PreparedClean>;
-
-    /// Publish `CLEAN` durably using the token returned after persistence.
-    fn publish_clean(&mut self, prepared: Self::PreparedClean) -> io::Result<()>;
-
-    /// Release ownership, including during error unwinding after acquisition.
-    fn release_exclusive(&mut self) -> io::Result<()>;
-}
-
-/// Owns the exclusive lifecycle of one backend runtime.
-pub struct RegionStore<B: RegionBackend> {
-    backend: B,
-    runtime: Option<B::Runtime>,
+/// Owns the files and runtime for one Region-backed cache.
+pub struct RegionStore<F: RegionFileSystem = SystemRegionFileSystem> {
+    backend: FileRegionBackend<F>,
+    runtime: Option<FileRegionRuntime>,
     startup: StartupMode,
     closed: bool,
 }
 
-impl<B: RegionBackend> RegionStore<B> {
-    pub fn open(index_slots: usize, mut backend: B) -> io::Result<Self> {
+impl<F: RegionFileSystem> RegionStore<F> {
+    pub fn open(index_slots: usize, mut backend: FileRegionBackend<F>) -> io::Result<Self> {
         validate_index_slots(index_slots)?;
         backend.acquire_exclusive()?;
 
@@ -122,7 +79,11 @@ impl<B: RegionBackend> RegionStore<B> {
         self.startup
     }
 
-    pub fn runtime(&self) -> io::Result<&B::Runtime> {
+    pub fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
+        Ok(self.runtime()?.data_plane()?.clone())
+    }
+
+    pub fn runtime(&self) -> io::Result<&FileRegionRuntime> {
         if self.closed {
             return Err(closed_error());
         }
@@ -130,7 +91,7 @@ impl<B: RegionBackend> RegionStore<B> {
     }
 
     #[cfg(test)]
-    pub fn runtime_mut(&mut self) -> io::Result<&mut B::Runtime> {
+    pub fn runtime_mut(&mut self) -> io::Result<&mut FileRegionRuntime> {
         if self.closed {
             return Err(closed_error());
         }
@@ -168,7 +129,7 @@ impl<B: RegionBackend> RegionStore<B> {
     }
 }
 
-impl<B: RegionBackend> Drop for RegionStore<B> {
+impl<F: RegionFileSystem> Drop for RegionStore<F> {
     fn drop(&mut self) {
         if !self.closed {
             let _ = self.close_fast();
@@ -190,297 +151,4 @@ fn validate_index_slots(index_slots: usize) -> io::Result<()> {
     validated_index_partition_ranges(index_slots)
         .map(|_| ())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use super::*;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Event {
-        Lock,
-        Inspect,
-        Anonymous,
-        Map,
-        Running,
-        Start,
-        StopFast,
-        Freeze,
-        Persist,
-        Clean,
-        Unlock,
-    }
-
-    #[derive(Clone, Copy)]
-    enum RecoveryScenario {
-        Cold,
-        Clean,
-        RejectedClean,
-    }
-
-    struct Backend {
-        scenario: RecoveryScenario,
-        events: Rc<RefCell<Vec<Event>>>,
-        fail_at: Option<Event>,
-    }
-
-    impl Backend {
-        fn record(&self, event: Event) -> io::Result<()> {
-            self.events.borrow_mut().push(event);
-            if self.fail_at == Some(event) {
-                Err(io::Error::other(format!("{event:?}")))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl RegionBackend for Backend {
-        type Runtime = usize;
-        type CleanImage = bool;
-        type FrozenView = usize;
-        type PreparedClean = ();
-
-        fn acquire_exclusive(&mut self) -> io::Result<()> {
-            self.record(Event::Lock)
-        }
-
-        fn inspect_recovery(
-            &mut self,
-            _index_slots: usize,
-        ) -> io::Result<Option<Self::CleanImage>> {
-            self.record(Event::Inspect)?;
-            Ok(match self.scenario {
-                RecoveryScenario::Cold => None,
-                RecoveryScenario::Clean => Some(true),
-                RecoveryScenario::RejectedClean => Some(false),
-            })
-        }
-
-        fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<Self::Runtime> {
-            self.record(Event::Anonymous)?;
-            Ok(index_slots)
-        }
-
-        fn map_clean_runtime(
-            &mut self,
-            clean: Self::CleanImage,
-            index_slots: usize,
-        ) -> io::Result<Option<Self::Runtime>> {
-            self.record(Event::Map)?;
-            Ok(clean.then_some(index_slots))
-        }
-
-        fn publish_running(&mut self) -> io::Result<()> {
-            self.record(Event::Running)
-        }
-
-        fn start_runtime(&mut self, runtime: Self::Runtime) -> io::Result<Self::Runtime> {
-            self.record(Event::Start)?;
-            Ok(runtime)
-        }
-
-        fn stop_fast(&mut self, _runtime: Self::Runtime) -> io::Result<()> {
-            self.record(Event::StopFast)
-        }
-
-        fn freeze_warm(&mut self, runtime: Self::Runtime) -> io::Result<Self::FrozenView> {
-            self.record(Event::Freeze)?;
-            Ok(runtime)
-        }
-
-        fn persist_frozen(&mut self, _view: &Self::FrozenView) -> io::Result<Self::PreparedClean> {
-            self.record(Event::Persist)
-        }
-
-        fn publish_clean(&mut self, _prepared: Self::PreparedClean) -> io::Result<()> {
-            self.record(Event::Clean)
-        }
-
-        fn release_exclusive(&mut self) -> io::Result<()> {
-            self.record(Event::Unlock)
-        }
-    }
-
-    fn backend(
-        scenario: RecoveryScenario,
-        fail_at: Option<Event>,
-    ) -> (Backend, Rc<RefCell<Vec<Event>>>) {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        (
-            Backend {
-                scenario,
-                events: Rc::clone(&events),
-                fail_at,
-            },
-            events,
-        )
-    }
-
-    #[test]
-    fn invalid_capacity_is_rejected_before_ownership_or_allocation() {
-        for index_slots in [0, 1, 7, usize::MAX] {
-            let (backend, events) = backend(RecoveryScenario::Cold, None);
-            assert!(RegionStore::open(index_slots, backend).is_err());
-            assert!(events.borrow().is_empty());
-        }
-    }
-
-    #[test]
-    fn recovery_inspection_selects_one_runtime_before_the_running_barrier() {
-        for (scenario, startup, expected) in [
-            (
-                RecoveryScenario::Cold,
-                StartupMode::Cold,
-                vec![
-                    Event::Lock,
-                    Event::Inspect,
-                    Event::Anonymous,
-                    Event::Running,
-                    Event::Start,
-                ],
-            ),
-            (
-                RecoveryScenario::Clean,
-                StartupMode::Warm,
-                vec![
-                    Event::Lock,
-                    Event::Inspect,
-                    Event::Map,
-                    Event::Running,
-                    Event::Start,
-                ],
-            ),
-            (
-                RecoveryScenario::RejectedClean,
-                StartupMode::Cold,
-                vec![
-                    Event::Lock,
-                    Event::Inspect,
-                    Event::Map,
-                    Event::Anonymous,
-                    Event::Running,
-                    Event::Start,
-                ],
-            ),
-        ] {
-            let (backend, events) = backend(scenario, None);
-            let mut store = RegionStore::open(8, backend).unwrap();
-            assert_eq!(store.startup(), startup);
-            assert_eq!(*events.borrow(), expected);
-            store.close_fast().unwrap();
-        }
-    }
-
-    #[test]
-    fn shutdown_modes_are_disjoint_and_release_ownership() {
-        for (warm, expected) in [
-            (false, vec![Event::StopFast, Event::Unlock]),
-            (
-                true,
-                vec![Event::Freeze, Event::Persist, Event::Clean, Event::Unlock],
-            ),
-        ] {
-            let (backend, events) = backend(RecoveryScenario::Cold, None);
-            let mut store = RegionStore::open(8, backend).unwrap();
-            events.borrow_mut().clear();
-            if warm {
-                store.close_warm().unwrap();
-            } else {
-                store.close_fast().unwrap();
-            }
-            assert_eq!(*events.borrow(), expected);
-        }
-    }
-
-    #[test]
-    fn drop_uses_the_non_recoverable_shutdown_path() {
-        let (backend, events) = backend(RecoveryScenario::Cold, None);
-        let store = RegionStore::open(8, backend).unwrap();
-        events.borrow_mut().clear();
-
-        drop(store);
-
-        assert_eq!(*events.borrow(), vec![Event::StopFast, Event::Unlock]);
-    }
-
-    #[test]
-    fn open_failure_stops_at_the_failed_stage_and_releases_ownership() {
-        for (scenario, failed, expected) in [
-            (
-                RecoveryScenario::Cold,
-                Event::Inspect,
-                vec![Event::Lock, Event::Inspect, Event::Unlock],
-            ),
-            (
-                RecoveryScenario::Cold,
-                Event::Anonymous,
-                vec![Event::Lock, Event::Inspect, Event::Anonymous, Event::Unlock],
-            ),
-            (
-                RecoveryScenario::Clean,
-                Event::Map,
-                vec![Event::Lock, Event::Inspect, Event::Map, Event::Unlock],
-            ),
-            (
-                RecoveryScenario::Cold,
-                Event::Running,
-                vec![
-                    Event::Lock,
-                    Event::Inspect,
-                    Event::Anonymous,
-                    Event::Running,
-                    Event::Unlock,
-                ],
-            ),
-            (
-                RecoveryScenario::Cold,
-                Event::Start,
-                vec![
-                    Event::Lock,
-                    Event::Inspect,
-                    Event::Anonymous,
-                    Event::Running,
-                    Event::Start,
-                    Event::Unlock,
-                ],
-            ),
-        ] {
-            let (backend, events) = backend(scenario, Some(failed));
-            assert!(RegionStore::open(8, backend).is_err());
-            assert_eq!(*events.borrow(), expected, "failed at {failed:?}");
-        }
-    }
-
-    #[test]
-    fn shutdown_failure_does_not_cross_a_publication_boundary() {
-        for (warm, failed, expected) in [
-            (false, Event::StopFast, vec![Event::StopFast, Event::Unlock]),
-            (true, Event::Freeze, vec![Event::Freeze, Event::Unlock]),
-            (
-                true,
-                Event::Persist,
-                vec![Event::Freeze, Event::Persist, Event::Unlock],
-            ),
-            (
-                true,
-                Event::Clean,
-                vec![Event::Freeze, Event::Persist, Event::Clean, Event::Unlock],
-            ),
-        ] {
-            let (backend, events) = backend(RecoveryScenario::Cold, Some(failed));
-            let mut store = RegionStore::open(8, backend).unwrap();
-            events.borrow_mut().clear();
-            let result = if warm {
-                store.close_warm()
-            } else {
-                store.close_fast()
-            };
-            assert!(result.is_err(), "failed at {failed:?}");
-            assert_eq!(*events.borrow(), expected, "failed at {failed:?}");
-        }
-    }
 }
