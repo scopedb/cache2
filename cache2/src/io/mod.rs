@@ -14,5 +14,5 @@
 
 //! Positioned file access and bounded owned-buffer execution.
 
-pub mod backend;
 pub mod engine;
+pub mod file;

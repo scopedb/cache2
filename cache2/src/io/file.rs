@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Synchronous positioned I/O abstraction used for open, recovery, and the
-//! reference runtime path.
+//! Positioned reads and writes, owned cache files, and durability operations.
 //!
 //! Persistence points are carried through the trait so tests can fail an exact
 //! record, superblock, or barrier operation without changing the cache
@@ -48,53 +47,53 @@ const LINUX_EINTR: i32 = 4;
 const SAFE_CACHE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeIoPath {
+pub enum FileIoPath {
     Buffered,
     Direct,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeIoDirection {
+pub enum FileIoDirection {
     Read,
     Write,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeIoDirectionStats {
+pub struct FileIoDirectionStats {
     pub buffered: CacheIoPathSnapshot,
     pub direct: CacheIoPathSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeIoStats {
+pub struct FileIoStats {
     pub direct_active: bool,
-    pub read: RuntimeIoDirectionStats,
-    pub write: RuntimeIoDirectionStats,
+    pub read: FileIoDirectionStats,
+    pub write: FileIoDirectionStats,
 }
 
 #[derive(Clone)]
-pub struct RuntimeIoStatsHandle {
-    inner: Arc<RuntimeIoCounters>,
+pub struct FileIoStatsHandle {
+    inner: Arc<FileIoCounters>,
 }
 
-struct RuntimeIoCounters {
+struct FileIoCounters {
     direct_active: bool,
     activity_counters_enabled: AtomicBool,
-    read: RuntimeIoDirectionCounters,
-    write: RuntimeIoDirectionCounters,
+    read: FileIoDirectionCounters,
+    write: FileIoDirectionCounters,
 }
 
-struct RuntimeIoDirectionCounters {
-    buffered: RuntimeIoPathCounters,
-    direct: RuntimeIoPathCounters,
+struct FileIoDirectionCounters {
+    buffered: FileIoPathCounters,
+    direct: FileIoPathCounters,
 }
 
-struct RuntimeIoPathCounters {
+struct FileIoPathCounters {
     operations: AtomicU64,
     bytes: AtomicU64,
 }
 
-impl RuntimeIoPathCounters {
+impl FileIoPathCounters {
     fn new() -> Self {
         Self {
             operations: AtomicU64::new(0),
@@ -110,46 +109,46 @@ impl RuntimeIoPathCounters {
     }
 }
 
-impl RuntimeIoDirectionCounters {
+impl FileIoDirectionCounters {
     fn new() -> Self {
         Self {
-            buffered: RuntimeIoPathCounters::new(),
-            direct: RuntimeIoPathCounters::new(),
+            buffered: FileIoPathCounters::new(),
+            direct: FileIoPathCounters::new(),
         }
     }
 
-    fn snapshot(&self) -> RuntimeIoDirectionStats {
-        RuntimeIoDirectionStats {
+    fn snapshot(&self) -> FileIoDirectionStats {
+        FileIoDirectionStats {
             buffered: self.buffered.snapshot(),
             direct: self.direct.snapshot(),
         }
     }
 }
 
-impl RuntimeIoStatsHandle {
+impl FileIoStatsHandle {
     pub fn new(direct_active: bool) -> Self {
         Self {
-            inner: Arc::new(RuntimeIoCounters {
+            inner: Arc::new(FileIoCounters {
                 direct_active,
                 activity_counters_enabled: AtomicBool::new(true),
-                read: RuntimeIoDirectionCounters::new(),
-                write: RuntimeIoDirectionCounters::new(),
+                read: FileIoDirectionCounters::new(),
+                write: FileIoDirectionCounters::new(),
             }),
         }
     }
 
-    fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
+    fn record(&self, direction: FileIoDirection, path: FileIoPath, length: usize) {
         if !self.inner.activity_counters_enabled.load(Ordering::Relaxed) {
             return;
         }
         let bytes = u64::try_from(length).unwrap_or(u64::MAX);
         let direction = match direction {
-            RuntimeIoDirection::Read => &self.inner.read,
-            RuntimeIoDirection::Write => &self.inner.write,
+            FileIoDirection::Read => &self.inner.read,
+            FileIoDirection::Write => &self.inner.write,
         };
         let path = match path {
-            RuntimeIoPath::Buffered => &direction.buffered,
-            RuntimeIoPath::Direct => &direction.direct,
+            FileIoPath::Buffered => &direction.buffered,
+            FileIoPath::Direct => &direction.direct,
         };
         path.operations.fetch_add(1, Ordering::Relaxed);
         path.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -161,8 +160,8 @@ impl RuntimeIoStatsHandle {
             .store(enabled, Ordering::Relaxed);
     }
 
-    pub fn snapshot(&self) -> RuntimeIoStats {
-        RuntimeIoStats {
+    pub fn snapshot(&self) -> FileIoStats {
+        FileIoStats {
             direct_active: self.inner.direct_active,
             read: self.inner.read.snapshot(),
             write: self.inner.write.snapshot(),
@@ -174,19 +173,19 @@ impl RuntimeIoStatsHandle {
 /// the descriptor that owns flock, so retaining this set also retains the
 /// cache lock if an issued write or flush cannot be fenced. `direct`, when present,
 /// is a separate O_DIRECT open used only for aligned runtime data requests.
-pub struct RuntimeFileSet {
+pub struct DataFileHandles {
     buffered: File,
     direct: Option<File>,
-    stats: RuntimeIoStatsHandle,
+    stats: FileIoStatsHandle,
 }
 
-impl RuntimeFileSet {
+impl DataFileHandles {
     #[cfg(test)]
     pub fn buffered(file: File) -> Self {
         Self {
             buffered: file,
             direct: None,
-            stats: RuntimeIoStatsHandle::new(false),
+            stats: FileIoStatsHandle::new(false),
         }
     }
 
@@ -200,7 +199,7 @@ impl RuntimeFileSet {
         Self {
             buffered,
             direct,
-            stats: RuntimeIoStatsHandle::new(direct_active),
+            stats: FileIoStatsHandle::new(direct_active),
         }
     }
 
@@ -210,26 +209,26 @@ impl RuntimeFileSet {
         length: usize,
         offset: u64,
         allow_direct: bool,
-    ) -> RuntimeIoPath {
+    ) -> FileIoPath {
         if !allow_direct || self.direct.is_none() {
-            return RuntimeIoPath::Buffered;
+            return FileIoPath::Buffered;
         }
         // Never issue malformed O_DIRECT. Unaligned record fragments and an
         // unaligned remainder after a positive short completion use the
         // buffered compatibility path. Direct mode requires the direct
         // descriptor but does not make 32-byte-aligned records unreadable.
         if direct_io_aligned(buffer, length, offset) {
-            RuntimeIoPath::Direct
+            FileIoPath::Direct
         } else {
-            RuntimeIoPath::Buffered
+            FileIoPath::Buffered
         }
     }
 
-    pub fn record(&self, direction: RuntimeIoDirection, path: RuntimeIoPath, length: usize) {
+    pub fn record(&self, direction: FileIoDirection, path: FileIoPath, length: usize) {
         self.stats.record(direction, path, length);
     }
 
-    pub fn stats_handle(&self) -> RuntimeIoStatsHandle {
+    pub fn stats_handle(&self) -> FileIoStatsHandle {
         self.stats.clone()
     }
 
@@ -242,10 +241,10 @@ impl RuntimeFileSet {
     }
 
     #[cfg(unix)]
-    pub fn file_for(&self, path: RuntimeIoPath) -> &File {
+    pub fn file_for(&self, path: FileIoPath) -> &File {
         match path {
-            RuntimeIoPath::Buffered => &self.buffered,
-            RuntimeIoPath::Direct => self
+            FileIoPath::Buffered => &self.buffered,
+            FileIoPath::Direct => self
                 .direct
                 .as_ref()
                 .expect("direct path requires a direct descriptor"),
@@ -288,12 +287,8 @@ pub enum SyncMode {
     All,
 }
 
-pub trait IoBackend: Send + Sync {
-    fn len(&self) -> io::Result<u64>;
-    fn set_len(&self, len: u64) -> io::Result<()>;
-    fn preallocate(&self, len: u64) -> io::Result<()> {
-        self.set_len(len)
-    }
+/// Synchronous reads and writes at explicit byte offsets.
+pub trait PositionedIo: Send + Sync {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
     /// Reads into storage that may not yet be initialized.
     ///
@@ -308,9 +303,8 @@ pub trait IoBackend: Send + Sync {
         length: usize,
         offset: u64,
     ) -> io::Result<usize> {
-        // The default keeps fault-injecting and test backends source-compatible.
-        // Production runtime files override this method with positioned kernel
-        // I/O that can initialize the destination directly.
+        // Slice-based implementations require initialized storage. Data-file
+        // handles override this method to let the kernel initialize it directly.
         // SAFETY: upheld by the caller; zeroing establishes initialized bytes
         // before constructing the mutable slice required by `read_at`.
         unsafe {
@@ -319,24 +313,30 @@ pub trait IoBackend: Send + Sync {
         }
     }
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize>;
+}
+
+/// File ownership, extent management, and durability for cache persistence.
+///
+/// Recovery reads through [`PositionedIo`], synchronizes through this interface,
+/// and clones the same validated descriptor for an immutable private mapping. File identity is
+/// intentionally descriptor-based so callers never need to reopen a path between validation and
+/// `mmap`.
+pub trait StorageFile: PositionedIo {
+    fn len(&self) -> io::Result<u64>;
+    fn set_len(&self, len: u64) -> io::Result<()>;
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
     fn unlock(&self) -> io::Result<()>;
-}
 
-/// Buffered descriptor access needed by recovery-control code.
-///
-/// Recovery uses the [`IoBackend`] methods for injectable positioned I/O and
-/// durability barriers, then clones this exact validated descriptor for an
-/// immutable private mapping. File identity is intentionally descriptor-based
-/// so callers never need to reopen a path between validation and `mmap`.
-pub trait ControlIoBackend: IoBackend {
-    fn try_clone_control_file(&self) -> io::Result<File>;
+    fn try_clone_mapping_file(&self) -> io::Result<File>;
 
-    fn control_file_identity(&self) -> io::Result<ControlFileIdentity>;
+    fn identity(&self) -> io::Result<FileIdentity>;
 
-    fn is_same_file(&self, other: &dyn ControlIoBackend) -> io::Result<bool> {
-        Ok(self.control_file_identity()? == other.control_file_identity()?)
+    fn is_same_file(&self, other: &dyn StorageFile) -> io::Result<bool> {
+        Ok(self.identity()? == other.identity()?)
     }
 }
 
@@ -345,19 +345,19 @@ pub trait ControlIoBackend: IoBackend {
 /// The fields remain opaque: recovery code only needs equality to reject
 /// aliased data, state, and image descriptors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControlFileIdentity {
+pub struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
-pub struct FileBackend {
+pub struct CacheFile {
     /// Buffered control descriptor and flock owner.
     file: File,
     /// Separate Linux O_DIRECT descriptor for aligned runtime data I/O.
     direct: Option<File>,
 }
 
-impl FileBackend {
+impl CacheFile {
     #[cfg(test)]
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_io_mode(path, IoMode::Buffered)
@@ -424,10 +424,10 @@ impl FileBackend {
         }
     }
 
-    pub fn try_clone_runtime_files(&self) -> io::Result<RuntimeFileSet> {
+    pub fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
         let buffered = self.file.try_clone()?;
         let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
-        Ok(RuntimeFileSet::with_direct(buffered, direct))
+        Ok(DataFileHandles::with_direct(buffered, direct))
     }
 }
 
@@ -456,35 +456,7 @@ fn preallocate_macos(file: &File, len: i64) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-impl ControlIoBackend for FileBackend {
-    fn try_clone_control_file(&self) -> io::Result<File> {
-        self.file.try_clone()
-    }
-
-    fn control_file_identity(&self) -> io::Result<ControlFileIdentity> {
-        let metadata = self.file.metadata()?;
-        Ok(ControlFileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-}
-
-/// Positioned-I/O backend used by the POSIX engine. Control,
-/// metadata, locking, and recovery continue to use `FileBackend`; this backend
-/// routes only aligned runtime reads and record writes to the direct fd.
-pub struct RuntimeFileBackend {
-    files: RuntimeFileSet,
-}
-
-impl RuntimeFileBackend {
-    pub fn new(files: RuntimeFileSet) -> Self {
-        Self { files }
-    }
-}
-
-#[cfg(unix)]
-impl IoBackend for FileBackend {
+impl StorageFile for CacheFile {
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
@@ -549,14 +521,6 @@ impl IoBackend for FileBackend {
         }
     }
 
-    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.file.read_at(buffer, offset)
-    }
-
-    fn write_at(&self, _point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
-        self.file.write_at(buffer, offset)
-    }
-
     fn sync(&self, _point: SyncPoint, mode: SyncMode) -> io::Result<()> {
         match mode {
             SyncMode::Data => self.file.sync_data(),
@@ -586,31 +550,40 @@ impl IoBackend for FileBackend {
             Err(io::Error::last_os_error())
         }
     }
+
+    fn try_clone_mapping_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
+    fn identity(&self) -> io::Result<FileIdentity> {
+        let metadata = self.file.metadata()?;
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
 }
 
 #[cfg(unix)]
-impl IoBackend for RuntimeFileBackend {
-    fn len(&self) -> io::Result<u64> {
-        Ok(self
-            .files
-            .file_for(RuntimeIoPath::Buffered)
-            .metadata()?
-            .len())
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        self.files.file_for(RuntimeIoPath::Buffered).set_len(len)
-    }
-
+impl PositionedIo for CacheFile {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-        let path = self
-            .files
-            .select_path(buffer.as_ptr(), buffer.len(), offset, true);
-        let result = self.files.file_for(path).read_at(buffer, offset);
+        self.file.read_at(buffer, offset)
+    }
+
+    fn write_at(&self, _point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
+        self.file.write_at(buffer, offset)
+    }
+}
+
+#[cfg(unix)]
+impl PositionedIo for DataFileHandles {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        let path = self.select_path(buffer.as_ptr(), buffer.len(), offset, true);
+        let result = self.file_for(path).read_at(buffer, offset);
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(RuntimeIoDirection::Read, path, bytes);
+            self.record(FileIoDirection::Read, path, bytes);
         }
         result
     }
@@ -621,57 +594,32 @@ impl IoBackend for RuntimeFileBackend {
         length: usize,
         offset: u64,
     ) -> io::Result<usize> {
-        let path = self
-            .files
-            .select_path(buffer.cast_const(), length, offset, true);
+        let path = self.select_path(buffer.cast_const(), length, offset, true);
         // SAFETY: the caller supplies a writable destination for `length`
         // bytes; the selected descriptor is held by `self` for this call.
-        let result =
-            unsafe { read_file_at_uninit(self.files.file_for(path), buffer, length, offset) };
+        let result = unsafe { read_file_at_uninit(self.file_for(path), buffer, length, offset) };
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(RuntimeIoDirection::Read, path, bytes);
+            self.record(FileIoDirection::Read, path, bytes);
         }
         result
     }
 
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
-        let path = self.files.select_path(
+        let path = self.select_path(
             buffer.as_ptr(),
             buffer.len(),
             offset,
             point == WritePoint::Record,
         );
-        let result = self.files.file_for(path).write_at(buffer, offset);
+        let result = self.file_for(path).write_at(buffer, offset);
         if let Ok(bytes) = result
             && bytes != 0
         {
-            self.files.record(RuntimeIoDirection::Write, path, bytes);
+            self.record(FileIoDirection::Write, path, bytes);
         }
         result
-    }
-
-    fn sync(&self, _point: SyncPoint, mode: SyncMode) -> io::Result<()> {
-        let file = self.files.file_for(RuntimeIoPath::Buffered);
-        match mode {
-            SyncMode::Data => file.sync_data(),
-            SyncMode::All => file.sync_all(),
-        }
-    }
-
-    fn try_lock_exclusive(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "runtime file backend does not own cache locking",
-        ))
-    }
-
-    fn unlock(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "runtime file backend does not own cache locking",
-        ))
     }
 }
 
@@ -696,26 +644,22 @@ fn open_direct(path: &Path, buffered: &File) -> io::Result<File> {
     Ok(direct)
 }
 
-pub fn read_exact_at(backend: &dyn IoBackend, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    read_exact_at_with_progress(backend, buffer, offset).0
+pub fn read_exact_at(io: &dyn PositionedIo, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    read_exact_at_with_progress(io, buffer, offset).0
 }
 
-pub fn read_at_bounded(
-    backend: &dyn IoBackend,
-    buffer: &mut [u8],
-    offset: u64,
-) -> io::Result<usize> {
-    retry_interrupted(|| backend.read_at(buffer, offset))
+pub fn read_at_bounded(io: &dyn PositionedIo, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    retry_interrupted(|| io.read_at(buffer, offset))
 }
 
 fn read_exact_at_with_progress(
-    backend: &dyn IoBackend,
+    io: &dyn PositionedIo,
     mut buffer: &mut [u8],
     mut offset: u64,
 ) -> (io::Result<()>, usize) {
     let mut transferred = 0_usize;
     while !buffer.is_empty() {
-        let read = match read_at_bounded(backend, buffer, offset) {
+        let read = match read_at_bounded(io, buffer, offset) {
             Err(error) => return (Err(error), transferred),
             Ok(read) => read,
         };
@@ -756,7 +700,7 @@ fn read_exact_at_with_progress(
 }
 
 pub fn read_exact_at_uninit_with_progress(
-    backend: &dyn IoBackend,
+    io: &dyn PositionedIo,
     buffer: *mut u8,
     length: usize,
     mut offset: u64,
@@ -767,7 +711,7 @@ pub fn read_exact_at_uninit_with_progress(
         let read = match retry_interrupted(|| {
             // SAFETY: the caller owns a destination valid for `length` bytes,
             // and the unchanged suffix bounds remain valid across retries.
-            unsafe { backend.read_at_uninit(buffer.add(transferred), remaining, offset) }
+            unsafe { io.read_at_uninit(buffer.add(transferred), remaining, offset) }
         }) {
             Err(error) => return (Err(error), transferred),
             Ok(read) => read,
@@ -830,23 +774,23 @@ unsafe fn read_file_at_uninit(
 }
 
 pub fn write_all_at(
-    backend: &dyn IoBackend,
+    io: &dyn PositionedIo,
     point: WritePoint,
     buffer: &[u8],
     offset: u64,
 ) -> io::Result<()> {
-    write_all_at_with_progress(backend, point, buffer, offset).0
+    write_all_at_with_progress(io, point, buffer, offset).0
 }
 
 pub fn write_all_at_with_progress(
-    backend: &dyn IoBackend,
+    io: &dyn PositionedIo,
     point: WritePoint,
     mut buffer: &[u8],
     mut offset: u64,
 ) -> (io::Result<()>, usize) {
     let mut transferred = 0_usize;
     while !buffer.is_empty() {
-        let written = match retry_interrupted(|| backend.write_at(point, buffer, offset)) {
+        let written = match retry_interrupted(|| io.write_at(point, buffer, offset)) {
             Err(error) => return (Err(error), transferred),
             Ok(written) => written,
         };
@@ -923,19 +867,11 @@ mod tests {
     struct AlignedBytes([u8; 2 * DIRECT_IO_ALIGNMENT]);
 
     #[derive(Default)]
-    struct InterruptedBackend {
+    struct InterruptedIo {
         calls: AtomicUsize,
     }
 
-    impl IoBackend for InterruptedBackend {
-        fn len(&self) -> io::Result<u64> {
-            Ok(0)
-        }
-
-        fn set_len(&self, _len: u64) -> io::Result<()> {
-            Ok(())
-        }
-
+    impl PositionedIo for InterruptedIo {
         fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::new(
@@ -951,50 +887,37 @@ mod tests {
                 "interrupted write",
             ))
         }
-
-        fn sync(&self, _point: SyncPoint, _mode: SyncMode) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn try_lock_exclusive(&self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn unlock(&self) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
     fn exact_io_stops_after_the_interrupted_retry_budget() {
         let mut initialized = [0_u8; 1];
-        let backend = InterruptedBackend::default();
-        let (result, transferred) = read_exact_at_with_progress(&backend, &mut initialized, 0);
+        let io = InterruptedIo::default();
+        let (result, transferred) = read_exact_at_with_progress(&io, &mut initialized, 0);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(transferred, 0);
         assert_eq!(
-            backend.calls.load(Ordering::Relaxed),
+            io.calls.load(Ordering::Relaxed),
             MAX_INTERRUPTED_RETRIES + 1
         );
 
         let mut uninitialized = std::mem::MaybeUninit::<u8>::uninit();
-        let backend = InterruptedBackend::default();
+        let io = InterruptedIo::default();
         let (result, transferred) =
-            read_exact_at_uninit_with_progress(&backend, uninitialized.as_mut_ptr(), 1, 0);
+            read_exact_at_uninit_with_progress(&io, uninitialized.as_mut_ptr(), 1, 0);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(transferred, 0);
         assert_eq!(
-            backend.calls.load(Ordering::Relaxed),
+            io.calls.load(Ordering::Relaxed),
             MAX_INTERRUPTED_RETRIES + 1
         );
 
-        let backend = InterruptedBackend::default();
-        let (result, transferred) =
-            write_all_at_with_progress(&backend, WritePoint::Record, &[1], 0);
+        let io = InterruptedIo::default();
+        let (result, transferred) = write_all_at_with_progress(&io, WritePoint::Record, &[1], 0);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(transferred, 0);
         assert_eq!(
-            backend.calls.load(Ordering::Relaxed),
+            io.calls.load(Ordering::Relaxed),
             MAX_INTERRUPTED_RETRIES + 1
         );
     }
@@ -1020,58 +943,58 @@ mod tests {
     }
 
     #[test]
-    fn runtime_files_route_only_fully_aligned_data_to_direct() {
+    fn data_handles_route_only_fully_aligned_data_to_direct() {
         let buffered = TestFile::new("buffered-route");
         let direct = TestFile::new("direct-route");
-        let files = RuntimeFileSet::new(buffered.open(), Some(direct.open()));
+        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
         let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
         let pointer = bytes.0.as_ptr();
 
         assert_eq!(
             files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
-            RuntimeIoPath::Direct
+            FileIoPath::Direct
         );
         assert_eq!(
             files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, false),
-            RuntimeIoPath::Buffered
+            FileIoPath::Buffered
         );
         assert_eq!(
             files.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
-            RuntimeIoPath::Buffered
+            FileIoPath::Buffered
         );
 
-        let buffered_only = RuntimeFileSet::buffered(buffered.open());
+        let buffered_only = DataFileHandles::buffered(buffered.open());
         assert_eq!(
             buffered_only.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
-            RuntimeIoPath::Buffered
+            FileIoPath::Buffered
         );
 
-        let required = RuntimeFileSet::with_direct(buffered.open(), Some(direct.open()));
+        let required = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
-            RuntimeIoPath::Buffered,
+            FileIoPath::Buffered,
             "required mode must preserve the buffered unaligned-I/O path"
         );
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, false),
-            RuntimeIoPath::Buffered,
+            FileIoPath::Buffered,
             "metadata remains on the buffered control descriptor"
         );
     }
 
     #[test]
-    fn runtime_io_statistics_are_shared_and_can_be_disabled() {
+    fn file_io_statistics_are_shared_and_can_be_disabled() {
         let buffered = TestFile::new("buffered-stats");
         let direct = TestFile::new("direct-stats");
-        let files = RuntimeFileSet::new(buffered.open(), Some(direct.open()));
+        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
         let cloned = files.try_clone().unwrap();
 
         cloned.record(
-            RuntimeIoDirection::Read,
-            RuntimeIoPath::Direct,
+            FileIoDirection::Read,
+            FileIoPath::Direct,
             DIRECT_IO_ALIGNMENT,
         );
-        cloned.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        cloned.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
         let stats = files.stats_handle().snapshot();
         assert_eq!(stats.read.direct.operations, 1);
         assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
@@ -1080,16 +1003,16 @@ mod tests {
 
         cloned.stats_handle().set_activity_counters_enabled(false);
         files.record(
-            RuntimeIoDirection::Read,
-            RuntimeIoPath::Direct,
+            FileIoDirection::Read,
+            FileIoPath::Direct,
             DIRECT_IO_ALIGNMENT,
         );
-        files.record(RuntimeIoDirection::Write, RuntimeIoPath::Buffered, 32);
+        files.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
         assert_eq!(files.stats_handle().snapshot(), stats);
     }
 
     #[test]
-    fn posix_runtime_backend_routes_record_data_and_reports_bytes() {
+    fn data_handles_route_record_data_and_reports_bytes() {
         let buffered = TestFile::new("posix-buffered-data");
         let direct = TestFile::new("posix-direct-data");
         let buffered_file = buffered.open();
@@ -1098,26 +1021,24 @@ mod tests {
             .set_len(2 * DIRECT_IO_ALIGNMENT as u64)
             .unwrap();
         direct_file.set_len(2 * DIRECT_IO_ALIGNMENT as u64).unwrap();
-        let backend = RuntimeFileBackend::new(RuntimeFileSet::new(
+        let io = DataFileHandles::new(
             buffered_file.try_clone().unwrap(),
             Some(direct_file.try_clone().unwrap()),
-        ));
+        );
         let record = AlignedBytes([0x5a; 2 * DIRECT_IO_ALIGNMENT]);
 
         assert_eq!(
-            backend
-                .write_at(WritePoint::Record, &record.0[..DIRECT_IO_ALIGNMENT], 0,)
+            io.write_at(WritePoint::Record, &record.0[..DIRECT_IO_ALIGNMENT], 0,)
                 .unwrap(),
             DIRECT_IO_ALIGNMENT
         );
         assert_eq!(
-            backend
-                .write_at(
-                    WritePoint::DataSuperblock,
-                    &record.0[..DIRECT_IO_ALIGNMENT],
-                    DIRECT_IO_ALIGNMENT as u64,
-                )
-                .unwrap(),
+            io.write_at(
+                WritePoint::DataSuperblock,
+                &record.0[..DIRECT_IO_ALIGNMENT],
+                DIRECT_IO_ALIGNMENT as u64,
+            )
+            .unwrap(),
             DIRECT_IO_ALIGNMENT
         );
 
@@ -1130,14 +1051,14 @@ mod tests {
             .unwrap();
         assert!(observed.iter().all(|byte| *byte == 0x5a));
 
-        assert_eq!(backend.read_at(&mut [], 0).unwrap(), 0);
-        assert_eq!(backend.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
+        assert_eq!(io.read_at(&mut [], 0).unwrap(), 0);
+        assert_eq!(io.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
 
         assert_eq!(
-            backend.files.stats_handle().snapshot(),
-            RuntimeIoStats {
+            io.stats_handle().snapshot(),
+            FileIoStats {
                 direct_active: true,
-                write: RuntimeIoDirectionStats {
+                write: FileIoDirectionStats {
                     buffered: CacheIoPathSnapshot {
                         operations: 1,
                         bytes: DIRECT_IO_ALIGNMENT as u64,
@@ -1147,7 +1068,7 @@ mod tests {
                         bytes: DIRECT_IO_ALIGNMENT as u64,
                     },
                 },
-                ..RuntimeIoStats::default()
+                ..FileIoStats::default()
             }
         );
     }
@@ -1159,12 +1080,12 @@ mod tests {
     #[test]
     fn preallocate_sets_the_exact_file_extent() {
         let file = TestFile::new("preallocate");
-        let backend = FileBackend::open(file.path()).unwrap();
+        let io = CacheFile::open(file.path()).unwrap();
         let len = 2 * DIRECT_IO_ALIGNMENT as u64;
-        backend.preallocate(len).unwrap();
-        assert_eq!(backend.len().unwrap(), len);
+        io.preallocate(len).unwrap();
+        assert_eq!(io.len().unwrap(), len);
         #[cfg(target_os = "macos")]
-        assert!(backend.file.metadata().unwrap().blocks() * 512 >= len);
+        assert!(io.file.metadata().unwrap().blocks() * 512 >= len);
     }
 
     #[cfg(not(any(
@@ -1174,24 +1095,24 @@ mod tests {
     #[test]
     fn unsupported_physical_preallocation_fails_closed() {
         let file = TestFile::new("preallocate-unsupported");
-        let backend = FileBackend::open(file.path()).unwrap();
-        let error = backend.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
+        let io = CacheFile::open(file.path()).unwrap();
+        let error = io.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(backend.len().unwrap(), 0);
+        assert_eq!(io.len().unwrap(), 0);
     }
 
     #[test]
-    fn recovery_control_backend_clones_exact_file_and_detects_aliases() {
+    fn storage_file_clones_exact_file_and_detects_aliases() {
         let primary = TestFile::new("control-primary");
         let alias = TestFile::new("control-alias");
         let other = TestFile::new("control-other");
         drop(primary.open());
         std::fs::hard_link(primary.path(), alias.path()).unwrap();
 
-        let primary = FileBackend::open(primary.path()).unwrap();
-        let alias = FileBackend::open(alias.path()).unwrap();
-        let other = FileBackend::open(other.path()).unwrap();
-        let cloned = ControlIoBackend::try_clone_control_file(&primary).unwrap();
+        let primary = CacheFile::open(primary.path()).unwrap();
+        let alias = CacheFile::open(alias.path()).unwrap();
+        let other = CacheFile::open(other.path()).unwrap();
+        let cloned = StorageFile::try_clone_mapping_file(&primary).unwrap();
 
         primary
             .write_at(WritePoint::RecoveryImageHeader, b"image-ok", 0)
@@ -1199,19 +1120,18 @@ mod tests {
         let mut observed = [0_u8; 8];
         cloned.read_at(&mut observed, 0).unwrap();
         assert_eq!(&observed, b"image-ok");
-        assert!(ControlIoBackend::is_same_file(&primary, &alias).unwrap());
-        assert!(!ControlIoBackend::is_same_file(&primary, &other).unwrap());
+        assert!(StorageFile::is_same_file(&primary, &alias).unwrap());
+        assert!(!StorageFile::is_same_file(&primary, &other).unwrap());
     }
 
     #[test]
     fn recovery_temp_creation_never_reopens_an_existing_target() {
         let image = TestFile::new("recovery-create-new");
-        let backend = FileBackend::create_new_buffered(image.path()).unwrap();
-        backend
-            .write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
+        let io = CacheFile::create_new_buffered(image.path()).unwrap();
+        io.write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
             .unwrap();
 
-        let error = FileBackend::create_new_buffered(image.path())
+        let error = CacheFile::create_new_buffered(image.path())
             .err()
             .expect("create_new must reject an existing recovery target");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
@@ -1219,19 +1139,18 @@ mod tests {
 
     #[test]
     fn one_fault_handle_controls_multiple_recovery_files() {
-        use crate::io::backend::testing::FaultAction;
-        use crate::io::backend::testing::FaultBackend;
-        use crate::io::backend::testing::FaultEvent;
-        use crate::io::backend::testing::FaultHandle;
+        use crate::io::file::testing::FaultAction;
+        use crate::io::file::testing::FaultEvent;
+        use crate::io::file::testing::FaultFile;
+        use crate::io::file::testing::FaultHandle;
 
         let state = TestFile::new("shared-fault-state");
         let image = TestFile::new("shared-fault-image");
         let temp = TestFile::new("shared-fault-temp");
         let faults = FaultHandle::default();
-        let state = FaultBackend::open_with_handle(state.path(), faults.clone()).unwrap();
-        let image = FaultBackend::open_with_handle(image.path(), faults.clone()).unwrap();
-        let temp =
-            FaultBackend::create_new_buffered_with_handle(temp.path(), faults.clone()).unwrap();
+        let state = FaultFile::open_with_handle(state.path(), faults.clone()).unwrap();
+        let image = FaultFile::open_with_handle(image.path(), faults.clone()).unwrap();
+        let temp = FaultFile::create_new_buffered_with_handle(temp.path(), faults.clone()).unwrap();
 
         faults.arm(
             FaultEvent::Write(WritePoint::State),
@@ -1273,7 +1192,7 @@ mod tests {
         drop(target.open());
         symlink(target.path(), link.path()).unwrap();
 
-        assert!(FileBackend::open(link.path()).is_err());
+        assert!(CacheFile::open(link.path()).is_err());
     }
 }
 
@@ -1356,22 +1275,22 @@ pub mod testing {
         }
     }
 
-    pub struct FaultBackend {
-        inner: FileBackend,
+    pub struct FaultFile {
+        inner: CacheFile,
         handle: FaultHandle,
     }
 
-    impl FaultBackend {
+    impl FaultFile {
         pub fn open(path: &Path) -> io::Result<(Self, FaultHandle)> {
             let handle = FaultHandle::default();
-            let backend = Self::open_with_handle(path, handle.clone())?;
-            Ok((backend, handle))
+            let io = Self::open_with_handle(path, handle.clone())?;
+            Ok((io, handle))
         }
 
         /// Opens another control file governed by the same fault schedule.
         pub fn open_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
             Ok(Self {
-                inner: FileBackend::open(path)?,
+                inner: CacheFile::open(path)?,
                 handle,
             })
         }
@@ -1379,7 +1298,7 @@ pub mod testing {
         /// Opens an existing control file without creating a missing path.
         pub fn open_existing_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
             Ok(Self {
-                inner: FileBackend::open_existing_with_io_mode(path, IoMode::Buffered)?,
+                inner: CacheFile::open_existing_with_io_mode(path, IoMode::Buffered)?,
                 handle,
             })
         }
@@ -1391,21 +1310,13 @@ pub mod testing {
             handle: FaultHandle,
         ) -> io::Result<Self> {
             Ok(Self {
-                inner: FileBackend::create_new_buffered(path)?,
+                inner: CacheFile::create_new_buffered(path)?,
                 handle,
             })
         }
     }
 
-    impl IoBackend for FaultBackend {
-        fn len(&self) -> io::Result<u64> {
-            self.inner.len()
-        }
-
-        fn set_len(&self, len: u64) -> io::Result<()> {
-            self.inner.set_len(len)
-        }
-
+    impl PositionedIo for FaultFile {
         fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
             match self.handle.action(FaultEvent::Read) {
                 Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
@@ -1439,6 +1350,17 @@ pub mod testing {
                 }
                 None => self.inner.write_at(point, buffer, offset),
             }
+        }
+    }
+
+    #[cfg(unix)]
+    impl StorageFile for FaultFile {
+        fn len(&self) -> io::Result<u64> {
+            self.inner.len()
+        }
+
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.inner.set_len(len)
         }
 
         fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()> {
@@ -1482,16 +1404,13 @@ pub mod testing {
                 None => self.inner.unlock(),
             }
         }
-    }
 
-    #[cfg(unix)]
-    impl ControlIoBackend for FaultBackend {
-        fn try_clone_control_file(&self) -> io::Result<File> {
-            ControlIoBackend::try_clone_control_file(&self.inner)
+        fn try_clone_mapping_file(&self) -> io::Result<File> {
+            StorageFile::try_clone_mapping_file(&self.inner)
         }
 
-        fn control_file_identity(&self) -> io::Result<ControlFileIdentity> {
-            self.inner.control_file_identity()
+        fn identity(&self) -> io::Result<FileIdentity> {
+            self.inner.identity()
         }
     }
 

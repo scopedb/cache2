@@ -20,34 +20,33 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 
-use crate::io::backend::IoBackend;
-#[cfg(unix)]
-use crate::io::backend::RuntimeFileBackend;
-#[cfg(unix)]
-use crate::io::backend::RuntimeFileSet;
-use crate::io::backend::RuntimeIoStatsHandle;
-use crate::io::backend::read_exact_at_uninit_with_progress;
-use crate::io::backend::write_all_at_with_progress;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
+use crate::io::engine::EngineState;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::RuntimeShared;
 use crate::io::engine::lock_unpoisoned;
+#[cfg(unix)]
+#[cfg(unix)]
+use crate::io::file::DataFileHandles;
+use crate::io::file::FileIoStatsHandle;
+use crate::io::file::PositionedIo;
+use crate::io::file::read_exact_at_uninit_with_progress;
+use crate::io::file::write_all_at_with_progress;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
 #[cfg(unix)]
 pub fn start(
-    files: RuntimeFileSet,
+    handles: DataFileHandles,
     max_in_flight: usize,
     worker_count: usize,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<IoEngine> {
-    let io_stats = files.stats_handle();
-    let backend = Arc::new(RuntimeFileBackend::new(files));
-    start_backend(
-        backend,
+    let io_stats = handles.stats_handle();
+    let io = Arc::new(handles);
+    start_workers(
+        io,
         io_stats,
         max_in_flight,
         worker_count,
@@ -58,27 +57,27 @@ pub fn start(
 
 #[cfg(test)]
 impl IoEngine {
-    pub fn for_test(backend: Arc<dyn IoBackend>, max_in_flight: usize) -> io::Result<Self> {
-        Self::for_test_with_options(backend, max_in_flight, max_in_flight.min(4), true, false)
+    pub fn for_test(io: Arc<dyn PositionedIo>, max_in_flight: usize) -> io::Result<Self> {
+        Self::for_test_with_options(io, max_in_flight, max_in_flight.min(4), true, false)
     }
 
     pub fn for_test_with_read_wait(
-        backend: Arc<dyn IoBackend>,
+        io: Arc<dyn PositionedIo>,
         max_in_flight: usize,
     ) -> io::Result<Self> {
-        Self::for_test_with_options(backend, max_in_flight, max_in_flight.min(4), true, true)
+        Self::for_test_with_options(io, max_in_flight, max_in_flight.min(4), true, true)
     }
 
     pub fn for_test_with_options(
-        backend: Arc<dyn IoBackend>,
+        io: Arc<dyn PositionedIo>,
         max_in_flight: usize,
         worker_count: usize,
         activity_counters_enabled: bool,
         read_wait_enabled: bool,
     ) -> io::Result<Self> {
-        start_backend(
-            backend,
-            RuntimeIoStatsHandle::new(false),
+        start_workers(
+            io,
+            FileIoStatsHandle::new(false),
             max_in_flight,
             worker_count,
             activity_counters_enabled,
@@ -87,9 +86,9 @@ impl IoEngine {
     }
 }
 
-fn start_backend(
-    backend: Arc<dyn IoBackend>,
-    io_stats: RuntimeIoStatsHandle,
+fn start_workers(
+    io: Arc<dyn PositionedIo>,
+    io_stats: FileIoStatsHandle,
     max_in_flight: usize,
     worker_count: usize,
     activity_counters_enabled: bool,
@@ -114,22 +113,22 @@ fn start_backend(
         .unwrap()
         .reserve_exact(worker_count);
     for worker_index in 0..worker_count {
-        let worker_backend = Arc::clone(&backend);
-        let worker_shared = Arc::clone(&engine.shared);
+        let worker_io = Arc::clone(&io);
+        let worker_state = Arc::clone(&engine.state);
         let worker_receiver = Arc::clone(&receiver);
         let worker = std::thread::Builder::new()
             .name(format!("cache2-sync-io-{worker_index}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
-            .spawn(move || backend_driver(worker_backend, worker_shared, worker_receiver))?;
+            .spawn(move || posix_worker(worker_io, worker_state, worker_receiver))?;
         // Retain each worker immediately so engine Drop joins it if a later spawn fails.
         engine.workers.get_mut().unwrap().push(worker);
     }
     Ok(engine)
 }
 
-fn backend_driver(
-    backend: Arc<dyn IoBackend>,
-    shared: Arc<RuntimeShared>,
+fn posix_worker(
+    io: Arc<dyn PositionedIo>,
+    state: Arc<EngineState>,
     receiver: Arc<Mutex<Receiver<DriverCommand>>>,
 ) -> io::Result<()> {
     loop {
@@ -140,19 +139,19 @@ fn backend_driver(
         match command {
             DriverCommand::Submit(mut task) => {
                 if task.completion.cancel_requested.load(Ordering::Acquire) {
-                    shared.finish(task, CompletionStatus::Cancelled, 0);
+                    state.finish(task, CompletionStatus::Cancelled, 0);
                     continue;
                 }
                 let (status, transferred) = panic::catch_unwind(AssertUnwindSafe(|| {
-                    execute_backend(backend.as_ref(), &mut task.operation)
+                    execute_operation(io.as_ref(), &mut task.operation)
                 }))
                 .unwrap_or_else(|_| {
                     (
-                        CompletionStatus::Failed(io::Error::other("I/O backend panicked")),
+                        CompletionStatus::Failed(io::Error::other("positioned I/O panicked")),
                         0,
                     )
                 });
-                shared.finish(task, status, transferred);
+                state.finish(task, status, transferred);
             }
             DriverCommand::Cancel(request_id) => {
                 // The cancel flag is visible directly through CompletionState.
@@ -165,22 +164,18 @@ fn backend_driver(
     Ok(())
 }
 
-fn execute_backend(
-    backend: &dyn IoBackend,
+fn execute_operation(
+    io: &dyn PositionedIo,
     operation: &mut IoOperation,
 ) -> (CompletionStatus, usize) {
     match operation {
         IoOperation::Read { buffer, offset } => match buffer.read_target() {
             Ok(buffer_pointer) => {
-                let (result, transferred) = read_exact_at_uninit_with_progress(
-                    backend,
-                    buffer_pointer,
-                    buffer.len(),
-                    *offset,
-                );
-                backend_result(result, transferred)
+                let (result, transferred) =
+                    read_exact_at_uninit_with_progress(io, buffer_pointer, buffer.len(), *offset);
+                completion_result(result, transferred)
             }
-            Err(error) => backend_result(Err(error), 0),
+            Err(error) => completion_result(Err(error), 0),
         },
         IoOperation::Write {
             point,
@@ -188,16 +183,15 @@ fn execute_backend(
             offset,
         } => match buffer.as_slice() {
             Ok(buffer) => {
-                let (result, transferred) =
-                    write_all_at_with_progress(backend, *point, buffer, *offset);
-                backend_result(result, transferred)
+                let (result, transferred) = write_all_at_with_progress(io, *point, buffer, *offset);
+                completion_result(result, transferred)
             }
-            Err(error) => backend_result(Err(error), 0),
+            Err(error) => completion_result(Err(error), 0),
         },
     }
 }
 
-fn backend_result(result: io::Result<()>, transferred: usize) -> (CompletionStatus, usize) {
+fn completion_result(result: io::Result<()>, transferred: usize) -> (CompletionStatus, usize) {
     match result {
         Ok(()) => (CompletionStatus::Completed, transferred),
         Err(error) => (CompletionStatus::Failed(error), transferred),

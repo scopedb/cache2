@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use crate::io::backend::FileBackend;
-use crate::io::backend::IoBackend;
+use crate::io::file::CacheFile;
+use crate::io::file::PositionedIo;
 
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.
@@ -124,9 +124,9 @@ impl TestFile {
             .unwrap()
     }
 
-    /// Opens the file as a buffered backend.
-    pub fn backend(&self) -> Arc<dyn IoBackend> {
-        Arc::new(FileBackend::open(&self.path).unwrap())
+    /// Opens the file for buffered positioned I/O.
+    pub fn io(&self) -> Arc<dyn PositionedIo> {
+        Arc::new(CacheFile::open(&self.path).unwrap())
     }
 }
 

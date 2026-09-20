@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::recovery::PersistentId;
 use crate::region::recovery::metadata::PartitionMetadataRecord;

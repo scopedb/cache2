@@ -54,10 +54,10 @@ use self::staging::StagingEncodeError;
 use self::staging::StagingError;
 use crate::checksum::crc32c;
 use crate::hashing::route_hash;
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::region::appender::RegionSpanCompletion;
 #[cfg(test)]

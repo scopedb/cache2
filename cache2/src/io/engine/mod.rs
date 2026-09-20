@@ -49,7 +49,7 @@ use asyncband::semaphore::Semaphore;
 #[cfg(unix)]
 use crate::config::runtime::IoEngineConfig;
 #[cfg(unix)]
-use crate::io::backend::RuntimeFileSet;
+use crate::io::file::DataFileHandles;
 #[cfg(all(
     feature = "io-uring",
     target_os = "linux",
@@ -61,7 +61,7 @@ use crate::io::backend::RuntimeFileSet;
         target_arch = "powerpc64"
     )
 ))]
-use crate::io::backend::RuntimeIoDirection;
+use crate::io::file::FileIoDirection;
 #[cfg(all(
     feature = "io-uring",
     target_os = "linux",
@@ -73,10 +73,10 @@ use crate::io::backend::RuntimeIoDirection;
         target_arch = "powerpc64"
     )
 ))]
-use crate::io::backend::RuntimeIoPath;
-use crate::io::backend::RuntimeIoStats;
-use crate::io::backend::RuntimeIoStatsHandle;
-use crate::io::backend::WritePoint;
+use crate::io::file::FileIoPath;
+use crate::io::file::FileIoStats;
+use crate::io::file::FileIoStatsHandle;
+use crate::io::file::WritePoint;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
@@ -102,14 +102,14 @@ mod uring;
 /// POSIX workers and io_uring drivers share this command and completion protocol.
 /// Callers share the engine through `Arc`; the final owner shuts down its workers.
 pub struct IoEngine {
-    shared: Arc<RuntimeShared>,
+    state: Arc<EngineState>,
     commands: SyncSender<DriverCommand>,
     submit_state: Arc<RwLock<SubmitState>>,
     next_request_id: AtomicU64,
     wake: Option<Arc<dyn DriverWake>>,
     workers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
     shutdown: ShutdownState,
-    io_stats: RuntimeIoStatsHandle,
+    io_stats: FileIoStatsHandle,
 }
 
 const IO_BUFFER_ALIGNMENT: usize = 4096;
@@ -138,7 +138,7 @@ const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EngineIoSnapshot {
     pub requests: CacheIoDirectionSnapshot,
-    pub runtime: RuntimeIoStats,
+    pub file_io: FileIoStats,
 }
 
 /// A logical range of an engine-budgeted aligned buffer lease.
@@ -351,10 +351,10 @@ impl OperationKind {
             target_arch = "powerpc64"
         )
     ))]
-    const fn io_direction(self) -> RuntimeIoDirection {
+    const fn io_direction(self) -> FileIoDirection {
         match self {
-            Self::Read => RuntimeIoDirection::Read,
-            Self::Write => RuntimeIoDirection::Write,
+            Self::Read => FileIoDirection::Read,
+            Self::Write => FileIoDirection::Write,
         }
     }
 }
@@ -440,11 +440,11 @@ impl IoOperation {
             target_arch = "powerpc64"
         )
     ))]
-    fn runtime_io_path(
+    fn file_io_path(
         &self,
-        files: &RuntimeFileSet,
+        handles: &DataFileHandles,
         transferred: usize,
-    ) -> io::Result<RuntimeIoPath> {
+    ) -> io::Result<FileIoPath> {
         match self {
             Self::Read { buffer, offset } => {
                 let remaining = buffer.len().checked_sub(transferred).ok_or_else(|| {
@@ -453,7 +453,7 @@ impl IoOperation {
                 let offset = offset.checked_add(transferred as u64).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow")
                 })?;
-                Ok(files.select_path(
+                Ok(handles.select_path(
                     buffer.read_target()?.wrapping_add(transferred),
                     remaining,
                     offset,
@@ -471,7 +471,7 @@ impl IoOperation {
                 let offset = offset.checked_add(transferred as u64).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "write offset overflow")
                 })?;
-                Ok(files.select_path(
+                Ok(handles.select_path(
                     buffer.as_ptr()?.wrapping_add(transferred),
                     remaining,
                     offset,
@@ -1016,7 +1016,7 @@ fn submit_cache_io_until(
 }
 
 struct IoSlot {
-    shared: Arc<RuntimeShared>,
+    state: Arc<EngineState>,
     write: bool,
     // This permit drops only after `IoSlot::drop` publishes physical capacity.
     read_permit: Option<OwnedSemaphorePermit>,
@@ -1031,7 +1031,7 @@ pub struct ReadSlot {
 
 /// An async reservation handle backed by the engine's physical slot state.
 pub struct ReadSlotWaiter {
-    shared: Arc<RuntimeShared>,
+    state: Arc<EngineState>,
 }
 
 // The physical completion path must not allocate. Asyncband keeps waiter nodes
@@ -1142,25 +1142,25 @@ impl ReadSlotWaiter {
         tokio_handle: &tokio::runtime::Handle,
     ) -> io::Result<ReadSlot> {
         let admission = self
-            .shared
+            .state
             .read_slot_admission
             .as_ref()
             .ok_or_else(|| io::Error::other("async read admission is disabled"))?;
         let _waiter = admission.register_waiter();
-        self.shared.ensure_accepting()?;
+        self.state.ensure_accepting()?;
         let permit = admission.acquire_until(deadline, tokio_handle).await?;
-        self.shared.try_reserve_read_slot(Some(permit))
+        self.state.try_reserve_read_slot(Some(permit))
     }
 }
 
 impl Drop for IoSlot {
     fn drop(&mut self) {
         {
-            let _slot = lock_unpoisoned(&self.shared.slot_lock);
-            self.shared
+            let _slot = lock_unpoisoned(&self.state.slot_lock);
+            self.state
                 .slot_state
                 .fetch_sub(slot_delta(self.write), Ordering::AcqRel);
-            self.shared.slot_available.notify_one();
+            self.state.slot_available.notify_one();
         }
         drop(self.read_permit.take());
     }
@@ -1182,7 +1182,7 @@ const fn active_write_slots(state: u64) -> usize {
     ((state >> WRITE_SLOT_SHIFT) & SLOT_COUNT_MASK) as usize
 }
 
-struct RuntimeShared {
+struct EngineState {
     latency: std::sync::OnceLock<crate::stats::recording::IoTiming>,
     max_in_flight: usize,
     activity_counters_enabled: bool,
@@ -1212,7 +1212,7 @@ enum SlotWaitError {
     TimedOut,
 }
 
-impl RuntimeShared {
+impl EngineState {
     fn new(max_in_flight: usize, activity_counters_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
             latency: std::sync::OnceLock::new(),
@@ -1276,7 +1276,7 @@ impl RuntimeShared {
                         update_peak(&self.in_flight_peak, total + 1);
                     }
                     return Some(IoSlot {
-                        shared: Arc::clone(self),
+                        state: Arc::clone(self),
                         write,
                         read_permit: None,
                     });
@@ -1616,38 +1616,38 @@ impl IoEngine {
     /// Installed once during construction, before any requests are admitted.
     pub fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
         assert!(
-            self.shared.latency.set(recorder).is_ok(),
+            self.state.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"
         );
     }
 
     pub fn wake_slot_waiters(&self) {
-        self.shared.wake_slot_waiters();
+        self.state.wake_slot_waiters();
     }
 
     pub fn in_flight(&self) -> usize {
-        self.shared.total_in_flight()
+        self.state.total_in_flight()
     }
 
     pub fn writes_in_flight(&self) -> usize {
-        self.shared.writes_in_flight()
+        self.state.writes_in_flight()
     }
 
     /// True means a failed driver could not fence an issued write.
     /// The cache must retain its exclusive file lock for process lifetime.
     pub fn has_unfenced_writes(&self) -> bool {
-        self.shared.has_unfenced_writes()
+        self.state.has_unfenced_writes()
     }
 
     #[cfg(test)]
     pub fn mark_unfenced_writes_for_test(&self) {
-        self.shared.mark_unfenced_writes();
+        self.state.mark_unfenced_writes();
     }
 
     pub fn stats(&self) -> EngineIoSnapshot {
         EngineIoSnapshot {
-            requests: self.shared.snapshot(),
-            runtime: self.io_stats.snapshot(),
+            requests: self.state.snapshot(),
+            file_io: self.io_stats.snapshot(),
         }
     }
 
@@ -1670,7 +1670,7 @@ impl IoEngine {
         max_in_flight: usize,
         activity_counters_enabled: bool,
         read_wait_enabled: bool,
-        io_stats: RuntimeIoStatsHandle,
+        io_stats: FileIoStatsHandle,
     ) -> io::Result<(Self, Receiver<DriverCommand>)> {
         if !(1..=MAX_IO_REQUESTS_PER_ENGINE).contains(&max_in_flight) {
             return Err(io::Error::new(
@@ -1686,7 +1686,7 @@ impl IoEngine {
         io_stats.set_activity_counters_enabled(activity_counters_enabled);
         Ok((
             Self {
-                shared: Arc::new(RuntimeShared::new(
+                state: Arc::new(EngineState::new(
                     max_in_flight,
                     activity_counters_enabled,
                     read_wait_enabled,
@@ -1728,17 +1728,17 @@ impl IoEngine {
 
     pub fn try_reserve_read(&self) -> io::Result<ReadSlot> {
         let permit = self
-            .shared
+            .state
             .read_slot_admission
             .as_ref()
             .map(ReadSlotAdmission::try_acquire)
             .transpose()?;
-        self.shared.try_reserve_read_slot(permit)
+        self.state.try_reserve_read_slot(permit)
     }
 
     pub fn read_slot_waiter(&self) -> ReadSlotWaiter {
         ReadSlotWaiter {
-            shared: Arc::clone(&self.shared),
+            state: Arc::clone(&self.state),
         }
     }
 
@@ -1747,8 +1747,7 @@ impl IoEngine {
         slot: ReadSlot,
         operation: IoOperation,
     ) -> Result<IoRequest, SubmitError> {
-        if operation.kind() != OperationKind::Read || !Arc::ptr_eq(&slot.slot.shared, &self.shared)
-        {
+        if operation.kind() != OperationKind::Read || !Arc::ptr_eq(&slot.slot.state, &self.state) {
             return Err(SubmitError {
                 error: io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1801,26 +1800,26 @@ impl IoEngine {
             return Err(SubmitError { error, operation });
         }
         let write = operation.kind().uses_write_slot();
-        let slot_wait_started = self.shared.activity_counters_enabled.then(Instant::now);
+        let slot_wait_started = self.state.activity_counters_enabled.then(Instant::now);
         let slot = match slot_mode {
             #[cfg(test)]
-            SlotMode::Try if !self.shared.accepting.load(Ordering::Acquire) => Err(io::Error::new(
+            SlotMode::Try if !self.state.accepting.load(Ordering::Acquire) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "I/O engine is shut down",
             )),
             #[cfg(test)]
-            SlotMode::Try => self.shared.try_reserve_slot(write).ok_or_else(|| {
+            SlotMode::Try => self.state.try_reserve_slot(write).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
             }),
             #[cfg(test)]
-            SlotMode::Wait => self.shared.reserve_slot_wait(write).ok_or_else(|| {
+            SlotMode::Wait => self.state.reserve_slot_wait(write).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
             }),
             SlotMode::Controlled {
                 cancelled,
                 deadline,
             } => self
-                .shared
+                .state
                 .reserve_slot_controlled(write, cancelled, deadline)
                 .map_err(|error| match error {
                     SlotWaitError::Shutdown => {
@@ -1841,11 +1840,11 @@ impl IoEngine {
             }
         };
         if let Some(slot_wait_started) = slot_wait_started {
-            add_duration_ns(&self.shared.slot_wait_ns, slot_wait_started.elapsed());
+            add_duration_ns(&self.state.slot_wait_ns, slot_wait_started.elapsed());
         }
 
-        let request_started = (self.shared.activity_counters_enabled
-            || self.shared.latency.get().is_some())
+        let request_started = (self.state.activity_counters_enabled
+            || self.state.latency.get().is_some())
         .then(Instant::now);
         self.submit_with_slot(operation, slot, request_started, nonblocking)
     }
@@ -1893,8 +1892,8 @@ impl IoEngine {
             slot,
             submitted_at: request_started,
         };
-        if self.shared.activity_counters_enabled {
-            self.shared
+        if self.state.activity_counters_enabled {
+            self.state
                 .requests_submitted
                 .fetch_add(1, Ordering::Release);
         }
@@ -1911,8 +1910,8 @@ impl IoEngine {
                 })
             }
             Err(TrySendError::Full(DriverCommand::Submit(task))) => {
-                if self.shared.activity_counters_enabled {
-                    self.shared
+                if self.state.activity_counters_enabled {
+                    self.state
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
                 }
@@ -1926,8 +1925,8 @@ impl IoEngine {
                 })
             }
             Err(TrySendError::Disconnected(DriverCommand::Submit(task))) => {
-                if self.shared.activity_counters_enabled {
-                    self.shared
+                if self.state.activity_counters_enabled {
+                    self.state
                         .requests_submitted
                         .fetch_sub(1, Ordering::Relaxed);
                 }
@@ -1952,9 +1951,7 @@ impl IoEngine {
             match self.commands.try_send(DriverCommand::Cancel(request_id)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    self.shared
-                        .cancel_scan_needed
-                        .store(true, Ordering::Release);
+                    self.state.cancel_scan_needed.store(true, Ordering::Release);
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(io::Error::new(
@@ -1977,7 +1974,7 @@ impl IoEngine {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
-        self.shared.stop_accepting_slots();
+        self.state.stop_accepting_slots();
         drop(submit_state);
         if let Some(wake) = &self.wake {
             wake.wake();
@@ -2015,7 +2012,7 @@ impl IoEngine {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             submit_state.accepting = false;
-            self.shared.stop_accepting_slots();
+            self.state.stop_accepting_slots();
             let mut error = None;
             for _ in 0..worker_count {
                 if self.commands.send(DriverCommand::Shutdown).is_err() {
@@ -2057,14 +2054,14 @@ impl Drop for IoEngine {
 
 #[cfg(unix)]
 pub fn build_file_engine(
-    files: RuntimeFileSet,
+    handles: DataFileHandles,
     config: IoEngineConfig,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<Arc<IoEngine>> {
     match config {
         IoEngineConfig::Posix { workers } => posix::start(
-            files,
+            handles,
             workers,
             workers,
             activity_counters_enabled,
@@ -2084,8 +2081,13 @@ pub fn build_file_engine(
                 )
             ))]
             {
-                uring::start(files, config, activity_counters_enabled, read_wait_enabled)
-                    .map(Arc::new)
+                uring::start(
+                    handles,
+                    config,
+                    activity_counters_enabled,
+                    read_wait_enabled,
+                )
+                .map(Arc::new)
             }
             #[cfg(not(all(
                 feature = "io-uring",
@@ -2099,7 +2101,7 @@ pub fn build_file_engine(
                 )
             )))]
             {
-                let _ = files;
+                let _ = handles;
                 let _ = config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,

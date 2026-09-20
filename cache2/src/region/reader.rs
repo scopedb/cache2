@@ -24,7 +24,6 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -35,6 +34,7 @@ use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::region::index::packed::IndexEntry;
 use crate::region::record::RECORD_ALIGNMENT;
@@ -322,29 +322,19 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::io::backend::IoBackend;
-    use crate::io::backend::SyncMode;
-    use crate::io::backend::SyncPoint;
-    use crate::io::backend::WritePoint;
     use crate::io::engine::IoEngine;
+    use crate::io::file::PositionedIo;
+    use crate::io::file::WritePoint;
     use crate::managed_memory::ManagedMemory;
     use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
 
     #[derive(Default)]
-    struct RecordingBackend {
+    struct RecordingIo {
         reads: Mutex<Vec<(u64, usize)>>,
     }
 
-    impl IoBackend for RecordingBackend {
-        fn len(&self) -> io::Result<u64> {
-            Ok(u64::MAX)
-        }
-
-        fn set_len(&self, _len: u64) -> io::Result<()> {
-            Ok(())
-        }
-
+    impl PositionedIo for RecordingIo {
         fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
             self.reads
                 .lock()
@@ -358,18 +348,6 @@ mod tests {
 
         fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "write unused"))
-        }
-
-        fn sync(&self, _point: SyncPoint, _mode: SyncMode) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn try_lock_exclusive(&self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn unlock(&self) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -396,8 +374,8 @@ mod tests {
 
     #[test]
     fn unaligned_record_uses_one_aligned_read_and_returns_its_exact_slice() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
@@ -421,7 +399,7 @@ mod tests {
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
 
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
-        let reads = backend
+        let reads = io
             .reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -438,8 +416,8 @@ mod tests {
 
     #[test]
     fn buffered_record_uses_one_size_class_upper_bound_read() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
             memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
@@ -461,8 +439,7 @@ mod tests {
         assert_eq!(completion.descriptor.record_range, 0..1120);
         assert_eq!(completion.record_bytes().unwrap().len(), 1120);
         assert_eq!(
-            backend
-                .reads
+            io.reads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
@@ -490,15 +467,14 @@ mod tests {
 
     #[test]
     fn invalid_entry_is_rejected_before_allocating_or_issuing_io() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let invalid = entry(PackedLocation::new(geometry().region_count, 0, 32).unwrap());
 
         let error = describe_read(geometry(), 7, candidate(invalid), true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
-            backend
-                .reads
+            io.reads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()

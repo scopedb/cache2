@@ -25,7 +25,7 @@ use hashcrew::xxhash::xxh3_64_with_seed;
 
 use crate::checksum::crc32c;
 #[cfg(test)]
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_RECORD_LEN;
 use crate::region::index::packed::PackedLocation;

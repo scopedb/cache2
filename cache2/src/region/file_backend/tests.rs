@@ -38,13 +38,13 @@ use crate::StatsOptions;
 use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
-use crate::io::backend::MAX_INTERRUPTED_RETRIES;
-use crate::io::backend::testing::FaultAction;
-use crate::io::backend::testing::FaultBackend;
-use crate::io::backend::testing::FaultEvent;
-use crate::io::backend::testing::FaultHandle;
-use crate::io::backend::testing::kill_process;
 use crate::io::engine::IoEngine;
+use crate::io::file::MAX_INTERRUPTED_RETRIES;
+use crate::io::file::testing::FaultAction;
+use crate::io::file::testing::FaultEvent;
+use crate::io::file::testing::FaultFile;
+use crate::io::file::testing::FaultHandle;
+use crate::io::file::testing::kill_process;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::region::RegionStageValue;
@@ -161,7 +161,7 @@ impl Drop for TestDirectory {
 #[test]
 fn state_page_reads_stop_after_the_interrupted_retry_budget() {
     let directory = TestDirectory::new();
-    let (state, faults) = FaultBackend::open(&directory.files.state).unwrap();
+    let (state, faults) = FaultFile::open(&directory.files.state).unwrap();
     state.set_len(STATE_FILE_SIZE as u64).unwrap();
     faults.arm(FaultEvent::Read, 1, FaultAction::ErrorAlways(libc::EINTR));
 
@@ -227,23 +227,23 @@ impl FaultRegionFileSystem {
 }
 
 impl RegionFileSystem for FaultRegionFileSystem {
-    type File = FaultBackend;
+    type File = FaultFile;
 
     fn open(&self, path: &Path, create: bool) -> io::Result<Self::File> {
         if create {
-            FaultBackend::open_with_handle(path, self.io.clone())
+            FaultFile::open_with_handle(path, self.io.clone())
         } else {
-            FaultBackend::open_existing_with_handle(path, self.io.clone())
+            FaultFile::open_existing_with_handle(path, self.io.clone())
         }
     }
 
-    fn try_clone_runtime_files(&self, _file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
+    fn try_clone_data_handles(&self, _file: &Self::File) -> io::Result<Option<DataFileHandles>> {
         self.file_system.check(FileSystemFault::CloneRuntimeFiles)?;
         Ok(None)
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File> {
-        FaultBackend::create_new_buffered_with_handle(path, self.io.clone())
+        FaultFile::create_new_buffered_with_handle(path, self.io.clone())
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -942,7 +942,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+    let (backend, faults) = FaultFile::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(backend), 2).unwrap();
     let value = vec![0x5a; 16 * 1024];
@@ -1106,7 +1106,7 @@ fn same_hash_candidate_requires_full_key() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, _) = FaultBackend::open(&directory.files.data).unwrap();
+    let (backend, _) = FaultFile::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
     let owner_key = b"collision-owner";
@@ -1251,7 +1251,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, faults) = FaultBackend::open(&directory.files.data).unwrap();
+    let (backend, faults) = FaultFile::open(&directory.files.data).unwrap();
     backend.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
     let hash = hash_key(data.hash_seed, b"key");

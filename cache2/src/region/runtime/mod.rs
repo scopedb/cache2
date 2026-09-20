@@ -52,7 +52,6 @@ use crate::config::runtime::read_io_wait_capacity;
 use crate::config::runtime::read_io_wait_timeout;
 use crate::config::storage_geometry;
 use crate::hashing::route_hash;
-use crate::io::backend::RuntimeFileSet;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
@@ -61,6 +60,7 @@ use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::submit_background_io;
+use crate::io::file::DataFileHandles;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -748,7 +748,7 @@ impl RegionDataPlane {
     pub fn new(
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
-        files: RuntimeFileSet,
+        files: DataFileHandles,
         config: CacheConfig,
     ) -> io::Result<Self> {
         // Recovery supplies independently validated metadata. It must still
@@ -1305,7 +1305,7 @@ impl RegionDataPlane {
     }
 
     /// Fences admission, drains all workers, and shuts down the I/O engine.
-    /// The return value asks the backend to retain flock for process lifetime
+    /// The return value asks the io to retain flock for process lifetime
     /// because an issued write or flush could not be fenced.
     pub fn shutdown(&self) -> io::Result<bool> {
         self.start_close();
@@ -1361,10 +1361,10 @@ fn aggregate_io_stats(
         // File-set clones intentionally share one path counter. Read it once
         // rather than multiplying the same totals by the number of workers.
         if engine_index == 0 {
-            aggregate.read.buffered = snapshot.runtime.read.buffered;
-            aggregate.read.direct = snapshot.runtime.read.direct;
-            aggregate.write.buffered = snapshot.runtime.write.buffered;
-            aggregate.write.direct = snapshot.runtime.write.direct;
+            aggregate.read.buffered = snapshot.file_io.read.buffered;
+            aggregate.read.direct = snapshot.file_io.read.direct;
+            aggregate.write.buffered = snapshot.file_io.write.buffered;
+            aggregate.write.direct = snapshot.file_io.write.direct;
         }
     }
     for engine in reclaim_engines {
@@ -1401,7 +1401,7 @@ fn add_io_direction(aggregate: &mut CacheIoDirectionSnapshot, snapshot: CacheIoD
 fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    files: RuntimeFileSet,
+    files: DataFileHandles,
     config: CacheConfig,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
@@ -1593,7 +1593,7 @@ fn start_running(
 }
 
 fn build_engine_pool(
-    files: RuntimeFileSet,
+    files: DataFileHandles,
     runtime: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
@@ -2246,10 +2246,10 @@ mod tests {
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
         let file = TestFile::new("read-lane");
-        let backend = file.backend();
+        let io = file.io();
         let engines: Box<[Arc<IoEngine>]> = vec![
-            Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()),
-            Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()),
+            Arc::new(IoEngine::for_test(Arc::clone(&io), 1).unwrap()),
+            Arc::new(IoEngine::for_test(Arc::clone(&io), 1).unwrap()),
         ]
         .into_boxed_slice();
         let pressure_cursor = AtomicUsize::new(0);
@@ -2277,15 +2277,15 @@ mod tests {
             engine.shutdown().unwrap();
         }
         drop(engines);
-        drop(backend);
+        drop(io);
     }
 
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
         let file = TestFile::new("read-lane-rotation");
-        let backend = file.backend();
+        let io = file.io();
         let engines: Box<[Arc<IoEngine>]> = (0..4)
-            .map(|_| Arc::new(IoEngine::for_test(Arc::clone(&backend), 1).unwrap()))
+            .map(|_| Arc::new(IoEngine::for_test(Arc::clone(&io), 1).unwrap()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let pressure_cursor = AtomicUsize::new(0);
@@ -2303,7 +2303,7 @@ mod tests {
             engine.shutdown().unwrap();
         }
         drop(engines);
-        drop(backend);
+        drop(io);
     }
 
     #[test]

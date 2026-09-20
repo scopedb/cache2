@@ -32,16 +32,16 @@ use crate::config::runtime::IoMode;
 use crate::config::runtime::RuntimeOptions;
 #[cfg(test)]
 use crate::config::storage::cache_config;
-use crate::io::backend::ControlIoBackend;
-use crate::io::backend::FileBackend;
-use crate::io::backend::IoBackend;
-use crate::io::backend::RuntimeFileSet;
-use crate::io::backend::SyncMode;
-use crate::io::backend::SyncPoint;
-use crate::io::backend::WritePoint;
-use crate::io::backend::read_at_bounded;
-use crate::io::backend::read_exact_at;
-use crate::io::backend::write_all_at;
+use crate::io::file::CacheFile;
+use crate::io::file::DataFileHandles;
+use crate::io::file::PositionedIo;
+use crate::io::file::StorageFile;
+use crate::io::file::SyncMode;
+use crate::io::file::SyncPoint;
+use crate::io::file::WritePoint;
+use crate::io::file::read_at_bounded;
+use crate::io::file::read_exact_at;
+use crate::io::file::write_all_at;
 use crate::region::FileRegionCore;
 use crate::region::RegionAccessState;
 use crate::region::RegionHealthLatch;
@@ -202,7 +202,7 @@ impl FileRegionRuntime {
     fn attach_data_plane(
         &mut self,
         data: DataSuperblock,
-        files: RuntimeFileSet,
+        files: DataFileHandles,
         config: CacheConfig,
     ) -> io::Result<()> {
         if self.data_plane.is_some() {
@@ -238,7 +238,7 @@ impl FileRegionRuntime {
 }
 
 pub trait RegionFileSystem {
-    type File: ControlIoBackend;
+    type File: StorageFile;
 
     fn open(&self, path: &Path, create: bool) -> io::Result<Self::File>;
 
@@ -246,7 +246,7 @@ pub trait RegionFileSystem {
         self.open(path, create)
     }
 
-    fn try_clone_runtime_files(&self, _file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
+    fn try_clone_data_handles(&self, _file: &Self::File) -> io::Result<Option<DataFileHandles>> {
         Ok(None)
     }
 
@@ -263,30 +263,30 @@ pub trait RegionFileSystem {
 pub struct SystemRegionFileSystem;
 
 impl RegionFileSystem for SystemRegionFileSystem {
-    type File = FileBackend;
+    type File = CacheFile;
 
     fn open(&self, path: &Path, create: bool) -> io::Result<Self::File> {
         if create {
-            FileBackend::open_with_io_mode(path, IoMode::Buffered)
+            CacheFile::open_with_io_mode(path, IoMode::Buffered)
         } else {
-            FileBackend::open_existing_with_io_mode(path, IoMode::Buffered)
+            CacheFile::open_existing_with_io_mode(path, IoMode::Buffered)
         }
     }
 
     fn open_data(&self, path: &Path, create: bool, mode: IoMode) -> io::Result<Self::File> {
         if create {
-            FileBackend::open_with_io_mode(path, mode)
+            CacheFile::open_with_io_mode(path, mode)
         } else {
-            FileBackend::open_existing_with_io_mode(path, mode)
+            CacheFile::open_existing_with_io_mode(path, mode)
         }
     }
 
-    fn try_clone_runtime_files(&self, file: &Self::File) -> io::Result<Option<RuntimeFileSet>> {
-        file.try_clone_runtime_files().map(Some)
+    fn try_clone_data_handles(&self, file: &Self::File) -> io::Result<Option<DataFileHandles>> {
+        file.try_clone_data_handles().map(Some)
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File> {
-        FileBackend::create_new_buffered(path)
+        CacheFile::create_new_buffered(path)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -680,7 +680,7 @@ where
         if !metadata.matches_image(data, header) {
             return self.cold_recovery("metadata_identity_mismatch");
         }
-        let file = image.try_clone_control_file()?;
+        let file = image.try_clone_mapping_file()?;
         self.cold_reset_needed = false;
         Ok(Some(CleanFileRegionImage {
             file,
@@ -837,7 +837,7 @@ where
             .data_file
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        if let Some(files) = self.file_system.try_clone_runtime_files(data_file)? {
+        if let Some(files) = self.file_system.try_clone_data_handles(data_file)? {
             runtime.attach_data_plane(data, files, self.config.clone())?;
         }
         Ok(runtime)
@@ -1074,14 +1074,14 @@ where
         let state_result = self
             .state_file
             .as_ref()
-            .map(IoBackend::unlock)
+            .map(StorageFile::unlock)
             .unwrap_or(Ok(()));
         let data_result = if self.retain_lock {
             Ok(())
         } else {
             self.data_file
                 .as_ref()
-                .map(IoBackend::unlock)
+                .map(StorageFile::unlock)
                 .unwrap_or(Ok(()))
         };
         self.locked = false;
@@ -1098,8 +1098,8 @@ fn inspect_or_format_data<D, S>(
     format_data: DataSuperblock,
 ) -> io::Result<(DataSuperblock, bool)>
 where
-    D: IoBackend,
-    S: IoBackend,
+    D: StorageFile,
+    S: StorageFile,
 {
     let file_len = file.len()?;
     if file_len >= RECOVERY_PAGE_SIZE as u64 {
@@ -1134,8 +1134,8 @@ where
 /// ever matching stale bytes, without scanning the file or its old records.
 fn format_empty_data<D, S>(file: &D, state: &S, format_data: DataSuperblock) -> io::Result<()>
 where
-    D: IoBackend,
-    S: IoBackend,
+    D: StorageFile,
+    S: StorageFile,
 {
     let encoded = format_data
         .encode()
@@ -1155,7 +1155,7 @@ where
 
 fn read_state_pages<B>(file: &B) -> io::Result<[[u8; RECOVERY_PAGE_SIZE]; STATE_SLOT_COUNT]>
 where
-    B: IoBackend,
+    B: PositionedIo,
 {
     let mut pages = [[0_u8; RECOVERY_PAGE_SIZE]; STATE_SLOT_COUNT];
     for (slot, page) in pages.iter_mut().enumerate() {
@@ -1195,7 +1195,7 @@ fn select_state_for_fence(
 
 fn write_state_page<B>(file: &B, page: &[u8; RECOVERY_PAGE_SIZE], offset: u64) -> io::Result<()>
 where
-    B: IoBackend,
+    B: PositionedIo,
 {
     write_all_at(file, WritePoint::State, page, offset)
 }
@@ -1462,13 +1462,13 @@ const fn anonymous_index_backing_name() -> &'static str {
     }
 }
 
-struct PositionedIoWriter<'a, B: IoBackend + ?Sized> {
+struct PositionedIoWriter<'a, B: PositionedIo + ?Sized> {
     backend: &'a B,
     point: WritePoint,
     offset: u64,
 }
 
-impl<'a, B: IoBackend + ?Sized> PositionedIoWriter<'a, B> {
+impl<'a, B: PositionedIo + ?Sized> PositionedIoWriter<'a, B> {
     const fn new(backend: &'a B, point: WritePoint, offset: u64) -> Self {
         Self {
             backend,
@@ -1482,7 +1482,7 @@ impl<'a, B: IoBackend + ?Sized> PositionedIoWriter<'a, B> {
     }
 }
 
-impl<B: IoBackend + ?Sized> Write for PositionedIoWriter<'_, B> {
+impl<B: PositionedIo + ?Sized> Write for PositionedIoWriter<'_, B> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.backend.write_at(self.point, buffer, self.offset)?;
         self.offset = self

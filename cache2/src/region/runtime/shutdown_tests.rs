@@ -17,12 +17,10 @@ use std::sync::mpsc;
 
 use super::*;
 use crate::IoEngineOptions;
-use crate::io::backend::IoBackend;
-use crate::io::backend::SyncMode;
-use crate::io::backend::SyncPoint;
-use crate::io::backend::WritePoint;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoRequest;
+use crate::io::file::PositionedIo;
+use crate::io::file::WritePoint;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -52,15 +50,7 @@ impl BlockedRead {
     }
 }
 
-impl IoBackend for BlockedRead {
-    fn len(&self) -> io::Result<u64> {
-        Ok(4096)
-    }
-
-    fn set_len(&self, _: u64) -> io::Result<()> {
-        Ok(())
-    }
-
+impl PositionedIo for BlockedRead {
     fn read_at(&self, bytes: &mut [u8], _: u64) -> io::Result<usize> {
         let mut state = self.state.lock().unwrap();
         state.started = true;
@@ -74,18 +64,6 @@ impl IoBackend for BlockedRead {
 
     fn write_at(&self, _: WritePoint, bytes: &[u8], _: u64) -> io::Result<usize> {
         Ok(bytes.len())
-    }
-
-    fn sync(&self, _: SyncPoint, _: SyncMode) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn try_lock_exclusive(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn unlock(&self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -142,10 +120,10 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     store.close_fast().unwrap();
     // Reuse a stopped runtime's fixed resources without unrelated workers.
     let shared = Arc::get_mut(&mut plane.shared).unwrap();
-    let backend = Arc::new(BlockedRead::default());
-    let engine = Arc::new(IoEngine::for_test(backend.clone(), 1).unwrap());
+    let io = Arc::new(BlockedRead::default());
+    let engine = Arc::new(IoEngine::for_test(io.clone(), 1).unwrap());
     let read_engine = Arc::clone(&engine);
-    let read_backend = Arc::clone(&backend);
+    let read_io = Arc::clone(&io);
     let managed_memory = Arc::clone(&shared.managed_memory);
     let submit_read = move || -> io::Result<IoRequest> {
         let slot = read_engine.try_reserve_read()?;
@@ -154,7 +132,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         let request = read_engine
             .submit_reserved_read(slot, IoOperation::read(buffer, 0))
             .map_err(|error| error.error)?;
-        read_backend.wait_started();
+        read_io.wait_started();
         Ok(request)
     };
     let (submitted, submission) = mpsc::channel();
@@ -182,7 +160,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         tx.send(result).unwrap();
     });
     let result = rx.recv_timeout(Duration::from_secs(1));
-    backend.release();
+    io.release();
     thread.join().unwrap();
     engine.shutdown().unwrap();
     std::fs::remove_dir_all(root).unwrap();

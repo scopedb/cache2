@@ -23,8 +23,6 @@ use std::io;
 #[cfg(test)]
 use std::time::Duration;
 
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
-use crate::io::backend::WritePoint;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
@@ -36,6 +34,8 @@ use crate::io::engine::RequestId;
 use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::recovery::RecoveryAttempt;
 use crate::io::engine::submit_background_io;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
+use crate::io::file::WritePoint;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
@@ -255,27 +255,17 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::io::backend::IoBackend;
-    use crate::io::backend::SyncMode;
-    use crate::io::backend::SyncPoint;
     use crate::io::engine::IoEngine;
+    use crate::io::file::PositionedIo;
     use crate::managed_memory::BufferLease;
 
     #[derive(Default)]
-    struct RecordingBackend {
+    struct RecordingIo {
         writes: Mutex<Vec<(WritePoint, u64, Vec<u8>)>>,
         delay: Duration,
     }
 
-    impl IoBackend for RecordingBackend {
-        fn len(&self) -> io::Result<u64> {
-            Ok(u64::MAX)
-        }
-
-        fn set_len(&self, _len: u64) -> io::Result<()> {
-            Ok(())
-        }
-
+    impl PositionedIo for RecordingIo {
         fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "read unused"))
         }
@@ -287,18 +277,6 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push((point, offset, buffer.to_vec()));
             Ok(buffer.len())
-        }
-
-        fn sync(&self, _point: SyncPoint, _mode: SyncMode) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn try_lock_exclusive(&self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn unlock(&self) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -325,11 +303,11 @@ mod tests {
 
     #[test]
     fn late_span_completion_remains_valid_and_keeps_engine_usable() {
-        let backend = Arc::new(RecordingBackend {
+        let io = Arc::new(RecordingIo {
             delay: CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(50),
-            ..RecordingBackend::default()
+            ..RecordingIo::default()
         });
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
@@ -353,15 +331,15 @@ mod tests {
             completion.buffer.unwrap().as_slice().unwrap(),
             &[0x5a; 4096]
         );
-        assert_eq!(backend.writes.lock().unwrap().len(), 1);
+        assert_eq!(io.writes.lock().unwrap().len(), 1);
         assert!(engine.try_reserve_read().is_ok());
         engine.shutdown().unwrap();
     }
 
     #[test]
     fn span_write_preserves_owned_buffer_and_maps_region_offset_exactly() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
 
@@ -377,7 +355,7 @@ mod tests {
         assert!(completion.buffer.is_some());
         drop(completion.buffer);
 
-        let writes = backend
+        let writes = io
             .writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -394,8 +372,8 @@ mod tests {
 
     #[test]
     fn invalid_span_returns_the_only_buffer_without_submitting_io() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut invalid = span();
         invalid.end_offset += 1;
         let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();
@@ -414,8 +392,7 @@ mod tests {
         assert!(error.buffer.is_some());
         drop(error.buffer);
         assert!(
-            backend
-                .writes
+            io.writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
