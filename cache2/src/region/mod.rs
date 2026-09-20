@@ -947,7 +947,7 @@ impl FileRegionCore {
         shard_id: usize,
         recovery: &crate::io::engine::recovery::BackgroundRecovery,
     ) -> io::Result<Option<RegionWriteSpan>> {
-        let recovery = recovery.attempt();
+        let mut recovery = recovery.attempt();
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
@@ -1042,7 +1042,7 @@ impl FileRegionCore {
             absolute,
             records,
         } = job;
-        let flight = match submit_span(engine, geometry, span, buffer, absolute, &recovery) {
+        let flight = match submit_span(engine, geometry, span, buffer, absolute, &mut recovery) {
             Ok(flight) => flight,
             Err(error) => {
                 let original = error.error;
@@ -1050,7 +1050,7 @@ impl FileRegionCore {
                 return Err(original);
             }
         };
-        let completion = flight.wait(engine, &recovery);
+        let completion = flight.wait(engine, &mut recovery);
         let RegionSpanCompletion {
             span,
             result,

@@ -765,7 +765,7 @@ impl BoundedIoRequest {
     pub fn wait_with_recovery(
         mut self,
         engine: &dyn IoEngine,
-        recovery: &RecoveryAttempt<'_>,
+        recovery: &mut RecoveryAttempt<'_>,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let original = self.deadline;
         loop {
@@ -948,7 +948,7 @@ pub fn submit_background_io(
     engine: &dyn IoEngine,
     mut operation: IoOperation,
     timeout: Duration,
-    recovery: &RecoveryAttempt<'_>,
+    recovery: &mut RecoveryAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
     let original = Instant::now()
         .checked_add(timeout)

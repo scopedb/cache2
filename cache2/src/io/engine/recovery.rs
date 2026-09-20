@@ -14,7 +14,6 @@
 
 //! Reversible background timeout recovery, separate from the health latch.
 
-use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -40,7 +39,7 @@ impl BackgroundRecovery {
     pub fn attempt(&self) -> RecoveryAttempt<'_> {
         RecoveryAttempt {
             recovery: self,
-            entered: Cell::new(false),
+            entered: false,
         }
     }
 
@@ -57,13 +56,13 @@ impl BackgroundRecovery {
 /// Failed attempts deliberately leave the fence raised until instance teardown.
 pub struct RecoveryAttempt<'a> {
     recovery: &'a BackgroundRecovery,
-    entered: Cell<bool>,
+    entered: bool,
 }
 
 impl RecoveryAttempt<'_> {
     /// Poll completion/admission at fixed one-second intervals, without extending
     /// a configured total budget. Shutdown also terminates unlimited recovery.
-    pub fn next_deadline(&self, original: Instant) -> Option<Instant> {
+    pub fn next_deadline(&mut self, original: Instant) -> Option<Instant> {
         if self.recovery.stopped.load(Ordering::Acquire) {
             return None;
         }
@@ -79,18 +78,19 @@ impl RecoveryAttempt<'_> {
             }
             None => deadline,
         };
-        if !self.entered.replace(true) && self.recovery.pending.fetch_add(1, Ordering::AcqRel) == 0
-        {
-            log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
+        if !self.entered {
+            self.entered = true;
+            if self.recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
+                log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
                 "background I/O timed out; pausing cache fills while retaining owned requests");
+            }
         }
         Some(deadline)
     }
 
     /// Called only after operation-result validation and publication succeed.
-    pub fn finish(&self) {
-        if self.entered.replace(false) && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1
-        {
+    pub fn finish(self) {
+        if self.entered && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
                 "all timed-out background operations recovered and passed validation");
         }

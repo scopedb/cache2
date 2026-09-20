@@ -323,8 +323,8 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     let plane = store.data_plane_handle().unwrap();
     plane.put(b"existing", b"value").unwrap();
     plane.drain().unwrap();
-    let first = plane.shared.recovery.attempt();
-    let second = plane.shared.recovery.attempt();
+    let mut first = plane.shared.recovery.attempt();
+    let mut second = plane.shared.recovery.attempt();
     assert!(first.next_deadline(Instant::now()).is_some());
     assert!(second.next_deadline(Instant::now()).is_some());
     assert_eq!(plane.snapshot().unwrap().health, CacheHealth::Recovering);

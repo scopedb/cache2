@@ -1239,7 +1239,7 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
             scope.spawn(move || {
                 tx.send(request.wait_with_recovery(
                     engine,
-                    &BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
+                    &mut BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
                 ))
                 .unwrap();
             });
@@ -1286,7 +1286,7 @@ fn exhausted_background_recovery_still_fences_unfinished_writes() {
     request.cancel_grace = Duration::from_millis(10);
     let result = request.wait_with_recovery(
         &engine,
-        &BackgroundRecovery::new(Some(Duration::from_millis(20))).attempt(),
+        &mut BackgroundRecovery::new(Some(Duration::from_millis(20))).attempt(),
     );
     let pending = engine.writes_in_flight();
     let rejected = engine.submit(IoOperation::write(
@@ -1320,18 +1320,15 @@ fn background_admission_recovers_without_duplicate_submission() {
         let engine = &engine;
         let managed_memory = &managed_memory;
         scope.spawn(move || {
+            let recovery = BackgroundRecovery::new(Some(Duration::from_secs(2)));
+            let mut attempt = recovery.attempt();
             let result = submit_background_io(
                 engine,
                 IoOperation::read(read_buffer(managed_memory, 4096), 0),
                 Duration::from_millis(10),
-                &BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
+                &mut attempt,
             )
-            .map(|request| {
-                request.wait_with_recovery(
-                    engine,
-                    &BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
-                )
-            });
+            .map(|request| request.wait_with_recovery(engine, &mut attempt));
             tx.send(result).unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(50));
@@ -1375,8 +1372,8 @@ fn unlimited_recovery_keeps_admission_paused_until_validation() {
         let recovery = &recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let attempt = recovery.attempt();
-            let completion = request.wait_with_recovery(engine, &attempt).unwrap();
+            let mut attempt = recovery.attempt();
+            let completion = request.wait_with_recovery(engine, &mut attempt).unwrap();
             completed_tx.send(completion).unwrap();
             validate_rx.recv().unwrap();
             attempt.finish();
@@ -1422,8 +1419,8 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
         let recovery = &recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let attempt = recovery.attempt();
-            tx.send(request.wait_with_recovery(engine, &attempt))
+            let mut attempt = recovery.attempt();
+            tx.send(request.wait_with_recovery(engine, &mut attempt))
                 .unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(30));

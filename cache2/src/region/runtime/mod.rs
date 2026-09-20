@@ -1747,7 +1747,7 @@ fn reclaim_worker_result(
             if shared.reclaim_control.is_stopped()? {
                 return Ok(());
             }
-            let recovery = shared.recovery.attempt();
+            let mut recovery = shared.recovery.attempt();
             let Some(receipt) = shared.core.begin_reclaim()? else {
                 break;
             };
@@ -1774,11 +1774,11 @@ fn reclaim_worker_result(
                     engine.as_ref(),
                     IoOperation::read(io_buffer, absolute),
                     shared.reclaim_io_timeout,
-                    &recovery,
+                    &mut recovery,
                 )
                 .map_err(|error| error.into_lease().0)?;
                 let completion = request
-                    .wait_with_recovery(engine.as_ref(), &recovery)
+                    .wait_with_recovery(engine.as_ref(), &mut recovery)
                     .map_err(|error| error.into_lease().0)?;
                 let (result, returned) = completion.into_lease();
                 let transferred = result?;

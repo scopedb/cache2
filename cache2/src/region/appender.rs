@@ -86,7 +86,7 @@ impl RegionSpanFlight {
     pub fn wait(
         self,
         engine: &dyn IoEngine,
-        recovery: &RecoveryAttempt<'_>,
+        recovery: &mut RecoveryAttempt<'_>,
     ) -> RegionSpanCompletion {
         let completion = match self.request.wait_with_recovery(engine, recovery) {
             Ok(completion) => completion,
@@ -147,7 +147,7 @@ pub fn submit_span(
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
-    recovery: &RecoveryAttempt<'_>,
+    recovery: &mut RecoveryAttempt<'_>,
 ) -> Result<RegionSpanFlight, RegionSpanSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
@@ -333,20 +333,21 @@ mod tests {
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
+        let recovery = BackgroundRecovery::new(Some(Duration::from_secs(5)));
+        let mut attempt = recovery.attempt();
         let completion = submit_span(
             &engine,
             geometry(),
             span(),
             IoBuffer::for_write(lease, 4096).unwrap(),
             absolute,
-            &BackgroundRecovery::new(Some(Duration::from_secs(5))).attempt(),
+            &mut attempt,
         )
         .unwrap()
-        .wait(
-            &engine,
-            &BackgroundRecovery::new(Some(Duration::from_secs(5))).attempt(),
-        );
+        .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
+        attempt.finish();
+        assert!(!recovery.is_recovering());
         assert_eq!(completion.span, span());
         assert_eq!(
             completion.buffer.unwrap().as_slice().unwrap(),
@@ -366,19 +367,11 @@ mod tests {
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
-        let completion = submit_span(
-            &engine,
-            geometry(),
-            span(),
-            buffer,
-            absolute,
-            &BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
-        )
-        .unwrap()
-        .wait(
-            &engine,
-            &BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
-        );
+        let recovery = BackgroundRecovery::new(Some(Duration::ZERO));
+        let mut attempt = recovery.attempt();
+        let completion = submit_span(&engine, geometry(), span(), buffer, absolute, &mut attempt)
+            .unwrap()
+            .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
         assert_eq!(completion.span, span());
         assert!(completion.buffer.is_some());
@@ -412,7 +405,7 @@ mod tests {
             invalid,
             buffer,
             0,
-            &BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
+            &mut BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
         ) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),
