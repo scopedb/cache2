@@ -228,6 +228,8 @@ record_command() {
   echo "backing_source=$backing_source"
   echo "device_qualification=$device_qualification"
   echo "performance_gates_configured=$performance_gate_count/4"
+  echo "benchmark_features=io-uring"
+  echo "benchmark_activity_counters=true"
   echo "[performance-gates]"
   for gate in "${performance_gates[@]}"; do
     echo "$gate=${!gate:-unset}"
@@ -319,29 +321,44 @@ run_benchmark_profile() {
   local read_workers=$4
   local write_workers=$5
   local runs=$6
+  shift 6
+  local extra_env=("$@")
   local log=$report_directory/benchmark-$profile.log
   local run
   for ((run = 1; run <= runs; run++)); do
     echo "profile=$profile run=$run/$runs"
-    CACHE_BENCH_DIR="$cache_directory" \
-    CACHE_BENCH_IO_ENGINE="$engine" \
-    CACHE_BENCH_IO_MODE="$mode" \
-    CACHE_BENCH_POSIX_READ_WORKERS="$read_workers" \
-    CACHE_BENCH_POSIX_WRITE_WORKERS="$write_workers" \
-      cargo +1.98.0 bench --locked --package benchmarks --bench cache --quiet 2>&1 | tee -a "$log"
+    env \
+      CACHE_BENCH_DIR="$cache_directory" \
+      CACHE_BENCH_IO_ENGINE="$engine" \
+      CACHE_BENCH_IO_MODE="$mode" \
+      CACHE_BENCH_POSIX_READ_WORKERS="$read_workers" \
+      CACHE_BENCH_POSIX_WRITE_WORKERS="$write_workers" \
+      CACHE_BENCH_ACTIVITY_COUNTERS=true \
+      "${extra_env[@]}" \
+      cargo +1.98.0 bench --locked --package benchmarks --bench cache --features io-uring \
+      --quiet 2>&1 | tee -a "$log"
   done
   summarize_profile "$profile" "$runs" "$log"
 }
 
 echo "building release benchmark targets"
-cargo +1.98.0 build --locked --release --package benchmarks --benches
+cargo +1.98.0 build --locked --release --package benchmarks --benches --features io-uring
 
 run_benchmark_profile posix-buffered posix buffered 4 4 "$benchmark_runs"
 run_benchmark_profile posix-direct posix direct 4 4 "$benchmark_runs"
 
 for workers in 1 2 4 8 16; do
   run_benchmark_profile "posix-direct-workers-$workers" \
-    posix direct "$workers" "$workers" 1
+    posix direct "$workers" "$workers" 1 \
+    "CACHE_BENCH_CLIENTS=$workers"
+done
+
+for inflight in 16 32 64; do
+  run_benchmark_profile "io-uring-direct-inflight-$inflight" \
+    io-uring direct 1 4 1 \
+    "CACHE_BENCH_CLIENTS=$inflight" \
+    "CACHE_BENCH_IO_URING_READ_RINGS=1" \
+    "CACHE_BENCH_IO_URING_READ_MAX_IN_FLIGHT=$inflight"
 done
 
 echo "starting ${soak_seconds}s POSIX/buffered turnover soak"
@@ -353,7 +370,8 @@ CACHE_SOAK_FINAL_WARM_VERIFY=true \
 CACHE_SOAK_REQUIRE_PATH_COVERAGE=true \
 CACHE_SOAK_IO_ENGINE=posix \
 CACHE_SOAK_IO_MODE=buffered \
-  cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak --quiet 2>&1 \
+  cargo +1.98.0 bench --locked --package benchmarks --bench cache_soak --features io-uring \
+  --quiet 2>&1 \
   | tee "$report_directory/soak-posix-buffered.log"
 
 if ! grep -q '^warm_verification .* errors=0$' \

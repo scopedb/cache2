@@ -200,7 +200,7 @@ runtime.read_admission = ReadAdmission::Wait {
 
 A full wait queue, memory pressure, or deadline expiry returns explicit `ErrorKind::Overloaded`. Making the timeout longer does not enlarge the queue and cannot compensate for severely undersized execution capacity. If busy misses or queue-full overloads dominate, add execution capacity or reduce L2 demand. If memory misses dominate, adding capacity can make the problem worse; add managed headroom, reduce retained buffers, or improve L1 promotion instead.
 
-Size POSIX workers from peak concurrent L2 reads, not total requests. For a strict-hit bias, provision close to that peak and use immediate admission or a very short wait. For a memory/thread bias, use fewer workers plus a short deadline and accept explicit overload. Validate p99 as well as hit rate.
+Size POSIX workers from peak concurrent L2 reads, not total requests. For io_uring, size `max_in_flight` to that same concurrent depth and keep ring count low until driver CPU is the measured limit. For a strict-hit bias, provision close to that peak and use immediate admission or a very short wait. For a memory/thread bias, use fewer workers plus a short deadline and accept explicit overload. Validate p99 as well as hit rate.
 
 Direct I/O expands reads to 4 KiB boundaries within the selected Region. Small or unaligned records therefore need more buffer and device bytes than their payload size suggests. Include that amplification when setting memory headroom and read concurrency.
 
@@ -361,6 +361,17 @@ For low overhead start with counters and, if needed, full L2 lookup and I/O late
 - Reserve managed-memory headroom for concurrent aligned L2 reads and for Region-backed values retained by callers.
 - Validate direct-I/O read amplification if Direct mode is used.
 
+### Linux NVMe Direct I/O
+
+Use this profile when the data set exceeds host RAM and the goal is device behavior rather than page-cache behavior.
+
+- Keep Buffered POSIX as the portable production default; switch to Direct only after measuring amplification and warm-close cost on the target filesystem.
+- Size POSIX `read_workers` to the application's concurrent L2 get depth. Worker count is both thread count and admission depth.
+- For experimental io_uring, start with one read ring and set `max_in_flight` to that same concurrent get depth. Extra rings do not add execution slots.
+- Keep write execution modest; more write workers cannot exceed sequential device fill.
+- Profile IOPOLL separately with `IoUringPoolOptions::io_poll` and Direct I/O on a polling-capable filesystem; do not enable it from ring or in-flight sweeps.
+- Watch `requests_in_flight_peak`, `slot_wait_ns`, `l2_read_busy_misses`, and Direct versus served-byte amplification instead of throughput alone.
+
 ## Diagnostic map
 
 Use `Cache::snapshot()` for regular telemetry and `Cache::detailed_snapshot()` for periodic diagnosis.
@@ -379,6 +390,8 @@ Use `Cache::snapshot()` for regular telemetry and `Cache::detailed_snapshot()` f
 | `reinsert_skipped` rises while `reinsert_budget_skipped` is zero    | Reinsertion staging/validation pressure           | Reduce concurrent reclaim or foreground pressure; do not increase the byte budget indirectly |
 | `reinsert_budget_skipped` rises                                     | Hot live bytes exceed the fixed reclaim allowance | Treat retention as best effort; change capacity/workload geometry rather than worker count   |
 | High `l1_bypasses` with useful candidates                           | L1 contention, slots, or byte pressure            | Inspect L1 occupancy, retained bytes, shards, capacity, and oversized values                 |
+| Read in-flight peak stays below configured capacity                 | Caller concurrency below engine depth             | Match concurrent L2 gets to `read_workers` or `max_in_flight`; extra rings add no slots      |
+| Direct read bytes much larger than `served_bytes`                   | Size-class and 4 KiB alignment amplification      | Treat `read_amp` as device work, not a miss; raise entry size or accept extra bytes          |
 | Managed-memory peak approaches the limit                            | Fixed or transient memory pressure                | Rebalance index, L1, staging, I/O topology, and read headroom                                |
 | `fill_control.pressure` is `Paused` while `health` is `Running`     | Pre-timeout slow background I/O                   | Expected Adaptive load-shed; correlate with device queueing before treating it as a fault    |
 | Pause refusals with little device wait                              | Checkpoint fired without device saturation        | Confirm I/O timeouts and host scheduling; `FillLimits` do not drive pause                    |

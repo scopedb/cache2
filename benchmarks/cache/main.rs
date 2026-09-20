@@ -351,7 +351,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("C² cache benchmark");
     println!("stats={:?}", config.stats);
     println!(
-        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} activity_counters={}",
+        "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} configured_read_in_flight={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} activity_counters={}",
         config.entries,
         index_slots,
         index_load,
@@ -364,6 +364,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         initial_l1_bytes as f64 / MIB as f64,
         config.managed_memory_limit_bytes as f64 / MIB as f64,
         config.append_shards,
+        read_max_in_flight(config.io_engine),
         config.read_io_wait_capacity,
         config.read_io_wait_timeout.as_micros(),
         config.read_latency_sample_interval,
@@ -579,13 +580,30 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             snapshot.l1_hits,
             snapshot.l1_misses,
         );
+        let payload_bytes = snapshot.served_bytes;
+        let io_bytes = snapshot
+            .io
+            .read
+            .buffered
+            .bytes
+            .saturating_add(snapshot.io.read.direct.bytes);
+        let read_amp = if payload_bytes == 0 {
+            0.0
+        } else {
+            io_bytes as f64 / payload_bytes as f64
+        };
         println!(
-            "result phase=read_io requests={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={} busy_misses={} memory_misses={}",
+            "result phase=read_io requests={} buffered_operations={} buffered_bytes={} direct_operations={} direct_bytes={} in_flight_peak={} configured_in_flight={} slot_wait_ns={} payload_bytes={} read_amp={:.3} busy_misses={} memory_misses={}",
             snapshot.io.read.requests_succeeded,
             snapshot.io.read.buffered.operations,
             snapshot.io.read.buffered.bytes,
             snapshot.io.read.direct.operations,
             snapshot.io.read.direct.bytes,
+            snapshot.io.read.requests_in_flight_peak,
+            read_max_in_flight(config.io_engine),
+            snapshot.io.read.slot_wait_ns,
+            payload_bytes,
+            read_amp,
             snapshot.l2_read_busy_misses,
             snapshot.l2_read_memory_misses,
         );
