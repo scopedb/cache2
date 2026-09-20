@@ -78,11 +78,11 @@ fn submitted_read_must_not_pin_close() {
 }
 
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
+    use crate::cache::session::CacheSession;
     use crate::config::runtime::PosixIoOptions;
     use crate::region::file_backend::FileRegionBackend;
     use crate::region::file_backend::RegionPaths;
     use crate::region::recovery::PersistentId;
-    use crate::region::store::RegionStore;
     let root = env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
         std::process::id()
@@ -111,7 +111,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         }),
         ..RuntimeOptions::default()
     };
-    let mut store = RegionStore::open(
+    let mut store = CacheSession::open(
         8,
         FileRegionBackend::for_test_with_options(paths, data, 8, config),
     )
@@ -181,10 +181,10 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
 
 #[test]
 fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
+    use crate::cache::session::CacheSession;
     use crate::region::file_backend::FileRegionBackend;
     use crate::region::file_backend::RegionPaths;
     use crate::region::recovery::PersistentId;
-    use crate::region::store::RegionStore;
     use crate::snapshot::CacheHealth;
     let root = env::temp_dir().join(format!("cache2-recovery-admission-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -206,7 +206,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         l1_capacity_bytes: 0,
         ..RuntimeOptions::default()
     };
-    let mut store = RegionStore::open(
+    let mut store = CacheSession::open(
         8,
         FileRegionBackend::for_test_with_options(paths, data, 8, config),
     )

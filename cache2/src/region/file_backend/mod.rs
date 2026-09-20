@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! File ownership, recovery, and lifecycle adapter for the Region core.
+//! File ownership, recovery, and lifecycle adapter for the Region regions.
 
 use std::fmt;
 use std::fs::File;
@@ -43,11 +43,10 @@ use crate::io::file::write_all_at;
 use crate::io::fs::FileSystem;
 use crate::io::fs::OsFileSystem;
 use crate::io::fs::parent_directory;
-use crate::region::FileRegionCore;
-use crate::region::RegionAccessState;
+use crate::region::AppendShardGate;
 use crate::region::RegionHealthLatch;
-use crate::region::RegionManagerAuthority;
-use crate::region::RegionShard;
+use crate::region::RegionManagerLock;
+use crate::region::RegionStore;
 use crate::region::guarded_index_result;
 use crate::region::index::RegionIndex;
 use crate::region::index::packed::MAX_INDEX_PARTITIONS;
@@ -83,7 +82,7 @@ use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
 use crate::region::recovery::metadata::RegionMetadataRecord;
 use crate::region::recovery::metadata::RegionMetadataRoot;
-use crate::region::recovery::metadata::RegionMetadataState;
+use crate::region::recovery::metadata::RegionState;
 use crate::region::recovery::prepare_next_state;
 use crate::region::recovery::prepare_running_barrier;
 use crate::region::recovery::recovery_image_index_len;
@@ -116,19 +115,19 @@ impl RegionPaths {
     }
 }
 pub struct FileRegionRuntime {
-    core: Arc<FileRegionCore>,
+    regions: Arc<RegionStore>,
     data_plane: Option<RegionDataPlane>,
 }
 
 impl Deref for FileRegionRuntime {
-    type Target = FileRegionCore;
+    type Target = RegionStore;
 
     fn deref(&self) -> &Self::Target {
-        &self.core
+        &self.regions
     }
 }
 pub struct FrozenFileRegionView {
-    core: Arc<FileRegionCore>,
+    regions: Arc<RegionStore>,
     metadata: RegionMetadata,
 }
 
@@ -161,8 +160,8 @@ impl FileRegionRuntime {
             ));
         }
         let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
-        let mut shards = Vec::new();
-        shards
+        let mut append_gates = Vec::new();
+        append_gates
             .try_reserve_exact(manager.active_regions().len())
             .map_err(|_| {
                 io::Error::new(
@@ -170,9 +169,9 @@ impl FileRegionRuntime {
                     "cannot allocate data shard gates",
                 )
             })?;
-        shards.resize_with(manager.active_regions().len(), RegionShard::default);
-        let mut region_access = Vec::new();
-        region_access
+        append_gates.resize_with(manager.active_regions().len(), AppendShardGate::default);
+        let mut region_generations = Vec::new();
+        region_generations
             .try_reserve_exact(manager.regions().len())
             .map_err(|_| {
                 io::Error::new(
@@ -181,18 +180,16 @@ impl FileRegionRuntime {
                 )
             })?;
         for region in manager.regions() {
-            region_access.push(RegionAccessState {
-                generation: AtomicU64::new(region.created_seqno),
-            });
+            region_generations.push(AtomicU64::new(region.created_seqno));
         }
         let health = RegionHealthLatch::healthy();
         let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
         Ok(Self {
-            core: Arc::new(FileRegionCore {
+            regions: Arc::new(RegionStore {
                 index,
-                manager: RegionManagerAuthority::new(manager, health.clone()),
-                shards: shards.into_boxed_slice(),
-                region_access: region_access.into_boxed_slice(),
+                manager: RegionManagerLock::new(manager, health.clone()),
+                append_gates: append_gates.into_boxed_slice(),
+                region_generations: region_generations.into_boxed_slice(),
                 rotation: Mutex::new(()),
                 health,
             }),
@@ -213,7 +210,7 @@ impl FileRegionRuntime {
             ));
         }
         self.data_plane = Some(RegionDataPlane::new(
-            Arc::clone(&self.core),
+            Arc::clone(&self.regions),
             data,
             handles,
             config,
@@ -393,7 +390,7 @@ where
         if self.locked {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "RegionStore backend is already locked",
+                "CacheSession backend is already locked",
             ));
         }
         if self.paths.data == self.paths.state
@@ -402,7 +399,7 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore data/state/image paths must be distinct",
+                "CacheSession data/state/image paths must be distinct",
             ));
         }
         if parent_directory(&self.paths.data) != parent_directory(&self.paths.state)
@@ -410,7 +407,7 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore data/state/image files must share one directory",
+                "CacheSession data/state/image files must share one directory",
             ));
         }
         let temporary = recovery_temporary_path(&self.paths.image);
@@ -420,7 +417,7 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore recovery temporary path collides with a cache file",
+                "CacheSession recovery temporary path collides with a cache file",
             ));
         }
         let data = self
@@ -448,7 +445,7 @@ where
             let _ = data.unlock();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore data and state paths resolve to the same file",
+                "CacheSession data and state paths resolve to the same file",
             ));
         }
         if let Err(error) = state.try_lock_exclusive() {
@@ -530,7 +527,7 @@ where
         if image.is_same_file(data_file)? || image.is_same_file(state_file)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RegionStore image aliases the data or state file",
+                "CacheSession image aliases the data or state file",
             ));
         }
 
@@ -817,24 +814,27 @@ where
             }
         }
         runtime.health.require_healthy()?;
-        let core = runtime.core;
-        if core.shards.iter().any(|shard| shard.mutation.is_poisoned())
-            || core.rotation.is_poisoned()
+        let regions = runtime.regions;
+        if regions
+            .append_gates
+            .iter()
+            .any(|shard| shard.mutation.is_poisoned())
+            || regions.rotation.is_poisoned()
         {
-            core.health.enter_miss_only();
+            regions.health.enter_miss_only();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "data shard gate is poisoned",
             ));
         }
-        let partitions = index_partition_metadata(core.index.storage(), &core.health)?;
-        let metadata = core
+        let partitions = index_partition_metadata(regions.index.storage(), &regions.health)?;
+        let metadata = regions
             .manager
             .lock()?
             .freeze_metadata(partitions)
             .map_err(region_metadata_io_error)?;
-        core.health.require_healthy()?;
-        Ok(FrozenFileRegionView { core, metadata })
+        regions.health.require_healthy()?;
+        Ok(FrozenFileRegionView { regions, metadata })
     }
 
     /// Make completed data and one complete image durable.
@@ -842,13 +842,13 @@ where
         &mut self,
         view: &FrozenFileRegionView,
     ) -> io::Result<PreparedFileRegionClean> {
-        let health = &view.core.health;
+        let health = &view.regions.health;
         health.require_healthy()?;
         let source_metadata = &view.metadata;
         source_metadata
             .validate()
             .map_err(region_metadata_io_error)?;
-        let storage = view.core.index.storage();
+        let storage = view.regions.index.storage();
         let physical_stats = guarded_index_result(health, storage.physical_stats())?;
         let partition_stats = guarded_index_result(health, storage.partition_stats())?;
         if source_metadata.root.index_slots
@@ -1269,12 +1269,12 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
 fn empty_region_metadata(
     data: DataSuperblock,
     index_slots: usize,
-    shards: u32,
+    append_gates: u32,
 ) -> io::Result<RegionMetadata> {
-    if shards == 0 || data.geometry.region_count <= shards {
+    if append_gates == 0 || data.geometry.region_count <= append_gates {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RegionStore requires one Active Region per shard plus one spare",
+            "CacheSession requires one Active Region per shard plus one spare",
         ));
     }
     let partition_ranges =
@@ -1292,7 +1292,7 @@ fn empty_region_metadata(
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate Region table"))?;
     let mut free_ordinal = 0_u32;
     for region_id in 0..data.geometry.region_count {
-        let active = region_id < shards;
+        let active = region_id < append_gates;
         let queue_ordinal = if active {
             region_id
         } else {
@@ -1304,9 +1304,9 @@ fn empty_region_metadata(
         };
         regions.push(RegionMetadataRecord {
             state: if active {
-                RegionMetadataState::Active
+                RegionState::Active
             } else {
-                RegionMetadataState::Free
+                RegionState::Free
             },
             queue_ordinal,
             created_seqno: if active { u64::from(region_id) + 1 } else { 0 },
@@ -1330,10 +1330,10 @@ fn empty_region_metadata(
             partition_count: u32::try_from(partition_ranges.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "too many index partitions")
             })?,
-            shard_count: shards,
-            max_seqno: u64::from(shards),
-            free_region_count: data.geometry.region_count - shards,
-            active_region_count: shards,
+            shard_count: append_gates,
+            max_seqno: u64::from(append_gates),
+            free_region_count: data.geometry.region_count - append_gates,
+            active_region_count: append_gates,
             sealed_region_count: 0,
         },
         regions: regions.into_boxed_slice(),

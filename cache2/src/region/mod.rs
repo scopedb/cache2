@@ -38,7 +38,7 @@ use self::manager::RegionReclaimReceipt;
 use self::reader::PendingRead;
 use self::reader::ReadCandidate;
 use self::reader::ReadCompletion;
-use self::reader::ReadDescriptor;
+use self::reader::ReadDesc;
 #[cfg(test)]
 use self::reader::describe_read;
 use self::reader::submit_read;
@@ -76,7 +76,7 @@ use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
 use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadataError;
-use crate::region::staging::RegionStaging;
+use crate::region::staging::AppendStaging;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
@@ -87,7 +87,6 @@ pub mod record;
 pub mod recovery;
 pub mod runtime;
 pub mod staging;
-pub mod store;
 
 mod appender;
 mod reader;
@@ -151,7 +150,7 @@ impl RegionHealthLatch {
         self.is_healthy().then_some(()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore is miss-only and cannot publish CLEAN",
+                "Region store is miss-only and cannot publish CLEAN",
             )
         })
     }
@@ -160,32 +159,32 @@ impl RegionHealthLatch {
 /// The steady-state owner of Region allocation, FIFO rotation, and write-span
 /// accounting. Index publication is deliberately independent; reads validate
 /// the physical record locally and may observe an older valid completion.
-struct RegionManagerAuthority {
-    inner: Mutex<RegionManager>,
+struct RegionManagerLock {
+    state: Mutex<RegionManager>,
     health: RegionHealthLatch,
 }
 
-impl RegionManagerAuthority {
+impl RegionManagerLock {
     fn new(manager: RegionManager, health: RegionHealthLatch) -> Self {
         Self {
-            inner: Mutex::new(manager),
+            state: Mutex::new(manager),
             health,
         }
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, RegionManager>> {
         self.health.require_healthy()?;
-        match self.inner.lock() {
+        match self.state.lock() {
             Ok(guard) if self.health.is_healthy() => Ok(guard),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore became miss-only while acquiring Region authority",
+                "Region store became miss-only while acquiring Region authority",
             )),
             Err(_) => {
                 self.health.enter_miss_only();
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "RegionStore Region authority is poisoned",
+                    "Region manager is poisoned",
                 ))
             }
         }
@@ -193,35 +192,31 @@ impl RegionManagerAuthority {
 
     fn try_lock(&self) -> io::Result<Option<MutexGuard<'_, RegionManager>>> {
         self.health.require_healthy()?;
-        match self.inner.try_lock() {
+        match self.state.try_lock() {
             Ok(guard) if self.health.is_healthy() => Ok(Some(guard)),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore became miss-only while acquiring Region authority",
+                "Region store became miss-only while acquiring Region authority",
             )),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Poisoned(_)) => {
                 self.health.enter_miss_only();
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "RegionStore Region authority is poisoned",
+                    "Region manager is poisoned",
                 ))
             }
         }
     }
 }
 
-pub struct FileRegionCore {
+pub struct RegionStore {
     index: RegionIndex,
-    manager: RegionManagerAuthority,
-    shards: Box<[RegionShard]>,
-    region_access: Box<[RegionAccessState]>,
+    manager: RegionManagerLock,
+    append_gates: Box<[AppendShardGate]>,
+    region_generations: Box<[AtomicU64]>,
     rotation: Mutex<()>,
     health: RegionHealthLatch,
-}
-
-struct RegionAccessState {
-    generation: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -248,7 +243,7 @@ pub struct RegionReinsertRecord<'a> {
 /// staging transitions one operation. Span completion and rotation are already
 /// ordered by the shard's single production worker.
 #[derive(Default)]
-struct RegionShard {
+struct AppendShardGate {
     mutation: Mutex<()>,
 }
 
@@ -288,9 +283,9 @@ impl RegionValueRead {
     }
 }
 
-impl FileRegionCore {
+impl RegionStore {
     pub const fn shard_count(&self) -> usize {
-        self.shards.len()
+        self.append_gates.len()
     }
 
     pub const fn index_slot_count(&self) -> usize {
@@ -309,7 +304,7 @@ impl FileRegionCore {
     }
 
     pub fn append_shard(&self, hash: u64) -> usize {
-        route_hash(hash, self.shards.len())
+        route_hash(hash, self.append_gates.len())
     }
 
     pub fn region_snapshot(&self) -> io::Result<RegionSnapshot> {
@@ -509,8 +504,8 @@ impl FileRegionCore {
     /// Releases one fully scanned source only after every accepted replacement
     /// batch has completed and conditionally published.
     pub fn complete_reclaim(&self, receipt: RegionReclaimReceipt) -> io::Result<()> {
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(receipt.region_id as usize)
             .ok_or_else(|| {
                 io::Error::new(
@@ -518,7 +513,7 @@ impl FileRegionCore {
                     "reclaim Region id is out of bounds",
                 )
             })?;
-        access.generation.store(0, Ordering::Release);
+        generation.store(0, Ordering::Release);
         self.manager
             .lock()?
             .finish_reclaim(receipt)
@@ -539,12 +534,12 @@ impl FileRegionCore {
     }
 
     fn lock_shard_mutation(&self, shard_id: usize) -> io::Result<MutexGuard<'_, ()>> {
-        let shard = self.shard(shard_id)?;
+        let shard = self.append_gate(shard_id)?;
         self.lock_shard_gate(&shard.mutation)
     }
 
-    fn shard(&self, shard_id: usize) -> io::Result<&RegionShard> {
-        self.shards.get(shard_id).ok_or_else(|| {
+    fn append_gate(&self, shard_id: usize) -> io::Result<&AppendShardGate> {
+        self.append_gates.get(shard_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "data shard is out of bounds")
         })
     }
@@ -592,10 +587,10 @@ impl FileRegionCore {
                 return None;
             }
         };
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(entry.location.region_id() as usize)?;
-        let region_generation = access.generation.load(Ordering::Acquire);
+        let region_generation = generation.load(Ordering::Acquire);
         if region_generation == 0 {
             return None;
         }
@@ -618,21 +613,21 @@ impl FileRegionCore {
         let Some(candidate) = self.begin_point_read(hash) else {
             return Ok(None);
         };
-        let descriptor = describe_read(geometry, hash, candidate, true)?;
+        let desc = describe_read(geometry, hash, candidate, true)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_descriptor(engine, slot, buffer, descriptor, key)
+        self.read_value_from_desc(engine, slot, buffer, desc, key)
     }
 
     #[cfg(test)]
-    fn read_value_from_descriptor(
+    fn read_value_from_desc(
         &self,
         engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        descriptor: ReadDescriptor,
+        desc: ReadDesc,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let pending = self.submit_value_read(engine, slot, buffer, descriptor)?;
+        let pending = self.submit_value_read(engine, slot, buffer, desc)?;
         let completion = pending.wait(engine);
         self.finish_value_read(completion, key)
     }
@@ -642,9 +637,9 @@ impl FileRegionCore {
         engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        descriptor: ReadDescriptor,
+        desc: ReadDesc,
     ) -> io::Result<PendingRead> {
-        match submit_read(engine, slot, descriptor, buffer) {
+        match submit_read(engine, slot, desc, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
                 if !is_read_pressure(error.kind()) {
@@ -661,7 +656,7 @@ impl FileRegionCore {
         completion: ReadCompletion,
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
-        let hash = completion.descriptor.hash;
+        let hash = completion.desc.hash;
         if let Err(error) = completion.result {
             if !is_read_pressure(error.kind()) {
                 self.health
@@ -684,12 +679,11 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.region_generation != completion.descriptor.region_generation
-            || header.key_hash != hash
+        if header.region_generation != completion.desc.region_generation || header.key_hash != hash
         {
             return Ok(None);
         }
-        let indexed_location = completion.descriptor.entry.location;
+        let indexed_location = completion.desc.entry.location;
         let Ok(exact_location) = PackedLocation::new(
             indexed_location.region_id(),
             indexed_location.offset(),
@@ -722,7 +716,7 @@ impl FileRegionCore {
         if crc32c(&[&record[RECORD_HEADER_SIZE..payload_end]]) != header.payload_crc {
             return Ok(None);
         }
-        let value_start = completion.descriptor.record_range.start + RECORD_HEADER_SIZE + key_len;
+        let value_start = completion.desc.record_range.start + RECORD_HEADER_SIZE + key_len;
         let Some(value_end) = value_start.checked_add(value_len) else {
             return Ok(None);
         };
@@ -737,7 +731,7 @@ impl FileRegionCore {
         };
         Ok(Some(RegionValueRead {
             buffer,
-            buffer_len: completion.descriptor.read_len,
+            buffer_len: completion.desc.read_len,
             value_range: value_start..value_end,
             seqno: header.seqno,
         }))
@@ -750,7 +744,7 @@ impl FileRegionCore {
     /// This method performs no device I/O and never publishes an index entry.
     pub fn try_stage_value(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
@@ -762,7 +756,7 @@ impl FileRegionCore {
 
     pub fn try_stage_reinsert(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         record: RegionReinsertRecord<'_>,
     ) -> io::Result<RegionStageValue> {
@@ -780,7 +774,7 @@ impl FileRegionCore {
     #[allow(clippy::too_many_arguments)]
     fn try_stage_record(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
@@ -796,7 +790,7 @@ impl FileRegionCore {
             ));
         }
         let payload = RecordPayload::new(key, value);
-        let _shard_mutation = match self.shard(shard_id)?.mutation.try_lock() {
+        let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
             Err(TryLockError::Poisoned(_)) => {
@@ -928,7 +922,7 @@ impl FileRegionCore {
 
     fn fail_preflighted_stage(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         message: &'static str,
     ) -> io::Result<RegionStageValue> {
         self.health.enter_miss_only();
@@ -942,7 +936,7 @@ impl FileRegionCore {
     /// exact owned-buffer write completion succeeds.
     pub fn flush_staging_shard(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         engine: &IoEngine,
         shard_id: usize,
         recovery: &crate::io::engine::recovery::BackgroundRecovery,
@@ -1119,8 +1113,8 @@ impl FileRegionCore {
             .lock()?
             .begin_rotation(candidate)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(receipt.activated_region_id as usize)
             .ok_or_else(|| {
                 self.health.enter_miss_only();
@@ -1129,9 +1123,7 @@ impl FileRegionCore {
                     "rotation activated an untracked Region",
                 )
             })?;
-        access
-            .generation
-            .store(receipt.activated_created_seqno, Ordering::Release);
+        generation.store(receipt.activated_created_seqno, Ordering::Release);
         // Manager authority now carries the exact in-progress rotation
         // receipt, so foreground staging fails fast on this shard. Release the
         // shard gates before publishing the completed in-memory rotation.
@@ -1165,7 +1157,7 @@ impl FileRegionCore {
 
     fn fail_staged_span(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         span: RegionWriteSpan,
         buffer: Option<IoBuffer>,
         records: Vec<StagedRecord>,
@@ -1260,14 +1252,14 @@ fn region_metadata_io_error(error: RegionMetadataError) -> io::Error {
 fn region_mutation_io_error(error: RegionMutationError) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("RegionStore authority mutation failed: {error:?}"),
+        format!("Region state mutation failed: {error:?}"),
     )
 }
 
 fn region_mutation_context(context: &'static str, error: RegionMutationError) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("RegionStore {context} failed: {error:?}"),
+        format!("Region {context} failed: {error:?}"),
     )
 }
 

@@ -34,14 +34,14 @@ use crate::region::runtime::RegionDataPlane;
 use crate::snapshot::StartupMode;
 
 /// Owns the files and runtime for one Region-backed cache.
-pub struct RegionStore<F: FileSystem = OsFileSystem> {
+pub struct CacheSession<F: FileSystem = OsFileSystem> {
     backend: FileRegionBackend<F>,
     runtime: Option<FileRegionRuntime>,
     startup: StartupMode,
     closed: bool,
 }
 
-impl<F: FileSystem> RegionStore<F> {
+impl<F: FileSystem> CacheSession<F> {
     pub fn open(index_slots: usize, mut backend: FileRegionBackend<F>) -> io::Result<Self> {
         validate_index_slots(index_slots)?;
         backend.acquire_exclusive()?;
@@ -129,7 +129,7 @@ impl<F: FileSystem> RegionStore<F> {
     }
 }
 
-impl<F: FileSystem> Drop for RegionStore<F> {
+impl<F: FileSystem> Drop for CacheSession<F> {
     fn drop(&mut self) {
         if !self.closed {
             let _ = self.close_fast();
@@ -138,14 +138,14 @@ impl<F: FileSystem> Drop for RegionStore<F> {
 }
 
 fn closed_error() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "RegionStore is closed")
+    io::Error::new(io::ErrorKind::BrokenPipe, "CacheSession is closed")
 }
 
 fn validate_index_slots(index_slots: usize) -> io::Result<()> {
     if index_slots < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RegionStore requires at least 8 index slots",
+            "CacheSession requires at least 8 index slots",
         ));
     }
     validated_index_partition_ranges(index_slots)

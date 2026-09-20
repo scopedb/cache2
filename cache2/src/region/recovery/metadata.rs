@@ -132,13 +132,13 @@ impl PageKind {
 /// Only stable, quiescent Region states can appear in a CLEAN image.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RegionMetadataState {
+pub enum RegionState {
     Free = 0,
     Active = 1,
     Sealed = 2,
 }
 
-impl RegionMetadataState {
+impl RegionState {
     fn decode(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Free),
@@ -172,7 +172,7 @@ pub struct RegionMetadataRoot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegionMetadataRecord {
-    pub state: RegionMetadataState,
+    pub state: RegionState,
     /// Free queue position, Active shard id, or Sealed FIFO position.
     pub queue_ordinal: u32,
     pub created_seqno: u64,
@@ -469,11 +469,9 @@ impl RegionMetadata {
                 .checked_add(removed)
                 .ok_or(RegionMetadataError::ArithmeticOverflow)?;
             for region in &mut self.regions {
-                if region.state == RegionMetadataState::Active
-                    && region.queue_ordinal >= shard_count
-                {
+                if region.state == RegionState::Active && region.queue_ordinal >= shard_count {
                     let removed_ordinal = region.queue_ordinal - shard_count;
-                    region.state = RegionMetadataState::Sealed;
+                    region.state = RegionState::Sealed;
                     region.queue_ordinal = first_new_sealed
                         .checked_add(removed_ordinal)
                         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -499,11 +497,9 @@ impl RegionMetadata {
                 .checked_add(1)
                 .ok_or(RegionMetadataError::ArithmeticOverflow)?;
             for region in &mut self.regions {
-                if region.state == RegionMetadataState::Free
-                    && region.queue_ordinal >= free_region_count
-                {
+                if region.state == RegionState::Free && region.queue_ordinal >= free_region_count {
                     let added_ordinal = region.queue_ordinal - free_region_count;
-                    region.state = RegionMetadataState::Active;
+                    region.state = RegionState::Active;
                     region.queue_ordinal = old_shard_count
                         .checked_add(added_ordinal)
                         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -652,16 +648,16 @@ fn validate_regions(
             return Err(RegionMetadataError::InvalidField("region_geometry"));
         }
         let (seen, state_count) = match region.state {
-            RegionMetadataState::Free => (&mut free_seen, root.free_region_count),
-            RegionMetadataState::Active => (&mut active_seen, root.active_region_count),
-            RegionMetadataState::Sealed => (&mut sealed_seen, root.sealed_region_count),
+            RegionState::Free => (&mut free_seen, root.free_region_count),
+            RegionState::Active => (&mut active_seen, root.active_region_count),
+            RegionState::Sealed => (&mut sealed_seen, root.sealed_region_count),
         };
         if region.queue_ordinal >= state_count
             || mem::replace(&mut seen[region.queue_ordinal as usize], 1) != 0
         {
             return Err(RegionMetadataError::InvalidField("region_queue_ordinal"));
         }
-        if region.state == RegionMetadataState::Free {
+        if region.state == RegionState::Free {
             if region.created_seqno != 0
                 || region.durable_used_offset != 0
                 || region.physical_record_count != 0
@@ -1088,7 +1084,7 @@ fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord, RegionMetadataErr
         return Err(RegionMetadataError::InvalidField("region_encoding"));
     }
     Ok(RegionMetadataRecord {
-        state: RegionMetadataState::decode(input[REGION_STATE_OFFSET])
+        state: RegionState::decode(input[REGION_STATE_OFFSET])
             .ok_or(RegionMetadataError::InvalidField("region_state"))?,
         queue_ordinal: get_u32(input, REGION_QUEUE_ORDINAL_OFFSET)?,
         created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)?,
@@ -1219,28 +1215,28 @@ mod tests {
             },
             regions: vec![
                 RegionMetadataRecord {
-                    state: RegionMetadataState::Active,
+                    state: RegionState::Active,
                     queue_ordinal: 0,
                     created_seqno: 1,
                     durable_used_offset: 0,
                     physical_record_count: 0,
                 },
                 RegionMetadataRecord {
-                    state: RegionMetadataState::Sealed,
+                    state: RegionState::Sealed,
                     queue_ordinal: 0,
                     created_seqno: 2,
                     durable_used_offset: 128,
                     physical_record_count: 2,
                 },
                 RegionMetadataRecord {
-                    state: RegionMetadataState::Sealed,
+                    state: RegionState::Sealed,
                     queue_ordinal: 1,
                     created_seqno: 4,
                     durable_used_offset: 64,
                     physical_record_count: 1,
                 },
                 RegionMetadataRecord {
-                    state: RegionMetadataState::Free,
+                    state: RegionState::Free,
                     queue_ordinal: 0,
                     created_seqno: 0,
                     durable_used_offset: 0,
@@ -1305,7 +1301,7 @@ mod tests {
         assert_eq!(metadata.root.free_region_count, 0);
         assert_eq!(metadata.root.sealed_region_count, 2);
         assert_eq!(metadata.root.max_seqno, 5);
-        assert_eq!(metadata.regions[3].state, RegionMetadataState::Active);
+        assert_eq!(metadata.regions[3].state, RegionState::Active);
         assert_eq!(metadata.regions[3].queue_ordinal, 1);
         assert_eq!(metadata.regions[3].created_seqno, 5);
 
@@ -1315,7 +1311,7 @@ mod tests {
         assert_eq!(metadata.root.free_region_count, 0);
         assert_eq!(metadata.root.sealed_region_count, 3);
         assert_eq!(metadata.root.max_seqno, 5);
-        assert_eq!(metadata.regions[3].state, RegionMetadataState::Sealed);
+        assert_eq!(metadata.regions[3].state, RegionState::Sealed);
         assert_eq!(metadata.regions[3].queue_ordinal, 2);
         metadata.validate().unwrap();
     }

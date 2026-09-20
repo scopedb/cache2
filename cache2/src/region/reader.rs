@@ -50,7 +50,7 @@ pub struct ReadCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadDescriptor {
+pub struct ReadDesc {
     pub hash: u64,
     pub entry: IndexEntry,
     pub region_generation: u64,
@@ -60,13 +60,13 @@ pub struct ReadDescriptor {
 }
 
 pub struct PendingRead {
-    descriptor: ReadDescriptor,
+    desc: ReadDesc,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
 pub struct ReadCompletion {
-    pub descriptor: ReadDescriptor,
+    pub desc: ReadDesc,
     pub result: io::Result<()>,
     pub buffer: Option<BufferLease>,
 }
@@ -80,9 +80,9 @@ impl ReadCompletion {
         }
         self.buffer
             .as_ref()?
-            .prepared(self.descriptor.read_len)
+            .prepared(self.desc.read_len)
             .ok()?
-            .get(self.descriptor.record_range.clone())
+            .get(self.desc.record_range.clone())
     }
 }
 
@@ -90,12 +90,12 @@ impl PendingRead {
     #[cfg(test)]
     pub fn wait(self, engine: &IoEngine) -> ReadCompletion {
         let Self {
-            descriptor,
+            desc,
             request_id,
             request,
         } = self;
         let completion = request.wait(engine);
-        Self::finish(descriptor, request_id, completion)
+        Self::finish(desc, request_id, completion)
     }
 
     pub async fn wait_async(
@@ -104,16 +104,16 @@ impl PendingRead {
         tokio_handle: &tokio::runtime::Handle,
     ) -> ReadCompletion {
         let Self {
-            descriptor,
+            desc,
             request_id,
             request,
         } = self;
         let completion = request.wait_async(engine, tokio_handle).await;
-        Self::finish(descriptor, request_id, completion)
+        Self::finish(desc, request_id, completion)
     }
 
     fn finish(
-        descriptor: ReadDescriptor,
+        desc: ReadDesc,
         request_id: RequestId,
         completion: Result<IoCompletion, IoDeadlineExceeded>,
     ) -> ReadCompletion {
@@ -122,7 +122,7 @@ impl PendingRead {
             Err(timeout) => {
                 let (error, buffer) = timeout.into_lease();
                 return ReadCompletion {
-                    descriptor,
+                    desc,
                     result: Err(error),
                     buffer,
                 };
@@ -145,7 +145,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(descriptor.read_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_err())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -158,7 +158,7 @@ impl PendingRead {
         let result = match protocol_error {
             Some(error) => Err(error),
             None => io_result.and_then(|completed| {
-                if completed != descriptor.read_len || bytes_transferred != descriptor.read_len {
+                if completed != desc.read_len || bytes_transferred != desc.read_len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Region record read completed with the wrong byte count",
@@ -168,7 +168,7 @@ impl PendingRead {
             }),
         };
         ReadCompletion {
-            descriptor,
+            desc,
             result,
             buffer,
         }
@@ -182,14 +182,14 @@ impl PendingRead {
 pub fn submit_read(
     engine: &IoEngine,
     slot: ReadSlot,
-    descriptor: ReadDescriptor,
+    desc: ReadDesc,
     buffer: BufferLease,
 ) -> io::Result<PendingRead> {
-    let buffer = IoBuffer::for_read(buffer, descriptor.read_len).map_err(|error| error.error)?;
-    let request = submit_cache_read(engine, slot, IoOperation::read(buffer, descriptor.absolute))
+    let buffer = IoBuffer::for_read(buffer, desc.read_len).map_err(|error| error.error)?;
+    let request = submit_cache_read(engine, slot, IoOperation::read(buffer, desc.absolute))
         .map_err(|error| error.into_lease().0)?;
     Ok(PendingRead {
-        descriptor,
+        desc,
         request_id: request.id(),
         request,
     })
@@ -200,7 +200,7 @@ pub fn describe_read(
     hash: u64,
     candidate: ReadCandidate,
     align_for_direct_io: bool,
-) -> io::Result<ReadDescriptor> {
+) -> io::Result<ReadDesc> {
     let ReadCandidate {
         entry,
         region_generation,
@@ -300,7 +300,7 @@ pub fn describe_read(
         ));
     }
 
-    Ok(ReadDescriptor {
+    Ok(ReadDesc {
         hash,
         entry,
         region_generation,
@@ -383,19 +383,19 @@ mod tests {
         .unwrap();
         let location = PackedLocation::new(1, 32, 64).unwrap();
         let entry = entry(location);
-        let descriptor = describe_read(geometry(), 7, candidate(entry), true).unwrap();
+        let desc = describe_read(geometry(), 7, candidate(entry), true).unwrap();
 
         let slot = engine.try_reserve_read().unwrap();
         let completion = submit_read(
             &engine,
             slot,
-            descriptor,
+            desc,
             managed_memory.try_read_buffer(DIRECT_IO_ALIGNMENT).unwrap(),
         )
         .unwrap()
         .wait(&engine);
         assert!(completion.result.is_ok());
-        assert_eq!(completion.descriptor.record_range, 32..96);
+        assert_eq!(completion.desc.record_range, 32..96);
         assert_eq!(completion.record_bytes().unwrap().len(), 64);
 
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
@@ -424,19 +424,19 @@ mod tests {
         })
         .unwrap();
         let entry = entry(PackedLocation::new(1, 32, 1120).unwrap());
-        let descriptor = describe_read(geometry(), 7, candidate(entry), false).unwrap();
+        let desc = describe_read(geometry(), 7, candidate(entry), false).unwrap();
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
 
         let completion = submit_read(
             &engine,
             engine.try_reserve_read().unwrap(),
-            descriptor,
+            desc,
             managed_memory.try_read_buffer(1120).unwrap(),
         )
         .unwrap()
         .wait(&engine);
         assert!(completion.result.is_ok());
-        assert_eq!(completion.descriptor.record_range, 0..1120);
+        assert_eq!(completion.desc.record_range, 0..1120);
         assert_eq!(completion.record_bytes().unwrap().len(), 1120);
         assert_eq!(
             io.reads
@@ -455,12 +455,12 @@ mod tests {
         let record_len = 1056;
         let offset = geometry().region_size as u32 - record_len;
         let entry = entry(PackedLocation::new(1, offset, 1120).unwrap());
-        let descriptor = describe_read(geometry(), 7, candidate(entry), false).unwrap();
+        let desc = describe_read(geometry(), 7, candidate(entry), false).unwrap();
 
-        assert_eq!(descriptor.record_range, 0..record_len as usize);
-        assert_eq!(descriptor.read_len, record_len as usize);
+        assert_eq!(desc.record_range, 0..record_len as usize);
+        assert_eq!(desc.read_len, record_len as usize);
         assert_eq!(
-            descriptor.absolute,
+            desc.absolute,
             DATA_REGION_AREA_OFFSET + geometry().region_size + u64::from(offset)
         );
     }

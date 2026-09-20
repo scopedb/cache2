@@ -37,6 +37,7 @@ use tokio::task::JoinError;
 
 use crate::LatencyMode;
 use crate::RequestOperation;
+use crate::cache::session::CacheSession;
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
 use crate::config::storage_fingerprint;
@@ -52,10 +53,11 @@ use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
 use crate::region::recovery::recovery_image_index_len;
 use crate::region::runtime::HybridValueRead;
 use crate::region::runtime::RegionDataPlane;
-use crate::region::store::RegionStore;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 use crate::snapshot::StartupMode;
+
+pub mod session;
 
 /// Storage tier that served a lookup.
 ///
@@ -119,7 +121,7 @@ pub struct Cache {
     read_recording: bool,
     mutation_recording: bool,
     data_plane: RegionDataPlane,
-    owner: Arc<Mutex<RegionStore>>,
+    session: Arc<Mutex<CacheSession>>,
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
@@ -254,15 +256,15 @@ impl Cache {
         let mutation_recording =
             stats.request_counters || stats.mutation_latency != LatencyMode::Off;
         let backend = FileRegionBackend::new(paths, format_data, config);
-        let store = RegionStore::open(index_slots, backend)?;
-        let startup = store.startup();
-        let data_plane = store.data_plane_handle()?;
+        let session = CacheSession::open(index_slots, backend)?;
+        let startup = session.startup();
+        let data_plane = session.data_plane_handle()?;
         Ok(Cache {
             closed: AtomicBool::new(false),
             read_recording,
             mutation_recording,
             data_plane,
-            owner: Arc::new(Mutex::new(store)),
+            session: Arc::new(Mutex::new(session)),
             startup,
             path,
             logical_disk_peak_bytes,
@@ -516,18 +518,18 @@ impl Cache {
         let tokio_handle = self.tokio_handle.clone();
         let close = (!self.closed.swap(true, Ordering::AcqRel)).then(|| {
             self.data_plane.start_close();
-            let owner = Arc::clone(&self.owner);
+            let session = Arc::clone(&self.session);
             let path = self.path.clone();
             let started = Instant::now();
             tokio_handle.spawn_blocking(move || {
-                let result = owner
+                let result = session
                     .lock()
                     .map_err(|_| cache_lifecycle_poisoned())
-                    .and_then(|mut store| {
+                    .and_then(|mut session| {
                         if warm {
-                            store.close_warm()
+                            session.close_warm()
                         } else {
-                            store.close_fast()
+                            session.close_fast()
                         }
                     });
                 log_cache_close(&path, mode, started.elapsed(), &result);
