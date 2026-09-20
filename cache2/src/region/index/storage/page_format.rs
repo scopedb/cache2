@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::codec::crc32c_with_zeroed_u32;
+use crate::codec::get_u16;
+use crate::codec::get_u32;
+use crate::codec::get_u64;
 use crate::codec::put_u16;
 use crate::codec::put_u32;
 use crate::codec::put_u64;
@@ -203,25 +206,13 @@ pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
 }
 
 fn read_u16(input: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        input[offset..offset + 2]
-            .try_into()
-            .expect("fixed u16 field is in bounds"),
-    )
+    get_u16(input, offset).expect("fixed u16 field is in bounds")
 }
 
 fn read_u32(input: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        input[offset..offset + 4]
-            .try_into()
-            .expect("fixed u32 field is in bounds"),
-    )
+    get_u32(input, offset).expect("fixed u32 field is in bounds")
 }
 
 pub fn read_u64(input: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        input[offset..offset + 8]
-            .try_into()
-            .expect("fixed u64 field is in bounds"),
-    )
+    get_u64(input, offset).expect("fixed u64 field is in bounds")
 }
