@@ -12,25 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! File ownership, recovery, and lifecycle adapter for the Region regions.
+//! File ownership, restart recovery, and durable Region image publication.
 
 use std::fmt;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self};
-use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
 
-use crate::config::CacheConfig;
 use crate::config::runtime::IoMode;
-#[cfg(test)]
-use crate::config::runtime::RuntimeOptions;
-#[cfg(test)]
-use crate::config::storage::cache_config;
 use crate::io::file::DataFileHandles;
 use crate::io::file::PositionedIo;
 use crate::io::file::StorageFile;
@@ -43,20 +34,18 @@ use crate::io::file::write_all_at;
 use crate::io::fs::FileSystem;
 use crate::io::fs::OsFileSystem;
 use crate::io::fs::parent_directory;
-use crate::region::AppendShardGate;
+use crate::region::FrozenRegionStore;
 use crate::region::RegionHealthLatch;
-use crate::region::RegionManagerLock;
 use crate::region::RegionStore;
+use crate::region::empty_partition_metadata;
 use crate::region::guarded_index_result;
-use crate::region::index::RegionIndex;
 use crate::region::index::packed::MAX_INDEX_PARTITIONS;
 use crate::region::index::storage::IndexImageBinding;
-use crate::region::index::storage::IndexPartitionRange;
-use crate::region::index::storage::IndexPhysicalStats;
 use crate::region::index::storage::PartitionedIndexStorage;
 use crate::region::index::storage::canonical_index_partition_ranges;
 use crate::region::index_storage_io_error;
-use crate::region::manager::RegionManager;
+use crate::region::metadata_partition_stats;
+use crate::region::metadata_partition_stats_match;
 use crate::region::recovery::DataSuperblock;
 use crate::region::recovery::DataSuperblockProbe;
 use crate::region::recovery::PersistentId;
@@ -74,7 +63,6 @@ use crate::region::recovery::StateRecord;
 use crate::region::recovery::StateSelectionError;
 use crate::region::recovery::clean_image_matches;
 use crate::region::recovery::latest_state;
-use crate::region::recovery::metadata::PartitionMetadataRecord;
 use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
 use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
@@ -87,9 +75,8 @@ use crate::region::recovery::prepare_next_state;
 use crate::region::recovery::prepare_running_barrier;
 use crate::region::recovery::recovery_image_index_len;
 use crate::region::region_metadata_io_error;
-use crate::region::runtime::RegionDataPlane;
 
-/// Shared shard count for compact concrete-backend fixtures.
+/// Shared shard count for compact concrete-file fixtures.
 #[cfg(test)]
 const REGION_SHARDS: u32 = 4;
 
@@ -114,132 +101,19 @@ impl RegionPaths {
         }
     }
 }
-pub struct FileRegionRuntime {
-    regions: Arc<RegionStore>,
-    data_plane: Option<RegionDataPlane>,
-}
-
-impl Deref for FileRegionRuntime {
-    type Target = RegionStore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.regions
-    }
-}
-pub struct FrozenFileRegionView {
-    regions: Arc<RegionStore>,
-    metadata: RegionMetadata,
-}
-
-pub struct CleanFileRegionImage {
+pub struct RecoveryImage {
     file: File,
     header: RecoveryImageHeader,
     metadata: RegionMetadata,
 }
 
-pub struct PreparedFileRegionClean {
+pub struct PreparedClean {
     state: StatePageWrite,
     health: RegionHealthLatch,
 }
 
-impl FileRegionRuntime {
-    /// Installs one complete authority. Recovery metadata is consumed here so
-    /// the live runtime cannot retain a stale second copy beside the manager.
-    fn install(index: PartitionedIndexStorage, metadata: RegionMetadata) -> io::Result<Self> {
-        let physical_stats = index.partition_stats().map_err(index_storage_io_error)?;
-        let slot_count = u64::try_from(index.slot_count()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
-        })?;
-        if metadata.root.index_slots != slot_count
-            || metadata.root.partition_count as usize != index.partition_count()
-            || !metadata_partition_stats_match(&metadata, &physical_stats)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "index and Region metadata do not describe one authority",
-            ));
-        }
-        let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
-        let mut append_gates = Vec::new();
-        append_gates
-            .try_reserve_exact(manager.active_regions().len())
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "cannot allocate data shard gates",
-                )
-            })?;
-        append_gates.resize_with(manager.active_regions().len(), AppendShardGate::default);
-        let mut region_generations = Vec::new();
-        region_generations
-            .try_reserve_exact(manager.regions().len())
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "cannot allocate Region access state",
-                )
-            })?;
-        for region in manager.regions() {
-            region_generations.push(AtomicU64::new(region.created_seqno));
-        }
-        let health = RegionHealthLatch::healthy();
-        let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
-        Ok(Self {
-            regions: Arc::new(RegionStore {
-                index,
-                manager: RegionManagerLock::new(manager, health.clone()),
-                append_gates: append_gates.into_boxed_slice(),
-                region_generations: region_generations.into_boxed_slice(),
-                rotation: Mutex::new(()),
-                health,
-            }),
-            data_plane: None,
-        })
-    }
-
-    fn attach_data_plane(
-        &mut self,
-        data: DataSuperblock,
-        handles: DataFileHandles,
-        config: CacheConfig,
-    ) -> io::Result<()> {
-        if self.data_plane.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "data plane is already attached",
-            ));
-        }
-        self.data_plane = Some(RegionDataPlane::new(
-            Arc::clone(&self.regions),
-            data,
-            handles,
-            config,
-        )?);
-        Ok(())
-    }
-
-    fn shutdown_data_plane(&mut self) -> io::Result<bool> {
-        self.data_plane
-            .take()
-            .map(|plane| plane.shutdown())
-            .unwrap_or(Ok(false))
-    }
-
-    pub fn data_plane(&self) -> io::Result<&RegionDataPlane> {
-        self.data_plane.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "backend does not provide a native runtime data path",
-            )
-        })
-    }
-}
-
-/// Concrete state/index lifecycle backed by one data file and two sidecars.
-///
-/// It owns the append/read runtime, persists one complete index plus the
-/// Region/FIFO physical view, and never scans records during open.
-pub struct FileRegionBackend<F = OsFileSystem>
+/// Owns cache files and publishes the persistent state used by restart recovery.
+pub struct RegionPersistence<F = OsFileSystem>
 where
     F: FileSystem,
 {
@@ -248,7 +122,6 @@ where
     /// files retain their on-disk identities but must match this geometry and
     /// storage-layout fingerprint.
     format_data: DataSuperblock,
-    config: CacheConfig,
     file_system: F,
     data_file: Option<F::File>,
     state_file: Option<F::File>,
@@ -260,53 +133,11 @@ where
     retain_lock: bool,
 }
 
-impl FileRegionBackend<OsFileSystem> {
-    #[cfg(test)]
-    fn for_test(paths: RegionPaths, format_data: DataSuperblock, index_slots: usize) -> Self {
-        Self::for_test_with_options(paths, format_data, index_slots, RuntimeOptions::default())
-    }
-
-    #[cfg(test)]
-    pub fn for_test_with_options(
-        paths: RegionPaths,
-        format_data: DataSuperblock,
-        index_slots: usize,
-        runtime_options: RuntimeOptions,
-    ) -> Self {
-        let config = cache_config(format_data.geometry, index_slots, runtime_options);
-        Self::new(paths, format_data, config)
-    }
-
-    pub fn new(paths: RegionPaths, format_data: DataSuperblock, config: CacheConfig) -> Self {
-        Self::new_with_file_system(paths, format_data, OsFileSystem, config)
-    }
-}
-
-impl<F> FileRegionBackend<F>
-where
-    F: FileSystem,
-{
-    #[cfg(test)]
-    fn for_test_with_file_system(
-        paths: RegionPaths,
-        format_data: DataSuperblock,
-        index_slots: usize,
-        file_system: F,
-    ) -> Self {
-        let config = cache_config(format_data.geometry, index_slots, RuntimeOptions::default());
-        Self::new_with_file_system(paths, format_data, file_system, config)
-    }
-
-    fn new_with_file_system(
-        paths: RegionPaths,
-        format_data: DataSuperblock,
-        file_system: F,
-        config: CacheConfig,
-    ) -> Self {
+impl<F: FileSystem> RegionPersistence<F> {
+    pub fn new(paths: RegionPaths, format_data: DataSuperblock, file_system: F) -> Self {
         Self {
             paths,
             format_data,
-            config,
             file_system,
             data_file: None,
             state_file: None,
@@ -325,7 +156,7 @@ where
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "state file is not open"))
     }
 
-    fn data_superblock(&self) -> io::Result<DataSuperblock> {
+    pub fn data_superblock(&self) -> io::Result<DataSuperblock> {
         self.data.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -380,17 +211,17 @@ where
         );
     }
 
-    fn cold_recovery(&self, reason: &'static str) -> io::Result<Option<CleanFileRegionImage>> {
+    fn cold_recovery(&self, reason: &'static str) -> io::Result<Option<RecoveryImage>> {
         self.log_cold_recovery(reason);
         Ok(None)
     }
 
     /// Acquire exclusive ownership of the data and state files before inspection.
-    pub fn acquire_exclusive(&mut self) -> io::Result<()> {
+    pub fn acquire_exclusive(&mut self, io_mode: IoMode) -> io::Result<()> {
         if self.locked {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "CacheSession backend is already locked",
+                "cache files are already locked",
             ));
         }
         if self.paths.data == self.paths.state
@@ -399,7 +230,7 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CacheSession data/state/image paths must be distinct",
+                "cache data/state/image paths must be distinct",
             ));
         }
         if parent_directory(&self.paths.data) != parent_directory(&self.paths.state)
@@ -407,7 +238,7 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CacheSession data/state/image files must share one directory",
+                "cache data/state/image files must share one directory",
             ));
         }
         let temporary = recovery_temporary_path(&self.paths.image);
@@ -417,12 +248,10 @@ where
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CacheSession recovery temporary path collides with a cache file",
+                "cache recovery temporary path collides with a cache file",
             ));
         }
-        let data = self
-            .file_system
-            .open(&self.paths.data, true, self.config.runtime().io_mode)?;
+        let data = self.file_system.open(&self.paths.data, true, io_mode)?;
         data.try_lock_exclusive()?;
         let state = match self
             .file_system
@@ -445,7 +274,7 @@ where
             let _ = data.unlock();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CacheSession data and state paths resolve to the same file",
+                "cache data and state paths resolve to the same file",
             ));
         }
         if let Err(error) = state.try_lock_exclusive() {
@@ -460,10 +289,7 @@ where
 
     /// Return an eligible clean image, or `None` to select a cold start.
     /// This must not allocate or scan the full index or Region data extents.
-    pub fn inspect_recovery(
-        &mut self,
-        index_slots: usize,
-    ) -> io::Result<Option<CleanFileRegionImage>> {
+    pub fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<Option<RecoveryImage>> {
         self.file_system
             .remove_file(&recovery_temporary_path(&self.paths.image))?;
         let format_data = self.format_data;
@@ -527,7 +353,7 @@ where
         if image.is_same_file(data_file)? || image.is_same_file(state_file)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CacheSession image aliases the data or state file",
+                "cache image aliases the data or state file",
             ));
         }
 
@@ -617,15 +443,19 @@ where
         }
         let file = image.try_clone_mapping_file()?;
         self.cold_reset_needed = false;
-        Ok(Some(CleanFileRegionImage {
+        Ok(Some(RecoveryImage {
             file,
             header,
             metadata,
         }))
     }
 
-    /// Construct a provisional empty runtime without starting workers.
-    pub fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<FileRegionRuntime> {
+    /// Discard stale recovery artifacts and construct an empty Region store.
+    pub fn cold_regions(
+        &mut self,
+        index_slots: usize,
+        append_shards: u32,
+    ) -> io::Result<RegionStore> {
         self.file_system.remove_file(&self.paths.image)?;
         self.file_system
             .remove_file(&recovery_temporary_path(&self.paths.image))?;
@@ -641,8 +471,7 @@ where
             self.current_state = None;
             self.cold_reset_needed = false;
         }
-        let metadata =
-            empty_region_metadata(data, index_slots, self.config.runtime().append_shards)?;
+        let metadata = empty_region_metadata(data, index_slots, append_shards)?;
         let index = match PartitionedIndexStorage::anonymous(index_slots) {
             Ok(index) => index,
             Err(error) => {
@@ -663,16 +492,16 @@ where
                 return Err(index_storage_io_error(error));
             }
         };
-        let runtime = FileRegionRuntime::install(index, metadata)?;
-        Ok(runtime)
+        RegionStore::from_recovery(index, metadata)
     }
 
     /// `Ok(None)` rejects the complete image and selects a cold start.
-    pub fn map_clean_runtime(
+    pub fn recover_regions(
         &mut self,
-        mut clean: CleanFileRegionImage,
+        mut image: RecoveryImage,
         index_slots: usize,
-    ) -> io::Result<Option<FileRegionRuntime>> {
+        append_shards: u32,
+    ) -> io::Result<Option<RegionStore>> {
         let data = self.data_superblock()?;
         let expected_slots = u64::try_from(index_slots).map_err(|_| {
             io::Error::new(
@@ -683,45 +512,44 @@ where
         let expected_index_len = recovery_image_index_len(expected_slots).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid index image length")
         })?;
-        let actual_file_len = clean.file.metadata()?.len();
+        let actual_file_len = image.file.metadata()?.len();
         let eligible = self.current_state.is_some_and(|selected| {
             clean_image_matches(
                 selected.record,
                 data,
-                clean.header,
+                image.header,
                 actual_file_len,
                 expected_slots,
                 expected_index_len,
             )
-        }) && clean.metadata.matches_image(data, clean.header)
-            && clean.metadata.validate().is_ok();
+        }) && image.metadata.matches_image(data, image.header)
+            && image.metadata.validate().is_ok();
         if !eligible {
             self.cold_reset_needed = true;
             self.log_cold_recovery("image_became_ineligible");
             return Ok(None);
         }
-        let previous_append_shards = clean.metadata.root.shard_count;
-        let shard_count = self.config.runtime().append_shards;
-        if previous_append_shards != shard_count {
-            let added_shards = shard_count.saturating_sub(previous_append_shards);
-            if added_shards > clean.metadata.root.free_region_count {
+        let previous_append_shards = image.metadata.root.shard_count;
+        if previous_append_shards != append_shards {
+            let added_shards = append_shards.saturating_sub(previous_append_shards);
+            if added_shards > image.metadata.root.free_region_count {
                 self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_insufficient_free_regions");
                 return Ok(None);
             }
-            if clean.metadata.rebind_append_shards(shard_count).is_err() {
+            if image.metadata.rebind_append_shards(append_shards).is_err() {
                 self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_invalid");
                 return Ok(None);
             }
-            self.log_append_shards_rebind_planned(previous_append_shards, shard_count);
+            self.log_append_shards_rebind_planned(previous_append_shards, append_shards);
         }
-        let partition_stats = metadata_partition_stats(&clean.metadata)?;
-        let binding = index_image_binding(clean.header);
-        let index_mapping_bytes = clean.header.index_offset.saturating_add(expected_index_len);
+        let partition_stats = metadata_partition_stats(&image.metadata)?;
+        let binding = index_image_binding(image.header);
+        let index_mapping_bytes = image.header.index_offset.saturating_add(expected_index_len);
         let index = match PartitionedIndexStorage::map_private(
-            &clean.file,
-            clean.header.index_offset,
+            &image.file,
+            image.header.index_offset,
             index_slots,
             binding,
             &partition_stats,
@@ -738,8 +566,8 @@ where
                 return Ok(None);
             }
         };
-        let runtime = FileRegionRuntime::install(index, clean.metadata)?;
-        Ok(Some(runtime))
+        let regions = RegionStore::from_recovery(index, image.metadata)?;
+        Ok(Some(regions))
     }
 
     /// Replace both state slots with durable `RUNNING` generations so a torn
@@ -762,93 +590,27 @@ where
         Ok(())
     }
 
-    /// Start workers only after `RUNNING`; an error must tear them down.
-    pub fn start_runtime(
-        &mut self,
-        mut runtime: FileRegionRuntime,
-    ) -> io::Result<FileRegionRuntime> {
-        let data = self.data_superblock()?;
-        let data_file = self
-            .data_file
+    pub fn clone_data_handles(&self) -> io::Result<DataFileHandles> {
+        self.data_file
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        let handles = data_file.try_clone_data_handles()?;
-        runtime.attach_data_plane(data, handles, self.config.clone())?;
-        Ok(runtime)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?
+            .try_clone_data_handles()
     }
 
-    /// Quiesce all mutation sources without constructing recovery metadata.
-    pub fn stop_fast(&mut self, mut runtime: FileRegionRuntime) -> io::Result<()> {
-        match runtime.shutdown_data_plane() {
-            Ok(false) => Ok(()),
-            Ok(true) => {
-                self.retain_lock = true;
-                Err(io::Error::other(
-                    "I/O engine could not fence an issued write; lock retained",
-                ))
-            }
-            Err(error) => {
-                runtime.health.enter_miss_only();
-                Err(error)
-            }
-        }
-    }
-
-    /// Quiesce the runtime and return its immutable recovery authority.
-    pub fn freeze_warm(
-        &mut self,
-        mut runtime: FileRegionRuntime,
-    ) -> io::Result<FrozenFileRegionView> {
-        match runtime.shutdown_data_plane() {
-            Ok(false) => {}
-            Ok(true) => {
-                self.retain_lock = true;
-                runtime.health.enter_miss_only();
-                return Err(io::Error::other(
-                    "I/O engine could not fence an issued write; CLEAN rejected",
-                ));
-            }
-            Err(error) => {
-                runtime.health.enter_miss_only();
-                return Err(error);
-            }
-        }
-        runtime.health.require_healthy()?;
-        let regions = runtime.regions;
-        if regions
-            .append_gates
-            .iter()
-            .any(|shard| shard.mutation.is_poisoned())
-            || regions.rotation.is_poisoned()
-        {
-            regions.health.enter_miss_only();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "data shard gate is poisoned",
-            ));
-        }
-        let partitions = index_partition_metadata(regions.index.storage(), &regions.health)?;
-        let metadata = regions
-            .manager
-            .lock()?
-            .freeze_metadata(partitions)
-            .map_err(region_metadata_io_error)?;
-        regions.health.require_healthy()?;
-        Ok(FrozenFileRegionView { regions, metadata })
+    /// Keep ownership with issued writes whose completion cannot be fenced.
+    pub fn retain_data_lock(&mut self) {
+        self.retain_lock = true;
     }
 
     /// Make completed data and one complete image durable.
-    pub fn persist_frozen(
-        &mut self,
-        view: &FrozenFileRegionView,
-    ) -> io::Result<PreparedFileRegionClean> {
-        let health = &view.regions.health;
+    pub fn persist_frozen(&mut self, frozen: &FrozenRegionStore) -> io::Result<PreparedClean> {
+        let health = &frozen.regions.health;
         health.require_healthy()?;
-        let source_metadata = &view.metadata;
+        let source_metadata = &frozen.metadata;
         source_metadata
             .validate()
             .map_err(region_metadata_io_error)?;
-        let storage = view.regions.index.storage();
+        let storage = frozen.regions.index.storage();
         let physical_stats = guarded_index_result(health, storage.physical_stats())?;
         let partition_stats = guarded_index_result(health, storage.partition_stats())?;
         if source_metadata.root.index_slots
@@ -961,19 +723,19 @@ where
         }
         persisted?;
         self.prepared_clean = Some((clean_state.slot, clean_state.record));
-        Ok(PreparedFileRegionClean {
+        Ok(PreparedClean {
             state: clean_state,
             health: health.clone(),
         })
     }
 
     /// Publish `CLEAN` durably using the token returned after persistence.
-    pub fn publish_clean(&mut self, prepared: PreparedFileRegionClean) -> io::Result<()> {
+    pub fn publish_clean(&mut self, prepared: PreparedClean) -> io::Result<()> {
         prepared.health.require_healthy()?;
         if self.prepared_clean.take() != Some((prepared.state.slot, prepared.state.record)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "CLEAN token does not belong to this backend session",
+                "CLEAN token does not belong to this persistence session",
             ));
         }
         let data = self.data_superblock()?;
@@ -1160,121 +922,15 @@ fn maximum_region_metadata_len(region_count: u32) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("Region metadata length overflow"))
 }
 
-fn empty_partition_metadata(
-    ranges: &[IndexPartitionRange],
-) -> io::Result<Box<[PartitionMetadataRecord]>> {
-    let mut stats = Vec::new();
-    stats.try_reserve_exact(ranges.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "cannot allocate index partition statistics",
-        )
-    })?;
-    stats.resize(ranges.len(), IndexPhysicalStats::default());
-    partition_metadata_from_stats(ranges, &stats)
-}
-
-fn index_partition_metadata(
-    index: &PartitionedIndexStorage,
-    health: &RegionHealthLatch,
-) -> io::Result<Box<[PartitionMetadataRecord]>> {
-    let stats = guarded_index_result(health, index.partition_stats())?;
-    partition_metadata_from_stats(index.partition_ranges(), &stats)
-}
-
-fn partition_metadata_from_stats(
-    ranges: &[IndexPartitionRange],
-    stats: &[IndexPhysicalStats],
-) -> io::Result<Box<[PartitionMetadataRecord]>> {
-    if ranges.len() != stats.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index partition ranges and statistics disagree",
-        ));
-    }
-    let mut partitions = Vec::new();
-    partitions.try_reserve_exact(ranges.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "cannot allocate index partition directory",
-        )
-    })?;
-    for (range, stats) in ranges.iter().zip(stats) {
-        partitions.push(PartitionMetadataRecord {
-            partition_id: u32::try_from(range.partition_id).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "partition id is too large")
-            })?,
-            first_index_page: u64::try_from(range.first_page).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "partition page offset is too large",
-                )
-            })?,
-            index_page_count: u64::try_from(range.page_count).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "partition page count is too large",
-                )
-            })?,
-            first_slot: u64::try_from(range.first_slot).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "partition slot offset is too large",
-                )
-            })?,
-            slot_count: u64::try_from(range.slot_count).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "partition slot count is too large",
-                )
-            })?,
-            physical_value_slots: stats.value,
-            physical_deleted_slots: stats.deleted,
-        });
-    }
-    Ok(partitions.into_boxed_slice())
-}
-
-fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexPhysicalStats]>> {
-    let mut stats = Vec::new();
-    stats
-        .try_reserve_exact(metadata.partitions.len())
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "cannot allocate index partition statistics",
-            )
-        })?;
-    for partition in &metadata.partitions {
-        stats.push(IndexPhysicalStats {
-            value: partition.physical_value_slots,
-            deleted: partition.physical_deleted_slots,
-        });
-    }
-    Ok(stats.into_boxed_slice())
-}
-
-fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysicalStats]) -> bool {
-    metadata.partitions.len() == stats.len()
-        && metadata
-            .partitions
-            .iter()
-            .zip(stats)
-            .all(|(metadata, actual)| {
-                metadata.physical_value_slots == actual.value
-                    && metadata.physical_deleted_slots == actual.deleted
-            })
-}
-
 fn empty_region_metadata(
     data: DataSuperblock,
     index_slots: usize,
-    append_gates: u32,
+    append_shards: u32,
 ) -> io::Result<RegionMetadata> {
-    if append_gates == 0 || data.geometry.region_count <= append_gates {
+    if append_shards == 0 || data.geometry.region_count <= append_shards {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "CacheSession requires one Active Region per shard plus one spare",
+            "cache requires one Active Region per shard plus one spare",
         ));
     }
     let partition_ranges =
@@ -1292,7 +948,7 @@ fn empty_region_metadata(
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate Region table"))?;
     let mut free_ordinal = 0_u32;
     for region_id in 0..data.geometry.region_count {
-        let active = region_id < append_gates;
+        let active = region_id < append_shards;
         let queue_ordinal = if active {
             region_id
         } else {
@@ -1330,10 +986,10 @@ fn empty_region_metadata(
             partition_count: u32::try_from(partition_ranges.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "too many index partitions")
             })?,
-            shard_count: append_gates,
-            max_seqno: u64::from(append_gates),
-            free_region_count: data.geometry.region_count - append_gates,
-            active_region_count: append_gates,
+            shard_count: append_shards,
+            max_seqno: u64::from(append_shards),
+            free_region_count: data.geometry.region_count - append_shards,
+            active_region_count: append_shards,
             sealed_region_count: 0,
         },
         regions: regions.into_boxed_slice(),
@@ -1394,15 +1050,15 @@ const fn anonymous_index_backing_name() -> &'static str {
 }
 
 struct PositionedIoWriter<'a, B: PositionedIo + ?Sized> {
-    backend: &'a B,
+    file: &'a B,
     point: WritePoint,
     offset: u64,
 }
 
 impl<'a, B: PositionedIo + ?Sized> PositionedIoWriter<'a, B> {
-    const fn new(backend: &'a B, point: WritePoint, offset: u64) -> Self {
+    const fn new(file: &'a B, point: WritePoint, offset: u64) -> Self {
         Self {
-            backend,
+            file,
             point,
             offset,
         }
@@ -1415,7 +1071,7 @@ impl<'a, B: PositionedIo + ?Sized> PositionedIoWriter<'a, B> {
 
 impl<B: PositionedIo + ?Sized> Write for PositionedIoWriter<'_, B> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let written = self.backend.write_at(self.point, buffer, self.offset)?;
+        let written = self.file.write_at(self.point, buffer, self.offset)?;
         self.offset = self
             .offset
             .checked_add(written as u64)

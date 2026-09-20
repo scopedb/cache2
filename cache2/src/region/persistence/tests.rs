@@ -35,10 +35,12 @@ use std::time::Instant;
 use super::*;
 use crate::IoEngineOptions;
 use crate::StatsOptions;
+use crate::cache::runtime::CacheRead;
 use crate::cache::session::CacheSession;
 use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
+use crate::config::runtime::RuntimeOptions;
 use crate::io::engine::IoEngine;
 use crate::io::file::MAX_INTERRUPTED_RETRIES;
 use crate::io::file::testing::FaultAction;
@@ -54,6 +56,7 @@ use crate::region::index::packed::PackedLocation;
 use crate::region::index::storage::IndexSlot;
 use crate::region::index::storage::IndexSlotState;
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::manager::RegionManager;
 use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
 use crate::region::reader::ReadDesc;
@@ -64,7 +67,6 @@ use crate::region::record::codec::required_record_bytes;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::PersistentId;
-use crate::region::runtime::HybridValueRead;
 use crate::region::staging::AppendStaging;
 use crate::region::staging::StagedRecord;
 use crate::snapshot::CacheSnapshot;
@@ -73,34 +75,31 @@ use crate::snapshot::StartupMode;
 
 impl CacheSession {
     fn put_value(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
-        self.runtime()?.data_plane()?.put(key, value)
+        self.runtime()?.put(key, value)
     }
 
-    fn get_value(&self, key: &[u8]) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?.data_plane()?.get(key)
+    fn get_value(&self, key: &[u8]) -> io::Result<Option<CacheRead>> {
+        self.runtime()?.get(key)
     }
 
     async fn get_value_async(
         &self,
         key: &[u8],
         tokio_handle: &tokio::runtime::Handle,
-    ) -> io::Result<Option<HybridValueRead>> {
-        self.runtime()?
-            .data_plane()?
-            .get_async(key, tokio_handle, None)
-            .await
+    ) -> io::Result<Option<CacheRead>> {
+        self.runtime()?.get_async(key, tokio_handle, None).await
     }
 
     pub fn drain(&self) -> io::Result<()> {
-        self.runtime()?.data_plane()?.drain()
+        self.runtime()?.drain()
     }
 
     pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
-        self.runtime()?.data_plane()?.snapshot()
+        self.runtime()?.snapshot()
     }
 
     pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {
-        self.runtime()?.data_plane()?.detailed_snapshot()
+        self.runtime()?.detailed_snapshot()
     }
 }
 
@@ -327,18 +326,14 @@ fn external_process_kill_recovery_contract() {
     ] {
         let directory = TestDirectory::new();
         let data = data_path_superblock();
-        let mut initial = CacheSession::open(
-            4096,
-            FileRegionBackend::for_test(directory.paths.clone(), data, 4096),
-        )
-        .unwrap();
+        let mut initial = CacheSession::for_test(directory.paths.clone(), data, 4096).unwrap();
         eventually_admitted(|| initial.put_value(b"survivor", b"old"));
         initial.drain().unwrap();
         initial.close_warm().unwrap();
 
         let status = Command::new(env::current_exe().unwrap())
             .arg("--exact")
-            .arg("region::file_backend::tests::external_process_kill_recovery_contract")
+            .arg("region::persistence::tests::external_process_kill_recovery_contract")
             .arg("--ignored")
             .arg("--nocapture")
             .env(CHILD_CASE, case)
@@ -353,11 +348,7 @@ fn external_process_kill_recovery_contract() {
             "crash case {case} did not SIGKILL"
         );
 
-        let mut reopened = CacheSession::open(
-            4096,
-            FileRegionBackend::for_test(directory.paths.clone(), data, 4096),
-        )
-        .unwrap();
+        let mut reopened = CacheSession::for_test(directory.paths.clone(), data, 4096).unwrap();
         if expect_clean {
             assert_eq!(reopened.startup(), StartupMode::Warm, "{case}");
             assert_eq!(
@@ -378,13 +369,11 @@ fn run_crash_child(case: &str, paths: RegionPaths) -> ! {
     let data = data_path_superblock();
     match case {
         "open" => {
-            let _store =
-                CacheSession::open(4096, FileRegionBackend::for_test(paths, data, 4096)).unwrap();
+            let _store = CacheSession::for_test(paths, data, 4096).unwrap();
             kill_process();
         }
         "write" | "drain" => {
-            let session =
-                CacheSession::open(4096, FileRegionBackend::for_test(paths, data, 4096)).unwrap();
+            let session = CacheSession::for_test(paths, data, 4096).unwrap();
             eventually_admitted(|| session.put_value(b"replacement", b"new"));
             if case == "drain" {
                 session.drain().unwrap();
@@ -393,11 +382,8 @@ fn run_crash_child(case: &str, paths: RegionPaths) -> ! {
         }
         "warm-data" | "warm-image" | "clean-state" => {
             let (file_system, faults, _) = FaultFileSystem::new();
-            let mut session = CacheSession::open(
-                4096,
-                FileRegionBackend::for_test_with_file_system(paths, data, 4096, file_system),
-            )
-            .unwrap();
+            let mut session =
+                CacheSession::for_test_with_file_system(paths, data, 4096, file_system).unwrap();
             let point = match case {
                 "warm-data" => SyncPoint::WarmData,
                 "warm-image" => SyncPoint::RecoveryImage,
@@ -459,16 +445,9 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         },
         ..RuntimeOptions::default()
     };
-    let mut session = CacheSession::open(
-        4096,
-        FileRegionBackend::for_test_with_options(
-            directory.paths.clone(),
-            data,
-            4096,
-            runtime_options,
-        ),
-    )
-    .unwrap();
+    let mut session =
+        CacheSession::for_test_with_options(directory.paths.clone(), data, 4096, runtime_options)
+            .unwrap();
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
@@ -476,8 +455,10 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
         .unwrap();
     eventually_admitted(|| session.put_value(b"queued-read", b"local-value"));
     session.drain().unwrap();
-    let plane = session.data_plane_handle().unwrap();
-    let mut slots: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
+    let runtime = session.runtime().unwrap().clone();
+    let mut slots: Vec<_> = (0..2)
+        .map(|_| runtime.reserve_read_slot_for_test())
+        .collect();
     tokio_runtime.block_on(async {
         let mut cancelled =
             Box::pin(session.get_value_async(b"queued-read", tokio_runtime.handle()));
@@ -501,7 +482,9 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     drop(slots);
     assert_eq!(value.value(), b"local-value");
     drop(value);
-    let blocked: Vec<_> = (0..2).map(|_| plane.reserve_read_slot_for_test()).collect();
+    let blocked: Vec<_> = (0..2)
+        .map(|_| runtime.reserve_read_slot_for_test())
+        .collect();
     tokio_runtime.block_on(async {
         let mut waiting = Box::pin(session.get_value_async(b"queued-read", tokio_runtime.handle()));
         assert_pending(
@@ -547,14 +530,11 @@ fn queued_l2_read_does_not_pin_warm_close() {
         },
         ..RuntimeOptions::default()
     };
-    let mut session = CacheSession::open(
+    let mut session = CacheSession::for_test_with_options(
+        directory.paths.clone(),
+        data,
         4096,
-        FileRegionBackend::for_test_with_options(
-            directory.paths.clone(),
-            data,
-            4096,
-            runtime_options.clone(),
-        ),
+        runtime_options.clone(),
     )
     .unwrap();
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
@@ -563,11 +543,12 @@ fn queued_l2_read_does_not_pin_warm_close() {
         .unwrap();
     eventually_admitted(|| session.put_value(b"queued-close", b"value"));
     session.drain().unwrap();
-    let plane = session.data_plane_handle().unwrap();
-    let slot = plane.reserve_read_slot_for_test();
+    let runtime = session.runtime().unwrap().clone();
+    let slot = runtime.reserve_read_slot_for_test();
 
     tokio_runtime.block_on(async {
-        let mut waiting = Box::pin(plane.get_async(b"queued-close", tokio_runtime.handle(), None));
+        let mut waiting =
+            Box::pin(runtime.get_async(b"queued-close", tokio_runtime.handle(), None));
         assert_pending(waiting.as_mut(), "saturated read must enter the wait queue").await;
 
         session.close_warm().unwrap();
@@ -579,22 +560,15 @@ fn queued_l2_read_does_not_pin_warm_close() {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     });
 
-    let mut reopened = CacheSession::open(
-        4096,
-        FileRegionBackend::for_test_with_options(
-            directory.paths.clone(),
-            data,
-            4096,
-            runtime_options,
-        ),
-    )
-    .unwrap();
+    let mut reopened =
+        CacheSession::for_test_with_options(directory.paths.clone(), data, 4096, runtime_options)
+            .unwrap();
     assert_eq!(reopened.startup(), StartupMode::Warm);
     reopened.close_fast().unwrap();
 }
 
 #[test]
-fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
+fn cache_runtime_reads_mixed_chunks_rotates_and_warm_recovers() {
     let directory = TestDirectory::new();
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
@@ -605,16 +579,9 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
         },
         ..RuntimeOptions::default()
     };
-    let mut session = CacheSession::open(
-        4096,
-        FileRegionBackend::for_test_with_options(
-            directory.paths.clone(),
-            data,
-            4096,
-            runtime_options,
-        ),
-    )
-    .unwrap();
+    let mut session =
+        CacheSession::for_test_with_options(directory.paths.clone(), data, 4096, runtime_options)
+            .unwrap();
 
     let mixed = [16 * 1024, 64 * 1024, 128 * 1024, 256 * 1024];
     let mut expected = Vec::new();
@@ -684,11 +651,7 @@ fn production_data_plane_reads_mixed_chunks_rotates_and_warm_recovers() {
     session.close_warm().unwrap();
     assert_eq!(retained_hits[0].value(), rotation_value);
     drop(retained_hits);
-    let mut recovered = CacheSession::open(
-        4096,
-        FileRegionBackend::for_test(directory.paths.clone(), data, 4096),
-    )
-    .unwrap();
+    let mut recovered = CacheSession::for_test(directory.paths.clone(), data, 4096).unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
     assert_eq!(
         recovered
@@ -717,38 +680,28 @@ fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
             write_flush_threshold_bytes: 128 * 1024,
             ..RuntimeOptions::default()
         };
-        let mut session = CacheSession::open(
+        let mut session = CacheSession::for_test_with_options(
+            directory.paths.clone(),
+            data,
             4096,
-            FileRegionBackend::for_test_with_options(
-                directory.paths.clone(),
-                data,
-                4096,
-                runtime_options.clone(),
-            ),
+            runtime_options.clone(),
         )
         .unwrap();
 
-        let runtime = session.runtime().unwrap();
+        let runtime = session.regions().unwrap();
         match case {
-            "shard" => runtime.data_plane().unwrap().poison_shard_for_test(0),
-            "index" => runtime
-                .regions
-                .index
-                .storage()
-                .poison_hash_partition_for_test(0),
+            "shard" => session.runtime().unwrap().poison_append_worker_for_test(0),
+            "index" => runtime.index.storage().poison_hash_partition_for_test(0),
             _ => unreachable!(),
         }
         let error = session.close_warm().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");
 
-        let mut reopened = CacheSession::open(
+        let mut reopened = CacheSession::for_test_with_options(
+            directory.paths.clone(),
+            data,
             4096,
-            FileRegionBackend::for_test_with_options(
-                directory.paths.clone(),
-                data,
-                4096,
-                runtime_options,
-            ),
+            runtime_options,
         )
         .unwrap();
         assert_eq!(reopened.startup(), StartupMode::Cold, "{case}");
@@ -810,9 +763,9 @@ fn four_tib_region_metadata_round_trips_into_runtime_authority() {
     assert_eq!(manager.next_seqno(), u64::from(REGION_SHARDS) + 1);
 }
 
-fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, AppendStaging) {
+fn foreground_stage_fixture() -> (DataSuperblock, Arc<RegionStore>, AppendStaging) {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
@@ -825,19 +778,19 @@ fn foreground_stage_fixture() -> (DataSuperblock, FileRegionRuntime, AppendStagi
         &managed_memory,
     )
     .unwrap();
-    (data, runtime, staging)
+    (data, Arc::new(regions), staging)
 }
 
 #[test]
 fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
-    let (data, runtime, staging) = foreground_stage_fixture();
-    let manager = runtime.manager.state.lock().unwrap();
+    let (data, regions, staging) = foreground_stage_fixture();
+    let manager = regions.manager.state.lock().unwrap();
     let next_seqno = manager.next_seqno();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
 
     assert_eq!(
-        runtime
+        regions
             .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
             .unwrap(),
         RegionStageValue::NeedsProgress
@@ -847,15 +800,16 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
 
 #[test]
 fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
-    let (data, runtime, staging) = foreground_stage_fixture();
-    let next_seqno = runtime.manager.state.lock().unwrap().next_seqno();
-    let mutation = runtime.regions.append_gates[0].mutation.lock().unwrap();
+    let (data, regions, staging) = foreground_stage_fixture();
+    let next_seqno = regions.manager.state.lock().unwrap().next_seqno();
+    let mutation = regions.append_gates[0].mutation.lock().unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
-    let regions = Arc::clone(&runtime.regions);
+    let writer_regions = Arc::clone(&regions);
     let writer = std::thread::spawn(move || {
-        let result = regions.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
+        let result =
+            writer_regions.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
         sender.send((result, staging)).unwrap();
     });
 
@@ -865,13 +819,12 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let (result, staging) = early.expect("a busy shard must reject without waiting for its lock");
     assert!(matches!(result.unwrap(), RegionStageValue::NeedsProgress));
     assert_eq!(
-        runtime.manager.state.lock().unwrap().next_seqno(),
+        regions.manager.state.lock().unwrap().next_seqno(),
         next_seqno
     );
     assert!(staging.shard_fill_snapshot(0).unwrap().is_none());
 
-    let staged = runtime
-        .regions
+    let staged = regions
         .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
         .unwrap();
     assert!(matches!(
@@ -879,7 +832,7 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
         RegionStageValue::Staged { seqno, .. } if seqno == next_seqno
     ));
     assert_eq!(
-        runtime.manager.state.lock().unwrap().next_seqno(),
+        regions.manager.state.lock().unwrap().next_seqno(),
         next_seqno + 1
     );
 }
@@ -887,12 +840,12 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
 #[test]
 fn completed_record_publication_does_not_enter_region_manager() {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    let regions = Arc::clone(&runtime.regions);
+    let regions = Arc::new(regions);
     let manager = regions.manager.state.lock().unwrap();
     let record = StagedRecord::new(
         7,
@@ -902,10 +855,10 @@ fn completed_record_publication_does_not_enter_region_manager() {
         1,
     );
     let (sender, receiver) = mpsc::sync_channel(1);
-    let publisher_core = Arc::clone(&regions);
+    let publisher_regions = Arc::clone(&regions);
     let publisher = std::thread::spawn(move || {
         sender
-            .send(publisher_core.publish_completed_records(&[record]))
+            .send(publisher_regions.publish_completed_records(&[record]))
             .unwrap();
     });
 
@@ -913,14 +866,14 @@ fn completed_record_publication_does_not_enter_region_manager() {
     drop(manager);
     publisher.join().unwrap();
     published.unwrap().unwrap();
-    assert_eq!(runtime.lookup_snapshot(7).unwrap(), Some(record.entry()));
+    assert_eq!(regions.lookup_snapshot(7).unwrap(), Some(record.entry()));
 }
 
 #[test]
 fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     let data = data_path_superblock();
     let index_slots = INDEX_IMAGE_SLOTS_PER_PAGE * 4;
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(index_slots).unwrap(),
         empty_region_metadata(data, index_slots, REGION_SHARDS).unwrap(),
     )
@@ -934,9 +887,9 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, faults) = FaultFile::open(&directory.paths.data).unwrap();
-    backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = IoEngine::for_test(Arc::new(backend), 2).unwrap();
+    let (file, faults) = FaultFile::open(&directory.paths.data).unwrap();
+    file.set_len(data.geometry.data_file_len).unwrap();
+    let engine = IoEngine::for_test(Arc::new(file), 2).unwrap();
     let value = vec![0x5a; 16 * 1024];
     let mut first = None;
     let mut last = None;
@@ -945,7 +898,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         let key = format!("file/chunk/{staged_records:04}");
         let hash = hash_key(data.hash_seed, key.as_bytes());
         let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
-        match runtime
+        match regions
             .try_stage_value(&staging, 0, hash, record_bytes, key.as_bytes(), &value)
             .unwrap()
         {
@@ -964,9 +917,9 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         first.expect("4 MiB span must contain target-size records");
     let (last_key, last_hash, last_seqno) = last.expect("4 MiB span must retain its final record");
     assert!(staged_records > 240);
-    assert_eq!(runtime.lookup_snapshot(first_hash).unwrap(), None);
+    assert_eq!(regions.lookup_snapshot(first_hash).unwrap(), None);
 
-    let published = runtime
+    let published = regions
         .flush_staging_shard(
             &staging,
             &engine,
@@ -979,7 +932,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         (published.end_offset - published.start_offset) % RECOVERY_PAGE_SIZE as u64,
         0
     );
-    let Some(entry) = runtime.lookup_snapshot(first_hash).unwrap() else {
+    let Some(entry) = regions.lookup_snapshot(first_hash).unwrap() else {
         panic!("completed first record must be published");
     };
     let first_exact = PackedLocation::new(
@@ -990,7 +943,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     .unwrap();
     assert!(entry.location.index_equivalent(first_exact));
     assert_ne!(entry.location.record_len() % RECOVERY_PAGE_SIZE as u32, 0);
-    let Some(last_entry) = runtime.lookup_snapshot(last_hash).unwrap() else {
+    let Some(last_entry) = regions.lookup_snapshot(last_hash).unwrap() else {
         panic!("completed final record must be published");
     };
     assert!(
@@ -1006,19 +959,19 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     )
     .unwrap();
     assert!(last_entry.location.index_equivalent(last_exact));
-    let read = runtime
+    let read = regions
         .begin_point_read(first_hash)
         .expect("completed entry must yield a Region read candidate");
     assert_eq!(read.entry, entry);
 
-    let last_read = runtime
+    let last_read = regions
         .begin_point_read(last_hash)
         .expect("completed final entry must yield a Region read candidate");
     let read_buffer_bytes = describe_read(data.geometry, last_hash, last_read, true)
         .unwrap()
         .read_len;
     let memory_before_read = managed_memory.snapshot().current_bytes;
-    let hit = runtime
+    let hit = regions
         .read_value(
             &engine,
             data.geometry,
@@ -1045,7 +998,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
 #[test]
 fn read_availability_errors_do_not_latch_miss_only() {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
@@ -1073,18 +1026,18 @@ fn read_availability_errors_do_not_latch_miss_only() {
             result: Err(io::Error::new(kind, "injected read availability error")),
             buffer: None,
         };
-        let Err(error) = runtime.finish_value_read(completion, b"key") else {
+        let Err(error) = regions.finish_value_read(completion, b"key") else {
             panic!("injected read availability error unexpectedly succeeded");
         };
         assert_eq!(error.kind(), kind);
-        assert!(runtime.is_healthy(), "{kind:?}");
+        assert!(regions.is_healthy(), "{kind:?}");
     }
 }
 
 #[test]
 fn same_hash_candidate_requires_full_key() {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
@@ -1098,15 +1051,15 @@ fn same_hash_candidate_requires_full_key() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, _) = FaultFile::open(&directory.paths.data).unwrap();
-    backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
+    let (file, _) = FaultFile::open(&directory.paths.data).unwrap();
+    file.set_len(data.geometry.data_file_len).unwrap();
+    let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
     let owner_key = b"collision-owner";
     let foreign_key = b"collision-foreign";
     let value = b"owner-value-must-not-leak";
     let owner_hash = hash_key(data.hash_seed, owner_key);
     let owner_record_bytes = required_record_bytes(owner_key.len(), value.len()).unwrap();
-    let RegionStageValue::Staged { .. } = runtime
+    let RegionStageValue::Staged { .. } = regions
         .try_stage_value(
             &staging,
             0,
@@ -1119,7 +1072,7 @@ fn same_hash_candidate_requires_full_key() {
     else {
         panic!("collision owner must stage");
     };
-    runtime
+    regions
         .flush_staging_shard(
             &staging,
             &engine,
@@ -1129,14 +1082,14 @@ fn same_hash_candidate_requires_full_key() {
         .unwrap()
         .expect("collision owner must publish");
 
-    let Some(entry) = runtime.lookup_snapshot(owner_hash).unwrap() else {
+    let Some(entry) = regions.lookup_snapshot(owner_hash).unwrap() else {
         panic!("collision owner must be indexed after publication");
     };
     let read_buffer_bytes =
         (entry.location.record_len() as usize).div_ceil(RECOVERY_PAGE_SIZE) * RECOVERY_PAGE_SIZE;
     let memory_before_read = managed_memory.snapshot().current_bytes;
     let read_buffer = managed_memory.try_read_buffer(read_buffer_bytes).unwrap();
-    let entry = runtime
+    let entry = regions
         .begin_point_read(owner_hash)
         .expect("hash lookup must return the collision candidate");
     let desc = describe_read(data.geometry, owner_hash, entry, true).unwrap();
@@ -1144,7 +1097,7 @@ fn same_hash_candidate_requires_full_key() {
     // Supplying a different key after the hash lookup precisely models a
     // 64-bit collision at the L2 record-validation boundary.
     assert!(
-        runtime
+        regions
             .read_value_from_desc(
                 &engine,
                 engine.try_reserve_read().unwrap(),
@@ -1155,10 +1108,10 @@ fn same_hash_candidate_requires_full_key() {
             .unwrap()
             .is_none()
     );
-    assert!(runtime.health.is_healthy());
+    assert!(regions.health.is_healthy());
     assert_eq!(managed_memory.snapshot().current_bytes, memory_before_read);
 
-    let current = runtime
+    let current = regions
         .begin_point_read(owner_hash)
         .expect("owner remains indexed");
     let stale_generation = ReadCandidate {
@@ -1167,7 +1120,7 @@ fn same_hash_candidate_requires_full_key() {
     };
     let stale_desc = describe_read(data.geometry, owner_hash, stale_generation, true).unwrap();
     assert!(
-        runtime
+        regions
             .read_value_from_desc(
                 &engine,
                 engine.try_reserve_read().unwrap(),
@@ -1194,7 +1147,7 @@ fn same_hash_candidate_requires_full_key() {
     let wrong_length_desc = describe_read(data.geometry, owner_hash, wrong_length, true).unwrap();
     let wrong_length_read_bytes = wrong_length_desc.read_len;
     assert!(
-        runtime
+        regions
             .read_value_from_desc(
                 &engine,
                 engine.try_reserve_read().unwrap(),
@@ -1208,7 +1161,7 @@ fn same_hash_candidate_requires_full_key() {
             .is_none()
     );
 
-    let hit = runtime
+    let hit = regions
         .read_value(
             &engine,
             data.geometry,
@@ -1227,7 +1180,7 @@ fn same_hash_candidate_requires_full_key() {
 #[test]
 fn failed_span_write_never_publishes_and_latches_miss_only() {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
@@ -1241,12 +1194,12 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     )
     .unwrap();
     let directory = TestDirectory::new();
-    let (backend, faults) = FaultFile::open(&directory.paths.data).unwrap();
-    backend.set_len(data.geometry.data_file_len).unwrap();
-    let engine = IoEngine::for_test(Arc::new(backend), 1).unwrap();
+    let (file, faults) = FaultFile::open(&directory.paths.data).unwrap();
+    file.set_len(data.geometry.data_file_len).unwrap();
+    let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), 16 * 1024).unwrap();
-    let RegionStageValue::Staged { .. } = runtime
+    let RegionStageValue::Staged { .. } = regions
         .try_stage_value(&staging, 0, hash, record_bytes, b"key", &[7; 16 * 1024])
         .unwrap()
     else {
@@ -1259,7 +1212,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
     );
 
     assert_eq!(
-        runtime
+        regions
             .flush_staging_shard(
                 &staging,
                 &engine,
@@ -1272,11 +1225,11 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
             .raw_os_error(),
         Some(5)
     );
-    assert!(!runtime.health.is_healthy());
-    assert_eq!(runtime.lookup_snapshot(hash).unwrap(), None);
-    assert_eq!(runtime.index.lookup_raw(hash).unwrap(), None);
+    assert!(!regions.health.is_healthy());
+    assert_eq!(regions.lookup_snapshot(hash).unwrap(), None);
+    assert_eq!(regions.index.lookup_raw(hash).unwrap(), None);
     assert_eq!(
-        runtime.manager.state.lock().unwrap().regions()[0].completed_used,
+        regions.manager.state.lock().unwrap().regions()[0].completed_used,
         0
     );
     engine.shutdown().unwrap();
@@ -1285,12 +1238,12 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
 #[test]
 fn rotation_is_committed_without_a_metadata_io_boundary() {
     let data = data_path_superblock();
-    let runtime = FileRegionRuntime::install(
+    let regions = RegionStore::from_recovery(
         PartitionedIndexStorage::anonymous(64).unwrap(),
         empty_region_metadata(data, 64, REGION_SHARDS).unwrap(),
     )
     .unwrap();
-    runtime
+    regions
         .manager
         .state
         .lock()
@@ -1298,9 +1251,9 @@ fn rotation_is_committed_without_a_metadata_io_boundary() {
         .request_rotation_for_test(0)
         .unwrap();
 
-    assert!(runtime.rotate_shard(0).unwrap());
-    assert!(runtime.health.is_healthy());
-    let manager = runtime.manager.lock().unwrap();
+    assert!(regions.rotate_shard(0).unwrap());
+    assert!(regions.health.is_healthy());
+    let manager = regions.manager.lock().unwrap();
     assert_eq!(manager.active_regions()[0], REGION_SHARDS);
     assert_eq!(manager.sealed_regions().back(), Some(&0));
 }
@@ -1325,14 +1278,11 @@ fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
     let data = test_data_superblock();
 
     let (fresh_file_system, fresh_io, _) = FaultFileSystem::new();
-    let mut fresh = CacheSession::open(
+    let mut fresh = CacheSession::for_test_with_file_system(
+        directory.paths.clone(),
+        data,
         config,
-        FileRegionBackend::for_test_with_file_system(
-            directory.paths.clone(),
-            data,
-            config,
-            fresh_file_system,
-        ),
+        fresh_file_system,
     )
     .unwrap();
     assert_eq!(fresh.startup(), StartupMode::Cold);
@@ -1340,14 +1290,11 @@ fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
     fresh.close_fast().unwrap();
 
     let (dirty_file_system, dirty_io, _) = FaultFileSystem::new();
-    let mut dirty = CacheSession::open(
+    let mut dirty = CacheSession::for_test_with_file_system(
+        directory.paths.clone(),
+        data,
         config,
-        FileRegionBackend::for_test_with_file_system(
-            directory.paths.clone(),
-            data,
-            config,
-            dirty_file_system,
-        ),
+        dirty_file_system,
     )
     .unwrap();
     assert_eq!(dirty.startup(), StartupMode::Cold);
@@ -1361,30 +1308,21 @@ fn publish_custom_clean_image(
     data: DataSuperblock,
     metadata: RegionMetadata,
 ) {
-    let shard_count = metadata.root.shard_count;
-    let runtime_options = RuntimeOptions {
-        append_shards: shard_count,
-        ..RuntimeOptions::default()
-    };
-    let mut backend = FileRegionBackend::for_test_with_options(
-        directory.paths.clone(),
-        data,
-        index_slots,
-        runtime_options,
+    let mut persistence = RegionPersistence::new(directory.paths.clone(), data, OsFileSystem);
+    persistence.acquire_exclusive(IoMode::Buffered).unwrap();
+    assert!(persistence.inspect_recovery(index_slots).unwrap().is_none());
+    let regions = Arc::new(
+        RegionStore::from_recovery(
+            PartitionedIndexStorage::anonymous(index_slots).unwrap(),
+            metadata,
+        )
+        .unwrap(),
     );
-    backend.acquire_exclusive().unwrap();
-    assert!(backend.inspect_recovery(index_slots).unwrap().is_none());
-    let runtime = FileRegionRuntime::install(
-        PartitionedIndexStorage::anonymous(index_slots).unwrap(),
-        metadata,
-    )
-    .unwrap();
-    backend.publish_running().unwrap();
-    let runtime = backend.start_runtime(runtime).unwrap();
-    let frozen = backend.freeze_warm(runtime).unwrap();
-    let prepared = backend.persist_frozen(&frozen).unwrap();
-    backend.publish_clean(prepared).unwrap();
-    backend.release_exclusive().unwrap();
+    persistence.publish_running().unwrap();
+    let frozen = regions.freeze().unwrap();
+    let prepared = persistence.persist_frozen(&frozen).unwrap();
+    persistence.publish_clean(prepared).unwrap();
+    persistence.release_exclusive().unwrap();
 }
 
 #[test]
@@ -1396,27 +1334,19 @@ fn clean_image_rebinds_a_different_append_shard_topology() {
     let metadata = empty_region_metadata(data, config, 1).unwrap();
     publish_custom_clean_image(&directory, config, data, metadata);
 
-    let mut reopened = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut reopened = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(reopened.startup(), StartupMode::Warm);
-    let manager = reopened.runtime().unwrap().manager.lock().unwrap();
+    let manager = reopened.regions().unwrap().manager.lock().unwrap();
     assert_eq!(manager.active_regions(), &[0, 2, 3, 4]);
     assert_eq!(manager.free_regions().len(), 1);
     drop(manager);
     reopened.close_warm().unwrap();
 
-    let mut stable = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut stable = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(stable.startup(), StartupMode::Warm);
     assert_eq!(
         stable
-            .runtime()
+            .regions()
             .unwrap()
             .manager
             .lock()
@@ -1445,13 +1375,9 @@ fn append_shard_growth_without_free_regions_cold_starts_safely() {
     metadata.validate().unwrap();
     publish_custom_clean_image(&directory, config, data, metadata);
 
-    let mut reopened = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut reopened = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(reopened.startup(), StartupMode::Cold);
-    let manager = reopened.runtime().unwrap().manager.lock().unwrap();
+    let manager = reopened.regions().unwrap().manager.lock().unwrap();
     assert_eq!(manager.active_regions(), &[0, 1, 2, 3]);
     assert_eq!(manager.free_regions().len(), 1);
     drop(manager);
@@ -1465,11 +1391,7 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
     let directory = TestDirectory::new();
     let config = 8;
     let data = test_data_superblock();
-    let mut first = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     first.close_fast().unwrap();
 
     let stale_offset = 2 * RECOVERY_PAGE_SIZE as u64;
@@ -1481,11 +1403,7 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
     file.write_all_at(b"stale-record", stale_offset).unwrap();
     file.sync_data().unwrap();
 
-    let mut cold = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut cold = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
     let mut observed = [0xff_u8; 12];
     File::open(&directory.paths.data)
@@ -1497,42 +1415,17 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
 }
 
 #[test]
-fn invalid_capacity_is_rejected_before_creating_files() {
-    for index_slots in [0, 1, 7, usize::MAX] {
-        let directory = TestDirectory::new();
-        let opened = CacheSession::open(
-            index_slots,
-            FileRegionBackend::for_test(directory.paths.clone(), test_data_superblock(), 8),
-        );
-        assert_eq!(opened.err().unwrap().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(fs::read_dir(&directory.root).unwrap().count(), 0);
-    }
-}
-
-#[test]
 fn dropping_a_warm_runtime_releases_ownership_and_reopens_cold() {
     let directory = TestDirectory::new();
     let data = test_data_superblock();
-    let mut initial = CacheSession::open(
-        8,
-        FileRegionBackend::for_test(directory.paths.clone(), data, 8),
-    )
-    .unwrap();
+    let mut initial = CacheSession::for_test(directory.paths.clone(), data, 8).unwrap();
     initial.close_warm().unwrap();
 
-    let recovered = CacheSession::open(
-        8,
-        FileRegionBackend::for_test(directory.paths.clone(), data, 8),
-    )
-    .unwrap();
+    let recovered = CacheSession::for_test(directory.paths.clone(), data, 8).unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
     drop(recovered);
 
-    let mut cold = CacheSession::open(
-        8,
-        FileRegionBackend::for_test(directory.paths.clone(), data, 8),
-    )
-    .unwrap();
+    let mut cold = CacheSession::for_test(directory.paths.clone(), data, 8).unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
     cold.close_fast().unwrap();
 }
@@ -1550,12 +1443,8 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
         },
     });
 
-    let mut first = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
-    let runtime = first.runtime_mut().unwrap();
+    let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
+    let runtime = first.regions().unwrap();
     assert_eq!(runtime.index.storage().partition_count(), 2);
     runtime
         .index
@@ -1567,18 +1456,14 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
     first.close_warm().unwrap();
     first.close_fast().unwrap();
     assert_eq!(
-        first.runtime().err().unwrap().kind(),
+        first.regions().err().unwrap().kind(),
         io::ErrorKind::BrokenPipe
     );
     drop(first);
 
-    let mut recovered = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut recovered = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
-    let recovered_runtime = recovered.runtime().unwrap();
+    let recovered_runtime = recovered.regions().unwrap();
     assert_eq!(recovered_runtime.index.storage().partition_count(), 2);
     assert_eq!(
         recovered_runtime
@@ -1598,11 +1483,7 @@ fn corrupt_region_metadata_rejects_the_complete_clean_image() {
     let directory = TestDirectory::new();
     let config = 130;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
-    let mut first = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     first.close_warm().unwrap();
 
     let image = File::options()
@@ -1620,14 +1501,10 @@ fn corrupt_region_metadata_rejects_the_complete_clean_image() {
         .unwrap();
     image.sync_data().unwrap();
 
-    let mut rejected = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut rejected = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(rejected.startup(), StartupMode::Cold);
     assert_eq!(
-        rejected.runtime().unwrap().lookup_snapshot(0).unwrap(),
+        rejected.regions().unwrap().lookup_snapshot(0).unwrap(),
         None
     );
     rejected.close_fast().unwrap();
@@ -1640,11 +1517,7 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
     let directory = TestDirectory::new();
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
-    let mut first = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     first.close_warm().unwrap();
 
     let image = File::options()
@@ -1660,13 +1533,9 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
         .unwrap();
     image.sync_data().unwrap();
 
-    let mut recovered = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut recovered = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(recovered.startup(), StartupMode::Warm);
-    let runtime = recovered.runtime().unwrap();
+    let runtime = recovered.regions().unwrap();
     assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);
     assert!(runtime.health.is_healthy());
     assert_eq!(runtime.lookup_snapshot(1).unwrap(), None);
@@ -1675,13 +1544,9 @@ fn one_corrupt_lazy_index_page_rejects_all_pages() {
     assert_eq!(runtime.lookup_snapshot(0).unwrap(), None);
     assert!(recovered.close_warm().is_err());
 
-    let mut cold = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut cold = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
-    assert_eq!(cold.runtime().unwrap().lookup_snapshot(1).unwrap(), None);
+    assert_eq!(cold.regions().unwrap().lookup_snapshot(1).unwrap(), None);
     cold.close_fast().unwrap();
 }
 
@@ -1746,13 +1611,13 @@ fn every_prepublication_failure_leaves_no_selectable_clean_state() {
         let config = 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
         let (file_system, io_faults, file_system_faults) = FaultFileSystem::new();
-        let backend = FileRegionBackend::for_test_with_file_system(
+        let mut session = CacheSession::for_test_with_file_system(
             directory.paths.clone(),
             data,
             config,
             file_system,
-        );
-        let mut session = CacheSession::open(config, backend).unwrap();
+        )
+        .unwrap();
         if let Some((event, action)) = io_fault {
             io_faults.arm(event, 1, action);
         }
@@ -1761,11 +1626,7 @@ fn every_prepublication_failure_leaves_no_selectable_clean_state() {
         }
         assert!(session.close_warm().is_err(), "failure case {case}");
 
-        let mut reopened = CacheSession::open(
-            config,
-            FileRegionBackend::for_test(directory.paths.clone(), data, config),
-        )
-        .unwrap();
+        let mut reopened = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
         assert_eq!(reopened.startup(), StartupMode::Cold, "failure case {case}");
         reopened.close_fast().unwrap();
     }
@@ -1800,14 +1661,11 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
         let data = test_data_superblock();
         let (file_system, faults, _) = FaultFileSystem::new();
         faults.arm(event, occurrence, action);
-        let opened = CacheSession::open(
+        let opened = CacheSession::for_test_with_file_system(
+            directory.paths.clone(),
+            data,
             config,
-            FileRegionBackend::for_test_with_file_system(
-                directory.paths.clone(),
-                data,
-                config,
-                file_system,
-            ),
+            file_system,
         );
         assert!(opened.is_err(), "RUNNING barrier case {case}");
         assert!(
@@ -1815,11 +1673,7 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
             "runtime paths must not be requested before RUNNING is durable"
         );
 
-        let mut cold = CacheSession::open(
-            config,
-            FileRegionBackend::for_test(directory.paths.clone(), data, config),
-        )
-        .unwrap();
+        let mut cold = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
         assert!(matches!(cold.startup(), StartupMode::Cold));
         cold.close_fast().unwrap();
     }
@@ -1831,10 +1685,8 @@ fn runtime_file_failure_after_running_releases_ownership_and_reopens_cold() {
     let data = test_data_superblock();
     let (file_system, faults, _) = FaultFileSystem::new();
     faults.arm(FaultEvent::CloneDataHandles, 1, FaultAction::Error(5));
-    let opened = CacheSession::open(
-        8,
-        FileRegionBackend::for_test_with_file_system(directory.paths.clone(), data, 8, file_system),
-    );
+    let opened =
+        CacheSession::for_test_with_file_system(directory.paths.clone(), data, 8, file_system);
     assert_eq!(opened.err().unwrap().raw_os_error(), Some(5));
     assert!(faults.events().contains(&FaultEvent::CloneDataHandles));
     assert!(
@@ -1843,11 +1695,7 @@ fn runtime_file_failure_after_running_releases_ownership_and_reopens_cold() {
             .contains(&FaultEvent::Sync(SyncPoint::RunningState))
     );
 
-    let mut cold = CacheSession::open(
-        8,
-        FileRegionBackend::for_test(directory.paths.clone(), data, 8),
-    )
-    .unwrap();
+    let mut cold = CacheSession::for_test(directory.paths.clone(), data, 8).unwrap();
     assert_eq!(cold.startup(), StartupMode::Cold);
     cold.close_fast().unwrap();
 }
@@ -1858,16 +1706,9 @@ fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
     let config = 8;
     let data = test_data_superblock();
     let (file_system, faults, _) = FaultFileSystem::new();
-    let mut session = CacheSession::open(
-        config,
-        FileRegionBackend::for_test_with_file_system(
-            directory.paths.clone(),
-            data,
-            config,
-            file_system,
-        ),
-    )
-    .unwrap();
+    let mut session =
+        CacheSession::for_test_with_file_system(directory.paths.clone(), data, config, file_system)
+            .unwrap();
     faults.arm(
         FaultEvent::Sync(SyncPoint::CleanState),
         1,
@@ -1875,17 +1716,13 @@ fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
     );
     assert!(session.close_warm().is_err());
 
-    let mut reopened = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut reopened = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
     assert!(matches!(
         reopened.startup(),
         StartupMode::Warm | StartupMode::Cold
     ));
     assert_eq!(
-        reopened.runtime().unwrap().lookup_snapshot(0).unwrap(),
+        reopened.regions().unwrap().lookup_snapshot(0).unwrap(),
         None
     );
     reopened.close_fast().unwrap();
@@ -1900,10 +1737,7 @@ fn data_and_state_inode_alias_is_rejected_without_truncation() {
     fs::write(&directory.paths.data, marker).unwrap();
     fs::hard_link(&directory.paths.data, &directory.paths.state).unwrap();
 
-    let opened = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    );
+    let opened = CacheSession::for_test(directory.paths.clone(), data, config);
     assert!(matches!(
         opened,
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
@@ -1920,13 +1754,10 @@ fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
     fs::write(&data_path, marker).unwrap();
     let paths = RegionPaths::new(&data_path, directory.root.join("state"), image);
 
-    let opened = CacheSession::open(
+    let opened = CacheSession::for_test(
+        paths,
+        test_data_superblock_with_regions(REGION_SHARDS + 1),
         8,
-        FileRegionBackend::for_test(
-            paths,
-            test_data_superblock_with_regions(REGION_SHARDS + 1),
-            8,
-        ),
     );
     assert!(matches!(
         opened,
@@ -1945,10 +1776,7 @@ fn recovery_sidecars_must_share_one_directory() {
         other.join("state"),
         directory.root.join("image"),
     );
-    let opened = CacheSession::open(
-        8,
-        FileRegionBackend::for_test(paths, test_data_superblock(), 8),
-    );
+    let opened = CacheSession::for_test(paths, test_data_superblock(), 8);
     assert!(matches!(
         opened,
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
@@ -1962,21 +1790,14 @@ fn state_sidecar_lock_prevents_cross_data_file_races() {
     let directory = TestDirectory::new();
     let config = 8;
     let data = test_data_superblock();
-    let mut first = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(directory.paths.clone(), data, config),
-    )
-    .unwrap();
+    let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
 
     let conflicting_files = RegionPaths::new(
         directory.root.join("other-data"),
         directory.paths.state.clone(),
         directory.root.join("other-image"),
     );
-    let opened = CacheSession::open(
-        config,
-        FileRegionBackend::for_test(conflicting_files, data, config),
-    );
+    let opened = CacheSession::for_test(conflicting_files, data, config);
     assert!(opened.is_err());
     first.close_fast().unwrap();
 }

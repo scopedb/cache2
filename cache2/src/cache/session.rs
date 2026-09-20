@@ -12,90 +12,144 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Recovery and shutdown state machine for the Region-backed cache.
+//! Owns one open cache session and orders restart recovery, execution, and close.
 //!
-//! The coordinator owns no file-format or data-plane logic. A
-//! [`FileRegionBackend`] supplies those operations, while this module enforces the
-//! order that makes warm recovery safe:
-//!
-//! - inspect recovery before constructing an index;
-//! - publish `RUNNING` before exposing a runtime;
-//! - publish `CLEAN` only after freezing and persisting a complete image;
-//! - release exclusive ownership on every terminal path.
+//! RUNNING is durable before workers start. CLEAN is published only after
+//! mutation quiescence and a durable recovery image. Every terminal path
+//! releases file ownership unless an issued write still requires the lock.
 
 use std::io;
+use std::sync::Arc;
 
+use crate::cache::runtime::CacheRuntime;
+use crate::config::CacheConfig;
+#[cfg(test)]
+use crate::config::runtime::RuntimeOptions;
+#[cfg(test)]
+use crate::config::storage::cache_config;
 use crate::io::fs::FileSystem;
 use crate::io::fs::OsFileSystem;
-use crate::region::file_backend::FileRegionBackend;
-use crate::region::file_backend::FileRegionRuntime;
-use crate::region::index::storage::validated_index_partition_ranges;
-use crate::region::runtime::RegionDataPlane;
+#[cfg(test)]
+use crate::region::RegionStore;
+use crate::region::persistence::RegionPaths;
+use crate::region::persistence::RegionPersistence;
+use crate::region::recovery::DataSuperblock;
 use crate::snapshot::StartupMode;
 
-/// Owns the files and runtime for one Region-backed cache.
 pub struct CacheSession<F: FileSystem = OsFileSystem> {
-    backend: FileRegionBackend<F>,
-    runtime: Option<FileRegionRuntime>,
+    persistence: RegionPersistence<F>,
+    runtime: Option<CacheRuntime>,
     startup: StartupMode,
     closed: bool,
 }
 
+impl CacheSession {
+    pub fn open(
+        paths: RegionPaths,
+        format_data: DataSuperblock,
+        config: CacheConfig,
+    ) -> io::Result<Self> {
+        Self::open_with_file_system(paths, format_data, config, OsFileSystem)
+    }
+
+    #[cfg(test)]
+    pub fn for_test(
+        paths: RegionPaths,
+        data: DataSuperblock,
+        index_slots: usize,
+    ) -> io::Result<Self> {
+        Self::for_test_with_options(paths, data, index_slots, RuntimeOptions::default())
+    }
+
+    #[cfg(test)]
+    pub fn for_test_with_options(
+        paths: RegionPaths,
+        data: DataSuperblock,
+        index_slots: usize,
+        options: RuntimeOptions,
+    ) -> io::Result<Self> {
+        Self::open(
+            paths,
+            data,
+            cache_config(data.geometry, index_slots, options),
+        )
+    }
+}
+
 impl<F: FileSystem> CacheSession<F> {
-    pub fn open(index_slots: usize, mut backend: FileRegionBackend<F>) -> io::Result<Self> {
-        validate_index_slots(index_slots)?;
-        backend.acquire_exclusive()?;
+    fn open_with_file_system(
+        paths: RegionPaths,
+        format_data: DataSuperblock,
+        config: CacheConfig,
+        file_system: F,
+    ) -> io::Result<Self> {
+        let index_slots = config.storage().index_slots();
+        let append_shards = config.runtime().append_shards;
+        let mut persistence = RegionPersistence::new(paths, format_data, file_system);
+        persistence.acquire_exclusive(config.runtime().io_mode)?;
 
         let opened = (|| {
-            let runtime = match backend.inspect_recovery(index_slots)? {
-                Some(clean) => backend.map_clean_runtime(clean, index_slots)?,
+            let regions = match persistence.inspect_recovery(index_slots)? {
+                Some(image) => persistence.recover_regions(image, index_slots, append_shards)?,
                 None => None,
             };
-            let (runtime, startup) = match runtime {
-                Some(runtime) => (runtime, StartupMode::Warm),
-                None => (backend.anonymous_runtime(index_slots)?, StartupMode::Cold),
+            let (regions, startup) = match regions {
+                Some(regions) => (regions, StartupMode::Warm),
+                None => (
+                    persistence.cold_regions(index_slots, append_shards)?,
+                    StartupMode::Cold,
+                ),
             };
-
-            backend.publish_running()?;
-            let runtime = backend.start_runtime(runtime)?;
+            persistence.publish_running()?;
+            let runtime = CacheRuntime::start(
+                Arc::new(regions),
+                persistence.data_superblock()?,
+                persistence.clone_data_handles()?,
+                config,
+            )?;
             Ok((runtime, startup))
         })();
 
         match opened {
             Ok((runtime, startup)) => Ok(Self {
-                backend,
+                persistence,
                 runtime: Some(runtime),
                 startup,
                 closed: false,
             }),
             Err(error) => {
-                let _ = backend.release_exclusive();
+                let _ = persistence.release_exclusive();
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn for_test_with_file_system(
+        paths: RegionPaths,
+        data: DataSuperblock,
+        index_slots: usize,
+        file_system: F,
+    ) -> io::Result<Self> {
+        Self::open_with_file_system(
+            paths,
+            data,
+            cache_config(data.geometry, index_slots, RuntimeOptions::default()),
+            file_system,
+        )
     }
 
     pub const fn startup(&self) -> StartupMode {
         self.startup
     }
 
-    pub fn data_plane_handle(&self) -> io::Result<RegionDataPlane> {
-        Ok(self.runtime()?.data_plane()?.clone())
-    }
-
-    pub fn runtime(&self) -> io::Result<&FileRegionRuntime> {
-        if self.closed {
-            return Err(closed_error());
-        }
+    pub fn runtime(&self) -> io::Result<&CacheRuntime> {
         self.runtime.as_ref().ok_or_else(closed_error)
     }
 
     #[cfg(test)]
-    pub fn runtime_mut(&mut self) -> io::Result<&mut FileRegionRuntime> {
-        if self.closed {
-            return Err(closed_error());
-        }
-        self.runtime.as_mut().ok_or_else(closed_error)
+    pub fn regions(&self) -> io::Result<&RegionStore> {
+        Ok(self.runtime()?.regions())
     }
 
     /// Stop without producing a recovery image. The next open starts empty.
@@ -112,18 +166,38 @@ impl<F: FileSystem> CacheSession<F> {
         if self.closed {
             return Ok(());
         }
-
         let result = match self.runtime.take() {
-            Some(runtime) if warm => self
-                .backend
-                .freeze_warm(runtime)
-                .and_then(|frozen| self.backend.persist_frozen(&frozen))
-                .and_then(|prepared| self.backend.publish_clean(prepared)),
-            Some(runtime) => self.backend.stop_fast(runtime),
+            Some(runtime) => (|| {
+                let regions = Arc::clone(runtime.regions());
+                let stopped = runtime.shutdown();
+                drop(runtime);
+                match stopped {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.persistence.retain_data_lock();
+                        let message = if warm {
+                            regions.enter_miss_only();
+                            "I/O engine could not fence an issued write; CLEAN rejected"
+                        } else {
+                            "I/O engine could not fence an issued write; lock retained"
+                        };
+                        return Err(io::Error::other(message));
+                    }
+                    Err(error) => {
+                        regions.enter_miss_only();
+                        return Err(error);
+                    }
+                }
+                if warm {
+                    let frozen = regions.freeze()?;
+                    let prepared = self.persistence.persist_frozen(&frozen)?;
+                    self.persistence.publish_clean(prepared)?;
+                }
+                Ok(())
+            })(),
             None => Err(closed_error()),
         };
-
-        let unlock = self.backend.release_exclusive();
+        let unlock = self.persistence.release_exclusive();
         self.closed = true;
         result.and(unlock)
     }
@@ -138,17 +212,5 @@ impl<F: FileSystem> Drop for CacheSession<F> {
 }
 
 fn closed_error() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "CacheSession is closed")
-}
-
-fn validate_index_slots(index_slots: usize) -> io::Result<()> {
-    if index_slots < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "CacheSession requires at least 8 index slots",
-        ));
-    }
-    validated_index_partition_ranges(index_slots)
-        .map(|_| ())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    io::Error::new(io::ErrorKind::BrokenPipe, "cache session is closed")
 }

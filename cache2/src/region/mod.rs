@@ -63,6 +63,9 @@ use crate::region::appender::RegionSpanCompletion;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::IndexPartitionRange;
+use crate::region::index::storage::IndexPhysicalStats;
+use crate::region::index::storage::PartitionedIndexStorage;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::record::codec::RecordEncodeError;
@@ -72,24 +75,25 @@ use crate::region::record::codec::encode_value_into_hashed;
 #[cfg(test)]
 use crate::region::record::codec::hash_key;
 use crate::region::recovery::DataGeometry;
+use crate::region::recovery::metadata::PartitionMetadataRecord;
 use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
 use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
 use crate::region::staging::AppendStaging;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
-pub mod file_backend;
 pub mod index;
 pub mod manager;
+pub mod persistence;
 pub mod record;
 pub mod recovery;
-pub mod runtime;
 pub mod staging;
 
-mod appender;
-mod reader;
+pub mod appender;
+pub mod reader;
 
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;
@@ -210,6 +214,12 @@ impl RegionManagerLock {
     }
 }
 
+pub struct FrozenRegionStore {
+    regions: Arc<RegionStore>,
+    metadata: RegionMetadata,
+}
+
+/// Live L2 index, Region allocation, and append/read/reclaim coordination.
 pub struct RegionStore {
     index: RegionIndex,
     manager: RegionManagerLock,
@@ -258,7 +268,7 @@ pub enum RegionStageValue {
     NeedsRotation,
 }
 
-pub struct RegionValueRead {
+pub struct RegionValue {
     buffer: BufferLease,
     buffer_len: usize,
     value_range: Range<usize>,
@@ -268,9 +278,9 @@ pub struct RegionValueRead {
 // SAFETY: this type is constructed only after the owned record read reaches
 // terminal completion. From then until drop, it exposes initialized bytes only
 // through shared slices and never returns the allocation to a mutable pool.
-unsafe impl Sync for RegionValueRead {}
+unsafe impl Sync for RegionValue {}
 
-impl RegionValueRead {
+impl RegionValue {
     pub fn value(&self) -> &[u8] {
         &self
             .buffer
@@ -284,6 +294,86 @@ impl RegionValueRead {
 }
 
 impl RegionStore {
+    /// Consume the index and Region metadata into one live store.
+    pub fn from_recovery(
+        index: PartitionedIndexStorage,
+        metadata: RegionMetadata,
+    ) -> io::Result<Self> {
+        let physical_stats = index.partition_stats().map_err(index_storage_io_error)?;
+        let slot_count = u64::try_from(index.slot_count()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
+        })?;
+        if metadata.root.index_slots != slot_count
+            || metadata.root.partition_count as usize != index.partition_count()
+            || !metadata_partition_stats_match(&metadata, &physical_stats)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index and Region metadata do not describe one authority",
+            ));
+        }
+        let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
+        let mut append_gates = Vec::new();
+        append_gates
+            .try_reserve_exact(manager.active_regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate append shard gates",
+                )
+            })?;
+        append_gates.resize_with(manager.active_regions().len(), AppendShardGate::default);
+        let mut region_generations = Vec::new();
+        region_generations
+            .try_reserve_exact(manager.regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate Region generations",
+                )
+            })?;
+        for region in manager.regions() {
+            region_generations.push(AtomicU64::new(region.created_seqno));
+        }
+        let health = RegionHealthLatch::healthy();
+        let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
+        Ok(Self {
+            index,
+            manager: RegionManagerLock::new(manager, health.clone()),
+            append_gates: append_gates.into_boxed_slice(),
+            region_generations: region_generations.into_boxed_slice(),
+            rotation: Mutex::new(()),
+            health,
+        })
+    }
+
+    /// Freeze the quiescent index and Region metadata for a recovery image.
+    /// The caller must stop mutation admission and finish all accepted writes first.
+    pub fn freeze(self: Arc<Self>) -> io::Result<FrozenRegionStore> {
+        self.health.require_healthy()?;
+        let regions = self;
+        if regions
+            .append_gates
+            .iter()
+            .any(|shard| shard.mutation.is_poisoned())
+            || regions.rotation.is_poisoned()
+        {
+            regions.health.enter_miss_only();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append shard gate is poisoned",
+            ));
+        }
+        let partitions = index_partition_metadata(regions.index.storage(), &regions.health)?;
+        let metadata = regions
+            .manager
+            .lock()?
+            .freeze_metadata(partitions)
+            .map_err(region_metadata_io_error)?;
+        regions.health.require_healthy()?;
+        Ok(FrozenRegionStore { regions, metadata })
+    }
+
     pub const fn shard_count(&self) -> usize {
         self.append_gates.len()
     }
@@ -548,7 +638,7 @@ impl RegionStore {
         self.health.require_healthy()?;
         gate.lock().map_err(|_| {
             self.health.enter_miss_only();
-            io::Error::new(io::ErrorKind::InvalidData, "data shard gate is poisoned")
+            io::Error::new(io::ErrorKind::InvalidData, "append shard gate is poisoned")
         })
     }
 
@@ -608,7 +698,7 @@ impl RegionStore {
         buffer: BufferLease,
         hash_seed: u64,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
+    ) -> io::Result<Option<RegionValue>> {
         let hash = hash_key(hash_seed, key);
         let Some(candidate) = self.begin_point_read(hash) else {
             return Ok(None);
@@ -626,7 +716,7 @@ impl RegionStore {
         buffer: BufferLease,
         desc: ReadDesc,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
+    ) -> io::Result<Option<RegionValue>> {
         let pending = self.submit_value_read(engine, slot, buffer, desc)?;
         let completion = pending.wait(engine);
         self.finish_value_read(completion, key)
@@ -655,7 +745,7 @@ impl RegionStore {
         &self,
         completion: ReadCompletion,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
+    ) -> io::Result<Option<RegionValue>> {
         let hash = completion.desc.hash;
         if let Err(error) = completion.result {
             if !is_read_pressure(error.kind()) {
@@ -729,7 +819,7 @@ impl RegionStore {
                 .enter_miss_only_with_error("record_read_completion_invalid", &error);
             return Err(error);
         };
-        Ok(Some(RegionValueRead {
+        Ok(Some(RegionValue {
             buffer,
             buffer_len: completion.desc.read_len,
             value_range: value_start..value_end,
@@ -797,7 +887,7 @@ impl RegionStore {
                 self.health.enter_miss_only();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "data shard gate is poisoned",
+                    "append shard gate is poisoned",
                 ));
             }
         };
@@ -1304,4 +1394,110 @@ fn enter_miss_only_for_index_error(health: &RegionHealthLatch, error: &IndexStor
         _ => "index_storage_invalid",
     };
     health.enter_miss_only_with_error(reason, error);
+}
+
+fn empty_partition_metadata(
+    ranges: &[IndexPartitionRange],
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    let mut stats = Vec::new();
+    stats.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate index partition statistics",
+        )
+    })?;
+    stats.resize(ranges.len(), IndexPhysicalStats::default());
+    partition_metadata_from_stats(ranges, &stats)
+}
+
+fn index_partition_metadata(
+    index: &PartitionedIndexStorage,
+    health: &RegionHealthLatch,
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    let stats = guarded_index_result(health, index.partition_stats())?;
+    partition_metadata_from_stats(index.partition_ranges(), &stats)
+}
+
+fn partition_metadata_from_stats(
+    ranges: &[IndexPartitionRange],
+    stats: &[IndexPhysicalStats],
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    if ranges.len() != stats.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index partition ranges and statistics disagree",
+        ));
+    }
+    let mut partitions = Vec::new();
+    partitions.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate index partition directory",
+        )
+    })?;
+    for (range, stats) in ranges.iter().zip(stats) {
+        partitions.push(PartitionMetadataRecord {
+            partition_id: u32::try_from(range.partition_id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "partition id is too large")
+            })?,
+            first_index_page: u64::try_from(range.first_page).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition page offset is too large",
+                )
+            })?,
+            index_page_count: u64::try_from(range.page_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition page count is too large",
+                )
+            })?,
+            first_slot: u64::try_from(range.first_slot).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition slot offset is too large",
+                )
+            })?,
+            slot_count: u64::try_from(range.slot_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition slot count is too large",
+                )
+            })?,
+            physical_value_slots: stats.value,
+            physical_deleted_slots: stats.deleted,
+        });
+    }
+    Ok(partitions.into_boxed_slice())
+}
+
+fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexPhysicalStats]>> {
+    let mut stats = Vec::new();
+    stats
+        .try_reserve_exact(metadata.partitions.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate index partition statistics",
+            )
+        })?;
+    for partition in &metadata.partitions {
+        stats.push(IndexPhysicalStats {
+            value: partition.physical_value_slots,
+            deleted: partition.physical_deleted_slots,
+        });
+    }
+    Ok(stats.into_boxed_slice())
+}
+
+fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysicalStats]) -> bool {
+    metadata.partitions.len() == stats.len()
+        && metadata
+            .partitions
+            .iter()
+            .zip(stats)
+            .all(|(metadata, actual)| {
+                metadata.physical_value_slots == actual.value
+                    && metadata.physical_deleted_slots == actual.deleted
+            })
 }

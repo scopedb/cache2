@@ -37,6 +37,8 @@ use tokio::task::JoinError;
 
 use crate::LatencyMode;
 use crate::RequestOperation;
+use crate::cache::runtime::CacheRead;
+use crate::cache::runtime::CacheRuntime;
 use crate::cache::session::CacheSession;
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
@@ -45,18 +47,16 @@ use crate::config::storage_geometry;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
-use crate::region::file_backend::FileRegionBackend;
-use crate::region::file_backend::RegionPaths;
+use crate::region::persistence::RegionPaths;
 use crate::region::recovery::DataSuperblock;
 use crate::region::recovery::PersistentId;
 use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
 use crate::region::recovery::recovery_image_index_len;
-use crate::region::runtime::HybridValueRead;
-use crate::region::runtime::RegionDataPlane;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
 use crate::snapshot::StartupMode;
 
+pub mod runtime;
 pub mod session;
 
 /// Storage tier that served a lookup.
@@ -77,7 +77,7 @@ pub enum CacheTier {
 /// The value dereferences to its bytes and keeps its L1 or transient L2
 /// backing alive until it is dropped.
 pub struct Value {
-    inner: HybridValueRead,
+    inner: CacheRead,
 }
 
 impl Deref for Value {
@@ -120,7 +120,7 @@ pub struct Cache {
     closed: AtomicBool,
     read_recording: bool,
     mutation_recording: bool,
-    data_plane: RegionDataPlane,
+    runtime: CacheRuntime,
     session: Arc<Mutex<CacheSession>>,
     startup: StartupMode,
     path: PathBuf,
@@ -190,8 +190,8 @@ impl Cache {
         tokio_handle: tokio::runtime::Handle,
         started: Instant,
     ) -> io::Result<Cache> {
-        let capacity_bytes = config.storage().capacity_bytes();
         let index_slots = config.storage().index_slots();
+        let capacity_bytes = config.storage().capacity_bytes();
         let index_bytes = u64::try_from(index_slots)
             .ok()
             .and_then(recovery_image_index_len)
@@ -247,7 +247,6 @@ impl Cache {
             sidecar_path(&path, ".state"),
             sidecar_path(&path, ".image"),
         );
-        let index_slots = config.storage().index_slots();
         let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
         let stats = config.runtime().stats;
         let read_recording = stats.request_counters
@@ -255,15 +254,14 @@ impl Cache {
             || stats.l2_latency != LatencyMode::Off;
         let mutation_recording =
             stats.request_counters || stats.mutation_latency != LatencyMode::Off;
-        let backend = FileRegionBackend::new(paths, format_data, config);
-        let session = CacheSession::open(index_slots, backend)?;
+        let session = CacheSession::open(paths, format_data, config)?;
         let startup = session.startup();
-        let data_plane = session.data_plane_handle()?;
+        let runtime = session.runtime()?.clone();
         Ok(Cache {
             closed: AtomicBool::new(false),
             read_recording,
             mutation_recording,
-            data_plane,
+            runtime,
             session: Arc::new(Mutex::new(session)),
             startup,
             path,
@@ -290,7 +288,7 @@ impl Cache {
     /// classifications.
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.mutate(ErrorOperation::Put, RequestOperation::Put, || {
-            self.data_plane.put(key.as_ref(), value.as_ref())
+            self.runtime.put(key.as_ref(), value.as_ref())
         })
     }
 
@@ -308,7 +306,7 @@ impl Cache {
     /// [`ErrorOperation::PutL2`](ErrorOperation::PutL2) as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.mutate(ErrorOperation::PutL2, RequestOperation::PutL2, || {
-            self.data_plane.put_l2(key.as_ref(), value.as_ref())
+            self.runtime.put_l2(key.as_ref(), value.as_ref())
         })
     }
 
@@ -325,7 +323,7 @@ impl Cache {
     /// Runtime and device failures remain explicit.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.mutate(ErrorOperation::Delete, RequestOperation::Delete, || {
-            self.data_plane.delete(key.as_ref())
+            self.runtime.delete(key.as_ref())
         })
     }
 
@@ -353,22 +351,19 @@ impl Cache {
             }
             return public_result(
                 ErrorOperation::Get,
-                self.data_plane
+                self.runtime
                     .get_async(key.as_ref(), &self.tokio_handle, None)
                     .await,
             )
             .map(|value| value.map(|inner| Value { inner }));
         }
-        let mut guard = self
-            .data_plane
-            .stats_recorder()
-            .begin(RequestOperation::Get);
+        let mut guard = self.runtime.stats_recorder().begin(RequestOperation::Get);
         let result = if self.is_closed() {
             Ok(None)
         } else {
             public_result(
                 ErrorOperation::Get,
-                self.data_plane
+                self.runtime
                     .get_async(key.as_ref(), &self.tokio_handle, Some(&mut guard))
                     .await,
             )
@@ -394,7 +389,7 @@ impl Cache {
     /// Accepted work that cannot complete returns a structured runtime/device failure.
     pub async fn drain(&self) -> Result<(), Error> {
         self.ensure_open(ErrorOperation::Drain)?;
-        public_result(ErrorOperation::Drain, self.data_plane.drain_async().await)
+        public_result(ErrorOperation::Drain, self.runtime.drain_async().await)
     }
 
     /// Returns a lock-free operational snapshot. Activity and I/O counters are
@@ -408,7 +403,7 @@ impl Cache {
     /// structured runtime failure if the snapshot cannot be read.
     pub fn snapshot(&self) -> Result<CacheSnapshot, Error> {
         self.ensure_open(ErrorOperation::Snapshot)?;
-        let mut snapshot = public_result(ErrorOperation::Snapshot, self.data_plane.snapshot())?;
+        let mut snapshot = public_result(ErrorOperation::Snapshot, self.runtime.snapshot())?;
         snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
     }
@@ -424,7 +419,7 @@ impl Cache {
     ///
     /// Uses the same availability and runtime failures as [`Self::snapshot`].
     pub fn stats_snapshot(&self) -> Result<crate::CacheStatsSnapshot, Error> {
-        Ok(self.data_plane.stats_recorder().snapshot(self.snapshot()?))
+        Ok(self.runtime.stats_recorder().snapshot(self.snapshot()?))
     }
 
     /// Samples L1, index, write-buffer rejection, I/O, and Region state in
@@ -441,7 +436,7 @@ impl Cache {
         self.ensure_open(ErrorOperation::DetailedSnapshot)?;
         let mut snapshot = public_result(
             ErrorOperation::DetailedSnapshot,
-            self.data_plane.detailed_snapshot(),
+            self.runtime.detailed_snapshot(),
         )?;
         snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
         Ok(snapshot)
@@ -486,7 +481,7 @@ impl Cache {
     ) -> Result<u64, Error> {
         let guard = self
             .mutation_recording
-            .then(|| self.data_plane.stats_recorder().begin(stats_operation));
+            .then(|| self.runtime.stats_recorder().begin(stats_operation));
         let result = self
             .ensure_open(operation)
             .and_then(|()| public_result(operation, mutation()));
@@ -517,7 +512,7 @@ impl Cache {
         };
         let tokio_handle = self.tokio_handle.clone();
         let close = (!self.closed.swap(true, Ordering::AcqRel)).then(|| {
-            self.data_plane.start_close();
+            self.runtime.start_close();
             let session = Arc::clone(&self.session);
             let path = self.path.clone();
             let started = Instant::now();

@@ -17,6 +17,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::StatsOptions;
+use crate::cache::runtime::metrics::ActivityMetrics;
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
 use crate::error::Error;
@@ -30,7 +31,6 @@ use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::MAX_CONFIG_COUNT;
 use crate::memory::MemoryStore;
 use crate::region::recovery::DataGeometry;
-use crate::region::runtime::metrics::ActivityMetrics;
 use crate::region::runtime_fixed_memory_bytes;
 use crate::region::staging::AppendStaging;
 use crate::stats::recording::Recorder;

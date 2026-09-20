@@ -80,8 +80,7 @@ fn submitted_read_must_not_pin_close() {
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::cache::session::CacheSession;
     use crate::config::runtime::PosixIoOptions;
-    use crate::region::file_backend::FileRegionBackend;
-    use crate::region::file_backend::RegionPaths;
+    use crate::region::persistence::RegionPaths;
     use crate::region::recovery::PersistentId;
     let root = env::temp_dir().join(format!(
         "cache2-close-race-{}-{submit_before_close}",
@@ -111,20 +110,16 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         }),
         ..RuntimeOptions::default()
     };
-    let mut store = CacheSession::open(
-        8,
-        FileRegionBackend::for_test_with_options(paths, data, 8, config),
-    )
-    .unwrap();
-    let mut plane = store.data_plane_handle().unwrap();
-    store.close_fast().unwrap();
+    let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+    let mut runtime = session.runtime().unwrap().clone();
+    session.close_fast().unwrap();
     // Reuse a stopped runtime's fixed resources without unrelated workers.
-    let shared = Arc::get_mut(&mut plane.shared).unwrap();
+    let state = Arc::get_mut(&mut runtime.state).unwrap();
     let io = Arc::new(BlockedRead::default());
     let engine = Arc::new(IoEngine::for_test(io.clone(), 1).unwrap());
     let read_engine = Arc::clone(&engine);
     let read_io = Arc::clone(&io);
-    let managed_memory = Arc::clone(&shared.managed_memory);
+    let managed_memory = Arc::clone(&state.managed_memory);
     let submit_read = move || -> io::Result<IoRequest> {
         let slot = read_engine.try_reserve_read()?;
         let buffer =
@@ -141,20 +136,20 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         assert_eq!(engine.in_flight(), 1);
     } else {
         // Exercise the interval between the idle snapshot and synchronous shutdown.
-        *shared.after_io_snapshot.get_mut().unwrap() = Some(Box::new(move || {
+        *state.after_io_snapshot.get_mut().unwrap() = Some(Box::new(move || {
             submitted.send(submit_read()).unwrap();
         }));
     }
-    shared.read_engines = vec![engine.clone()].into_boxed_slice();
-    shared.write_engines = Box::new([]);
-    shared.reclaim_engines = Box::new([]);
-    shared.shards = Box::new([]);
-    let shared = Arc::clone(&plane.shared);
+    state.read_engines = vec![engine.clone()].into_boxed_slice();
+    state.write_engines = Box::new([]);
+    state.reclaim_engines = Box::new([]);
+    state.append_controls = Box::new([]);
+    let state = Arc::clone(&runtime.state);
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
-        let result = stop_running(RunningOwner {
-            shared,
-            shard_workers: vec![],
+        let result = stop_workers(RuntimeWorkers {
+            state,
+            append_workers: vec![],
             reclaim_workers: vec![],
         });
         tx.send(result).unwrap();
@@ -182,8 +177,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
 #[test]
 fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     use crate::cache::session::CacheSession;
-    use crate::region::file_backend::FileRegionBackend;
-    use crate::region::file_backend::RegionPaths;
+    use crate::region::persistence::RegionPaths;
     use crate::region::recovery::PersistentId;
     use crate::snapshot::CacheHealth;
     let root = env::temp_dir().join(format!("cache2-recovery-admission-{}", std::process::id()));
@@ -206,37 +200,33 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         l1_capacity_bytes: 0,
         ..RuntimeOptions::default()
     };
-    let mut store = CacheSession::open(
-        8,
-        FileRegionBackend::for_test_with_options(paths, data, 8, config),
-    )
-    .unwrap();
-    let plane = store.data_plane_handle().unwrap();
-    plane.put(b"existing", b"value").unwrap();
-    plane.drain().unwrap();
-    let mut first = plane.shared.recovery.attempt();
-    let mut second = plane.shared.recovery.attempt();
+    let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+    let runtime = session.runtime().unwrap().clone();
+    runtime.put(b"existing", b"value").unwrap();
+    runtime.drain().unwrap();
+    let mut first = runtime.state.recovery.attempt();
+    let mut second = runtime.state.recovery.attempt();
     assert!(first.next_deadline(Instant::now()).is_some());
     assert!(second.next_deadline(Instant::now()).is_some());
-    assert_eq!(plane.snapshot().unwrap().health, CacheHealth::Recovering);
+    assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Recovering);
     assert_eq!(
-        plane.put(b"new", b"value").unwrap_err().kind(),
+        runtime.put(b"new", b"value").unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     assert_eq!(
-        plane.put_l2(b"new", b"value").unwrap_err().kind(),
+        runtime.put_l2(b"new", b"value").unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    assert_eq!(plane.get(b"existing").unwrap().unwrap().value(), b"value");
-    plane.delete(b"existing").unwrap();
-    assert!(plane.get(b"existing").unwrap().is_none());
+    assert_eq!(runtime.get(b"existing").unwrap().unwrap().value(), b"value");
+    runtime.delete(b"existing").unwrap();
+    assert!(runtime.get(b"existing").unwrap().is_none());
     first.finish();
-    assert_eq!(plane.snapshot().unwrap().health, CacheHealth::Recovering);
+    assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Recovering);
     second.finish();
-    assert_eq!(plane.snapshot().unwrap().health, CacheHealth::Running);
+    assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Running);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match plane.put(b"new", b"value") {
+        match runtime.put(b"new", b"value") {
             Ok(_) => break,
             Err(error) => {
                 assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -245,8 +235,8 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
             }
         }
     }
-    plane.drain().unwrap();
-    assert_eq!(plane.get(b"new").unwrap().unwrap().value(), b"value");
-    store.close_fast().unwrap();
+    runtime.drain().unwrap();
+    assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");
+    session.close_fast().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
