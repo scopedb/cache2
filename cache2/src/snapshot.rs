@@ -28,6 +28,9 @@ pub enum StartupMode {
 pub enum CacheHealth {
     /// Reads and mutations are operating normally.
     Running,
+    /// Background I/O timed out. New fills return overload while owned requests
+    /// recover; reads and deletes retain their normal behavior.
+    Recovering,
     /// New mutations are fenced while accepted work completes.
     Draining,
     /// Reads fail open as misses and mutations report the terminal failure.

@@ -932,7 +932,12 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     assert_eq!(runtime.lookup_snapshot(first_hash).unwrap(), None);
 
     let published = runtime
-        .flush_staging_shard(&staging, &engine, 0)
+        .flush_staging_shard(
+            &staging,
+            &engine,
+            0,
+            &crate::io::engine::recovery::BackgroundRecovery::new(Some(std::time::Duration::ZERO)),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1080,7 +1085,12 @@ fn same_hash_candidate_requires_full_key() {
         panic!("collision owner must stage");
     };
     runtime
-        .flush_staging_shard(&staging, &engine, 0)
+        .flush_staging_shard(
+            &staging,
+            &engine,
+            0,
+            &crate::io::engine::recovery::BackgroundRecovery::new(Some(std::time::Duration::ZERO)),
+        )
         .unwrap()
         .expect("collision owner must publish");
 
@@ -1217,7 +1227,14 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
 
     assert_eq!(
         runtime
-            .flush_staging_shard(&staging, &engine, 0)
+            .flush_staging_shard(
+                &staging,
+                &engine,
+                0,
+                &crate::io::engine::recovery::BackgroundRecovery::new(Some(
+                    std::time::Duration::ZERO
+                ))
+            )
             .unwrap_err()
             .raw_os_error(),
         Some(5)

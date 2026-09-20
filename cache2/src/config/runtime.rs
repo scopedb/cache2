@@ -374,8 +374,19 @@ pub struct RuntimeOptions {
     /// Defaults to five seconds. Must be positive and representable as an
     /// absolute deadline. Does not change foreground reads or writes. Longer
     /// deadlines can delay shutdown and exhaust free Regions while waiting;
-    /// expiration still fails the cache instance after bounded cancellation.
+    /// expiration enters `io_recovery_timeout` recovery before cancellation
+    /// can fail the cache instance.
     pub reclaim_io_timeout: Duration,
+    /// Background timeout recovery budget after the normal admission/completion
+    /// deadline. Defaults to `None`: recover until completion or close. Use
+    /// `Some(Duration::ZERO)` for immediate cancellation, or a finite duration
+    /// to limit recovery. While recovering, new fills return overload; existing
+    /// reads and deletes remain available. Original requests retain their slots,
+    /// buffers, and Regions and are never resubmitted. Recovery checks completion
+    /// and shutdown at one-second intervals. Close interrupts recovery; drain
+    /// can wait indefinitely with `None`. Actual I/O errors and invalid
+    /// completions still fail the instance.
+    pub io_recovery_timeout: Option<Duration>,
     /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
     /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
     /// spare Region.
@@ -409,6 +420,7 @@ impl Default for RuntimeOptions {
             io_mode: IoMode::Buffered,
             read_admission: ReadAdmission::Immediate,
             reclaim_io_timeout: Duration::from_secs(5),
+            io_recovery_timeout: None,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             l1_eviction_policy: L1EvictionPolicy::Clock,
@@ -554,6 +566,18 @@ impl RuntimeOptions {
         {
             return Err(invalid_config(
                 "reclaim I/O timeout must be positive and fit an absolute deadline",
+            ));
+        }
+        if let Some(recovery_timeout) = self.io_recovery_timeout
+            && self
+                .reclaim_io_timeout
+                .max(Duration::from_secs(5))
+                .checked_add(recovery_timeout)
+                .and_then(|timeout| Instant::now().checked_add(timeout))
+                .is_none()
+        {
+            return Err(invalid_config(
+                "I/O recovery timeout must fit the combined absolute deadline",
             ));
         }
         let read_topology = IoPoolTopology::read(self.io_engine);
@@ -777,6 +801,29 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::StorageOptions;
+
+    #[test]
+    fn recovery_timeout_allows_zero_and_rejects_overflow() {
+        let storage = crate::StorageOptions::new(1024 * 1024 * 1024)
+            .build()
+            .unwrap();
+        assert_eq!(RuntimeOptions::default().io_recovery_timeout, None);
+        for timeout in [Duration::ZERO, Duration::from_secs(30)] {
+            let options = RuntimeOptions {
+                io_recovery_timeout: Some(timeout),
+                ..RuntimeOptions::default()
+            };
+            CacheConfig::new(storage.clone(), options).unwrap();
+        }
+        let options = RuntimeOptions {
+            io_recovery_timeout: Some(Duration::MAX),
+            ..RuntimeOptions::default()
+        };
+        assert_eq!(
+            CacheConfig::new(storage, options).unwrap_err().kind(),
+            crate::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn reclaim_timeout_is_validated_at_config_construction() {

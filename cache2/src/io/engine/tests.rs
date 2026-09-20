@@ -15,6 +15,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::recovery::BackgroundRecovery;
 use super::*;
 use crate::IoOutcome;
 use crate::IoRole;
@@ -1163,4 +1164,230 @@ fn background_read_can_complete_after_default_deadline() {
     release.join().unwrap();
     engine.shutdown().unwrap();
     assert!(completion.is_ok());
+}
+
+#[test]
+fn background_recovery_keeps_the_original_request_and_accepts_late_completion() {
+    for write in [false, true] {
+        let backend = Arc::new(BlockingBackend::default());
+        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let managed_memory = managed_memory();
+        let operation = if write {
+            IoOperation::write(
+                WritePoint::Record,
+                write_buffer(&managed_memory, &[7; 4096]),
+                0,
+            )
+        } else {
+            IoOperation::read(read_buffer(&managed_memory, 4096), 0)
+        };
+        let mut request = submit_cache_io(&engine, operation).unwrap();
+        assert!(backend.wait_for_entered(1));
+        // Force the normal deadline to expire while the backend still owns I/O.
+        request.deadline = Instant::now();
+        let id = request.id();
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let engine = &engine;
+            scope.spawn(move || {
+                tx.send(request.wait_with_recovery(
+                    engine,
+                    &mut BackgroundRecovery::new(Some(Duration::from_secs(2))).attempt(),
+                ))
+                .unwrap();
+            });
+            let early = rx.recv_timeout(Duration::from_millis(30));
+            let in_flight = engine.in_flight();
+            let charged = managed_memory.snapshot().current_bytes;
+            backend.release();
+            assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(in_flight, 1);
+            assert!(charged >= 4096);
+            let completion = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            assert_eq!(completion.request_id, id);
+            assert_eq!(completion.bytes_transferred, 4096);
+            assert!(completion.into_io_result().0.is_ok());
+        });
+        assert_eq!(lock_unpoisoned(&backend.state).entered, 1);
+        // Recovery does not poison admission: the next request also completes.
+        let next = engine
+            .read_exact_at(read_buffer(&managed_memory, 4096), 0)
+            .unwrap()
+            .wait();
+        assert!(next.into_io_result().0.is_ok());
+        engine.shutdown().unwrap();
+        assert_eq!(managed_memory.snapshot().current_bytes, 0);
+    }
+}
+
+#[test]
+fn exhausted_background_recovery_still_fences_unfinished_writes() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+    let managed_memory = managed_memory();
+    let mut request = submit_cache_io(
+        &engine,
+        IoOperation::write(
+            WritePoint::Record,
+            write_buffer(&managed_memory, &[7; 4096]),
+            0,
+        ),
+    )
+    .unwrap();
+    assert!(backend.wait_for_entered(1));
+    request.deadline = Instant::now();
+    request.cancel_grace = Duration::from_millis(10);
+    let result = request.wait_with_recovery(
+        &engine,
+        &mut BackgroundRecovery::new(Some(Duration::from_millis(20))).attempt(),
+    );
+    let pending = engine.writes_in_flight();
+    let rejected = engine.submit(IoOperation::write(
+        WritePoint::Record,
+        write_buffer(&managed_memory, &[8; 4096]),
+        4096,
+    ));
+    backend.release();
+    engine.shutdown().unwrap();
+    let (error, buffer) = result.unwrap_err().into_buffer();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(buffer.is_none());
+    assert_eq!(pending, 1);
+    assert_eq!(
+        rejected.unwrap_err().error.kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn background_admission_recovers_without_duplicate_submission() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+    let managed_memory = managed_memory();
+    let first = engine
+        .read_exact_at(read_buffer(&managed_memory, 4096), 0)
+        .unwrap();
+    assert!(backend.wait_for_entered(1));
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        let engine = &engine;
+        let managed_memory = &managed_memory;
+        scope.spawn(move || {
+            let recovery = BackgroundRecovery::new(Some(Duration::from_secs(2)));
+            let mut attempt = recovery.attempt();
+            let result = submit_background_io(
+                engine,
+                IoOperation::read(read_buffer(managed_memory, 4096), 0),
+                Duration::from_millis(10),
+                &mut attempt,
+            )
+            .map(|request| request.wait_with_recovery(engine, &mut attempt));
+            tx.send(result).unwrap();
+        });
+        let early = rx.recv_timeout(Duration::from_millis(50));
+        backend.release();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_io_result()
+                .0
+                .is_ok()
+        );
+    });
+    assert!(first.wait().into_io_result().0.is_ok());
+    engine.shutdown().unwrap();
+    assert_eq!(lock_unpoisoned(&backend.state).entered, 2);
+}
+
+#[test]
+fn unlimited_recovery_keeps_admission_paused_until_validation() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+    let managed_memory = managed_memory();
+    let recovery = BackgroundRecovery::new(None);
+    let mut request = submit_cache_io(
+        &engine,
+        IoOperation::write(
+            WritePoint::Record,
+            write_buffer(&managed_memory, &[9; 4096]),
+            0,
+        ),
+    )
+    .unwrap();
+    assert!(backend.wait_for_entered(1));
+    request.deadline = Instant::now();
+    std::thread::scope(|scope| {
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (validate_tx, validate_rx) = mpsc::channel();
+        let recovery = &recovery;
+        let engine = &engine;
+        scope.spawn(move || {
+            let mut attempt = recovery.attempt();
+            let completion = request.wait_with_recovery(engine, &mut attempt).unwrap();
+            completed_tx.send(completion).unwrap();
+            validate_rx.recv().unwrap();
+            attempt.finish();
+        });
+        // Cross more than one polling interval while preserving the same I/O.
+        let early = completed_rx.recv_timeout(Duration::from_millis(1100));
+        let paused = recovery.is_recovering();
+        backend.release();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(paused);
+        let completion = completed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            recovery.is_recovering(),
+            "completion delivery alone must not resume fills"
+        );
+        assert!(completion.into_io_result().0.is_ok());
+        validate_tx.send(()).unwrap();
+    });
+    assert!(!recovery.is_recovering());
+    assert_eq!(lock_unpoisoned(&backend.state).entered, 1);
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
+    let backend = Arc::new(BlockingBackend::default());
+    let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+    let managed_memory = managed_memory();
+    let recovery = BackgroundRecovery::new(None);
+    let mut request = submit_cache_io(
+        &engine,
+        IoOperation::write(
+            WritePoint::Record,
+            write_buffer(&managed_memory, &[9; 4096]),
+            0,
+        ),
+    )
+    .unwrap();
+    assert!(backend.wait_for_entered(1));
+    request.deadline = Instant::now();
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        let recovery = &recovery;
+        let engine = &engine;
+        scope.spawn(move || {
+            let mut attempt = recovery.attempt();
+            tx.send(request.wait_with_recovery(engine, &mut attempt))
+                .unwrap();
+        });
+        let early = rx.recv_timeout(Duration::from_millis(30));
+        recovery.stop();
+        let stopped = rx.recv_timeout(Duration::from_secs(2));
+        let pending = engine.writes_in_flight();
+        let charged = managed_memory.snapshot().current_bytes;
+        backend.release();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        let (error, buffer) = stopped.unwrap().unwrap_err().into_buffer();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(buffer.is_none());
+        assert_eq!(pending, 1);
+        assert!(charged >= 4096);
+    });
+    engine.shutdown().unwrap();
 }
