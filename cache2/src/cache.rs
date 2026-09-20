@@ -45,7 +45,7 @@ use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
 use crate::region::file_backend::FileRegionBackend;
-use crate::region::file_backend::RegionFiles;
+use crate::region::file_backend::RegionPaths;
 use crate::region::recovery::DataSuperblock;
 use crate::region::recovery::PersistentId;
 use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
@@ -240,7 +240,7 @@ impl Cache {
             hash_seed: KEY_HASH_SEED,
             storage_fingerprint: storage_fingerprint(config.storage()),
         };
-        let files = RegionFiles::new(
+        let paths = RegionPaths::new(
             &path,
             sidecar_path(&path, ".state"),
             sidecar_path(&path, ".image"),
@@ -253,7 +253,7 @@ impl Cache {
             || stats.l2_latency != LatencyMode::Off;
         let mutation_recording =
             stats.request_counters || stats.mutation_latency != LatencyMode::Off;
-        let backend = FileRegionBackend::new(files, format_data, config);
+        let backend = FileRegionBackend::new(paths, format_data, config);
         let store = RegionStore::open(index_slots, backend)?;
         let startup = store.startup();
         let data_plane = store.data_plane_handle()?;

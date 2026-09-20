@@ -748,7 +748,7 @@ impl RegionDataPlane {
     pub fn new(
         core: Arc<FileRegionCore>,
         data: DataSuperblock,
-        files: DataFileHandles,
+        handles: DataFileHandles,
         config: CacheConfig,
     ) -> io::Result<Self> {
         // Recovery supplies independently validated metadata. It must still
@@ -772,7 +772,7 @@ impl RegionDataPlane {
         let running = start_running(
             Arc::clone(&core),
             data,
-            files,
+            handles,
             config,
             Arc::clone(&metrics),
             Arc::clone(&operations),
@@ -1401,7 +1401,7 @@ fn add_io_direction(aggregate: &mut CacheIoDirectionSnapshot, snapshot: CacheIoD
 fn start_running(
     core: Arc<FileRegionCore>,
     data: DataSuperblock,
-    files: DataFileHandles,
+    handles: DataFileHandles,
     config: CacheConfig,
     metrics: Arc<RuntimeMetrics>,
     operations: Arc<MutationGate>,
@@ -1458,11 +1458,11 @@ fn start_running(
                 })?,
         );
     }
-    let reclaim_files = files.try_clone()?;
-    let write_files = files.try_clone()?;
+    let reclaim_handles = handles.try_clone()?;
+    let write_handles = handles.try_clone()?;
     let read_wait_enabled = !read_io_wait_timeout(runtime).is_zero();
     let read_engines = build_engine_pool(
-        files,
+        handles,
         runtime,
         IoPoolTopology::read(runtime.io_engine),
         read_wait_enabled,
@@ -1470,13 +1470,13 @@ fn start_running(
     let read_waiters =
         read_wait_enabled.then(|| Arc::new(Semaphore::new(read_io_wait_capacity(runtime))));
     let write_engines = build_engine_pool(
-        write_files,
+        write_handles,
         runtime,
         IoPoolTopology::write(runtime.io_engine),
         false,
     )?;
     let reclaim_engines = build_engine_pool(
-        reclaim_files,
+        reclaim_handles,
         runtime,
         IoPoolTopology::reclaim(runtime.io_engine),
         false,
@@ -1593,12 +1593,12 @@ fn start_running(
 }
 
 fn build_engine_pool(
-    files: DataFileHandles,
+    handles: DataFileHandles,
     runtime: &RuntimeOptions,
     topology: IoPoolTopology,
     read_wait_enabled: bool,
 ) -> io::Result<Box<[Arc<IoEngine>]>> {
-    let mut source = Some(files);
+    let mut source = Some(handles);
     let engine_count = topology.engine_count();
     let mut engines = Vec::new();
     engines
@@ -2512,7 +2512,7 @@ mod tests {
         use crate::config::runtime::IoEngineOptions;
         use crate::config::runtime::PosixIoOptions;
         use crate::region::file_backend::FileRegionBackend;
-        use crate::region::file_backend::RegionFiles;
+        use crate::region::file_backend::RegionPaths;
         use crate::region::index::packed::IndexEntry;
         use crate::region::index::packed::PackedLocation;
         use crate::region::recovery::DATA_REGION_AREA_OFFSET;
@@ -2524,7 +2524,7 @@ mod tests {
             "cache2-completion-timeout-{}-{id}",
             std::process::id()
         ));
-        let files = RegionFiles::new(
+        let paths = RegionPaths::new(
             path.with_extension("cache"),
             path.with_extension("state"),
             path.with_extension("image"),
@@ -2566,7 +2566,7 @@ mod tests {
             };
             let mut store = RegionStore::open(
                 8,
-                FileRegionBackend::for_test_with_options(files.clone(), data, 8, config),
+                FileRegionBackend::for_test_with_options(paths.clone(), data, 8, config),
             )
             .unwrap();
             let plane = store.data_plane_handle().unwrap();
@@ -2607,8 +2607,8 @@ mod tests {
                 assert_eq!(snapshot.l2_read_overloads, 1);
             }
         }
-        std::fs::remove_file(files.data).unwrap();
-        std::fs::remove_file(files.state).unwrap();
+        std::fs::remove_file(paths.data).unwrap();
+        std::fs::remove_file(paths.state).unwrap();
     }
 
     #[test]

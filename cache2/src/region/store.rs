@@ -25,23 +25,23 @@
 
 use std::io;
 
+use crate::io::fs::FileSystem;
+use crate::io::fs::OsFileSystem;
 use crate::region::file_backend::FileRegionBackend;
 use crate::region::file_backend::FileRegionRuntime;
-use crate::region::file_backend::RegionFileSystem;
-use crate::region::file_backend::SystemRegionFileSystem;
 use crate::region::index::storage::validated_index_partition_ranges;
 use crate::region::runtime::RegionDataPlane;
 use crate::snapshot::StartupMode;
 
 /// Owns the files and runtime for one Region-backed cache.
-pub struct RegionStore<F: RegionFileSystem = SystemRegionFileSystem> {
+pub struct RegionStore<F: FileSystem = OsFileSystem> {
     backend: FileRegionBackend<F>,
     runtime: Option<FileRegionRuntime>,
     startup: StartupMode,
     closed: bool,
 }
 
-impl<F: RegionFileSystem> RegionStore<F> {
+impl<F: FileSystem> RegionStore<F> {
     pub fn open(index_slots: usize, mut backend: FileRegionBackend<F>) -> io::Result<Self> {
         validate_index_slots(index_slots)?;
         backend.acquire_exclusive()?;
@@ -129,7 +129,7 @@ impl<F: RegionFileSystem> RegionStore<F> {
     }
 }
 
-impl<F: RegionFileSystem> Drop for RegionStore<F> {
+impl<F: FileSystem> Drop for RegionStore<F> {
     fn drop(&mut self) {
         if !self.closed {
             let _ = self.close_fast();

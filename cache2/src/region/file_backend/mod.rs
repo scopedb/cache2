@@ -15,7 +15,6 @@
 //! File ownership, recovery, and lifecycle adapter for the Region core.
 
 use std::fmt;
-use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self};
@@ -32,7 +31,6 @@ use crate::config::runtime::IoMode;
 use crate::config::runtime::RuntimeOptions;
 #[cfg(test)]
 use crate::config::storage::cache_config;
-use crate::io::file::CacheFile;
 use crate::io::file::DataFileHandles;
 use crate::io::file::PositionedIo;
 use crate::io::file::StorageFile;
@@ -42,6 +40,9 @@ use crate::io::file::WritePoint;
 use crate::io::file::read_at_bounded;
 use crate::io::file::read_exact_at;
 use crate::io::file::write_all_at;
+use crate::io::fs::FileSystem;
+use crate::io::fs::OsFileSystem;
+use crate::io::fs::parent_directory;
 use crate::region::FileRegionCore;
 use crate::region::RegionAccessState;
 use crate::region::RegionHealthLatch;
@@ -93,15 +94,15 @@ use crate::region::runtime::RegionDataPlane;
 #[cfg(test)]
 const REGION_SHARDS: u32 = 4;
 
-/// Data and recovery sidecars owned by one concrete Region backend.
+/// Paths to the data file and its state and recovery-image sidecars.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RegionFiles {
+pub struct RegionPaths {
     pub data: PathBuf,
     pub state: PathBuf,
     pub image: PathBuf,
 }
 
-impl RegionFiles {
+impl RegionPaths {
     pub fn new(
         data: impl Into<PathBuf>,
         state: impl Into<PathBuf>,
@@ -202,7 +203,7 @@ impl FileRegionRuntime {
     fn attach_data_plane(
         &mut self,
         data: DataSuperblock,
-        files: DataFileHandles,
+        handles: DataFileHandles,
         config: CacheConfig,
     ) -> io::Result<()> {
         if self.data_plane.is_some() {
@@ -214,7 +215,7 @@ impl FileRegionRuntime {
         self.data_plane = Some(RegionDataPlane::new(
             Arc::clone(&self.core),
             data,
-            files,
+            handles,
             config,
         )?);
         Ok(())
@@ -237,84 +238,15 @@ impl FileRegionRuntime {
     }
 }
 
-pub trait RegionFileSystem {
-    type File: StorageFile;
-
-    fn open(&self, path: &Path, create: bool) -> io::Result<Self::File>;
-
-    fn open_data(&self, path: &Path, create: bool, _mode: IoMode) -> io::Result<Self::File> {
-        self.open(path, create)
-    }
-
-    fn try_clone_data_handles(&self, _file: &Self::File) -> io::Result<Option<DataFileHandles>> {
-        Ok(None)
-    }
-
-    fn create_new(&self, path: &Path) -> io::Result<Self::File>;
-
-    fn remove_file(&self, path: &Path) -> io::Result<()>;
-
-    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
-
-    fn sync_parent(&self, path: &Path) -> io::Result<()>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemRegionFileSystem;
-
-impl RegionFileSystem for SystemRegionFileSystem {
-    type File = CacheFile;
-
-    fn open(&self, path: &Path, create: bool) -> io::Result<Self::File> {
-        if create {
-            CacheFile::open_with_io_mode(path, IoMode::Buffered)
-        } else {
-            CacheFile::open_existing_with_io_mode(path, IoMode::Buffered)
-        }
-    }
-
-    fn open_data(&self, path: &Path, create: bool, mode: IoMode) -> io::Result<Self::File> {
-        if create {
-            CacheFile::open_with_io_mode(path, mode)
-        } else {
-            CacheFile::open_existing_with_io_mode(path, mode)
-        }
-    }
-
-    fn try_clone_data_handles(&self, file: &Self::File) -> io::Result<Option<DataFileHandles>> {
-        file.try_clone_data_handles().map(Some)
-    }
-
-    fn create_new(&self, path: &Path) -> io::Result<Self::File> {
-        CacheFile::create_new_buffered(path)
-    }
-
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
-        fs::rename(source, destination)
-    }
-
-    fn sync_parent(&self, path: &Path) -> io::Result<()> {
-        File::open(parent_directory(path))?.sync_all()
-    }
-}
-
 /// Concrete state/index lifecycle backed by one data file and two sidecars.
 ///
 /// It owns the append/read runtime, persists one complete index plus the
 /// Region/FIFO physical view, and never scans records during open.
-pub struct FileRegionBackend<F = SystemRegionFileSystem>
+pub struct FileRegionBackend<F = OsFileSystem>
 where
-    F: RegionFileSystem,
+    F: FileSystem,
 {
-    files: RegionFiles,
+    paths: RegionPaths,
     /// Used when the data file is missing or empty. Existing
     /// files retain their on-disk identities but must match this geometry and
     /// storage-layout fingerprint.
@@ -331,51 +263,51 @@ where
     retain_lock: bool,
 }
 
-impl FileRegionBackend<SystemRegionFileSystem> {
+impl FileRegionBackend<OsFileSystem> {
     #[cfg(test)]
-    fn for_test(files: RegionFiles, format_data: DataSuperblock, index_slots: usize) -> Self {
-        Self::for_test_with_options(files, format_data, index_slots, RuntimeOptions::default())
+    fn for_test(paths: RegionPaths, format_data: DataSuperblock, index_slots: usize) -> Self {
+        Self::for_test_with_options(paths, format_data, index_slots, RuntimeOptions::default())
     }
 
     #[cfg(test)]
     pub fn for_test_with_options(
-        files: RegionFiles,
+        paths: RegionPaths,
         format_data: DataSuperblock,
         index_slots: usize,
         runtime_options: RuntimeOptions,
     ) -> Self {
         let config = cache_config(format_data.geometry, index_slots, runtime_options);
-        Self::new(files, format_data, config)
+        Self::new(paths, format_data, config)
     }
 
-    pub fn new(files: RegionFiles, format_data: DataSuperblock, config: CacheConfig) -> Self {
-        Self::new_with_file_system(files, format_data, SystemRegionFileSystem, config)
+    pub fn new(paths: RegionPaths, format_data: DataSuperblock, config: CacheConfig) -> Self {
+        Self::new_with_file_system(paths, format_data, OsFileSystem, config)
     }
 }
 
 impl<F> FileRegionBackend<F>
 where
-    F: RegionFileSystem,
+    F: FileSystem,
 {
     #[cfg(test)]
     fn for_test_with_file_system(
-        files: RegionFiles,
+        paths: RegionPaths,
         format_data: DataSuperblock,
         index_slots: usize,
         file_system: F,
     ) -> Self {
         let config = cache_config(format_data.geometry, index_slots, RuntimeOptions::default());
-        Self::new_with_file_system(files, format_data, file_system, config)
+        Self::new_with_file_system(paths, format_data, file_system, config)
     }
 
     fn new_with_file_system(
-        files: RegionFiles,
+        paths: RegionPaths,
         format_data: DataSuperblock,
         file_system: F,
         config: CacheConfig,
     ) -> Self {
         Self {
-            files,
+            paths,
             format_data,
             config,
             file_system,
@@ -409,8 +341,8 @@ where
         log::info!(
             target: "cache2::recovery",
             event = "cache_recovery_cold",
-            path:% = self.files.data.display(),
-            image_path:% = self.files.image.display(),
+            path:% = self.paths.data.display(),
+            image_path:% = self.paths.image.display(),
             reason;
             "cache recovery selected cold start"
         );
@@ -426,8 +358,8 @@ where
         log::warn!(
             target: "cache2::recovery",
             event = "cache_recovery_cold",
-            path:% = self.files.data.display(),
-            image_path:% = self.files.image.display(),
+            path:% = self.paths.data.display(),
+            image_path:% = self.paths.image.display(),
             reason,
             index_backing = "file_private_mmap",
             index_slots,
@@ -441,7 +373,7 @@ where
         log::info!(
             target: "cache2::recovery",
             event = "cache_append_shards_rebind_planned",
-            path:% = self.files.data.display(),
+            path:% = self.paths.data.display(),
             previous_append_shards = previous,
             append_shards = current,
             reused_active_regions = previous.min(current),
@@ -456,7 +388,7 @@ where
         Ok(None)
     }
 
-    /// Acquire exclusive ownership of all files before inspection.
+    /// Acquire exclusive ownership of the data and state files before inspection.
     pub fn acquire_exclusive(&mut self) -> io::Result<()> {
         if self.locked {
             return Err(io::Error::new(
@@ -464,38 +396,41 @@ where
                 "RegionStore backend is already locked",
             ));
         }
-        if self.files.data == self.files.state
-            || self.files.data == self.files.image
-            || self.files.state == self.files.image
+        if self.paths.data == self.paths.state
+            || self.paths.data == self.paths.image
+            || self.paths.state == self.paths.image
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore data/state/image paths must be distinct",
             ));
         }
-        if parent_directory(&self.files.data) != parent_directory(&self.files.state)
-            || parent_directory(&self.files.data) != parent_directory(&self.files.image)
+        if parent_directory(&self.paths.data) != parent_directory(&self.paths.state)
+            || parent_directory(&self.paths.data) != parent_directory(&self.paths.image)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore data/state/image files must share one directory",
             ));
         }
-        let temporary = recovery_temporary_path(&self.files.image);
-        if temporary == self.files.data
-            || temporary == self.files.state
-            || temporary == self.files.image
+        let temporary = recovery_temporary_path(&self.paths.image);
+        if temporary == self.paths.data
+            || temporary == self.paths.state
+            || temporary == self.paths.image
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RegionStore recovery temporary path collides with a cache file",
             ));
         }
-        let data =
-            self.file_system
-                .open_data(&self.files.data, true, self.config.runtime().io_mode)?;
+        let data = self
+            .file_system
+            .open(&self.paths.data, true, self.config.runtime().io_mode)?;
         data.try_lock_exclusive()?;
-        let state = match self.file_system.open(&self.files.state, true) {
+        let state = match self
+            .file_system
+            .open(&self.paths.state, true, IoMode::Buffered)
+        {
             Ok(state) => state,
             Err(error) => {
                 let _ = data.unlock();
@@ -533,7 +468,7 @@ where
         index_slots: usize,
     ) -> io::Result<Option<CleanFileRegionImage>> {
         self.file_system
-            .remove_file(&recovery_temporary_path(&self.files.image))?;
+            .remove_file(&recovery_temporary_path(&self.paths.image))?;
         let format_data = self.format_data;
         let (data, fresh) = {
             let data_file = self.data_file.as_ref().ok_or_else(|| {
@@ -574,7 +509,10 @@ where
             return self.cold_recovery("state_data_mismatch");
         }
 
-        let image = match self.file_system.open(&self.files.image, false) {
+        let image = match self
+            .file_system
+            .open(&self.paths.image, false, IoMode::Buffered)
+        {
             Ok(image) => image,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return self.cold_recovery("image_missing");
@@ -691,9 +629,9 @@ where
 
     /// Construct a provisional empty runtime without starting workers.
     pub fn anonymous_runtime(&mut self, index_slots: usize) -> io::Result<FileRegionRuntime> {
-        self.file_system.remove_file(&self.files.image)?;
+        self.file_system.remove_file(&self.paths.image)?;
         self.file_system
-            .remove_file(&recovery_temporary_path(&self.files.image))?;
+            .remove_file(&recovery_temporary_path(&self.paths.image))?;
         let data = self.data_superblock()?;
         if self.cold_reset_needed {
             let data_file = self.data_file.as_ref().ok_or_else(|| {
@@ -718,7 +656,7 @@ where
                 log::error!(
                     target: "cache2::recovery",
                     event = "cache_index_backing_failed",
-                    path:% = self.files.data.display(),
+                    path:% = self.paths.data.display(),
                     index_backing = anonymous_index_backing_name(),
                     index_slots,
                     index_mapping_bytes,
@@ -837,9 +775,8 @@ where
             .data_file
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        if let Some(files) = self.file_system.try_clone_data_handles(data_file)? {
-            runtime.attach_data_plane(data, files, self.config.clone())?;
-        }
+        let handles = data_file.try_clone_data_handles()?;
+        runtime.attach_data_plane(data, handles, self.config.clone())?;
         Ok(runtime)
     }
 
@@ -984,7 +921,7 @@ where
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
         data_file.sync(SyncPoint::WarmData, SyncMode::Data)?;
 
-        let temporary = recovery_temporary_path(&self.files.image);
+        let temporary = recovery_temporary_path(&self.paths.image);
         self.file_system.remove_file(&temporary)?;
         let persisted = (|| {
             let image = self.file_system.create_new(&temporary)?;
@@ -1015,8 +952,8 @@ where
             )?;
             image.sync(SyncPoint::RecoveryImage, SyncMode::Data)?;
             health.require_healthy()?;
-            self.file_system.rename(&temporary, &self.files.image)?;
-            self.file_system.sync_parent(&self.files.image)?;
+            self.file_system.rename(&temporary, &self.paths.image)?;
+            self.file_system.sync_parent(&self.paths.image)?;
             health.require_healthy()
         })();
         if persisted.is_err() {
@@ -1443,12 +1380,6 @@ fn recovery_temporary_path(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_os_string();
     path.push(".next");
     PathBuf::from(path)
-}
-
-fn parent_directory(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
 }
 
 const fn anonymous_index_backing_name() -> &'static str {

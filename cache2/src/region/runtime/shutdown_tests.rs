@@ -80,7 +80,7 @@ fn submitted_read_must_not_pin_close() {
 fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     use crate::config::runtime::PosixIoOptions;
     use crate::region::file_backend::FileRegionBackend;
-    use crate::region::file_backend::RegionFiles;
+    use crate::region::file_backend::RegionPaths;
     use crate::region::recovery::PersistentId;
     use crate::region::store::RegionStore;
     let root = env::temp_dir().join(format!(
@@ -88,7 +88,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let files = RegionFiles::new(root.join("data"), root.join("state"), root.join("image"));
+    let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
     let data = DataSuperblock {
         generation: 1,
         cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -113,7 +113,7 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     };
     let mut store = RegionStore::open(
         8,
-        FileRegionBackend::for_test_with_options(files, data, 8, config),
+        FileRegionBackend::for_test_with_options(paths, data, 8, config),
     )
     .unwrap();
     let mut plane = store.data_plane_handle().unwrap();
@@ -182,13 +182,13 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
 #[test]
 fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     use crate::region::file_backend::FileRegionBackend;
-    use crate::region::file_backend::RegionFiles;
+    use crate::region::file_backend::RegionPaths;
     use crate::region::recovery::PersistentId;
     use crate::region::store::RegionStore;
     use crate::snapshot::CacheHealth;
     let root = env::temp_dir().join(format!("cache2-recovery-admission-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let files = RegionFiles::new(root.join("data"), root.join("state"), root.join("image"));
+    let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
     let data = DataSuperblock {
         generation: 1,
         cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -208,7 +208,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     };
     let mut store = RegionStore::open(
         8,
-        FileRegionBackend::for_test_with_options(files, data, 8, config),
+        FileRegionBackend::for_test_with_options(paths, data, 8, config),
     )
     .unwrap();
     let plane = store.data_plane_handle().unwrap();

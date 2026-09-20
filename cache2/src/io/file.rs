@@ -333,6 +333,8 @@ pub trait StorageFile: PositionedIo {
 
     fn try_clone_mapping_file(&self) -> io::Result<File>;
 
+    fn try_clone_data_handles(&self) -> io::Result<DataFileHandles>;
+
     fn identity(&self) -> io::Result<FileIdentity>;
 
     fn is_same_file(&self, other: &dyn StorageFile) -> io::Result<bool> {
@@ -423,12 +425,6 @@ impl CacheFile {
             ))
         }
     }
-
-    pub fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
-        let buffered = self.file.try_clone()?;
-        let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
-        Ok(DataFileHandles::with_direct(buffered, direct))
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -457,6 +453,12 @@ fn preallocate_macos(file: &File, len: i64) -> io::Result<()> {
 
 #[cfg(unix)]
 impl StorageFile for CacheFile {
+    fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
+        let buffered = self.file.try_clone()?;
+        let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
+        Ok(DataFileHandles::with_direct(buffered, direct))
+    }
+
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
@@ -1206,6 +1208,7 @@ pub mod testing {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum FaultEvent {
         Read,
+        CloneDataHandles,
         Write(WritePoint),
         Sync(SyncPoint),
         Lock,
@@ -1281,6 +1284,13 @@ pub mod testing {
     }
 
     impl FaultFile {
+        pub fn with_handle(file: CacheFile, handle: FaultHandle) -> Self {
+            Self {
+                inner: file,
+                handle,
+            }
+        }
+
         pub fn open(path: &Path) -> io::Result<(Self, FaultHandle)> {
             let handle = FaultHandle::default();
             let io = Self::open_with_handle(path, handle.clone())?;
@@ -1291,14 +1301,6 @@ pub mod testing {
         pub fn open_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
             Ok(Self {
                 inner: CacheFile::open(path)?,
-                handle,
-            })
-        }
-
-        /// Opens an existing control file without creating a missing path.
-        pub fn open_existing_with_handle(path: &Path, handle: FaultHandle) -> io::Result<Self> {
-            Ok(Self {
-                inner: CacheFile::open_existing_with_io_mode(path, IoMode::Buffered)?,
                 handle,
             })
         }
@@ -1355,6 +1357,20 @@ pub mod testing {
 
     #[cfg(unix)]
     impl StorageFile for FaultFile {
+        fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
+            match self.handle.action(FaultEvent::CloneDataHandles) {
+                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
+                    Err(io::Error::from_raw_os_error(code))
+                }
+                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "torn actions apply only to positioned I/O",
+                )),
+                Some(FaultAction::KillAfter) => kill_after(self.inner.try_clone_data_handles()),
+                None => self.inner.try_clone_data_handles(),
+            }
+        }
+
         fn len(&self) -> io::Result<u64> {
             self.inner.len()
         }
