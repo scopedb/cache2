@@ -481,16 +481,17 @@ pub fn emit_cache_report(
     );
     let fill = cache.fill_control;
     println!(
-        "report version=2 type=fill_control benchmark={} scenario={} phase={} pressure={:?} enforcing={} bytes_per_second={} operations_per_second={} rejections={} would_reject={} outstanding_operations={} outstanding_bytes={} oldest_operation_ns={} estimated_drain_ns={}",
+        "report version=2 type=fill_control benchmark={} scenario={} phase={} pressure={:?} enforcing={} bytes_per_second={} records_per_second={} rejections={} would_reject={} dropped_observations={} outstanding_operations={} outstanding_bytes={} oldest_operation_ns={} estimated_drain_ns={}",
         benchmark,
         scenario,
         phase,
         fill.pressure,
         fill.enforcing,
         fill.bytes_per_second,
-        fill.operations_per_second,
+        fill.records_per_second,
         fill.rejections,
         fill.would_reject,
+        fill.dropped_observations,
         fill.outstanding_operations,
         fill.outstanding_bytes,
         fill.oldest_operation_ns,

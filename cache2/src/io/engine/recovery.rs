@@ -22,14 +22,14 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::io::fill_control::FillController;
-use crate::io::fill_control::Progress;
+use crate::io::fill_control::Observation;
 
 /// Shared across background workers. Resource ownership remains with each worker.
 pub struct BackgroundRecovery {
     timeout: Option<Duration>,
     pending: AtomicUsize,
     stopped: AtomicBool,
-    pub controller: Option<Arc<FillController>>,
+    pub fill: Option<Arc<FillController>>,
 }
 
 impl BackgroundRecovery {
@@ -38,16 +38,13 @@ impl BackgroundRecovery {
             timeout,
             pending: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
-            controller: None,
+            fill: None,
         }
     }
 
-    pub fn with_controller(
-        timeout: Option<Duration>,
-        controller: Option<Arc<FillController>>,
-    ) -> Self {
+    pub fn with_fill(timeout: Option<Duration>, fill: Option<Arc<FillController>>) -> Self {
         Self {
-            controller,
+            fill,
             ..Self::new(timeout)
         }
     }
@@ -56,7 +53,7 @@ impl BackgroundRecovery {
         RecoveryAttempt {
             recovery: self,
             entered: false,
-            progress: None,
+            observation: None,
         }
     }
 
@@ -66,8 +63,8 @@ impl BackgroundRecovery {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
-        if let Some(control) = &self.controller {
-            control.stop();
+        if let Some(fill) = &self.fill {
+            fill.stop();
         }
     }
 }
@@ -77,25 +74,24 @@ impl BackgroundRecovery {
 pub struct RecoveryAttempt<'a> {
     recovery: &'a BackgroundRecovery,
     entered: bool,
-    progress: Option<Progress<'a>>,
+    observation: Option<Observation<'a>>,
 }
 
 impl RecoveryAttempt<'_> {
-    pub fn start(&mut self, bytes: u64, timeout: Duration) -> std::io::Result<()> {
-        if let Some(control) = &self.recovery.controller {
-            self.progress = Some(control.observe(bytes, timeout)?);
+    pub fn start(&mut self, bytes: u64, timeout: Duration) {
+        if let Some(fill) = &self.recovery.fill {
+            self.observation = fill.observe(bytes, timeout);
         }
-        Ok(())
     }
 
     pub fn admitted(&self) {
-        if let Some(progress) = &self.progress {
-            progress.admitted();
+        if let Some(observation) = &self.observation {
+            observation.admitted();
         }
     }
-    pub fn returned(&self) {
-        if let Some(progress) = &self.progress {
-            progress.returned();
+    pub fn completed(&self) {
+        if let Some(observation) = &self.observation {
+            observation.completed();
         }
     }
 
@@ -119,8 +115,8 @@ impl RecoveryAttempt<'_> {
         };
         if !self.entered {
             self.entered = true;
-            if let Some(control) = &self.recovery.controller {
-                control.set_recovering(true);
+            if let Some(fill) = &self.recovery.fill {
+                fill.set_recovering(true);
             }
             if self.recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
                 log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
@@ -132,12 +128,12 @@ impl RecoveryAttempt<'_> {
 
     /// Called only after operation-result validation and publication succeed.
     pub fn finish(mut self) {
-        if let Some(progress) = self.progress.take() {
-            progress.finish();
+        if let Some(observation) = self.observation.take() {
+            observation.finish();
         }
         if self.entered && self.recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Some(control) = &self.recovery.controller {
-                control.set_recovering(false);
+            if let Some(fill) = &self.recovery.fill {
+                fill.set_recovering(false);
             }
             log::info!(target: "cache2::health", event = "cache_io_recovery_completed";
                 "all timed-out background operations recovered and passed validation");

@@ -20,35 +20,70 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::AdaptiveFillOptions;
 use crate::FillControlOptions;
 use crate::FillControlSnapshot;
+use crate::FillLimits;
 use crate::FillPressure;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
 const TICK: Duration = Duration::from_millis(100);
+const TICKS_PER_SECOND: u64 = 10;
 const UNIT: u64 = 64;
 const COUNT_MASK: u64 = 0xffff;
-const CREDIT_MASK: u64 = (1 << 48) - 1;
 const MAX_CAS_ATTEMPTS: usize = 4;
+const MIN_BYTES_PER_SECOND: u64 = 640;
+const MAX_BYTES_PER_SECOND: u64 = 1 << 40;
+const MIN_RECORDS_PER_SECOND: u32 = 10;
+const MAX_RECORDS_PER_SECOND: u32 = 655_350;
+const DECISION_WINDOW: Duration = Duration::from_millis(500);
+const STALL_CAP: Duration = Duration::from_millis(500);
+const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+const CLEAN_DECISIONS: u32 = 3;
+const RAMP_DIVISOR: u32 = 40;
+const STAGING_KEEP_NUM: u64 = 7;
+const STAGING_KEEP_DEN: u64 = 10;
+const SERVICE_HEADROOM: f64 = 0.8;
+
+fn packed_epoch(value: u64) -> u64 {
+    value >> 48
+}
+fn packed_ops(value: u64) -> u64 {
+    (value >> 32) & COUNT_MASK
+}
+fn packed_units(value: u64) -> u64 {
+    value & u64::from(u32::MAX)
+}
+fn pack_credit(epoch: u64, ops: u64, units: u64) -> u64 {
+    (epoch & COUNT_MASK) << 48 | (ops << 32) | units
+}
+
+fn encode_pressure(pressure: FillPressure) -> u8 {
+    match pressure {
+        FillPressure::Disabled => 0,
+        FillPressure::Healthy => 1,
+        FillPressure::Throttled => 2,
+        FillPressure::Paused => 3,
+    }
+}
 
 #[derive(Clone, Copy)]
-struct Observation {
+struct InFlight {
     start: Instant,
     admitted: Option<Instant>,
-    returned: Option<Instant>,
+    completed: Option<Instant>,
     bytes: u64,
     timeout: Duration,
 }
 
 struct State {
-    slots: Box<[Option<Observation>]>,
+    slots: Box<[Option<InFlight>]>,
     snapshot: FillControlSnapshot,
     last_tick: Instant,
     last_progress: Instant,
@@ -65,19 +100,20 @@ struct State {
 }
 
 pub struct FillController {
-    options: AdaptiveFillOptions,
+    options: FillLimits,
     enforcing: bool,
     max_units: u64,
     max_ops: u64,
-    // Epoch:16, operations:16, 64-byte units:32. One CAS reserves both dimensions.
+    // Epoch:16, records:16, 64-byte units:32. One CAS reserves both dimensions.
     credit: AtomicU64,
     epoch: AtomicU64,
     staging_pressure: AtomicBool,
-    paused: AtomicBool,
+    pressure: AtomicU8,
     stopped: AtomicBool,
     recovering: AtomicBool,
     rejections: AtomicU64,
     would_reject: AtomicU64,
+    dropped_observations: AtomicU64,
     state: Mutex<State>,
     wake: Condvar,
 }
@@ -104,8 +140,9 @@ impl FillController {
                 settings
             }
         };
-        if !(640..=1 << 40).contains(&settings.max_bytes_per_second)
-            || !(10..=655_350).contains(&settings.max_operations_per_second)
+        if !(MIN_BYTES_PER_SECOND..=MAX_BYTES_PER_SECOND).contains(&settings.max_bytes_per_second)
+            || !(MIN_RECORDS_PER_SECOND..=MAX_RECORDS_PER_SECOND)
+                .contains(&settings.max_records_per_second)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -113,7 +150,7 @@ impl FillController {
             ));
         }
         slots
-            .checked_mul(size_of::<Option<Observation>>())
+            .checked_mul(size_of::<Option<InFlight>>())
             .and_then(|bytes| bytes.checked_add(size_of::<Self>() + CACHE_THREAD_STACK_BYTES + 256))
             .ok_or_else(|| {
                 io::Error::new(
@@ -134,7 +171,7 @@ impl FillController {
             FillControlOptions::Observe(settings) => (settings, false),
             FillControlOptions::Adaptive(settings) => (settings, true),
         };
-        let max_units = (settings.max_bytes_per_second / 10)
+        let max_units = (settings.max_bytes_per_second / TICKS_PER_SECOND)
             .max(max_record)
             .div_ceil(UNIT);
         if max_units > u64::from(u32::MAX) {
@@ -143,7 +180,7 @@ impl FillController {
                 "fill burst exceeds budget representation",
             ));
         }
-        let max_ops = u64::from(settings.max_operations_per_second / 10).max(1);
+        let max_ops = u64::from(settings.max_records_per_second / TICKS_PER_SECOND as u32).max(1);
         let mut observations = Vec::new();
         observations.try_reserve_exact(slots).map_err(|_| {
             io::Error::new(
@@ -158,21 +195,22 @@ impl FillController {
             enforcing,
             max_units,
             max_ops,
-            credit: AtomicU64::new((max_ops << 32) | max_units),
+            credit: AtomicU64::new(pack_credit(0, max_ops, max_units)),
             epoch: AtomicU64::new(0),
             staging_pressure: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
+            pressure: AtomicU8::new(encode_pressure(FillPressure::Healthy)),
             stopped: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             rejections: AtomicU64::new(0),
             would_reject: AtomicU64::new(0),
+            dropped_observations: AtomicU64::new(0),
             state: Mutex::new(State {
                 slots: observations.into_boxed_slice(),
                 snapshot: FillControlSnapshot {
                     pressure: FillPressure::Healthy,
                     enforcing,
                     bytes_per_second: settings.max_bytes_per_second,
-                    operations_per_second: settings.max_operations_per_second,
+                    records_per_second: settings.max_records_per_second,
                     ..FillControlSnapshot::default()
                 },
                 last_tick: now,
@@ -200,15 +238,17 @@ impl FillController {
             .spawn(move || {
                 let mut state = control.lock();
                 while !control.stopped.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    let elapsed = now.saturating_duration_since(state.last_tick);
+                    if elapsed >= TICK {
+                        control.tick(&mut state, now);
+                        continue;
+                    }
                     state = control
                         .wake
-                        .wait_timeout(state, TICK)
+                        .wait_timeout(state, TICK - elapsed)
                         .unwrap_or_else(|p| p.into_inner())
                         .0;
-                    let now = Instant::now();
-                    if now.saturating_duration_since(state.last_tick) >= TICK {
-                        control.tick(&mut state, now);
-                    }
                 }
             })?;
         Ok(FillMonitor {
@@ -224,22 +264,28 @@ impl FillController {
     pub fn stop(&self) {
         let _state = self.lock();
         self.stopped.store(true, Ordering::Release);
-        self.paused.store(true, Ordering::Release);
+        self.fence();
         self.wake.notify_all();
     }
 
     pub fn set_recovering(&self, recovering: bool) {
         self.recovering.store(recovering, Ordering::Release);
         if recovering && self.enforcing {
-            self.paused.store(true, Ordering::Release);
+            self.fence();
         }
     }
 
-    pub fn suppress_reinsertion(&self) -> bool {
-        self.enforcing && self.lock().snapshot.pressure != FillPressure::Healthy
+    fn fence(&self) {
+        self.pressure
+            .store(encode_pressure(FillPressure::Paused), Ordering::Release);
     }
 
-    pub fn staging_busy(&self) {
+    pub fn suppress_reinsertion(&self) -> bool {
+        self.enforcing
+            && self.pressure.load(Ordering::Acquire) != encode_pressure(FillPressure::Healthy)
+    }
+
+    pub fn note_staging_pressure(&self) {
         self.staging_pressure.store(true, Ordering::Relaxed);
     }
 
@@ -247,46 +293,55 @@ impl FillController {
         let mut snapshot = self.lock().snapshot;
         snapshot.rejections = self.rejections.load(Ordering::Relaxed);
         snapshot.would_reject = self.would_reject.load(Ordering::Relaxed);
+        snapshot.dropped_observations = self.dropped_observations.load(Ordering::Relaxed);
         snapshot
     }
 
     pub fn try_admit(&self, bytes: u64) -> Option<FillPermit<'_>> {
         let units = bytes.div_ceil(UNIT);
-        let epoch = self.epoch.load(Ordering::Acquire);
+        if self.stopped.load(Ordering::Acquire)
+            || self.pressure.load(Ordering::Acquire) == encode_pressure(FillPressure::Paused)
+        {
+            return self.refuse(true);
+        }
         let mut value = self.credit.load(Ordering::Relaxed);
-        if !self.paused.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire) {
-            for _ in 0..MAX_CAS_ATTEMPTS {
-                if value >> 48 != epoch & COUNT_MASK || self.epoch.load(Ordering::Acquire) != epoch
-                {
-                    break;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let epoch = self.epoch.load(Ordering::Acquire);
+            if packed_epoch(value) != epoch & COUNT_MASK {
+                value = self.credit.load(Ordering::Relaxed);
+                continue;
+            }
+            if packed_units(value) < units || packed_ops(value) == 0 {
+                return self.refuse(true);
+            }
+            match self.credit.compare_exchange_weak(
+                value,
+                value - units - (1 << 32),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(FillPermit {
+                        control: self,
+                        units,
+                        epoch,
+                        committed: false,
+                    });
                 }
-                if value & u64::from(u32::MAX) < units || (value >> 32) & COUNT_MASK == 0 {
-                    break;
-                }
-                let next = value - units - (1 << 32);
-                match self.credit.compare_exchange_weak(
-                    value,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return Some(FillPermit {
-                            control: self,
-                            units,
-                            epoch,
-                            committed: false,
-                        });
-                    }
-                    Err(current) => value = current,
-                }
+                Err(current) => value = current,
             }
         }
+        self.refuse(false)
+    }
+
+    fn refuse(&self, policy: bool) -> Option<FillPermit<'_>> {
         if self.enforcing {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             None
         } else {
-            self.would_reject.fetch_add(1, Ordering::Relaxed);
+            if policy {
+                self.would_reject.fetch_add(1, Ordering::Relaxed);
+            }
             Some(FillPermit {
                 control: self,
                 units: 0,
@@ -296,30 +351,56 @@ impl FillController {
         }
     }
 
-    pub fn observe(&self, bytes: u64, timeout: Duration) -> io::Result<Progress<'_>> {
+    pub fn observe(&self, bytes: u64, timeout: Duration) -> Option<Observation<'_>> {
         let mut state = self.lock();
         let now = Instant::now();
-        if state.slots.iter().all(Option::is_none) {
+        let mut free = None;
+        let mut occupied = 0;
+        for (index, slot) in state.slots.iter().enumerate() {
+            if slot.is_some() {
+                occupied += 1;
+            } else if free.is_none() {
+                free = Some(index);
+            }
+        }
+        let Some(index) = free else {
+            self.dropped_observations.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if occupied == 0 {
             state.last_progress = now;
         }
-        let index = state
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| io::Error::other("background observation capacity exhausted"))?;
-        state.slots[index] = Some(Observation {
+        state.slots[index] = Some(InFlight {
             start: now,
             admitted: None,
-            returned: None,
+            completed: None,
             bytes,
             timeout,
         });
-        self.wake.notify_one();
-        Ok(Progress {
+        Some(Observation {
             control: self,
             index,
             succeeded: false,
         })
+    }
+
+    fn clamp_rates(&self, bytes: u64, records: u32) -> (u64, u32) {
+        (
+            bytes
+                .max(MIN_BYTES_PER_SECOND)
+                .min(self.options.max_bytes_per_second),
+            records
+                .max(MIN_RECORDS_PER_SECOND)
+                .min(self.options.max_records_per_second),
+        )
+    }
+
+    fn throttle(&self, state: &mut State, bytes: u64, records: u32) {
+        let (bytes, records) = self.clamp_rates(bytes, records);
+        state.snapshot.pressure = FillPressure::Throttled;
+        state.snapshot.bytes_per_second = bytes;
+        state.snapshot.records_per_second = records;
+        state.clean_ticks = 0;
     }
 
     fn tick(&self, state: &mut State, now: Instant) {
@@ -327,7 +408,7 @@ impl FillController {
         let elapsed = now
             .saturating_duration_since(state.window_start)
             .as_secs_f64();
-        let decision = elapsed >= 0.5;
+        let decision = elapsed >= DECISION_WINDOW.as_secs_f64();
         let mut made_progress = false;
         if decision {
             let bytes = state.completed_bytes.saturating_sub(state.sampled_bytes);
@@ -342,15 +423,15 @@ impl FillController {
         let mut pending = 0;
         let mut bytes = 0_u64;
         let mut oldest = Duration::ZERO;
-        let mut deadline = Duration::from_secs(5);
+        let mut deadline = MAX_DRAIN_DEADLINE;
         let mut aged = false;
-        for observation in state.slots.iter().flatten() {
+        for request in state.slots.iter().flatten() {
             pending += 1;
-            bytes = bytes.saturating_add(observation.bytes);
-            let age = now.saturating_duration_since(observation.start);
+            bytes = bytes.saturating_add(request.bytes);
+            let age = now.saturating_duration_since(request.start);
             oldest = oldest.max(age);
-            deadline = deadline.min(observation.timeout);
-            aged |= age >= observation.timeout / 4;
+            deadline = deadline.min(request.timeout);
+            aged |= age >= request.timeout / 4;
         }
         let drain = if pending != 0 && state.service_bytes > 0. && state.service_ops > 0. {
             (bytes as f64 / state.service_bytes).max(pending as f64 / state.service_ops)
@@ -358,55 +439,53 @@ impl FillController {
             0.
         };
         let no_progress = pending != 0
-            && now.saturating_duration_since(state.last_progress)
-                >= (deadline / 2).min(Duration::from_millis(500));
+            && now.saturating_duration_since(state.last_progress) >= (deadline / 2).min(STALL_CAP);
         let recovering = self.recovering.load(Ordering::Acquire);
-        let pressure = recovering || aged || no_progress || drain >= deadline.as_secs_f64() / 4.;
+        let pause = recovering || aged || no_progress || drain >= deadline.as_secs_f64() / 4.;
         let previous = state.snapshot.pressure;
-        let staging_busy = decision && self.staging_pressure.swap(false, Ordering::Relaxed);
-        if pressure {
+        let staging_pressure = decision && self.staging_pressure.swap(false, Ordering::Relaxed);
+        if pause {
             state.snapshot.pressure = FillPressure::Paused;
             state.clean_ticks = 0;
         } else if previous == FillPressure::Paused || state.was_recovering {
             if pending == 0
                 || (made_progress && oldest < deadline / 10 && drain < deadline.as_secs_f64() / 10.)
             {
-                state.snapshot.pressure = FillPressure::Throttled;
-                state.snapshot.bytes_per_second = (state.snapshot.bytes_per_second / 2).max(640);
-                state.snapshot.operations_per_second =
-                    (state.snapshot.operations_per_second / 2).max(10);
-                if state.service_bytes > 0. {
-                    state.snapshot.bytes_per_second = state
-                        .snapshot
-                        .bytes_per_second
-                        .min((state.service_bytes * 0.8) as u64)
-                        .max(640);
-                    state.snapshot.operations_per_second = state
-                        .snapshot
-                        .operations_per_second
-                        .min((state.service_ops * 0.8) as u32)
-                        .max(10);
-                }
-                state.clean_ticks = 0;
+                let bytes = state.snapshot.bytes_per_second / 2;
+                let records = state.snapshot.records_per_second / 2;
+                let (bytes, records) = if state.service_bytes > 0. {
+                    (
+                        bytes.min((state.service_bytes * SERVICE_HEADROOM) as u64),
+                        records.min((state.service_ops * SERVICE_HEADROOM) as u32),
+                    )
+                } else {
+                    (bytes, records)
+                };
+                self.throttle(state, bytes, records);
             }
-        } else if staging_busy && pending >= state.previous_pending && pending != 0 {
-            state.snapshot.pressure = FillPressure::Throttled;
-            state.snapshot.bytes_per_second = (state.snapshot.bytes_per_second * 7 / 10).max(640);
-            state.snapshot.operations_per_second =
-                (state.snapshot.operations_per_second * 7 / 10).max(10);
-            state.clean_ticks = 0;
+        } else if staging_pressure && pending >= state.previous_pending && pending != 0 {
+            self.throttle(
+                state,
+                state.snapshot.bytes_per_second * STAGING_KEEP_NUM / STAGING_KEEP_DEN,
+                u32::try_from(
+                    u64::from(state.snapshot.records_per_second) * STAGING_KEEP_NUM
+                        / STAGING_KEEP_DEN,
+                )
+                .unwrap_or(MIN_RECORDS_PER_SECOND),
+            );
         } else if made_progress {
             state.clean_ticks += 1;
-            if state.clean_ticks >= 3 {
-                state.snapshot.bytes_per_second = (state.snapshot.bytes_per_second
-                    + self.options.max_bytes_per_second / 40)
-                    .min(self.options.max_bytes_per_second);
-                state.snapshot.operations_per_second = (state.snapshot.operations_per_second
-                    + self.options.max_operations_per_second.div_ceil(40))
-                .min(self.options.max_operations_per_second);
-                if state.snapshot.bytes_per_second == self.options.max_bytes_per_second
-                    && state.snapshot.operations_per_second
-                        == self.options.max_operations_per_second
+            if state.clean_ticks >= CLEAN_DECISIONS {
+                let (bytes, records) = self.clamp_rates(
+                    state.snapshot.bytes_per_second
+                        + self.options.max_bytes_per_second / u64::from(RAMP_DIVISOR),
+                    state.snapshot.records_per_second
+                        + self.options.max_records_per_second.div_ceil(RAMP_DIVISOR),
+                );
+                state.snapshot.bytes_per_second = bytes;
+                state.snapshot.records_per_second = records;
+                if bytes == self.options.max_bytes_per_second
+                    && records == self.options.max_records_per_second
                 {
                     state.snapshot.pressure = FillPressure::Healthy;
                 }
@@ -420,22 +499,18 @@ impl FillController {
         state.snapshot.outstanding_bytes = bytes;
         state.snapshot.oldest_operation_ns = nanos(oldest);
         state.snapshot.estimated_drain_ns = (drain * 1e9).min(u64::MAX as f64) as u64;
-        self.paused.store(
-            state.snapshot.pressure == FillPressure::Paused,
-            Ordering::Release,
-        );
-        // Publishing a fresh epoch bounds refunds and prevents accumulating missed ticks.
+        self.pressure
+            .store(encode_pressure(state.snapshot.pressure), Ordering::Release);
         let clear =
             previous != state.snapshot.pressure || state.snapshot.pressure == FillPressure::Paused;
-        let add_units = state.snapshot.bytes_per_second / 10 / UNIT;
-        let add_ops = u64::from(state.snapshot.operations_per_second / 10);
+        let add_units = state.snapshot.bytes_per_second / TICKS_PER_SECOND / UNIT;
+        let add_ops = u64::from(state.snapshot.records_per_second) / TICKS_PER_SECOND;
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         let _ = self
             .credit
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-                let units = if clear { 0 } else { old & u64::from(u32::MAX) };
-                let ops = if clear { 0 } else { (old >> 32) & COUNT_MASK };
-                let next_epoch = (epoch & COUNT_MASK) << 48;
+                let units = if clear { 0 } else { packed_units(old) };
+                let ops = if clear { 0 } else { packed_ops(old) };
                 let (units, ops) = if state.snapshot.pressure == FillPressure::Paused {
                     (0, 0)
                 } else {
@@ -444,7 +519,7 @@ impl FillController {
                         (ops + add_ops).min(self.max_ops),
                     )
                 };
-                Some(next_epoch | (ops << 32) | units)
+                Some(pack_credit(epoch, ops, units))
             });
         if previous != state.snapshot.pressure {
             log::info!(target: "cache2::health", event = "cache_fill_pressure_changed", pressure:? = state.snapshot.pressure;
@@ -476,13 +551,15 @@ impl Drop for FillPermit<'_> {
         let mut value = self.control.credit.load(Ordering::Relaxed);
         for _ in 0..MAX_CAS_ATTEMPTS {
             if self.control.epoch.load(Ordering::Acquire) != self.epoch
-                || value >> 48 != self.epoch & COUNT_MASK
+                || packed_epoch(value) != self.epoch & COUNT_MASK
             {
                 return;
             }
-            let units = ((value & u64::from(u32::MAX)) + self.units).min(self.control.max_units);
-            let ops = (((value >> 32) & COUNT_MASK) + 1).min(self.control.max_ops);
-            let next = (value & !CREDIT_MASK) | (ops << 32) | units;
+            let next = pack_credit(
+                packed_epoch(value),
+                (packed_ops(value) + 1).min(self.control.max_ops),
+                (packed_units(value) + self.units).min(self.control.max_units),
+            );
             match self.control.credit.compare_exchange_weak(
                 value,
                 next,
@@ -497,53 +574,57 @@ impl Drop for FillPermit<'_> {
 }
 
 /// One worker-owned observation. Failed work is removed, never marked successful.
-pub struct Progress<'a> {
+pub struct Observation<'a> {
     control: &'a FillController,
     index: usize,
     succeeded: bool,
 }
-impl Progress<'_> {
+impl Observation<'_> {
     pub fn admitted(&self) {
-        self.control.lock().slots[self.index]
-            .as_mut()
-            .unwrap()
-            .admitted = Some(Instant::now());
+        self.stamp(|request, now| request.admitted = Some(now));
     }
-    pub fn returned(&self) {
-        self.control.lock().slots[self.index]
-            .as_mut()
-            .unwrap()
-            .returned = Some(Instant::now());
+    pub fn completed(&self) {
+        self.stamp(|request, now| request.completed = Some(now));
     }
     pub fn finish(mut self) {
         self.succeeded = true;
     }
+    fn stamp(&self, update: impl FnOnce(&mut InFlight, Instant)) {
+        update(
+            self.control.lock().slots[self.index]
+                .as_mut()
+                .expect("live observation slot"),
+            Instant::now(),
+        );
+    }
 }
-impl Drop for Progress<'_> {
+impl Drop for Observation<'_> {
     fn drop(&mut self) {
         let mut state = self.control.lock();
-        let observation = state.slots[self.index].take().expect("live progress slot");
+        let request = state.slots[self.index]
+            .take()
+            .expect("live observation slot");
         let now = Instant::now();
         if self.succeeded {
             state.completed_ops = state.completed_ops.saturating_add(1);
-            state.completed_bytes = state.completed_bytes.saturating_add(observation.bytes);
+            state.completed_bytes = state.completed_bytes.saturating_add(request.bytes);
             state.last_progress = now;
         }
-        let admission_end = observation.admitted.unwrap_or(now);
+        let admission_end = request.admitted.unwrap_or(now);
         state.snapshot.admission_ns = state.snapshot.admission_ns.saturating_add(nanos(
-            admission_end.saturating_duration_since(observation.start),
+            admission_end.saturating_duration_since(request.start),
         ));
-        if let Some(admitted) = observation.admitted {
-            let wait_end = observation.returned.unwrap_or(now);
+        if let Some(admitted) = request.admitted {
+            let wait_end = request.completed.unwrap_or(now);
             state.snapshot.completion_wait_ns = state
                 .snapshot
                 .completion_wait_ns
                 .saturating_add(nanos(wait_end.saturating_duration_since(admitted)));
-            if let Some(returned) = observation.returned {
+            if let Some(completed) = request.completed {
                 state.snapshot.validation_ns = state
                     .snapshot
                     .validation_ns
-                    .saturating_add(nanos(now.saturating_duration_since(returned)));
+                    .saturating_add(nanos(now.saturating_duration_since(completed)));
             }
         }
     }
@@ -554,7 +635,7 @@ mod tests {
     use super::*;
 
     fn control(enforcing: bool) -> Arc<FillController> {
-        let settings = AdaptiveFillOptions::new(64_000, 100);
+        let settings = FillLimits::new(64_000, 100);
         FillController::new(
             if enforcing {
                 FillControlOptions::Adaptive(settings)
@@ -597,7 +678,7 @@ mod tests {
     fn staging_pressure_reduces_once_per_window_and_idle_does_not_raise_rates() {
         let control = control(true);
         let pending = control.observe(64, Duration::from_secs(30)).unwrap();
-        control.staging_busy();
+        control.note_staging_pressure();
         tick(&control, TICK);
         assert_eq!(control.snapshot().bytes_per_second, 64_000);
         {
@@ -607,7 +688,7 @@ mod tests {
         tick(&control, Duration::from_millis(500));
         assert_eq!(control.snapshot().pressure, FillPressure::Throttled);
         assert_eq!(control.snapshot().bytes_per_second, 44_800);
-        assert_eq!(control.snapshot().operations_per_second, 70);
+        assert_eq!(control.snapshot().records_per_second, 70);
         drop(pending);
         tick(&control, Duration::from_secs(10));
         assert_eq!(control.snapshot().bytes_per_second, 44_800);
@@ -643,7 +724,7 @@ mod tests {
         old.admitted();
         let fast = control.observe(64, Duration::from_secs(2)).unwrap();
         fast.admitted();
-        fast.returned();
+        fast.completed();
         fast.finish();
         {
             // Many small completions keep aggregate progress healthy. Only
@@ -656,7 +737,7 @@ mod tests {
         tick(&control, Duration::from_millis(600));
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         assert!(control.try_admit(64).is_none());
-        old.returned();
+        old.completed();
         assert!(
             control.try_admit(64).is_none(),
             "delivery does not release the admission fence"
@@ -686,10 +767,9 @@ mod tests {
         let control = control(true);
         tick(&control, Duration::from_secs(3600));
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert_eq!(
-            control.credit.load(Ordering::Relaxed) & CREDIT_MASK,
-            (control.max_ops << 32) | control.max_units
-        );
+        let credit = control.credit.load(Ordering::Relaxed);
+        assert_eq!(packed_ops(credit), control.max_ops);
+        assert_eq!(packed_units(credit), control.max_units);
         let _new = control.observe(4096, Duration::from_secs(2)).unwrap();
         // Production ticks and observations use the same clock.
         let mut state = control.lock();
@@ -700,7 +780,7 @@ mod tests {
     #[test]
     fn large_record_remains_eligible_and_stop_cannot_reopen_admission() {
         let control = FillController::new(
-            FillControlOptions::Adaptive(AdaptiveFillOptions::new(640, 10)),
+            FillControlOptions::Adaptive(FillLimits::new(640, 10)),
             1,
             4096,
         )
@@ -739,14 +819,15 @@ mod tests {
     #[test]
     fn failed_observations_release_capacity_without_reporting_success() {
         let control = FillController::new(
-            FillControlOptions::Observe(AdaptiveFillOptions::new(640, 10)),
+            FillControlOptions::Observe(FillLimits::new(640, 10)),
             1,
             4096,
         )
         .unwrap()
         .unwrap();
         let pending = control.observe(4096, Duration::from_secs(5)).unwrap();
-        assert!(control.observe(64, Duration::from_secs(5)).is_err());
+        assert!(control.observe(64, Duration::from_secs(5)).is_none());
+        assert_eq!(control.snapshot().dropped_observations, 1);
         // A failed admission still contributes its elapsed phase time.
         control.lock().slots[0].as_mut().unwrap().start -= Duration::from_secs(1);
         drop(pending);
@@ -761,6 +842,25 @@ mod tests {
         assert_eq!(state.completed_ops, 0);
         assert_eq!(state.completed_bytes, 0);
         assert!(state.slots[0].is_none());
+    }
+
+    #[test]
+    fn observe_would_reject_counts_policy_not_epoch_contention() {
+        let control = control(false);
+        control.epoch.store(1, Ordering::Release);
+        control.try_admit(64).unwrap().commit();
+        assert_eq!(control.snapshot().would_reject, 0);
+        tick(&control, TICK);
+        for _ in 0..10 {
+            control.try_admit(64).unwrap().commit();
+        }
+        control.try_admit(64).unwrap().commit();
+        assert_eq!(control.snapshot().would_reject, 1);
+        let _old = control.observe(4096, Duration::from_secs(2)).unwrap();
+        tick(&control, Duration::from_millis(600));
+        assert_eq!(control.snapshot().pressure, FillPressure::Paused);
+        control.try_admit(64).unwrap().commit();
+        assert_eq!(control.snapshot().would_reject, 2);
     }
 
     #[test]

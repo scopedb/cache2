@@ -842,8 +842,8 @@ impl RegionDataPlane {
                 return Err(write_overload_error());
             }
         };
-        let fill_permit = if let Some(controller) = &running.recovery.controller {
-            match controller.try_admit(u64::from(record_bytes)) {
+        let fill_permit = if let Some(fill) = &running.recovery.fill {
+            match fill.try_admit(u64::from(record_bytes)) {
                 Some(permit) => Some(permit),
                 None => {
                     if running.activity_counters {
@@ -894,14 +894,14 @@ impl RegionDataPlane {
                 Ok(seqno)
             }
             RegionStageValue::NeedsProgress => {
-                if let Some(controller) = &running.recovery.controller {
-                    controller.staging_busy();
+                if let Some(fill) = &running.recovery.fill {
+                    fill.note_staging_pressure();
                 }
                 reject_staged_write(running, control, WAKE_URGENT, operation)
             }
             RegionStageValue::NeedsRotation => {
-                if let Some(controller) = &running.recovery.controller {
-                    controller.staging_busy();
+                if let Some(fill) = &running.recovery.fill {
+                    fill.note_staging_pressure();
                 }
                 reject_staged_write(running, control, WAKE_ROTATE | WAKE_URGENT, operation)
             }
@@ -1321,8 +1321,8 @@ impl RegionDataPlane {
         {
             snapshot.health = crate::snapshot::CacheHealth::Recovering;
         }
-        if let Some(controller) = &running.recovery.controller {
-            snapshot.fill_control = controller.snapshot();
+        if let Some(fill) = &running.recovery.fill {
+            snapshot.fill_control = fill.snapshot();
         }
         snapshot.io = aggregate_io_stats(
             &running.read_engines,
@@ -1525,12 +1525,12 @@ fn start_running(
         io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
     })?;
     shards.resize_with(shard_count, || Arc::new(ShardControl::new()));
-    let controller = FillController::new(
+    let fill = FillController::new(
         runtime.fill_control,
         shard_count + reclaim_worker_count,
         data.geometry.region_size,
     )?;
-    let fill_monitor = controller.as_ref().map(FillController::start).transpose()?;
+    let fill_monitor = fill.as_ref().map(FillController::start).transpose()?;
     let shared = Arc::new(RunningShared {
         core,
         read_engines,
@@ -1540,7 +1540,7 @@ fn start_running(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: runtime.reclaim_io_timeout,
-        recovery: BackgroundRecovery::with_controller(runtime.io_recovery_timeout, controller),
+        recovery: BackgroundRecovery::with_fill(runtime.io_recovery_timeout, fill),
         managed_memory,
         metrics,
         memory,
@@ -1854,9 +1854,9 @@ fn reclaim_worker_result(
             let preserve_hot = shared.core.reclaim_can_reinsert()?
                 && !shared
                     .recovery
-                    .controller
+                    .fill
                     .as_ref()
-                    .is_some_and(|control| control.suppress_reinsertion());
+                    .is_some_and(|fill| fill.suppress_reinsertion());
             let reinsert_operation = if preserve_hot {
                 shared.operations.try_enter()
             } else {

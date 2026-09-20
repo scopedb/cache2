@@ -779,14 +779,27 @@ impl BoundedIoRequest {
         loop {
             self.request = match self.request.wait_until(self.deadline) {
                 Ok(completion) => {
-                    recovery.returned();
+                    recovery.completed();
                     return Ok(completion);
                 }
                 Err(request) => request,
             };
             match recovery.next_deadline(original) {
                 Some(deadline) => self.deadline = deadline,
-                None => return self.wait(engine),
+                None => {
+                    return match self.wait(engine) {
+                        Ok(completion) => {
+                            recovery.completed();
+                            Ok(completion)
+                        }
+                        Err(exceeded) => {
+                            if exceeded.completion.is_some() {
+                                recovery.completed();
+                            }
+                            Err(exceeded)
+                        }
+                    };
+                }
             }
         }
     }
@@ -964,9 +977,7 @@ pub fn submit_background_io(
     let bytes = match &operation {
         IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len() as u64,
     };
-    if let Err(error) = recovery.start(bytes, timeout) {
-        return Err(SubmitError { error, operation });
-    }
+    recovery.start(bytes, timeout);
     let original = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);

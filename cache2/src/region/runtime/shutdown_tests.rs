@@ -297,9 +297,7 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
         storage_fingerprint: 4,
     };
     let config = RuntimeOptions {
-        fill_control: crate::FillControlOptions::Adaptive(crate::AdaptiveFillOptions::new(
-            1_048_576, 1000,
-        )),
+        fill_control: crate::FillControlOptions::Adaptive(crate::FillLimits::new(1_048_576, 1000)),
         append_shards: 1,
         l1_capacity_bytes: 0,
         ..RuntimeOptions::default()
@@ -312,13 +310,10 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     let plane = store.data_plane_handle().unwrap();
     plane.put(b"existing", b"value").unwrap();
     plane.drain().unwrap();
-    let controller = plane.shared.recovery.controller.as_ref().unwrap();
-    let pending = controller
-        .observe(4096, Duration::from_millis(400))
-        .unwrap();
-    pending.admitted();
+    let fill = plane.shared.recovery.fill.as_ref().unwrap();
+    fill.set_recovering(true);
     let deadline = Instant::now() + Duration::from_secs(2);
-    while controller.snapshot().pressure != crate::FillPressure::Paused {
+    while fill.snapshot().pressure != crate::FillPressure::Paused {
         assert!(Instant::now() < deadline, "monitor did not pause fills");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -336,9 +331,8 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     assert_eq!(plane.get(b"existing").unwrap().unwrap().value(), b"value");
     plane.delete(b"existing").unwrap();
     assert!(plane.get(b"existing").unwrap().is_none());
-    pending.returned();
     assert!(plane.put(b"new", b"value").is_err());
-    pending.finish();
+    fill.set_recovering(false);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match plane.put(b"new", b"value") {

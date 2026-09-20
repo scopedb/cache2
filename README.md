@@ -83,6 +83,7 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 | Memory      | `managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                       |
 | I/O mode    | `io_mode`                                                                    | Buffered I/O.                                                                                 |
 | Metrics     | `stats: StatsOptions`                                                        | Health/resource gauges always available; activity, request, and latency collection opt in.    |
+| Fill control | `fill_control: FillControlOptions`                                          | Disabled. `Observe` reports pause/budget pressure; `Adaptive` rejects new fills before timeout. |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm open. Growth uses available Free Regions; when there are not enough, the disposable cache safely starts empty.
 

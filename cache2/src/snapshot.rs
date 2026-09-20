@@ -50,7 +50,7 @@ pub enum FillPressure {
     Healthy,
     /// Fill rate has been reduced while accepted work drains.
     Throttled,
-    /// New fills are paused while outstanding work recovers.
+    /// New fills are paused while outstanding work is old or stalled.
     Paused,
 }
 
@@ -64,12 +64,14 @@ pub struct FillControlSnapshot {
     pub enforcing: bool,
     /// Current encoded-byte admission rate.
     pub bytes_per_second: u64,
-    /// Current record admission rate.
-    pub operations_per_second: u32,
-    /// Fills rejected by the controller, including bounded CAS contention.
+    /// Current fill-record admission rate.
+    pub records_per_second: u32,
+    /// Fills rejected by Adaptive, including bounded CAS contention.
     pub rejections: u64,
-    /// Fills that Observe mode would have rejected.
+    /// Observe-mode pause or budget refusals; excludes CAS/epoch contention.
     pub would_reject: u64,
+    /// Background observations skipped because the table was full.
+    pub dropped_observations: u64,
     /// Background operations awaiting completion or validation.
     pub outstanding_operations: u64,
     /// Bytes held by those background operations; excludes unflushed staging.

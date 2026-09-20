@@ -1394,12 +1394,12 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
 
 #[test]
 fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validation() {
-    use crate::AdaptiveFillOptions;
     use crate::FillControlOptions;
+    use crate::FillLimits;
     use crate::FillPressure;
     use crate::io::fill_control::FillController;
     for enforcing in [false, true] {
-        let settings = AdaptiveFillOptions::new(1024 * 1024, 1000);
+        let settings = FillLimits::new(1024 * 1024, 1000);
         let mode = if enforcing {
             FillControlOptions::Adaptive(settings)
         } else {
@@ -1407,7 +1407,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_validat
         };
         let control = FillController::new(mode, 1, 4096).unwrap().unwrap();
         let monitor = control.start().unwrap();
-        let recovery = BackgroundRecovery::with_controller(None, Some(Arc::clone(&control)));
+        let recovery = BackgroundRecovery::with_fill(None, Some(Arc::clone(&control)));
         let backend = Arc::new(BlockingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let memory = managed_memory();

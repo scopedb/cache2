@@ -361,28 +361,28 @@ pub enum FillControlOptions {
     #[default]
     Disabled,
     /// Report pressure and hypothetical rejections without changing admission.
-    Observe(AdaptiveFillOptions),
-    /// Shape new fills while allowing accepted writes and essential reclaim.
-    Adaptive(AdaptiveFillOptions),
+    Observe(FillLimits),
+    /// Reject new fills under pressure. Accepted writes and essential reclaim continue.
+    Adaptive(FillLimits),
 }
 
-/// Logical fill-rate ceilings for the optional adaptive controller.
-/// These are not physical-device bandwidth or IOPS guarantees.
+/// Logical fill-rate ceilings shared by [`FillControlOptions::Observe`] and
+/// [`FillControlOptions::Adaptive`]. These are not device bandwidth or IOPS guarantees.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AdaptiveFillOptions {
+pub struct FillLimits {
     /// Maximum encoded fill bytes per second, from 640 through 1 TiB/s.
     pub max_bytes_per_second: u64,
     /// Maximum fill records per second, from 10 through 655350.
-    pub max_operations_per_second: u32,
+    pub max_records_per_second: u32,
 }
 
-impl AdaptiveFillOptions {
+impl FillLimits {
     /// Creates unchecked rate ceilings. [`CacheConfig::new`] validates them.
-    pub const fn new(max_bytes_per_second: u64, max_operations_per_second: u32) -> Self {
+    pub const fn new(max_bytes_per_second: u64, max_records_per_second: u32) -> Self {
         Self {
             max_bytes_per_second,
-            max_operations_per_second,
+            max_records_per_second,
         }
     }
 }
@@ -853,9 +853,7 @@ mod tests {
         assert_eq!(base.runtime().fill_control, FillControlOptions::Disabled);
         for (bytes, operations) in [(639, 100), ((1 << 40) + 1, 100), (640, 9), (640, 655_351)] {
             let options = RuntimeOptions {
-                fill_control: FillControlOptions::Adaptive(AdaptiveFillOptions::new(
-                    bytes, operations,
-                )),
+                fill_control: FillControlOptions::Adaptive(FillLimits::new(bytes, operations)),
                 ..RuntimeOptions::default()
             };
             assert_eq!(
@@ -870,7 +868,7 @@ mod tests {
             let config = CacheConfig::new(
                 storage.clone(),
                 RuntimeOptions {
-                    fill_control: mode(AdaptiveFillOptions::new(64_000, 100)),
+                    fill_control: mode(FillLimits::new(64_000, 100)),
                     ..RuntimeOptions::default()
                 },
             )

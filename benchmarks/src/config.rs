@@ -70,7 +70,7 @@ pub fn fill_control_from_env(prefix: &str) -> io::Result<cache2::FillControlOpti
         .ok_or_else(|| invalid("enabled fill control requires FILL_BYTES_PER_SECOND"))?;
     let operations = setting(&format!("{prefix}_FILL_OPERATIONS_PER_SECOND"))?
         .ok_or_else(|| invalid("enabled fill control requires FILL_OPERATIONS_PER_SECOND"))?;
-    let options = cache2::AdaptiveFillOptions::new(bytes, operations);
+    let options = cache2::FillLimits::new(bytes, operations);
     match mode.as_str() {
         "observe" => Ok(cache2::FillControlOptions::Observe(options)),
         "adaptive" => Ok(cache2::FillControlOptions::Adaptive(options)),
