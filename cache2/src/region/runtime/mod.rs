@@ -446,6 +446,8 @@ struct RunningShared {
     write_flush_threshold_bytes: usize,
     align_reads_for_direct_io: bool,
     activity_counters: bool,
+    #[cfg(test)]
+    after_io_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Default)]
@@ -1499,6 +1501,8 @@ fn start_running(
         write_flush_threshold_bytes: runtime.write_flush_threshold_bytes,
         align_reads_for_direct_io: runtime.io_mode == IoMode::Direct,
         activity_counters: runtime.stats.activity_counters,
+        #[cfg(test)]
+        after_io_snapshot: Mutex::new(None),
     });
     // Inspect the recovered queue before workers can contend with foreground
     // mutations. Fresh caches have no sealed Regions and need no wakeup.
@@ -2069,6 +2073,13 @@ fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
         .engines()
         .map(|engine| engine.in_flight())
         .sum::<usize>();
+    #[cfg(test)]
+    {
+        let after_snapshot = owner.shared.after_io_snapshot.lock().unwrap().take();
+        if let Some(after_snapshot) = after_snapshot {
+            after_snapshot();
+        }
+    }
     let writes_in_flight = owner
         .shared
         .engines()

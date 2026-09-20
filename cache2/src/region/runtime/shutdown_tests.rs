@@ -13,19 +13,16 @@
 // limitations under the License.
 
 use std::env;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 use super::*;
 use crate::IoEngineOptions;
 use crate::io::backend::IoBackend;
-use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::io::backend::WritePoint;
 use crate::io::engine::BackendIoEngine;
 use crate::io::engine::IoRequest;
-use crate::io::engine::RuntimeInner;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -92,44 +89,6 @@ impl IoBackend for BlockedRead {
     }
 }
 
-struct RacingEngine {
-    inner: BackendIoEngine,
-    backend: Arc<BlockedRead>,
-    managed_memory: Arc<ManagedMemory>,
-    inject: AtomicBool,
-    pending: Mutex<Option<IoRequest>>,
-}
-
-impl IoEngine for RacingEngine {
-    fn inner(&self) -> &RuntimeInner {
-        self.inner.inner()
-    }
-
-    fn runtime_io_stats(&self) -> RuntimeIoStats {
-        self.inner.runtime_io_stats()
-    }
-
-    fn in_flight(&self) -> usize {
-        let observed = self.inner.in_flight();
-        if self.inject.swap(false, Ordering::AcqRel) {
-            // Schedule a competing read immediately after the idle observation.
-            if let Ok(slot) = self.inner.try_reserve_read() {
-                let buffer =
-                    IoBuffer::for_read(self.managed_memory.try_read_buffer(4096).unwrap(), 4096)
-                        .unwrap();
-                if let Ok(request) = self
-                    .inner
-                    .submit_reserved_read(slot, IoOperation::read(buffer, 0))
-                {
-                    *self.pending.lock().unwrap() = Some(request);
-                    self.backend.wait_started();
-                }
-            }
-        }
-        observed
-    }
-}
-
 #[test]
 fn late_read_must_not_pin_close() {
     assert_close_does_not_wait_for_read(false);
@@ -184,16 +143,29 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     // Reuse a stopped runtime's fixed resources without unrelated workers.
     let shared = Arc::get_mut(&mut plane.shared).unwrap();
     let backend = Arc::new(BlockedRead::default());
-    let engine = Arc::new(RacingEngine {
-        inner: BackendIoEngine::new(backend.clone(), 1).unwrap(),
-        backend: backend.clone(),
-        managed_memory: shared.managed_memory.clone(),
-        inject: AtomicBool::new(true),
-        pending: Mutex::new(None),
-    });
+    let engine = Arc::new(BackendIoEngine::new(backend.clone(), 1).unwrap());
+    let read_engine = Arc::clone(&engine);
+    let read_backend = Arc::clone(&backend);
+    let managed_memory = Arc::clone(&shared.managed_memory);
+    let submit_read = move || -> io::Result<IoRequest> {
+        let slot = read_engine.try_reserve_read()?;
+        let buffer =
+            IoBuffer::for_read(managed_memory.try_read_buffer(4096).unwrap(), 4096).unwrap();
+        let request = read_engine
+            .submit_reserved_read(slot, IoOperation::read(buffer, 0))
+            .map_err(|error| error.error)?;
+        read_backend.wait_started();
+        Ok(request)
+    };
+    let (submitted, submission) = mpsc::channel();
     if submit_before_close {
-        assert_eq!(engine.in_flight(), 0);
-        assert_eq!(engine.inner.in_flight(), 1);
+        submitted.send(submit_read()).unwrap();
+        assert_eq!(engine.in_flight(), 1);
+    } else {
+        // Exercise the interval between the idle snapshot and synchronous shutdown.
+        *shared.after_io_snapshot.get_mut().unwrap() = Some(Box::new(move || {
+            submitted.send(submit_read()).unwrap();
+        }));
     }
     shared.read_engines = vec![engine.clone() as Arc<dyn IoEngine>].into_boxed_slice();
     shared.write_engines = Box::new([]);
@@ -213,10 +185,18 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     backend.release();
     thread.join().unwrap();
     engine.shutdown().unwrap();
-    assert!(!engine.inject.load(Ordering::Acquire));
     std::fs::remove_dir_all(root).unwrap();
     assert!(
         matches!(result, Ok(Ok(false))),
         "close synchronously joined a blocked read"
     );
+    let submitted = submission.recv_timeout(Duration::from_secs(1)).unwrap();
+    if submit_before_close {
+        assert!(matches!(
+            submitted.unwrap().wait().status,
+            crate::io::engine::CompletionStatus::Completed
+        ));
+    } else {
+        assert_eq!(submitted.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
 }
