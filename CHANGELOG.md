@@ -7,6 +7,10 @@
 - All optional statistics now use `RuntimeOptions::stats`: replace `runtime.statistics` with `runtime.stats.activity_counters` and `CacheSnapshot::statistics_enabled` with `activity_counters_enabled`. Activity counters, terminal request counters, and latency collection remain independent and disabled by default; counter semantics and the on-disk format are unchanged. See [the configuration migration guide](CONFIGURATION.md#migrating-from-05).
 - The benchmarking `RegionIndexTurnoverReport` field `config` is renamed to `options`, matching the `RegionIndexTurnoverOptions` input it carries.
 
+### Improvements
+
+- Background write and reclaim timeouts now enter a reversible `CacheHealth::Recovering` state: new cache fills return overload while existing reads and deletes remain available. Original requests keep their bounded buffers and Regions and are never resubmitted; all affected work must complete validation and publication before fills resume. `RuntimeOptions::io_recovery_timeout` defaults to `None` for recovery until completion or close; use `Some(duration)` to bound recovery or `Some(Duration::ZERO)` for immediate cancellation. Recovery checks at fixed one-second intervals. Close interrupts recovery and preserves the existing unfenced-write safeguards; drain may wait indefinitely. Actual I/O errors and invalid completions remain terminal.
+
 ## v0.5.0 (2026-09-16)
 
 ### Breaking Changes
