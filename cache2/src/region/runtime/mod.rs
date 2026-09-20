@@ -59,7 +59,8 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
-use crate::io::engine::submit_cache_io_with_timeout;
+use crate::io::engine::recovery::BackgroundRecovery;
+use crate::io::engine::submit_background_io;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -436,6 +437,7 @@ struct RunningShared {
     reclaim_engines: Box<[Arc<dyn IoEngine>]>,
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
+    recovery: BackgroundRecovery,
     managed_memory: Arc<ManagedMemory>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -785,6 +787,7 @@ impl RegionDataPlane {
     }
 
     pub fn start_close(&self) {
+        self.shared.recovery.stop();
         self.operations.start_close();
     }
 
@@ -812,6 +815,12 @@ impl RegionDataPlane {
             ));
         }
         let running = &self.shared;
+        if running.recovery.is_recovering() {
+            if running.activity_counters {
+                running.metrics.record_write_rejection();
+            }
+            return Err(write_overload_error());
+        }
         let hash = hash_key(self.data.hash_seed, key);
         let shard_id = self.core.append_shard(hash);
         let control = &running.shards[shard_id];
@@ -1279,6 +1288,11 @@ impl RegionDataPlane {
             running.managed_memory.snapshot(),
             running.memory.metrics_snapshot(),
         );
+        if snapshot.health == crate::snapshot::CacheHealth::Running
+            && running.recovery.is_recovering()
+        {
+            snapshot.health = crate::snapshot::CacheHealth::Recovering;
+        }
         snapshot.io = aggregate_io_stats(
             &running.read_engines,
             &running.write_engines,
@@ -1291,7 +1305,7 @@ impl RegionDataPlane {
     /// The return value asks the backend to retain flock for process lifetime
     /// because an issued write or flush could not be fenced.
     pub fn shutdown(&self) -> io::Result<bool> {
-        self.operations.start_close();
+        self.start_close();
         self.operations.wait_quiescent()?;
         let _ = self.metrics.lifecycle.compare_exchange(
             LIFECYCLE_RUNNING,
@@ -1489,6 +1503,7 @@ fn start_running(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: runtime.reclaim_io_timeout,
+        recovery: BackgroundRecovery::new(runtime.io_recovery_timeout),
         managed_memory,
         metrics,
         memory,
@@ -1628,6 +1643,7 @@ fn shard_worker(shared: Arc<RunningShared>, shard_id: usize) {
         );
     }
     shared.core.enter_miss_only();
+    shared.recovery.stop();
     control.fail(&error);
     // Wake engine admission in case another shard is blocked behind work that
     // can no longer make progress after this runtime entered miss-only.
@@ -1694,6 +1710,7 @@ fn reclaim_worker(
         .lifecycle
         .store(LIFECYCLE_FAILED, Ordering::Release);
     shared.core.enter_miss_only();
+    shared.recovery.stop();
     log::error!(
         target: "cache2::health",
         event = "cache_reclaim_worker_failed",
@@ -1730,6 +1747,7 @@ fn reclaim_worker_result(
             if shared.reclaim_control.is_stopped()? {
                 return Ok(());
             }
+            let mut recovery = shared.recovery.attempt();
             let Some(receipt) = shared.core.begin_reclaim()? else {
                 break;
             };
@@ -1752,14 +1770,15 @@ fn reclaim_worker_result(
                 // count. Use the bounded background wait so transient CAS
                 // contention cannot turn a healthy cache miss-only; foreground
                 // reads use their separately configured admission path.
-                let request = submit_cache_io_with_timeout(
+                let request = submit_background_io(
                     engine.as_ref(),
                     IoOperation::read(io_buffer, absolute),
                     shared.reclaim_io_timeout,
+                    &mut recovery,
                 )
                 .map_err(|error| error.into_lease().0)?;
                 let completion = request
-                    .wait(engine.as_ref())
+                    .wait_with_recovery(engine.as_ref(), &mut recovery)
                     .map_err(|error| error.into_lease().0)?;
                 let (result, returned) = completion.into_lease();
                 let transferred = result?;
@@ -1823,6 +1842,7 @@ fn reclaim_worker_result(
                 shared.shards[reinsert_shard].wait_for_drain(generation)?;
             }
             shared.core.complete_reclaim(receipt)?;
+            recovery.finish();
             drop(reinsert_operation);
             if shared.activity_counters {
                 shared.metrics.record_reclaim(stats);
@@ -1872,9 +1892,12 @@ fn shard_worker_result(
                 }
                 if force_flush || fill.bytes >= shared.write_flush_threshold_bytes {
                     let engine = shared.write_engine_for(shard_id as u64);
-                    shared
-                        .core
-                        .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
+                    shared.core.flush_staging_shard(
+                        &shared.staging,
+                        engine.as_ref(),
+                        shard_id,
+                        &shared.recovery,
+                    )?;
                     deadline = None;
                 }
             }
@@ -1904,9 +1927,12 @@ fn shard_worker_result(
             match shared.staging.shard_fill_snapshot(shard_id) {
                 Ok(Some(_)) => {
                     let engine = shared.write_engine_for(shard_id as u64);
-                    shared
-                        .core
-                        .flush_staging_shard(&shared.staging, engine.as_ref(), shard_id)?;
+                    shared.core.flush_staging_shard(
+                        &shared.staging,
+                        engine.as_ref(),
+                        shard_id,
+                        &shared.recovery,
+                    )?;
                 }
                 Ok(None) => {}
                 Err(StagingError::WouldBlock) => {
@@ -2041,6 +2067,7 @@ async fn drain_shards_async(shared: &RunningShared, stop: bool) -> io::Result<()
 }
 
 fn stop_running(mut owner: RunningOwner) -> io::Result<bool> {
+    owner.shared.recovery.stop();
     let drain = drain_shards(&owner.shared, true);
     let mut join_error = None;
     for worker in owner.shard_workers.drain(..) {

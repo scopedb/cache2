@@ -79,6 +79,9 @@ use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
 mod posix;
+pub mod recovery;
+
+use self::recovery::RecoveryAttempt;
 
 #[cfg(all(
     feature = "io-uring",
@@ -119,7 +122,7 @@ pub fn io_uring_extra_memory_bytes(max_in_flight: usize, rings: usize) -> Option
 /// A stalled cache-device operation must not hold a frontend or shutdown
 /// barrier forever. This is intentionally a fixed production guardrail rather
 /// than a durability knob: cache contents are disposable.
-const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CACHE_IO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cancellation is only a request. Give the target operation a short window to
 /// publish its own completion, which is the actual buffer-lifetime fence.
 const CACHE_IO_CANCEL_GRACE: Duration = Duration::from_millis(100);
@@ -756,6 +759,27 @@ impl BoundedIoRequest {
         self.request.id()
     }
 
+    /// Allows an issued background operation to finish without cancelling it
+    /// at the normal deadline. The same request keeps its slot and buffer;
+    /// callers must still validate completion before publishing or reusing it.
+    pub fn wait_with_recovery(
+        mut self,
+        engine: &dyn IoEngine,
+        recovery: &mut RecoveryAttempt<'_>,
+    ) -> Result<IoCompletion, IoDeadlineExceeded> {
+        let original = self.deadline;
+        loop {
+            self.request = match self.request.wait_until(self.deadline) {
+                Ok(completion) => return Ok(completion),
+                Err(request) => request,
+            };
+            match recovery.next_deadline(original) {
+                Some(deadline) => self.deadline = deadline,
+                None => return self.wait(engine),
+            }
+        }
+    }
+
     pub fn wait(self, engine: &dyn IoEngine) -> Result<IoCompletion, IoDeadlineExceeded> {
         let request = match self.request.wait_until(self.deadline) {
             Ok(completion) => return Ok(completion),
@@ -897,6 +921,7 @@ impl IoDeadlineExceeded {
 }
 
 /// Submit one cache-device request with a hard end-to-end deadline.
+#[cfg(test)]
 pub fn submit_cache_io(
     engine: &dyn IoEngine,
     operation: IoOperation,
@@ -905,6 +930,7 @@ pub fn submit_cache_io(
 }
 
 /// Submits background I/O with its configured admission and completion budget.
+#[cfg(test)]
 pub fn submit_cache_io_with_timeout(
     engine: &dyn IoEngine,
     operation: IoOperation,
@@ -914,6 +940,36 @@ pub fn submit_cache_io_with_timeout(
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
+}
+
+/// Retries admission only when ownership of an unsubmitted operation returns.
+/// Issued I/O is never resubmitted; both stages share the original deadline.
+pub fn submit_background_io(
+    engine: &dyn IoEngine,
+    mut operation: IoOperation,
+    timeout: Duration,
+    recovery: &mut RecoveryAttempt<'_>,
+) -> Result<BoundedIoRequest, SubmitError> {
+    let original = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut deadline = original;
+    loop {
+        match submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE) {
+            Ok(mut request) => {
+                request.deadline = original;
+                return Ok(request);
+            }
+            Err(error) if error.error.kind() == io::ErrorKind::TimedOut => {
+                let Some(next) = recovery.next_deadline(original) else {
+                    return Err(error);
+                };
+                deadline = next;
+                operation = error.operation;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Submits a read whose engine slot was reserved before allocating its buffer.
