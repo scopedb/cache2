@@ -14,16 +14,19 @@
 
 use std::env;
 use std::fmt;
-use std::fs;
 use std::io;
-use std::mem::MaybeUninit;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
+use benchmarks::config::env_u64;
+use benchmarks::config::env_usize;
+use benchmarks::config::invalid;
+use benchmarks::config::reject_renamed_env;
+use benchmarks::harness::BenchFiles;
+use benchmarks::harness::current_rss_bytes;
+use benchmarks::harness::peak_rss_bytes;
+use benchmarks::harness::put_eventually;
 use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
 use cache2::Cache;
@@ -50,7 +53,7 @@ struct ScaleConfig {
 
 impl ScaleConfig {
     fn from_env() -> io::Result<Self> {
-        benchmarks::config::reject_renamed_env("CACHE_RECOVERY")?;
+        reject_renamed_env("CACHE_RECOVERY")?;
         let expected_entries = env_usize("CACHE_RECOVERY_EXPECTED_ENTRIES", 1_000_000)?;
         let capacity_bytes = env_u64("CACHE_RECOVERY_CAPACITY_MIB", 256)?
             .checked_mul(MIB as u64)
@@ -106,87 +109,6 @@ impl ScaleConfig {
     }
 }
 
-struct ScaleFiles {
-    data: PathBuf,
-    cleanup_on_drop: bool,
-}
-
-impl ScaleFiles {
-    fn new(directory: &Path) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Self {
-            data: directory.join(format!(
-                "cache2-recovery-scale-{}-{timestamp}.cache",
-                std::process::id()
-            )),
-            cleanup_on_drop: false,
-        }
-    }
-
-    fn mark_success(&mut self) {
-        self.cleanup_on_drop = true;
-    }
-
-    fn logical_bytes(&self) -> io::Result<u64> {
-        self.paths()
-            .into_iter()
-            .try_fold(0_u64, |total, path| match fs::metadata(path) {
-                Ok(metadata) => total
-                    .checked_add(metadata.len())
-                    .ok_or_else(|| invalid("logical file size overflow")),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-                Err(error) => Err(error),
-            })
-    }
-
-    #[cfg(unix)]
-    fn allocated_bytes(&self) -> io::Result<u64> {
-        use std::os::unix::fs::MetadataExt;
-
-        self.paths()
-            .into_iter()
-            .try_fold(0_u64, |total, path| match fs::metadata(path) {
-                Ok(metadata) => total
-                    .checked_add(metadata.blocks().saturating_mul(512))
-                    .ok_or_else(|| invalid("allocated file size overflow")),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-                Err(error) => Err(error),
-            })
-    }
-
-    #[cfg(not(unix))]
-    fn allocated_bytes(&self) -> io::Result<u64> {
-        self.logical_bytes()
-    }
-
-    fn paths(&self) -> [PathBuf; 4] {
-        [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ]
-    }
-}
-
-impl Drop for ScaleFiles {
-    fn drop(&mut self) {
-        if !self.cleanup_on_drop {
-            eprintln!(
-                "recovery-scale artifacts preserved after failure: data={}",
-                self.data.display()
-            );
-            return;
-        }
-        for path in self.paths() {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 fn main() -> io::Result<()> {
     let reporter = RunReporter::start("recovery_scale", None);
     let result = run_benchmark();
@@ -208,7 +130,7 @@ fn run_benchmark() -> io::Result<()> {
 }
 
 async fn run(config: ScaleConfig) -> io::Result<()> {
-    let mut files = ScaleFiles::new(&config.directory);
+    let mut files = BenchFiles::preserved_on_failure(&config.directory, "recovery-scale");
     let storage = config.storage_options().build()?;
     let cache_config = CacheConfig::new(storage.clone(), config.runtime_options())?;
     let peak_disk_bytes = storage.peak_disk_bytes();
@@ -226,7 +148,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     );
 
     let opened = Instant::now();
-    let cache = Cache::open(&files.data, cache_config.clone()).await?;
+    let cache = Cache::open(files.data(), cache_config.clone()).await?;
     emit("fresh_open", "control", opened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Cold)?;
     let resources = cache.snapshot()?;
@@ -242,7 +164,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     let populated = Instant::now();
     for (ordinal, key) in keys.iter().enumerate() {
         value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-        put_eventually(&cache, key, &value)?;
+        put_eventually(&cache, key, &value, WRITE_RETRY_TIMEOUT)?;
     }
     cache.drain().await?;
     emit(
@@ -259,7 +181,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = Cache::open(&files.data, cache_config.clone()).await?;
+    let cache = Cache::open(files.data(), cache_config.clone()).await?;
     emit("warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;
@@ -270,7 +192,7 @@ async fn run(config: ScaleConfig) -> io::Result<()> {
     emit_sizes(&files, peak_disk_bytes)?;
 
     let reopened = Instant::now();
-    let cache = Cache::open(&files.data, cache_config.clone()).await?;
+    let cache = Cache::open(files.data(), cache_config.clone()).await?;
     emit("second_warm_open", "control", reopened.elapsed(), 1, 0);
     require_startup(cache.startup_mode(), StartupMode::Warm)?;
     verify_sentinels(&cache, &keys, config.value_bytes).await?;
@@ -307,25 +229,6 @@ async fn verify_sentinels(cache: &Cache, keys: &[[u8; 16]], value_bytes: usize) 
     Ok(())
 }
 
-fn put_eventually(cache: &Cache, key: &[u8], value: &[u8]) -> io::Result<()> {
-    let deadline = Instant::now() + WRITE_RETRY_TIMEOUT;
-    loop {
-        match cache.put(key, value) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "recovery benchmark write did not enter bounded staging",
-                    ));
-                }
-                std::thread::sleep(Duration::from_micros(50));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 fn require_startup(observed: StartupMode, expected: StartupMode) -> io::Result<()> {
     if observed != expected {
         return Err(io::Error::other(format!(
@@ -350,58 +253,12 @@ fn emit(phase: &str, operation: &str, elapsed: Duration, operations: u64, bytes:
         "result phase={phase} elapsed_ns={} elapsed_seconds={:.6} current_rss_bytes={} peak_rss_bytes={}",
         elapsed.as_nanos(),
         elapsed.as_secs_f64(),
-        current_rss_bytes(),
+        current_rss_bytes().unwrap_or(0),
         peak_rss_bytes(),
     );
 }
 
-#[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
-    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: `usage` points to writable storage for one `rusage` value.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-        return 0;
-    }
-    // SAFETY: a successful getrusage initialized the complete value.
-    let usage = unsafe { usage.assume_init() };
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        u64::try_from(usage.ru_maxrss).unwrap_or(0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        u64::try_from(usage.ru_maxrss)
-            .unwrap_or(0)
-            .saturating_mul(1024)
-    }
-}
-
-#[cfg(not(unix))]
-fn peak_rss_bytes() -> u64 {
-    0
-}
-
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")
-                    .and_then(|value| value.split_ascii_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
-        })
-        .unwrap_or(0)
-        .saturating_mul(1024)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn current_rss_bytes() -> u64 {
-    0
-}
-
-fn emit_sizes(files: &ScaleFiles, peak_disk_bytes: u64) -> io::Result<()> {
+fn emit_sizes(files: &BenchFiles, peak_disk_bytes: u64) -> io::Result<()> {
     let logical_bytes = files.logical_bytes()?;
     let allocated_bytes = files.allocated_bytes()?;
     if logical_bytes > peak_disk_bytes {
@@ -419,30 +276,4 @@ fn sentinel_key(ordinal: usize) -> [u8; 16] {
     let mut key = *b"recovery-scale!!";
     key[8..].copy_from_slice(&(ordinal as u64).to_le_bytes());
     key
-}
-
-fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    env_u64(name, default as u64).and_then(|value| {
-        usize::try_from(value).map_err(|_| invalid(format!("{name} does not fit usize")))
-    })
-}
-
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

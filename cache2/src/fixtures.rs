@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared byte assertions for module-local persistent-format fixtures.
+//! Shared assertions and guards for module-local tests.
 //!
 //! Golden fixtures pin versioned on-disk bytes. Changes require an explicit format-version
 //! decision; tests never regenerate them. Each fixture lives beside the module that owns its
@@ -20,6 +20,21 @@
 //!
 //! The sparse representation starts with the complete byte length. Each following line contains a
 //! hexadecimal offset and hexadecimal bytes; unspecified bytes are zero.
+//!
+//! [`TestFile`] gives file-based tests a unique temporary path and removes it on drop, including
+//! when an assertion fails midway.
+
+use std::env;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+use crate::io::backend::FileBackend;
+use crate::io::backend::IoBackend;
 
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.
@@ -66,4 +81,57 @@ fn sparse_golden(input: &str) -> Vec<u8> {
         assert!(fields.next().is_none());
     }
     output.expect("golden fixture must declare its length")
+}
+
+/// Unique temporary file removed when the guard drops, even when the test fails midway.
+pub struct TestFile {
+    path: PathBuf,
+}
+
+impl TestFile {
+    /// Returns a guard for a unique `cache2-{label}-*` path in the system temp directory.
+    pub fn new(label: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            path: env::temp_dir().join(format!("cache2-{label}-{}-{id}.tmp", std::process::id())),
+        }
+    }
+
+    /// Returns the temporary file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Opens the file for reading and writing, creating it when missing.
+    pub fn open(&self) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)
+            .unwrap()
+    }
+
+    /// Creates the file exclusively for reading and writing.
+    pub fn create_new(&self) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .unwrap()
+    }
+
+    /// Opens the file as a buffered backend.
+    pub fn backend(&self) -> Arc<dyn IoBackend> {
+        Arc::new(FileBackend::open(&self.path).unwrap())
+    }
+}
+
+impl Drop for TestFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }

@@ -647,7 +647,7 @@ impl FileRegionCore {
         match submit_read(engine, slot, descriptor, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
-                if !is_read_availability_error(error.kind()) {
+                if !is_read_pressure(error.kind()) {
                     self.health
                         .enter_miss_only_with_error("record_read_submit_failed", &error);
                 }
@@ -663,7 +663,7 @@ impl FileRegionCore {
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = completion.descriptor.hash;
         if let Err(error) = completion.result {
-            if !is_read_availability_error(error.kind()) {
+            if !is_read_pressure(error.kind()) {
                 self.health
                     .enter_miss_only_with_error("record_read_completion_failed", &error);
             }
@@ -1172,7 +1172,10 @@ impl FileRegionCore {
     }
 }
 
-fn is_read_availability_error(kind: io::ErrorKind) -> bool {
+/// Classifies transient read-availability failures: the caller may retry on an
+/// alternate lane or surface a busy miss, but the failure says nothing about
+/// the stored data and must not trip Region health.
+pub fn is_read_pressure(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::OutOfMemory

@@ -952,41 +952,104 @@ fn submit_cache_io_until(
 }
 
 pub trait IoEngine: Send + Sync {
+    /// Shared submission, completion, and bookkeeping state behind the
+    /// engine-specific driver.
+    fn inner(&self) -> &Arc<RuntimeInner>;
+    /// Backend path and direct-I/O counters reported with the engine stats.
+    fn runtime_io_stats(&self) -> RuntimeIoStats;
+
     /// Installed once during construction, before any requests are admitted.
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming);
-    fn try_reserve_read(&self) -> io::Result<ReadSlot>;
-    fn read_slot_waiter(&self) -> ReadSlotWaiter;
+    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+        assert!(
+            self.inner().shared.latency.set(recorder).is_ok(),
+            "I/O recorder installed twice"
+        );
+    }
+
+    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
+        self.inner().try_reserve_read()
+    }
+
+    fn read_slot_waiter(&self) -> ReadSlotWaiter {
+        self.inner().read_slot_waiter()
+    }
+
     fn submit_reserved_read(
         &self,
         slot: ReadSlot,
         operation: IoOperation,
-    ) -> Result<IoRequest, SubmitError>;
+    ) -> Result<IoRequest, SubmitError> {
+        self.inner().submit_reserved_read(slot, operation)
+    }
+
     #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner().submit(operation)
+    }
+
     #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError>;
+    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner().submit_wait(operation)
+    }
+
     fn submit_wait_controlled(
         &self,
         operation: IoOperation,
         cancelled: &AtomicBool,
         deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError>;
-    fn wake_slot_waiters(&self);
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool>;
-    fn shutdown(&self) -> io::Result<()>;
-    fn in_flight(&self) -> usize;
+    ) -> Result<IoRequest, SubmitError> {
+        self.inner()
+            .submit_wait_controlled(operation, cancelled, deadline)
+    }
+
+    fn wake_slot_waiters(&self) {
+        self.inner().shared.wake_slot_waiters();
+    }
+
+    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
+        self.inner().cancel(request_id, state)
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        self.inner().shutdown()
+    }
+
+    fn in_flight(&self) -> usize {
+        self.inner().shared.total_in_flight()
+    }
+
     #[cfg(test)]
-    fn direct_active(&self) -> bool;
+    fn direct_active(&self) -> bool {
+        self.runtime_io_stats().direct_active
+    }
+
     /// Permanently stop accepting requests after a target operation missed both its
     /// deadline and cancellation grace period.
-    fn stop_accepting_requests(&self);
-    fn writes_in_flight(&self) -> usize;
+    fn stop_accepting_requests(&self) {
+        self.inner().stop_accepting_requests();
+    }
+
+    fn writes_in_flight(&self) -> usize {
+        self.inner().shared.writes_in_flight()
+    }
+
     /// True means a failed driver could not fence an issued write.
     /// The cache must retain its exclusive file lock for process lifetime.
-    fn has_unfenced_writes(&self) -> bool;
+    fn has_unfenced_writes(&self) -> bool {
+        self.inner().shared.has_unfenced_writes()
+    }
+
     #[cfg(test)]
-    fn mark_unfenced_writes_for_test(&self);
-    fn stats(&self) -> EngineIoSnapshot;
+    fn mark_unfenced_writes_for_test(&self) {
+        self.inner().shared.mark_unfenced_writes();
+    }
+
+    fn stats(&self) -> EngineIoSnapshot {
+        EngineIoSnapshot {
+            requests: self.inner().shared.snapshot(),
+            runtime: self.runtime_io_stats(),
+        }
+    }
 
     #[cfg(test)]
     fn read_exact_at(&self, buffer: IoBuffer, offset: u64) -> Result<IoRequest, SubmitError> {
@@ -1589,7 +1652,7 @@ struct ShutdownState {
     stopped: Condvar,
 }
 
-struct RuntimeInner {
+pub(crate) struct RuntimeInner {
     shared: Arc<RuntimeShared>,
     commands: SyncSender<DriverCommand>,
     submit_state: Arc<RwLock<SubmitState>>,

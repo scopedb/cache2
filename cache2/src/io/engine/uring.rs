@@ -33,7 +33,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
 
 use hashcrew::xxhash::Xxh3_64Builder;
 use io_uring::IoUring;
@@ -45,36 +44,33 @@ use io_uring::types;
 use crate::config::runtime::IoUringEngineConfig;
 use crate::io::backend::RuntimeFileSet;
 use crate::io::backend::RuntimeIoPath;
+use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::RuntimeIoStatsHandle;
+use crate::io::backend::retry_interrupted;
+#[cfg(test)]
 use crate::io::engine::CompletionState;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
 use crate::io::engine::DriverWake;
-use crate::io::engine::EngineIoSnapshot;
 #[cfg(test)]
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 #[cfg(test)]
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::IoRequest;
 #[cfg(test)]
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::OperationKind;
-use crate::io::engine::ReadSlot;
-use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::RequestId;
 use crate::io::engine::RuntimeInner;
 use crate::io::engine::RuntimeShared;
 use crate::io::engine::ShutdownPhase;
 use crate::io::engine::ShutdownState;
-use crate::io::engine::SubmitError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 #[cfg(test)]
 use crate::io::engine::io_uring_extra_memory_bytes;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
-use crate::stats::recording::IoTiming;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
@@ -84,7 +80,6 @@ const LINUX_EINTR: i32 = 4;
 const LINUX_ECANCELED: i32 = 125;
 const LINUX_POLLIN: u32 = 0x0001;
 const FATAL_DRAIN_ROUNDS: usize = 64;
-const MAX_INTERRUPTED_RETRIES: usize = 4;
 const MAX_WAKE_ATTEMPTS: usize = 4;
 const MAX_COMMANDS_PER_DRAIN: usize = 64;
 
@@ -246,92 +241,12 @@ impl UringIoEngine {
 }
 
 impl IoEngine for UringIoEngine {
-    fn set_latency_recorder(&self, recorder: IoTiming) {
-        assert!(
-            self.inner.shared.latency.set(recorder).is_ok(),
-            "I/O recorder installed twice"
-        );
+    fn inner(&self) -> &Arc<RuntimeInner> {
+        &self.inner
     }
 
-    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
-        self.inner.try_reserve_read()
-    }
-
-    fn read_slot_waiter(&self) -> ReadSlotWaiter {
-        self.inner.read_slot_waiter()
-    }
-
-    fn submit_reserved_read(
-        &self,
-        slot: ReadSlot,
-        operation: IoOperation,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_reserved_read(slot, operation)
-    }
-
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit(operation)
-    }
-
-    #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_wait(operation)
-    }
-
-    fn submit_wait_controlled(
-        &self,
-        operation: IoOperation,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner
-            .submit_wait_controlled(operation, cancelled, deadline)
-    }
-
-    fn wake_slot_waiters(&self) {
-        self.inner.shared.wake_slot_waiters();
-    }
-
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        self.inner.cancel(request_id, state)
-    }
-
-    fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown()
-    }
-
-    fn in_flight(&self) -> usize {
-        self.inner.shared.total_in_flight()
-    }
-
-    #[cfg(test)]
-    fn direct_active(&self) -> bool {
-        self.io_stats.snapshot().direct_active
-    }
-
-    fn stop_accepting_requests(&self) {
-        self.inner.stop_accepting_requests();
-    }
-
-    fn writes_in_flight(&self) -> usize {
-        self.inner.shared.writes_in_flight()
-    }
-
-    fn has_unfenced_writes(&self) -> bool {
-        self.inner.shared.has_unfenced_writes()
-    }
-
-    #[cfg(test)]
-    fn mark_unfenced_writes_for_test(&self) {
-        self.inner.shared.mark_unfenced_writes();
-    }
-
-    fn stats(&self) -> EngineIoSnapshot {
-        EngineIoSnapshot {
-            requests: self.inner.shared.snapshot(),
-            runtime: self.io_stats.snapshot(),
-        }
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
+        self.io_stats.snapshot()
     }
 }
 
@@ -1028,21 +943,6 @@ impl UringDriver {
                     flight.transferred,
                 );
             }
-        }
-    }
-}
-
-fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    let mut retries = 0_usize;
-    loop {
-        match operation() {
-            Err(error)
-                if error.kind() == io::ErrorKind::Interrupted
-                    && retries < MAX_INTERRUPTED_RETRIES =>
-            {
-                retries += 1;
-            }
-            result => return result,
         }
     }
 }

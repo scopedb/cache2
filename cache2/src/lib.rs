@@ -60,6 +60,7 @@ pub use self::snapshot::RegionSnapshot;
 pub use self::snapshot::StartupMode;
 
 mod checksum;
+mod codec;
 mod hashing;
 mod io;
 mod managed_memory;

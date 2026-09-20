@@ -19,40 +19,31 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
 
 use crate::io::backend::IoBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileBackend;
 #[cfg(unix)]
 use crate::io::backend::RuntimeFileSet;
+use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::read_exact_at_uninit_with_progress;
 use crate::io::backend::write_all_at_with_progress;
 use crate::io::engine::BackendIoEngine;
-use crate::io::engine::CompletionState;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
-use crate::io::engine::EngineIoSnapshot;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::IoRequest;
-use crate::io::engine::ReadSlot;
-use crate::io::engine::ReadSlotWaiter;
-use crate::io::engine::RequestId;
 use crate::io::engine::RuntimeInner;
 use crate::io::engine::RuntimeShared;
 use crate::io::engine::ShutdownPhase;
 use crate::io::engine::ShutdownState;
-use crate::io::engine::SubmitError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::lock_unpoisoned;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
-use crate::stats::recording::IoTiming;
 
 impl BackendIoEngine {
     #[cfg(unix)]
@@ -172,92 +163,12 @@ impl BackendIoEngine {
 }
 
 impl IoEngine for BackendIoEngine {
-    fn set_latency_recorder(&self, recorder: IoTiming) {
-        assert!(
-            self.inner.shared.latency.set(recorder).is_ok(),
-            "I/O recorder installed twice"
-        );
+    fn inner(&self) -> &Arc<RuntimeInner> {
+        &self.inner
     }
 
-    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
-        self.inner.try_reserve_read()
-    }
-
-    fn read_slot_waiter(&self) -> ReadSlotWaiter {
-        self.inner.read_slot_waiter()
-    }
-
-    fn submit_reserved_read(
-        &self,
-        slot: ReadSlot,
-        operation: IoOperation,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_reserved_read(slot, operation)
-    }
-
-    #[cfg(test)]
-    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit(operation)
-    }
-
-    #[cfg(test)]
-    fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_wait(operation)
-    }
-
-    fn submit_wait_controlled(
-        &self,
-        operation: IoOperation,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner
-            .submit_wait_controlled(operation, cancelled, deadline)
-    }
-
-    fn wake_slot_waiters(&self) {
-        self.inner.shared.wake_slot_waiters();
-    }
-
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        self.inner.cancel(request_id, state)
-    }
-
-    fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown()
-    }
-
-    fn in_flight(&self) -> usize {
-        self.inner.shared.total_in_flight()
-    }
-
-    #[cfg(test)]
-    fn direct_active(&self) -> bool {
-        self.backend.runtime_io_stats().direct_active
-    }
-
-    fn stop_accepting_requests(&self) {
-        self.inner.stop_accepting_requests();
-    }
-
-    fn writes_in_flight(&self) -> usize {
-        self.inner.shared.writes_in_flight()
-    }
-
-    fn has_unfenced_writes(&self) -> bool {
-        self.inner.shared.has_unfenced_writes()
-    }
-
-    #[cfg(test)]
-    fn mark_unfenced_writes_for_test(&self) {
-        self.inner.shared.mark_unfenced_writes();
-    }
-
-    fn stats(&self) -> EngineIoSnapshot {
-        EngineIoSnapshot {
-            requests: self.inner.shared.snapshot(),
-            runtime: self.backend.runtime_io_stats(),
-        }
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
+        self.backend.runtime_io_stats()
     }
 }
 

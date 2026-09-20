@@ -15,26 +15,34 @@
 use std::cmp::min;
 use std::env;
 use std::fmt;
-use std::fs;
 use std::io;
-use std::mem::MaybeUninit;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
+use benchmarks::config::env_bool;
+use benchmarks::config::env_u32;
+use benchmarks::config::env_u64;
+use benchmarks::config::env_usize;
+use benchmarks::config::env_usize_list;
+use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
+use benchmarks::config::parse_io_mode;
+use benchmarks::config::parse_l1_eviction_policy;
 use benchmarks::config::reclaim_max_in_flight;
+use benchmarks::harness::BenchFiles;
+use benchmarks::harness::current_rss_bytes;
+use benchmarks::harness::peak_rss_bytes;
+use benchmarks::harness::splitmix64;
 use benchmarks::report::AtomicLatencyHistogram;
 use benchmarks::report::JobReport;
 use benchmarks::report::LatencyHistogram;
 use benchmarks::report::RunReporter;
 use benchmarks::report::emit_cache_report;
+use benchmarks::report::should_sample;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
@@ -211,68 +219,6 @@ impl SoakConfig {
     }
 }
 
-struct SoakFiles {
-    data: PathBuf,
-    cleanup_on_drop: AtomicBool,
-}
-
-impl SoakFiles {
-    fn new(directory: &Path) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Self {
-            data: directory.join(format!(
-                "cache2-soak-{}-{timestamp}.cache",
-                std::process::id()
-            )),
-            cleanup_on_drop: AtomicBool::new(false),
-        }
-    }
-
-    fn mark_success(&self) {
-        self.cleanup_on_drop.store(true, Ordering::Release);
-    }
-
-    fn logical_bytes(&self) -> io::Result<u64> {
-        [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ]
-        .into_iter()
-        .try_fold(0_u64, |total, path| match fs::metadata(path) {
-            Ok(metadata) => total
-                .checked_add(metadata.len())
-                .ok_or_else(|| invalid("logical disk byte count overflow")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-            Err(error) => Err(error),
-        })
-    }
-}
-
-impl Drop for SoakFiles {
-    fn drop(&mut self) {
-        if !self.cleanup_on_drop.load(Ordering::Acquire) {
-            eprintln!(
-                "soak artifacts preserved after failure: data={}",
-                self.data.display()
-            );
-            return;
-        }
-        for path in [
-            self.data.clone(),
-            sidecar(&self.data, ".state"),
-            sidecar(&self.data, ".image"),
-            sidecar(&self.data, ".image.next"),
-        ] {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 #[derive(Default)]
 struct SoakCounters {
     writes: AtomicU64,
@@ -352,7 +298,7 @@ fn run_benchmark() -> io::Result<()> {
         .thread_name("cache2-soak")
         .enable_time()
         .build()?;
-    let files = SoakFiles::new(&config.directory);
+    let mut files = BenchFiles::preserved_on_failure(&config.directory, "soak");
     let storage = config.storage_options().build()?;
     let peak_disk_bytes = storage.peak_disk_bytes();
     let cache_config = CacheConfig::new(storage, config.runtime_options())?;
@@ -420,7 +366,7 @@ fn run_benchmark() -> io::Result<()> {
         peak_disk_bytes,
         config.rss_slack_bytes,
         config.rss_reopen_allowance_bytes,
-        files.data.display(),
+        files.data().display(),
     );
 
     std::thread::scope(|scope| -> io::Result<()> {
@@ -621,10 +567,10 @@ fn init_logforth() -> io::Result<()> {
 
 fn open_cache(
     runtime: &tokio::runtime::Runtime,
-    files: &SoakFiles,
+    files: &BenchFiles,
     config: &CacheConfig,
 ) -> io::Result<Cache> {
-    Ok(runtime.block_on(Cache::open(&files.data, config.clone()))?)
+    Ok(runtime.block_on(Cache::open(files.data(), config.clone()))?)
 }
 
 fn populate_for_warm_reopen(
@@ -703,11 +649,11 @@ fn run_writer(
         let put_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
         match cache.put(key, &value[..value_bytes]) {
             Ok(_) => {
-                record_latency(&counters.put_latency, put_started);
+                counters.put_latency.record_sampled(put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
-                record_latency(&counters.put_latency, put_started);
+                counters.put_latency.record_sampled(put_started);
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(OVERLOAD_DELAY);
                 continue;
@@ -721,11 +667,11 @@ fn run_writer(
                 should_sample(delete_ordinal, config.latency_sample_interval).then(Instant::now);
             match cache.delete(key) {
                 Ok(_) => {
-                    record_latency(&counters.delete_latency, delete_started);
+                    counters.delete_latency.record_sampled(delete_started);
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
-                    record_latency(&counters.delete_latency, delete_started);
+                    counters.delete_latency.record_sampled(delete_started);
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
                     std::thread::sleep(OVERLOAD_DELAY);
                 }
@@ -762,7 +708,7 @@ fn run_reader(
         let get_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
         match runtime.block_on(cache.get(&key))? {
             Some(observed) => {
-                record_latency(&counters.get_latency, get_started);
+                counters.get_latency.record_sampled(get_started);
                 let latest = expected[sampled].load(Ordering::SeqCst);
                 let stale = validate_observed(
                     sampled,
@@ -777,7 +723,7 @@ fn run_reader(
                 }
             }
             None => {
-                record_latency(&counters.get_latency, get_started);
+                counters.get_latency.record_sampled(get_started);
                 counters.misses.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -863,16 +809,13 @@ fn validate_observed(
 }
 
 fn mixed_value_index(sequence: u64, value_size_count: u64) -> io::Result<usize> {
-    let mut mixed = sequence.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
+    let mixed = splitmix64(sequence.wrapping_add(0x9e37_79b9_7f4a_7c15));
     usize::try_from(mixed % value_size_count).map_err(|_| invalid("value-size index exceeds usize"))
 }
 
 fn resource_sample(
     cache: &Cache,
-    files: &SoakFiles,
+    files: &BenchFiles,
     peak_disk_bytes: u64,
     rss_slack_bytes: usize,
     rss_reopen_allowance_bytes: usize,
@@ -1096,140 +1039,8 @@ fn report_sample(
     );
 }
 
-fn should_sample(ordinal: u64, interval: usize) -> bool {
-    interval != 0 && ordinal.is_multiple_of(interval as u64)
-}
-
-fn record_latency(histogram: &AtomicLatencyHistogram, started: Option<Instant>) {
-    if let Some(started) = started {
-        histogram.record(started.elapsed());
-    }
-}
-
 fn pace(interval: Duration) {
     if !interval.is_zero() {
         std::thread::sleep(interval);
     }
-}
-
-#[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
-    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: `usage` points to writable storage for one `rusage` value.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-        return 0;
-    }
-    // SAFETY: a successful getrusage initialized the complete value.
-    let usage = unsafe { usage.assume_init() };
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        u64::try_from(usage.ru_maxrss).unwrap_or(0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        u64::try_from(usage.ru_maxrss)
-            .unwrap_or(0)
-            .saturating_mul(1024)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> io::Result<u64> {
-    let status = fs::read_to_string("/proc/self/status")?;
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|value| value.split_ascii_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| io::Error::other("cannot read current RSS from /proc/self/status"))?;
-    kib.checked_mul(1024)
-        .ok_or_else(|| io::Error::other("current RSS byte count overflow"))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn current_rss_bytes() -> io::Result<u64> {
-    Ok(0)
-}
-
-#[cfg(not(unix))]
-fn peak_rss_bytes() -> u64 {
-    0
-}
-
-fn env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    env_u64(name, default as u64).and_then(|value| {
-        usize::try_from(value).map_err(|_| invalid(format!("{name} does not fit usize")))
-    })
-}
-
-fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
-    match env::var(name) {
-        Ok(value) => value
-            .split(',')
-            .map(|item| {
-                item.parse::<usize>()
-                    .map_err(|_| invalid(format!("{name} must be comma-separated integers")))
-            })
-            .collect::<io::Result<Vec<_>>>()
-            .map(Vec::into_boxed_slice),
-        Err(env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn env_u32(name: &str, default: u32) -> io::Result<u32> {
-    env_u64(name, u64::from(default))
-        .and_then(|value| u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds u32"))))
-}
-
-fn env_bool(name: &str, default: bool) -> io::Result<bool> {
-    match env::var(name) {
-        Ok(value) if value == "true" || value == "1" => Ok(true),
-        Ok(value) if value == "false" || value == "0" => Ok(false),
-        Ok(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn parse_io_mode(name: &str) -> io::Result<IoMode> {
-    match env::var(name)
-        .unwrap_or_else(|_| "buffered".to_owned())
-        .as_str()
-    {
-        "buffered" => Ok(IoMode::Buffered),
-        "direct" => Ok(IoMode::Direct),
-        value => Err(invalid(format!("unsupported I/O mode: {value}"))),
-    }
-}
-
-fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
-    match env::var(name)
-        .unwrap_or_else(|_| "clock".to_owned())
-        .as_str()
-    {
-        "clock" => Ok(L1EvictionPolicy::Clock),
-        "s3-fifo" => Ok(L1EvictionPolicy::S3Fifo),
-        value => Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
-    }
-}
-
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

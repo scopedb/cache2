@@ -19,9 +19,11 @@ use std::io;
 use std::str::FromStr;
 
 use cache2::IoEngineOptions;
+use cache2::IoMode;
 use cache2::IoUringOptions;
 use cache2::IoUringPoolOptions;
 use cache2::IoUringSqPollOptions;
+use cache2::L1EvictionPolicy;
 use cache2::PosixIoOptions;
 
 /// Reads backend-specific pool settings under a benchmark's environment prefix.
@@ -95,6 +97,89 @@ pub fn reject_renamed_env(prefix: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads an unsigned 64-bit setting, falling back to `default` when unset.
+pub fn env_u64(name: &str, default: u64) -> io::Result<u64> {
+    Ok(setting(name)?.unwrap_or(default))
+}
+
+/// Reads a `usize` setting, falling back to `default` when unset.
+pub fn env_usize(name: &str, default: usize) -> io::Result<usize> {
+    Ok(setting(name)?.unwrap_or(default))
+}
+
+/// Reads an unsigned 32-bit setting, falling back to `default` when unset.
+pub fn env_u32(name: &str, default: u32) -> io::Result<u32> {
+    Ok(setting(name)?.unwrap_or(default))
+}
+
+/// Reads a boolean setting (`true`/`1` or `false`/`0`), falling back to `default` when unset.
+pub fn env_bool(name: &str, default: bool) -> io::Result<bool> {
+    match setting::<String>(name)?.as_deref() {
+        None => Ok(default),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(_) => Err(invalid(format!("{name} must be true, false, 1, or 0"))),
+    }
+}
+
+/// Reads an optional `usize` setting.
+pub fn env_optional_usize(name: &str) -> io::Result<Option<usize>> {
+    setting(name)
+}
+
+/// Reads an optional finite, non-negative threshold setting.
+pub fn env_optional_f64(name: &str) -> io::Result<Option<f64>> {
+    let Some(value) = setting::<f64>(name)? else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value < 0.0 {
+        return Err(invalid(format!(
+            "{name} must be a finite non-negative number"
+        )));
+    }
+    Ok(Some(value))
+}
+
+/// Reads a comma-separated list of `usize` values, falling back to `default` when unset.
+pub fn env_usize_list(name: &str, default: &[usize]) -> io::Result<Box<[usize]>> {
+    match env::var(name) {
+        Ok(value) => value
+            .split(',')
+            .map(|item| {
+                item.parse::<usize>()
+                    .map_err(|_| invalid(format!("{name} must be comma-separated integers")))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .map(Vec::into_boxed_slice),
+        Err(env::VarError::NotPresent) => Ok(default.to_vec().into_boxed_slice()),
+        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
+    }
+}
+
+/// Reads an I/O mode setting (`buffered` or `direct`, default `buffered`).
+pub fn parse_io_mode(name: &str) -> io::Result<IoMode> {
+    match env::var(name)
+        .unwrap_or_else(|_| "buffered".to_owned())
+        .as_str()
+    {
+        "buffered" => Ok(IoMode::Buffered),
+        "direct" => Ok(IoMode::Direct),
+        value => Err(invalid(format!("unsupported I/O mode: {value}"))),
+    }
+}
+
+/// Reads an L1 eviction policy setting (`clock` or `s3-fifo`, default `clock`).
+pub fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
+    match env::var(name)
+        .unwrap_or_else(|_| "clock".to_owned())
+        .as_str()
+    {
+        "clock" => Ok(L1EvictionPolicy::Clock),
+        "s3-fifo" => Ok(L1EvictionPolicy::S3Fifo),
+        value => Err(invalid(format!("unsupported L1 eviction policy: {value}"))),
+    }
+}
+
 fn io_uring_pool(
     prefix: &str,
     role: &str,
@@ -128,7 +213,8 @@ fn io_uring_pool(
     Ok(options)
 }
 
-fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
+/// Reads an optional typed setting, reporting the raw value on parse failure.
+pub fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
     match env::var(name) {
         Ok(value) => value
             .parse()
@@ -139,6 +225,7 @@ fn setting<T: FromStr>(name: &str) -> io::Result<Option<T>> {
     }
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
+/// Builds an `InvalidInput` error for a rejected benchmark setting.
+pub fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::checksum::Crc32c;
+use crate::codec::crc32c_with_zeroed_u32;
+use crate::codec::put_u16;
+use crate::codec::put_u32;
+use crate::codec::put_u64;
 use crate::region::index::storage::CorruptPageReason;
 use crate::region::index::storage::IndexImageBinding;
 use crate::region::index::storage::IndexStorageError;
@@ -195,11 +198,8 @@ pub fn validate_page_header(
 }
 
 pub fn page_checksum(page: &[u8; INDEX_IMAGE_PAGE_SIZE]) -> u32 {
-    let mut checksum = Crc32c::new();
-    checksum.update(&page[..PAGE_CHECKSUM_OFFSET]);
-    checksum.update(&[0_u8; size_of::<u32>()]);
-    checksum.update(&page[PAGE_CHECKSUM_OFFSET + size_of::<u32>()..]);
-    checksum.finish()
+    crc32c_with_zeroed_u32(page, PAGE_CHECKSUM_OFFSET)
+        .expect("index page checksum field is in bounds")
 }
 
 fn read_u16(input: &[u8], offset: usize) -> u16 {
@@ -224,16 +224,4 @@ pub fn read_u64(input: &[u8], offset: usize) -> u64 {
             .try_into()
             .expect("fixed u64 field is in bounds"),
     )
-}
-
-fn put_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u64(output: &mut [u8], offset: usize, value: u64) {
-    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }

@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
-use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,15 +19,13 @@ use super::*;
 use crate::IoOutcome;
 use crate::IoRole;
 use crate::StatsOptions;
-use crate::io::backend::FileBackend;
+use crate::fixtures::TestFile;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
 use crate::stats::recording::Recorder;
-
-static FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn wait_for_registered_read_waiters(engine: &BackendIoEngine, expected: usize) {
     for _ in 0..100 {
@@ -70,39 +62,6 @@ async fn read_wait_error(waiter: tokio::task::JoinHandle<io::Result<ReadSlot>>) 
     match waiter.await.unwrap() {
         Ok(_) => panic!("read waiter unexpectedly reserved a slot"),
         Err(error) => error,
-    }
-}
-
-struct TestFile {
-    path: PathBuf,
-}
-
-impl TestFile {
-    fn new() -> Self {
-        let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            env::temp_dir().join(format!("cache2-io-engine-{}-{id}.bin", std::process::id()));
-        Self { path }
-    }
-
-    fn backend(&self) -> Arc<dyn IoBackend> {
-        Arc::new(FileBackend::open(&self.path).unwrap())
-    }
-
-    fn file(&self) -> File {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)
-            .unwrap()
-    }
-}
-
-impl Drop for TestFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -317,7 +276,7 @@ fn aligned_buffer_has_stable_alignment() {
 
 #[test]
 fn posix_engine_round_trips_owned_buffers_and_drains() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = BackendIoEngine::new(file.backend(), 4).unwrap();
     let managed_memory = managed_memory();
     let input = b"owned async positioned I/O";
@@ -382,8 +341,8 @@ fn posix_engine_reports_progress_before_a_terminal_short_io_error() {
 
 #[tokio::test]
 async fn async_request_is_woken_by_driver_completion() {
-    let file = TestFile::new();
-    file.file().set_len(4096).unwrap();
+    let file = TestFile::new("io-engine");
+    file.open().set_len(4096).unwrap();
     let engine: Arc<dyn IoEngine> = Arc::new(BackendIoEngine::new(file.backend(), 2).unwrap());
     let managed_memory = managed_memory();
     let request = submit_cache_io(
@@ -453,8 +412,8 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
 #[tokio::test]
 async fn reserved_read_latency_includes_time_before_submission() {
     for activity_counters_enabled in [false, true] {
-        let file = TestFile::new();
-        file.file().set_len(4096).unwrap();
+        let file = TestFile::new("io-engine");
+        file.open().set_len(4096).unwrap();
         let engine = BackendIoEngine::new_with_workers_and_activity_counters(
             file.backend(),
             1,
@@ -553,7 +512,7 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
 
 #[tokio::test]
 async fn read_slot_wait_is_woken_by_engine_shutdown() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
     let slot = engine.try_reserve_read().unwrap();
     let mut waiters = Vec::new();
@@ -576,7 +535,7 @@ async fn read_slot_wait_is_woken_by_engine_shutdown() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn queued_read_reservation_precedes_new_immediate_read() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
     let queued = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
@@ -595,7 +554,7 @@ async fn queued_read_reservation_precedes_new_immediate_read() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn queued_read_reservations_are_fifo() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
@@ -618,7 +577,7 @@ async fn queued_read_reservations_are_fifo() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn queued_reads_use_every_released_engine_slot() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 2).unwrap());
     let held: Vec<_> = (0..2).map(|_| engine.try_reserve_read().unwrap()).collect();
     let first = spawn_registered_read_slot_waiter(&engine, Duration::from_secs(1), 1).await;
@@ -637,7 +596,7 @@ async fn queued_reads_use_every_released_engine_slot() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn timed_out_queue_head_passes_priority_to_next_read() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
@@ -655,7 +614,7 @@ async fn timed_out_queue_head_passes_priority_to_next_read() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_queue_head_passes_priority_to_next_read() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = Arc::new(BackendIoEngine::new_with_read_wait(file.backend(), 1).unwrap());
     let held = engine.try_reserve_read().unwrap();
 
@@ -706,10 +665,10 @@ async fn async_read_deadline_keeps_other_slots_available() {
 #[cfg(unix)]
 #[test]
 fn posix_engine_routes_only_aligned_record_io_to_direct() {
-    let buffered = TestFile::new();
-    let direct = TestFile::new();
-    let buffered_file = buffered.file();
-    let direct_file = direct.file();
+    let buffered = TestFile::new("io-engine");
+    let direct = TestFile::new("io-engine");
+    let buffered_file = buffered.open();
+    let direct_file = direct.open();
     buffered_file.set_len(8192).unwrap();
     direct_file.set_len(8192).unwrap();
     let engine =
@@ -754,7 +713,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
 
 #[test]
 fn unfenced_write_state_remains_unsafe_after_shutdown() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
     assert!(!engine.has_unfenced_writes());
 
@@ -842,7 +801,7 @@ fn completion_deadline_keeps_an_issued_write_counted_until_target_completion() {
 
 #[test]
 fn engine_request_capacity_is_hard_bounded() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     assert!(matches!(
         BackendIoEngine::new(file.backend(), MAX_IO_REQUESTS_PER_ENGINE + 1),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
@@ -852,8 +811,8 @@ fn engine_request_capacity_is_hard_bounded() {
 #[cfg(unix)]
 #[test]
 fn configured_posix_engine_shares_its_worker_capacity() {
-    let file = TestFile::new();
-    let files = RuntimeFileSet::new(file.file(), None);
+    let file = TestFile::new("io-engine");
+    let files = RuntimeFileSet::new(file.open(), None);
     let engine =
         build_file_engine(files, IoEngineConfig::Posix { workers: 4 }, false, false).unwrap();
 
@@ -869,7 +828,7 @@ fn configured_posix_engine_shares_its_worker_capacity() {
 
 #[test]
 fn disabled_io_statistics_skip_cumulative_engine_counters() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine =
         BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
             .unwrap();
@@ -902,7 +861,7 @@ fn slot_state_tracks_full_write_capacity() {
 
 #[test]
 fn unused_read_reservation_releases_its_engine_slot() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
     let slot = engine.try_reserve_read().unwrap();
     assert_eq!(engine.in_flight(), 1);
@@ -918,7 +877,7 @@ fn unused_read_reservation_releases_its_engine_slot() {
 
 #[test]
 fn nowait_submission_does_not_wait_for_the_shutdown_fence() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine = BackendIoEngine::new(file.backend(), 1).unwrap();
     let managed_memory = managed_memory();
     let fence = engine
@@ -1142,7 +1101,7 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
 
 #[test]
 fn io_histograms_include_failures_when_activity_counters_are_disabled() {
-    let file = TestFile::new();
+    let file = TestFile::new("io-engine");
     let engine =
         BackendIoEngine::new_with_workers_and_activity_counters(file.backend(), 1, 1, false, false)
             .unwrap();

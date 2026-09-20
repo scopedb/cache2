@@ -20,8 +20,14 @@
 //! `CLEAN`. This module performs no I/O; callers must write the returned page
 //! to the selected slot and provide the required `fdatasync` barrier.
 
-use crate::checksum::Crc32c;
-use crate::checksum::crc32c;
+use crate::codec::crc32c_with_zeroed_u32;
+use crate::codec::crc32c_with_zeroed_u32_matches;
+use crate::codec::get_u16;
+use crate::codec::get_u32;
+use crate::codec::get_u64;
+use crate::codec::put_u16;
+use crate::codec::put_u32;
+use crate::codec::put_u64;
 use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
 use crate::region::index::packed::MAX_PACKED_REGION_SIZE;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
@@ -877,62 +883,14 @@ fn get_id(input: &[u8], offset: usize) -> Option<PersistentId> {
     PersistentId::from_bytes(input.get(offset..offset + 16)?.try_into().ok()?)
 }
 
-fn put_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(output: &mut [u8], offset: usize, value: u64) {
-    output[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        input
-            .get(offset..offset + size_of::<u16>())?
-            .try_into()
-            .ok()?,
-    ))
-}
-
-fn get_u32(input: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        input
-            .get(offset..offset + size_of::<u32>())?
-            .try_into()
-            .ok()?,
-    ))
-}
-
-fn get_u64(input: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        input
-            .get(offset..offset + size_of::<u64>())?
-            .try_into()
-            .ok()?,
-    ))
-}
-
 fn write_page_crc(page: &mut [u8; RECOVERY_PAGE_SIZE]) {
-    put_u32(page, PAGE_CRC_OFFSET, 0);
-    let checksum = crc32c(page);
+    let checksum = crc32c_with_zeroed_u32(page, PAGE_CRC_OFFSET)
+        .expect("recovery page CRC field is in bounds");
     put_u32(page, PAGE_CRC_OFFSET, checksum);
 }
 
 fn page_crc_matches(page: &[u8]) -> bool {
-    if page.len() != RECOVERY_PAGE_SIZE {
-        return false;
-    }
-    let Some(expected) = get_u32(page, PAGE_CRC_OFFSET) else {
-        return false;
-    };
-    let mut checksum = Crc32c::new();
-    checksum.update(&page[..PAGE_CRC_OFFSET]);
-    checksum.update(&[0; size_of::<u32>()]);
-    checksum.finish() == expected
+    page.len() == RECOVERY_PAGE_SIZE && crc32c_with_zeroed_u32_matches(page, PAGE_CRC_OFFSET)
 }
 
 #[cfg(test)]

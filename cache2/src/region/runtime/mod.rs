@@ -84,6 +84,7 @@ use crate::region::index::packed::PackedLocation;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 #[cfg(test)]
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::is_read_pressure;
 use crate::region::reader::PendingRead;
 #[cfg(test)]
 use crate::region::reader::ReadCandidate;
@@ -2157,17 +2158,6 @@ fn write_overload_error() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "write path is busy")
 }
 
-fn is_read_pressure(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::OutOfMemory
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::BrokenPipe
-    )
-}
-
 fn staging_runtime_error(error: StagingError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -2198,8 +2188,7 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::io::backend::FileBackend;
-    use crate::io::backend::IoBackend;
+    use crate::fixtures::TestFile;
     use crate::io::engine::BackendIoEngine;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2218,12 +2207,8 @@ mod tests {
 
     #[test]
     fn read_lane_uses_one_bounded_alternate_on_primary_pressure() {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
-            "cache2-read-lane-{}-{id}.cache",
-            std::process::id()
-        ));
-        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
+        let file = TestFile::new("read-lane");
+        let backend = file.backend();
         let engines: Box<[Arc<dyn IoEngine>]> = vec![
             Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
             Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap()) as Arc<dyn IoEngine>,
@@ -2255,17 +2240,12 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn hot_read_route_rotates_pressure_fallback_across_all_lanes() {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
-            "cache2-read-lane-rotation-{}-{id}.cache",
-            std::process::id()
-        ));
-        let backend: Arc<dyn IoBackend> = Arc::new(FileBackend::open(&path).unwrap());
+        let file = TestFile::new("read-lane-rotation");
+        let backend = file.backend();
         let engines: Box<[Arc<dyn IoEngine>]> = (0..4)
             .map(|_| {
                 Arc::new(BackendIoEngine::new(Arc::clone(&backend), 1).unwrap())
@@ -2289,7 +2269,6 @@ mod tests {
         }
         drop(engines);
         drop(backend);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

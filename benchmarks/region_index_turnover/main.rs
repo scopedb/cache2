@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::fmt;
 use std::io;
 
+use benchmarks::config::env_usize;
 use benchmarks::report::JobReport;
 use benchmarks::report::RunReporter;
 use cache2::benchmarking::RegionIndexTurnoverOptions;
@@ -128,18 +128,4 @@ fn report_phase(turn: usize, phase: &str, measurement: RegionIndexTurnoverPhase)
         measurement.stale_slots,
         measurement.checksum,
     );
-}
-
-fn env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| invalid(format!("{name} must be an unsigned integer"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(invalid(format!("cannot read {name}: {error}"))),
-    }
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

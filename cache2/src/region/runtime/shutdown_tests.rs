@@ -19,16 +19,13 @@ use std::sync::mpsc;
 use super::*;
 use crate::IoEngineOptions;
 use crate::io::backend::IoBackend;
+use crate::io::backend::RuntimeIoStats;
 use crate::io::backend::SyncMode;
 use crate::io::backend::SyncPoint;
 use crate::io::backend::WritePoint;
 use crate::io::engine::BackendIoEngine;
-use crate::io::engine::CompletionState;
-use crate::io::engine::EngineIoSnapshot;
 use crate::io::engine::IoRequest;
-use crate::io::engine::ReadSlotWaiter;
-use crate::io::engine::RequestId;
-use crate::io::engine::SubmitError;
+use crate::io::engine::RuntimeInner;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -104,52 +101,12 @@ struct RacingEngine {
 }
 
 impl IoEngine for RacingEngine {
-    fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
-        self.inner.set_latency_recorder(recorder);
-    }
-    fn try_reserve_read(&self) -> io::Result<ReadSlot> {
-        self.inner.try_reserve_read()
+    fn inner(&self) -> &Arc<RuntimeInner> {
+        self.inner.inner()
     }
 
-    fn read_slot_waiter(&self) -> ReadSlotWaiter {
-        self.inner.read_slot_waiter()
-    }
-
-    fn submit_reserved_read(
-        &self,
-        slot: ReadSlot,
-        op: IoOperation,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_reserved_read(slot, op)
-    }
-
-    fn submit(&self, op: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit(op)
-    }
-
-    fn submit_wait(&self, op: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_wait(op)
-    }
-
-    fn submit_wait_controlled(
-        &self,
-        op: IoOperation,
-        cancel: &AtomicBool,
-        deadline: Option<Instant>,
-    ) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_wait_controlled(op, cancel, deadline)
-    }
-
-    fn wake_slot_waiters(&self) {
-        self.inner.wake_slot_waiters();
-    }
-
-    fn cancel(&self, id: RequestId, state: &CompletionState) -> io::Result<bool> {
-        self.inner.cancel(id, state)
-    }
-
-    fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown()
+    fn runtime_io_stats(&self) -> RuntimeIoStats {
+        self.inner.runtime_io_stats()
     }
 
     fn in_flight(&self) -> usize {
@@ -170,30 +127,6 @@ impl IoEngine for RacingEngine {
             }
         }
         observed
-    }
-
-    fn direct_active(&self) -> bool {
-        false
-    }
-
-    fn stop_accepting_requests(&self) {
-        self.inner.stop_accepting_requests();
-    }
-
-    fn writes_in_flight(&self) -> usize {
-        self.inner.writes_in_flight()
-    }
-
-    fn has_unfenced_writes(&self) -> bool {
-        self.inner.has_unfenced_writes()
-    }
-
-    fn mark_unfenced_writes_for_test(&self) {
-        self.inner.mark_unfenced_writes_for_test();
-    }
-
-    fn stats(&self) -> EngineIoSnapshot {
-        self.inner.stats()
     }
 }
 
