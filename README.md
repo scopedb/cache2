@@ -83,7 +83,7 @@ See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for exam
 | Memory      | `managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                       |
 | I/O mode    | `io_mode`                                                                    | Buffered I/O.                                                                                 |
 | Metrics     | `stats: StatsOptions`                                                        | Health/resource gauges always available; activity, request, and latency collection opt in.    |
-| Fill control | `fill_control: FillControlOptions`                                          | Disabled. `Observe` reports pause pressure; `Adaptive` rejects new fills before timeout. |
+| Fill control | `fill_control: FillControlOptions`                                           | Disabled. `Observe` reports pause; `Adaptive` rejects new fills. Ceilings are cache-wide.     |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm open. Growth uses available Free Regions; when there are not enough, the disposable cache safely starts empty.
 
@@ -132,6 +132,12 @@ RUST_LOG=cache2=info cargo run --package examples --example logforth -- /tmp/cac
 
 `cache_opened` reports the index backing, mapping extent, validation mode, and whether warm mutations use copy-on-write. `cache_recovery_cold` records why a clean image was rejected or why private mapping fell back to a cold start. `cache_miss_only` records the first terminal index-validation or I/O failure.
 
+### Reclaim read deadline
+
+Set `RuntimeOptions::reclaim_io_timeout` to change the normal background reclaim deadline, for example `Duration::from_secs(30)` (default five seconds). Background write and reclaim timeouts enter `CacheHealth::Recovering`: new fills return overload while reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` defaults to `None`, allowing recovery until completion or close. Use `Some(Duration::from_secs(300))` to limit the additional wait, or `Some(Duration::ZERO)` for immediate cancellation. Original requests retain their resources and are never resubmitted; fills resume after validation and publication of all affected work. Close interrupts recovery; drain may wait indefinitely. Actual I/O errors and invalid completions still fail the cache.
+
+Optional [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) detects slow background progress before timeout. `Adaptive` pauses new fills immediately and paces non-essential flush with instance-wide byte and record ceilings. Start with `FillControlOptions::Observe` to inspect pause pressure and hypothetical rejections, then use `Adaptive` to enforce the same limits. It is disabled by default; reads, deletes, accepted writes, and essential reclaim retain their existing paths.
+
 ## Development
 
 C² requires Rust 1.98.0.
@@ -156,8 +162,3 @@ The root workspace keeps the publishable crate, integration tests, benchmarks, e
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
-### Reclaim read deadline
-
-Set `RuntimeOptions::reclaim_io_timeout` to change the normal background reclaim deadline, for example `Duration::from_secs(30)` (default five seconds). Background write and reclaim timeouts enter `CacheHealth::Recovering`: new fills return overload while reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` defaults to `None`, allowing recovery until completion or close. Use `Some(Duration::from_secs(300))` to limit the additional wait, or `Some(Duration::ZERO)` for immediate cancellation. Original requests retain their resources and are never resubmitted; fills resume after validation and publication of all affected work. Close interrupts recovery; drain may wait indefinitely. Actual I/O errors and invalid completions still fail the cache.
-
-Optional [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) detects slow background progress before timeout. `Adaptive` pauses new fills immediately and paces non-essential flush by encoded bytes and record count. Start with `FillControlOptions::Observe` to inspect pause pressure and hypothetical rejections, then use `Adaptive` to enforce. It is disabled by default; reads, deletes, accepted writes, and essential reclaim retain their existing paths.

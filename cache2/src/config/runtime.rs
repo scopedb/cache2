@@ -367,13 +367,17 @@ pub enum FillControlOptions {
 }
 
 /// Logical fill-rate ceilings shared by [`FillControlOptions::Observe`] and
-/// [`FillControlOptions::Adaptive`]. These are not device bandwidth or IOPS guarantees.
+/// [`FillControlOptions::Adaptive`]. They are instance-wide, not per worker,
+/// and are not device bandwidth or IOPS guarantees. Foreground `put` does not
+/// consume them; Adaptive uses them to pace non-essential background flush.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FillLimits {
     /// Maximum encoded fill bytes per second, from 640 through 1 TiB/s.
+    /// Instance-wide across all shard workers.
     pub max_bytes_per_second: u64,
-    /// Maximum fill records per second, from 10 through 655350.
+    /// Maximum fill records per second, from 10 through 4,294,967,295.
+    /// Instance-wide across all shard workers.
     pub max_records_per_second: u32,
 }
 
@@ -852,7 +856,7 @@ mod tests {
         let storage = StorageOptions::new(1024 * 1024 * 1024).build().unwrap();
         let base = CacheConfig::new(storage.clone(), RuntimeOptions::default()).unwrap();
         assert_eq!(base.runtime().fill_control, FillControlOptions::Disabled);
-        for (bytes, operations) in [(639, 100), ((1 << 40) + 1, 100), (640, 9), (640, 655_351)] {
+        for (bytes, operations) in [(639, 100), ((1 << 40) + 1, 100), (640, 9)] {
             let options = RuntimeOptions {
                 fill_control: FillControlOptions::Adaptive(FillLimits::new(bytes, operations)),
                 ..RuntimeOptions::default()
@@ -864,6 +868,14 @@ mod tests {
                 ErrorKind::InvalidInput
             );
         }
+        CacheConfig::new(
+            storage.clone(),
+            RuntimeOptions {
+                fill_control: FillControlOptions::Adaptive(FillLimits::new(640, u32::MAX)),
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
         let mut minimum = None;
         for mode in [FillControlOptions::Observe, FillControlOptions::Adaptive] {
             let config = CacheConfig::new(

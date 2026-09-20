@@ -63,6 +63,7 @@ use crate::io::engine::recovery::BackgroundRecovery;
 use crate::io::engine::submit_background_io;
 use crate::io::fill_control::FLUSH_RETRY;
 use crate::io::fill_control::FillController;
+use crate::io::fill_control::FlushCharge;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -1922,14 +1923,11 @@ fn shard_worker_result(
                     let essential = flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining;
                     let bytes = fill.bytes as u64;
                     let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
-                    let allow = shared
-                        .recovery
-                        .fill
-                        .as_ref()
-                        .is_none_or(|control| control.try_flush(bytes, records, essential));
-                    if !allow {
-                        deadline = Some(Instant::now() + FLUSH_RETRY);
-                    } else {
+                    let charge = match &shared.recovery.fill {
+                        None => Some(FlushCharge { ops: 0, units: 0 }),
+                        Some(control) => control.try_flush(bytes, records, essential),
+                    };
+                    if let Some(charge) = charge {
                         let engine = shared.write_engine_for(shard_id as u64);
                         match shared.core.flush_staging_shard(
                             &shared.staging,
@@ -1939,12 +1937,14 @@ fn shard_worker_result(
                         )? {
                             Some(_) => deadline = None,
                             None => {
-                                if !essential && let Some(control) = &shared.recovery.fill {
-                                    control.refund_flush(bytes, records);
+                                if let Some(control) = &shared.recovery.fill {
+                                    control.refund_flush(charge);
                                 }
                                 deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
                             }
                         }
+                    } else {
+                        deadline = Some(Instant::now() + FLUSH_RETRY);
                     }
                 }
             }
