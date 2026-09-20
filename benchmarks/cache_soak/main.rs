@@ -89,6 +89,7 @@ struct SoakConfig {
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
     io_engine: IoEngineOptions,
+    fill_control: cache2::FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -193,6 +194,7 @@ impl SoakConfig {
             require_path_coverage,
             require_reinsert_coverage,
             io_engine,
+            fill_control: benchmarks::config::fill_control_from_env("CACHE_SOAK")?,
             io_mode,
             l1_eviction_policy,
             directory,
@@ -209,6 +211,8 @@ impl SoakConfig {
     fn runtime_options(&self) -> RuntimeOptions {
         let mut options = RuntimeOptions::default();
         options.io_engine = self.io_engine;
+        options.fill_control = self.fill_control;
+        println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
         options.l1_capacity_bytes = self.l1_capacity_bytes;

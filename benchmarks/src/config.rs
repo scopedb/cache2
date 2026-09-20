@@ -59,6 +59,25 @@ pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
     }
 }
 
+/// Reads optional fill-control mode and its explicit logical rate ceilings.
+pub fn fill_control_from_env(prefix: &str) -> io::Result<cache2::FillControlOptions> {
+    let name = format!("{prefix}_FILL_CONTROL");
+    let mode = setting::<String>(&name)?.unwrap_or_else(|| "disabled".into());
+    if mode == "disabled" {
+        return Ok(cache2::FillControlOptions::Disabled);
+    }
+    let bytes = setting(&format!("{prefix}_FILL_BYTES_PER_SECOND"))?
+        .ok_or_else(|| invalid("enabled fill control requires FILL_BYTES_PER_SECOND"))?;
+    let operations = setting(&format!("{prefix}_FILL_OPERATIONS_PER_SECOND"))?
+        .ok_or_else(|| invalid("enabled fill control requires FILL_OPERATIONS_PER_SECOND"))?;
+    let options = cache2::FillLimits::new(bytes, operations);
+    match mode.as_str() {
+        "observe" => Ok(cache2::FillControlOptions::Observe(options)),
+        "adaptive" => Ok(cache2::FillControlOptions::Adaptive(options)),
+        _ => Err(invalid(format!("unsupported {name}: {mode}"))),
+    }
+}
+
 /// Maximum active reads across the selected backend's pool.
 pub fn read_max_in_flight(options: IoEngineOptions) -> usize {
     match options {

@@ -777,13 +777,38 @@ impl BoundedIoRequest {
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let original = self.deadline;
         loop {
-            self.request = match self.request.wait_until(self.deadline) {
-                Ok(completion) => return Ok(completion),
+            let cap = if Instant::now() < original {
+                recovery.wait_cap(original)
+            } else {
+                self.deadline
+            };
+            self.request = match self.request.wait_until(cap) {
+                Ok(completion) => {
+                    recovery.clear_slow();
+                    return Ok(completion);
+                }
                 Err(request) => request,
             };
+            if Instant::now() < original {
+                recovery.note_slow();
+                continue;
+            }
             match recovery.next_deadline(original) {
                 Some(deadline) => self.deadline = deadline,
-                None => return self.wait(engine),
+                None => {
+                    return match self.wait(engine) {
+                        Ok(completion) => {
+                            recovery.clear_slow();
+                            Ok(completion)
+                        }
+                        Err(exceeded) => {
+                            if exceeded.completion.is_some() {
+                                recovery.clear_slow();
+                            }
+                            Err(exceeded)
+                        }
+                    };
+                }
             }
         }
     }
@@ -958,10 +983,14 @@ pub fn submit_background_io(
     timeout: Duration,
     recovery: &mut RecoveryAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
+    let bytes = match &operation {
+        IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len() as u64,
+    };
+    recovery.start(bytes, timeout);
     let original = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
-    let mut deadline = original;
+    let mut deadline = recovery.wait_cap(original);
     loop {
         match submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE) {
             Ok(mut request) => {
@@ -969,6 +998,12 @@ pub fn submit_background_io(
                 return Ok(request);
             }
             Err(error) if error.error.kind() == io::ErrorKind::TimedOut => {
+                if Instant::now() < original {
+                    recovery.note_slow();
+                    deadline = original;
+                    operation = error.operation;
+                    continue;
+                }
                 let Some(next) = recovery.next_deadline(original) else {
                     return Err(error);
                 };

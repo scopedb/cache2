@@ -104,6 +104,7 @@ The managed-memory limit is not an RSS limit. Allocator metadata, Tokio, the app
 | Enable or lengthen read waiting  | Trades immediate misses for bounded wait            | Adds the configured wait capacity, can raise p99, and returns overload when queue, memory, or deadline is exhausted                         |
 | Increase write execution capacity | Adds write I/O concurrency                         | Adds queue pressure and device contention; POSIX also adds worker stacks and neither backend adds foreground staging space                 |
 | Increase reclaim concurrency     | Recycles more Regions concurrently                  | Adds one Region buffer and logical worker per request slot and can compete for device and append-staging capacity                          |
+| Enable Adaptive fill control    | Pauses new fills; paces flush                        | Ceilings are instance-wide; they do not change reads, deletes, or `CacheHealth` on pre-timeout pause                                        |
 | Increase L1 capacity            | Retains more reusable values                         | Reduces L2 demand but consumes retained bytes and fixed metadata from the same managed-memory limit                                         |
 | Increase L1 shards              | Reduces shard-local contention                       | Adds fixed metadata and controls; too many small shards reduce useful capacity efficiency                                                   |
 | Lower write flush threshold     | Requests earlier partial publication                 | Increases write operation count and reduces batching without increasing staging capacity                                                    |
@@ -379,6 +380,9 @@ Use `Cache::snapshot()` for regular telemetry and `Cache::detailed_snapshot()` f
 | `reinsert_budget_skipped` rises                                     | Hot live bytes exceed the fixed reclaim allowance | Treat retention as best effort; change capacity/workload geometry rather than worker count   |
 | High `l1_bypasses` with useful candidates                           | L1 contention, slots, or byte pressure            | Inspect L1 occupancy, retained bytes, shards, capacity, and oversized values                 |
 | Managed-memory peak approaches the limit                            | Fixed or transient memory pressure                | Rebalance index, L1, staging, I/O topology, and read headroom                                |
+| `fill_control.pressure` is `Paused` while `health` is `Running`     | Pre-timeout slow background I/O                   | Expected Adaptive load-shed; correlate with device queueing before treating it as a fault    |
+| Pause refusals with little device wait                              | Checkpoint fired without device saturation        | Confirm I/O timeouts and host scheduling; `FillLimits` do not drive pause                    |
+| `write_rejections` while fill pressure is `Healthy`                 | Staging or paced-flush pressure                   | Distinguish from pause; change ceilings only after measuring sustainable fill                |
 | Unexpected cold start after configuration change                    | Static identity or append-shard rebind failed     | Verify Region/index geometry and available Free Regions; cache loss is safe                  |
 
 Always correlate cache counters with device latency, physical IOPS, filesystem behavior, process RSS, and authoritative-backend load. Cache throughput alone can reward configurations that merely turn work into fast misses.
@@ -393,8 +397,9 @@ Always correlate cache counters with device latency, physical IOPS, filesystem b
 6. Tune read execution and wait semantics using hit rate, overload, and p99.
 7. Tune append shards, write execution, and flush threshold using acceptance, publication, and device counters.
 8. Increase reclaim concurrency only if one reclaimer cannot maintain Free Regions.
-9. Re-run after selecting Buffered versus Direct or POSIX versus io_uring; backend topology values are not interchangeable.
-10. Validate cold and warm opens, `drain`, overload behavior, managed-memory peak, and final value correctness before deployment.
+9. Enable fill control after write and reclaim topology is stable: `Observe` with chosen instance-wide ceilings, then `Adaptive` with the same values.
+10. Re-run after selecting Buffered versus Direct or POSIX versus io_uring; backend topology values are not interchangeable.
+11. Validate cold and warm opens, `drain`, overload behavior, managed-memory peak, and final value correctness before deployment.
 
 Change one resource family at a time and alternate baseline and candidate runs on the same host. Use multiple fresh-cache samples for turnover and burst tests. For storage qualification, use a dataset larger than host RAM and follow [Validation](BENCHMARK.md).
 
@@ -414,6 +419,8 @@ Change one resource family at a time and alternate baseline and candidate runs o
 | Maximum waiting reads    | 1 through 65,536 in `Wait`; defaults to the read execution capacity |
 | L1 shards                | 1 through 65,536                                                                                                                                           |
 | Write flush threshold    | 4 KiB multiple from 4 KiB through 4 MiB                                                                                                                    |
+| Fill bytes per second    | 640 through 1 TiB/s when fill control is enabled; instance-wide                                                                                            |
+| Fill records per second  | 10 through 4,294,967,295 when fill control is enabled; instance-wide                                                                                       |
 | Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed footprint                                                                               |
 
 Storage and configuration construction enforce these bounds before file access. Open checks the selected filesystem, device, and runtime environment.
@@ -425,3 +432,28 @@ Set `options.reclaim_io_timeout = Duration::from_secs(30)` after constructing `R
 ### Background I/O recovery
 
 `options.io_recovery_timeout = None` is the default: background admission/completion timeouts enter `CacheHealth::Recovering` and wait until the original operation completes or close interrupts recovery. Set `Some(Duration::from_secs(300))` for a five-minute additional budget, or `Some(Duration::ZERO)` for immediate cancellation. Finite combined deadlines must be representable. Recovery uses fixed one-second checks, without an exponential backoff or repeated submission of issued I/O. Admission retries are allowed only when the engine returns the unsubmitted operation. New `put` and `put_l2` calls return overload while any background operation is recovering; reads and deletes keep their normal behavior. Already accepted work retains its bounded resources. Fills resume only after every affected operation passes validation and publication. Drain can wait indefinitely in the default mode; close interrupts recovery within a polling interval, then applies bounded cancellation. Normal close work still has its ordinary deadlines. Actual I/O errors, invalid completions, and finite-budget exhaustion retain terminal failure safeguards. This is not an automatic reopen of a failed instance.
+
+### Adaptive fill admission
+
+`RuntimeOptions::fill_control` defaults to `FillControlOptions::Disabled`. `Observe` records pause pressure and hypothetical rejections while retaining ordinary admission and flush cadence. `Adaptive` rejects new `put` and `put_l2` fills with `ErrorKind::Overloaded` when paused, and paces non-essential background flush by the configured ceilings. Neither mode changes foreground reads, deletes, accepted flushes, essential reclaim, or the existing timeout recovery policy. Adaptive also suppresses optional hot-record reinsertion while paused. Pressure is separate from `CacheHealth`: a pre-timeout pause leaves a healthy cache `Running`.
+
+```rust
+use cache2::{FillControlOptions, FillLimits, RuntimeOptions};
+
+let mut options = RuntimeOptions::default();
+// Instance-wide mixed-write starting point; not a device sequential-write spec.
+let limits = FillLimits::new(256 * 1024 * 1024, 20_000);
+options.fill_control = FillControlOptions::Observe(limits);
+// After evaluating pressure and would_reject, enforce the same policy:
+options.fill_control = FillControlOptions::Adaptive(limits);
+```
+
+The two ceilings are instance-wide: every append shard shares one token bucket. They constrain logical encoded fill bytes (charged in 64-byte units) and fill records from the worker's staging snapshot, not device bandwidth or physical IOPS. `put` and `put_l2` do not consume the bucket; Adaptive rejects those calls only while paused. The sealed span may grow by later encodes before the lock. Valid ceilings are 640 bytes/s through 1 TiB/s and 10 through 4,294,967,295 records/s. Adaptive refill adds elapsed credit up to 100 ms of the configured ceilings and at least one maximum-size record; intervals too short to mint a unit or record do not move the refill clock. An idle controller never accumulates more than that bounded burst. A flush larger than that burst still proceeds on remaining credit, and a flush that cannot take a span refunds only what it consumed. Urgent, drain, and rotation flushes always proceed; other flushes wait for budget and back-pressure staging into ordinary write overload. Observe does not delay flush and counts `would_reject` only for pause.
+
+Background workers checkpoint outstanding I/O at one quarter of the normal deadline, capped at 500 ms, and pause new Adaptive fills without entering timeout recovery. Checkpoint pause follows live holder counts and lifts when that I/O completes, even if later validation or reclaim scanning is still running. Observe uses the same checkpoints so it can report `would_reject`. Estimated drain time is reported for snapshots from validated throughput since open and does not pause admission. These are conservative pressure signals: very short deadlines or a descheduled worker can still reach timeout first. Idle time alone never looks like a stall. Pause and the rate bucket are independent: a busy device is shed by checkpoint or timeout recovery, not by copying sequential-write specifications into `FillLimits`. Normal timeout recovery keeps its admission fence until all affected work is validated and published.
+
+Start with `Observe` and the same ceilings you plan to enforce. Inspect `CacheSnapshot::fill_control` (`pressure`, `would_reject`, `oldest_operation_ns`) together with device queueing, then switch to `Adaptive` without changing the numbers. The example `256 MiB/s` and `20_000` records/s is a conservative mixed-write starting point, not an NVMe datasheet copy. Both dimensions must hold: if typical encoded records are about 1 KiB, a 256 MiB/s byte ceiling needs on the order of 200_000–500_000 records/s or the record limit fires first. To pause ingest on stalls while leaving healthy flush uncapped, raise both ceilings until they no longer clip measured fill (for example 1–2 GiB/s with a matching record rate). To keep headroom for reads and reclaim on a shared NVMe, set the byte ceiling around one third to one half of measured sustainable cache write; four write workers and a 4 MiB flush threshold often land in the 256–512 MiB/s range. Do not use the legal minima (640 bytes/s, 10 records/s) as NVMe defaults. Buffered macOS results do not qualify Linux NVMe; use [Validation](BENCHMARK.md) on the target device.
+
+`CacheSnapshot::fill_control` reports pressure, enforcement, configured or paused rates, rejections, hypothetical pause refusals, dropped observations, outstanding bytes/operations, oldest age, and estimated drain time independently of `RuntimeOptions::stats`. Outstanding bytes exclude unflushed staging. A zero drain estimate means no estimate is available when work is pending. A full observation table skips that request rather than failing I/O. These measurements cannot distinguish device throttling from CPU scheduling, kernel queueing, or slow validation; correlate them with host metrics before diagnosing hardware. `cache_fill_pressure_changed` logs state transitions under `cache2::health`.
+
+Enabled modes preallocate one observation per append/reclaim worker, included in `CacheConfig::minimum_memory_bytes()`. Background observations use atomics over this bounded table. Foreground fill admission loads pause-holder and recovery counters without allocation, clocks, or locks from the controller. Reinsertion suppression reads atomics. Close stops admission independently of outstanding I/O. Disabled mode creates no controller or observations.
