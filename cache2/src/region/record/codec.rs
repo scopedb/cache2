@@ -272,8 +272,8 @@ mod tests {
         let actual = [hash_key(seed, b""), hash_key(seed, b"cache2\0key")];
         assert_eq!(actual, [0x4e79_f242_1392_7a65, 0xd168_c107_36e1_695c,]);
 
-        // Digests from twox-hash 2.1.4 pin the persisted hash contract across
-        // XXH3 input-size boundaries and the maximum supported key length.
+        // Fixed digests pin the persisted hash contract across XXH3 input-size
+        // boundaries and the maximum supported key length.
         let key = (0..4096)
             .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
             .collect::<Vec<_>>();

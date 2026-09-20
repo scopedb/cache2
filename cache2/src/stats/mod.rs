@@ -44,7 +44,7 @@ pub enum LatencyMode {
 ///
 /// Defaults allocate no counter or histogram stripes. Enable `request_counters` for complete
 /// terminal accounting even when durations are sampled. All enabled storage is
-/// included in the managed-memory plan. Configuration cannot change while open.
+/// included in the managed memory limit. Configuration cannot change while open.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatsOptions {

@@ -251,20 +251,6 @@ impl RuntimeFileSet {
         self.stats.set_activity_counters_enabled(enabled);
     }
 
-    #[cfg_attr(
-        not(all(
-            feature = "io-uring",
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            )
-        )),
-        allow(dead_code)
-    )]
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             buffered: self.buffered.try_clone()?,
@@ -365,7 +351,6 @@ pub trait IoBackend: Send + Sync {
 /// durability barriers, then clones this exact validated descriptor for an
 /// immutable private mapping. File identity is intentionally descriptor-based
 /// so callers never need to reopen a path between validation and `mmap`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub trait ControlIoBackend: IoBackend {
     fn try_clone_control_file(&self) -> io::Result<File>;
 
@@ -381,7 +366,6 @@ pub trait ControlIoBackend: IoBackend {
 /// The fields remain opaque: recovery code only needs equality to reject
 /// aliased data, state, and image descriptors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ControlFileIdentity {
     device: u64,
     inode: u64,
@@ -410,7 +394,6 @@ impl FileBackend {
 
     /// Atomically creates a new buffered control file without following a
     /// symbolic link or opening an existing recovery-image target.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn create_new_buffered(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)

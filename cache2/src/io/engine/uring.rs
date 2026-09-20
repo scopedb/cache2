@@ -270,8 +270,8 @@ impl IoEngine for UringIoEngine {
     }
 
     #[cfg(test)]
-    fn submit_nowait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_nowait(operation)
+    fn submit(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner.submit(operation)
     }
 
     #[cfg(test)]

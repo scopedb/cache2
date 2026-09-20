@@ -24,6 +24,7 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -40,8 +41,7 @@ use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 
-const _READ_ALIGNMENT: usize = 4096;
-const _MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * _READ_ALIGNMENT;
+const MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * DIRECT_IO_ALIGNMENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadCandidate {
@@ -257,7 +257,7 @@ pub fn describe_read(
             )
         })?;
 
-    let alignment = _READ_ALIGNMENT as u64;
+    let alignment = DIRECT_IO_ALIGNMENT as u64;
     let (absolute, io_end) = if align_for_direct_io {
         (
             record_absolute / alignment * alignment,
@@ -271,7 +271,9 @@ pub fn describe_read(
     let read_len = io_end
         .checked_sub(absolute)
         .and_then(|length| usize::try_from(length).ok())
-        .filter(|length| *length != 0 && (!align_for_direct_io || *length % _READ_ALIGNMENT == 0))
+        .filter(|length| {
+            *length != 0 && (!align_for_direct_io || *length % DIRECT_IO_ALIGNMENT == 0)
+        })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Region record read"))?;
     let record_start = record_absolute
         .checked_sub(absolute)
@@ -289,7 +291,7 @@ pub fn describe_read(
     })?;
     if record_range.end > read_len
         || (align_for_direct_io
-            && (!absolute.is_multiple_of(alignment) || overhead >= _MAX_READ_ALIGNMENT_OVERHEAD))
+            && (!absolute.is_multiple_of(alignment) || overhead >= MAX_READ_ALIGNMENT_OVERHEAD))
         || io_end > geometry.data_file_len
     {
         return Err(io::Error::new(
@@ -397,7 +399,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
-            memory_limit_bytes: _READ_ALIGNMENT,
+            memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
         .unwrap();
@@ -410,7 +412,7 @@ mod tests {
             &engine,
             slot,
             descriptor,
-            managed_memory.try_read_buffer(_READ_ALIGNMENT).unwrap(),
+            managed_memory.try_read_buffer(DIRECT_IO_ALIGNMENT).unwrap(),
         )
         .unwrap()
         .wait(&engine);
@@ -439,7 +441,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let engine = BackendIoEngine::new(backend.clone(), 1).unwrap();
         let managed_memory = ManagedMemory::try_new(ManagedMemoryLimits {
-            memory_limit_bytes: _READ_ALIGNMENT,
+            memory_limit_bytes: DIRECT_IO_ALIGNMENT,
             reserved_memory_bytes: 0,
         })
         .unwrap();

@@ -103,7 +103,7 @@ fn validated_index_image_layout(slot_count: usize) -> Result<ImageLayout, IndexS
     ImageLayout::new(slot_count)
 }
 
-/// One canonical, page-aligned partition of Index Image .
+/// One canonical, page-aligned partition of the index image.
 ///
 /// Ordinals are global to the complete image. Every physical 4 KiB page is
 /// owned by exactly one range, so a partition lock also owns every slot byte and
@@ -209,7 +209,7 @@ fn final_partition_slots(
         .ok_or(IndexStorageError::SizeOverflow)
 }
 
-/// Logical fields in one Index Image bucket.
+/// Logical fields in one index image bucket.
 ///
 /// This type is intentionally not `repr(C)` and is never copied directly to
 /// or from an image. Its stable representation is exactly 8 bytes encoded by
@@ -240,7 +240,7 @@ const SLOT_DISPLACEMENT_MASK: u64 = (1_u64 << SLOT_DISPLACEMENT_BITS) - 1;
 
 const _: () = assert!(SLOT_DISPLACEMENT_SHIFT + SLOT_DISPLACEMENT_BITS == u64::BITS);
 
-/// Typed runtime meaning of one canonical Index Image bucket.
+/// Typed runtime meaning of one canonical index image bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexSlotState {
     Empty,
@@ -420,7 +420,7 @@ pub enum PageValidationState {
     Rejected,
 }
 
-/// Why a recovered Index Image page was rejected.
+/// Why a recovered index image page was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorruptPageReason {
     InvalidMagic,
@@ -630,7 +630,7 @@ impl IndexStorage {
         })
     }
 
-    /// Maps an Index Image range writable and private.
+    /// Maps an index image range writable and private.
     ///
     /// Opening checks only range bounds and establishes the mapping. It does
     /// not scan page headers, slots, or CRCs. `file_offset` must be 4 KiB image
@@ -777,7 +777,7 @@ impl IndexStorage {
         Ok(())
     }
 
-    /// Sequentially emits a new, fully checksummed Index Image .
+    /// Sequentially emits a new, fully checksummed index image.
     ///
     /// Encoding uses one 4 KiB stack page and one lazily allocated, fixed
     /// 1 MiB write batch regardless of index size. The destination should be
@@ -1059,7 +1059,7 @@ impl IndexStorageCore {
             unsafe { slice::from_raw_parts(self.data_ptr().add(offset), INDEX_IMAGE_PAGE_SIZE) };
         let page: &[u8; INDEX_IMAGE_PAGE_SIZE] = page
             .try_into()
-            .expect("fixed mapped page has the Index Image page size");
+            .expect("fixed mapped page has the index image page size");
         let expected_first_slot = page_index
             .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
             .ok_or(IndexStorageError::SizeOverflow)?;

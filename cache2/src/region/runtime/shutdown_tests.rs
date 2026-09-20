@@ -123,8 +123,8 @@ impl IoEngine for RacingEngine {
         self.inner.submit_reserved_read(slot, op)
     }
 
-    fn submit_nowait(&self, op: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.inner.submit_nowait(op)
+    fn submit(&self, op: IoOperation) -> Result<IoRequest, SubmitError> {
+        self.inner.submit(op)
     }
 
     fn submit_wait(&self, op: IoOperation) -> Result<IoRequest, SubmitError> {

@@ -577,7 +577,7 @@ impl FileRegionCore {
     }
 
     /// Begins one physical read with a single bounded index lookup.
-    fn begin_point_read(&self, hash: u64) -> Option<ReadCandidate> {
+    pub fn begin_point_read(&self, hash: u64) -> Option<ReadCandidate> {
         if !self.health.is_healthy() {
             return None;
         }
@@ -605,12 +605,6 @@ impl FileRegionCore {
         })
     }
 
-    /// Begins one durable value read. The owned read buffer becomes the value
-    /// owner on a hit, avoiding a second payload copy.
-    pub fn begin_value_read(&self, hash: u64) -> Option<ReadCandidate> {
-        self.begin_point_read(hash)
-    }
-
     #[cfg(test)]
     fn read_value(
         &self,
@@ -621,7 +615,7 @@ impl FileRegionCore {
         key: &[u8],
     ) -> io::Result<Option<RegionValueRead>> {
         let hash = hash_key(hash_seed, key);
-        let Some(candidate) = self.begin_value_read(hash) else {
+        let Some(candidate) = self.begin_point_read(hash) else {
             return Ok(None);
         };
         let descriptor = describe_read(geometry, hash, candidate, true)?;
@@ -972,7 +966,7 @@ impl FileRegionCore {
             })
         };
 
-        // An already aligned span is sealed under this first manager guard. A
+        // An already aligned span is sealed under this manager guard. A
         // non-zero tail receipt remains a shard fence while staging extends its
         // last record outside the manager lock.
         let (padding, sealed) = {

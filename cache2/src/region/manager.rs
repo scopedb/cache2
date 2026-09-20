@@ -646,7 +646,7 @@ impl RegionManager {
 
     /// Seals the shard's accumulated resident records into one ordered device
     /// span. A second span may be built concurrently in resident staging, but
-    /// only one submitted span per shard is admitted in this first kernel.
+    /// only one submitted span per shard is admitted at a time.
     pub fn seal_write_span(
         &mut self,
         shard_id: usize,
