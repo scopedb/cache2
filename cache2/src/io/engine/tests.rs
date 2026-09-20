@@ -1329,3 +1329,71 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
     });
     engine.shutdown().unwrap();
 }
+
+#[test]
+fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_completes() {
+    use crate::FillControlOptions;
+    use crate::FillLimits;
+    use crate::FillPressure;
+    use crate::io::fill_control::FillController;
+    for enforcing in [false, true] {
+        let settings = FillLimits::new(1024 * 1024, 1000);
+        let mode = if enforcing {
+            FillControlOptions::Adaptive(settings)
+        } else {
+            FillControlOptions::Observe(settings)
+        };
+        let control = FillController::new(mode, 1, 4096).unwrap().unwrap();
+        let io_recovery = IoRecovery::with_fill(None, Some(Arc::clone(&control)));
+        let io = Arc::new(BlockingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
+        let memory = managed_memory();
+        std::thread::scope(|scope| {
+            let (returned_tx, returned_rx) = mpsc::channel();
+            let (validate_tx, validate_rx) = mpsc::channel();
+            let io_recovery = &io_recovery;
+            let engine = &engine;
+            let memory = &memory;
+            scope.spawn(move || {
+                let mut attempt = io_recovery.attempt();
+                let request = submit_background_io(
+                    engine,
+                    IoOperation::write(WritePoint::Record, write_buffer(memory, &[5; 4096]), 0),
+                    Duration::from_secs(4),
+                    &mut attempt,
+                )
+                .unwrap();
+                let completion = request.wait_with_io_recovery(engine, &mut attempt).unwrap();
+                returned_tx.send(completion).unwrap();
+                validate_rx.recv().unwrap();
+                attempt.finish();
+            });
+            assert!(io.wait_for_entered(1));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while control.snapshot().pressure != FillPressure::Paused && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let paused = control.snapshot();
+            let recovered = io_recovery.is_recovering();
+            let admission = control.try_admit();
+            io.release();
+            let completion = returned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(paused.pressure, FillPressure::Paused);
+            assert!(!recovered, "must react before the normal I/O timeout");
+            assert_eq!(admission, !enforcing);
+            assert_eq!(paused.outstanding_bytes, 4096);
+            assert!(completion.into_io_result().0.is_ok());
+            assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
+            assert!(control.try_admit());
+            validate_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.snapshot().pressure == FillPressure::Paused && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
+        assert!(control.try_admit());
+        assert_eq!(lock_unpoisoned(&io.state).entered, 1);
+        engine.shutdown().unwrap();
+    }
+}

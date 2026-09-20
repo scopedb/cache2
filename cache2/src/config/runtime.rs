@@ -353,6 +353,44 @@ pub enum ReadAdmission {
     },
 }
 
+/// Optional pre-timeout pressure observation and fill admission control.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FillControlOptions {
+    /// No controller, timer, or additional request accounting.
+    #[default]
+    Disabled,
+    /// Report pressure and hypothetical rejections without changing admission.
+    Observe(FillLimits),
+    /// Reject new fills under pressure. Accepted writes and essential reclaim continue.
+    Adaptive(FillLimits),
+}
+
+/// Logical fill-rate ceilings shared by [`FillControlOptions::Observe`] and
+/// [`FillControlOptions::Adaptive`]. They are instance-wide, not per worker,
+/// and are not device bandwidth or IOPS guarantees. Foreground `put` does not
+/// consume them; Adaptive uses them to pace non-essential background flush.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FillLimits {
+    /// Maximum encoded fill bytes per second, from 640 through 1 TiB/s.
+    /// Instance-wide across all shard workers.
+    pub max_bytes_per_second: u64,
+    /// Maximum fill records per second, from 10 through 4,294,967,295.
+    /// Instance-wide across all shard workers.
+    pub max_records_per_second: u32,
+}
+
+impl FillLimits {
+    /// Creates unchecked rate ceilings. [`CacheConfig::new`] validates them.
+    pub const fn new(max_bytes_per_second: u64, max_records_per_second: u32) -> Self {
+        Self {
+            max_bytes_per_second,
+            max_records_per_second,
+        }
+    }
+}
+
 /// Process-local resource choices, checked together by [`CacheConfig::new`].
 ///
 /// These values may change across opens. Warm recovery rebinds append shards
@@ -387,6 +425,10 @@ pub struct RuntimeOptions {
     /// can wait indefinitely with `None`. Actual I/O errors and invalid
     /// completions still fail the instance.
     pub io_recovery_timeout: Option<Duration>,
+    /// Optional pre-timeout fill pressure control. Disabled by default.
+    /// Enabled modes reserve bounded worker observations; Adaptive paces
+    /// background flush and pauses new fills when outstanding work is old.
+    pub fill_control: FillControlOptions,
     /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
     /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
     /// spare Region.
@@ -421,6 +463,7 @@ impl Default for RuntimeOptions {
             read_admission: ReadAdmission::Immediate,
             reclaim_io_timeout: Duration::from_secs(5),
             io_recovery_timeout: None,
+            fill_control: FillControlOptions::Disabled,
             append_shards: DEFAULT_APPEND_SHARDS,
             l1_capacity_bytes: DEFAULT_L1_CAPACITY_BYTES,
             l1_eviction_policy: L1EvictionPolicy::Clock,
@@ -496,6 +539,11 @@ impl CacheConfig {
             let index_slots = storage.index_slots;
             runtime.resolve()?;
             let stats_bytes = Recorder::allocation_bytes(runtime.stats)?;
+            let fill_bytes = crate::io::fill_control::FillController::allocation_bytes(
+                runtime.fill_control,
+                runtime.append_shards as usize
+                    + IoPoolTopology::reclaim(runtime.io_engine).max_in_flight(),
+            )?;
             if geometry.region_count <= runtime.append_shards {
                 return Err(invalid_config(
                     "append shards require valid geometry with one Active Region each plus one spare Region",
@@ -511,6 +559,7 @@ impl CacheConfig {
             let fixed_bytes = runtime_fixed_memory_bytes(index_slots, geometry.region_count)?
                 .checked_add(l1_metadata_bytes)
                 .and_then(|bytes| bytes.checked_add(stats_bytes))
+                .and_then(|bytes| bytes.checked_add(fill_bytes))
                 .ok_or_else(|| invalid_config("fixed memory requirements overflow"))?;
             let (reserved_memory_bytes, minimum_memory_bytes) =
                 runtime.memory_requirements(geometry, fixed_bytes)?;
@@ -801,6 +850,51 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::StorageOptions;
+
+    #[test]
+    fn fill_control_validates_ceilings_and_accounts_observation_memory() {
+        let storage = StorageOptions::new(1024 * 1024 * 1024).build().unwrap();
+        let base = CacheConfig::new(storage.clone(), RuntimeOptions::default()).unwrap();
+        assert_eq!(base.runtime().fill_control, FillControlOptions::Disabled);
+        for (bytes, operations) in [(639, 100), ((1 << 40) + 1, 100), (640, 9)] {
+            let options = RuntimeOptions {
+                fill_control: FillControlOptions::Adaptive(FillLimits::new(bytes, operations)),
+                ..RuntimeOptions::default()
+            };
+            assert_eq!(
+                CacheConfig::new(storage.clone(), options)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+        CacheConfig::new(
+            storage.clone(),
+            RuntimeOptions {
+                fill_control: FillControlOptions::Adaptive(FillLimits::new(640, u32::MAX)),
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+        let mut minimum = None;
+        for mode in [FillControlOptions::Observe, FillControlOptions::Adaptive] {
+            let config = CacheConfig::new(
+                storage.clone(),
+                RuntimeOptions {
+                    fill_control: mode(FillLimits::new(64_000, 100)),
+                    ..RuntimeOptions::default()
+                },
+            )
+            .unwrap();
+            let extra = config.minimum_memory_bytes() - base.minimum_memory_bytes();
+            assert!(extra > 0);
+            assert!(extra < CACHE_THREAD_STACK_BYTES);
+            if let Some(previous) = minimum {
+                assert_eq!(extra, previous);
+            }
+            minimum = Some(extra);
+        }
+    }
 
     #[test]
     fn recovery_timeout_allows_zero_and_rejects_overflow() {

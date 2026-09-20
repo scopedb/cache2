@@ -39,9 +39,50 @@ pub enum CacheHealth {
     Failed,
 }
 
-/// Lock-free point-in-time operational counters and cache-owned resource
-/// accounting. Counters are process-local and reset on every open. Concurrent
-/// updates may appear across fields at slightly different instants.
+/// Admission pressure, independent of terminal cache health.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FillPressure {
+    /// Pressure observation is disabled.
+    #[default]
+    Disabled,
+    /// Configured rate ceilings apply.
+    Healthy,
+    /// New fills are paused while outstanding work is old or stalled.
+    Paused,
+}
+
+/// Always available when fill control is enabled, independent of statistics.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FillControlSnapshot {
+    /// Current measured pressure; Observe mode does not enforce it.
+    pub pressure: FillPressure,
+    /// Whether the controller enforces its admission decisions.
+    pub enforcing: bool,
+    /// Configured encoded-byte ceiling when healthy; zero while paused.
+    pub bytes_per_second: u64,
+    /// Configured fill-record ceiling when healthy; zero while paused.
+    pub records_per_second: u32,
+    /// Fills rejected by Adaptive while paused.
+    pub rejections: u64,
+    /// Observe-mode pause refusals.
+    pub would_reject: u64,
+    /// Background observations skipped because the table was full.
+    pub dropped_observations: u64,
+    /// Background operations awaiting completion or validation.
+    pub outstanding_operations: u64,
+    /// Bytes held by those background operations; excludes unflushed staging.
+    pub outstanding_bytes: u64,
+    /// Age of the oldest background operation.
+    pub oldest_operation_ns: u64,
+    /// Estimated drain time using validated background throughput since open.
+    pub estimated_drain_ns: u64,
+}
+
+/// Point-in-time operational counters and cache-owned resource accounting.
+/// Sampling uses atomics. Counters are process-local and reset on every open.
+/// Concurrent updates may appear across fields at slightly different instants.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {
@@ -51,6 +92,8 @@ pub struct CacheSnapshot {
     pub metrics_epoch: u64,
     /// Current cache availability.
     pub health: CacheHealth,
+    /// Pre-timeout fill pressure and controller accounting.
+    pub fill_control: FillControlSnapshot,
     /// Whether optional cumulative activity and I/O counters are enabled.
     pub activity_counters_enabled: bool,
     /// Accepted `put` and `put_l2` operations.
@@ -245,7 +288,7 @@ pub struct RegionSnapshot {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {
-    /// Lock-free summary sampled for this diagnostic.
+    /// Operational summary sampled for this diagnostic.
     pub summary: CacheSnapshot,
     /// Mutations rejected specifically because an append buffer needed progress.
     pub write_buffer_rejections: u64,

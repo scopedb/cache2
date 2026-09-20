@@ -59,6 +59,9 @@ use crate::io::engine::ReadSlotWaiter;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DataFileHandles;
+use crate::io::fill_control::FLUSH_RETRY;
+use crate::io::fill_control::FillController;
+use crate::io::fill_control::FlushCharge;
 use crate::io::recovery::IoRecovery;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
@@ -844,6 +847,14 @@ impl CacheRuntime {
                 return Err(write_overload_error());
             }
         };
+        if let Some(fill) = &state.io_recovery.fill
+            && !fill.try_admit()
+        {
+            if state.activity_counters {
+                state.metrics.record_write_rejection();
+            }
+            return Err(write_overload_error());
+        }
         let staged = self.regions.try_stage_value(
             &state.staging,
             shard_id,
@@ -1288,6 +1299,9 @@ impl CacheRuntime {
         {
             snapshot.health = crate::snapshot::CacheHealth::Recovering;
         }
+        if let Some(fill) = &state.io_recovery.fill {
+            snapshot.fill_control = fill.snapshot();
+        }
         snapshot.io = aggregate_io_stats(
             &state.read_engines,
             &state.write_engines,
@@ -1495,6 +1509,11 @@ fn start_workers(
             io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
         })?;
     append_controls.resize_with(shard_count, || Arc::new(AppendWorkerControl::new()));
+    let fill = FillController::new(
+        options.fill_control,
+        shard_count + reclaim_worker_count,
+        data.geometry.region_size,
+    )?;
     let state = Arc::new(RuntimeState {
         regions,
         read_engines,
@@ -1504,7 +1523,7 @@ fn start_workers(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: options.reclaim_io_timeout,
-        io_recovery: IoRecovery::new(options.io_recovery_timeout),
+        io_recovery: IoRecovery::with_fill(options.io_recovery_timeout, fill),
         managed_memory,
         metrics,
         memory,
@@ -1814,7 +1833,12 @@ fn reclaim_worker_result(
             // Keep one completion boundary per source Region while each
             // reclaimer rotates through a disjoint subset of append shards.
             let reinsert_shard = reinsert_shards.take();
-            let preserve_hot = state.regions.reclaim_can_reinsert()?;
+            let preserve_hot = state.regions.reclaim_can_reinsert()?
+                && !state
+                    .io_recovery
+                    .fill
+                    .as_ref()
+                    .is_some_and(|fill| fill.suppress_reinsertion());
             let reinsert_operation = if preserve_hot {
                 state.operations.try_enter()
             } else {
@@ -1894,14 +1918,32 @@ fn append_worker_result(
                     )?);
                 }
                 if force_flush || fill.bytes >= state.write_flush_threshold_bytes {
-                    let engine = state.write_engine_for(shard_id as u64);
-                    state.regions.flush_staging_shard(
-                        &state.staging,
-                        engine.as_ref(),
-                        shard_id,
-                        &state.io_recovery,
-                    )?;
-                    deadline = None;
+                    let essential = flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining;
+                    let bytes = fill.bytes as u64;
+                    let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
+                    let charge = match &state.io_recovery.fill {
+                        None => Some(FlushCharge { ops: 0, units: 0 }),
+                        Some(control) => control.try_flush(bytes, records, essential),
+                    };
+                    if let Some(charge) = charge {
+                        let engine = state.write_engine_for(shard_id as u64);
+                        match state.regions.flush_staging_shard(
+                            &state.staging,
+                            engine.as_ref(),
+                            shard_id,
+                            &state.io_recovery,
+                        )? {
+                            Some(_) => deadline = None,
+                            None => {
+                                if let Some(control) = &state.io_recovery.fill {
+                                    control.refund_flush(charge);
+                                }
+                                deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
+                            }
+                        }
+                    } else {
+                        deadline = Some(Instant::now() + FLUSH_RETRY);
+                    }
                 }
             }
             Ok(None) => {

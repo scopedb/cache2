@@ -240,3 +240,74 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
     session.close_fast().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
+    use crate::cache::session::CacheSession;
+    use crate::region::persistence::RegionPaths;
+    use crate::region::recovery::PersistentId;
+    use crate::snapshot::CacheHealth;
+    let root = env::temp_dir().join(format!("cache2-fill-admission-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
+    let data = DataSuperblock {
+        generation: 1,
+        cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
+        data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
+        geometry: DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(4096, 4).unwrap(),
+            region_size: 4096,
+            region_count: 4,
+        },
+        hash_seed: 3,
+        storage_fingerprint: 4,
+    };
+    let config = RuntimeOptions {
+        fill_control: crate::FillControlOptions::Adaptive(crate::FillLimits::new(1_048_576, 1000)),
+        append_shards: 1,
+        l1_capacity_bytes: 0,
+        ..RuntimeOptions::default()
+    };
+    let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+    let runtime = session.runtime().unwrap().clone();
+    runtime.put(b"existing", b"value").unwrap();
+    runtime.drain().unwrap();
+    let fill = runtime.state.io_recovery.fill.as_ref().unwrap();
+    fill.set_recovering(true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fill.snapshot().pressure != crate::FillPressure::Paused {
+        assert!(Instant::now() < deadline, "controller did not pause fills");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let snapshot = runtime.snapshot().unwrap();
+    assert_eq!(snapshot.health, CacheHealth::Running);
+    assert_eq!(snapshot.fill_control.pressure, crate::FillPressure::Paused);
+    assert_eq!(
+        runtime.put(b"new", b"value").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        runtime.put_l2(b"new", b"value").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(runtime.get(b"existing").unwrap().unwrap().value(), b"value");
+    runtime.delete(b"existing").unwrap();
+    assert!(runtime.get(b"existing").unwrap().is_none());
+    assert!(runtime.put(b"new", b"value").is_err());
+    fill.set_recovering(false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match runtime.put(b"new", b"value") {
+            Ok(_) => break,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(Instant::now() < deadline, "fills did not resume");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    runtime.drain().unwrap();
+    assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");
+    session.close_fast().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
