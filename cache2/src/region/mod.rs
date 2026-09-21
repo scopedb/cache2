@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use self::appender::submit_span;
+use self::appender::submit_write;
 use self::index::ReclaimIndexAction;
 use self::index::RegionIndex;
 use self::index::heat_memory_bytes;
@@ -38,7 +38,7 @@ use self::manager::RegionReclaimReceipt;
 use self::reader::PendingRead;
 use self::reader::ReadCandidate;
 use self::reader::ReadCompletion;
-use self::reader::ReadDescriptor;
+use self::reader::ReadDesc;
 #[cfg(test)]
 use self::reader::describe_read;
 use self::reader::submit_read;
@@ -54,15 +54,19 @@ use self::staging::StagingEncodeError;
 use self::staging::StagingError;
 use crate::checksum::crc32c;
 use crate::hashing::route_hash;
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
+use crate::io::background::BackgroundIoAttempt;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
-use crate::region::appender::RegionSpanCompletion;
+use crate::region::appender::WriteCompletion;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::IndexPartitionRange;
+use crate::region::index::storage::IndexPhysicalStats;
+use crate::region::index::storage::PartitionedIndexStorage;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::record::codec::RecordEncodeError;
@@ -72,25 +76,25 @@ use crate::region::record::codec::encode_value_into_hashed;
 #[cfg(test)]
 use crate::region::record::codec::hash_key;
 use crate::region::recovery::DataGeometry;
+use crate::region::recovery::metadata::PartitionMetadataRecord;
 use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
 use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
-use crate::region::staging::RegionStaging;
+use crate::region::staging::AppendStaging;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
-pub mod file_backend;
 pub mod index;
 pub mod manager;
+pub mod persistence;
 pub mod record;
 pub mod recovery;
-pub mod runtime;
 pub mod staging;
-pub mod store;
 
-mod appender;
-mod reader;
+pub mod appender;
+pub mod reader;
 
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;
@@ -151,7 +155,7 @@ impl RegionHealthLatch {
         self.is_healthy().then_some(()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore is miss-only and cannot publish CLEAN",
+                "Region store is miss-only and cannot publish CLEAN",
             )
         })
     }
@@ -160,32 +164,32 @@ impl RegionHealthLatch {
 /// The steady-state owner of Region allocation, FIFO rotation, and write-span
 /// accounting. Index publication is deliberately independent; reads validate
 /// the physical record locally and may observe an older valid completion.
-struct RegionManagerAuthority {
-    inner: Mutex<RegionManager>,
+struct RegionManagerLock {
+    state: Mutex<RegionManager>,
     health: RegionHealthLatch,
 }
 
-impl RegionManagerAuthority {
+impl RegionManagerLock {
     fn new(manager: RegionManager, health: RegionHealthLatch) -> Self {
         Self {
-            inner: Mutex::new(manager),
+            state: Mutex::new(manager),
             health,
         }
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, RegionManager>> {
         self.health.require_healthy()?;
-        match self.inner.lock() {
+        match self.state.lock() {
             Ok(guard) if self.health.is_healthy() => Ok(guard),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore became miss-only while acquiring Region authority",
+                "Region store became miss-only while acquiring Region authority",
             )),
             Err(_) => {
                 self.health.enter_miss_only();
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "RegionStore Region authority is poisoned",
+                    "Region manager is poisoned",
                 ))
             }
         }
@@ -193,35 +197,37 @@ impl RegionManagerAuthority {
 
     fn try_lock(&self) -> io::Result<Option<MutexGuard<'_, RegionManager>>> {
         self.health.require_healthy()?;
-        match self.inner.try_lock() {
+        match self.state.try_lock() {
             Ok(guard) if self.health.is_healthy() => Ok(Some(guard)),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "RegionStore became miss-only while acquiring Region authority",
+                "Region store became miss-only while acquiring Region authority",
             )),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Poisoned(_)) => {
                 self.health.enter_miss_only();
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "RegionStore Region authority is poisoned",
+                    "Region manager is poisoned",
                 ))
             }
         }
     }
 }
 
-pub struct FileRegionCore {
-    index: RegionIndex,
-    manager: RegionManagerAuthority,
-    shards: Box<[RegionShard]>,
-    region_access: Box<[RegionAccessState]>,
-    rotation: Mutex<()>,
-    health: RegionHealthLatch,
+pub struct FrozenRegionStore {
+    regions: Arc<RegionStore>,
+    metadata: RegionMetadata,
 }
 
-struct RegionAccessState {
-    generation: AtomicU64,
+/// Live L2 index, Region allocation, and append/read/reclaim coordination.
+pub struct RegionStore {
+    index: RegionIndex,
+    manager: RegionManagerLock,
+    append_gates: Box<[AppendShardGate]>,
+    region_generations: Box<[AtomicU64]>,
+    rotation: Mutex<()>,
+    health: RegionHealthLatch,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -248,7 +254,7 @@ pub struct RegionReinsertRecord<'a> {
 /// staging transitions one operation. Span completion and rotation are already
 /// ordered by the shard's single production worker.
 #[derive(Default)]
-struct RegionShard {
+struct AppendShardGate {
     mutation: Mutex<()>,
 }
 
@@ -263,7 +269,7 @@ pub enum RegionStageValue {
     NeedsRotation,
 }
 
-pub struct RegionValueRead {
+pub struct RegionValue {
     buffer: BufferLease,
     buffer_len: usize,
     value_range: Range<usize>,
@@ -273,9 +279,9 @@ pub struct RegionValueRead {
 // SAFETY: this type is constructed only after the owned record read reaches
 // terminal completion. From then until drop, it exposes initialized bytes only
 // through shared slices and never returns the allocation to a mutable pool.
-unsafe impl Sync for RegionValueRead {}
+unsafe impl Sync for RegionValue {}
 
-impl RegionValueRead {
+impl RegionValue {
     pub fn value(&self) -> &[u8] {
         &self
             .buffer
@@ -288,9 +294,89 @@ impl RegionValueRead {
     }
 }
 
-impl FileRegionCore {
+impl RegionStore {
+    /// Consume the index and Region metadata into one live store.
+    pub fn from_recovery(
+        index: PartitionedIndexStorage,
+        metadata: RegionMetadata,
+    ) -> io::Result<Self> {
+        let physical_stats = index.partition_stats().map_err(index_storage_io_error)?;
+        let slot_count = u64::try_from(index.slot_count()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
+        })?;
+        if metadata.root.index_slots != slot_count
+            || metadata.root.partition_count as usize != index.partition_count()
+            || !metadata_partition_stats_match(&metadata, &physical_stats)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index and Region metadata do not describe one authority",
+            ));
+        }
+        let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
+        let mut append_gates = Vec::new();
+        append_gates
+            .try_reserve_exact(manager.active_regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate append shard gates",
+                )
+            })?;
+        append_gates.resize_with(manager.active_regions().len(), AppendShardGate::default);
+        let mut region_generations = Vec::new();
+        region_generations
+            .try_reserve_exact(manager.regions().len())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot allocate Region generations",
+                )
+            })?;
+        for region in manager.regions() {
+            region_generations.push(AtomicU64::new(region.created_seqno));
+        }
+        let health = RegionHealthLatch::healthy();
+        let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
+        Ok(Self {
+            index,
+            manager: RegionManagerLock::new(manager, health.clone()),
+            append_gates: append_gates.into_boxed_slice(),
+            region_generations: region_generations.into_boxed_slice(),
+            rotation: Mutex::new(()),
+            health,
+        })
+    }
+
+    /// Freeze the quiescent index and Region metadata for a recovery image.
+    /// The caller must stop mutation admission and finish all accepted writes first.
+    pub fn freeze(self: Arc<Self>) -> io::Result<FrozenRegionStore> {
+        self.health.require_healthy()?;
+        let regions = self;
+        if regions
+            .append_gates
+            .iter()
+            .any(|shard| shard.mutation.is_poisoned())
+            || regions.rotation.is_poisoned()
+        {
+            regions.health.enter_miss_only();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append shard gate is poisoned",
+            ));
+        }
+        let partitions = index_partition_metadata(regions.index.storage(), &regions.health)?;
+        let metadata = regions
+            .manager
+            .lock()?
+            .freeze_metadata(partitions)
+            .map_err(region_metadata_io_error)?;
+        regions.health.require_healthy()?;
+        Ok(FrozenRegionStore { regions, metadata })
+    }
+
     pub const fn shard_count(&self) -> usize {
-        self.shards.len()
+        self.append_gates.len()
     }
 
     pub const fn index_slot_count(&self) -> usize {
@@ -309,7 +395,7 @@ impl FileRegionCore {
     }
 
     pub fn append_shard(&self, hash: u64) -> usize {
-        route_hash(hash, self.shards.len())
+        route_hash(hash, self.append_gates.len())
     }
 
     pub fn region_snapshot(&self) -> io::Result<RegionSnapshot> {
@@ -509,8 +595,8 @@ impl FileRegionCore {
     /// Releases one fully scanned source only after every accepted replacement
     /// batch has completed and conditionally published.
     pub fn complete_reclaim(&self, receipt: RegionReclaimReceipt) -> io::Result<()> {
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(receipt.region_id as usize)
             .ok_or_else(|| {
                 io::Error::new(
@@ -518,7 +604,7 @@ impl FileRegionCore {
                     "reclaim Region id is out of bounds",
                 )
             })?;
-        access.generation.store(0, Ordering::Release);
+        generation.store(0, Ordering::Release);
         self.manager
             .lock()?
             .finish_reclaim(receipt)
@@ -539,12 +625,12 @@ impl FileRegionCore {
     }
 
     fn lock_shard_mutation(&self, shard_id: usize) -> io::Result<MutexGuard<'_, ()>> {
-        let shard = self.shard(shard_id)?;
+        let shard = self.append_gate(shard_id)?;
         self.lock_shard_gate(&shard.mutation)
     }
 
-    fn shard(&self, shard_id: usize) -> io::Result<&RegionShard> {
-        self.shards.get(shard_id).ok_or_else(|| {
+    fn append_gate(&self, shard_id: usize) -> io::Result<&AppendShardGate> {
+        self.append_gates.get(shard_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "data shard is out of bounds")
         })
     }
@@ -553,7 +639,7 @@ impl FileRegionCore {
         self.health.require_healthy()?;
         gate.lock().map_err(|_| {
             self.health.enter_miss_only();
-            io::Error::new(io::ErrorKind::InvalidData, "data shard gate is poisoned")
+            io::Error::new(io::ErrorKind::InvalidData, "append shard gate is poisoned")
         })
     }
 
@@ -592,10 +678,10 @@ impl FileRegionCore {
                 return None;
             }
         };
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(entry.location.region_id() as usize)?;
-        let region_generation = access.generation.load(Ordering::Acquire);
+        let region_generation = generation.load(Ordering::Acquire);
         if region_generation == 0 {
             return None;
         }
@@ -613,26 +699,26 @@ impl FileRegionCore {
         buffer: BufferLease,
         hash_seed: u64,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
+    ) -> io::Result<Option<RegionValue>> {
         let hash = hash_key(hash_seed, key);
         let Some(candidate) = self.begin_point_read(hash) else {
             return Ok(None);
         };
-        let descriptor = describe_read(geometry, hash, candidate, true)?;
+        let desc = describe_read(geometry, hash, candidate, true)?;
         let slot = engine.try_reserve_read()?;
-        self.read_value_from_descriptor(engine, slot, buffer, descriptor, key)
+        self.read_value_from_desc(engine, slot, buffer, desc, key)
     }
 
     #[cfg(test)]
-    fn read_value_from_descriptor(
+    fn read_value_from_desc(
         &self,
         engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        descriptor: ReadDescriptor,
+        desc: ReadDesc,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
-        let pending = self.submit_value_read(engine, slot, buffer, descriptor)?;
+    ) -> io::Result<Option<RegionValue>> {
+        let pending = self.submit_value_read(engine, slot, buffer, desc)?;
         let completion = pending.wait(engine);
         self.finish_value_read(completion, key)
     }
@@ -642,9 +728,9 @@ impl FileRegionCore {
         engine: &IoEngine,
         slot: ReadSlot,
         buffer: BufferLease,
-        descriptor: ReadDescriptor,
+        desc: ReadDesc,
     ) -> io::Result<PendingRead> {
-        match submit_read(engine, slot, descriptor, buffer) {
+        match submit_read(engine, slot, desc, buffer) {
             Ok(pending) => Ok(pending),
             Err(error) => {
                 if !is_read_pressure(error.kind()) {
@@ -660,8 +746,8 @@ impl FileRegionCore {
         &self,
         completion: ReadCompletion,
         key: &[u8],
-    ) -> io::Result<Option<RegionValueRead>> {
-        let hash = completion.descriptor.hash;
+    ) -> io::Result<Option<RegionValue>> {
+        let hash = completion.desc.hash;
         if let Err(error) = completion.result {
             if !is_read_pressure(error.kind()) {
                 self.health
@@ -684,12 +770,11 @@ impl FileRegionCore {
         else {
             return Ok(None);
         };
-        if header.region_generation != completion.descriptor.region_generation
-            || header.key_hash != hash
+        if header.region_generation != completion.desc.region_generation || header.key_hash != hash
         {
             return Ok(None);
         }
-        let indexed_location = completion.descriptor.entry.location;
+        let indexed_location = completion.desc.entry.location;
         let Ok(exact_location) = PackedLocation::new(
             indexed_location.region_id(),
             indexed_location.offset(),
@@ -722,7 +807,7 @@ impl FileRegionCore {
         if crc32c(&[&record[RECORD_HEADER_SIZE..payload_end]]) != header.payload_crc {
             return Ok(None);
         }
-        let value_start = completion.descriptor.record_range.start + RECORD_HEADER_SIZE + key_len;
+        let value_start = completion.desc.record_range.start + RECORD_HEADER_SIZE + key_len;
         let Some(value_end) = value_start.checked_add(value_len) else {
             return Ok(None);
         };
@@ -735,9 +820,9 @@ impl FileRegionCore {
                 .enter_miss_only_with_error("record_read_completion_invalid", &error);
             return Err(error);
         };
-        Ok(Some(RegionValueRead {
+        Ok(Some(RegionValue {
             buffer,
-            buffer_len: completion.descriptor.read_len,
+            buffer_len: completion.desc.read_len,
             value_range: value_start..value_end,
             seqno: header.seqno,
         }))
@@ -750,7 +835,7 @@ impl FileRegionCore {
     /// This method performs no device I/O and never publishes an index entry.
     pub fn try_stage_value(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
@@ -762,7 +847,7 @@ impl FileRegionCore {
 
     pub fn try_stage_reinsert(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         record: RegionReinsertRecord<'_>,
     ) -> io::Result<RegionStageValue> {
@@ -780,7 +865,7 @@ impl FileRegionCore {
     #[allow(clippy::too_many_arguments)]
     fn try_stage_record(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         shard_id: usize,
         hash: u64,
         record_bytes: u32,
@@ -796,14 +881,14 @@ impl FileRegionCore {
             ));
         }
         let payload = RecordPayload::new(key, value);
-        let _shard_mutation = match self.shard(shard_id)?.mutation.try_lock() {
+        let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
             Err(TryLockError::Poisoned(_)) => {
                 self.health.enter_miss_only();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "data shard gate is poisoned",
+                    "append shard gate is poisoned",
                 ));
             }
         };
@@ -928,7 +1013,7 @@ impl FileRegionCore {
 
     fn fail_preflighted_stage(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         message: &'static str,
     ) -> io::Result<RegionStageValue> {
         self.health.enter_miss_only();
@@ -942,12 +1027,11 @@ impl FileRegionCore {
     /// exact owned-buffer write completion succeeds.
     pub fn flush_staging_shard(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         engine: &IoEngine,
         shard_id: usize,
-        recovery: &crate::io::engine::recovery::BackgroundRecovery,
+        mut attempt: BackgroundIoAttempt<'_>,
     ) -> io::Result<Option<RegionWriteSpan>> {
-        let mut recovery = recovery.attempt();
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
@@ -1042,16 +1126,16 @@ impl FileRegionCore {
             absolute,
             records,
         } = job;
-        let flight = match submit_span(engine, geometry, span, buffer, absolute, &mut recovery) {
-            Ok(flight) => flight,
+        let pending = match submit_write(engine, geometry, span, buffer, absolute, &mut attempt) {
+            Ok(pending) => pending,
             Err(error) => {
                 let original = error.error;
                 self.fail_staged_span(staging, span, error.buffer, records);
                 return Err(original);
             }
         };
-        let completion = flight.wait(engine, &mut recovery);
-        let RegionSpanCompletion {
+        let completion = pending.wait(engine, &mut attempt);
+        let WriteCompletion {
             span,
             result,
             buffer,
@@ -1092,7 +1176,7 @@ impl FileRegionCore {
             self.health.enter_miss_only();
             return Err(staging_io_error(error));
         }
-        recovery.finish();
+        attempt.finish();
         Ok(Some(span))
     }
 
@@ -1119,8 +1203,8 @@ impl FileRegionCore {
             .lock()?
             .begin_rotation(candidate)
             .map_err(|error| region_mutation_context("rotation begin", error))?;
-        let access = self
-            .region_access
+        let generation = self
+            .region_generations
             .get(receipt.activated_region_id as usize)
             .ok_or_else(|| {
                 self.health.enter_miss_only();
@@ -1129,9 +1213,7 @@ impl FileRegionCore {
                     "rotation activated an untracked Region",
                 )
             })?;
-        access
-            .generation
-            .store(receipt.activated_created_seqno, Ordering::Release);
+        generation.store(receipt.activated_created_seqno, Ordering::Release);
         // Manager authority now carries the exact in-progress rotation
         // receipt, so foreground staging fails fast on this shard. Release the
         // shard gates before publishing the completed in-memory rotation.
@@ -1165,7 +1247,7 @@ impl FileRegionCore {
 
     fn fail_staged_span(
         &self,
-        staging: &RegionStaging,
+        staging: &AppendStaging,
         span: RegionWriteSpan,
         buffer: Option<IoBuffer>,
         records: Vec<StagedRecord>,
@@ -1260,14 +1342,14 @@ fn region_metadata_io_error(error: RegionMetadataError) -> io::Error {
 fn region_mutation_io_error(error: RegionMutationError) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("RegionStore authority mutation failed: {error:?}"),
+        format!("Region state mutation failed: {error:?}"),
     )
 }
 
 fn region_mutation_context(context: &'static str, error: RegionMutationError) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("RegionStore {context} failed: {error:?}"),
+        format!("Region {context} failed: {error:?}"),
     )
 }
 
@@ -1312,4 +1394,110 @@ fn enter_miss_only_for_index_error(health: &RegionHealthLatch, error: &IndexStor
         _ => "index_storage_invalid",
     };
     health.enter_miss_only_with_error(reason, error);
+}
+
+fn empty_partition_metadata(
+    ranges: &[IndexPartitionRange],
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    let mut stats = Vec::new();
+    stats.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate index partition statistics",
+        )
+    })?;
+    stats.resize(ranges.len(), IndexPhysicalStats::default());
+    partition_metadata_from_stats(ranges, &stats)
+}
+
+fn index_partition_metadata(
+    index: &PartitionedIndexStorage,
+    health: &RegionHealthLatch,
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    let stats = guarded_index_result(health, index.partition_stats())?;
+    partition_metadata_from_stats(index.partition_ranges(), &stats)
+}
+
+fn partition_metadata_from_stats(
+    ranges: &[IndexPartitionRange],
+    stats: &[IndexPhysicalStats],
+) -> io::Result<Box<[PartitionMetadataRecord]>> {
+    if ranges.len() != stats.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index partition ranges and statistics disagree",
+        ));
+    }
+    let mut partitions = Vec::new();
+    partitions.try_reserve_exact(ranges.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot allocate index partition directory",
+        )
+    })?;
+    for (range, stats) in ranges.iter().zip(stats) {
+        partitions.push(PartitionMetadataRecord {
+            partition_id: u32::try_from(range.partition_id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "partition id is too large")
+            })?,
+            first_index_page: u64::try_from(range.first_page).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition page offset is too large",
+                )
+            })?,
+            index_page_count: u64::try_from(range.page_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition page count is too large",
+                )
+            })?,
+            first_slot: u64::try_from(range.first_slot).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition slot offset is too large",
+                )
+            })?,
+            slot_count: u64::try_from(range.slot_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "partition slot count is too large",
+                )
+            })?,
+            physical_value_slots: stats.value,
+            physical_deleted_slots: stats.deleted,
+        });
+    }
+    Ok(partitions.into_boxed_slice())
+}
+
+fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexPhysicalStats]>> {
+    let mut stats = Vec::new();
+    stats
+        .try_reserve_exact(metadata.partitions.len())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cannot allocate index partition statistics",
+            )
+        })?;
+    for partition in &metadata.partitions {
+        stats.push(IndexPhysicalStats {
+            value: partition.physical_value_slots,
+            deleted: partition.physical_deleted_slots,
+        });
+    }
+    Ok(stats.into_boxed_slice())
+}
+
+fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysicalStats]) -> bool {
+    metadata.partitions.len() == stats.len()
+        && metadata
+            .partitions
+            .iter()
+            .zip(stats)
+            .all(|(metadata, actual)| {
+                metadata.physical_value_slots == actual.value
+                    && metadata.physical_deleted_slots == actual.deleted
+            })
 }

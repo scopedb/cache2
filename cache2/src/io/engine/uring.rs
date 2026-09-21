@@ -39,14 +39,12 @@ use io_uring::squeue;
 use io_uring::types;
 
 use crate::config::runtime::IoUringEngineConfig;
-use crate::io::backend::RuntimeFileSet;
-use crate::io::backend::RuntimeIoPath;
-use crate::io::backend::retry_interrupted;
 #[cfg(test)]
 use crate::io::engine::CompletionState;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
 use crate::io::engine::DriverWake;
+use crate::io::engine::EngineState;
 #[cfg(test)]
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 #[cfg(test)]
@@ -57,11 +55,13 @@ use crate::io::engine::IoOperation;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
-use crate::io::engine::RuntimeShared;
 use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 #[cfg(test)]
 use crate::io::engine::io_uring_extra_memory_bytes;
+use crate::io::file::DataFileHandles;
+use crate::io::file::FileIoPath;
+use crate::io::file::retry_interrupted;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
 const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
@@ -108,7 +108,7 @@ impl DriverWake for SocketWake {
 
 /// Starts a driver that owns the ring and all submitted buffer pointers.
 pub fn start(
-    files: RuntimeFileSet,
+    handles: DataFileHandles,
     config: IoUringEngineConfig,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
@@ -118,7 +118,7 @@ pub fn start(
         max_in_flight,
         activity_counters_enabled,
         read_wait_enabled,
-        files.stats_handle(),
+        handles.stats_handle(),
     )?;
     let ring_entries = max_in_flight
         .checked_add(2)
@@ -180,18 +180,18 @@ pub fn start(
         pending: Arc::clone(&wake_pending),
     });
     engine.wake = Some(wake);
-    let worker_shared = Arc::clone(&engine.shared);
+    let worker_state = Arc::clone(&engine.state);
     let worker_submit_state = Arc::clone(&engine.submit_state);
     let worker = std::thread::Builder::new()
         .name("cache2-uring-io".into())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
             uring_driver(
-                files,
+                handles,
                 ring,
                 wake_receiver,
                 wake_pending,
-                worker_shared,
+                worker_state,
                 worker_submit_state,
                 receiver,
             )
@@ -204,7 +204,7 @@ struct Flight {
     task: Task,
     transferred: usize,
     active: bool,
-    active_path: Option<RuntimeIoPath>,
+    active_path: Option<FileIoPath>,
     cancel_submitted: bool,
 }
 
@@ -217,14 +217,14 @@ enum PendingEntry {
 }
 
 struct UringDriver {
-    files: Option<RuntimeFileSet>,
+    handles: Option<DataFileHandles>,
     ring: Option<IoUring>,
     wake_receiver: UnixStream,
     wake_pending: Arc<AtomicBool>,
     wake_active: bool,
     wake_cancel_submitted: bool,
     wake_cancel_completed: bool,
-    shared: Arc<RuntimeShared>,
+    state: Arc<EngineState>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
     flights: HashMap<RequestId, Flight, Xxh3_64Builder>,
@@ -239,27 +239,27 @@ struct UringDriver {
 }
 
 fn uring_driver(
-    files: RuntimeFileSet,
+    handles: DataFileHandles,
     mut ring: IoUring,
     wake_receiver: UnixStream,
     wake_pending: Arc<AtomicBool>,
-    shared: Arc<RuntimeShared>,
+    state: Arc<EngineState>,
     submit_state: Arc<RwLock<SubmitState>>,
     receiver: Receiver<DriverCommand>,
 ) -> io::Result<()> {
-    let max_in_flight = shared.max_in_flight;
+    let max_in_flight = state.max_in_flight;
     let submission_capacity = ring.submission().capacity();
     let completion_capacity = ring.completion().capacity();
     let io_poll = ring.params().is_setup_iopoll();
     let mut driver = UringDriver {
-        files: Some(files),
+        handles: Some(handles),
         ring: Some(ring),
         wake_receiver,
         wake_pending,
         wake_active: false,
         wake_cancel_submitted: false,
         wake_cancel_completed: false,
-        shared,
+        state,
         submit_state,
         receiver,
         flights: HashMap::with_capacity_and_hasher(max_in_flight, Xxh3_64Builder::default()),
@@ -333,9 +333,9 @@ impl UringDriver {
             match self.receiver.try_recv() {
                 Ok(DriverCommand::Submit(task)) => {
                     if task.completion.cancel_requested.load(Ordering::Acquire) {
-                        self.shared.finish(task, CompletionStatus::Cancelled, 0);
+                        self.state.finish(task, CompletionStatus::Cancelled, 0);
                     } else if task.operation_is_empty() {
-                        self.shared.finish(task, CompletionStatus::Completed, 0);
+                        self.state.finish(task, CompletionStatus::Completed, 0);
                     } else {
                         let request_id = task.request_id;
                         self.flights.insert(
@@ -366,7 +366,7 @@ impl UringDriver {
     }
 
     fn queue_requested_cancels(&mut self) {
-        if !self.shared.cancel_scan_needed.swap(false, Ordering::AcqRel) {
+        if !self.state.cancel_scan_needed.swap(false, Ordering::AcqRel) {
             return;
         }
         self.requested_cancels.clear();
@@ -443,7 +443,7 @@ impl UringDriver {
                     .remove(&request_id)
                     .expect("checked flight exists");
                 let status = cancelled_before_resubmit_status(&flight);
-                self.shared.finish(flight.task, status, flight.transferred);
+                self.state.finish(flight.task, status, flight.transferred);
                 continue;
             }
             self.pending_entries.push(PendingEntry::Target(request_id));
@@ -483,23 +483,23 @@ impl UringDriver {
                         .flights
                         .get(&request_id)
                         .expect("pending target has a flight");
-                    flight.task.operation.runtime_io_path(
-                        self.files
+                    flight.task.operation.file_io_path(
+                        self.handles
                             .as_ref()
-                            .expect("runtime files exist while driver runs"),
+                            .expect("runtime handles exist while driver runs"),
                         flight.transferred,
                     )?
                 };
-                if self.io_poll && path != RuntimeIoPath::Direct {
+                if self.io_poll && path != FileIoPath::Direct {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "io_uring IOPOLL operation is not direct-I/O aligned",
                     ));
                 }
                 let file_fd = self
-                    .files
+                    .handles
                     .as_ref()
-                    .expect("runtime files exist while driver runs")
+                    .expect("runtime handles exist while driver runs")
                     .file_for(path)
                     .as_raw_fd();
                 let flight = self
@@ -665,7 +665,7 @@ impl UringDriver {
             return;
         };
         flight.active = false;
-        let active_path = flight.active_path.take().unwrap_or(RuntimeIoPath::Buffered);
+        let active_path = flight.active_path.take().unwrap_or(FileIoPath::Buffered);
         if result < 0 {
             let raw_error = result.saturating_neg();
             let error = io::Error::from_raw_os_error(raw_error);
@@ -683,7 +683,7 @@ impl UringDriver {
             } else {
                 CompletionStatus::Failed(error)
             };
-            self.shared.finish(flight.task, status, flight.transferred);
+            self.state.finish(flight.task, status, flight.transferred);
             return;
         }
 
@@ -693,9 +693,9 @@ impl UringDriver {
                     operation_length(&flight.task.operation).saturating_sub(flight.transferred);
                 let completed = result as usize;
                 if completed <= remaining && completed != 0 {
-                    self.files
+                    self.handles
                         .as_ref()
-                        .expect("runtime files exist while driver runs")
+                        .expect("runtime handles exist while driver runs")
                         .record(
                             flight.task.operation.kind().io_direction(),
                             active_path,
@@ -708,13 +708,13 @@ impl UringDriver {
                     } else {
                         io::ErrorKind::WriteZero
                     };
-                    self.shared.finish(
+                    self.state.finish(
                         flight.task,
                         CompletionStatus::Failed(io::Error::new(kind, "short io_uring I/O")),
                         flight.transferred,
                     );
                 } else if completed > remaining {
-                    self.shared.finish(
+                    self.state.finish(
                         flight.task,
                         CompletionStatus::Failed(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -725,7 +725,7 @@ impl UringDriver {
                 } else {
                     flight.transferred += completed;
                     if flight.transferred == operation_length(&flight.task.operation) {
-                        self.shared.finish(
+                        self.state.finish(
                             flight.task,
                             CompletionStatus::Completed,
                             flight.transferred,
@@ -737,7 +737,7 @@ impl UringDriver {
                         .load(Ordering::Acquire)
                     {
                         let status = cancelled_before_resubmit_status(&flight);
-                        self.shared.finish(flight.task, status, flight.transferred);
+                        self.state.finish(flight.task, status, flight.transferred);
                     } else {
                         self.flights.insert(request_id, flight);
                         self.pending_targets.push_back(request_id);
@@ -748,7 +748,7 @@ impl UringDriver {
     }
 
     fn stop_accepting_and_fail_all(&mut self, error: &io::Error) {
-        // Submission holds a shared fence through the bounded channel send.
+        // Submission holds a state fence through the bounded channel send.
         // Once this exclusive guard is acquired, no task can appear after
         // the drain.
         let mut submit_state = self
@@ -756,7 +756,7 @@ impl UringDriver {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         submit_state.accepting = false;
-        self.shared.stop_accepting_slots();
+        self.state.stop_accepting_slots();
         // The false state is permanent. Release the fence before waking
         // completion consumers so a custom waker may safely re-enter the
         // engine and receive BrokenPipe instead of deadlocking.
@@ -778,24 +778,24 @@ impl UringDriver {
             // duplicated open-file description (and therefore its flock)
             // for process lifetime. The cache must also observe the flag
             // and never issue LOCK_UN on another duplicate.
-            self.shared.mark_unfenced_writes();
-            if let Some(files) = self.files.take() {
-                mem::forget(files);
+            self.state.mark_unfenced_writes();
+            if let Some(handles) = self.handles.take() {
+                mem::forget(handles);
             }
         }
 
         for (_, flight) in self.flights.drain() {
             let status = CompletionStatus::Failed(copy_io_error(error, &message));
             if flight.active {
-                self.shared
+                self.state
                     .finish_quarantined(flight.task, status, flight.transferred);
             } else {
-                self.shared.finish(flight.task, status, flight.transferred);
+                self.state.finish(flight.task, status, flight.transferred);
             }
         }
         while let Ok(command) = self.receiver.try_recv() {
             if let DriverCommand::Submit(task) = command {
-                self.shared.finish(
+                self.state.finish(
                     task,
                     CompletionStatus::Failed(copy_io_error(error, &message)),
                     0,
@@ -887,7 +887,7 @@ impl UringDriver {
             } else if user_data & INTERNAL_CQE_BIT == 0
                 && let Some(flight) = self.flights.remove(&RequestId(user_data))
             {
-                self.shared.finish(
+                self.state.finish(
                     flight.task,
                     CompletionStatus::Failed(copy_io_error(error, message)),
                     flight.transferred,
@@ -978,7 +978,7 @@ mod tests {
     use crate::managed_memory::ManagedMemoryLimits;
 
     struct CancelledCommandProducer {
-        shared: Arc<RuntimeShared>,
+        state: Arc<EngineState>,
         commands: mpsc::SyncSender<DriverCommand>,
         managed_memory: ManagedMemory,
         next: AtomicU64,
@@ -1000,7 +1000,7 @@ mod tests {
                 request_id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 operation: IoOperation::read(buffer, 0),
                 completion,
-                slot: self.shared.try_reserve_slot(false).unwrap(),
+                slot: self.state.try_reserve_slot(false).unwrap(),
                 submitted_at: None,
             };
             assert!(self.commands.try_send(DriverCommand::Submit(task)).is_ok());
@@ -1018,11 +1018,11 @@ mod tests {
     #[test]
     fn cancelled_command_refills_leave_room_for_io_progress() {
         let depth = 2;
-        let shared = Arc::new(RuntimeShared::new(depth, false, false));
+        let state = Arc::new(EngineState::new(depth, false, false));
         let (commands, receiver) = mpsc::sync_channel(depth * 2 + 1);
         let (_wake_sender, wake_receiver) = UnixStream::pair().unwrap();
         let producer = Arc::new(CancelledCommandProducer {
-            shared: Arc::clone(&shared),
+            state: Arc::clone(&state),
             commands,
             managed_memory: ManagedMemory::try_new(ManagedMemoryLimits {
                 memory_limit_bytes: 16 * 1024,
@@ -1034,14 +1034,14 @@ mod tests {
         });
         // Command processing needs neither a kernel ring nor file descriptors.
         let mut driver = UringDriver {
-            files: None,
+            handles: None,
             ring: None,
             wake_receiver,
             wake_pending: Arc::new(AtomicBool::new(false)),
             wake_active: false,
             wake_cancel_submitted: false,
             wake_cancel_completed: false,
-            shared,
+            state,
             submit_state: Arc::new(RwLock::new(SubmitState { accepting: true })),
             receiver,
             flights: HashMap::with_capacity_and_hasher(depth, Xxh3_64Builder::default()),

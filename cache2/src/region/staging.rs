@@ -21,8 +21,8 @@ use std::mem;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
 use crate::io::engine::IoBuffer;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::ManagedMemory;
@@ -62,7 +62,6 @@ pub struct ShardFillSnapshot {
 /// containing device span completes. The descriptor stays owned by the
 /// completion path; staging never calls into the index while holding a shard
 /// lock.
-/// Compact transient completion descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StagedRecord {
     hash: u64,
@@ -122,8 +121,8 @@ impl StagedRecord {
 
 /// A zero-copy write job. `buffer` is the shard's former fill lease and is
 /// therefore 4 KiB aligned. The I/O completion must return this exact buffer
-/// and the record vector to [`RegionStaging::finish_success`] or
-/// [`RegionStaging::finish_failure`].
+/// and the record vector to [`AppendStaging::finish_success`] or
+/// [`AppendStaging::finish_failure`].
 pub struct StagedWrite {
     pub span: RegionWriteSpan,
     pub buffer: IoBuffer,
@@ -249,14 +248,14 @@ impl Drop for EncodingBuffer<'_> {
 /// fill while the former is owned by the I/O engine. There is no resident-read
 /// copy and no staging-owned span sequence: the Region manager receipt is the
 /// sole identity accepted by sealing and completion.
-pub struct RegionStaging {
+pub struct AppendStaging {
     shards: Vec<ShardStaging>,
     chunk_bytes: usize,
     region_size: u64,
     _memory: RuntimeMemoryReservation,
 }
 
-impl RegionStaging {
+impl AppendStaging {
     pub fn reservation_bytes(shard_count: usize, chunk_bytes: usize) -> Option<usize> {
         let buffers_per_shard = chunk_bytes.checked_mul(2)?;
         let records_per_shard = MAX_STAGING_RECORDS
@@ -978,7 +977,7 @@ mod tests {
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
         assert_eq!(size_of::<StagedRecord>(), 32);
         let managed_memory = managed_memory(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
         assert_eq!(
             managed_memory.snapshot().current_bytes,
@@ -1048,7 +1047,7 @@ mod tests {
     #[test]
     fn fill_snapshot_distinguishes_empty_ready_submitted_and_terminal_shards() {
         let managed_memory = managed_memory(8 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.shard_fill_snapshot(0).unwrap(), None);
         assert_eq!(
             staging.shard_fill_snapshot(1),
@@ -1084,7 +1083,7 @@ mod tests {
         staging.close();
         assert_eq!(staging.shard_fill_snapshot(0), Err(StagingError::Closed));
 
-        let failed = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let failed = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         failed
             .encode_reserved(receipt, |target| {
                 target.fill(0x32);
@@ -1104,7 +1103,7 @@ mod tests {
     fn fill_snapshot_never_observes_a_partially_encoded_record() {
         let managed_memory = managed_memory(4 * 1024 * 1024);
         let staging =
-            Arc::new(RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap());
+            Arc::new(AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap());
         let (receipt, record) = reservation(4096, 64, 11);
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -1140,7 +1139,7 @@ mod tests {
     #[test]
     fn padding_receipt_expands_only_the_final_record_without_copying() {
         let managed_memory = managed_memory(4 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         let first_len = RecordHeader::aligned_len(0, 0).unwrap();
         let (first, first_record) = reservation(4096, first_len, 11);
         let mut pointer = 0_usize;
@@ -1219,7 +1218,7 @@ mod tests {
     fn fixed_record_and_byte_bounds_request_a_seal_without_running_encoder() {
         let managed_memory = managed_memory(8 * 1024 * 1024);
         let chunk_bytes = 256 * 1024;
-        let staging = RegionStaging::try_new(1, chunk_bytes, 512 * 1024, &managed_memory).unwrap();
+        let staging = AppendStaging::try_new(1, chunk_bytes, 512 * 1024, &managed_memory).unwrap();
         let mut offset = 0;
         for index in 0..MAX_STAGING_RECORDS {
             let (receipt, record) = reservation(offset, RECORD_ALIGNMENT, index as u64 + 1);
@@ -1281,7 +1280,7 @@ mod tests {
     #[test]
     fn completion_fences_stale_receipts_and_write_failure_is_sticky() {
         let managed_memory = managed_memory(8 * 1024 * 1024);
-        let staging = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         let (receipt, record) = reservation(4096, 64, 11);
         let entry = record.entry();
         let mismatched = StagedRecord::new(
@@ -1321,7 +1320,7 @@ mod tests {
             Err(StagingEncodeError::Staging(StagingError::Failed))
         );
 
-        let other = RegionStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
+        let other = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         other
             .encode_reserved(receipt, |target| {
                 target.fill(0x44);

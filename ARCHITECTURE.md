@@ -28,6 +28,30 @@ Cache
 
 The complete raw key is hashed once with seeded XXH3-64 at the public operation boundary. L1 compares the full key, and an L2 hit validates the key stored in the record. Returned values always match the complete key.
 
+## Implementation roles
+
+The private implementation separates cache execution, live L2 state, and persistence. A Region is a fixed extent in the data file, an append shard is a write-admission and batching lane, and an index partition is a lookup and locking boundary. These are independent divisions; none is a storage backend or a separate cache instance.
+
+| Type                           | Responsibility                                                                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CacheSession`                 | Owns one open/close lifecycle, ordering recovery, durable RUNNING, runtime startup, shutdown, and CLEAN publication.                                  |
+| `CacheRuntime`                 | Executes public requests across L1 and L2; owns bounded I/O engines, append staging, and append/reclaim workers.                                      |
+| `RegionStore`                  | Holds the live L2 index and Region manager, append gates, generation checks, and terminal health latch. It does not own cache files or start workers. |
+| `RegionManager`                | Allocates append positions, rotates Active Regions, maintains the Free/Sealed queues, and tracks outstanding append/reclaim work.                     |
+| `RegionDesc`                   | Describes one Region's state, generation, reserved/completed prefix, and physical record count.                                                       |
+| `AppendStaging`                | Owns the fixed per-shard buffers and the records awaiting index publication.                                                                          |
+| `ReadDesc`                     | Describes the exact candidate and byte range for one bounded L2 read.                                                                                 |
+| `PendingRead` / `PendingWrite` | Retain the submitted operation and its buffer until I/O completes; completion validation precedes returning a value or publishing an index entry.     |
+| `RegionPersistence`            | Owns file locks, validates restart artifacts, constructs cold or recovered Region state, and durably publishes recovery images.                       |
+
+`cache/session.rs` contains the lifecycle ordering, `cache/runtime/` contains request execution and workers, and `region/` contains L2 state and operations. `region/persistence/` coordinates files; `region/recovery/` defines the persistent formats and their validation. The session passes a quiescent `FrozenRegionStore` to persistence, which produces a `PreparedClean` only after data and image durability; publishing CLEAN is a separate final step.
+
+The I/O layer names capabilities and resources directly. `PositionedIo` is synchronous positioned read/write access; `StorageFile` adds file identity, extent management, locking, sync, and handle duplication. `CacheFile` is the OS file resource, while `DataFileHandles` holds its buffered/direct descriptors for engine use. `FileSystem` covers path operations such as create, rename, and parent-directory sync; `OsFileSystem` supplies those operations. These narrow interfaces also support fault injection. Region lifecycle and storage have one concrete implementation and no backend trait.
+
+`CacheRuntime` owns `IoRecovery` and the optional `FillController` independently. `IoRecovery` tracks timeout recovery and its admission fence; `FillController` observes I/O pressure, gates new fills, and paces non-essential flushes. A `BackgroundIoAttempt` in `io/background.rs` borrows both for one operation, from admission through completion validation and publication. The runtime stops both policies before waiting for mutation quiescence.
+
+Three states serve different purposes: `RegionState` is Free/Active/Sealed, persisted `SessionState` is EMPTY/RUNNING/CLEAN, and `IoRecovery` tracks reversible background I/O timeout recovery. The Region health latch is a separate terminal failure boundary. Recovery of an I/O request cannot restore an unhealthy Region store or make a restart image eligible.
+
 ## Consistency model
 
 Each accepted mutation receives a logical sequence number. L1 uses that number to avoid replacing a newer exact-key resident value with an older publication or promotion, and a sequenced delete does not remove a newer L1 value. Reclaim preserves the original logical sequence when it rewrites a live record.
@@ -120,6 +144,8 @@ Each lane uses one concrete `IoEngine` for admission, submission, cancellation, 
 
 Adaptive foreground `put`/`put_l2` load pause-holder state and otherwise only compete for staging. Byte and record ceilings are instance-wide, shared by every shard worker; they pace non-essential background flush. Urgent, drain, and rotation flushes always proceed. A flush that cannot take a span refunds the consumed budget and retries. `Observe` does not delay flush or reject fills and counts pause refusals as `would_reject`; it still checkpoints waits so pause is observable. Adaptive rejects new fills immediately while paused and skips optional reinsertion. Pause is released when the slow I/O completes, not after later publication. Reads, deletes, and essential reclaim bypass fill budgets. Close stops admission independently of outstanding I/O.
 
+Flush budgets count encoded bytes and records, while pressure observations count I/O requests. One batched write may contain many records. `try_acquire_flush_budget` returns a `FlushCharge` in record credits and byte units; acquiring this budget does not submit I/O. `refund_flush_budget` returns only the credits that were consumed.
+
 See [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for rate ceilings, pause conditions, bounded bursts, and tuning limits.
 
 ### Memory
@@ -170,7 +196,7 @@ The index image is mapped writable and private. Runtime mutations therefore use 
 
 ### Warm close publication
 
-The public handle separates a shared data-plane view from the cache-internal lifecycle owner. `close_warm(&self)` therefore works while other `Arc<Cache>` handles remain alive. One acquire-load rejects calls after close starts. L1 hits and all reads pay no operation-gate read-modify-write. A permanent mutation fence and the write engines provide the quiescence required by recovery. Read I/O owns no persistent state and cannot pin the snapshot. Calls admitted before close are in flight and may finish; queued but unsubmitted L2 work also cannot pin close. Retained public handles keep only bounded in-memory data-plane resources alive until drop.
+The public handle shares request execution through `CacheRuntime`, while `CacheSession` owns the open/close lifecycle. `close_warm(&self)` therefore works while other `Arc<Cache>` handles remain alive. One acquire-load rejects calls after close starts. L1 hits and all reads pay no operation-gate read-modify-write. A permanent mutation fence and the write engines provide the quiescence required by recovery. Read I/O owns no persistent state and cannot pin the snapshot. Calls admitted before close are in flight and may finish; queued but unsubmitted L2 work also cannot pin close. Retained public handles keep only bounded in-memory runtime resources alive until drop.
 
 `close_warm` establishes one recoverable snapshot in this order:
 
@@ -197,6 +223,6 @@ Stale data, overload, and cache loss are valid outcomes. Every returned value pa
 
 ### Background I/O timeout recovery
 
-A background write or reclaim admission/completion timeout enters a reversible recovery state separate from the terminal Region health latch. `RuntimeOptions::io_recovery_timeout` defaults to `None` (until completion or close); `Some(duration)` bounds the additional wait and `Some(Duration::ZERO)` disables recovery. Each affected worker holds a recovery attempt through validation and publication. A shared pending count fences new foreground fills until all attempts succeed; reads and deletes remain independent, and previously accepted work may finish. The snapshot reports `CacheHealth::Recovering` unless a draining or terminal state takes precedence. Workers use fixed one-second admission/completion checks anchored to the original deadline for finite budgets. Only unsubmitted operations returned by admission can be retried. Issued requests retain their worker, slot, buffer, staging span, and Region until completion. No new queue or worker is introduced, and memory remains bounded regardless of recovery duration.
+A background write or reclaim admission/completion timeout enters a reversible recovery state separate from the terminal Region health latch. `RuntimeOptions::io_recovery_timeout` defaults to `None` (until completion or close); `Some(duration)` bounds the additional wait and `Some(Duration::ZERO)` disables recovery. Each affected worker holds a `BackgroundIoAttempt` through validation and publication. A shared pending count fences new foreground fills until all attempts succeed; reads and deletes remain independent, and previously accepted work may finish. The snapshot reports `CacheHealth::Recovering` unless a draining or terminal state takes precedence. Workers use fixed one-second admission/completion checks anchored to the original deadline for finite budgets. Only unsubmitted operations returned by admission can be retried. Issued requests retain their worker, slot, buffer, staging span, and Region until completion. No new queue or worker is introduced, and memory remains bounded regardless of recovery duration.
 
 `cache_io_recovery_started` and `cache_io_recovery_completed` log transitions into recovery and out of it after all affected operations pass validation and publication. Failed attempts never lower the admission fence. Actual I/O errors, invalid completions, and finite-budget exhaustion retain the terminal failure policy; this implementation does not retry completed I/O failures or reopen a failed instance. Closing or a background worker failure stops recovery, observed within one polling interval; normal cancellation then preserves the unfenced-write boundary and prevents unsafe CLEAN publication. Close starts this interruption before waiting for mutation quiescence, including reclaim reinsertion. Drain remains a completion fence and may wait indefinitely in unlimited recovery mode.

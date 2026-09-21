@@ -17,6 +17,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::StatsOptions;
+use crate::cache::runtime::metrics::ActivityMetrics;
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
 use crate::error::Error;
@@ -30,9 +31,8 @@ use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::MAX_CONFIG_COUNT;
 use crate::memory::MemoryStore;
 use crate::region::recovery::DataGeometry;
-use crate::region::runtime::metrics::ActivityMetrics;
 use crate::region::runtime_fixed_memory_bytes;
-use crate::region::staging::RegionStaging;
+use crate::region::staging::AppendStaging;
 use crate::stats::recording::Recorder;
 
 const DEFAULT_L1_SHARDS: usize = 32;
@@ -776,7 +776,7 @@ impl RuntimeOptions {
             .map_err(|_| invalid_config("Region size does not fit the memory requirements"))?;
         let chunk_bytes = usable_region;
         let write_buffer_reservation =
-            RegionStaging::reservation_bytes(shard_count, chunk_bytes)
+            AppendStaging::reservation_bytes(shard_count, chunk_bytes)
                 .ok_or_else(|| invalid_config("write buffer memory requirements overflow"))?;
         let reserved_memory = fixed_bytes
             .checked_add(self.l1_capacity_bytes)

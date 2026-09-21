@@ -23,8 +23,9 @@ use std::io;
 #[cfg(test)]
 use std::time::Duration;
 
-use crate::io::backend::DIRECT_IO_ALIGNMENT;
-use crate::io::backend::WritePoint;
+use crate::io::background::BackgroundIoAttempt;
+#[cfg(test)]
+use crate::io::background::IoRecovery;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
@@ -32,24 +33,23 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
-#[cfg(test)]
-use crate::io::engine::recovery::BackgroundRecovery;
-use crate::io::engine::recovery::RecoveryAttempt;
 use crate::io::engine::submit_background_io;
+use crate::io::file::DIRECT_IO_ALIGNMENT;
+use crate::io::file::WritePoint;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 
-pub struct RegionSpanSubmitError {
+pub struct WriteSubmitError {
     pub error: io::Error,
     pub span: RegionWriteSpan,
     pub buffer: Option<IoBuffer>,
 }
 
-impl fmt::Debug for RegionSpanSubmitError {
+impl fmt::Debug for WriteSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RegionSpanSubmitError")
+            .debug_struct("WriteSubmitError")
             .field("error", &self.error)
             .field("span", &self.span)
             .field("buffer_returned", &self.buffer.is_some())
@@ -57,42 +57,38 @@ impl fmt::Debug for RegionSpanSubmitError {
     }
 }
 
-impl fmt::Display for RegionSpanSubmitError {
+impl fmt::Display for WriteSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.error.fmt(formatter)
     }
 }
 
-impl std::error::Error for RegionSpanSubmitError {
+impl std::error::Error for WriteSubmitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
-pub struct RegionSpanFlight {
+pub struct PendingWrite {
     span: RegionWriteSpan,
     expected_len: usize,
     request_id: RequestId,
     request: BoundedIoRequest,
 }
 
-pub struct RegionSpanCompletion {
+pub struct WriteCompletion {
     pub span: RegionWriteSpan,
     pub result: io::Result<()>,
     pub buffer: Option<IoBuffer>,
 }
 
-impl RegionSpanFlight {
-    pub fn wait(
-        self,
-        engine: &IoEngine,
-        recovery: &mut RecoveryAttempt<'_>,
-    ) -> RegionSpanCompletion {
-        let completion = match self.request.wait_with_recovery(engine, recovery) {
+impl PendingWrite {
+    pub fn wait(self, engine: &IoEngine, attempt: &mut BackgroundIoAttempt<'_>) -> WriteCompletion {
+        let completion = match self.request.wait_background(engine, attempt) {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_buffer();
-                return RegionSpanCompletion {
+                return WriteCompletion {
                     span: self.span,
                     result: Err(error),
                     buffer,
@@ -130,7 +126,7 @@ impl RegionSpanFlight {
             }
             Ok(())
         });
-        RegionSpanCompletion {
+        WriteCompletion {
             span: self.span,
             result,
             buffer,
@@ -141,18 +137,18 @@ impl RegionSpanFlight {
 // The error returns the owned aligned buffer without another fallible
 // allocation; boxing it would violate that overload-path property.
 #[allow(clippy::result_large_err)]
-pub fn submit_span(
+pub fn submit_write(
     engine: &IoEngine,
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
-    recovery: &mut RecoveryAttempt<'_>,
-) -> Result<RegionSpanFlight, RegionSpanSubmitError> {
+    attempt: &mut BackgroundIoAttempt<'_>,
+) -> Result<PendingWrite, WriteSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
         Err(error) => {
-            return Err(RegionSpanSubmitError {
+            return Err(WriteSubmitError {
                 error,
                 span,
                 buffer: Some(buffer),
@@ -160,7 +156,7 @@ pub fn submit_span(
         }
     };
     if buffer.len() != expected_len || absolute != expected_absolute {
-        return Err(RegionSpanSubmitError {
+        return Err(WriteSubmitError {
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "staging job does not match its Region span",
@@ -174,7 +170,7 @@ pub fn submit_span(
             && bytes.len() % DIRECT_IO_ALIGNMENT == 0
     });
     if !buffer_is_direct_aligned {
-        return Err(RegionSpanSubmitError {
+        return Err(WriteSubmitError {
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Region span buffer is not direct-I/O aligned",
@@ -187,19 +183,19 @@ pub fn submit_span(
         engine,
         IoOperation::write(WritePoint::Record, buffer, absolute),
         CACHE_IO_COMPLETION_TIMEOUT,
-        recovery,
+        attempt,
     ) {
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_buffer();
-            return Err(RegionSpanSubmitError {
+            return Err(WriteSubmitError {
                 error,
                 span,
                 buffer,
             });
         }
     };
-    Ok(RegionSpanFlight {
+    Ok(PendingWrite {
         span,
         expected_len,
         request_id: request.id(),
@@ -255,27 +251,17 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::io::backend::IoBackend;
-    use crate::io::backend::SyncMode;
-    use crate::io::backend::SyncPoint;
     use crate::io::engine::IoEngine;
+    use crate::io::file::PositionedIo;
     use crate::managed_memory::BufferLease;
 
     #[derive(Default)]
-    struct RecordingBackend {
+    struct RecordingIo {
         writes: Mutex<Vec<(WritePoint, u64, Vec<u8>)>>,
         delay: Duration,
     }
 
-    impl IoBackend for RecordingBackend {
-        fn len(&self) -> io::Result<u64> {
-            Ok(u64::MAX)
-        }
-
-        fn set_len(&self, _len: u64) -> io::Result<()> {
-            Ok(())
-        }
-
+    impl PositionedIo for RecordingIo {
         fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "read unused"))
         }
@@ -287,18 +273,6 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push((point, offset, buffer.to_vec()));
             Ok(buffer.len())
-        }
-
-        fn sync(&self, _point: SyncPoint, _mode: SyncMode) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn try_lock_exclusive(&self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn unlock(&self) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -325,17 +299,17 @@ mod tests {
 
     #[test]
     fn late_span_completion_remains_valid_and_keeps_engine_usable() {
-        let backend = Arc::new(RecordingBackend {
+        let io = Arc::new(RecordingIo {
             delay: CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(50),
-            ..RecordingBackend::default()
+            ..RecordingIo::default()
         });
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
-        let recovery = BackgroundRecovery::new(Some(Duration::from_secs(5)));
-        let mut attempt = recovery.attempt();
-        let completion = submit_span(
+        let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
+        let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
+        let completion = submit_write(
             &engine,
             geometry(),
             span(),
@@ -347,29 +321,29 @@ mod tests {
         .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
         attempt.finish();
-        assert!(!recovery.is_recovering());
+        assert!(!io_recovery.is_recovering());
         assert_eq!(completion.span, span());
         assert_eq!(
             completion.buffer.unwrap().as_slice().unwrap(),
             &[0x5a; 4096]
         );
-        assert_eq!(backend.writes.lock().unwrap().len(), 1);
+        assert_eq!(io.writes.lock().unwrap().len(), 1);
         assert!(engine.try_reserve_read().is_ok());
         engine.shutdown().unwrap();
     }
 
     #[test]
     fn span_write_preserves_owned_buffer_and_maps_region_offset_exactly() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepare(4096).unwrap().fill(0x5a);
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
-        let recovery = BackgroundRecovery::new(Some(Duration::ZERO));
-        let mut attempt = recovery.attempt();
-        let completion = submit_span(&engine, geometry(), span(), buffer, absolute, &mut attempt)
+        let io_recovery = IoRecovery::new(Some(Duration::ZERO));
+        let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
+        let completion = submit_write(&engine, geometry(), span(), buffer, absolute, &mut attempt)
             .unwrap()
             .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
@@ -377,7 +351,7 @@ mod tests {
         assert!(completion.buffer.is_some());
         drop(completion.buffer);
 
-        let writes = backend
+        let writes = io
             .writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -394,18 +368,18 @@ mod tests {
 
     #[test]
     fn invalid_span_returns_the_only_buffer_without_submitting_io() {
-        let backend = Arc::new(RecordingBackend::default());
-        let engine = IoEngine::for_test(backend.clone(), 1).unwrap();
+        let io = Arc::new(RecordingIo::default());
+        let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut invalid = span();
         invalid.end_offset += 1;
         let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();
-        let error = match submit_span(
+        let error = match submit_write(
             &engine,
             geometry(),
             invalid,
             buffer,
             0,
-            &mut BackgroundRecovery::new(Some(Duration::ZERO)).attempt(),
+            &mut BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         ) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),
@@ -414,8 +388,7 @@ mod tests {
         assert!(error.buffer.is_some());
         drop(error.buffer);
         assert!(
-            backend
-                .writes
+            io.writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()

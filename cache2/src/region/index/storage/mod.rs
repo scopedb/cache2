@@ -1778,7 +1778,7 @@ impl Mapping {
         Self::map(length, libc::MAP_PRIVATE, file.as_raw_fd())
     }
 
-    fn map(length: usize, flags: i32, descriptor: i32) -> io::Result<Self> {
+    fn map(length: usize, flags: i32, fd: i32) -> io::Result<Self> {
         // SAFETY: the requested range is non-zero and bounded by `isize::MAX`.
         // Anonymous mappings ignore descriptor; file mappings use offset zero
         // after the caller verifies the file range.
@@ -1788,7 +1788,7 @@ impl Mapping {
                 length,
                 libc::PROT_READ | libc::PROT_WRITE,
                 flags,
-                descriptor,
+                fd,
                 0,
             )
         };
