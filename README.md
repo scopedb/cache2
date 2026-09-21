@@ -92,7 +92,7 @@ The default `ReadAdmission::Immediate` returns a miss under read-engine or buffe
 Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux mode. io_uring requires the `io-uring` crate feature on a supported Linux target and remains experimental. Keep one ring per pool; set `read.max_in_flight` to concurrent L2 gets, and leave write and reclaim at their defaults. Extra rings split the same depth across driver threads and do not add slots.
 
 ```toml
-cache2 = { version = "0.5", features = ["io-uring"] }
+cache2 = { version = "0.6", features = ["io-uring"] }
 ```
 
 ```rust
