@@ -39,7 +39,7 @@ With `FillControlOptions::Adaptive`, new fills also return `Overloaded` when the
 | `ErrorKind` | Meaning | Usual response |
 | --- | --- | --- |
 | `InvalidInput` | Storage/runtime options or a request key/value is invalid. | Fix the input; retrying it unchanged cannot succeed. |
-| `Unsupported` | The selected I/O engine, mode, or platform capability is unavailable. | Select a supported configuration or build target. |
+| `Unsupported` | The selected I/O engine, mode, or platform capability is unavailable. | Select a supported configuration or build target; inspect the I/O source for the missing requirement. |
 | `Busy` | `open` could not acquire exclusive ownership of the cache files. | Coordinate ownership or retry later with a bound. |
 | `Overloaded` | A bounded request-path slot, queue, buffer, or deadline is exhausted. | Fall through to the authoritative path or retry with a bound. |
 | `ResourceExhausted` | Startup or lifecycle work could not satisfy a required allocation/resource requirement. | Reduce the configured footprint or provide more resources. |

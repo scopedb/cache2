@@ -50,9 +50,9 @@ pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
         }
         "io-uring" => {
             let mut options = IoUringOptions::default();
-            options.read = io_uring_pool(prefix, "READ", 4, 256)?;
-            options.write = io_uring_pool(prefix, "WRITE", 4, 256)?;
-            options.reclaim = io_uring_pool(prefix, "RECLAIM", 1, 1)?;
+            options.read = io_uring_pool(prefix, "READ", options.read)?;
+            options.write = io_uring_pool(prefix, "WRITE", options.write)?;
+            options.reclaim = io_uring_pool(prefix, "RECLAIM", options.reclaim)?;
             Ok(IoEngineOptions::IoUring(options))
         }
         value => Err(invalid(format!("unsupported {name}: {value}"))),
@@ -196,13 +196,12 @@ pub fn parse_l1_eviction_policy(name: &str) -> io::Result<L1EvictionPolicy> {
 fn io_uring_pool(
     prefix: &str,
     role: &str,
-    rings: usize,
-    max_in_flight: usize,
+    mut options: IoUringPoolOptions,
 ) -> io::Result<IoUringPoolOptions> {
     let prefix = format!("{prefix}_IO_URING_{role}");
-    let mut options = IoUringPoolOptions::default();
-    options.rings = setting(&format!("{prefix}_RINGS"))?.unwrap_or(rings);
-    options.max_in_flight = setting(&format!("{prefix}_MAX_IN_FLIGHT"))?.unwrap_or(max_in_flight);
+    options.rings = setting(&format!("{prefix}_RINGS"))?.unwrap_or(options.rings);
+    options.max_in_flight =
+        setting(&format!("{prefix}_MAX_IN_FLIGHT"))?.unwrap_or(options.max_in_flight);
     options.io_poll = env_bool(&format!("{prefix}_IOPOLL"), false)?;
     let idle = setting(&format!("{prefix}_SQPOLL_MS"))?;
     let cpu = setting(&format!("{prefix}_SQPOLL_CPU"))?;

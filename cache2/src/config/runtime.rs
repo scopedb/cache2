@@ -75,22 +75,35 @@ impl Default for PosixIoOptions {
 /// experimental io_uring engine.
 ///
 /// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
-/// `max_in_flight` is distributed as evenly as possible across `rings`. This
-/// keeps admission capacity independent of the number of driver threads.
+/// Keep [`Self::rings`] at 1 and size [`Self::max_in_flight`] to concurrent work
+/// for this pool. Extra rings split the same depth across driver threads; they
+/// do not add execution slots. Leave [`Self::sq_poll`] and [`Self::io_poll`]
+/// unset unless a host profile needs one of them; they are independent advanced
+/// flags and are easy to combine incorrectly.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringPoolOptions {
-    /// Number of independent rings and driver threads. Defaults to 1.
-    pub rings: usize,
-    /// Aggregate maximum number of in-flight requests. Defaults to 64.
-    pub max_in_flight: usize,
-    /// Kernel submission queue polling for every ring in this pool. Defaults to
-    /// `None`, which disables polling.
-    pub sq_poll: Option<IoUringSqPollOptions>,
-    /// Completion polling for every ring in this pool. Defaults to false.
+    /// Independent rings and driver threads. Defaults to 1.
     ///
-    /// I/O polling consumes CPU while waiting and requires direct I/O on a
-    /// filesystem and block device that support polling.
+    /// Raise this only after `max_in_flight` matches caller concurrency and a
+    /// single driver thread is CPU-bound. Must not exceed `max_in_flight`.
+    pub rings: usize,
+    /// Aggregate maximum in-flight requests. Defaults to 64.
+    ///
+    /// This is the admission bound. It is distributed as evenly as possible
+    /// across `rings`. For the read pool, set it to concurrent L2 gets.
+    pub max_in_flight: usize,
+    /// Advanced kernel submission-queue polling for every ring in this pool.
+    ///
+    /// Defaults to `None`, which disables SQPOLL. SQPOLL does not require
+    /// Direct I/O. Optional CPU affinity applies to every ring in the pool.
+    pub sq_poll: Option<IoUringSqPollOptions>,
+    /// Advanced completion polling for every ring in this pool.
+    ///
+    /// Defaults to false. Requires Direct I/O on a polling-capable filesystem
+    /// and block device. Consumes CPU while requests are outstanding, and a
+    /// cancellation stays advisory until the polled operation completes.
+    /// Independent of [`Self::sq_poll`].
     pub io_poll: bool,
 }
 
@@ -108,7 +121,9 @@ impl Default for IoUringPoolOptions {
 /// Unchecked kernel submission queue polling parameters for the experimental
 /// io_uring engine.
 ///
-/// Start with [`Self::new`] and assign fields before building [`CacheConfig`].
+/// This is an advanced opt-in. Start with [`Self::new`] and assign fields
+/// before building [`CacheConfig`]. For a multi-ring pool, every ring's
+/// polling thread uses the same optional CPU affinity.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringSqPollOptions {
@@ -133,6 +148,9 @@ impl IoUringSqPollOptions {
 /// write, and reclaim pools.
 ///
 /// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
+/// Keep one ring per pool. Set [`IoUringPoolOptions::max_in_flight`] on the read
+/// pool to concurrent L2 gets; leave write and reclaim at their defaults unless
+/// write slot wait or reclaim lag is the limiter.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringOptions {
@@ -168,7 +186,9 @@ pub enum IoEngineOptions {
     /// bounds.
     ///
     /// Its API, configuration, and runtime behavior may change between
-    /// releases.
+    /// releases. Keep one ring per pool and size read `max_in_flight` to
+    /// concurrent L2 gets. SQPOLL and IOPOLL are advanced per-pool opt-ins
+    /// with different requirements.
     ///
     /// This variant is available only with the `io-uring` crate feature on a
     /// supported Linux target.
@@ -185,18 +205,31 @@ impl IoEngineOptions {
     const fn is_available(self) -> bool {
         match self {
             Self::Posix(_) => true,
-            Self::IoUring(_) => cfg!(all(
-                feature = "io-uring",
-                target_os = "linux",
-                any(
-                    target_arch = "x86_64",
-                    target_arch = "aarch64",
-                    target_arch = "riscv64",
-                    target_arch = "loongarch64",
-                    target_arch = "powerpc64"
-                )
-            )),
+            Self::IoUring(_) => io_uring_unavailability().is_none(),
         }
+    }
+}
+
+const IO_URING_UNAVAILABLE_FEATURE: &str = "io_uring requires the io-uring crate feature";
+const IO_URING_UNAVAILABLE_PLATFORM: &str = "io_uring is unavailable on this platform";
+const IO_URING_UNAVAILABLE_ARCHITECTURE: &str = "io_uring is unavailable on this architecture";
+
+/// Names the missing io_uring requirement, if any, for this build and target.
+pub(crate) const fn io_uring_unavailability() -> Option<&'static str> {
+    if cfg!(not(target_os = "linux")) {
+        Some(IO_URING_UNAVAILABLE_PLATFORM)
+    } else if cfg!(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    ))) {
+        Some(IO_URING_UNAVAILABLE_ARCHITECTURE)
+    } else if cfg!(not(feature = "io-uring")) {
+        Some(IO_URING_UNAVAILABLE_FEATURE)
+    } else {
+        None
     }
 }
 
@@ -593,7 +626,7 @@ impl RuntimeOptions {
         if !self.io_engine.is_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "io_uring is unavailable on this build or platform",
+                io_uring_unavailability().expect("unavailable io_uring names a reason"),
             ));
         }
         if !self.io_mode.is_available() {
@@ -1117,6 +1150,56 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn io_uring_unavailability_names_the_missing_requirement() {
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            io_uring_unavailability(),
+            Some(IO_URING_UNAVAILABLE_PLATFORM)
+        );
+        #[cfg(all(
+            target_os = "linux",
+            not(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            ))
+        ))]
+        assert_eq!(
+            io_uring_unavailability(),
+            Some(IO_URING_UNAVAILABLE_ARCHITECTURE)
+        );
+        #[cfg(all(
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            ),
+            not(feature = "io-uring")
+        ))]
+        assert_eq!(
+            io_uring_unavailability(),
+            Some(IO_URING_UNAVAILABLE_FEATURE)
+        );
+        #[cfg(all(
+            feature = "io-uring",
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            )
+        ))]
+        assert_eq!(io_uring_unavailability(), None);
     }
 
     #[cfg(all(

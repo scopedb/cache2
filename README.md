@@ -89,7 +89,22 @@ Changing the append-shard count rebinds recovered Active Regions during a warm o
 
 The default `ReadAdmission::Immediate` returns a miss under read-engine or buffer pressure. `ReadAdmission::Wait` enables a queue bounded by `max_waiters` and a positive `timeout`. Queued requests retain their read descriptor and allocate a buffer after admission. Queue saturation, memory pressure, and timeout return explicit overload.
 
-Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux mode. io_uring requires the `io-uring` feature and remains experimental; its ring count and aggregate in-flight limit are independent, so size `max_in_flight` (or POSIX `read_workers`) to concurrent L2 gets rather than adding rings. SQPOLL and IOPOLL are explicit per-pool opt-ins: SQPOLL adds kernel submission polling with configurable idle time and optional CPU affinity, while IOPOLL adds completion polling and requires direct I/O on polling-capable storage.
+Buffered POSIX I/O is the production path. Direct I/O is an explicit Linux mode. io_uring requires the `io-uring` crate feature on a supported Linux target and remains experimental. Keep one ring per pool; set `read.max_in_flight` to concurrent L2 gets, and leave write and reclaim at their defaults. Extra rings split the same depth across driver threads and do not add slots.
+
+```toml
+cache2 = { version = "0.5", features = ["io-uring"] }
+```
+
+```rust
+use cache2::{IoEngineOptions, IoUringOptions, RuntimeOptions};
+
+let mut io = IoUringOptions::default();
+io.read.max_in_flight = 32; // concurrent L2 get() futures
+let mut runtime = RuntimeOptions::default();
+runtime.io_engine = IoEngineOptions::IoUring(io);
+```
+
+Configuration construction fails with `ErrorKind::Unsupported` when the feature, OS, or architecture is missing, and the I/O source names which one. SQPOLL and IOPOLL are advanced per-pool flags with different requirements; leave both off unless a host profile needs one of them. See [I/O engine and mode](CONFIGURATION.md#io-engine-and-mode).
 
 ### Platform support
 
