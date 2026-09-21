@@ -346,7 +346,12 @@ mod tests {
             Ok(buffer.len())
         }
 
-        fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
+        fn write_at(
+            &self,
+            #[expect(unused_variables)] point: WritePoint,
+            #[expect(unused_variables)] buffer: &[u8],
+            #[expect(unused_variables)] offset: u64,
+        ) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "write unused"))
         }
     }

@@ -262,7 +262,11 @@ mod tests {
     }
 
     impl PositionedIo for RecordingIo {
-        fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+        fn read_at(
+            &self,
+            #[expect(unused_variables)] buffer: &mut [u8],
+            #[expect(unused_variables)] offset: u64,
+        ) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "read unused"))
         }
 

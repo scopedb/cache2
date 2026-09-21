@@ -1020,7 +1020,11 @@ mod tests {
         let depth = 2;
         let state = Arc::new(EngineState::new(depth, false, false));
         let (commands, receiver) = mpsc::sync_channel(depth * 2 + 1);
-        let (_wake_sender, wake_receiver) = UnixStream::pair().unwrap();
+        #[expect(
+            unused_variables,
+            reason = "Keep the peer open while exercising the driver."
+        )]
+        let (wake_sender, wake_receiver) = UnixStream::pair().unwrap();
         let producer = Arc::new(CancelledCommandProducer {
             state: Arc::clone(&state),
             commands,

@@ -167,7 +167,7 @@ struct MemoryCharge {
 struct MemoryValueInner {
     bytes: Box<[u8]>,
     key_length: usize,
-    _charge: MemoryCharge,
+    charge: MemoryCharge,
 }
 
 #[derive(Clone)]
@@ -197,7 +197,7 @@ impl MemoryValue {
         Ok(Self(Arc::new(MemoryValueInner {
             bytes: bytes.into_boxed_slice(),
             key_length: key.len(),
-            _charge: charge,
+            charge,
         })))
     }
 
@@ -225,7 +225,7 @@ impl MemoryValue {
 
     fn disarm_exclusive_charge(&mut self) -> usize {
         let inner = Arc::get_mut(&mut self.0).expect("exclusive resident value gained an owner");
-        inner._charge.disarm()
+        inner.charge.disarm()
     }
 }
 
@@ -501,7 +501,11 @@ impl MemoryShard {
                     .charged_bytes()
             );
         }
-        let _entry = self.slots[index].take().expect("resident slot disappeared");
+        #[expect(
+            unused_variables,
+            reason = "Release the value after slot bookkeeping is complete."
+        )]
+        let entry = self.slots[index].take().expect("resident slot disappeared");
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
         debug_assert!(self.free_count < self.slots.len());
         let packed = u32::try_from(index).expect("memory slot index exceeds u32");

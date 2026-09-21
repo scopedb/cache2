@@ -108,7 +108,7 @@ impl ManagedMemory {
         let buffer = AlignedBuffer::try_new(capacity)?;
         Some(BufferLease {
             buffer,
-            _reservation: Some(reservation),
+            reservation: Some(reservation),
         })
     }
 
@@ -133,7 +133,11 @@ pub struct BufferLease {
     // Fields drop in declaration order: free the allocation before returning
     // its budget. Fixed staging buffers use their owner's aggregate charge.
     buffer: AlignedBuffer,
-    _reservation: Option<MemoryReservation>,
+    #[expect(
+        dead_code,
+        reason = "Returns the memory charge after the allocation is dropped."
+    )]
+    reservation: Option<MemoryReservation>,
 }
 
 impl BufferLease {
@@ -147,7 +151,7 @@ impl BufferLease {
         buffer.prepare_zeroed(length);
         Ok(Self {
             buffer,
-            _reservation: None,
+            reservation: None,
         })
     }
 

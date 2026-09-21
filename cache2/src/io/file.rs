@@ -523,7 +523,7 @@ impl StorageFile for CacheFile {
         }
     }
 
-    fn sync(&self, _point: SyncPoint, mode: SyncMode) -> io::Result<()> {
+    fn sync(&self, #[expect(unused_variables)] point: SyncPoint, mode: SyncMode) -> io::Result<()> {
         match mode {
             SyncMode::Data => self.file.sync_data(),
             SyncMode::All => self.file.sync_all(),
@@ -572,7 +572,12 @@ impl PositionedIo for CacheFile {
         self.file.read_at(buffer, offset)
     }
 
-    fn write_at(&self, _point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
+    fn write_at(
+        &self,
+        #[expect(unused_variables)] point: WritePoint,
+        buffer: &[u8],
+        offset: u64,
+    ) -> io::Result<usize> {
         self.file.write_at(buffer, offset)
     }
 }
@@ -874,7 +879,11 @@ mod tests {
     }
 
     impl PositionedIo for InterruptedIo {
-        fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+        fn read_at(
+            &self,
+            #[expect(unused_variables)] buffer: &mut [u8],
+            #[expect(unused_variables)] offset: u64,
+        ) -> io::Result<usize> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -882,7 +891,12 @@ mod tests {
             ))
         }
 
-        fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
+        fn write_at(
+            &self,
+            #[expect(unused_variables)] point: WritePoint,
+            #[expect(unused_variables)] buffer: &[u8],
+            #[expect(unused_variables)] offset: u64,
+        ) -> io::Result<usize> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,

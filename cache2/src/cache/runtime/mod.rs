@@ -883,12 +883,12 @@ impl CacheRuntime {
                 current_bytes,
             } => {
                 if ADMIT_L1 {
-                    let _published = state.memory.publish(hash, key, value, seqno);
+                    state.memory.publish(hash, key, value, seqno);
                 } else {
                     // Prevent an older exact-key L1 value from indefinitely
                     // shadowing the prefetched L2 record. Contention remains a
                     // valid best-effort stale outcome.
-                    let _removed = state.memory.delete(hash, key, seqno);
+                    state.memory.delete(hash, key, seqno);
                 }
                 if should_wake_write(
                     previous_bytes,
@@ -940,7 +940,7 @@ impl CacheRuntime {
             }
             return Err(write_overload_error());
         };
-        let _removed = state.memory.delete(hash, key, seqno);
+        state.memory.delete(hash, key, seqno);
         if let Some(activity) = activity {
             RuntimeMetrics::increment(&activity.deletes);
         }
@@ -1268,7 +1268,11 @@ impl CacheRuntime {
     pub fn drain(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait()?;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        #[expect(
+            unused_variables,
+            reason = "Restore lifecycle state when draining finishes."
+        )]
+        let draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
         drain_shards(state, false)
     }
@@ -1276,7 +1280,11 @@ impl CacheRuntime {
     pub async fn drain_async(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait_async().await;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        #[expect(
+            unused_variables,
+            reason = "Restore lifecycle state on completion or cancellation."
+        )]
+        let draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
         drain_shards_async(state, false).await
     }
@@ -1361,7 +1369,11 @@ impl CacheRuntime {
             .get(shard_id)
             .expect("test shard exists");
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let _state = shard.state.lock().unwrap();
+            #[expect(
+                unused_variables,
+                reason = "Keep the guard alive so unwinding poisons the lock."
+            )]
+            let state = shard.state.lock().unwrap();
             panic!("poison shard gate");
         }));
         assert!(result.is_err());

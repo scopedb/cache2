@@ -252,7 +252,11 @@ pub struct AppendStaging {
     shards: Vec<ShardStaging>,
     chunk_bytes: usize,
     region_size: u64,
-    _reservation: MemoryReservation,
+    #[expect(
+        dead_code,
+        reason = "Returns the aggregate charge when staging is dropped."
+    )]
+    reservation: MemoryReservation,
 }
 
 impl AppendStaging {
@@ -329,7 +333,7 @@ impl AppendStaging {
             shards,
             chunk_bytes,
             region_size,
-            _reservation: reservation,
+            reservation,
         })
     }
 

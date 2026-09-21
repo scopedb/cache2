@@ -881,7 +881,8 @@ impl RegionStore {
             ));
         }
         let payload = RecordPayload::new(key, value);
-        let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
+        #[expect(unused_variables)]
+        let shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
             Err(TryLockError::Poisoned(_)) => {

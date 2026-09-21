@@ -369,7 +369,11 @@ fn run_crash_child(case: &str, paths: RegionPaths) -> ! {
     let data = data_path_superblock();
     match case {
         "open" => {
-            let _store = CacheSession::for_test(paths, data, 4096).unwrap();
+            #[expect(
+                unused_variables,
+                reason = "Keep the session open until the process is killed."
+            )]
+            let session = CacheSession::for_test(paths, data, 4096).unwrap();
             kill_process();
         }
         "write" | "drain" => {
@@ -913,8 +917,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
             outcome => panic!("unexpected staging outcome: {outcome:?}"),
         }
     }
-    let (first_key, first_hash, _first_seqno) =
-        first.expect("4 MiB span must contain target-size records");
+    let (first_key, first_hash, _) = first.expect("4 MiB span must contain target-size records");
     let (last_key, last_hash, last_seqno) = last.expect("4 MiB span must retain its final record");
     assert!(staged_records > 240);
     assert_eq!(regions.lookup_snapshot(first_hash).unwrap(), None);
