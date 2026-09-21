@@ -29,7 +29,7 @@ use crate::FillControlSnapshot;
 use crate::FillLimits;
 use crate::FillPressure;
 
-const UNIT: u64 = 64;
+const CREDIT_UNIT_BYTES: u64 = 64;
 const MAX_CAS_ATTEMPTS: usize = 4;
 const MIN_BYTES_PER_SECOND: u64 = 640;
 const MAX_BYTES_PER_SECOND: u64 = 1 << 40;
@@ -44,18 +44,18 @@ pub const FLUSH_RETRY: Duration = Duration::from_millis(100);
 /// Credit taken by one non-essential flush. Zero for Observe and essential work.
 #[derive(Clone, Copy)]
 pub struct FlushCharge {
-    pub(crate) ops: u64,
-    pub(crate) units: u64,
+    pub records: u64,
+    pub byte_units: u64,
 }
 
-fn packed_ops(value: u64) -> u64 {
+fn packed_records(value: u64) -> u64 {
     value >> 32
 }
-fn packed_units(value: u64) -> u64 {
+fn packed_byte_units(value: u64) -> u64 {
     value & u64::from(u32::MAX)
 }
-fn pack_credit(ops: u64, units: u64) -> u64 {
-    (ops << 32) | units
+fn pack_credit(records: u64, byte_units: u64) -> u64 {
+    (records << 32) | byte_units
 }
 
 fn encode_pressure(pressure: FillPressure) -> u8 {
@@ -84,10 +84,10 @@ struct Slot {
 }
 
 pub struct FillController {
-    options: FillLimits,
+    limits: FillLimits,
     enforcing: bool,
-    max_units: u64,
-    max_ops: u64,
+    max_byte_units: u64,
+    max_records: u64,
     origin: Instant,
     credit: AtomicU64,
     last_refill_ns: AtomicU64,
@@ -99,21 +99,19 @@ pub struct FillController {
     would_reject: AtomicU64,
     dropped_observations: AtomicU64,
     completed_bytes: AtomicU64,
-    completed_ops: AtomicU64,
+    completed_io_operations: AtomicU64,
     slots: Box<[Slot]>,
 }
 
 impl FillController {
     pub fn allocation_bytes(options: FillControlOptions, slots: usize) -> io::Result<usize> {
-        let settings = match options {
+        let limits = match options {
             FillControlOptions::Disabled => return Ok(0),
-            FillControlOptions::Observe(settings) | FillControlOptions::Adaptive(settings) => {
-                settings
-            }
+            FillControlOptions::Observe(limits) | FillControlOptions::Adaptive(limits) => limits,
         };
-        if !(MIN_BYTES_PER_SECOND..=MAX_BYTES_PER_SECOND).contains(&settings.max_bytes_per_second)
+        if !(MIN_BYTES_PER_SECOND..=MAX_BYTES_PER_SECOND).contains(&limits.max_bytes_per_second)
             || !(MIN_RECORDS_PER_SECOND..=MAX_RECORDS_PER_SECOND)
-                .contains(&settings.max_records_per_second)
+                .contains(&limits.max_records_per_second)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -134,24 +132,24 @@ impl FillController {
     pub fn new(
         options: FillControlOptions,
         slots: usize,
-        max_record: u64,
+        max_flush_bytes: u64,
     ) -> io::Result<Option<Arc<Self>>> {
         Self::allocation_bytes(options, slots)?;
-        let (settings, enforcing) = match options {
+        let (limits, enforcing) = match options {
             FillControlOptions::Disabled => return Ok(None),
-            FillControlOptions::Observe(settings) => (settings, false),
-            FillControlOptions::Adaptive(settings) => (settings, true),
+            FillControlOptions::Observe(limits) => (limits, false),
+            FillControlOptions::Adaptive(limits) => (limits, true),
         };
-        let max_units = (settings.max_bytes_per_second / TICKS_PER_SECOND)
-            .max(max_record)
-            .div_ceil(UNIT);
-        if max_units > u64::from(u32::MAX) {
+        let max_byte_units = (limits.max_bytes_per_second / TICKS_PER_SECOND)
+            .max(max_flush_bytes)
+            .div_ceil(CREDIT_UNIT_BYTES);
+        if max_byte_units > u64::from(u32::MAX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "fill burst exceeds budget representation",
             ));
         }
-        let max_ops = u64::from(settings.max_records_per_second / TICKS_PER_SECOND as u32).max(1);
+        let max_records = u64::from(limits.max_records_per_second / TICKS_PER_SECOND as u32).max(1);
         let mut table = Vec::new();
         table.try_reserve_exact(slots).map_err(|_| {
             io::Error::new(
@@ -164,12 +162,12 @@ impl FillController {
             bytes: AtomicU64::new(0),
         });
         Ok(Some(Arc::new(Self {
-            options: settings,
+            limits,
             enforcing,
-            max_units,
-            max_ops,
+            max_byte_units,
+            max_records,
             origin: Instant::now(),
-            credit: AtomicU64::new(pack_credit(max_ops, max_units)),
+            credit: AtomicU64::new(pack_credit(max_records, max_byte_units)),
             last_refill_ns: AtomicU64::new(0),
             pressure: AtomicU8::new(encode_pressure(FillPressure::Healthy)),
             stopped: AtomicBool::new(false),
@@ -179,7 +177,7 @@ impl FillController {
             would_reject: AtomicU64::new(0),
             dropped_observations: AtomicU64::new(0),
             completed_bytes: AtomicU64::new(0),
-            completed_ops: AtomicU64::new(0),
+            completed_io_operations: AtomicU64::new(0),
             slots: table.into_boxed_slice(),
         })))
     }
@@ -284,8 +282,8 @@ impl FillController {
             (0, 0)
         } else {
             (
-                self.options.max_bytes_per_second,
-                self.options.max_records_per_second,
+                self.limits.max_bytes_per_second,
+                self.limits.max_records_per_second,
             )
         };
         FillControlSnapshot {
@@ -304,7 +302,7 @@ impl FillController {
     }
 
     /// Foreground admission: Adaptive rejects only while paused.
-    pub fn try_admit(&self) -> bool {
+    pub fn try_admit_fill(&self) -> bool {
         if !self.enforcing {
             if self.paused() {
                 self.would_reject.fetch_add(1, Ordering::Relaxed);
@@ -320,41 +318,60 @@ impl FillController {
     }
 
     /// Background flush pacing. Essential flushes always proceed.
-    pub fn try_flush(&self, bytes: u64, records: u32, essential: bool) -> Option<FlushCharge> {
+    pub fn try_acquire_flush_budget(
+        &self,
+        bytes: u64,
+        records: u32,
+        essential: bool,
+    ) -> Option<FlushCharge> {
         if essential || !self.enforcing {
-            return Some(FlushCharge { ops: 0, units: 0 });
+            return Some(FlushCharge {
+                records: 0,
+                byte_units: 0,
+            });
         }
         self.refill();
-        let raw_units = bytes.div_ceil(UNIT).max(1);
-        let raw_ops = u64::from(records.max(1));
-        let units = raw_units.min(self.max_units);
-        let ops = raw_ops.min(self.max_ops);
-        let byte_oversized = raw_units >= self.max_units;
-        let record_oversized = raw_ops >= self.max_ops;
+        let raw_byte_units = bytes.div_ceil(CREDIT_UNIT_BYTES).max(1);
+        let raw_records = u64::from(records.max(1));
+        let byte_units = raw_byte_units.min(self.max_byte_units);
+        let records = raw_records.min(self.max_records);
+        let byte_oversized = raw_byte_units >= self.max_byte_units;
+        let record_oversized = raw_records >= self.max_records;
         let mut value = self.credit.load(Ordering::Relaxed);
         for _ in 0..MAX_CAS_ATTEMPTS {
-            let have_units = packed_units(value);
-            let have_ops = packed_ops(value);
-            if have_units == 0 || have_ops == 0 {
+            let have_byte_units = packed_byte_units(value);
+            let have_records = packed_records(value);
+            if have_byte_units == 0 || have_records == 0 {
                 return None;
             }
-            if !byte_oversized && have_units < units {
+            if !byte_oversized && have_byte_units < byte_units {
                 return None;
             }
-            if !record_oversized && have_ops < ops {
+            if !record_oversized && have_records < records {
                 return None;
             }
-            let take_units = if byte_oversized { have_units } else { units };
-            let take_ops = if record_oversized { have_ops } else { ops };
-            let next = pack_credit(have_ops - take_ops, have_units - take_units);
+            let take_byte_units = if byte_oversized {
+                have_byte_units
+            } else {
+                byte_units
+            };
+            let take_records = if record_oversized {
+                have_records
+            } else {
+                records
+            };
+            let next = pack_credit(
+                have_records - take_records,
+                have_byte_units - take_byte_units,
+            );
             match self
                 .credit
                 .compare_exchange(value, next, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => {
                     return Some(FlushCharge {
-                        ops: take_ops,
-                        units: take_units,
+                        records: take_records,
+                        byte_units: take_byte_units,
                     });
                 }
                 Err(current) => value = current,
@@ -363,11 +380,11 @@ impl FillController {
         None
     }
 
-    pub fn refund_flush(&self, charge: FlushCharge) {
-        if !self.enforcing || (charge.ops == 0 && charge.units == 0) {
+    pub fn refund_flush_budget(&self, charge: FlushCharge) {
+        if !self.enforcing || (charge.records == 0 && charge.byte_units == 0) {
             return;
         }
-        self.add_credit(charge.ops, charge.units);
+        self.add_credit(charge.records, charge.byte_units);
     }
 
     fn refill(&self) {
@@ -376,18 +393,18 @@ impl FillController {
         let Some(dt) = now.checked_sub(last).filter(|dt| *dt != 0) else {
             return;
         };
-        let add_units = self
-            .options
+        let add_byte_units = self
+            .limits
             .max_bytes_per_second
             .saturating_mul(dt)
             .checked_div(1_000_000_000)
             .unwrap_or(0)
-            / UNIT;
-        let add_ops = u64::from(self.options.max_records_per_second)
+            / CREDIT_UNIT_BYTES;
+        let add_records = u64::from(self.limits.max_records_per_second)
             .saturating_mul(dt)
             .checked_div(1_000_000_000)
             .unwrap_or(0);
-        if add_units == 0 && add_ops == 0 {
+        if add_byte_units == 0 && add_records == 0 {
             return;
         }
         if self
@@ -397,18 +414,18 @@ impl FillController {
         {
             return;
         }
-        self.add_credit(add_ops, add_units);
+        self.add_credit(add_records, add_byte_units);
     }
 
-    fn add_credit(&self, ops: u64, units: u64) {
-        if ops == 0 && units == 0 {
+    fn add_credit(&self, records: u64, byte_units: u64) {
+        if records == 0 && byte_units == 0 {
             return;
         }
         let mut value = self.credit.load(Ordering::Relaxed);
         loop {
             let next = pack_credit(
-                (packed_ops(value) + ops).min(self.max_ops),
-                (packed_units(value) + units).min(self.max_units),
+                (packed_records(value) + records).min(self.max_records),
+                (packed_byte_units(value) + byte_units).min(self.max_byte_units),
             );
             match self
                 .credit
@@ -476,7 +493,9 @@ impl Drop for Observation<'_> {
         let bytes = slot.bytes.load(Ordering::Relaxed);
         slot.start_ns.store(0, Ordering::Release);
         if self.succeeded {
-            self.control.completed_ops.fetch_add(1, Ordering::Relaxed);
+            self.control
+                .completed_io_operations
+                .fetch_add(1, Ordering::Relaxed);
             self.control
                 .completed_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
@@ -492,12 +511,12 @@ mod tests {
     use super::*;
 
     fn control(enforcing: bool) -> Arc<FillController> {
-        let settings = FillLimits::new(64_000, 100);
+        let limits = FillLimits::new(64_000, 100);
         FillController::new(
             if enforcing {
-                FillControlOptions::Adaptive(settings)
+                FillControlOptions::Adaptive(limits)
             } else {
-                FillControlOptions::Observe(settings)
+                FillControlOptions::Observe(limits)
             },
             4,
             4096,
@@ -508,7 +527,7 @@ mod tests {
 
     fn restore_burst(control: &FillController) {
         control.credit.store(
-            pack_credit(control.max_ops, control.max_units),
+            pack_credit(control.max_records, control.max_byte_units),
             Ordering::Release,
         );
     }
@@ -523,32 +542,32 @@ mod tests {
     fn foreground_admit_ignores_flush_budget() {
         let control = control(true);
         for _ in 0..10 {
-            assert!(control.try_flush(64, 1, false).is_some());
+            assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
         }
-        assert!(control.try_flush(64, 1, false).is_none());
-        assert!(control.try_admit());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_none());
+        assert!(control.try_admit_fill());
     }
 
     #[test]
     fn record_budget_paces_nonessential_flush() {
         let control = control(true);
         for _ in 0..10 {
-            assert!(control.try_flush(64, 1, false).is_some());
+            assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
         }
-        assert!(control.try_flush(64, 1, false).is_none());
-        assert!(control.try_flush(64, 1, true).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_none());
+        assert!(control.try_acquire_flush_budget(64, 1, true).is_some());
         restore_burst(&control);
-        assert!(control.try_flush(64, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }
 
     #[test]
     fn byte_budget_paces_nonessential_flush() {
         let control = control(true);
-        assert!(control.try_flush(4096, 1, false).is_some());
-        assert!(control.try_flush(4096, 1, false).is_none());
-        assert!(control.try_flush(64, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(4096, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(4096, 1, false).is_none());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
         restore_burst(&control);
-        assert!(control.try_flush(4096, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(4096, 1, false).is_some());
     }
 
     #[test]
@@ -559,10 +578,10 @@ mod tests {
         fast.finish();
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
         drop(old);
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
     }
 
     #[test]
@@ -572,7 +591,7 @@ mod tests {
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         for _ in 0..20 {
-            assert!(control.try_admit());
+            assert!(control.try_admit_fill());
         }
         assert_eq!(control.snapshot().would_reject, 20);
         assert_eq!(control.snapshot().rejections, 0);
@@ -583,14 +602,14 @@ mod tests {
     fn observe_would_reject_counts_pause_not_budget() {
         let control = control(false);
         for _ in 0..20 {
-            assert!(control.try_flush(4096, 1, false).is_some());
-            assert!(control.try_admit());
+            assert!(control.try_acquire_flush_budget(4096, 1, false).is_some());
+            assert!(control.try_admit_fill());
         }
         assert_eq!(control.snapshot().would_reject, 0);
         let mut old = control.observe(4096, Duration::from_secs(2)).unwrap();
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
         assert_eq!(control.snapshot().would_reject, 1);
         assert_eq!(control.snapshot().rejections, 0);
     }
@@ -601,8 +620,8 @@ mod tests {
         control.last_refill_ns.store(0, Ordering::Relaxed);
         control.refill();
         let credit = control.credit.load(Ordering::Relaxed);
-        assert_eq!(packed_ops(credit), control.max_ops);
-        assert_eq!(packed_units(credit), control.max_units);
+        assert_eq!(packed_records(credit), control.max_records);
+        assert_eq!(packed_byte_units(credit), control.max_byte_units);
     }
 
     #[test]
@@ -614,11 +633,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(control.try_flush(4096, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(4096, 1, false).is_some());
         restore_burst(&control);
-        assert!(control.try_flush(4096, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(4096, 1, false).is_some());
         control.stop();
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
     }
 
     #[test]
@@ -626,10 +645,10 @@ mod tests {
         let control = control(true);
         control.set_recovering(true);
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
         control.set_recovering(false);
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
     }
 
     #[test]
@@ -637,13 +656,13 @@ mod tests {
         let control = control(true);
         control.set_recovering(true);
         control.set_recovering(true);
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
         control.set_recovering(false);
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
         control.set_recovering(false);
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
     }
 
     #[test]
@@ -661,7 +680,7 @@ mod tests {
         drop(pending);
         let pending = control.observe(4096, Duration::from_secs(5)).unwrap();
         drop(pending);
-        assert_eq!(control.completed_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(control.completed_io_operations.load(Ordering::Relaxed), 0);
         assert_eq!(control.completed_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(control.slots[0].start_ns.load(Ordering::Acquire), 0);
     }
@@ -677,7 +696,7 @@ mod tests {
                 let accepted = &accepted;
                 scope.spawn(move || {
                     for _ in 0..100 {
-                        if control.try_flush(640, 1, false).is_some() {
+                        if control.try_acquire_flush_budget(640, 1, false).is_some() {
                             accepted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -692,10 +711,10 @@ mod tests {
         let control = control(true);
         let mut pending = control.observe(4096, Duration::from_secs(2)).unwrap();
         pending.note_slow();
-        assert!(!control.try_admit());
+        assert!(!control.try_admit_fill());
         pending.clear_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
         pending.finish();
     }
 
@@ -708,14 +727,14 @@ mod tests {
                 scope.spawn(move || {
                     let mut pending = control.observe(64, Duration::from_secs(2)).unwrap();
                     pending.note_slow();
-                    assert!(!control.try_admit());
+                    assert!(!control.try_admit_fill());
                     drop(pending);
                 });
             }
         });
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
         assert_eq!(control.pause_holders.load(Ordering::Acquire), 0);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
     }
 
     #[test]
@@ -730,7 +749,7 @@ mod tests {
             drop(second);
             assert_eq!(control.pause_holders.load(Ordering::Acquire), 0);
             assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-            assert!(control.try_admit());
+            assert!(control.try_admit_fill());
         }
     }
 
@@ -738,25 +757,36 @@ mod tests {
     fn burst_sized_flush_proceeds_on_remaining_credit() {
         let control = control(true);
         freeze_refill(&control);
-        assert!(control.try_flush(64, 1, false).is_some());
-        assert!(control.try_flush(1_000_000, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
+        assert!(
+            control
+                .try_acquire_flush_budget(1_000_000, 1, false)
+                .is_some()
+        );
         restore_burst(&control);
         freeze_refill(&control);
-        assert!(control.try_flush(64, 1, false).is_some());
-        assert!(control.try_flush(64, 1_000_000, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
+        assert!(
+            control
+                .try_acquire_flush_budget(64, 1_000_000, false)
+                .is_some()
+        );
     }
 
     #[test]
     fn refund_restores_nonessential_budget() {
         let control = control(true);
         freeze_refill(&control);
-        let mut last = FlushCharge { ops: 0, units: 0 };
+        let mut last = FlushCharge {
+            records: 0,
+            byte_units: 0,
+        };
         for _ in 0..10 {
-            last = control.try_flush(64, 1, false).unwrap();
+            last = control.try_acquire_flush_budget(64, 1, false).unwrap();
         }
-        assert!(control.try_flush(64, 1, false).is_none());
-        control.refund_flush(last);
-        assert!(control.try_flush(64, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_none());
+        control.refund_flush_budget(last);
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }
 
     #[test]
@@ -769,7 +799,7 @@ mod tests {
         .unwrap()
         .unwrap();
         freeze_refill(&control);
-        while control.try_flush(64, 1, false).is_some() {}
+        while control.try_acquire_flush_budget(64, 1, false).is_some() {}
         let one_ms_ago = control.elapsed_ns().saturating_sub(1_000_000);
         control.last_refill_ns.store(one_ms_ago, Ordering::Relaxed);
         for _ in 0..32 {
@@ -778,7 +808,7 @@ mod tests {
         assert_eq!(control.last_refill_ns.load(Ordering::Relaxed), one_ms_ago);
         std::thread::sleep(Duration::from_millis(110));
         control.refill();
-        assert!(control.try_flush(64, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }
 
     #[test]
@@ -791,24 +821,27 @@ mod tests {
         .unwrap()
         .unwrap();
         freeze_refill(&control);
-        while control.try_flush(64, 1, false).is_some() {}
+        while control.try_acquire_flush_budget(64, 1, false).is_some() {}
         let before = control.credit.load(Ordering::Relaxed);
         std::thread::scope(|scope| {
             for _ in 0..32 {
                 let control = &control;
                 scope.spawn(move || {
-                    control.refund_flush(FlushCharge { ops: 1, units: 1 });
+                    control.refund_flush_budget(FlushCharge {
+                        records: 1,
+                        byte_units: 1,
+                    });
                 });
             }
         });
         let credit = control.credit.load(Ordering::Relaxed);
         assert_eq!(
-            packed_ops(credit),
-            (packed_ops(before) + 32).min(control.max_ops)
+            packed_records(credit),
+            (packed_records(before) + 32).min(control.max_records)
         );
         assert_eq!(
-            packed_units(credit),
-            (packed_units(before) + 32).min(control.max_units)
+            packed_byte_units(credit),
+            (packed_byte_units(before) + 32).min(control.max_byte_units)
         );
     }
 
@@ -817,16 +850,18 @@ mod tests {
         let control = control(true);
         freeze_refill(&control);
         for _ in 0..9 {
-            assert!(control.try_flush(64, 1, false).is_some());
+            assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
         }
-        let charge = control.try_flush(1_000_000, 1, false).unwrap();
-        assert_eq!(charge.ops, 1);
-        assert_eq!(charge.units, control.max_units - 9);
-        control.refund_flush(charge);
+        let charge = control
+            .try_acquire_flush_budget(1_000_000, 1, false)
+            .unwrap();
+        assert_eq!(charge.records, 1);
+        assert_eq!(charge.byte_units, control.max_byte_units - 9);
+        control.refund_flush_budget(charge);
         let credit = control.credit.load(Ordering::Relaxed);
-        assert_eq!(packed_ops(credit), 1);
-        assert_eq!(packed_units(credit), charge.units);
-        assert!(control.try_flush(64, 1, false).is_some());
-        assert!(control.try_flush(64, 1, false).is_none());
+        assert_eq!(packed_records(credit), 1);
+        assert_eq!(packed_byte_units(credit), charge.byte_units);
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
+        assert!(control.try_acquire_flush_budget(64, 1, false).is_none());
     }
 }

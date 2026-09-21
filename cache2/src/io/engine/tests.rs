@@ -1375,7 +1375,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             }
             let paused = control.snapshot();
             let recovered = io_recovery.is_recovering();
-            let admission = control.try_admit();
+            let admission = control.try_admit_fill();
             io.release();
             let completion = returned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(paused.pressure, FillPressure::Paused);
@@ -1384,7 +1384,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             assert_eq!(paused.outstanding_bytes, 4096);
             assert!(completion.into_io_result().0.is_ok());
             assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-            assert!(control.try_admit());
+            assert!(control.try_admit_fill());
             validate_tx.send(()).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1392,7 +1392,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
-        assert!(control.try_admit());
+        assert!(control.try_admit_fill());
         assert_eq!(lock_unpoisoned(&io.state).entered, 1);
         engine.shutdown().unwrap();
     }

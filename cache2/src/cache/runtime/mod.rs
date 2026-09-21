@@ -848,7 +848,7 @@ impl CacheRuntime {
             }
         };
         if let Some(fill) = &state.io_recovery.fill
-            && !fill.try_admit()
+            && !fill.try_admit_fill()
         {
             if state.activity_counters {
                 state.metrics.record_write_rejection();
@@ -1922,8 +1922,13 @@ fn append_worker_result(
                     let bytes = fill.bytes as u64;
                     let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
                     let charge = match &state.io_recovery.fill {
-                        None => Some(FlushCharge { ops: 0, units: 0 }),
-                        Some(control) => control.try_flush(bytes, records, essential),
+                        None => Some(FlushCharge {
+                            records: 0,
+                            byte_units: 0,
+                        }),
+                        Some(control) => {
+                            control.try_acquire_flush_budget(bytes, records, essential)
+                        }
                     };
                     if let Some(charge) = charge {
                         let engine = state.write_engine_for(shard_id as u64);
@@ -1936,7 +1941,7 @@ fn append_worker_result(
                             Some(_) => deadline = None,
                             None => {
                                 if let Some(control) = &state.io_recovery.fill {
-                                    control.refund_flush(charge);
+                                    control.refund_flush_budget(charge);
                                 }
                                 deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
                             }
