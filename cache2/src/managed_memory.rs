@@ -151,31 +151,6 @@ impl BufferLease {
         })
     }
 
-    #[cfg(test)]
-    pub fn prepare(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let buffer = &mut self.buffer;
-        if length > buffer.capacity {
-            return Err(());
-        }
-        // Callers encode complete records. Clearing here also fixes padding and
-        // prevents bytes from a prior key/value escaping into a later write.
-        buffer.prepare_zeroed(length);
-        Ok(buffer.prefix_mut(length))
-    }
-
-    /// Grow the leased buffer without clearing bytes already in the buffer.
-    ///
-    /// Fresh capacity is zeroed before it is exposed as initialized bytes.
-    #[cfg(test)]
-    fn grow_preserving(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let buffer = &mut self.buffer;
-        if length > buffer.capacity {
-            return Err(());
-        }
-        buffer.zero_uninitialized_through(length);
-        Ok(buffer.prefix_mut(length))
-    }
-
     pub fn prepared(&self, length: usize) -> Result<&[u8], ()> {
         let buffer = &self.buffer;
         if length > buffer.initialized {
@@ -251,21 +226,6 @@ impl AlignedBuffer {
         // a Rust reference is created.
         unsafe { self.ptr.as_ptr().write_bytes(0, length) };
         self.initialized = self.initialized.max(length);
-    }
-
-    #[cfg(test)]
-    fn zero_uninitialized_through(&mut self, length: usize) {
-        debug_assert!(length <= self.capacity);
-        if length > self.initialized {
-            // SAFETY: the uninitialized tail is inside the owned allocation.
-            unsafe {
-                self.ptr
-                    .as_ptr()
-                    .add(self.initialized)
-                    .write_bytes(0, length - self.initialized);
-            }
-            self.initialized = length;
-        }
     }
 
     fn prefix_mut(&mut self, length: usize) -> &mut [u8] {
@@ -383,25 +343,42 @@ mod tests {
     }
 
     #[test]
-    fn preserving_growth_keeps_prefix_and_zeroes_fresh_capacity() {
-        let mut buffer = BufferLease::try_fixed(3 * BUFFER_ALIGNMENT).unwrap();
+    fn read_buffers_expose_only_the_initialized_prefix() {
+        let managed_memory = ManagedMemory::try_new(limits()).unwrap();
+        let mut buffer = managed_memory.try_read_buffer(5000).unwrap();
+        let bytes = b"completed read prefix";
+        let target = buffer.read_target(5000).unwrap();
+        // SAFETY: simulate a completed read into the exclusively owned target;
+        // the source and destination do not overlap and the bytes fit.
+        unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
 
-        let first = buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap();
-        assert!(first.iter().all(|byte| *byte == 0));
-        first.fill(0x5a);
+        assert!(buffer.prepared(bytes.len()).is_err());
+        buffer.mark_initialized(bytes.len()).unwrap();
+        assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
+        assert!(buffer.prepared(bytes.len() + 1).is_err());
+        assert!(buffer.prepared_mut(bytes.len() + 1).is_err());
 
-        let grown = buffer.grow_preserving(2 * BUFFER_ALIGNMENT).unwrap();
-        assert!(grown[..BUFFER_ALIGNMENT].iter().all(|byte| *byte == 0x5a));
-        assert!(grown[BUFFER_ALIGNMENT..].iter().all(|byte| *byte == 0));
-        assert_eq!(buffer.address() % BUFFER_ALIGNMENT, 0);
+        // A shorter read can reuse the buffer without invalidating its prefix.
+        buffer.mark_initialized(1).unwrap();
+        assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
+        assert!(buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1).is_err());
+        assert!(buffer.prepared(bytes.len() + 1).is_err());
     }
 
     #[test]
-    fn failed_preserving_growth_keeps_the_existing_buffer() {
-        let mut buffer = BufferLease::try_fixed(2 * BUFFER_ALIGNMENT).unwrap();
-        buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
+    fn fixed_buffers_are_zeroed_and_reject_out_of_bounds_access() {
+        let mut buffer = BufferLease::try_fixed(BUFFER_ALIGNMENT).unwrap();
+        assert!(
+            buffer
+                .prepared(BUFFER_ALIGNMENT)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        buffer.prepared_mut(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
 
-        assert!(buffer.grow_preserving(3 * BUFFER_ALIGNMENT).is_err());
+        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_err());
+        assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_err());
         assert!(
             buffer
                 .prepared(BUFFER_ALIGNMENT)

@@ -199,7 +199,11 @@ fn read_buffer(managed_memory: &Arc<ManagedMemory>, length: usize) -> IoBuffer {
 
 fn write_buffer(managed_memory: &Arc<ManagedMemory>, bytes: &[u8]) -> IoBuffer {
     let mut lease = managed_memory.try_read_buffer(bytes.len()).unwrap();
-    lease.prepare(bytes.len()).unwrap().copy_from_slice(bytes);
+    let target = lease.read_target(bytes.len()).unwrap();
+    // SAFETY: the exclusively owned target fits the source, and the allocations
+    // do not overlap. Publish the initialized range only after copying it.
+    unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+    lease.mark_initialized(bytes.len()).unwrap();
     IoBuffer::for_write(lease, bytes.len()).unwrap()
 }
 
