@@ -45,7 +45,7 @@ The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults
 
 Request and latency collection are controlled independently by `CACHE_BENCH_REQUEST_STATS` (complete request counters, default false), `CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL`, `CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL`, and `CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL` (independent: 0 off, 1 full, greater values sample with that mean interval; default 0), `CACHE_BENCH_IO_LATENCY` (full engine latency, default false), and `CACHE_BENCH_STATS_SHARDS` (default 16). These instrument the library itself. `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` remains the independent benchmark observer and should be held constant across comparisons. The effective statistics settings are printed with each run. Compare disabled, counters-only, full and sampled modes on the same workload, keeping actual hit/overload populations in view.
 
-`CACHE_BENCH_ACTIVITY_COUNTERS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs.
+`CACHE_BENCH_ACTIVITY_COUNTERS=true` adds cache accounting on the measured request path. Use the same setting for baseline and candidate runs. The `result phase=read_io` line then also reports `in_flight_peak`, `configured_in_flight`, `slot_wait_ns`, `payload_bytes`, and `read_amp` (engine read bytes divided by served payload bytes).
 
 For device measurements, use a data set larger than host RAM and no larger than half of L2 capacity. Run baseline and candidate in alternating order at least five times, compare medians, and retain every sample. Throughput does not replace correctness, overload, memory, or latency checks.
 
@@ -116,7 +116,7 @@ Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution. Us
 
 Optional fill admission uses `_FILL_CONTROL=disabled|observe|adaptive` under the same three prefixes. Enabled modes require explicit `_FILL_BYTES_PER_SECOND` and `_FILL_OPERATIONS_PER_SECOND` ceilings. The harness prints the effective options and adds a `type=fill_control` report beside cache records. Compare the modes in alternating order with identical ceilings and traffic; record rejected and hypothetical fills alongside completed throughput. High ceilings help measure instrumentation overhead, while lower ceilings and injected storage stalls exercise admission behavior. Buffered macOS results do not qualify Linux NVMe or cgroup throttling.
 
-Select the backend with `_IO_ENGINE=posix|io-uring`. POSIX workers bound concurrent operations. io_uring ring count and aggregate in-flight limit are independent; changing one does not rewrite the other. Ring count must not exceed the in-flight limit. IOPOLL requires `_IO_MODE=direct`; SQPOLL CPU requires an idle timeout. Only the selected backend's settings are read. Each harness prints the resulting `IoEngineOptions`, and buffer estimates use its actual concurrency. The request benchmark's default read-wait capacity follows the selected read pool's in-flight limit.
+Select the backend with `_IO_ENGINE=posix|io-uring`. POSIX workers bound concurrent operations. io_uring ring count and aggregate in-flight limit are independent; changing one does not rewrite the other. Ring count must not exceed the in-flight limit. IOPOLL requires `_IO_MODE=direct`; SQPOLL CPU requires an idle timeout. Only the selected backend's settings are read. Each harness prints the resulting `IoEngineOptions`, and buffer estimates use its actual concurrency. The request benchmark's default read-wait capacity follows the selected read pool's in-flight limit. POSIX Immediate L2 reads still cap `CACHE_BENCH_CLIENTS` at the POSIX read-worker count, so a worker sweep must set clients at least as high as the worker count.
 
 `CACHE_BENCH_STATS` is now `CACHE_BENCH_ACTIVITY_COUNTERS`. Machine-readable reports use `version=2`, renaming the cache record field `statistics_enabled` to `activity_counters_enabled`; the counter population is unchanged.
 
@@ -132,7 +132,7 @@ Capacity variables follow the library's terms: `_CAPACITY_MIB` is L2, `_L1_CAPAC
   /var/tmp/cache2-qualification
 ```
 
-The runner records the revision, machine, filesystem, block device, complete configuration, raw logs, medians, and checksums. It exercises buffered and direct POSIX I/O, a worker-count sweep, mixed turnover, and final warm recovery.
+The runner records the revision, machine, filesystem, block device, complete configuration, raw logs, medians, and checksums. It exercises buffered and Direct POSIX I/O, a POSIX Direct worker sweep with matching client depth, an experimental io_uring Direct in-flight sweep (one ring at 16/32/64 concurrent gets), mixed turnover, and final warm recovery. Qualification builds with `--features io-uring` and sets `CACHE_BENCH_ACTIVITY_COUNTERS=true` so `result phase=read_io` records in-flight peak, slot wait, payload bytes, and read amplification. IOPOLL is an optional follow-up (`CACHE_BENCH_IO_URING_READ_IOPOLL=true` with Direct I/O), not part of the default matrix.
 
 A release pass requires:
 
