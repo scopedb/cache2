@@ -152,6 +152,8 @@ See [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for rate
 
 The managed-memory limit covers the index mapping, heat bits, L1, append buffers, reclaim buffers, metadata, cache-owned thread stacks, recovery scratch, and transient reads. Total deployment memory additionally includes allocator metadata, Tokio, process overhead, and the kernel page cache. `CacheConfig::new` rejects invalid or insufficient memory budgets before file access; actual allocation can still fail during open.
 
+`MemoryReservation` holds a charge until its allocation is released. `BufferLease` owns an aligned allocation directly and drops it before returning an optional individual charge; append staging instead keeps one aggregate reservation for its fixed buffers and record arrays. A failed buffer allocation releases its reservation automatically.
+
 ### Storage path
 
 C² owns one logical data path. Multi-device deployments stripe below the filesystem with RAID0 or an equivalent layer. Request routing, recovery identity, and descriptor count stay independent of device topology.

@@ -58,15 +58,14 @@ pub struct ManagedMemory {
     memory: Arc<MemoryTracker>,
 }
 
-/// A fixed runtime allocation charged to the same hard memory limit as the
-/// request pools. The owner keeps this guard for exactly as long as the
-/// associated bounded structure exists.
-pub struct RuntimeMemoryReservation {
+/// A charge against the cache-wide memory limit. Keep this guard until the
+/// associated allocation has been released.
+pub struct MemoryReservation {
     memory: Arc<MemoryTracker>,
     bytes: usize,
 }
 
-impl Drop for RuntimeMemoryReservation {
+impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.memory.release(self.bytes);
     }
@@ -87,14 +86,11 @@ impl ManagedMemory {
         Ok(Self { memory })
     }
 
-    pub fn reserve_runtime_memory(
-        &self,
-        bytes: usize,
-    ) -> Result<RuntimeMemoryReservation, ManagedMemoryError> {
+    pub fn reserve(&self, bytes: usize) -> Result<MemoryReservation, ManagedMemoryError> {
         if !self.memory.try_reserve(bytes) {
             return Err(ManagedMemoryError::Allocation);
         }
-        Ok(RuntimeMemoryReservation {
+        Ok(MemoryReservation {
             memory: Arc::clone(&self.memory),
             bytes,
         })
@@ -104,7 +100,16 @@ impl ManagedMemory {
     /// cache-wide hard memory limit. The caller maps failure to either a
     /// fail-open miss or an explicit bounded-wait overload.
     pub fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
-        BufferLease::try_standalone(length, Arc::clone(&self.memory))
+        let capacity = align_up(length, BUFFER_ALIGNMENT)?;
+        if capacity == 0 || capacity > isize::MAX as usize {
+            return None;
+        }
+        let reservation = self.reserve(capacity).ok()?;
+        let buffer = AlignedBuffer::try_new(capacity)?;
+        Some(BufferLease {
+            buffer,
+            reservation: Some(reservation),
+        })
     }
 
     pub fn snapshot(&self) -> ManagedMemorySnapshot {
@@ -125,13 +130,14 @@ pub struct ManagedMemorySnapshot {
 }
 
 pub struct BufferLease {
-    owner: BufferOwner,
-    buffer: Option<AlignedBuffer>,
-}
-
-enum BufferOwner {
-    Fixed,
-    Standalone { memory: Arc<MemoryTracker> },
+    // Fields drop in declaration order: free the allocation before returning
+    // its budget. Fixed staging buffers use their owner's aggregate charge.
+    buffer: AlignedBuffer,
+    #[expect(
+        dead_code,
+        reason = "Returns the memory charge after the allocation is dropped."
+    )]
+    reservation: Option<MemoryReservation>,
 }
 
 impl BufferLease {
@@ -141,68 +147,16 @@ impl BufferLease {
                 "fixed buffer size must be a non-zero 4096-byte multiple",
             ));
         }
-        let ptr = allocate_buffer(length).ok_or(ManagedMemoryError::Allocation)?;
-        let mut buffer = AlignedBuffer {
-            ptr,
-            capacity: length,
-            initialized: 0,
-        };
+        let mut buffer = AlignedBuffer::try_new(length).ok_or(ManagedMemoryError::Allocation)?;
         buffer.prepare_zeroed(length);
         Ok(Self {
-            owner: BufferOwner::Fixed,
-            buffer: Some(buffer),
+            buffer,
+            reservation: None,
         })
-    }
-
-    fn try_standalone(length: usize, memory: Arc<MemoryTracker>) -> Option<Self> {
-        let maximum = align_up(length, BUFFER_ALIGNMENT)?;
-        if maximum == 0 || maximum > isize::MAX as usize {
-            return None;
-        }
-        if !memory.try_reserve(maximum) {
-            return None;
-        }
-        let Some(ptr) = allocate_buffer(maximum) else {
-            memory.release(maximum);
-            return None;
-        };
-        Some(Self {
-            owner: BufferOwner::Standalone { memory },
-            buffer: Some(AlignedBuffer {
-                ptr,
-                capacity: maximum,
-                initialized: 0,
-            }),
-        })
-    }
-
-    #[cfg(test)]
-    pub fn prepare(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
-        if length > buffer.capacity {
-            return Err(());
-        }
-        // Callers encode complete records. Clearing here also fixes padding and
-        // prevents bytes from a prior key/value escaping into a later write.
-        buffer.prepare_zeroed(length);
-        Ok(buffer.prefix_mut(length))
-    }
-
-    /// Grow the leased buffer without clearing bytes already in the buffer.
-    ///
-    /// Fresh capacity is zeroed before it is exposed as initialized bytes.
-    #[cfg(test)]
-    fn grow_preserving(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let buffer = self.buffer.as_mut().expect("buffer lease owns a buffer");
-        if length > buffer.capacity {
-            return Err(());
-        }
-        buffer.zero_uninitialized_through(length);
-        Ok(buffer.prefix_mut(length))
     }
 
     pub fn prepared(&self, length: usize) -> Result<&[u8], ()> {
-        let buffer = self.buffer.as_ref().ok_or(())?;
+        let buffer = &self.buffer;
         if length > buffer.initialized {
             return Err(());
         }
@@ -212,7 +166,7 @@ impl BufferLease {
     }
 
     pub fn prepared_mut(&mut self, length: usize) -> Result<&mut [u8], ()> {
-        let buffer = self.buffer.as_mut().ok_or(())?;
+        let buffer = &mut self.buffer;
         if length > buffer.initialized {
             return Err(());
         }
@@ -220,13 +174,11 @@ impl BufferLease {
     }
 
     pub fn has_capacity(&self, length: usize) -> bool {
-        self.buffer
-            .as_ref()
-            .is_some_and(|buffer| length <= buffer.capacity)
+        length <= self.buffer.capacity
     }
 
     pub fn read_target(&self, length: usize) -> Result<*mut u8, ()> {
-        let buffer = self.buffer.as_ref().ok_or(())?;
+        let buffer = &self.buffer;
         if length > buffer.capacity {
             return Err(());
         }
@@ -234,7 +186,7 @@ impl BufferLease {
     }
 
     pub fn mark_initialized(&mut self, length: usize) -> Result<(), ()> {
-        let buffer = self.buffer.as_mut().ok_or(())?;
+        let buffer = &mut self.buffer;
         if length > buffer.capacity {
             return Err(());
         }
@@ -244,26 +196,7 @@ impl BufferLease {
 
     #[cfg(test)]
     fn address(&self) -> usize {
-        self.buffer
-            .as_ref()
-            .expect("buffer lease owns a buffer")
-            .ptr
-            .as_ptr() as usize
-    }
-}
-
-impl Drop for BufferLease {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            match &self.owner {
-                BufferOwner::Fixed => drop(buffer),
-                BufferOwner::Standalone { memory, .. } => {
-                    let capacity = buffer.capacity;
-                    drop(buffer);
-                    memory.release(capacity);
-                }
-            }
-        }
+        self.buffer.ptr.as_ptr() as usize
     }
 }
 
@@ -278,6 +211,18 @@ struct AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 
 impl AlignedBuffer {
+    fn try_new(capacity: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT).ok()?;
+        // SAFETY: both constructors validate that capacity is non-zero; the
+        // layout has valid power-of-two alignment and fits in isize.
+        let ptr = NonNull::new(unsafe { alloc(layout) })?;
+        Some(Self {
+            ptr,
+            capacity,
+            initialized: 0,
+        })
+    }
+
     fn prepare_zeroed(&mut self, length: usize) {
         debug_assert!(length <= self.capacity);
         // SAFETY: the allocation is valid for `capacity` bytes and this value
@@ -287,21 +232,6 @@ impl AlignedBuffer {
         self.initialized = self.initialized.max(length);
     }
 
-    #[cfg(test)]
-    fn zero_uninitialized_through(&mut self, length: usize) {
-        debug_assert!(length <= self.capacity);
-        if length > self.initialized {
-            // SAFETY: the uninitialized tail is inside the owned allocation.
-            unsafe {
-                self.ptr
-                    .as_ptr()
-                    .add(self.initialized)
-                    .write_bytes(0, length - self.initialized);
-            }
-            self.initialized = length;
-        }
-    }
-
     fn prefix_mut(&mut self, length: usize) -> &mut [u8] {
         debug_assert!(length <= self.capacity);
         debug_assert!(length <= self.initialized);
@@ -309,34 +239,15 @@ impl AlignedBuffer {
         // mutable borrow is exclusive, and `length <= initialized`.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), length) }
     }
-
-    fn deallocate(&mut self) {
-        if self.capacity == 0 {
-            return;
-        }
-        deallocate_buffer(self.ptr, self.capacity);
-        self.ptr = NonNull::dangling();
-        self.capacity = 0;
-        self.initialized = 0;
-    }
-}
-
-fn allocate_buffer(capacity: usize) -> Option<NonNull<u8>> {
-    let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT).ok()?;
-    // SAFETY: `layout` has non-zero size and valid power-of-two alignment.
-    NonNull::new(unsafe { alloc(layout) })
-}
-
-fn deallocate_buffer(pointer: NonNull<u8>, capacity: usize) {
-    let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT)
-        .expect("stored aligned-buffer layout is valid");
-    // SAFETY: `pointer` was allocated with this exact layout and is owned here.
-    unsafe { dealloc(pointer.as_ptr(), layout) };
 }
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
-        self.deallocate();
+        let layout = Layout::from_size_align(self.capacity, BUFFER_ALIGNMENT)
+            .expect("stored aligned-buffer layout is valid");
+        // SAFETY: the pointer was allocated with this exact layout and this
+        // buffer owns it until drop.
+        unsafe { dealloc(self.ptr.as_ptr(), layout) };
     }
 }
 
@@ -436,25 +347,42 @@ mod tests {
     }
 
     #[test]
-    fn preserving_growth_keeps_prefix_and_zeroes_fresh_capacity() {
-        let mut buffer = BufferLease::try_fixed(3 * BUFFER_ALIGNMENT).unwrap();
+    fn read_buffers_expose_only_the_initialized_prefix() {
+        let managed_memory = ManagedMemory::try_new(limits()).unwrap();
+        let mut buffer = managed_memory.try_read_buffer(5000).unwrap();
+        let bytes = b"completed read prefix";
+        let target = buffer.read_target(5000).unwrap();
+        // SAFETY: simulate a completed read into the exclusively owned target;
+        // the source and destination do not overlap and the bytes fit.
+        unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
 
-        let first = buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap();
-        assert!(first.iter().all(|byte| *byte == 0));
-        first.fill(0x5a);
+        assert!(buffer.prepared(bytes.len()).is_err());
+        buffer.mark_initialized(bytes.len()).unwrap();
+        assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
+        assert!(buffer.prepared(bytes.len() + 1).is_err());
+        assert!(buffer.prepared_mut(bytes.len() + 1).is_err());
 
-        let grown = buffer.grow_preserving(2 * BUFFER_ALIGNMENT).unwrap();
-        assert!(grown[..BUFFER_ALIGNMENT].iter().all(|byte| *byte == 0x5a));
-        assert!(grown[BUFFER_ALIGNMENT..].iter().all(|byte| *byte == 0));
-        assert_eq!(buffer.address() % BUFFER_ALIGNMENT, 0);
+        // A shorter read can reuse the buffer without invalidating its prefix.
+        buffer.mark_initialized(1).unwrap();
+        assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
+        assert!(buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1).is_err());
+        assert!(buffer.prepared(bytes.len() + 1).is_err());
     }
 
     #[test]
-    fn failed_preserving_growth_keeps_the_existing_buffer() {
-        let mut buffer = BufferLease::try_fixed(2 * BUFFER_ALIGNMENT).unwrap();
-        buffer.grow_preserving(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
+    fn fixed_buffers_are_zeroed_and_reject_out_of_bounds_access() {
+        let mut buffer = BufferLease::try_fixed(BUFFER_ALIGNMENT).unwrap();
+        assert!(
+            buffer
+                .prepared(BUFFER_ALIGNMENT)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        buffer.prepared_mut(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
 
-        assert!(buffer.grow_preserving(3 * BUFFER_ALIGNMENT).is_err());
+        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_err());
+        assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_err());
         assert!(
             buffer
                 .prepared(BUFFER_ALIGNMENT)

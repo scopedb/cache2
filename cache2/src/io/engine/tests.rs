@@ -118,13 +118,22 @@ impl BlockingIo {
 }
 
 impl PositionedIo for BlockingIo {
-    fn read_at(&self, buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+    fn read_at(
+        &self,
+        buffer: &mut [u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         self.enter_and_wait();
         buffer.fill(0);
         Ok(buffer.len())
     }
 
-    fn write_at(&self, _point: WritePoint, buffer: &[u8], _offset: u64) -> io::Result<usize> {
+    fn write_at(
+        &self,
+        #[expect(unused_variables)] point: WritePoint,
+        buffer: &[u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         self.enter_and_wait();
         Ok(buffer.len())
     }
@@ -149,7 +158,11 @@ impl PanicOnceIo {
 }
 
 impl PositionedIo for PanicOnceIo {
-    fn read_at(&self, buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+    fn read_at(
+        &self,
+        buffer: &mut [u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         if self.panic_next_read.swap(false, Ordering::AcqRel) {
             panic!("injected io panic");
         }
@@ -157,13 +170,22 @@ impl PositionedIo for PanicOnceIo {
         Ok(buffer.len())
     }
 
-    fn write_at(&self, _point: WritePoint, buffer: &[u8], _offset: u64) -> io::Result<usize> {
+    fn write_at(
+        &self,
+        #[expect(unused_variables)] point: WritePoint,
+        buffer: &[u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         Ok(buffer.len())
     }
 }
 
 impl PositionedIo for ShortThenErrorIo {
-    fn read_at(&self, buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+    fn read_at(
+        &self,
+        buffer: &mut [u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         if self.read_calls.fetch_add(1, Ordering::Relaxed) == 0 {
             let transferred = 3.min(buffer.len());
             buffer[..transferred].fill(0x5a);
@@ -173,7 +195,12 @@ impl PositionedIo for ShortThenErrorIo {
         }
     }
 
-    fn write_at(&self, _point: WritePoint, buffer: &[u8], _offset: u64) -> io::Result<usize> {
+    fn write_at(
+        &self,
+        #[expect(unused_variables)] point: WritePoint,
+        buffer: &[u8],
+        #[expect(unused_variables)] offset: u64,
+    ) -> io::Result<usize> {
         if self.write_calls.fetch_add(1, Ordering::Relaxed) == 0 {
             Ok(3.min(buffer.len()))
         } else {
@@ -199,7 +226,11 @@ fn read_buffer(managed_memory: &Arc<ManagedMemory>, length: usize) -> IoBuffer {
 
 fn write_buffer(managed_memory: &Arc<ManagedMemory>, bytes: &[u8]) -> IoBuffer {
     let mut lease = managed_memory.try_read_buffer(bytes.len()).unwrap();
-    lease.prepare(bytes.len()).unwrap().copy_from_slice(bytes);
+    let target = lease.read_target(bytes.len()).unwrap();
+    // SAFETY: the exclusively owned target fits the source, and the allocations
+    // do not overlap. Publish the initialized range only after copying it.
+    unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+    lease.mark_initialized(bytes.len()).unwrap();
     IoBuffer::for_write(lease, bytes.len()).unwrap()
 }
 

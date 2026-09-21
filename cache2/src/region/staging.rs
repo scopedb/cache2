@@ -27,7 +27,7 @@ use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryError;
-use crate::managed_memory::RuntimeMemoryReservation;
+use crate::managed_memory::MemoryReservation;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_RECORD_LEN;
 use crate::region::index::packed::PackedLocation;
@@ -252,7 +252,11 @@ pub struct AppendStaging {
     shards: Vec<ShardStaging>,
     chunk_bytes: usize,
     region_size: u64,
-    _memory: RuntimeMemoryReservation,
+    #[expect(
+        dead_code,
+        reason = "Returns the aggregate charge when staging is dropped."
+    )]
+    reservation: MemoryReservation,
 }
 
 impl AppendStaging {
@@ -301,7 +305,7 @@ impl AppendStaging {
             .ok_or(ManagedMemoryError::Allocation)?;
         // Keep the aggregate reservation alive so eager buffers and record
         // vectors participate in the hard memory limit.
-        let memory = managed_memory.reserve_runtime_memory(reserved)?;
+        let reservation = managed_memory.reserve(reserved)?;
 
         let mut shards = Vec::new();
         shards
@@ -329,7 +333,7 @@ impl AppendStaging {
             shards,
             chunk_bytes,
             region_size,
-            _memory: memory,
+            reservation,
         })
     }
 

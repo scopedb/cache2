@@ -883,12 +883,12 @@ impl CacheRuntime {
                 current_bytes,
             } => {
                 if ADMIT_L1 {
-                    let _published = state.memory.publish(hash, key, value, seqno);
+                    state.memory.publish(hash, key, value, seqno);
                 } else {
                     // Prevent an older exact-key L1 value from indefinitely
                     // shadowing the prefetched L2 record. Contention remains a
                     // valid best-effort stale outcome.
-                    let _removed = state.memory.delete(hash, key, seqno);
+                    state.memory.delete(hash, key, seqno);
                 }
                 if should_wake_write(
                     previous_bytes,
@@ -940,7 +940,7 @@ impl CacheRuntime {
             }
             return Err(write_overload_error());
         };
-        let _removed = state.memory.delete(hash, key, seqno);
+        state.memory.delete(hash, key, seqno);
         if let Some(activity) = activity {
             RuntimeMetrics::increment(&activity.deletes);
         }
