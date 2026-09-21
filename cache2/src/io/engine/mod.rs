@@ -2138,7 +2138,8 @@ pub fn build_file_engine(
                 let _ = config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "io_uring is unavailable on this build or platform",
+                    crate::config::runtime::io_uring_unavailability()
+                        .expect("unavailable io_uring names a reason"),
                 ))
             }
         }

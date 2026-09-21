@@ -269,26 +269,34 @@ Buffered POSIX I/O is the portable production baseline. It benefits from the ker
 
 Direct mode is Linux-only and requires `O_DIRECT` for aligned record I/O. It reduces page-cache duplication but can amplify small reads and exposes aligned I/O failures instead of silently falling back. Control and recovery operations remain buffered. Necessarily unaligned runtime remainders use the buffered compatibility path.
 
-io_uring is feature-gated and experimental. Its three pools configure physical rings and aggregate execution bounds independently:
+io_uring is feature-gated and experimental. Enable `cache2` with `features = ["io-uring"]` on a supported Linux target. `RuntimeOptions::io_mode` stays Buffered unless Direct is chosen separately. Start from `IoUringOptions::default()` and set only the read depth:
 
 ```rust
-use cache2::{
-    IoEngineOptions, IoMode, IoUringOptions, IoUringSqPollOptions, RuntimeOptions,
-};
+use cache2::{IoEngineOptions, IoUringOptions, RuntimeOptions};
 
-let mut sq_poll = IoUringSqPollOptions::new(2_000);
-sq_poll.cpu = Some(4);
 let mut io = IoUringOptions::default();
-io.read.max_in_flight = 128;
-io.read.sq_poll = Some(sq_poll);
+io.read.max_in_flight = 32;
 let mut runtime = RuntimeOptions::default();
 runtime.io_engine = IoEngineOptions::IoUring(io);
-runtime.io_mode = IoMode::Direct;
 ```
 
-`rings` controls driver-thread and kernel-ring count. `max_in_flight` is the aggregate admission bound and is divided as evenly as possible across those rings. SQPOLL's idle value is milliseconds; optional CPU affinity applies to each ring in that pool. SQPOLL defaults off; requested flags fail explicitly when the kernel cannot provide them.
+`rings` is driver-thread and kernel-ring count. `max_in_flight` is the aggregate admission bound and is divided as evenly as possible across those rings. Extra rings do not add execution slots. POSIX `read_workers` is both thread count and depth; map that depth to `read.max_in_flight` with `rings = 1`, not to `rings`. Configuration construction fails with `ErrorKind::Unsupported` if the crate feature, OS, or architecture is missing; the I/O source names the requirement. Kernel opcode and NODROP checks happen at open.
 
-IOPOLL is an additional explicit per-pool opt-in through the `IoUringPoolOptions::io_poll` field. It requires `IoMode::Direct` and a filesystem and block device that support polling. While requests are outstanding the driver busy-polls the device and consumes CPU, and a cancellation stays advisory until the polled operation completes, so profile IOPOLL on the target host before adopting it.
+| Pool    | `rings` | `max_in_flight`                         | Pattern                                              |
+| ------- | ------- | --------------------------------------- | ---------------------------------------------------- |
+| Read    | 1       | Concurrent L2 `get` futures             | Start here; this is admission depth                  |
+| Write   | 1       | Leave the default 64                    | Sequential fill; do not copy the read depth          |
+| Reclaim | 1       | Leave the default 1                     | Raise only for observed Free-Region lag              |
+
+Keep `rings = 1` until a single driver thread is CPU-bound, then raise `rings` while holding `max_in_flight` fixed. `rings` must not exceed that pool's in-flight limit; each ring receives a floor or ceiling share of the same depth. Under `ReadAdmission::Immediate`, extra gets beyond read depth are busy misses, so do not set `max_in_flight` far above caller concurrency.
+
+### Advanced io_uring polling
+
+Leave `IoUringPoolOptions::sq_poll` and `io_poll` off. They are independent advanced flags with different requirements and are easy to combine incorrectly; do not enable either while sweeping rings or in-flight depth, and do not turn both on because one of them helped.
+
+SQPOLL starts a kernel submission thread. The idle value is milliseconds. Optional CPU affinity applies to every ring in that pool, so a multi-ring pool pins every polling thread to the same CPU. SQPOLL does not require Direct I/O. Open fails if the kernel lacks non-fixed SQPOLL files or cannot provide the requested flags.
+
+IOPOLL busy-polls completions and consumes CPU while requests are outstanding. It requires `IoMode::Direct` and a filesystem and block device that support polling; configuration construction returns `InvalidInput` otherwise. Cancellation stays advisory until the polled operation completes. Profile IOPOLL alone on the target host.
 
 ### Statistics
 
@@ -367,10 +375,16 @@ Use this profile when the data set exceeds host RAM and the goal is device behav
 
 - Keep Buffered POSIX as the portable production default; switch to Direct only after measuring amplification and warm-close cost on the target filesystem.
 - Size POSIX `read_workers` to the application's concurrent L2 get depth. Worker count is both thread count and admission depth.
-- For experimental io_uring, start with one read ring and set `max_in_flight` to that same concurrent get depth. Extra rings do not add execution slots.
+- For experimental io_uring, do not scale `rings` with vCPU count. Keep one read ring and set `read.max_in_flight` to concurrent L2 gets. Leave write and reclaim at their defaults.
 - Keep write execution modest; more write workers cannot exceed sequential device fill.
-- Profile IOPOLL separately with `IoUringPoolOptions::io_poll` and Direct I/O on a polling-capable filesystem; do not enable it from ring or in-flight sweeps.
+- Leave SQPOLL and IOPOLL off during ring and in-flight sweeps. They are independent advanced flags; profile at most one of them, and only after depth is set. IOPOLL still requires Direct I/O on a polling-capable filesystem.
 - Watch `requests_in_flight_peak`, `slot_wait_ns`, `l2_read_busy_misses`, and Direct versus served-byte amplification instead of throughput alone.
+
+Keep the library default of one ring per pool. Set `read.max_in_flight` to concurrent L2 gets; use 32 or 64 when that is the caller depth, and lower it when the caller issues fewer gets. Do not raise `rings` with vCPU count. Leave write and reclaim at their defaults. Leave SQPOLL and IOPOLL off.
+
+| Read rings | Read `max_in_flight`         | Write / reclaim                    | SQPOLL / IOPOLL |
+| ---------- | ---------------------------- | ---------------------------------- | --------------- |
+| 1          | Concurrent L2 gets, 32 or 64 | Library default (1 / 64 and 1 / 1) | Off             |
 
 ## Diagnostic map
 

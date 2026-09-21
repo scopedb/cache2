@@ -43,7 +43,17 @@ use cache2::ErrorOperation;
 use cache2::IoEngineOptions;
 #[cfg(not(target_os = "linux"))]
 use cache2::IoMode;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
 use cache2::IoUringOptions;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoOptions;
@@ -511,6 +521,32 @@ fn unavailable_io_engine_is_rejected_before_file_creation() {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.operation(), ErrorOperation::BuildConfig);
     assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
+    let message = error.as_io_error().to_string();
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(message, "io_uring is unavailable on this platform");
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        ))
+    ))]
+    assert_eq!(message, "io_uring is unavailable on this architecture");
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        ),
+        not(feature = "io-uring")
+    ))]
+    assert_eq!(message, "io_uring requires the io-uring crate feature");
     files.assert_absent();
 }
 

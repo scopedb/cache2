@@ -134,7 +134,7 @@ The source Region stays pinned until accepted replacement writes finish. Conditi
 
 ### I/O
 
-Reads and writes use independent bounded engine pools. Reclaim has separate read lanes. POSIX uses positioned worker I/O; optional io_uring uses fixed-depth rings. Buffered I/O is the default. Direct mode aligns runtime record I/O and keeps control, recovery, and unavoidable remainder operations buffered. Locks cover bounded in-memory work and release before device I/O.
+Reads and writes use independent bounded engine pools. Reclaim has separate read lanes. POSIX uses positioned worker I/O; optional io_uring uses fixed-depth rings. Ring count and in-flight depth are independent: extra rings split the same admission bound and do not add slots. Buffered I/O is the default. Direct mode aligns runtime record I/O and keeps control, recovery, and unavoidable remainder operations buffered. SQPOLL and IOPOLL are advanced per-pool opt-ins with different requirements; they stay off until selected explicitly. Locks cover bounded in-memory work and release before device I/O.
 
 Each lane uses one concrete `IoEngine` for admission, submission, cancellation, statistics, and shutdown. Driver-specific constructors start POSIX workers or an io_uring driver behind the same bounded command and completion protocol. Callers share the engine through `Arc`; its final owner joins the workers. Submitted requests retain their buffers and capacity until actual completion, independently of the caller's wait deadline.
 
