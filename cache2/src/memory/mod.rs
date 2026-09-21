@@ -501,11 +501,7 @@ impl MemoryShard {
                     .charged_bytes()
             );
         }
-        #[expect(
-            unused_variables,
-            reason = "Release the value after slot bookkeeping is complete."
-        )]
-        let entry = self.slots[index].take().expect("resident slot disappeared");
+        let _entry = self.slots[index].take().expect("resident slot disappeared");
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
         debug_assert!(self.free_count < self.slots.len());
         let packed = u32::try_from(index).expect("memory slot index exceeds u32");

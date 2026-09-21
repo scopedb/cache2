@@ -369,11 +369,7 @@ fn run_crash_child(case: &str, paths: RegionPaths) -> ! {
     let data = data_path_superblock();
     match case {
         "open" => {
-            #[expect(
-                unused_variables,
-                reason = "Keep the session open until the process is killed."
-            )]
-            let session = CacheSession::for_test(paths, data, 4096).unwrap();
+            let _session = CacheSession::for_test(paths, data, 4096).unwrap();
             kill_process();
         }
         "write" | "drain" => {

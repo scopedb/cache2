@@ -1542,12 +1542,7 @@ impl PartitionedIndexStorage {
     pub fn poison_hash_partition_for_test(&self, hash: u64) {
         let partition = index_partition_for(hash, self.partitions.len());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[expect(
-                unused_variables,
-                clippy::readonly_write_lock,
-                reason = "Unwinding must hold a write guard to poison the partition."
-            )]
-            let guard = self.partitions[partition].write().unwrap();
+            let _guard = self.partitions[partition].write().unwrap();
             panic!("poison index partition for test");
         }));
         assert!(result.is_err());

@@ -39,11 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.stats.io_latency = true;
     let cache = Cache::open(path, CacheConfig::new(storage, runtime)?).await?;
     cache.put("example", "value")?;
-    #[expect(
-        unused_variables,
-        reason = "Retain the value through snapshot collection and close."
-    )]
-    let value = cache.get("example").await?;
+    let _value = cache.get("example").await?;
     cache.drain().await?;
     // Pass this owned, cumulative snapshot to the application's metrics adapter.
     // It carries collection modes/scopes; bucket bounds and sums use nanoseconds.

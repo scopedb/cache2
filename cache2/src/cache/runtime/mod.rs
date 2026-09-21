@@ -1268,11 +1268,7 @@ impl CacheRuntime {
     pub fn drain(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait()?;
-        #[expect(
-            unused_variables,
-            reason = "Restore lifecycle state when draining finishes."
-        )]
-        let draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
         drain_shards(state, false)
     }
@@ -1280,11 +1276,7 @@ impl CacheRuntime {
     pub async fn drain_async(&self) -> io::Result<()> {
         let operations = self.operations.begin_drain()?;
         operations.wait_async().await;
-        #[expect(
-            unused_variables,
-            reason = "Restore lifecycle state on completion or cancellation."
-        )]
-        let draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
+        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
         drain_shards_async(state, false).await
     }
@@ -1369,11 +1361,7 @@ impl CacheRuntime {
             .get(shard_id)
             .expect("test shard exists");
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            #[expect(
-                unused_variables,
-                reason = "Keep the guard alive so unwinding poisons the lock."
-            )]
-            let state = shard.state.lock().unwrap();
+            let _state = shard.state.lock().unwrap();
             panic!("poison shard gate");
         }));
         assert!(result.is_err());

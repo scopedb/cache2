@@ -847,8 +847,7 @@ impl BoundedIoRequest {
         let mut request = AsyncRequestGuard::new(self.request, engine);
         let deadline = tokio::time::Instant::from_std(self.deadline);
         let completion = {
-            #[expect(unused_variables)]
-            let entered = tokio_handle.enter();
+            let _entered = tokio_handle.enter();
             tokio::time::timeout_at(deadline, request.request_mut())
         }
         .await;
@@ -859,8 +858,7 @@ impl BoundedIoRequest {
 
         let cancel_error = request.cancel().err();
         let completion = {
-            #[expect(unused_variables)]
-            let entered = tokio_handle.enter();
+            let _entered = tokio_handle.enter();
             tokio::time::timeout(self.cancel_grace, request.request_mut())
         }
         .await;
@@ -1142,8 +1140,7 @@ impl ReadSlotAdmission {
         self.ensure_open()?;
         let acquire = Arc::clone(&self.slots).acquire_owned(1);
         {
-            #[expect(unused_variables)]
-            let entered = tokio_handle.enter();
+            let _entered = tokio_handle.enter();
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
         }
         .await
@@ -1182,11 +1179,7 @@ impl ReadSlotWaiter {
             .read_slot_admission
             .as_ref()
             .ok_or_else(|| io::Error::other("async read admission is disabled"))?;
-        #[expect(
-            unused_variables,
-            reason = "Unregister the waiter on completion or cancellation."
-        )]
-        let waiter = admission.register_waiter();
+        let _waiter = admission.register_waiter();
         self.state.ensure_accepting()?;
         let permit = admission.acquire_until(deadline, tokio_handle).await?;
         self.state.try_reserve_read_slot(Some(permit))
@@ -1196,8 +1189,7 @@ impl ReadSlotWaiter {
 impl Drop for IoSlot {
     fn drop(&mut self) {
         {
-            #[expect(unused_variables)]
-            let slot = lock_unpoisoned(&self.state.slot_lock);
+            let _slot = lock_unpoisoned(&self.state.slot_lock);
             self.state
                 .slot_state
                 .fetch_sub(slot_delta(self.write), Ordering::AcqRel);
@@ -1344,8 +1336,7 @@ impl EngineState {
 
     fn stop_accepting_slots(&self) {
         {
-            #[expect(unused_variables)]
-            let slot = lock_unpoisoned(&self.slot_lock);
+            let _slot = lock_unpoisoned(&self.slot_lock);
             self.accepting.store(false, Ordering::Release);
             self.slot_available.notify_all();
         }
@@ -1415,8 +1406,7 @@ impl EngineState {
     /// Taking the same mutex used around the check-and-wait transition makes
     /// `cancelled.store(true, Release); wake_slot_waiters()` lossless.
     fn wake_slot_waiters(&self) {
-        #[expect(unused_variables)]
-        let slot = lock_unpoisoned(&self.slot_lock);
+        let _slot = lock_unpoisoned(&self.slot_lock);
         self.slot_available.notify_all();
     }
 
