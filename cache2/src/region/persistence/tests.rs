@@ -924,7 +924,10 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
             &staging,
             &engine,
             0,
-            &crate::io::recovery::IoRecovery::new(Some(std::time::Duration::ZERO)),
+            crate::io::background::BackgroundIoAttempt::new(
+                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
+                None,
+            ),
         )
         .unwrap()
         .unwrap();
@@ -1077,7 +1080,10 @@ fn same_hash_candidate_requires_full_key() {
             &staging,
             &engine,
             0,
-            &crate::io::recovery::IoRecovery::new(Some(std::time::Duration::ZERO)),
+            crate::io::background::BackgroundIoAttempt::new(
+                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
+                None,
+            ),
         )
         .unwrap()
         .expect("collision owner must publish");
@@ -1217,7 +1223,10 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
                 &staging,
                 &engine,
                 0,
-                &crate::io::recovery::IoRecovery::new(Some(std::time::Duration::ZERO))
+                crate::io::background::BackgroundIoAttempt::new(
+                    &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
+                    None,
+                )
             )
             .unwrap_err()
             .raw_os_error(),

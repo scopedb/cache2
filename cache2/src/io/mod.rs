@@ -14,8 +14,8 @@
 
 //! Positioned file access and bounded owned-buffer execution.
 
+pub mod background;
 pub mod engine;
 pub mod file;
 pub mod fill_control;
 pub mod fs;
-pub mod recovery;

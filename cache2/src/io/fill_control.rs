@@ -35,7 +35,6 @@ const MIN_BYTES_PER_SECOND: u64 = 640;
 const MAX_BYTES_PER_SECOND: u64 = 1 << 40;
 const MIN_RECORDS_PER_SECOND: u32 = 10;
 const MAX_RECORDS_PER_SECOND: u32 = u32::MAX;
-const STALL_CAP: Duration = Duration::from_millis(500);
 const TICKS_PER_SECOND: u64 = 10;
 
 /// Wake shard workers this often when a non-essential flush is waiting for budget.
@@ -180,10 +179,6 @@ impl FillController {
             completed_io_operations: AtomicU64::new(0),
             slots: table.into_boxed_slice(),
         })))
-    }
-
-    pub fn checkpoint(start: Instant, timeout: Duration) -> Instant {
-        start + (timeout / 4).min(STALL_CAP)
     }
 
     fn elapsed_ns(&self) -> u64 {
@@ -437,7 +432,7 @@ impl FillController {
         }
     }
 
-    pub fn observe(&self, bytes: u64, _timeout: Duration) -> Option<Observation<'_>> {
+    pub fn observe_io(&self, bytes: u64) -> Option<IoObservation<'_>> {
         let start = self.elapsed_ns().max(1);
         for (index, slot) in self.slots.iter().enumerate() {
             if slot
@@ -446,7 +441,7 @@ impl FillController {
                 .is_ok()
             {
                 slot.bytes.store(bytes, Ordering::Relaxed);
-                return Some(Observation {
+                return Some(IoObservation {
                     control: self,
                     index,
                     succeeded: false,
@@ -460,13 +455,13 @@ impl FillController {
 }
 
 /// One worker-owned observation. Failed work is removed, never marked successful.
-pub struct Observation<'a> {
+pub struct IoObservation<'a> {
     control: &'a FillController,
     index: usize,
     succeeded: bool,
     slow: bool,
 }
-impl Observation<'_> {
+impl IoObservation<'_> {
     pub fn note_slow(&mut self) {
         if self.slow {
             return;
@@ -487,7 +482,7 @@ impl Observation<'_> {
         self.succeeded = true;
     }
 }
-impl Drop for Observation<'_> {
+impl Drop for IoObservation<'_> {
     fn drop(&mut self) {
         let slot = &self.control.slots[self.index];
         let bytes = slot.bytes.load(Ordering::Relaxed);
@@ -573,8 +568,8 @@ mod tests {
     #[test]
     fn old_request_pauses_while_other_requests_progress() {
         let control = control(true);
-        let mut old = control.observe(4096, Duration::from_secs(2)).unwrap();
-        let fast = control.observe(64, Duration::from_secs(2)).unwrap();
+        let mut old = control.observe_io(4096).unwrap();
+        let fast = control.observe_io(64).unwrap();
         fast.finish();
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
@@ -587,7 +582,7 @@ mod tests {
     #[test]
     fn observe_never_rejects_or_suppresses_reinsertion() {
         let control = control(false);
-        let mut old = control.observe(4096, Duration::from_secs(2)).unwrap();
+        let mut old = control.observe_io(4096).unwrap();
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         for _ in 0..20 {
@@ -606,7 +601,7 @@ mod tests {
             assert!(control.try_admit_fill());
         }
         assert_eq!(control.snapshot().would_reject, 0);
-        let mut old = control.observe(4096, Duration::from_secs(2)).unwrap();
+        let mut old = control.observe_io(4096).unwrap();
         old.note_slow();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         assert!(control.try_admit_fill());
@@ -674,11 +669,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let pending = control.observe(4096, Duration::from_secs(5)).unwrap();
-        assert!(control.observe(64, Duration::from_secs(5)).is_none());
+        let pending = control.observe_io(4096).unwrap();
+        assert!(control.observe_io(64).is_none());
         assert_eq!(control.snapshot().dropped_observations, 1);
         drop(pending);
-        let pending = control.observe(4096, Duration::from_secs(5)).unwrap();
+        let pending = control.observe_io(4096).unwrap();
         drop(pending);
         assert_eq!(control.completed_io_operations.load(Ordering::Relaxed), 0);
         assert_eq!(control.completed_bytes.load(Ordering::Relaxed), 0);
@@ -709,7 +704,7 @@ mod tests {
     #[test]
     fn io_completion_releases_pause_before_observation_drop() {
         let control = control(true);
-        let mut pending = control.observe(4096, Duration::from_secs(2)).unwrap();
+        let mut pending = control.observe_io(4096).unwrap();
         pending.note_slow();
         assert!(!control.try_admit_fill());
         pending.clear_slow();
@@ -725,7 +720,7 @@ mod tests {
             for _ in 0..8 {
                 let control = &control;
                 scope.spawn(move || {
-                    let mut pending = control.observe(64, Duration::from_secs(2)).unwrap();
+                    let mut pending = control.observe_io(64).unwrap();
                     pending.note_slow();
                     assert!(!control.try_admit_fill());
                     drop(pending);
@@ -741,8 +736,8 @@ mod tests {
     fn overlapping_hold_and_release_cannot_stick_paused() {
         let control = control(true);
         for _ in 0..1_000 {
-            let mut first = control.observe(64, Duration::from_secs(2)).unwrap();
-            let mut second = control.observe(64, Duration::from_secs(2)).unwrap();
+            let mut first = control.observe_io(64).unwrap();
+            let mut second = control.observe_io(64).unwrap();
             first.note_slow();
             second.note_slow();
             drop(first);

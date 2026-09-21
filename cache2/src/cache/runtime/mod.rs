@@ -51,6 +51,8 @@ use crate::config::runtime::read_io_wait_capacity;
 use crate::config::runtime::read_io_wait_timeout;
 use crate::config::storage_geometry;
 use crate::hashing::route_hash;
+use crate::io::background::BackgroundIoAttempt;
+use crate::io::background::IoRecovery;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
@@ -62,7 +64,6 @@ use crate::io::file::DataFileHandles;
 use crate::io::fill_control::FLUSH_RETRY;
 use crate::io::fill_control::FillController;
 use crate::io::fill_control::FlushCharge;
-use crate::io::recovery::IoRecovery;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
@@ -441,6 +442,7 @@ struct RuntimeState {
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
     io_recovery: IoRecovery,
+    fill_control: Option<Arc<FillController>>,
     managed_memory: Arc<ManagedMemory>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -512,6 +514,17 @@ impl ReclaimControl {
 }
 
 impl RuntimeState {
+    fn background_io_attempt(&self) -> BackgroundIoAttempt<'_> {
+        BackgroundIoAttempt::new(&self.io_recovery, self.fill_control.as_deref())
+    }
+
+    fn stop_fill_and_recovery(&self) {
+        self.io_recovery.stop();
+        if let Some(fill) = &self.fill_control {
+            fill.stop();
+        }
+    }
+
     fn write_engine_for(&self, route: u64) -> &Arc<IoEngine> {
         &self.write_engines[route_hash(route, self.write_engines.len())]
     }
@@ -798,7 +811,7 @@ impl CacheRuntime {
     }
 
     pub fn start_close(&self) {
-        self.state.io_recovery.stop();
+        self.state.stop_fill_and_recovery();
         self.operations.start_close();
     }
 
@@ -847,7 +860,7 @@ impl CacheRuntime {
                 return Err(write_overload_error());
             }
         };
-        if let Some(fill) = &state.io_recovery.fill
+        if let Some(fill) = &state.fill_control
             && !fill.try_admit_fill()
         {
             if state.activity_counters {
@@ -1299,7 +1312,7 @@ impl CacheRuntime {
         {
             snapshot.health = crate::snapshot::CacheHealth::Recovering;
         }
-        if let Some(fill) = &state.io_recovery.fill {
+        if let Some(fill) = &state.fill_control {
             snapshot.fill_control = fill.snapshot();
         }
         snapshot.io = aggregate_io_stats(
@@ -1509,7 +1522,7 @@ fn start_workers(
             io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate shard controls")
         })?;
     append_controls.resize_with(shard_count, || Arc::new(AppendWorkerControl::new()));
-    let fill = FillController::new(
+    let fill_control = FillController::new(
         options.fill_control,
         shard_count + reclaim_worker_count,
         data.geometry.region_size,
@@ -1523,7 +1536,8 @@ fn start_workers(
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
         reclaim_io_timeout: options.reclaim_io_timeout,
-        io_recovery: IoRecovery::with_fill(options.io_recovery_timeout, fill),
+        io_recovery: IoRecovery::new(options.io_recovery_timeout),
+        fill_control,
         managed_memory,
         metrics,
         memory,
@@ -1665,7 +1679,7 @@ fn append_worker(state: Arc<RuntimeState>, shard_id: usize) {
         );
     }
     state.regions.enter_miss_only();
-    state.io_recovery.stop();
+    state.stop_fill_and_recovery();
     control.fail(&error);
     // Wake engine admission in case another shard is blocked behind work that
     // can no longer make progress after this runtime entered miss-only.
@@ -1732,7 +1746,7 @@ fn reclaim_worker(
         .lifecycle
         .store(LIFECYCLE_FAILED, Ordering::Release);
     state.regions.enter_miss_only();
-    state.io_recovery.stop();
+    state.stop_fill_and_recovery();
     log::error!(
         target: "cache2::health",
         event = "cache_reclaim_worker_failed",
@@ -1769,7 +1783,7 @@ fn reclaim_worker_result(
             if state.reclaim_control.is_stopped()? {
                 return Ok(());
             }
-            let mut attempt = state.io_recovery.attempt();
+            let mut attempt = state.background_io_attempt();
             let Some(receipt) = state.regions.begin_reclaim()? else {
                 break;
             };
@@ -1800,7 +1814,7 @@ fn reclaim_worker_result(
                 )
                 .map_err(|error| error.into_lease().0)?;
                 let completion = request
-                    .wait_with_io_recovery(engine.as_ref(), &mut attempt)
+                    .wait_background(engine.as_ref(), &mut attempt)
                     .map_err(|error| error.into_lease().0)?;
                 let (result, returned) = completion.into_lease();
                 let transferred = result?;
@@ -1835,8 +1849,7 @@ fn reclaim_worker_result(
             let reinsert_shard = reinsert_shards.take();
             let preserve_hot = state.regions.reclaim_can_reinsert()?
                 && !state
-                    .io_recovery
-                    .fill
+                    .fill_control
                     .as_ref()
                     .is_some_and(|fill| fill.suppress_reinsertion());
             let reinsert_operation = if preserve_hot {
@@ -1921,7 +1934,7 @@ fn append_worker_result(
                     let essential = flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining;
                     let bytes = fill.bytes as u64;
                     let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
-                    let charge = match &state.io_recovery.fill {
+                    let charge = match &state.fill_control {
                         None => Some(FlushCharge {
                             records: 0,
                             byte_units: 0,
@@ -1936,11 +1949,11 @@ fn append_worker_result(
                             &state.staging,
                             engine.as_ref(),
                             shard_id,
-                            &state.io_recovery,
+                            state.background_io_attempt(),
                         )? {
                             Some(_) => deadline = None,
                             None => {
-                                if let Some(control) = &state.io_recovery.fill {
+                                if let Some(control) = &state.fill_control {
                                     control.refund_flush_budget(charge);
                                 }
                                 deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
@@ -1981,7 +1994,7 @@ fn append_worker_result(
                         &state.staging,
                         engine.as_ref(),
                         shard_id,
-                        &state.io_recovery,
+                        state.background_io_attempt(),
                     )?;
                 }
                 Ok(None) => {}
@@ -2117,7 +2130,7 @@ async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> 
 }
 
 fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<bool> {
-    workers.state.io_recovery.stop();
+    workers.state.stop_fill_and_recovery();
     let drain = drain_shards(&workers.state, true);
     let mut join_error = None;
     for worker in workers.append_workers.drain(..) {

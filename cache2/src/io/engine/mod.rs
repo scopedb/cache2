@@ -48,6 +48,7 @@ use asyncband::semaphore::Semaphore;
 
 #[cfg(unix)]
 use crate::config::runtime::IoEngineConfig;
+use crate::io::background::BackgroundIoAttempt;
 #[cfg(unix)]
 use crate::io::file::DataFileHandles;
 #[cfg(all(
@@ -77,7 +78,6 @@ use crate::io::file::FileIoPath;
 use crate::io::file::FileIoStats;
 use crate::io::file::FileIoStatsHandle;
 use crate::io::file::WritePoint;
-use crate::io::recovery::IoRecoveryAttempt;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 
@@ -765,18 +765,18 @@ impl BoundedIoRequest {
         self.request.id()
     }
 
-    /// Allows an issued background operation to finish without cancelling it
-    /// at the normal deadline. The same request keeps its slot and buffer;
-    /// callers must still validate completion before publishing or reusing it.
-    pub fn wait_with_io_recovery(
+    /// Observes slow background I/O before its normal deadline, then applies
+    /// timeout recovery. The same request keeps its slot and buffer; callers
+    /// must still validate completion before publishing or reusing it.
+    pub fn wait_background(
         mut self,
         engine: &IoEngine,
-        attempt: &mut IoRecoveryAttempt<'_>,
+        attempt: &mut BackgroundIoAttempt<'_>,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let original = self.deadline;
         loop {
             let cap = if Instant::now() < original {
-                attempt.wait_cap(original)
+                attempt.wait_deadline(original)
             } else {
                 self.deadline
             };
@@ -979,7 +979,7 @@ pub fn submit_background_io(
     engine: &IoEngine,
     mut operation: IoOperation,
     timeout: Duration,
-    attempt: &mut IoRecoveryAttempt<'_>,
+    attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
     let bytes = match &operation {
         IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len() as u64,
@@ -988,7 +988,7 @@ pub fn submit_background_io(
     let original = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
-    let mut deadline = attempt.wait_cap(original);
+    let mut deadline = attempt.wait_deadline(original);
     loop {
         match submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE) {
             Ok(mut request) => {

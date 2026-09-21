@@ -20,8 +20,9 @@ use crate::IoOutcome;
 use crate::IoRole;
 use crate::StatsOptions;
 use crate::fixtures::TestFile;
+use crate::io::background::BackgroundIoAttempt;
+use crate::io::background::IoRecovery;
 use crate::io::file::PositionedIo;
-use crate::io::recovery::IoRecovery;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
@@ -1128,9 +1129,12 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
             scope.spawn(move || {
-                tx.send(request.wait_with_io_recovery(
+                tx.send(request.wait_background(
                     engine,
-                    &mut IoRecovery::new(Some(Duration::from_secs(2))).attempt(),
+                    &mut BackgroundIoAttempt::new(
+                        &IoRecovery::new(Some(Duration::from_secs(2))),
+                        None,
+                    ),
                 ))
                 .unwrap();
             });
@@ -1175,9 +1179,9 @@ fn exhausted_background_recovery_still_fences_unfinished_writes() {
     assert!(io.wait_for_entered(1));
     request.deadline = Instant::now();
     request.cancel_grace = Duration::from_millis(10);
-    let result = request.wait_with_io_recovery(
+    let result = request.wait_background(
         &engine,
-        &mut IoRecovery::new(Some(Duration::from_millis(20))).attempt(),
+        &mut BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::from_millis(20))), None),
     );
     let pending = engine.writes_in_flight();
     let rejected = engine.submit(IoOperation::write(
@@ -1212,14 +1216,14 @@ fn background_admission_recovers_without_duplicate_submission() {
         let managed_memory = &managed_memory;
         scope.spawn(move || {
             let io_recovery = IoRecovery::new(Some(Duration::from_secs(2)));
-            let mut attempt = io_recovery.attempt();
+            let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
             let result = submit_background_io(
                 engine,
                 IoOperation::read(read_buffer(managed_memory, 4096), 0),
                 Duration::from_millis(10),
                 &mut attempt,
             )
-            .map(|request| request.wait_with_io_recovery(engine, &mut attempt));
+            .map(|request| request.wait_background(engine, &mut attempt));
             tx.send(result).unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(50));
@@ -1263,8 +1267,8 @@ fn unlimited_recovery_keeps_admission_paused_until_validation() {
         let io_recovery = &io_recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let mut attempt = io_recovery.attempt();
-            let completion = request.wait_with_io_recovery(engine, &mut attempt).unwrap();
+            let mut attempt = BackgroundIoAttempt::new(io_recovery, None);
+            let completion = request.wait_background(engine, &mut attempt).unwrap();
             completed_tx.send(completion).unwrap();
             validate_rx.recv().unwrap();
             attempt.finish();
@@ -1310,8 +1314,8 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
         let io_recovery = &io_recovery;
         let engine = &engine;
         scope.spawn(move || {
-            let mut attempt = io_recovery.attempt();
-            tx.send(request.wait_with_io_recovery(engine, &mut attempt))
+            let mut attempt = BackgroundIoAttempt::new(io_recovery, None);
+            tx.send(request.wait_background(engine, &mut attempt))
                 .unwrap();
         });
         let early = rx.recv_timeout(Duration::from_millis(30));
@@ -1344,7 +1348,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             FillControlOptions::Observe(settings)
         };
         let control = FillController::new(mode, 1, 4096).unwrap().unwrap();
-        let io_recovery = IoRecovery::with_fill(None, Some(Arc::clone(&control)));
+        let io_recovery = IoRecovery::new(None);
         let io = Arc::new(BlockingIo::default());
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let memory = managed_memory();
@@ -1352,10 +1356,11 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             let (returned_tx, returned_rx) = mpsc::channel();
             let (validate_tx, validate_rx) = mpsc::channel();
             let io_recovery = &io_recovery;
+            let control = &control;
             let engine = &engine;
             let memory = &memory;
             scope.spawn(move || {
-                let mut attempt = io_recovery.attempt();
+                let mut attempt = BackgroundIoAttempt::new(io_recovery, Some(control));
                 let request = submit_background_io(
                     engine,
                     IoOperation::write(WritePoint::Record, write_buffer(memory, &[5; 4096]), 0),
@@ -1363,7 +1368,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
                     &mut attempt,
                 )
                 .unwrap();
-                let completion = request.wait_with_io_recovery(engine, &mut attempt).unwrap();
+                let completion = request.wait_background(engine, &mut attempt).unwrap();
                 returned_tx.send(completion).unwrap();
                 validate_rx.recv().unwrap();
                 attempt.finish();

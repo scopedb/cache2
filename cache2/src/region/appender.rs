@@ -23,6 +23,9 @@ use std::io;
 #[cfg(test)]
 use std::time::Duration;
 
+use crate::io::background::BackgroundIoAttempt;
+#[cfg(test)]
+use crate::io::background::IoRecovery;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
@@ -33,9 +36,6 @@ use crate::io::engine::RequestId;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::io::file::WritePoint;
-#[cfg(test)]
-use crate::io::recovery::IoRecovery;
-use crate::io::recovery::IoRecoveryAttempt;
 use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
@@ -83,8 +83,8 @@ pub struct WriteCompletion {
 }
 
 impl PendingWrite {
-    pub fn wait(self, engine: &IoEngine, attempt: &mut IoRecoveryAttempt<'_>) -> WriteCompletion {
-        let completion = match self.request.wait_with_io_recovery(engine, attempt) {
+    pub fn wait(self, engine: &IoEngine, attempt: &mut BackgroundIoAttempt<'_>) -> WriteCompletion {
+        let completion = match self.request.wait_background(engine, attempt) {
             Ok(completion) => completion,
             Err(timeout) => {
                 let (error, buffer) = timeout.into_buffer();
@@ -143,7 +143,7 @@ pub fn submit_write(
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
-    attempt: &mut IoRecoveryAttempt<'_>,
+    attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<PendingWrite, WriteSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
@@ -308,7 +308,7 @@ mod tests {
         lease.prepare(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
-        let mut attempt = io_recovery.attempt();
+        let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
         let completion = submit_write(
             &engine,
             geometry(),
@@ -342,7 +342,7 @@ mod tests {
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::ZERO));
-        let mut attempt = io_recovery.attempt();
+        let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
         let completion = submit_write(&engine, geometry(), span(), buffer, absolute, &mut attempt)
             .unwrap()
             .wait(&engine, &mut attempt);
@@ -379,7 +379,7 @@ mod tests {
             invalid,
             buffer,
             0,
-            &mut IoRecovery::new(Some(Duration::ZERO)).attempt(),
+            &mut BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         ) {
             Err(error) => error,
             Ok(_) => panic!("unaligned span must not be submitted"),

@@ -54,6 +54,7 @@ use self::staging::StagingEncodeError;
 use self::staging::StagingError;
 use crate::checksum::crc32c;
 use crate::hashing::route_hash;
+use crate::io::background::BackgroundIoAttempt;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::ReadSlot;
@@ -1029,9 +1030,8 @@ impl RegionStore {
         staging: &AppendStaging,
         engine: &IoEngine,
         shard_id: usize,
-        io_recovery: &crate::io::recovery::IoRecovery,
+        mut attempt: BackgroundIoAttempt<'_>,
     ) -> io::Result<Option<RegionWriteSpan>> {
-        let mut attempt = io_recovery.attempt();
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let geometry_for = |manager: &RegionManager| {
             let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
