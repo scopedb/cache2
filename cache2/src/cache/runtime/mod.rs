@@ -1230,21 +1230,25 @@ impl CacheRuntime {
                 Ok(None)
             }
             Ok(Some(value)) => {
-                if let Some(activity) = activity {
-                    RuntimeMetrics::increment(&activity.l2_hits);
-                    RuntimeMetrics::add(&activity.served_bytes, value.value().len());
-                }
                 let promoted =
                     state
                         .memory
                         .promote(read_token, hash, key, value.value(), value.seqno());
-                if let Some(promoted) = promoted {
+                let read = if let Some(promoted) = promoted {
                     if let Some(activity) = activity {
                         RuntimeMetrics::increment(&activity.l1_promotions);
                     }
-                    return Ok(Some(CacheRead::PromotedL2(promoted)));
+                    CacheRead::PromotedL2(promoted)
+                } else {
+                    CacheRead::L2(value)
+                };
+                // Promotion may select a newer resident value of a different
+                // size. Count the payload that the caller actually receives.
+                if let Some(activity) = activity {
+                    RuntimeMetrics::increment(&activity.l2_hits);
+                    RuntimeMetrics::add(&activity.served_bytes, read.value().len());
                 }
-                Ok(Some(CacheRead::L2(value)))
+                Ok(Some(read))
             }
             Ok(None) => {
                 if let Some(activity) = activity {
@@ -2399,6 +2403,26 @@ mod tests {
     ) -> (crate::cache::session::CacheSession, std::path::PathBuf) {
         use crate::FillControlOptions;
         use crate::FillLimits;
+
+        runtime_store(
+            region_size,
+            RuntimeOptions {
+                append_shards,
+                l1_capacity_bytes: 0,
+                fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
+                stats: crate::StatsOptions {
+                    activity_counters: true,
+                    ..Default::default()
+                },
+                ..RuntimeOptions::default()
+            },
+        )
+    }
+
+    fn runtime_store(
+        region_size: u64,
+        options: RuntimeOptions,
+    ) -> (crate::cache::session::CacheSession, std::path::PathBuf) {
         use crate::region::persistence::RegionPaths;
         use crate::region::recovery::PersistentId;
 
@@ -2419,20 +2443,77 @@ mod tests {
             hash_seed: 3,
             storage_fingerprint: 4,
         };
-        let config = RuntimeOptions {
-            append_shards,
-            l1_capacity_bytes: 0,
-            fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
-            stats: crate::StatsOptions {
-                activity_counters: true,
-                ..Default::default()
-            },
-            ..RuntimeOptions::default()
-        };
         let store =
-            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, config)
+            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, options)
                 .unwrap();
         (store, path)
+    }
+
+    #[test]
+    fn served_bytes_count_the_value_returned_after_promotion() {
+        use crate::L1EvictionPolicy;
+
+        for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
+            for (l1_capacity, activity_counters, old_length, new_length) in [
+                (4096, true, 64, Some(128)),
+                (4096, true, 128, Some(64)),
+                (4096, true, 64, None),
+                (0, true, 64, Some(128)),
+                (4096, false, 64, Some(128)),
+            ] {
+                let (mut store, path) = runtime_store(
+                    8192,
+                    RuntimeOptions {
+                        append_shards: 1,
+                        l1_capacity_bytes: l1_capacity,
+                        l1_shards: 1,
+                        l1_eviction_policy: policy,
+                        stats: crate::StatsOptions {
+                            activity_counters,
+                            ..Default::default()
+                        },
+                        ..RuntimeOptions::default()
+                    },
+                );
+                let plane = store.runtime().unwrap().clone();
+                let old_value = vec![1; old_length];
+                plane.put_l2(b"key", &old_value).unwrap();
+                plane.drain().unwrap();
+                let PreparedGet::Pending(pending) = plane.prepare_get(b"key", None).unwrap() else {
+                    panic!("the initial value must be read from L2");
+                };
+                // Complete the disk read, then deterministically publish a
+                // newer value before the completion attempts L1 promotion.
+                let completed = pending.wait();
+                let new_value = new_length.map(|length| vec![2; length]);
+                if let Some(value) = &new_value {
+                    plane.put(b"key", value).unwrap();
+                }
+                let observed = plane.finish_get(completed, b"key").unwrap().unwrap();
+                let expected = if l1_capacity == 0 {
+                    &old_value
+                } else {
+                    new_value.as_ref().unwrap_or(&old_value)
+                };
+                assert_eq!(observed.value(), expected);
+                assert_eq!(
+                    matches!(&observed, CacheRead::PromotedL2(_)),
+                    l1_capacity != 0
+                );
+                let snapshot = plane.snapshot().unwrap();
+                let returned_bytes = observed.value().len() as u64;
+                drop(observed);
+                store.close_warm().unwrap();
+                std::fs::remove_dir_all(path).unwrap();
+                assert_eq!(snapshot.l1_hits, 0);
+                assert_eq!(snapshot.l2_hits, u64::from(activity_counters));
+                assert_eq!(
+                    snapshot.served_bytes,
+                    if activity_counters { returned_bytes } else { 0 },
+                    "served bytes must follow the final value with {policy:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2511,6 +2592,128 @@ mod tests {
         assert!(plane.get(key).unwrap().is_some());
         store.close_warm().unwrap();
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn full_staging_capacity_request_rotates_without_another_put_or_drain() {
+        use crate::region::record::RECORD_HEADER_SIZE;
+
+        let (mut store, path) = write_pressure_store(4096, 1);
+        let plane = store.runtime().unwrap().clone();
+        let key = b"full";
+        let value = vec![7; 4096 - RECORD_HEADER_SIZE - key.len()];
+        // Fill the entire Region before the worker is notified. The next
+        // public put must preserve rotation despite failing staging preflight.
+        assert!(matches!(
+            plane
+                .regions
+                .try_stage_value(
+                    &plane.state.staging,
+                    0,
+                    hash_key(plane.data.hash_seed, key),
+                    4096,
+                    key,
+                    &value,
+                )
+                .unwrap(),
+            RegionStageValue::Staged { .. }
+        ));
+        assert_eq!(
+            plane.put(b"next", b"value").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while plane.snapshot().unwrap().region_rotations == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let rotations = plane.snapshot().unwrap().region_rotations;
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+        plane.state.append_controls[0].notify(WAKE_ROTATE).unwrap();
+        plane.drain().unwrap();
+        let snapshot = plane.detailed_snapshot().unwrap();
+        store.close_warm().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(
+            rotations, 1,
+            "one rejection must flush and rotate the full Region"
+        );
+        assert_eq!(
+            snapshot.summary.region_rotations, 1,
+            "a duplicate wake must remain idle"
+        );
+        assert_eq!(snapshot.summary.write_rejections, 1);
+        assert_eq!(snapshot.write_buffer_rejections, 1);
+    }
+
+    #[test]
+    fn staging_record_limit_accounts_for_flush_padding_before_rotation() {
+        use crate::region::record::RECORD_HEADER_SIZE;
+
+        const REGION_BYTES: usize = 1024 * 1024;
+        for needs_rotation in [false, true] {
+            let (mut store, path) = write_pressure_store(REGION_BYTES as u64, 1);
+            let plane = store.runtime().unwrap().clone();
+            let key = b"key";
+            let hash = hash_key(plane.data.hash_seed, key);
+            // Start with a 96-byte record so filling the record vector leaves
+            // an unaligned tail that must be padded before the next append.
+            let first = vec![1; 96 - RECORD_HEADER_SIZE - key.len()];
+            assert!(matches!(
+                plane
+                    .regions
+                    .try_stage_value(&plane.state.staging, 0, hash, 96, key, &first)
+                    .unwrap(),
+                RegionStageValue::Staged { .. }
+            ));
+            let mut used = 96;
+            loop {
+                match plane
+                    .regions
+                    .try_stage_value(&plane.state.staging, 0, hash, 64, key, b"value")
+                    .unwrap()
+                {
+                    RegionStageValue::Staged { .. } => used += 64,
+                    RegionStageValue::NeedsFlush => break,
+                    outcome => panic!("unexpected staging outcome: {outcome:?}"),
+                }
+                assert!(
+                    used < REGION_BYTES,
+                    "the record limit must leave Region capacity"
+                );
+            }
+            assert_eq!(used % 4096, 32);
+            // A small next record still fits after flush. A record that fills
+            // the unpadded remainder needs rotation once padding is included.
+            let next_record_bytes = if needs_rotation {
+                REGION_BYTES - used
+            } else {
+                64
+            };
+            let next = vec![2; next_record_bytes - RECORD_HEADER_SIZE - key.len()];
+            assert_eq!(
+                plane.put(key, &next).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (plane.regions.begin_point_read(hash).is_none()
+                || (needs_rotation && plane.snapshot().unwrap().region_rotations == 0))
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Capture progress before drain, which must not supply a missing
+            // wake or rotation request on behalf of the rejected producer.
+            let published = plane.regions.begin_point_read(hash).is_some();
+            let rotations = plane.snapshot().unwrap().region_rotations;
+            plane.drain().unwrap();
+            let final_rotations = plane.snapshot().unwrap().region_rotations;
+            assert_eq!(plane.get(key).unwrap().unwrap().value(), b"value");
+            store.close_warm().unwrap();
+            std::fs::remove_dir_all(path).unwrap();
+            assert!(published, "record capacity must wake the worker");
+            assert_eq!(rotations, u64::from(needs_rotation));
+            assert_eq!(final_rotations, rotations);
+        }
     }
 
     #[test]

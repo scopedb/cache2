@@ -6,6 +6,7 @@
 
 - Lock contention during foreground staging returns overload without forcing partial Region flushes. `DetailedCacheSnapshot::write_buffer_rejections` excludes lock contention; `CacheSnapshot::write_rejections` continues to count all mutation rejections. Actual capacity and rotation pressure still request urgent progress.
 - A full Region retains its capacity request through the final write and rotates without requiring another rejected put. Duplicate notifications do not rotate the new empty Region or retain obsolete flush pressure.
+- `CacheSnapshot::served_bytes` counts the payload actually returned when L2 promotion selects a newer L1 value of a different size.
 
 ### Improvements
 

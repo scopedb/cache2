@@ -395,6 +395,46 @@ impl RegionManager {
             .ok_or(RegionMutationError::InvalidShard)
     }
 
+    /// Retains rotation pressure for an append rejected by staging preflight.
+    /// A record-count limit may require only a flush, so request rotation only
+    /// when the next record cannot fit after the required aligned flush. No
+    /// position or sequence number is reserved.
+    pub fn request_rotation_for_append(
+        &mut self,
+        shard_id: usize,
+        record_bytes: u32,
+    ) -> Result<bool, RegionMutationError> {
+        let region_id = *self
+            .active_regions
+            .get(shard_id)
+            .ok_or(RegionMutationError::InvalidShard)?;
+        let region = self
+            .regions
+            .get(region_id as usize)
+            .ok_or(RegionMutationError::Invariant(
+                "active Region id is out of bounds",
+            ))?;
+        if region.state != RegionState::Active {
+            return Err(RegionMutationError::Invariant(
+                "data shard does not own an Active Region",
+            ));
+        }
+        let padding = region.reserved_used.wrapping_neg() & (DIRECT_IO_ALIGNMENT as u64 - 1);
+        let end = region
+            .reserved_used
+            .checked_add(padding)
+            .and_then(|end| end.checked_add(u64::from(record_bytes)))
+            .ok_or(RegionMutationError::ArithmeticOverflow)?;
+        let needs_rotation = end > self.region_size;
+        if needs_rotation {
+            self.append_states
+                .get_mut(shard_id)
+                .ok_or(RegionMutationError::InvalidShard)?
+                .rotation_requested = true;
+        }
+        Ok(needs_rotation)
+    }
+
     /// Allocates one process-local ordering version. Sequence exhaustion is a
     /// terminal condition for the current cache identity; `u64::MAX` is never
     /// issued because clean metadata reserves it as invalid.

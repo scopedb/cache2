@@ -910,9 +910,9 @@ impl RegionStore {
                 ));
             }
         };
-        match staging.preflight_append(shard_id, record_bytes) {
-            Ok(StageAppend::Appended { .. }) => {}
-            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsFlush),
+        let needs_seal = match staging.preflight_append(shard_id, record_bytes) {
+            Ok(StageAppend::Appended { .. }) => false,
+            Ok(StageAppend::NeedsSeal) => true,
             Err(StagingError::WouldBlock) => {
                 return Ok(RegionStageValue::Contended);
             }
@@ -921,11 +921,24 @@ impl RegionStore {
                 staging.close();
                 return Err(staging_io_error(error));
             }
-        }
+        };
         let receipt = {
             let Some(mut manager) = self.manager.try_lock()? else {
                 return Ok(RegionStageValue::Contended);
             };
+            if needs_seal {
+                let needs_rotation = manager
+                    .request_rotation_for_append(shard_id, record_bytes)
+                    .map_err(|error| {
+                        self.health.enter_miss_only();
+                        region_mutation_io_error(error)
+                    })?;
+                return Ok(if needs_rotation {
+                    RegionStageValue::NeedsRotation
+                } else {
+                    RegionStageValue::NeedsFlush
+                });
+            }
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
                 Err(RegionMutationError::WouldBlock) => {
