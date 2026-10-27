@@ -63,7 +63,7 @@ def parse_measurement(output, metrics, minimum_seconds):
 def summarize(samples, metrics, block_count):
     result = {}
     for metric in metrics:
-        changes, centers = [], []
+        changes, centers, repeat_spreads = [], [], []
         for block in range(block_count):
             groups = {
                 version: [
@@ -75,6 +75,9 @@ def summarize(samples, metrics, block_count):
             }
             if any(len(group) != 2 for group in groups.values()):
                 raise ValueError("each block requires two samples per binary")
+            # Pairing can cancel large alternating run-to-run noise exactly.
+            # Check repeated runs of the same binary before averaging them.
+            repeat_spreads.extend(max(group) - min(group) for group in groups.values())
             means = {version: statistics.mean(group) for version, group in groups.items()}
             changes.append(means["B"] - means["A"])
             centers.append(statistics.mean(means.values()))
@@ -98,6 +101,7 @@ def summarize(samples, metrics, block_count):
             ],
             "block_change_percent": [100 * math.expm1(change) for change in changes],
             "block_center_spread_percent": 100 * math.expm1(max(centers) - min(centers)),
+            "max_within_block_spread_percent": 100 * math.expm1(max(repeat_spreads)),
         }
     return result
 
@@ -136,7 +140,7 @@ def main():
     parser.add_argument("--prefix", action="append", default=[], help="launcher argument before the binary; repeat for taskset/taskpolicy arguments")
     parser.add_argument("--aa", action="store_true", help="require identical binaries and a narrow interval around zero")
     parser.add_argument("--tolerance", type=float, default=3.0, help="A/A confidence interval bound, percent")
-    parser.add_argument("--max-drift", type=float, default=5.0, help="maximum spread of ABBA block centers, percent")
+    parser.add_argument("--max-drift", type=float, default=5.0, help="maximum spread of block centers or same-binary repeats within a block, percent")
     parser.add_argument("--min-seconds", type=float, default=5.0, help="minimum measured duration for each selected metric")
     parser.add_argument("--min-battery-percent", type=int, default=20, help="macOS battery floor; AC without discharging is always required")
     args = parser.parse_args()
@@ -207,7 +211,10 @@ def main():
         write_json(args.output / "failure.json", {"error": str(error), "completed_samples": len(samples)})
         raise
     metrics = summarize(samples, args.metric, args.blocks)
-    stable = all(value["block_center_spread_percent"] <= args.max_drift for value in metrics.values())
+    stable = all(
+        max(value["block_center_spread_percent"], value["max_within_block_spread_percent"]) <= args.max_drift
+        for value in metrics.values()
+    )
     aa_pass = stable and all(
         -args.tolerance <= value["paired_bootstrap_95_percent"][0]
         and value["paired_bootstrap_95_percent"][1] <= args.tolerance

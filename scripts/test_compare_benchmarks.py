@@ -13,9 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "compare_benchmarks", Path(__file__).with_name("compare-benchmarks.py")
@@ -25,6 +30,79 @@ spec.loader.exec_module(compare)
 
 
 class ComparisonTests(unittest.TestCase):
+    def run_comparison_fixture(self, rates, *, aa=False, expected_exit=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            binary = root / "benchmark"
+            binary.write_bytes(b"fixture benchmark")
+            settings = root / "environment.json"
+            settings.write_text(json.dumps({"CACHE_SOAK_KEYS": "123"}))
+            output = root / "results"
+            arguments = [
+                "compare-benchmarks.py", "--baseline", str(binary),
+                "--candidate", str(binary), "--env", str(settings),
+                "--output", str(output), "--blocks", "4", "--metric", "put_steady",
+            ]
+            if aa:
+                arguments.append("--aa")
+            remaining = iter(rates)
+
+            def run_fixture(command, *, env, stdout, **kwargs):
+                self.assertEqual(command, [str(binary)])
+                self.assertEqual(env["CACHE_SOAK_KEYS"], "123")
+                self.assertNotIn("CACHE_BENCH_TEST_INHERITED", env)
+                stdout.write(
+                    f"result phase=put_steady ops_per_sec={next(remaining)} elapsed_ns=5000000000\n"
+                    "report version=2 type=run status=pass\n"
+                )
+                return compare.subprocess.CompletedProcess(command, 0)
+
+            with (
+                mock.patch("sys.argv", arguments),
+                mock.patch.dict(compare.os.environ, {"CACHE_BENCH_TEST_INHERITED": "1"}),
+                mock.patch.object(compare, "record_power"),
+                mock.patch.object(compare.platform, "platform", return_value="test host"),
+                mock.patch.object(compare.subprocess, "run", side_effect=run_fixture),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                if expected_exit:
+                    with self.assertRaises(SystemExit) as error:
+                        compare.main()
+                    self.assertEqual(error.exception.code, expected_exit)
+                else:
+                    compare.main()
+            self.assertEqual(len(list(output.glob("*.log"))), 16)
+            samples = json.loads((output / "samples.json").read_text())
+            self.assertEqual("".join(sample["version"] for sample in samples), "ABBABAAB" * 2)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["sha256"]["A"], manifest["sha256"]["B"])
+            return json.loads((output / "summary.json").read_text())
+
+    def test_stable_aa_retains_all_samples_and_passes(self):
+        summary = self.run_comparison_fixture([1000] * 16, aa=True)
+        self.assertTrue(summary["stable"])
+        self.assertTrue(summary["aa_pass"])
+
+    def test_pairing_does_not_hide_alternating_run_noise(self):
+        for aa in (False, True):
+            with self.subTest(aa=aa):
+                summary = self.run_comparison_fixture([1000, 500] * 8, aa=aa, expected_exit=2)
+                metric = summary["metrics"]["put_steady"]
+                self.assertEqual(metric["paired_bootstrap_95_percent"], [0, 0])
+                self.assertEqual(metric["block_center_spread_percent"], 0)
+                self.assertAlmostEqual(metric["max_within_block_spread_percent"], 100)
+                self.assertFalse(summary["stable"])
+                self.assertEqual(summary["aa_pass"], False if aa else None)
+
+    def test_block_drift_fails_comparison_even_when_repeats_are_stable(self):
+        summary = self.run_comparison_fixture(
+            [1000 * 1.1 ** block for block in range(4) for _ in range(4)], expected_exit=2,
+        )
+        metric = summary["metrics"]["put_steady"]
+        self.assertEqual(metric["max_within_block_spread_percent"], 0)
+        self.assertGreater(metric["block_center_spread_percent"], 33)
+        self.assertFalse(summary["stable"])
+
     def test_parse_counts_hits_independently_of_library_statistics(self):
         output = """report version=2 type=job benchmark=cache_soak job=get iops=100 runtime_ns=20000000000
 complete hits=600 writes=1000 cache_puts=0 l1_hits=0 l2_hits=0
