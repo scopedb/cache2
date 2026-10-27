@@ -265,8 +265,16 @@ pub enum RegionStageValue {
         previous_bytes: usize,
         current_bytes: usize,
     },
-    NeedsProgress,
+    Contended,
+    NeedsFlush,
     NeedsRotation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionRotation {
+    Idle,
+    Pending,
+    Rotated,
 }
 
 pub struct RegionValue {
@@ -295,6 +303,16 @@ impl RegionValue {
 }
 
 impl RegionStore {
+    #[cfg(test)]
+    pub fn lock_manager_for_test(&self) -> MutexGuard<'_, RegionManager> {
+        self.manager.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn lock_append_for_test(&self, shard_id: usize) -> MutexGuard<'_, ()> {
+        self.append_gates[shard_id].mutation.lock().unwrap()
+    }
+
     /// Consume the index and Region metadata into one live store.
     pub fn from_recovery(
         index: PartitionedIndexStorage,
@@ -883,7 +901,7 @@ impl RegionStore {
         let payload = RecordPayload::new(key, value);
         let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
             Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::NeedsProgress),
+            Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::Contended),
             Err(TryLockError::Poisoned(_)) => {
                 self.health.enter_miss_only();
                 return Err(io::Error::new(
@@ -894,9 +912,9 @@ impl RegionStore {
         };
         match staging.preflight_append(shard_id, record_bytes) {
             Ok(StageAppend::Appended { .. }) => {}
-            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsProgress),
+            Ok(StageAppend::NeedsSeal) => return Ok(RegionStageValue::NeedsFlush),
             Err(StagingError::WouldBlock) => {
-                return Ok(RegionStageValue::NeedsProgress);
+                return Ok(RegionStageValue::Contended);
             }
             Err(error) => {
                 self.health.enter_miss_only();
@@ -906,15 +924,15 @@ impl RegionStore {
         }
         let receipt = {
             let Some(mut manager) = self.manager.try_lock()? else {
-                return Ok(RegionStageValue::NeedsProgress);
+                return Ok(RegionStageValue::Contended);
             };
             let receipt = match manager.reserve_append(shard_id, record_bytes) {
                 Ok(receipt) => receipt,
                 Err(RegionMutationError::WouldBlock) => {
-                    return Ok(RegionStageValue::NeedsProgress);
+                    return Ok(RegionStageValue::NeedsFlush);
                 }
                 Err(RegionMutationError::FlushBeforeRotation) => {
-                    return Ok(RegionStageValue::NeedsProgress);
+                    return Ok(RegionStageValue::NeedsRotation);
                 }
                 Err(RegionMutationError::RegionFull) => {
                     return Ok(RegionStageValue::NeedsRotation);
@@ -1182,7 +1200,7 @@ impl RegionStore {
 
     /// Rotates one empty data shard. Concurrent reads validate the returned
     /// record identity and may observe either valid generation.
-    pub fn rotate_shard(&self, shard_id: usize) -> io::Result<bool> {
+    pub fn rotate_shard(&self, shard_id: usize) -> io::Result<RegionRotation> {
         self.health.require_healthy()?;
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
         let rotation = self.rotation.lock().map_err(|_| {
@@ -1192,10 +1210,19 @@ impl RegionStore {
                 "Region rotation gate is poisoned",
             )
         })?;
-        let candidate = match self.manager.lock()?.rotation_candidate(shard_id) {
-            Ok(candidate) => candidate,
-            Err(RegionMutationError::WouldBlock) => return Ok(false),
-            Err(error) => return Err(region_mutation_context("rotation selection", error)),
+        let candidate = {
+            let manager = self.manager.lock()?;
+            if !manager
+                .rotation_requested(shard_id)
+                .map_err(|error| region_mutation_context("rotation selection", error))?
+            {
+                return Ok(RegionRotation::Idle);
+            }
+            match manager.rotation_candidate(shard_id) {
+                Ok(candidate) => candidate,
+                Err(RegionMutationError::WouldBlock) => return Ok(RegionRotation::Pending),
+                Err(error) => return Err(region_mutation_context("rotation selection", error)),
+            }
         };
 
         let receipt = self
@@ -1224,7 +1251,7 @@ impl RegionStore {
             self.health.enter_miss_only();
             return Err(region_mutation_context("rotation completion", error));
         }
-        Ok(true)
+        Ok(RegionRotation::Rotated)
     }
 
     /// Publishes a completed batch without entering global Region authority.

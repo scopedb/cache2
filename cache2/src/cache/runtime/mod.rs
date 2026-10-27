@@ -77,6 +77,7 @@ use crate::memory::MemoryMetricsSnapshot;
 use crate::memory::MemoryReadToken;
 use crate::memory::MemoryStore;
 use crate::memory::MemoryValue;
+use crate::region::RegionRotation;
 use crate::region::RegionStageValue;
 use crate::region::RegionStore;
 use crate::region::RegionValue;
@@ -903,7 +904,16 @@ impl CacheRuntime {
                 }
                 Ok(seqno)
             }
-            RegionStageValue::NeedsProgress => {
+            RegionStageValue::Contended => {
+                // The lock owner retains normal flush responsibility. A collision
+                // is not buffer pressure and must not force a partial flush.
+                drop(operation);
+                if state.activity_counters {
+                    state.metrics.record_write_rejection();
+                }
+                Err(write_overload_error())
+            }
+            RegionStageValue::NeedsFlush => {
                 reject_staged_write(state, control, WAKE_URGENT, operation)
             }
             RegionStageValue::NeedsRotation => {
@@ -1871,7 +1881,9 @@ fn reclaim_worker_result(
                         staged_reinsert = true;
                         Ok(true)
                     }
-                    RegionStageValue::NeedsProgress | RegionStageValue::NeedsRotation => {
+                    RegionStageValue::Contended
+                    | RegionStageValue::NeedsFlush
+                    | RegionStageValue::NeedsRotation => {
                         accepting_reinserts = false;
                         Ok(false)
                     }
@@ -1917,10 +1929,11 @@ fn append_worker_result(
     control: &AppendWorkerControl,
 ) -> io::Result<()> {
     let mut deadline = None;
+    let mut rotate_pending = false;
     loop {
         let (flags, drain_generation, stop, timed_out) = wait_for_shard_work(control, deadline)?;
         let draining = drain_generation != 0;
-        let force_flush = flags & WAKE_URGENT != 0 || timed_out || draining;
+        let force_flush = flags & WAKE_URGENT != 0 || timed_out || draining || rotate_pending;
         let rotate = flags & WAKE_ROTATE != 0;
 
         match state.staging.shard_fill_snapshot(shard_id) {
@@ -1931,7 +1944,8 @@ fn append_worker_result(
                     )?);
                 }
                 if force_flush || fill.bytes >= state.write_flush_threshold_bytes {
-                    let essential = flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining;
+                    let essential =
+                        flags & (WAKE_URGENT | WAKE_ROTATE) != 0 || draining || rotate_pending;
                     let bytes = fill.bytes as u64;
                     let records = u32::try_from(fill.records).unwrap_or(u32::MAX);
                     let charge = match &state.fill_control {
@@ -1966,20 +1980,27 @@ fn append_worker_result(
             }
             Ok(None) => {
                 deadline = None;
-                if rotate {
-                    let rotated = state.regions.rotate_shard(shard_id)?;
-                    if rotated && state.activity_counters {
-                        RuntimeMetrics::increment(&state.metrics.region_rotations);
-                    }
-                    if rotated {
-                        state.reclaim_control.notify()?;
-                    }
-                }
             }
             Err(StagingError::WouldBlock) => {
                 deadline = Some(Instant::now() + STAGING_RETRY_DELAY);
             }
             Err(error) => return Err(staging_runtime_error(error)),
+        }
+
+        if rotate || rotate_pending {
+            // Manager authority distinguishes a pending capacity request from a
+            // duplicate wake for an already rotated, empty Region.
+            match state.regions.rotate_shard(shard_id)? {
+                RegionRotation::Idle => rotate_pending = false,
+                RegionRotation::Pending => rotate_pending = true,
+                RegionRotation::Rotated => {
+                    rotate_pending = false;
+                    if state.activity_counters {
+                        RuntimeMetrics::increment(&state.metrics.region_rotations);
+                    }
+                    state.reclaim_control.notify()?;
+                }
+            }
         }
 
         if draining {
@@ -2370,6 +2391,406 @@ mod tests {
         assert!(!should_wake_write(64, 128, 4096));
         assert!(should_wake_write(4032, 4096, 4096));
         assert!(!should_wake_write(4096, 4160, 4096));
+    }
+
+    fn write_pressure_store(
+        region_size: u64,
+        append_shards: u32,
+    ) -> (crate::cache::session::CacheSession, std::path::PathBuf) {
+        use crate::FillControlOptions;
+        use crate::FillLimits;
+        use crate::region::persistence::RegionPaths;
+        use crate::region::recovery::PersistentId;
+
+        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            env::temp_dir().join(format!("cache2-write-pressure-{}-{id}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let files = RegionPaths::new(path.join("data"), path.join("state"), path.join("image"));
+        let data = DataSuperblock {
+            generation: 1,
+            cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
+            data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
+            geometry: DataGeometry {
+                data_file_len: DataGeometry::expected_file_len(region_size, 4).unwrap(),
+                region_size,
+                region_count: 4,
+            },
+            hash_seed: 3,
+            storage_fingerprint: 4,
+        };
+        let config = RuntimeOptions {
+            append_shards,
+            l1_capacity_bytes: 0,
+            fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
+            stats: crate::StatsOptions {
+                activity_counters: true,
+                ..Default::default()
+            },
+            ..RuntimeOptions::default()
+        };
+        let store =
+            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, config)
+                .unwrap();
+        (store, path)
+    }
+
+    #[test]
+    fn contention_rejects_without_waking_but_full_buffers_flush_and_publish() {
+        use crate::region::record::RECORD_HEADER_SIZE;
+
+        let (mut store, path) = write_pressure_store(4096, 1);
+        let plane = store.runtime().unwrap().clone();
+        for manager_contention in [false, true] {
+            let shard = (!manager_contention).then(|| plane.regions.lock_append_for_test(0));
+            let manager = manager_contention.then(|| plane.regions.lock_manager_for_test());
+            // A contended producer must not even acquire the worker's wake
+            // mutex. Release it before joining so a regression fails, not hangs.
+            let state = plane.state.append_controls[0].lock().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let writer_plane = plane.clone();
+            let writer = std::thread::spawn(move || {
+                send.send(writer_plane.put(b"contended", b"value")).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(1));
+            assert_eq!(state.wake_flags, 0);
+            drop(state);
+            drop(manager);
+            drop(shard);
+            writer.join().unwrap();
+            assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        }
+        assert_eq!(plane.snapshot().unwrap().write_rejections, 2);
+        assert_eq!(
+            plane.detailed_snapshot().unwrap().write_buffer_rejections,
+            0
+        );
+        let controller = plane.state.fill_control.as_ref().unwrap();
+        assert_eq!(controller.snapshot().outstanding_operations, 0);
+
+        // Fill without notifying the worker, then make the public path hit
+        // actual capacity pressure. It must still wake, flush and publish.
+        let key = b"pressure";
+        let value = vec![7; 4096 - RECORD_HEADER_SIZE - key.len()];
+        assert!(matches!(
+            plane
+                .regions
+                .try_stage_value(
+                    &plane.state.staging,
+                    0,
+                    hash_key(plane.data.hash_seed, key),
+                    4096,
+                    key,
+                    &value
+                )
+                .unwrap(),
+            RegionStageValue::Staged { .. }
+        ));
+        assert_eq!(
+            plane.put(b"next", b"value").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            plane.detailed_snapshot().unwrap().write_buffer_rejections,
+            1
+        );
+        // A drain would wake the worker itself and hide a missing pressure
+        // notification. Require automatic completion and publication first.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while plane
+            .regions
+            .begin_point_read(hash_key(plane.data.hash_seed, key))
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "capacity pressure must flush and publish without an explicit drain"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(plane.get(key).unwrap().is_some());
+        store.close_warm().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capacity_request_flushes_then_rotates_without_another_put_or_drain() {
+        use crate::region::record::RECORD_HEADER_SIZE;
+
+        let (mut store, path) = write_pressure_store(8192, 1);
+        let plane = store.runtime().unwrap().clone();
+        let first = vec![1; 4096 - RECORD_HEADER_SIZE - b"first".len()];
+        plane.put(b"first", &first).unwrap();
+        plane.drain().unwrap();
+
+        // Leave one aligned record unit at the end of the Region. This fill
+        // fits the staging buffer, but the next record needs a new Region.
+        let tail = vec![2; 4064 - RECORD_HEADER_SIZE - b"tail".len()];
+        assert!(matches!(
+            plane
+                .regions
+                .try_stage_value(
+                    &plane.state.staging,
+                    0,
+                    hash_key(plane.data.hash_seed, b"tail"),
+                    4064,
+                    b"tail",
+                    &tail,
+                )
+                .unwrap(),
+            RegionStageValue::Staged { .. }
+        ));
+        assert_eq!(
+            plane.put(b"next", b"value").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while plane.snapshot().unwrap().region_rotations == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "one capacity request must flush and rotate without another put or drain"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(plane.get(b"first").unwrap().unwrap().value(), first);
+        assert_eq!(plane.get(b"tail").unwrap().unwrap().value(), tail);
+        // A duplicate wake, including reclaim's free-capacity notification,
+        // must not rotate the newly empty Active Region.
+        plane.state.append_controls[0].notify(WAKE_ROTATE).unwrap();
+        plane.drain().unwrap();
+        assert_eq!(plane.snapshot().unwrap().region_rotations, 1);
+        assert_eq!(plane.snapshot().unwrap().write_rejections, 1);
+        store.close_warm().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn primary_contention_rejects_without_probing_other_shards() {
+        let (mut store, path) = write_pressure_store(8192, 3);
+        let plane = store.runtime().unwrap().clone();
+        let key = b"fixed-route";
+        let value = [7; 64];
+        let primary = plane
+            .regions
+            .append_shard(hash_key(plane.data.hash_seed, key));
+        let primary_gate = plane.regions.lock_append_for_test(primary);
+        let primary_wake = plane.state.append_controls[primary].lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer_plane = plane.clone();
+        let writer = std::thread::spawn(move || {
+            send.send(writer_plane.put(key, &value)).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        assert_eq!(primary_wake.wake_flags, 0);
+        drop(primary_wake);
+        drop(primary_gate);
+        writer.join().unwrap();
+        assert_eq!(
+            result
+                .expect("contention must not wait for a mutation or wake lock")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let controller = plane.state.fill_control.as_ref().unwrap();
+        assert_eq!(controller.snapshot().outstanding_operations, 0);
+        let snapshot = plane.detailed_snapshot().unwrap();
+        assert_eq!(snapshot.summary.puts, 0);
+        assert_eq!(snapshot.summary.write_rejections, 1);
+        assert_eq!(snapshot.write_buffer_rejections, 0);
+        assert_eq!(snapshot.summary.fill_control.outstanding_operations, 0);
+
+        plane.put(key, &value).unwrap();
+        plane.drain().unwrap();
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+        let snapshot = plane.detailed_snapshot().unwrap();
+        assert_eq!(snapshot.summary.puts, 1);
+        assert_eq!(snapshot.summary.write_rejections, 1);
+        assert_eq!(snapshot.write_buffer_rejections, 0);
+        store.close_warm().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn reclaimed_cache_rejects_primary_contention_without_trying_a_free_neighbor() {
+        let (mut store, path) = write_pressure_store(8192, 3);
+        let plane = store.runtime().unwrap().clone();
+        let key = b"stable-route";
+        let primary = plane
+            .regions
+            .append_shard(hash_key(plane.data.hash_seed, key));
+        plane
+            .regions
+            .lock_manager_for_test()
+            .request_rotation_for_test(primary)
+            .unwrap();
+        assert_eq!(
+            plane.regions.rotate_shard(primary).unwrap(),
+            RegionRotation::Rotated
+        );
+        let receipt = plane.regions.begin_reclaim().unwrap().unwrap();
+        plane.regions.complete_reclaim(receipt).unwrap();
+
+        let primary_gate = plane.regions.lock_append_for_test(primary);
+        let primary_wake = plane.state.append_controls[primary].lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer_plane = plane.clone();
+        let writer = std::thread::spawn(move || {
+            send.send(writer_plane.put(key, &[7; 64])).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        assert_eq!(primary_wake.wake_flags, 0);
+        drop(primary_wake);
+        drop(primary_gate);
+        writer.join().unwrap();
+        assert_eq!(
+            result
+                .expect("contention must not wait for a mutation or wake lock")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let snapshot = plane.detailed_snapshot().unwrap();
+        assert_eq!(snapshot.summary.puts, 0);
+        assert_eq!(snapshot.summary.write_rejections, 1);
+        assert_eq!(snapshot.write_buffer_rejections, 0);
+        assert_eq!(snapshot.summary.fill_control.outstanding_operations, 0);
+        assert_eq!(
+            plane
+                .regions
+                .begin_point_read(hash_key(plane.data.hash_seed, key)),
+            None
+        );
+        plane.put(key, &[7; 64]).unwrap();
+        plane.drain().unwrap();
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), &[7; 64]);
+        store.close_warm().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn existing_alternate_records_survive_reclaim_and_warm_reopen() {
+        use crate::FillControlOptions;
+        use crate::FillLimits;
+        use crate::region::persistence::RegionPaths;
+
+        let (mut store, path) = write_pressure_store(8192, 3);
+        let plane = store.runtime().unwrap().clone();
+        let key = b"fallback-route";
+        let value = [9; 64];
+        let data = plane.data;
+        let hash = hash_key(data.hash_seed, key);
+        let primary = plane.regions.append_shard(hash);
+        let alternate = (primary + 1) % plane.state.append_controls.len();
+        let alternate_region = plane.regions.lock_manager_for_test().active_regions()[alternate];
+
+        // Model a record written by an older runtime that used another
+        // append shard. Reads must follow the stored address, not today's route.
+        let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
+        assert!(matches!(
+            plane
+                .regions
+                .try_stage_value(
+                    &plane.state.staging,
+                    alternate,
+                    hash,
+                    record_bytes,
+                    key,
+                    &value,
+                )
+                .unwrap(),
+            RegionStageValue::Staged { .. }
+        ));
+        plane.drain().unwrap();
+        assert_eq!(
+            plane
+                .regions
+                .begin_point_read(hash)
+                .unwrap()
+                .entry
+                .location
+                .region_id(),
+            alternate_region
+        );
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+
+        // Reclaim an empty primary Region while the alternate record remains
+        // live. L1 is disabled, so all read assertions exercise the L2 address.
+        plane
+            .regions
+            .lock_manager_for_test()
+            .request_rotation_for_test(primary)
+            .unwrap();
+        assert_eq!(
+            plane.regions.rotate_shard(primary).unwrap(),
+            RegionRotation::Rotated
+        );
+        let receipt = plane.regions.begin_reclaim().unwrap().unwrap();
+        assert_ne!(receipt.region_id, alternate_region);
+        assert_eq!(receipt.physical_record_count, 0);
+        plane.regions.complete_reclaim(receipt).unwrap();
+        assert!(!plane.regions.reclaim_needed().unwrap());
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+        assert_eq!(
+            plane
+                .regions
+                .begin_point_read(hash)
+                .unwrap()
+                .entry
+                .location
+                .region_id(),
+            alternate_region
+        );
+        store.close_warm().unwrap();
+        drop(plane);
+        drop(store);
+
+        let files = RegionPaths::new(path.join("data"), path.join("state"), path.join("image"));
+        let options = RuntimeOptions {
+            append_shards: 3,
+            l1_capacity_bytes: 0,
+            fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
+            stats: crate::StatsOptions {
+                activity_counters: true,
+                ..Default::default()
+            },
+            ..RuntimeOptions::default()
+        };
+        let mut reopened =
+            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, options)
+                .unwrap();
+        let plane = reopened.runtime().unwrap().clone();
+        // Recovery preserves the old physical address. New foreground writes
+        // use the same hash route as they did before reclaim and close.
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+        assert_eq!(
+            plane
+                .regions
+                .begin_point_read(hash)
+                .unwrap()
+                .entry
+                .location
+                .region_id(),
+            alternate_region
+        );
+        plane.put_l2(key, &[11; 64]).unwrap();
+        plane.drain().unwrap();
+        assert_eq!(plane.get(key).unwrap().unwrap().value(), &[11; 64]);
+        let primary_region = plane.regions.lock_manager_for_test().active_regions()[primary];
+        assert_eq!(
+            plane
+                .regions
+                .begin_point_read(hash)
+                .unwrap()
+                .entry
+                .location
+                .region_id(),
+            primary_region
+        );
+        reopened.close_warm().unwrap();
+        drop(plane);
+        drop(reopened);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

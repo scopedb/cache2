@@ -43,6 +43,9 @@ use crate::snapshot::CacheL1Snapshot;
 
 mod eviction;
 
+#[cfg(test)]
+mod reuse_tests;
+
 /// Charged retained-value ownership. Fixed entry, policy, and directory
 /// storage is planned and allocated separately during open.
 const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
@@ -179,6 +182,7 @@ impl MemoryValue {
         value: &[u8],
         seqno: u64,
         charge: MemoryCharge,
+        recycled: Option<Self>,
     ) -> Result<Self, MemoryCharge> {
         let Some(length) = key
             .len()
@@ -187,6 +191,19 @@ impl MemoryValue {
         else {
             return Err(charge);
         };
+        // Reuse only a detached, exclusively owned allocation of the exact
+        // size. Caller-held values remain immutable and keep their own charge.
+        if let Some(mut recycled) = recycled
+            && let Some(inner) = Arc::get_mut(&mut recycled.0)
+            && inner.bytes.len() == length
+        {
+            inner.bytes[..key.len()].copy_from_slice(key);
+            inner.bytes[key.len()..key.len() + value.len()].copy_from_slice(value);
+            inner.bytes[length - MEMORY_VALUE_SEQNO_BYTES..].copy_from_slice(&seqno.to_le_bytes());
+            inner.key_length = key.len();
+            inner._charge = charge;
+            return Ok(recycled);
+        }
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(length).is_err() {
             return Err(charge);
@@ -426,20 +443,23 @@ impl MemoryShard {
     }
 
     fn remove_slot(&mut self, index: usize) {
-        if self.slots.get(index).and_then(Option::as_ref).is_none() {
-            return;
-        }
-        let Some(hash) = self.policy_slots.get(index).map(PolicySlot::hash) else {
-            return;
-        };
-        self.eviction.remove(&mut self.policy_slots, index);
-        self.remove_slot_after_policy(index, hash, false);
+        drop(self.take_slot(index));
     }
 
-    fn remove_slot_after_policy(&mut self, index: usize, hash: u64, transfer_charge: bool) {
-        let Some(mut cursor) = self.directory_head(hash) else {
-            return;
-        };
+    fn take_slot(&mut self, index: usize) -> Option<MemoryValue> {
+        self.slots.get(index).and_then(Option::as_ref)?;
+        let hash = self.policy_slots.get(index).map(PolicySlot::hash)?;
+        self.eviction.remove(&mut self.policy_slots, index);
+        self.remove_slot_after_policy(index, hash, false)
+    }
+
+    fn remove_slot_after_policy(
+        &mut self,
+        index: usize,
+        hash: u64,
+        transfer_charge: bool,
+    ) -> Option<MemoryValue> {
+        let mut cursor = self.directory_head(hash)?;
         let mut predecessor = None;
         let mut found = false;
         for _ in 0..MAX_SAME_HASH_ENTRIES {
@@ -461,7 +481,7 @@ impl MemoryShard {
         }
         debug_assert!(found, "resident slot must remain in its hash chain");
         if !found {
-            return;
+            return None;
         }
 
         let entry_next = self.slots[index]
@@ -501,13 +521,14 @@ impl MemoryShard {
                     .charged_bytes()
             );
         }
-        let _entry = self.slots[index].take().expect("resident slot disappeared");
+        let entry = self.slots[index].take().expect("resident slot disappeared");
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
         debug_assert!(self.free_count < self.slots.len());
         let packed = u32::try_from(index).expect("memory slot index exceeds u32");
         self.policy_slots[index] = PolicySlot::new_free(self.free_head);
         self.free_head = packed;
         self.free_count += 1;
+        Some(entry.value)
     }
 
     fn detach_for_admission(&mut self, index: usize) -> DetachedAdmissionEntry {
@@ -533,11 +554,17 @@ impl MemoryShard {
             .restore_for_admission(&mut self.policy_slots, entry.index, entry.policy);
     }
 
-    fn commit_detached(&mut self, entry: DetachedAdmissionEntry, record_eviction: bool) {
-        self.remove_slot_after_policy(entry.index, entry.policy.hash(), entry.transfers_charge);
+    fn commit_detached(
+        &mut self,
+        entry: DetachedAdmissionEntry,
+        record_eviction: bool,
+    ) -> Option<MemoryValue> {
+        let value =
+            self.remove_slot_after_policy(entry.index, entry.policy.hash(), entry.transfers_charge);
         if record_eviction {
             self.eviction.commit_eviction(entry.policy);
         }
+        value
     }
 
     fn restore_admission(
@@ -564,14 +591,14 @@ impl MemoryShard {
         let needs_slot = replacement.is_none() && self.free_head == NO_SLOT_INDEX;
         match self.budget.try_charge(required) {
             MemoryChargeAttempt::Charged(charge) => {
-                if let Some(replacement) = replacement {
-                    self.remove_slot(replacement);
-                } else if needs_slot {
+                if needs_slot {
                     return self.charge_with_slot_eviction(charge);
                 }
+                let recycled = replacement.and_then(|index| self.take_slot(index));
                 return ChargeResult::Charged {
                     charge,
                     evictions: 0,
+                    recycled,
                 };
             }
             MemoryChargeAttempt::Contended => {
@@ -624,15 +651,19 @@ impl MemoryShard {
             }
         };
 
-        if let Some(replacement) = replacement {
-            self.commit_detached(replacement, false);
-        }
+        let mut recycled = replacement.and_then(|entry| self.commit_detached(entry, false));
         for victim in victims.iter() {
-            self.commit_detached(victim, true);
+            let value = self.commit_detached(victim, true);
+            if recycled.as_ref().is_none_or(|value| {
+                value.charged_bytes() != required || !value.releases_charge_on_remove()
+            }) {
+                recycled = value;
+            }
         }
         ChargeResult::Charged {
             charge,
             evictions: victims.len,
+            recycled,
         }
     }
 
@@ -649,10 +680,11 @@ impl MemoryShard {
         // The candidate was charged independently because byte capacity was
         // available. Let an exclusive victim release its own charge normally.
         victim.transfers_charge = false;
-        self.commit_detached(victim, true);
+        let recycled = self.commit_detached(victim, true);
         ChargeResult::Charged {
             charge,
             evictions: 1,
+            recycled,
         }
     }
 
@@ -671,12 +703,17 @@ impl MemoryShard {
             return MemoryInsertResult::bypassed();
         }
 
-        let (charge, evictions) = match self.charge_with_eviction(charged_bytes, replacement) {
-            ChargeResult::Charged { charge, evictions } => (charge, evictions),
-            ChargeResult::Rejected { evictions } => {
-                return MemoryInsertResult::rejected(evictions);
-            }
-        };
+        let (charge, evictions, recycled) =
+            match self.charge_with_eviction(charged_bytes, replacement) {
+                ChargeResult::Charged {
+                    charge,
+                    evictions,
+                    recycled,
+                } => (charge, evictions, recycled),
+                ChargeResult::Rejected { evictions } => {
+                    return MemoryInsertResult::rejected(evictions);
+                }
+            };
         let packed_index = self.free_head;
         if packed_index == NO_SLOT_INDEX {
             return MemoryInsertResult::rejected(evictions);
@@ -684,7 +721,7 @@ impl MemoryShard {
         let Ok(index) = usize::try_from(packed_index) else {
             return MemoryInsertResult::rejected(evictions);
         };
-        let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge) else {
+        let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge, recycled) else {
             return MemoryInsertResult::rejected(evictions);
         };
         let previous_head = self.directory_head(hash);
@@ -712,6 +749,7 @@ enum ChargeResult {
     Charged {
         charge: MemoryCharge,
         evictions: usize,
+        recycled: Option<MemoryValue>,
     },
     Rejected {
         evictions: usize,
@@ -1049,10 +1087,12 @@ impl MemoryStore {
         if !self.metrics.enabled {
             return;
         }
-        self.metrics.evictions.fetch_add(
-            u64::try_from(result.evictions).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        if result.evictions != 0 {
+            self.metrics.evictions.fetch_add(
+                u64::try_from(result.evictions).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         if !result.inserted() {
             self.metrics.bypasses.fetch_add(1, Ordering::Relaxed);
         }
@@ -1117,6 +1157,77 @@ mod tests {
         let expected = 2 * size_of::<usize>();
         assert_eq!(size_of::<MemoryEntry>(), expected);
         assert_eq!(size_of::<Option<MemoryEntry>>(), expected);
+    }
+
+    #[test]
+    fn recycled_eviction_rewrites_key_and_sequence_with_exact_accounting() {
+        for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
+            let charge = memory_entry_bytes(b"a", &[1; 128]).unwrap();
+            // Exercise both byte pressure (transferred charge) and slot
+            // pressure with spare byte capacity (independent new charge).
+            for capacity in [charge, 2 * charge] {
+                let store = MemoryStore::new(capacity, 1, 1, policy, true).unwrap();
+                assert!(store.publish(7, b"a", &[1; 128], 1));
+                let old_address = match store.lookup(7, b"a") {
+                    MemoryLookup::Hit(value) => Arc::as_ptr(&value.0),
+                    MemoryLookup::Miss(_) => panic!("initial value must be resident"),
+                };
+                assert!(store.publish(8, b"bb", &[2; 127], 2));
+                assert_miss(&store, 7, b"a");
+                let MemoryLookup::Hit(value) = store.lookup(8, b"bb") else {
+                    panic!("replacement must be resident");
+                };
+                assert_eq!(Arc::as_ptr(&value.0), old_address);
+                assert_eq!(value.key(), b"bb");
+                assert_eq!(value.as_ref(), &[2; 127]);
+                assert_eq!(value.seqno(), 2);
+                let snapshot = store.detailed_snapshot().unwrap();
+                assert_eq!(snapshot.resident_entries, 1);
+                assert_eq!(snapshot.resident_bytes, charge);
+                assert_eq!(snapshot.retained_bytes, 0);
+                assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), charge);
+                assert_eq!(store.metrics_snapshot().evictions, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn recycled_replacement_preserves_caller_owned_values() {
+        for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
+            let charge = memory_entry_bytes(b"key", &[1; 128]).unwrap();
+            let store = MemoryStore::new(2 * charge, 2, 1, policy, true).unwrap();
+            assert!(store.publish(7, b"key", &[1; 128], 1));
+            let MemoryLookup::Hit(held) = store.lookup(7, b"key") else {
+                panic!("initial value must be resident");
+            };
+            assert!(store.publish(7, b"key", &[2; 128], 2));
+            let address = match store.lookup(7, b"key") {
+                MemoryLookup::Hit(value) => {
+                    assert!(!Arc::ptr_eq(&value.0, &held.0));
+                    assert_eq!(value.as_ref(), &[2; 128]);
+                    Arc::as_ptr(&value.0)
+                }
+                MemoryLookup::Miss(_) => panic!("newer value must be resident"),
+            };
+            assert_eq!(held.as_ref(), &[1; 128]);
+            assert_eq!(held.seqno(), 1);
+            assert_eq!(store.detailed_snapshot().unwrap().retained_bytes, charge);
+
+            // The newer resident allocation is exclusive, while the caller's
+            // old value still owns its separate charge. Reuse must not exceed
+            // the full budget or alter that old value.
+            assert!(store.publish(7, b"key", &[3; 128], 3));
+            let MemoryLookup::Hit(value) = store.lookup(7, b"key") else {
+                panic!("latest value must be resident");
+            };
+            assert_eq!(Arc::as_ptr(&value.0), address);
+            assert_eq!(value.as_ref(), &[3; 128]);
+            assert_eq!(value.seqno(), 3);
+            assert_eq!(held.as_ref(), &[1; 128]);
+            drop(held);
+            assert_eq!(store.detailed_snapshot().unwrap().retained_bytes, 0);
+            assert_eq!(store.shards[0].lock().unwrap().budget.used_bytes(), charge);
+        }
     }
 
     #[test]
