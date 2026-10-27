@@ -75,7 +75,7 @@ The eviction policies share those bounds but spend metadata differently:
 | CLOCK   | The default uses one visited bit and a bounded shard-local hand. It keeps policy metadata and hit work small.                                                                                                                                                                                                       |
 | S3-FIFO | Uses small and main resident FIFOs, a metadata-only ghost FIFO, and a saturating two-bit frequency. Hits update frequency without moving queue nodes; repeated small-queue entries and ghost hits can enter the main queue. It spends additional fixed metadata to distinguish reused entries from one-hit traffic. |
 
-Evicted values may remain alive while a caller owns them. Admission never waits for such retained values to release their memory charge; it selects another bounded victim or bypasses L1.
+Evicted values may remain alive while a caller owns them. Admission never waits for such retained values to release their memory charge; it selects another bounded victim or bypasses L1. Replacement and eviction can reuse one detached, exclusively owned allocation when its combined key/value size matches the new entry. The allocation and its charge become the new resident value; there is no extra free-buffer pool, and caller-held values remain immutable. This reduces allocator churn for fixed-size turnover under both CLOCK and S3-FIFO.
 
 ### L2 index
 
@@ -97,14 +97,14 @@ This layout converts small foreground mutations into ordered, batched Region wri
 
 ### `put` and `put_l2`
 
-1. Compute the key hash and encoded size once.
-2. Enter bounded mutation admission and reserve an append position under one short manager try-lock.
+1. Compute the key hash, encoded size, and payload checksum once.
+2. Enter bounded mutation admission and try the hash-routed append shard once. Reserve an append position under one short manager try-lock.
 3. Encode into the selected shard's current buffer.
 4. For `put`, attempt bounded L1 admission. For `put_l2`, stage through Region and remove an older exact-key L1 entry best effort.
 5. Return after bounded in-memory admission.
 6. The shard worker writes sealed batches and publishes their L2 mappings only after write completion.
 
-Full staging or short-path contention returns structured `ErrorKind::Overloaded`. Staging admission is shard-local; optional adaptive fill budgets are shared across shards. Success means accepted staging; `put_l2` becomes visible when publication completes. `drain` fences all mutations accepted before its operation barrier and waits for their Region writes and L2 publication, but does not issue the recovery durability syncs.
+Full staging or lock contention returns structured `ErrorKind::Overloaded`. Every fill uses the same hash route during initial growth, capacity reclaim, and recovery; there is no neighboring-shard retry or routing mode switch. Reads follow the physical address in the index, so records written to another shard by an older runtime remain readable. Lock contention does not force an early flush; capacity and rotation pressure still wake the affected shard worker urgently. A Region capacity request remains in manager authority through its final write, allowing the worker to flush and rotate without waiting for another rejected put; duplicate notifications cannot rotate an empty new Region or retain obsolete rotation pressure. Staging admission is shard-local; optional adaptive fill budgets are shared across shards. Success means accepted staging; `put_l2` becomes visible when publication completes. `drain` fences all mutations accepted before its operation barrier and waits for their Region writes and L2 publication, but does not issue the recovery durability syncs.
 
 ### `get`
 

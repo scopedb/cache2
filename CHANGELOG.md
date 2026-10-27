@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- Lock contention during foreground staging returns overload without forcing partial Region flushes. `DetailedCacheSnapshot::write_buffer_rejections` excludes lock contention; `CacheSnapshot::write_rejections` continues to count all mutation rejections. Actual capacity and rotation pressure still request urgent progress.
+- A full Region retains its capacity request through the final write and rotates without requiring another rejected put. Duplicate notifications do not rotate the new empty Region or retain obsolete flush pressure.
+- `CacheSnapshot::served_bytes` counts the payload actually returned when L2 promotion selects a newer L1 value of a different size.
+
+### Improvements
+
+- L1 replacement and eviction reuse detached, exclusively owned allocations of the same size under CLOCK and S3-FIFO, reducing repeated allocation during fixed-size turnover without an additional buffer pool. Caller-held values remain immutable and retain their separate memory charge. When activity statistics are enabled, mutations with no eviction also avoid a shared zero-value counter update.
+
 ## v0.6.0 (2026-09-21)
 
 ### Breaking Changes

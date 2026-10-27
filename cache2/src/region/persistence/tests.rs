@@ -793,7 +793,7 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
         regions
             .try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value")
             .unwrap(),
-        RegionStageValue::NeedsProgress
+        RegionStageValue::Contended
     );
     assert_eq!(manager.next_seqno(), next_seqno);
 }
@@ -817,7 +817,7 @@ fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     drop(mutation);
     writer.join().unwrap();
     let (result, staging) = early.expect("a busy shard must reject without waiting for its lock");
-    assert!(matches!(result.unwrap(), RegionStageValue::NeedsProgress));
+    assert!(matches!(result.unwrap(), RegionStageValue::Contended));
     assert_eq!(
         regions.manager.state.lock().unwrap().next_seqno(),
         next_seqno
@@ -909,7 +909,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
                 last = Some((key, hash, seqno));
                 staged_records += 1;
             }
-            RegionStageValue::NeedsProgress => break,
+            RegionStageValue::NeedsFlush => break,
             outcome => panic!("unexpected staging outcome: {outcome:?}"),
         }
     }
@@ -1258,7 +1258,14 @@ fn rotation_is_committed_without_a_metadata_io_boundary() {
         .request_rotation_for_test(0)
         .unwrap();
 
-    assert!(regions.rotate_shard(0).unwrap());
+    assert_eq!(
+        regions.rotate_shard(0).unwrap(),
+        crate::region::RegionRotation::Rotated
+    );
+    assert_eq!(
+        regions.rotate_shard(0).unwrap(),
+        crate::region::RegionRotation::Idle
+    );
     assert!(regions.health.is_healthy());
     let manager = regions.manager.lock().unwrap();
     assert_eq!(manager.active_regions()[0], REGION_SHARDS);
