@@ -2517,6 +2517,129 @@ mod tests {
     }
 
     #[test]
+    fn promoted_value_retains_its_bytes_and_charge_during_concurrent_replacement() {
+        use crate::L1EvictionPolicy;
+
+        for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
+            for activity_counters in [false, true] {
+                for (old_length, returned_length, final_length) in
+                    [(0, 1, 0), (1, 0, 1), (64, 128, 128), (128, 64, 257)]
+                {
+                    let (mut store, path) = runtime_store(
+                        8192,
+                        RuntimeOptions {
+                            append_shards: 1,
+                            l1_capacity_bytes: 4096,
+                            l1_shards: 1,
+                            l1_eviction_policy: policy,
+                            stats: crate::StatsOptions {
+                                activity_counters,
+                                ..Default::default()
+                            },
+                            ..RuntimeOptions::default()
+                        },
+                    );
+                    let plane = store.runtime().unwrap().clone();
+                    let key = b"key";
+                    let old_value = vec![1; old_length];
+                    let returned_value = vec![2; returned_length];
+                    let final_value = vec![3; final_length];
+                    plane.put_l2(key, &old_value).unwrap();
+                    plane.drain().unwrap();
+                    let PreparedGet::Pending(pending) = plane.prepare_get(key, None).unwrap()
+                    else {
+                        panic!("the initial value must be read from L2");
+                    };
+                    let completed = pending.wait();
+                    plane.put(key, &returned_value).unwrap();
+                    let held = plane.finish_get(completed, key).unwrap().unwrap();
+                    let CacheRead::PromotedL2(promoted) = &held else {
+                        panic!("promotion must select the newer resident value");
+                    };
+                    let held_clone = promoted.clone();
+                    assert_eq!(held.value(), returned_value);
+                    let before = plane.state.memory.detailed_snapshot().unwrap();
+                    assert_eq!(before.resident_entries, 1);
+                    assert_eq!(before.retained_bytes, 0);
+                    let promoted_charge = before.resident_bytes;
+
+                    // Retain both caller references while another thread
+                    // replaces the L1 entry. Reserve a real logical sequence
+                    // and publish directly to isolate L1 ownership from I/O.
+                    let seqno = plane
+                        .regions
+                        .lock_manager_for_test()
+                        .allocate_seqno()
+                        .unwrap();
+                    let concurrent = plane.clone();
+                    let replacement = final_value.clone();
+                    std::thread::spawn(move || {
+                        let hash = hash_key(concurrent.data.hash_seed, key);
+                        assert!(
+                            concurrent
+                                .state
+                                .memory
+                                .publish(hash, key, &replacement, seqno)
+                        );
+                    })
+                    .join()
+                    .unwrap();
+                    assert_eq!(held.value(), returned_value);
+                    assert_eq!(held_clone.as_ref(), returned_value);
+                    let snapshot = plane.snapshot().unwrap();
+                    assert_eq!(
+                        snapshot.served_bytes,
+                        if activity_counters {
+                            returned_length as u64
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(snapshot.l1_hits, 0);
+                    assert_eq!(snapshot.l2_hits, u64::from(activity_counters));
+                    let l1 = plane.state.memory.detailed_snapshot().unwrap();
+                    assert_eq!(l1.resident_entries, 1);
+                    assert_eq!(l1.retained_bytes, promoted_charge);
+                    assert_eq!(
+                        l1.resident_bytes,
+                        promoted_charge - returned_length + final_length
+                    );
+                    let current = plane.get(key).unwrap().unwrap();
+                    assert_eq!(current.value(), final_value);
+                    let snapshot = plane.snapshot().unwrap();
+                    assert_eq!(
+                        snapshot.served_bytes,
+                        if activity_counters {
+                            (returned_length + final_length) as u64
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(snapshot.l1_hits, u64::from(activity_counters));
+                    assert_eq!(snapshot.l2_hits, u64::from(activity_counters));
+                    drop(current);
+                    drop(held);
+                    assert_eq!(
+                        plane
+                            .state
+                            .memory
+                            .detailed_snapshot()
+                            .unwrap()
+                            .retained_bytes,
+                        promoted_charge
+                    );
+                    drop(held_clone);
+                    let released = plane.state.memory.detailed_snapshot().unwrap();
+                    assert_eq!(released.resident_bytes, l1.resident_bytes);
+                    assert_eq!(released.retained_bytes, 0);
+                    store.close_warm().unwrap();
+                    std::fs::remove_dir_all(path).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn contention_rejects_without_waking_but_full_buffers_flush_and_publish() {
         use crate::region::record::RECORD_HEADER_SIZE;
 
@@ -2713,6 +2836,124 @@ mod tests {
             assert!(published, "record capacity must wake the worker");
             assert_eq!(rotations, u64::from(needs_rotation));
             assert_eq!(final_rotations, rotations);
+        }
+    }
+
+    #[test]
+    fn staging_record_limit_distinguishes_exact_fit_from_one_unit_overflow() {
+        use crate::region::record::RECORD_ALIGNMENT;
+
+        const REGION_BYTES: usize = 1024 * 1024;
+        const ALIGNMENT: usize = crate::io::file::DIRECT_IO_ALIGNMENT;
+        let unit = RECORD_ALIGNMENT as usize;
+        for prefix in [0, ALIGNMENT] {
+            for extra in [0, unit, ALIGNMENT - unit] {
+                for overflow in [0, unit] {
+                    let (mut store, path) = write_pressure_store(REGION_BYTES as u64, 1);
+                    let plane = store.runtime().unwrap().clone();
+                    if prefix != 0 {
+                        let value = vec![8; prefix - RECORD_HEADER_SIZE - b"prefix".len()];
+                        plane.put_l2(b"prefix", &value).unwrap();
+                        plane.drain().unwrap();
+                    }
+                    let key = b"key";
+                    let hash = hash_key(plane.data.hash_seed, key);
+                    // Vary the first record so the full metadata vector
+                    // requires zero, maximal, or minimal flush padding.
+                    let first_bytes = 64 + extra;
+                    let first = vec![1; first_bytes - RECORD_HEADER_SIZE - key.len()];
+                    assert!(matches!(
+                        plane
+                            .regions
+                            .try_stage_value(
+                                &plane.state.staging,
+                                0,
+                                hash,
+                                first_bytes as u32,
+                                key,
+                                &first
+                            )
+                            .unwrap(),
+                        RegionStageValue::Staged { .. }
+                    ));
+                    let mut used = prefix + first_bytes;
+                    loop {
+                        match plane
+                            .regions
+                            .try_stage_value(&plane.state.staging, 0, hash, 64, key, b"value")
+                            .unwrap()
+                        {
+                            RegionStageValue::Staged { .. } => used += 64,
+                            RegionStageValue::NeedsFlush => break,
+                            outcome => panic!("unexpected staging outcome: {outcome:?}"),
+                        }
+                        assert!(
+                            used < REGION_BYTES,
+                            "the record limit must leave Region capacity"
+                        );
+                    }
+                    let aligned = used.div_ceil(ALIGNMENT) * ALIGNMENT;
+                    let record_bytes = REGION_BYTES - aligned + overflow;
+                    let value = vec![2; record_bytes - RECORD_HEADER_SIZE - key.len()];
+                    assert_eq!(
+                        plane.put_l2(key, &value).unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    let expected_rotations = u64::from(overflow != 0);
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    // Observe autonomous progress before a retry or drain
+                    // could supply the original missing rotation request.
+                    loop {
+                        let rotations = plane.snapshot().unwrap().region_rotations;
+                        let fill = plane.state.staging.shard_fill_snapshot(0);
+                        assert!(matches!(fill, Ok(_) | Err(StagingError::WouldBlock)));
+                        if matches!(fill, Ok(None)) && rotations == expected_rotations {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "no progress: prefix={prefix}, extra={extra}, overflow={overflow}, rotations={rotations}"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    {
+                        let manager = plane.regions.lock_manager_for_test();
+                        let active = manager.active_regions()[0] as usize;
+                        assert_eq!(
+                            manager.regions()[active].completed_used,
+                            if expected_rotations == 0 {
+                                aligned as u64
+                            } else {
+                                0
+                            }
+                        );
+                    }
+                    // Admission may briefly collide with the reclaimer after
+                    // rotation; only retry after asserting the above progress.
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        match plane.put_l2(key, &value) {
+                            Ok(_) => break,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "write admission did not resume"
+                                );
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("unexpected write failure: {error}"),
+                        }
+                    }
+                    plane.drain().unwrap();
+                    assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
+                    assert_eq!(
+                        plane.snapshot().unwrap().region_rotations,
+                        expected_rotations
+                    );
+                    store.close_warm().unwrap();
+                    std::fs::remove_dir_all(path).unwrap();
+                }
+            }
         }
     }
 
