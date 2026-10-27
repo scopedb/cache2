@@ -2470,7 +2470,7 @@ mod tests {
         });
         let waker = Waker::from(Arc::clone(&probe));
         let mut context = Context::from_waker(&waker);
-        let mut wait = Box::pin(control.wait_for_drain_async(1));
+        let mut wait = std::pin::pin!(control.wait_for_drain_async(1));
 
         assert!(wait.as_mut().poll(&mut context).is_pending());
         control.fail(&io::Error::other("test shard failure"));
