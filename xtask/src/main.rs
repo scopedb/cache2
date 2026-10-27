@@ -60,7 +60,7 @@ enum SubCommand {
         about = "Run nightly Rust lints, formatting, spelling, documentation, and policy checks"
     )]
     Lint(CommandLint),
-    #[command(about = "Run workspace tests and extended library tests")]
+    #[command(about = "Run workspace, extended library, and benchmark-tool tests")]
     Test(CommandTest),
 }
 
@@ -229,6 +229,7 @@ impl CommandTest {
             "--",
             "--ignored",
         ]);
+        command_run("python3", ["scripts/test_compare_benchmarks.py"]);
     }
 }
 

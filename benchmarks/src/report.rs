@@ -498,7 +498,7 @@ pub fn emit_cache_report(
         fill.estimated_drain_ns,
     );
     println!(
-        "report version=2 type=cache benchmark={} scenario={} phase={} health={:?} activity_counters_enabled={} puts={} deletes={} written_bytes={} served_bytes={} l1_hits={} l1_misses={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} l2_read_overloads={} l2_read_wait_ns={} promotions={} l1_evictions={} l1_bypasses={} write_rejections={} io_failures={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reinsert_records={} reinsert_bytes={} reinsert_skipped={} reinsert_budget_skipped={}",
+        "report version=2 type=cache benchmark={} scenario={} phase={} health={:?} activity_counters_enabled={} puts={} deletes={} written_bytes={} served_bytes={} l1_hits={} l1_misses={} l2_hits={} l2_misses={} l2_read_memory_misses={} l2_read_busy_misses={} l2_read_overloads={} l2_read_wait_ns={} promotions={} l1_evictions={} l1_bypasses={} write_rejections={} write_buffer_rejections={} io_failures={} rotations={} reclaimed_regions={} reclaim_bytes={} reclaim_records={} reinsert_records={} reinsert_bytes={} reinsert_skipped={} reinsert_budget_skipped={}",
         benchmark,
         scenario,
         phase,
@@ -520,6 +520,7 @@ pub fn emit_cache_report(
         cache.l1_evictions,
         cache.l1_bypasses,
         cache.write_rejections,
+        detailed.write_buffer_rejections,
         cache.io_failures,
         cache.region_rotations,
         cache.reclaim.regions,

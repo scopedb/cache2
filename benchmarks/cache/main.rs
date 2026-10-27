@@ -51,6 +51,8 @@ use cache2::StartupMode;
 use cache2::StorageOptions;
 use cache2::Value;
 
+mod steady;
+
 const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
 const L1_ENTRY_BYTES: usize = 256 * 1024;
@@ -74,10 +76,14 @@ struct BenchConfig {
     l1_capacity_bytes: usize,
     managed_memory_limit_bytes: usize,
     append_shards: u32,
+    write_flush_threshold_bytes: usize,
     read_io_wait_capacity: usize,
     read_io_wait_timeout: Duration,
     read_latency_sample_interval: usize,
     write_clients: usize,
+    write_rounds: usize,
+    write_warmup_rounds: usize,
+    write_only: bool,
     clients: usize,
     io_engine: IoEngineOptions,
     fill_control: cache2::FillControlOptions,
@@ -111,6 +117,13 @@ impl BenchConfig {
             env_usize("CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL", 16)?;
         let clients = env_usize("CACHE_BENCH_CLIENTS", 8)?;
         let write_clients = env_usize("CACHE_BENCH_WRITE_CLIENTS", 4)?;
+        let write_rounds = env_usize("CACHE_BENCH_WRITE_ROUNDS", 0)?;
+        let write_warmup_rounds = env_usize("CACHE_BENCH_WRITE_WARMUP_ROUNDS", 2)?;
+        let write_only = env_bool("CACHE_BENCH_WRITE_ONLY", false)?;
+        entries
+            .checked_mul(write_rounds)
+            .and_then(|_| write_rounds.checked_add(write_warmup_rounds))
+            .ok_or_else(|| invalid("benchmark write round count is too large"))?;
         let io_mode = parse_io_mode("CACHE_BENCH_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_BENCH_L1_EVICTION")?;
         let latency = |name| -> io::Result<cache2::LatencyMode> {
@@ -224,10 +237,17 @@ impl BenchConfig {
             l1_capacity_bytes,
             managed_memory_limit_bytes,
             append_shards,
+            write_flush_threshold_bytes: env_usize(
+                "CACHE_BENCH_WRITE_FLUSH_THRESHOLD_BYTES",
+                RuntimeOptions::default().write_flush_threshold_bytes,
+            )?,
             read_io_wait_capacity,
             read_io_wait_timeout,
             read_latency_sample_interval,
             write_clients,
+            write_rounds,
+            write_warmup_rounds,
+            write_only,
             clients,
             io_engine,
             fill_control: benchmarks::config::fill_control_from_env("CACHE_BENCH")?,
@@ -252,6 +272,7 @@ impl BenchConfig {
         println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
+        options.write_flush_threshold_bytes = self.write_flush_threshold_bytes;
         options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
@@ -282,6 +303,14 @@ struct Measurement {
     operations: usize,
     bytes: u128,
     checksum: u64,
+}
+
+#[derive(Default)]
+struct WriteTotals {
+    checksum: u64,
+    attempts: usize,
+    throttled: usize,
+    operations: usize,
 }
 
 struct WriteAdmission {
@@ -351,6 +380,10 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     println!("C² cache benchmark");
     println!("stats={:?}", config.stats);
     println!(
+        "write_flush_threshold_bytes={}",
+        config.write_flush_threshold_bytes
+    );
+    println!(
         "entries={} index_slots={} index_load={:.1}% resident_entries={} hot_entries={} hot_read_interval={} value={} B data={:.1} MiB l1_capacity={:.1} MiB initial_l1={:.1} MiB managed_memory_limit={:.1} MiB append_shards={} configured_read_in_flight={} read_wait_capacity={} read_wait_timeout_us={} read_latency_sample_interval={} write_clients={} read_clients={} l2_clients={} l1_entry_eligible={} l1_eviction={:?} engine={:?} mode={:?} activity_counters={}",
         config.entries,
         index_slots,
@@ -398,9 +431,11 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         config.value_bytes,
         config.write_clients,
     )?;
+    let admission_elapsed = write.measurement.elapsed;
     let drain_started = Instant::now();
     cache.drain().await?;
-    write.measurement.elapsed += drain_started.elapsed();
+    let drain_elapsed = drain_started.elapsed();
+    write.measurement.elapsed += drain_elapsed;
     let write_detailed = config
         .stats
         .activity_counters
@@ -417,11 +452,13 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         0,
     );
     println!(
-        "result phase=put_admission clients={} attempts={} retries={} throttled={}",
+        "result phase=put_admission clients={} attempts={} retries={} throttled={} admission_elapsed_ns={} drain_elapsed_ns={}",
         config.write_clients,
         write.attempts,
         write.attempts.saturating_sub(config.entries),
         write.throttled_writes,
+        admission_elapsed.as_nanos(),
+        drain_elapsed.as_nanos(),
     );
     if let Some(detailed) = &write_detailed {
         emit_cache_report(
@@ -431,6 +468,15 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             write.measurement.elapsed,
             detailed,
         );
+    }
+
+    if config.write_rounds != 0 {
+        steady::run(Arc::clone(&cache), &config).await?;
+    }
+    if config.write_only {
+        require_minimum_rate("CACHE_BENCH_MIN_PUT_OPS", &write.measurement)?;
+        cache.close_fast().await?;
+        return Ok(());
     }
 
     let started = Instant::now();
@@ -706,46 +752,33 @@ fn concurrent_writes(
     clients: usize,
 ) -> io::Result<WriteAdmission> {
     let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
+    let start = Arc::new(std::sync::Barrier::new(clients + 1));
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(clients);
         for client in 0..clients {
             let cache = Arc::clone(&cache);
             let barrier = Arc::clone(&barrier);
+            let start = Arc::clone(&start);
             handles.push(scope.spawn(move || {
                 let mut value = vec![0xa5; value_bytes];
                 barrier.wait();
-                let mut checksum = 0_u64;
-                let mut attempts = 0_usize;
-                let mut throttled_writes = 0_usize;
-                for ordinal in (client..entries).step_by(clients) {
-                    let key = benchmark_key(ordinal);
-                    value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-                    let (receipt, operation_attempts) = put_eventually(
-                        &cache,
-                        black_box(&key),
-                        black_box(&value),
-                        WRITE_RETRY_TIMEOUT,
-                    )?;
-                    attempts = attempts.saturating_add(operation_attempts);
-                    throttled_writes =
-                        throttled_writes.saturating_add(usize::from(operation_attempts > 1));
-                    checksum = checksum.wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
-                }
-                Ok::<_, io::Error>((checksum, attempts, throttled_writes))
+                start.wait();
+                write_ordinals(&cache, &mut value, (client..entries).step_by(clients))
             }));
         }
         barrier.wait();
         let started = Instant::now();
+        start.wait();
         let mut checksum = 0_u64;
         let mut attempts = 0_usize;
         let mut throttled_writes = 0_usize;
         for handle in handles {
-            let (client_checksum, client_attempts, client_throttled_writes) = handle
+            let totals = handle
                 .join()
                 .map_err(|_| io::Error::other("benchmark writer panicked"))??;
-            checksum = checksum.wrapping_add(client_checksum);
-            attempts = attempts.saturating_add(client_attempts);
-            throttled_writes = throttled_writes.saturating_add(client_throttled_writes);
+            checksum = checksum.wrapping_add(totals.checksum);
+            attempts = attempts.saturating_add(totals.attempts);
+            throttled_writes = throttled_writes.saturating_add(totals.throttled);
         }
         Ok(WriteAdmission {
             measurement: Measurement {
@@ -758,6 +791,31 @@ fn concurrent_writes(
             throttled_writes,
         })
     })
+}
+
+fn write_ordinals(
+    cache: &Cache,
+    value: &mut [u8],
+    ordinals: impl Iterator<Item = usize>,
+) -> io::Result<WriteTotals> {
+    let mut totals = WriteTotals::default();
+    for ordinal in ordinals {
+        let key = benchmark_key(ordinal);
+        value[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+        let (receipt, attempts) = put_eventually(
+            cache,
+            black_box(&key),
+            black_box(&*value),
+            WRITE_RETRY_TIMEOUT,
+        )?;
+        totals.operations += 1;
+        totals.attempts = totals.attempts.saturating_add(attempts);
+        totals.throttled += usize::from(attempts > 1);
+        totals.checksum = totals
+            .checksum
+            .wrapping_add(receipt.rotate_left((ordinal % 64) as u32));
+    }
+    Ok(totals)
 }
 
 async fn concurrent_reads(
@@ -776,12 +834,15 @@ async fn concurrent_reads(
         .and_then(|count| u32::try_from(count).ok())
         .ok_or_else(|| io::Error::other("benchmark client count exceeds async barrier capacity"))?;
     let barrier = Arc::new(Barrier::new(participants));
+    let start = Arc::new(Barrier::new(participants));
     let mut handles = Vec::with_capacity(clients);
     for client in 0..clients {
         let cache = Arc::clone(&cache);
         let barrier = Arc::clone(&barrier);
+        let start = Arc::clone(&start);
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
+            start.wait().await;
             let mut primary = TierCounts::default();
             let mut sampled = TierCounts::default();
             let mut latency = LatencyHistogram::default();
@@ -822,6 +883,7 @@ async fn concurrent_reads(
     }
     barrier.wait().await;
     let started = Instant::now();
+    start.wait().await;
     let mut primary = TierCounts::default();
     let mut sampled = TierCounts::default();
     let mut latency = LatencyHistogram::default();

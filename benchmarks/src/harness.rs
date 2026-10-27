@@ -220,8 +220,34 @@ pub fn current_rss_bytes() -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("current RSS byte count overflow"))
 }
 
-/// Returns the current resident set size in bytes, or 0 on platforms without `/proc`.
-#[cfg(not(target_os = "linux"))]
+/// Returns the current resident set size in bytes from macOS process accounting.
+#[cfg(target_os = "macos")]
+pub fn current_rss_bytes() -> io::Result<u64> {
+    let mut info = MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let length = i32::try_from(size_of::<libc::proc_taskinfo>())
+        .map_err(|_| invalid("process memory info size exceeds i32"))?;
+    // SAFETY: query the current process into writable storage of the exact
+    // type and size required by PROC_PIDTASKINFO. No reference is exposed yet.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            length,
+        )
+    };
+    if written != length {
+        return Err(io::Error::other(
+            "cannot read current RSS from proc_pidinfo",
+        ));
+    }
+    // SAFETY: the complete proc_taskinfo was initialized by the successful call.
+    Ok(unsafe { info.assume_init() }.pti_resident_size)
+}
+
+/// Returns 0 on platforms without current resident-memory accounting.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn current_rss_bytes() -> io::Result<u64> {
     Ok(0)
 }
