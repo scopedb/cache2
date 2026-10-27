@@ -2818,12 +2818,22 @@ mod tests {
                 io::ErrorKind::WouldBlock
             );
             let deadline = Instant::now() + Duration::from_secs(2);
-            while (plane.regions.begin_point_read(hash).is_none()
-                || (needs_rotation && plane.snapshot().unwrap().region_rotations == 0))
-                && Instant::now() < deadline
-            {
+            loop {
+                let fill = plane.state.staging.shard_fill_snapshot(0);
+                assert!(matches!(fill, Ok(_) | Err(StagingError::WouldBlock)));
+                let rotations = plane.snapshot().unwrap().region_rotations;
+                if matches!(fill, Ok(None)) && rotations == u64::from(needs_rotation) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "record capacity must complete publication and the requested rotation"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // Empty staging means every index entry has been published. An
+            // earlier lookup can succeed between publications, then a second
+            // lookup can miss on the publisher's next partition lock.
             // Capture progress before drain, which must not supply a missing
             // wake or rotation request on behalf of the rejected producer.
             let published = plane.regions.begin_point_read(hash).is_some();
