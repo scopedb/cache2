@@ -15,6 +15,8 @@ rustup toolchain install nightly --profile minimal --component rustfmt,clippy
 cargo install --locked cargo-deny hawkeye taplo-cli typos-cli
 ```
 
+Python 3 is required for the benchmark comparison tools and their tests, which are included in `cargo x test`.
+
 Before submitting a pull request, run:
 
 ```sh
@@ -23,7 +25,7 @@ cargo x test
 cargo x lint
 ```
 
-`check` covers the workspace and optional features, `test` includes the extended library tests, and `lint` checks formatting, code, documentation, packaging, and dependencies. Use `cargo x lint --fix` to apply supported automatic fixes, then review the diff.
+`check` covers the workspace and optional features, `test` includes the extended library and benchmark-tool tests, and `lint` checks formatting, code, documentation, packaging, and dependencies. Use `cargo x lint --fix` to apply supported automatic fixes, then review the diff.
 
 Cover observable behavior changes with tests. See [BENCHMARK.md](BENCHMARK.md) for performance workloads and qualification.
 

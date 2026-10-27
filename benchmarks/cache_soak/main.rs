@@ -86,6 +86,7 @@ struct SoakConfig {
     latency_sample_interval: usize,
     warm_reopen: bool,
     final_warm_verify: bool,
+    activity_counters: bool,
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
     io_engine: IoEngineOptions,
@@ -150,14 +151,20 @@ impl SoakConfig {
         } else {
             0
         };
+        let activity_counters = env_bool("CACHE_SOAK_ACTIVITY_COUNTERS", true)?;
         let require_path_coverage = env_bool("CACHE_SOAK_REQUIRE_PATH_COVERAGE", false)?;
         let require_reinsert_coverage = env_bool("CACHE_SOAK_REQUIRE_REINSERT_COVERAGE", false)?;
+        if !activity_counters && (require_path_coverage || require_reinsert_coverage) {
+            return Err(invalid("soak path coverage requires activity counters"));
+        }
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
         let directory = env::var_os("CACHE_SOAK_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
-        if duration.is_zero()
+        if Instant::now().checked_add(duration).is_none()
+            || Instant::now().checked_add(sample_period).is_none()
+            || duration.is_zero()
             || sample_period.is_zero()
             || value_bytes.is_empty()
             || value_bytes
@@ -191,6 +198,7 @@ impl SoakConfig {
             latency_sample_interval,
             warm_reopen,
             final_warm_verify,
+            activity_counters,
             require_path_coverage,
             require_reinsert_coverage,
             io_engine,
@@ -218,12 +226,13 @@ impl SoakConfig {
         options.l1_capacity_bytes = self.l1_capacity_bytes;
         options.l1_eviction_policy = self.l1_eviction_policy;
         options.managed_memory_limit_bytes = self.managed_memory_limit_bytes;
-        options.stats.activity_counters = true;
+        options.stats.activity_counters = self.activity_counters;
         options
     }
 }
 
 #[derive(Default)]
+#[repr(align(128))]
 struct SoakCounters {
     writes: AtomicU64,
     deletes: AtomicU64,
@@ -235,9 +244,13 @@ struct SoakCounters {
     put_latency: AtomicLatencyHistogram,
     delete_latency: AtomicLatencyHistogram,
     get_latency: AtomicLatencyHistogram,
+    // Workers accumulate payload bytes locally and publish once at exit. Job
+    // bandwidth must not depend on optional library activity counters.
+    written_bytes: AtomicU64,
+    read_bytes: AtomicU64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct CounterSnapshot {
     writes: u64,
     deletes: u64,
@@ -249,6 +262,8 @@ struct CounterSnapshot {
     put_latency: LatencyHistogram,
     delete_latency: LatencyHistogram,
     get_latency: LatencyHistogram,
+    written_bytes: u64,
+    read_bytes: u64,
 }
 
 #[derive(Default)]
@@ -258,22 +273,47 @@ struct WarmVerification {
     misses: u64,
 }
 
-impl SoakCounters {
-    fn snapshot(&self) -> CounterSnapshot {
-        CounterSnapshot {
-            writes: self.writes.load(Ordering::Relaxed),
-            deletes: self.deletes.load(Ordering::Relaxed),
-            write_rejections: self.write_rejections.load(Ordering::Relaxed),
-            delete_rejections: self.delete_rejections.load(Ordering::Relaxed),
-            hits: self.hits.load(Ordering::Relaxed),
-            stale_hits: self.stale_hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            put_latency: self.put_latency.snapshot(),
-            delete_latency: self.delete_latency.snapshot(),
-            get_latency: self.get_latency.snapshot(),
-        }
+fn counter_snapshot(workers: &[SoakCounters]) -> CounterSnapshot {
+    let mut total = CounterSnapshot::default();
+    for worker in workers {
+        total.writes = total
+            .writes
+            .saturating_add(worker.writes.load(Ordering::Relaxed));
+        total.deletes = total
+            .deletes
+            .saturating_add(worker.deletes.load(Ordering::Relaxed));
+        total.write_rejections = total
+            .write_rejections
+            .saturating_add(worker.write_rejections.load(Ordering::Relaxed));
+        total.delete_rejections = total
+            .delete_rejections
+            .saturating_add(worker.delete_rejections.load(Ordering::Relaxed));
+        total.hits = total
+            .hits
+            .saturating_add(worker.hits.load(Ordering::Relaxed));
+        total.stale_hits = total
+            .stale_hits
+            .saturating_add(worker.stale_hits.load(Ordering::Relaxed));
+        total.misses = total
+            .misses
+            .saturating_add(worker.misses.load(Ordering::Relaxed));
+        total.written_bytes = total
+            .written_bytes
+            .saturating_add(worker.written_bytes.load(Ordering::Relaxed));
+        total.read_bytes = total
+            .read_bytes
+            .saturating_add(worker.read_bytes.load(Ordering::Relaxed));
+        total.put_latency.merge(worker.put_latency.snapshot());
+        total.delete_latency.merge(worker.delete_latency.snapshot());
+        total.get_latency.merge(worker.get_latency.snapshot());
     }
+    total
 }
+
+// Keep the shared writer ticket away from the frequently read stop flag and
+// other clients' read-only state on 64-byte and 128-byte cache-line hosts.
+#[repr(align(128))]
+struct WorkOrdinal(AtomicU64);
 
 struct ResourceSample {
     detailed: DetailedCacheSnapshot,
@@ -307,6 +347,7 @@ fn run_benchmark() -> io::Result<()> {
     let peak_disk_bytes = storage.peak_disk_bytes();
     let cache_config = CacheConfig::new(storage, config.runtime_options())?;
     let mut cache = open_cache(&runtime, &files, &cache_config)?;
+    report_process_memory("cold_open")?;
     let key_count =
         u64::try_from(config.key_count).map_err(|_| invalid("soak key count exceeds u64"))?;
     let value_size_count = u64::try_from(config.value_bytes.len())
@@ -317,7 +358,11 @@ fn run_benchmark() -> io::Result<()> {
             populate_for_warm_reopen(&cache, &config, &expected, key_count, value_size_count)?;
         runtime.block_on(cache.drain())?;
         runtime.block_on(cache.close_warm())?;
+        report_process_memory("prepare_close")?;
+        drop(cache);
+        report_process_memory("prepare_drop")?;
         cache = open_cache(&runtime, &files, &cache_config)?;
+        report_process_memory("prepare_open")?;
         if cache.startup_mode() != StartupMode::Warm {
             return Err(io::Error::other(
                 "soak warm-reopen preparation did not recover a clean image",
@@ -327,22 +372,21 @@ fn run_benchmark() -> io::Result<()> {
     } else {
         0
     };
-    let next_write = AtomicU64::new(first_write);
-    let next_read = AtomicU64::new(0);
+    let next_write = WorkOrdinal(AtomicU64::new(first_write));
+    let next_read = WorkOrdinal(AtomicU64::new(0));
     let stop = AtomicBool::new(false);
     let client_count = config
         .writers
         .checked_add(config.readers)
         .ok_or_else(|| invalid("soak client count is too large"))?;
-    let counters = SoakCounters::default();
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(config.duration)
-        .ok_or_else(|| invalid("soak deadline is too far in the future"))?;
+    let counters: Vec<_> = (0..client_count).map(|_| SoakCounters::default()).collect();
+    let ready = std::sync::Barrier::new(client_count + 1);
+    let start = std::sync::Barrier::new(client_count + 1);
+
     let mut max_managed_memory = 0_usize;
 
     println!(
-        "C² soak duration={}s capacity={:.1}MiB l1_capacity={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} writers={} readers={} operation_interval_us={} latency_sample_interval={} warm_reopen={} final_warm_verify={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
+        "C² soak duration={}s capacity={:.1}MiB l1_capacity={:.1}MiB managed_memory_limit={:.1}MiB values={} keys={} append_shards={} writers={} readers={} operation_interval_us={} latency_sample_interval={} warm_reopen={} final_warm_verify={} activity_counters={} require_path_coverage={} require_reinsert_coverage={} delete_interval={} l1_eviction={:?} engine={:?} mode={:?} peak_disk={} rss_slack={} rss_reopen_allowance={} data={}",
         config.duration.as_secs(),
         config.capacity_bytes as f64 / MIB as f64,
         config.l1_capacity_bytes as f64 / MIB as f64,
@@ -361,6 +405,7 @@ fn run_benchmark() -> io::Result<()> {
         config.latency_sample_interval,
         config.warm_reopen,
         config.final_warm_verify,
+        config.activity_counters,
         config.require_path_coverage,
         config.require_reinsert_coverage,
         DELETE_INTERVAL,
@@ -373,19 +418,28 @@ fn run_benchmark() -> io::Result<()> {
         files.data().display(),
     );
 
-    std::thread::scope(|scope| -> io::Result<()> {
+    let started = std::thread::scope(|scope| -> io::Result<Instant> {
         let mut workers = Vec::with_capacity(client_count);
-        for _ in 0..config.writers {
-            workers.push(scope.spawn(|| {
+        for counters in &counters[..config.writers] {
+            let next_write = &next_write.0;
+            let ready = &ready;
+            let start = &start;
+            let cache = &cache;
+            let config = &config;
+            let expected = &expected;
+            let stop = &stop;
+            workers.push(scope.spawn(move || {
+                ready.wait();
+                start.wait();
                 let result = run_writer(
-                    &cache,
-                    &config,
-                    &expected,
+                    cache,
+                    config,
+                    expected,
                     key_count,
                     value_size_count,
-                    &next_write,
-                    &stop,
-                    &counters,
+                    next_write,
+                    stop,
+                    counters,
                 );
                 if result.is_err() {
                     stop.store(true, Ordering::Release);
@@ -397,11 +451,15 @@ fn run_benchmark() -> io::Result<()> {
             let cache = &cache;
             let config = &config;
             let expected = &expected;
-            let next_read = &next_read;
             let stop = &stop;
-            let counters = &counters;
+            let next_read = &next_read.0;
+            let counters = &counters[config.writers + reader_id];
             let runtime = runtime.handle().clone();
+            let ready = &ready;
+            let start = &start;
             workers.push(scope.spawn(move || {
+                ready.wait();
+                start.wait();
                 let result = run_reader(
                     cache,
                     config,
@@ -421,9 +479,19 @@ fn run_benchmark() -> io::Result<()> {
             }));
         }
 
+        ready.wait();
+        let started = Instant::now();
+        // Every exit after readiness must release the start gate, including
+        // an unrepresentable deadline, so scoped workers cannot be stranded.
+        let Some(deadline) = started.checked_add(config.duration) else {
+            stop.store(true, Ordering::Release);
+            start.wait();
+            return Err(invalid("soak deadline is too far in the future"));
+        };
+        start.wait();
         let mut next_sample = started
             .checked_add(config.sample_period)
-            .ok_or_else(|| invalid("soak sample deadline is too far in the future"))?;
+            .unwrap_or(deadline);
         let mut sample_error = None;
         while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
             let wake_at = min(next_sample, deadline);
@@ -440,13 +508,18 @@ fn run_benchmark() -> io::Result<()> {
                     config.rss_reopen_allowance_bytes,
                 ) {
                     Ok(sample) => {
+                        if let Err(error) = report_process_memory("workload_sample") {
+                            sample_error = Some(error);
+                            stop.store(true, Ordering::Release);
+                            break;
+                        }
                         max_managed_memory = max_managed_memory
                             .max(sample.detailed.summary.managed_memory_peak_bytes);
                         report_sample(
                             false,
                             started.elapsed(),
                             Duration::ZERO,
-                            counters.snapshot(),
+                            counter_snapshot(&counters),
                             &sample,
                             max_managed_memory,
                             &config,
@@ -476,7 +549,7 @@ fn run_benchmark() -> io::Result<()> {
         }
         match sample_error.or(worker_error) {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => Ok(started),
         }
     })?;
 
@@ -492,7 +565,7 @@ fn run_benchmark() -> io::Result<()> {
         config.rss_reopen_allowance_bytes,
     )?;
     max_managed_memory = max_managed_memory.max(sample.detailed.summary.managed_memory_peak_bytes);
-    let final_counters = counters.snapshot();
+    let final_counters = counter_snapshot(&counters);
     if config.require_path_coverage {
         validate_measured_path_coverage(&final_counters, &sample)?;
     }
@@ -500,8 +573,15 @@ fn run_benchmark() -> io::Result<()> {
         validate_reinsert_coverage(&sample)?;
     }
     if config.final_warm_verify {
+        report_process_memory("workload_complete")?;
         runtime.block_on(cache.close_warm())?;
+        report_process_memory("warm_close")?;
+        // Release the old instance's staging and L1 before allocating the
+        // replacement. Assignment alone keeps both alive during open_cache.
+        drop(cache);
+        report_process_memory("warm_drop")?;
         cache = open_cache(&runtime, &files, &cache_config)?;
+        report_process_memory("warm_open")?;
         if cache.startup_mode() != StartupMode::Warm {
             return Err(io::Error::other(
                 "soak final verification did not recover a clean image",
@@ -528,6 +608,7 @@ fn run_benchmark() -> io::Result<()> {
         max_managed_memory =
             max_managed_memory.max(verification_resources.managed_memory_peak_bytes);
         runtime.block_on(cache.close_fast())?;
+        report_process_memory("warm_verify")?;
         println!(
             "warm_verification keys={} hits={} stale_hits={} misses={} l2_hits={} l2_misses={} managed={} managed_peak={} errors=0",
             config.key_count,
@@ -627,6 +708,7 @@ fn run_writer(
 ) -> io::Result<()> {
     let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
+    let mut written_bytes = 0_u64;
     while !stop.load(Ordering::Acquire) {
         pace(config.operation_interval);
         if stop.load(Ordering::Acquire) {
@@ -655,6 +737,7 @@ fn run_writer(
             Ok(_) => {
                 counters.put_latency.record_sampled(put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
+                written_bytes = written_bytes.saturating_add(value_bytes as u64);
             }
             Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
                 counters.put_latency.record_sampled(put_started);
@@ -683,6 +766,9 @@ fn run_writer(
             }
         }
     }
+    counters
+        .written_bytes
+        .fetch_add(written_bytes, Ordering::Relaxed);
     Ok(())
 }
 
@@ -700,6 +786,7 @@ fn run_reader(
     runtime: &tokio::runtime::Handle,
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
+    let mut read_bytes = 0_u64;
     while !stop.load(Ordering::Acquire) {
         pace(config.operation_interval);
         if stop.load(Ordering::Acquire) {
@@ -722,6 +809,7 @@ fn run_reader(
                     &config.value_bytes,
                 )?;
                 counters.hits.fetch_add(1, Ordering::Relaxed);
+                read_bytes = read_bytes.saturating_add(observed.len() as u64);
                 if stale {
                     counters.stale_hits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -732,6 +820,7 @@ fn run_reader(
             }
         }
     }
+    counters.read_bytes.fetch_add(read_bytes, Ordering::Relaxed);
     Ok(())
 }
 
@@ -938,7 +1027,7 @@ fn report_sample(
         if config.writers != 0 {
             JobReport::new("cache_soak", None, "put", "write", elapsed, counters.writes)
                 .workers(config.writers)
-                .bytes(u128::from(resources.written_bytes))
+                .bytes(u128::from(counters.written_bytes))
                 .errors(counters.write_rejections)
                 .latency(&counters.put_latency, config.latency_sample_interval)
                 .emit();
@@ -952,7 +1041,7 @@ fn report_sample(
             counters.hits.saturating_add(counters.misses),
         )
         .workers(config.readers)
-        .bytes(u128::from(resources.served_bytes))
+        .bytes(u128::from(counters.read_bytes))
         .latency(&counters.get_latency, config.latency_sample_interval)
         .emit();
         if config.writers != 0 {
@@ -1047,4 +1136,13 @@ fn pace(interval: Duration) {
     if !interval.is_zero() {
         std::thread::sleep(interval);
     }
+}
+
+fn report_process_memory(phase: &str) -> io::Result<()> {
+    println!(
+        "report version=2 type=process_memory benchmark=cache_soak phase={phase} current_rss_bytes={} peak_rss_bytes={}",
+        current_rss_bytes()?,
+        peak_rss_bytes(),
+    );
+    Ok(())
 }
