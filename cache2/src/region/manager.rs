@@ -388,6 +388,53 @@ impl RegionManager {
         !self.free_regions.is_empty()
     }
 
+    pub fn rotation_requested(&self, shard_id: usize) -> Result<bool, RegionMutationError> {
+        self.append_states
+            .get(shard_id)
+            .map(|shard| shard.rotation_requested)
+            .ok_or(RegionMutationError::InvalidShard)
+    }
+
+    /// Retains rotation pressure for an append rejected by staging preflight.
+    /// A record-count limit may require only a flush, so request rotation only
+    /// when the next record cannot fit after the required aligned flush. No
+    /// position or sequence number is reserved.
+    pub fn request_rotation_for_append(
+        &mut self,
+        shard_id: usize,
+        record_bytes: u32,
+    ) -> Result<bool, RegionMutationError> {
+        let region_id = *self
+            .active_regions
+            .get(shard_id)
+            .ok_or(RegionMutationError::InvalidShard)?;
+        let region = self
+            .regions
+            .get(region_id as usize)
+            .ok_or(RegionMutationError::Invariant(
+                "active Region id is out of bounds",
+            ))?;
+        if region.state != RegionState::Active {
+            return Err(RegionMutationError::Invariant(
+                "data shard does not own an Active Region",
+            ));
+        }
+        let padding = region.reserved_used.wrapping_neg() & (DIRECT_IO_ALIGNMENT as u64 - 1);
+        let end = region
+            .reserved_used
+            .checked_add(padding)
+            .and_then(|end| end.checked_add(u64::from(record_bytes)))
+            .ok_or(RegionMutationError::ArithmeticOverflow)?;
+        let needs_rotation = end > self.region_size;
+        if needs_rotation {
+            self.append_states
+                .get_mut(shard_id)
+                .ok_or(RegionMutationError::InvalidShard)?
+                .rotation_requested = true;
+        }
+        Ok(needs_rotation)
+    }
+
     /// Allocates one process-local ordering version. Sequence exhaustion is a
     /// terminal condition for the current cache identity; `u64::MAX` is never
     /// issued because clean metadata reserves it as invalid.
@@ -441,16 +488,14 @@ impl RegionManager {
             .checked_add(u64::from(record_bytes))
             .ok_or(RegionMutationError::ArithmeticOverflow)?;
         if end > self.region_size {
-            let error = if shard.open_span.is_some() {
+            let error = if shard.open_span.is_some() || shard.submitted_span.is_some() {
                 RegionMutationError::FlushBeforeRotation
-            } else if shard.submitted_span.is_some() {
-                RegionMutationError::WouldBlock
             } else {
                 RegionMutationError::RegionFull
             };
-            if error == RegionMutationError::RegionFull {
-                self.append_states[shard_id].rotation_requested = true;
-            }
+            // Keep the capacity request through the final write so completion
+            // can rotate without requiring a second rejected foreground fill.
+            self.append_states[shard_id].rotation_requested = true;
             return Err(error);
         }
         let offset = u32::try_from(region.reserved_used)
@@ -1549,29 +1594,166 @@ mod tests {
     }
 
     #[test]
-    fn full_region_flushes_its_open_tail_before_requesting_rotation() {
-        let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        let active_region = manager.active_regions()[0] as usize;
-        let record_bytes = u32::try_from(manager.region_size() - RECORD_ALIGNMENT as u64).unwrap();
-        let reservation = manager.reserve_append(0, record_bytes).unwrap();
-        manager.stage_reservation(reservation).unwrap();
+    fn rotation_request_respects_every_flush_alignment_boundary() {
+        #[derive(Clone, Copy, Debug)]
+        enum PreviousSpan {
+            None,
+            Completed,
+            Submitted,
+        }
 
-        assert_eq!(
-            manager.reserve_append(0, 64),
-            Err(RegionMutationError::FlushBeforeRotation)
-        );
-        let padding = manager.reserve_write_padding(0).unwrap().unwrap();
-        assert_eq!(padding.padding_bytes(), Some(RECORD_ALIGNMENT));
-        let span = manager.seal_write_span_with_padding(padding).unwrap();
-        manager.complete_write_span(span).unwrap();
-        assert_eq!(
-            manager.regions()[active_region].completed_used,
-            manager.region_size()
-        );
-        assert_eq!(
-            manager.reserve_append(0, RECORD_ALIGNMENT),
-            Err(RegionMutationError::RegionFull)
-        );
+        const REGION_BYTES: u64 = 16 * 1024;
+        let alignment = DIRECT_IO_ALIGNMENT as u32;
+        let unit = i64::from(RECORD_ALIGNMENT);
+        let mut checked = 0;
+        // Cover every possible record-aligned tail in one I/O block, both
+        // before and after an earlier flush, including an in-flight span.
+        for previous in [
+            PreviousSpan::None,
+            PreviousSpan::Completed,
+            PreviousSpan::Submitted,
+        ] {
+            for tail in (RECORD_ALIGNMENT..=alignment).step_by(RECORD_ALIGNMENT as usize) {
+                for delta in [-unit, 0, unit] {
+                    let mut metadata = sample();
+                    metadata.root.region_size = REGION_BYTES;
+                    let mut manager = RegionManager::from_metadata(metadata).unwrap();
+                    let active = manager.active_regions()[0];
+                    let mut submitted = None;
+                    if !matches!(previous, PreviousSpan::None) {
+                        let reservation = manager.reserve_append(0, alignment).unwrap();
+                        manager.stage_reservation(reservation).unwrap();
+                        let span = manager.seal_write_span(0).unwrap();
+                        if matches!(previous, PreviousSpan::Completed) {
+                            manager.complete_write_span(span).unwrap();
+                        } else {
+                            submitted = Some(span);
+                        }
+                    }
+                    let reservation = manager.reserve_append(0, tail).unwrap();
+                    manager.stage_reservation(reservation).unwrap();
+                    let used = manager.regions()[active as usize].reserved_used;
+                    let padded = used.div_ceil(u64::from(alignment)) * u64::from(alignment);
+                    let remaining = REGION_BYTES - padded;
+                    let next = u32::try_from(remaining.checked_add_signed(delta).unwrap()).unwrap();
+                    let sequence = manager.next_seqno();
+                    let completed = manager.regions()[active as usize].completed_used;
+                    let needs_rotation = delta > 0;
+                    // Repeated preflight failures retain intent without
+                    // consuming another position or logical sequence number.
+                    for _ in 0..2 {
+                        assert_eq!(
+                            manager.request_rotation_for_append(0, next).unwrap(),
+                            needs_rotation,
+                            "previous={previous:?}, tail={tail}, delta={delta}"
+                        );
+                        assert_eq!(manager.rotation_requested(0).unwrap(), needs_rotation);
+                        assert_eq!(manager.next_seqno(), sequence);
+                        assert_eq!(manager.regions()[active as usize].reserved_used, used);
+                        assert_eq!(manager.regions()[active as usize].completed_used, completed);
+                        assert_eq!(
+                            manager.rotation_candidate(0),
+                            Err(RegionMutationError::WouldBlock)
+                        );
+                    }
+                    if let Some(submitted) = submitted {
+                        assert_eq!(
+                            manager.reserve_write_padding(0),
+                            Err(RegionMutationError::WouldBlock)
+                        );
+                        manager.complete_write_span(submitted).unwrap();
+                        assert_eq!(manager.regions()[active as usize].reserved_used, used);
+                        assert_eq!(manager.rotation_requested(0).unwrap(), needs_rotation);
+                    }
+                    // Compare the preflight decision with actual padding and
+                    // completion, using the absolute Region offset throughout.
+                    let span = match manager.reserve_write_padding(0).unwrap() {
+                        Some(padding) => {
+                            assert_eq!(padding.padding_bytes(), Some((padded - used) as u32));
+                            manager.seal_write_span_with_padding(padding).unwrap()
+                        }
+                        None => manager.seal_write_span(0).unwrap(),
+                    };
+                    assert_eq!(span.end_offset, padded);
+                    assert_eq!(
+                        manager.rotation_candidate(0),
+                        Err(RegionMutationError::WouldBlock)
+                    );
+                    manager.complete_write_span(span).unwrap();
+                    assert_eq!(manager.regions()[active as usize].completed_used, padded);
+                    if needs_rotation {
+                        let candidate = manager.rotation_candidate(0).unwrap();
+                        let receipt = manager.begin_rotation(candidate).unwrap();
+                        manager.finish_rotation(receipt).unwrap();
+                        assert!(!manager.rotation_requested(0).unwrap());
+                        assert_ne!(manager.active_regions()[0], active);
+                    }
+                    assert_eq!(
+                        manager.rotation_candidate(0),
+                        Err(RegionMutationError::WouldBlock)
+                    );
+                    let next_reservation = manager.reserve_append(0, next).unwrap();
+                    assert_eq!(
+                        u64::from(next_reservation.offset),
+                        if needs_rotation { 0 } else { padded }
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 3 * (alignment / RECORD_ALIGNMENT) * 3);
+    }
+
+    #[test]
+    fn full_region_retains_rotation_request_until_its_final_write_completes() {
+        for submitted in [false, true] {
+            let mut manager = RegionManager::from_metadata(sample()).unwrap();
+            let active_region = manager.active_regions()[0] as usize;
+            let record_bytes =
+                u32::try_from(manager.region_size() - RECORD_ALIGNMENT as u64).unwrap();
+            let reservation = manager.reserve_append(0, record_bytes).unwrap();
+            manager.stage_reservation(reservation).unwrap();
+
+            if !submitted {
+                assert_eq!(
+                    manager.reserve_append(0, 64),
+                    Err(RegionMutationError::FlushBeforeRotation)
+                );
+                assert_eq!(
+                    manager.rotation_candidate(0),
+                    Err(RegionMutationError::WouldBlock)
+                );
+            }
+            let padding = manager.reserve_write_padding(0).unwrap().unwrap();
+            assert_eq!(padding.padding_bytes(), Some(RECORD_ALIGNMENT));
+            let span = manager.seal_write_span_with_padding(padding).unwrap();
+            if submitted {
+                assert_eq!(
+                    manager.reserve_append(0, 64),
+                    Err(RegionMutationError::FlushBeforeRotation)
+                );
+            }
+            assert_eq!(
+                manager.rotation_candidate(0),
+                Err(RegionMutationError::WouldBlock)
+            );
+            manager.complete_write_span(span).unwrap();
+            assert_eq!(
+                manager.regions()[active_region].completed_used,
+                manager.region_size()
+            );
+            // No new failed reservation is needed to make rotation eligible.
+            let rotation = manager
+                .begin_rotation(manager.rotation_candidate(0).unwrap())
+                .unwrap();
+            manager.finish_rotation(rotation).unwrap();
+            assert_ne!(manager.active_regions()[0] as usize, active_region);
+            assert_eq!(
+                manager.rotation_candidate(0),
+                Err(RegionMutationError::WouldBlock),
+                "the retained request must rotate exactly once"
+            );
+        }
     }
 
     #[test]

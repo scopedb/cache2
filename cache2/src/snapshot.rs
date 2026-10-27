@@ -290,7 +290,8 @@ pub struct RegionSnapshot {
 pub struct DetailedCacheSnapshot {
     /// Operational summary sampled for this diagnostic.
     pub summary: CacheSnapshot,
-    /// Mutations rejected specifically because an append buffer needed progress.
+    /// Mutations rejected because append capacity or Region rotation needed progress.
+    /// Excludes lock contention; total mutation rejections remain in `summary.write_rejections`.
     pub write_buffer_rejections: u64,
     /// L1 occupancy and metadata detail.
     pub l1: CacheL1Snapshot,
