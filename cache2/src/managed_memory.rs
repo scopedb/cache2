@@ -399,7 +399,11 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 fn update_peak(peak: &AtomicUsize, candidate: usize) {
-    peak.fetch_max(candidate, Ordering::Relaxed);
+    // The peak only grows; a stale lower observation can cause an extra RMW,
+    // but cannot suppress a new maximum.
+    if candidate > peak.load(Ordering::Relaxed) {
+        peak.fetch_max(candidate, Ordering::Relaxed);
+    }
 }
 
 const MAX_ATOMIC_UPDATE_ATTEMPTS: usize = 8;
