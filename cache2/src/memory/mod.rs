@@ -116,9 +116,9 @@ impl MemoryBudget {
             .saturating_sub(self.used_bytes.load(Ordering::Acquire))
     }
 
-    /// Atomically transfers exclusive victim charges to one candidate before
-    /// any resident entry is removed. A failed CAS leaves both accounting and
-    /// the resident set unchanged.
+    /// Transfers exclusive victim charges to one candidate before any resident
+    /// entry is removed. Net byte changes use CAS; failure leaves both
+    /// accounting and the resident set unchanged.
     fn try_transfer_charge(
         self: &Arc<Self>,
         released: usize,
@@ -135,18 +135,23 @@ impl MemoryBudget {
             if next > self.capacity_bytes {
                 return MemoryChargeAttempt::Full;
             }
-            match self
-                .used_bytes
-                .compare_exchange(used, next, Ordering::AcqRel, Ordering::Acquire)
+            // Exclusive victims keep these bytes charged until the caller
+            // disarms them. A net-zero transfer needs no counter update.
+            if next != used
+                && let Err(observed) = self.used_bytes.compare_exchange(
+                    used,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
             {
-                Ok(_) => {
-                    return MemoryChargeAttempt::Charged(MemoryCharge {
-                        budget: Some(Arc::clone(self)),
-                        bytes: required,
-                    });
-                }
-                Err(observed) => used = observed,
+                used = observed;
+                continue;
             }
+            return MemoryChargeAttempt::Charged(MemoryCharge {
+                budget: Some(Arc::clone(self)),
+                bytes: required,
+            });
         }
         MemoryChargeAttempt::Contended
     }
@@ -921,6 +926,10 @@ impl MemoryStore {
     }
 
     pub fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
+        if self.entry_capacity == 0 {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return false;
+        }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
@@ -955,6 +964,9 @@ impl MemoryStore {
     /// Best-effort exact-key cleanup for a sequenced delete. Contention
     /// bypasses L1, and a newer resident value is never removed.
     pub fn delete(&self, hash: u64, key: &[u8], seqno: u64) -> bool {
+        if self.entry_capacity == 0 {
+            return true;
+        }
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
@@ -975,6 +987,9 @@ impl MemoryStore {
 
     pub fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
+        if self.entry_capacity == 0 {
+            return MemoryLookup::Miss(MemoryReadToken { shard_id });
+        }
         let mut attempts = 1;
         let mut shard = loop {
             match self.shards[shard_id].try_lock() {
@@ -1008,6 +1023,10 @@ impl MemoryStore {
         seqno: u64,
     ) -> Option<MemoryValue> {
         if token.shard_id != self.route(hash) {
+            return None;
+        }
+        if self.entry_capacity == 0 {
+            self.record_insert(MemoryInsertResult::bypassed());
             return None;
         }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
