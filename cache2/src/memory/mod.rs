@@ -921,6 +921,10 @@ impl MemoryStore {
     }
 
     pub fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
+        if self.entry_capacity == 0 {
+            self.record_insert(MemoryInsertResult::bypassed());
+            return false;
+        }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
             self.record_insert(MemoryInsertResult::bypassed());
             return false;
@@ -955,6 +959,9 @@ impl MemoryStore {
     /// Best-effort exact-key cleanup for a sequenced delete. Contention
     /// bypasses L1, and a newer resident value is never removed.
     pub fn delete(&self, hash: u64, key: &[u8], seqno: u64) -> bool {
+        if self.entry_capacity == 0 {
+            return true;
+        }
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
             self.record_insert(MemoryInsertResult::bypassed());
@@ -975,6 +982,9 @@ impl MemoryStore {
 
     pub fn lookup(&self, hash: u64, key: &[u8]) -> MemoryLookup {
         let shard_id = self.route(hash);
+        if self.entry_capacity == 0 {
+            return MemoryLookup::Miss(MemoryReadToken { shard_id });
+        }
         let mut attempts = 1;
         let mut shard = loop {
             match self.shards[shard_id].try_lock() {
@@ -1008,6 +1018,10 @@ impl MemoryStore {
         seqno: u64,
     ) -> Option<MemoryValue> {
         if token.shard_id != self.route(hash) {
+            return None;
+        }
+        if self.entry_capacity == 0 {
+            self.record_insert(MemoryInsertResult::bypassed());
             return None;
         }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {

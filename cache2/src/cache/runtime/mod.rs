@@ -2506,6 +2506,9 @@ mod tests {
                 store.close_warm().unwrap();
                 std::fs::remove_dir_all(path).unwrap();
                 assert_eq!(snapshot.l1_hits, 0);
+                if l1_capacity == 0 {
+                    assert_eq!(snapshot.l1_bypasses, 2);
+                }
                 assert_eq!(snapshot.l2_hits, u64::from(activity_counters));
                 assert_eq!(
                     snapshot.served_bytes,

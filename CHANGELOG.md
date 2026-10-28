@@ -10,6 +10,7 @@
 
 ### Improvements
 
+- A zero-capacity L1 bypasses shard locking and directory work for lookups, fills, promotions, and deletes.
 - Transient L2 reads avoid a redundant atomic peak update when their memory reservation does not exceed the recorded high-water mark.
 - L2 index updates and cold-record reclamation avoid redundant atomic writes for already-clear heat bits and validated index pages.
 - Hot-record reclamation reuses the checksum computed during payload validation for its rewrite, avoiding a second payload scan while preserving record validation and the on-disk format.
