@@ -116,9 +116,9 @@ impl MemoryBudget {
             .saturating_sub(self.used_bytes.load(Ordering::Acquire))
     }
 
-    /// Atomically transfers exclusive victim charges to one candidate before
-    /// any resident entry is removed. A failed CAS leaves both accounting and
-    /// the resident set unchanged.
+    /// Transfers exclusive victim charges to one candidate before any resident
+    /// entry is removed. Net byte changes use CAS; failure leaves both
+    /// accounting and the resident set unchanged.
     fn try_transfer_charge(
         self: &Arc<Self>,
         released: usize,
@@ -135,18 +135,23 @@ impl MemoryBudget {
             if next > self.capacity_bytes {
                 return MemoryChargeAttempt::Full;
             }
-            match self
-                .used_bytes
-                .compare_exchange(used, next, Ordering::AcqRel, Ordering::Acquire)
+            // Exclusive victims keep these bytes charged until the caller
+            // disarms them. A net-zero transfer needs no counter update.
+            if next != used
+                && let Err(observed) = self.used_bytes.compare_exchange(
+                    used,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
             {
-                Ok(_) => {
-                    return MemoryChargeAttempt::Charged(MemoryCharge {
-                        budget: Some(Arc::clone(self)),
-                        bytes: required,
-                    });
-                }
-                Err(observed) => used = observed,
+                used = observed;
+                continue;
             }
+            return MemoryChargeAttempt::Charged(MemoryCharge {
+                budget: Some(Arc::clone(self)),
+                bytes: required,
+            });
         }
         MemoryChargeAttempt::Contended
     }
