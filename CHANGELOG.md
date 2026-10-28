@@ -10,6 +10,7 @@
 
 ### Improvements
 
+- Hot-record reclamation reuses the checksum computed during payload validation for its rewrite, avoiding a second payload scan while preserving record validation and the on-disk format.
 - L1 replacement and eviction reuse detached, exclusively owned allocations of the same size under CLOCK and S3-FIFO, reducing repeated allocation during fixed-size turnover without an additional buffer pool. Caller-held values remain immutable and retain their separate memory charge. When activity statistics are enabled, mutations with no eviction also avoid a shared zero-value counter update.
 
 ## v0.6.0 (2026-09-21)

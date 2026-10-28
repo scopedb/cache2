@@ -246,8 +246,9 @@ pub struct RegionReinsertRecord<'a> {
     pub previous_location: PackedLocation,
     pub logical_seqno: u64,
     pub record_bytes: u32,
-    pub key: &'a [u8],
-    pub value: &'a [u8],
+    // Constructed only after payload validation; the same borrowed bytes and
+    // checksum travel together into staging without a second payload scan.
+    payload: RecordPayload<'a>,
 }
 
 /// Short shard-local transaction gate. `mutation` makes manager receipts and
@@ -562,20 +563,22 @@ impl RegionStore {
                                 "reclaim replacement record is too large",
                             )
                         })?;
-                    let payload_valid =
-                        crc32c(&[&bytes[header_end..payload_end]]) == header.payload_crc;
+                    let payload = RecordPayload::validate(key, value, header.payload_crc);
                     let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
-                    let budget_exhausted = payload_valid && !within_budget;
-                    let reinserted = payload_valid
+                    let budget_exhausted = payload.is_some() && !within_budget;
+                    let reinserted = if let Some(payload) = payload
                         && within_budget
-                        && try_reinsert(RegionReinsertRecord {
+                    {
+                        try_reinsert(RegionReinsertRecord {
                             hash: header.key_hash,
                             previous_location: location,
                             logical_seqno: header.seqno,
                             record_bytes: rewrite_bytes,
-                            key,
-                            value,
-                        })?;
+                            payload,
+                        })?
+                    } else {
+                        false
+                    };
                     if reinserted {
                         reinsert_budget = reinsert_budget.saturating_sub(u64::from(rewrite_bytes));
                         stats.reinsert_records = stats.reinsert_records.saturating_add(1);
@@ -860,7 +863,9 @@ impl RegionStore {
         key: &[u8],
         value: &[u8],
     ) -> io::Result<RegionStageValue> {
-        self.try_stage_record(staging, shard_id, hash, record_bytes, key, value, None)
+        self.validate_stage(staging, record_bytes)?;
+        let payload = RecordPayload::new(key, value);
+        self.try_stage_record(staging, shard_id, hash, record_bytes, &payload, None)
     }
 
     pub fn try_stage_reinsert(
@@ -869,28 +874,18 @@ impl RegionStore {
         shard_id: usize,
         record: RegionReinsertRecord<'_>,
     ) -> io::Result<RegionStageValue> {
+        self.validate_stage(staging, record.record_bytes)?;
         self.try_stage_record(
             staging,
             shard_id,
             record.hash,
             record.record_bytes,
-            record.key,
-            record.value,
+            &record.payload,
             Some((record.logical_seqno, record.previous_location)),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_stage_record(
-        &self,
-        staging: &AppendStaging,
-        shard_id: usize,
-        hash: u64,
-        record_bytes: u32,
-        key: &[u8],
-        value: &[u8],
-        reinsert: Option<(u64, PackedLocation)>,
-    ) -> io::Result<RegionStageValue> {
+    fn validate_stage(&self, staging: &AppendStaging, record_bytes: u32) -> io::Result<()> {
         self.health.require_healthy()?;
         if record_bytes as usize > staging.chunk_bytes() {
             return Err(io::Error::new(
@@ -898,7 +893,18 @@ impl RegionStore {
                 "value exceeds one Region staging buffer",
             ));
         }
-        let payload = RecordPayload::new(key, value);
+        Ok(())
+    }
+
+    fn try_stage_record(
+        &self,
+        staging: &AppendStaging,
+        shard_id: usize,
+        hash: u64,
+        record_bytes: u32,
+        payload: &RecordPayload<'_>,
+        reinsert: Option<(u64, PackedLocation)>,
+    ) -> io::Result<RegionStageValue> {
         let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::Contended),
@@ -970,11 +976,11 @@ impl RegionStore {
                     receipt,
                     hash,
                     record_bytes,
-                    &payload,
+                    payload,
                     logical_seqno,
                 )?,
                 None => {
-                    encode_value_into_hashed(destination, receipt, hash, record_bytes, &payload)?
+                    encode_value_into_hashed(destination, receipt, hash, record_bytes, payload)?
                 }
             };
             Ok::<StagedRecord, RecordEncodeError>(match reinsert {

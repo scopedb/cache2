@@ -57,11 +57,14 @@ use crate::region::index::storage::IndexSlot;
 use crate::region::index::storage::IndexSlotState;
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::manager::RegionManager;
+use crate::region::manager::RegionReclaimReceipt;
 use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
 use crate::region::reader::ReadDesc;
 use crate::region::reader::describe_read;
 use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::RECORD_HEADER_SIZE;
+use crate::region::record::RecordHeader;
 use crate::region::record::codec::hash_key;
 use crate::region::record::codec::required_record_bytes;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
@@ -996,6 +999,140 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
     assert_eq!(engine.stats().requests.requests_submitted, 2);
     assert_eq!(engine.stats().requests.requests_succeeded, 2);
     engine.shutdown().unwrap();
+}
+
+#[test]
+fn reclaim_validates_payload_before_staging_and_counts_rewrites() {
+    let key = b"retained-reclaim";
+    for (value_len, corrupt_byte, reinserted, budget_skips) in [
+        (16 * 1024 + 7, None, true, 0),
+        (16 * 1024 + 7, Some(0), false, 0),
+        (16 * 1024 + 7, Some(key.len()), false, 0),
+        (64 * 1024, None, false, 1),
+        (64 * 1024, Some(key.len()), false, 0),
+    ] {
+        let (data, regions, staging) = foreground_stage_fixture();
+        let value = vec![0xa7; value_len];
+        let cold_key = b"cold-reclaim";
+        let cold_value = vec![0x31; 192 * 1024];
+        let cold_len = required_record_bytes(cold_key.len(), cold_value.len()).unwrap() as usize;
+        let rewrite_bytes = required_record_bytes(key.len(), value.len()).unwrap();
+        let used = (cold_len + rewrite_bytes as usize).next_multiple_of(RECOVERY_PAGE_SIZE);
+        let mut bytes = vec![0_u8; used];
+        // Model an already-read source prefix. Region selection and release are
+        // covered separately; this test exercises scanning through staged I/O.
+        let receipt = RegionReclaimReceipt {
+            region_id: 1,
+            created_seqno: 2,
+            used_offset: used as u64,
+            physical_record_count: 2,
+        };
+        for (offset, length, key, value, seqno) in [
+            (0, cold_len, &cold_key[..], &cold_value[..], 2),
+            (cold_len, used - cold_len, &key[..], &value[..], 3),
+        ] {
+            let payload = [key, value].concat();
+            let header = RecordHeader {
+                key_len: key.len() as u16,
+                value_len: value.len() as u32,
+                seqno,
+                key_hash: hash_key(data.hash_seed, key),
+                payload_crc: crc_fast::crc32_iscsi(&payload),
+                region_generation: receipt.created_seqno,
+                record_len: length as u32,
+            };
+            bytes[offset..offset + RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
+            bytes[offset + RECORD_HEADER_SIZE..offset + RECORD_HEADER_SIZE + payload.len()]
+                .copy_from_slice(&payload);
+            regions
+                .index
+                .upsert(
+                    header.key_hash,
+                    IndexEntry {
+                        location: PackedLocation::new(
+                            receipt.region_id,
+                            offset as u32,
+                            length as u32,
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap();
+        }
+        let hash = hash_key(data.hash_seed, key);
+        assert!(regions.begin_point_read(hash).is_some());
+        assert!(regions.begin_point_read(hash).is_some());
+        let previous = regions.lookup_snapshot(hash).unwrap();
+        if let Some(corrupt_byte) = corrupt_byte {
+            bytes[cold_len + RECORD_HEADER_SIZE + corrupt_byte] ^= 1;
+        }
+        let stats = regions
+            .scan_reclaim(receipt, &bytes, |record| {
+                assert!(reinserted, "invalid or over-budget payload reached staging");
+                assert!(matches!(
+                    regions.try_stage_reinsert(&staging, 0, record)?,
+                    RegionStageValue::Staged { seqno, .. } if seqno > 3
+                ));
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(stats.bytes_read, receipt.used_offset);
+        assert_eq!(stats.records_scanned, 2);
+        assert_eq!(stats.records_removed, 2 - u64::from(reinserted));
+        assert_eq!(stats.reinsert_records, u64::from(reinserted));
+        assert_eq!(
+            stats.reinsert_bytes,
+            u64::from(reinserted) * u64::from(rewrite_bytes)
+        );
+        assert_eq!(stats.reinsert_skipped, u64::from(!reinserted));
+        assert_eq!(stats.reinsert_budget_skipped, budget_skips);
+        if !reinserted {
+            assert_eq!(regions.lookup_snapshot(hash).unwrap(), None);
+            assert!(staging.shard_fill_snapshot(0).unwrap().is_none());
+            continue;
+        }
+        assert_eq!(regions.lookup_snapshot(hash).unwrap(), previous);
+        assert!(
+            used - cold_len > rewrite_bytes as usize,
+            "source has flush padding"
+        );
+        // Destroy the source before I/O: staging must own the validated bytes.
+        bytes.fill(0xcc);
+        drop(bytes);
+        let directory = TestDirectory::new();
+        let (file, _) = FaultFile::open(&directory.paths.data).unwrap();
+        file.set_len(data.geometry.data_file_len).unwrap();
+        let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
+        regions
+            .flush_staging_shard(
+                &staging,
+                &engine,
+                0,
+                crate::io::background::BackgroundIoAttempt::new(
+                    &crate::io::background::IoRecovery::new(Some(Duration::ZERO)),
+                    None,
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let current = regions.begin_point_read(hash).unwrap();
+        assert_ne!(current.region_generation, receipt.created_seqno);
+        let desc = describe_read(data.geometry, hash, current, false).unwrap();
+        let memory = data_path_memory();
+        let hit = regions
+            .read_value_from_desc(
+                &engine,
+                engine.try_reserve_read().unwrap(),
+                memory.try_read_buffer(desc.read_len).unwrap(),
+                desc,
+                key,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.value(), value);
+        assert_eq!(hit.seqno(), 3);
+        engine.shutdown().unwrap();
+    }
 }
 
 #[test]
