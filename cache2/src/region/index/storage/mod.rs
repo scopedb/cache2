@@ -67,11 +67,12 @@ pub mod page_format;
 /// does not issue one positioned syscall per page.
 pub const WARM_IMAGE_WRITE_BATCH_BYTES: usize = 1024 * 1024;
 
+// Page states track source-image validation. Partition locks publish runtime
+// mutations, and warm close regenerates every page and its checksum.
 const PAGE_STATE_UNCHECKED: u8 = 0;
 const PAGE_STATE_VALIDATING: u8 = 1;
 const PAGE_STATE_VALID: u8 = 2;
-const PAGE_STATE_DIRTY: u8 = 3;
-const PAGE_STATE_REJECTED: u8 = 4;
+const PAGE_STATE_REJECTED: u8 = 3;
 const IMAGE_STATE_USABLE: u8 = 0;
 const IMAGE_STATE_REJECTED: u8 = 1;
 
@@ -443,7 +444,6 @@ pub enum PageValidationState {
     Unchecked,
     Validating,
     Valid,
-    Dirty,
     Rejected,
 }
 
@@ -947,7 +947,6 @@ impl IndexStorageCore {
             PAGE_STATE_UNCHECKED => PageValidationState::Unchecked,
             PAGE_STATE_VALIDATING => PageValidationState::Validating,
             PAGE_STATE_VALID => PageValidationState::Valid,
-            PAGE_STATE_DIRTY => PageValidationState::Dirty,
             PAGE_STATE_REJECTED => PageValidationState::Rejected,
             _ => PageValidationState::Rejected,
         })
@@ -978,7 +977,6 @@ impl IndexStorageCore {
                 INDEX_IMAGE_SLOT_SIZE,
             );
         }
-        self.page_states[page].store(PAGE_STATE_DIRTY, Ordering::Release);
         self.ensure_image_usable(page)
     }
 
@@ -1009,7 +1007,7 @@ impl IndexStorageCore {
         loop {
             self.ensure_image_usable(page)?;
             return match state.load(Ordering::Acquire) {
-                PAGE_STATE_VALID | PAGE_STATE_DIRTY => Ok(()),
+                PAGE_STATE_VALID => Ok(()),
                 PAGE_STATE_REJECTED => Err(IndexStorageError::CorruptPage {
                     page_index: page,
                     reason: CorruptPageReason::PreviouslyRejected,

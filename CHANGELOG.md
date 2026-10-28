@@ -10,7 +10,7 @@
 
 ### Improvements
 
-- L2 index updates and cold-record reclamation skip atomic writes for heat bits that are already clear.
+- L2 index updates and cold-record reclamation avoid redundant atomic writes for already-clear heat bits and validated index pages.
 - Hot-record reclamation reuses the checksum computed during payload validation for its rewrite, avoiding a second payload scan while preserving record validation and the on-disk format.
 - L1 replacement and eviction reuse detached, exclusively owned allocations of the same size under CLOCK and S3-FIFO, reducing repeated allocation during fixed-size turnover without an additional buffer pool. Caller-held values remain immutable and retain their separate memory charge. When activity statistics are enabled, mutations with no eviction also avoid a shared zero-value counter update.
 
