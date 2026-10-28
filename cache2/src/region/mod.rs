@@ -461,12 +461,14 @@ impl RegionStore {
     }
 
     /// Scans one exact sealed prefix, removes cold mappings, and offers each
-    /// hot current record once to a bounded reinsertion sink. The
-    /// source Region remains exclusively pinned until [`Self::complete_reclaim`].
+    /// hot current record once to a bounded reinsertion sink. A false sink
+    /// result stops further offers from this source Region. The source stays
+    /// exclusively pinned until [`Self::complete_reclaim`].
     pub fn scan_reclaim(
         &self,
         receipt: RegionReclaimReceipt,
         bytes: &[u8],
+        mut accepting_reinserts: bool,
         mut try_reinsert: impl FnMut(RegionReinsertRecord<'_>) -> io::Result<bool>,
     ) -> io::Result<RegionReclaimStats> {
         if bytes.len() as u64 != receipt.used_offset {
@@ -563,22 +565,29 @@ impl RegionStore {
                                 "reclaim replacement record is too large",
                             )
                         })?;
-                    let payload = RecordPayload::validate(key, value, header.payload_crc);
                     let within_budget = u64::from(rewrite_bytes) <= reinsert_budget;
-                    let budget_exhausted = payload.is_some() && !within_budget;
-                    let reinserted = if let Some(payload) = payload
-                        && within_budget
+                    // Once the sink stops, in-budget records will only be removed.
+                    // Over-budget records still need validation because the
+                    // budget-skipped counter excludes corrupt payloads.
+                    let mut reinserted = false;
+                    if (accepting_reinserts || !within_budget)
+                        && let Some(payload) =
+                            RecordPayload::validate(key, value, header.payload_crc)
                     {
-                        try_reinsert(RegionReinsertRecord {
-                            hash: header.key_hash,
-                            previous_location: location,
-                            logical_seqno: header.seqno,
-                            record_bytes: rewrite_bytes,
-                            payload,
-                        })?
-                    } else {
-                        false
-                    };
+                        if within_budget {
+                            reinserted = try_reinsert(RegionReinsertRecord {
+                                hash: header.key_hash,
+                                previous_location: location,
+                                logical_seqno: header.seqno,
+                                record_bytes: rewrite_bytes,
+                                payload,
+                            })?;
+                            accepting_reinserts = reinserted;
+                        } else {
+                            stats.reinsert_budget_skipped =
+                                stats.reinsert_budget_skipped.saturating_add(1);
+                        }
+                    }
                     if reinserted {
                         reinsert_budget = reinsert_budget.saturating_sub(u64::from(rewrite_bytes));
                         stats.reinsert_records = stats.reinsert_records.saturating_add(1);
@@ -586,10 +595,6 @@ impl RegionStore {
                             .reinsert_bytes
                             .saturating_add(u64::from(rewrite_bytes));
                     } else {
-                        if budget_exhausted {
-                            stats.reinsert_budget_skipped =
-                                stats.reinsert_budget_skipped.saturating_add(1);
-                        }
                         if self
                             .index
                             .remove_if_match(header.key_hash, location)

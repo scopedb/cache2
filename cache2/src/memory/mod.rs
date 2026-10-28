@@ -729,7 +729,7 @@ impl MemoryShard {
         let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge, recycled) else {
             return MemoryInsertResult::rejected(evictions);
         };
-        let previous_head = self.directory_head(hash);
+        let previous_head = self.directory_upsert(hash, packed_index);
         let entry = MemoryEntry {
             value: memory_value,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
@@ -741,8 +741,6 @@ impl MemoryShard {
         self.resident_bytes = self.resident_bytes.saturating_add(charged_bytes);
         self.eviction
             .insert(&mut self.policy_slots, index, hash, charged_bytes);
-        let previous = self.directory_upsert(hash, packed_index);
-        debug_assert_eq!(previous, previous_head);
         MemoryInsertResult {
             slot: Some(packed_index),
             evictions,

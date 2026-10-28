@@ -1871,29 +1871,20 @@ fn reclaim_worker_result(
             } else {
                 None
             };
-            let mut accepting_reinserts = reinsert_operation.is_some();
-            let mut staged_reinsert = false;
-            let stats = state.regions.scan_reclaim(receipt, bytes, |record| {
-                if !accepting_reinserts {
-                    return Ok(false);
-                }
-                match state
-                    .regions
-                    .try_stage_reinsert(&state.staging, reinsert_shard, record)?
-                {
-                    RegionStageValue::Staged { .. } => {
-                        staged_reinsert = true;
-                        Ok(true)
-                    }
-                    RegionStageValue::Contended
-                    | RegionStageValue::NeedsFlush
-                    | RegionStageValue::NeedsRotation => {
-                        accepting_reinserts = false;
-                        Ok(false)
-                    }
-                }
-            })?;
-            if staged_reinsert {
+            let stats = state.regions.scan_reclaim(
+                receipt,
+                bytes,
+                reinsert_operation.is_some(),
+                |record| {
+                    Ok(matches!(
+                        state
+                            .regions
+                            .try_stage_reinsert(&state.staging, reinsert_shard, record,)?,
+                        RegionStageValue::Staged { .. }
+                    ))
+                },
+            )?;
+            if stats.reinsert_records != 0 {
                 let generation = state.append_controls[reinsert_shard].request_drain(false)?;
                 state.append_controls[reinsert_shard].wait_for_drain(generation)?;
             }
