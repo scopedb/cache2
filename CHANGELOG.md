@@ -13,7 +13,7 @@
 - A zero-capacity L1 bypasses shard locking and directory work for lookups, fills, promotions, and deletes.
 - Memory accounting skips redundant atomic updates when transient reads stay within the recorded peak or L1 transfers leave the charged byte total unchanged.
 - L2 index updates and cold-record reclamation avoid redundant atomic writes for already-clear heat bits and validated index pages.
-- Hot-record reclamation reuses the checksum computed during payload validation for its rewrite, avoiding a second payload scan while preserving record validation and the on-disk format.
+- Hot-record reclamation reuses validated payload checksums for rewrites and skips payload checksum scans for records within the byte budget after reinsertion stops, while preserving record header validation, conditional removal, budget statistics, and the on-disk format.
 - L1 replacement and eviction reuse detached, exclusively owned allocations of the same size under CLOCK and S3-FIFO, reducing repeated allocation during fixed-size turnover without an additional buffer pool. Caller-held values remain immutable and retain their separate memory charge. When activity statistics are enabled, mutations with no eviction also avoid a shared zero-value counter update.
 
 ## v0.6.0 (2026-09-21)

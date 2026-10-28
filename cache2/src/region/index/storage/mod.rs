@@ -764,15 +764,14 @@ impl IndexStorage {
         // The exclusive partition guard keeps the state observed by the probe
         // stable, so updating its physical count needs no second slot decode.
         let global_slot = self.global_slot(slot)?;
-        let previous = IndexSlot::from_state(previous);
+        let previous_kind = match previous {
+            IndexSlotState::Empty => SlotPhysicalKind::Empty,
+            IndexSlotState::Value { .. } => SlotPhysicalKind::Value,
+        };
         let value = IndexSlot::from_state(state);
         let next_stats = self
             .physical_stats
-            .transitioned(
-                previous.physical_kind(),
-                value.physical_kind(),
-                self.range.slot_count,
-            )
+            .transitioned(previous_kind, value.physical_kind(), self.range.slot_count)
             .ok_or(IndexStorageError::InvalidPhysicalStats)?;
         self.core.write_slot(global_slot, value)?;
         self.physical_stats = next_stats;
