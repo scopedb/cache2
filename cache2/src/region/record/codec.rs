@@ -100,6 +100,13 @@ impl<'a> RecordPayload<'a> {
             crc: crc32c(&[key, value]),
         }
     }
+
+    /// Validates persisted payload bytes and retains their checksum for a rewrite.
+    /// The shared borrows keep the validated bytes immutable through encoding.
+    pub fn validate(key: &'a [u8], value: &'a [u8], expected_crc: u32) -> Option<Self> {
+        let payload = Self::new(key, value);
+        (payload.crc == expected_crc).then_some(payload)
+    }
 }
 
 /// Returns the minimum 32-byte-aligned envelope for one logical value.
@@ -304,6 +311,23 @@ mod tests {
     }
 
     #[test]
+    fn payload_validation_checks_all_bytes_before_rewrite() {
+        for (key, value) in [
+            (&b""[..], &b""[..]),
+            (&b"key"[..], &b""[..]),
+            (&b""[..], &b"value"[..]),
+            (&b"key"[..], &b"value"[..]),
+        ] {
+            let expected_crc = crc_fast::crc32_iscsi(&[key, value].concat());
+            let payload = RecordPayload::validate(key, value, expected_crc).unwrap();
+            assert_eq!(payload.key, key);
+            assert_eq!(payload.value, value);
+            assert_eq!(payload.crc, expected_crc);
+            assert!(RecordPayload::validate(key, value, expected_crc ^ 1).is_none());
+        }
+    }
+
+    #[test]
     fn reinsertion_preserves_logical_seqno_across_a_new_region_generation() {
         let key = b"key";
         let value = b"value";
@@ -318,12 +342,14 @@ mod tests {
         };
         let mut destination = vec![0_u8; required as usize];
 
-        let payload = RecordPayload::new(key, value);
+        let expected_crc = crc_fast::crc32_iscsi(&[&key[..], &value[..]].concat());
+        let payload = RecordPayload::validate(key, value, expected_crc).unwrap();
         encode_reinsert_into_hashed(&mut destination, reservation, 7, required, &payload, 11)
             .unwrap();
         let header = RecordHeader::decode(&destination[..RECORD_HEADER_SIZE]).unwrap();
         assert_eq!(header.seqno, 11);
         assert_eq!(header.region_generation, 100);
+        assert_eq!(header.payload_crc, expected_crc);
     }
 
     #[test]
