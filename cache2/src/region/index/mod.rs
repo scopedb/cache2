@@ -106,11 +106,16 @@ impl SlotHeat {
     fn take_hot(&self, slot: usize) -> bool {
         let word = slot / REFERENCE_WORD_BITS;
         let mask = 1_u64 << (slot % REFERENCE_WORD_BITS);
-        let was_hot = self
-            .hot
-            .get(word)
-            .is_some_and(|current| current.fetch_and(!mask, Ordering::Relaxed) & mask != 0);
-        if let Some(current) = self.seen.get(word) {
+        // The caller holds this slot's partition write guard, so its bits
+        // cannot be marked concurrently. Other partitions may share the word:
+        // skip already-clear bits, but retain the RMW for actual clears.
+        let was_hot = self.hot.get(word).is_some_and(|current| {
+            current.load(Ordering::Relaxed) & mask != 0
+                && current.fetch_and(!mask, Ordering::Relaxed) & mask != 0
+        });
+        if let Some(current) = self.seen.get(word)
+            && current.load(Ordering::Relaxed) & mask != 0
+        {
             current.fetch_and(!mask, Ordering::Relaxed);
         }
         was_hot
@@ -721,6 +726,35 @@ mod tests {
     }
 
     #[test]
+    fn heat_clears_preserve_neighboring_slots_in_a_shared_word() {
+        let heat = SlotHeat::try_new(REFERENCE_WORD_BITS).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            for slot in [0, REFERENCE_WORD_BITS - 1] {
+                let heat = &heat;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut valid = true;
+                    for _ in 0..256 {
+                        heat.mark(slot);
+                        heat.mark(slot);
+                        barrier.wait();
+                        valid &= heat.take_hot(slot);
+                        barrier.wait();
+                        valid &= heat.seen[0].load(Ordering::Relaxed) == 0;
+                        valid &= heat.hot[0].load(Ordering::Relaxed) == 0;
+                        heat.clear(slot);
+                        barrier.wait();
+                    }
+                    // Finish all barriers before reporting a failure.
+                    assert!(valid, "shared-word clears lost or retained a heat bit");
+                });
+            }
+        });
+    }
+
+    #[test]
     fn point_operations_use_fixed_candidates_without_tombstones() {
         let index = anonymous(128);
         let hash = 0x1234_5678_90ab_cdef;
@@ -817,13 +851,15 @@ mod tests {
             ReclaimIndexAction::Removed
         );
 
-        index.upsert(hash, old).unwrap();
-        assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
-        assert_eq!(
-            index.prepare_reclaim(hash, old.location).unwrap(),
-            ReclaimIndexAction::Removed,
-            "one candidate access must not survive a scan"
-        );
+        for _ in 0..2 {
+            index.upsert(hash, old).unwrap();
+            assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
+            assert_eq!(
+                index.prepare_reclaim(hash, old.location).unwrap(),
+                ReclaimIndexAction::Removed,
+                "one candidate access must not survive a scan, even after slot reuse"
+            );
+        }
 
         index.upsert(hash, old).unwrap();
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(old));
