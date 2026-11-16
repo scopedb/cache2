@@ -34,9 +34,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use asyncband::event::AutoResetEvent;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
-use asyncband::watch;
 
 use self::metrics::RuntimeMetrics;
 use crate::config::CacheConfig;
@@ -165,17 +165,17 @@ struct MutationGate {
     state: AtomicUsize,
     quiescent: Mutex<()>,
     quiescent_changed: Condvar,
-    async_changed: watch::Sender<()>,
+    // MutationDrainGuard admits one async drain; synchronous close waits use the condvar.
+    async_changed: AutoResetEvent,
 }
 
 impl MutationGate {
     fn new() -> Self {
-        let (async_changed, _) = watch::channel(());
         Self {
             state: AtomicUsize::new(0),
             quiescent: Mutex::new(()),
             quiescent_changed: Condvar::new(),
-            async_changed,
+            async_changed: AutoResetEvent::new(),
         }
     }
 
@@ -236,14 +236,10 @@ impl MutationGate {
     }
 
     async fn wait_quiescent_async(&self) {
-        // Subscribe before inspecting the predicate so a transition racing the check advances the
-        // receiver version and cannot be missed.
-        let mut changed = self.async_changed.subscribe();
+        // Completion between the check and wait leaves a stored signal. A signal left by a
+        // cancelled drain only causes another predicate check.
         while self.active_mutations() != 0 {
-            changed
-                .changed()
-                .await
-                .expect("the mutation gate retains its watch sender");
+            self.async_changed.wait().await;
         }
     }
 
@@ -257,7 +253,7 @@ impl MutationGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.quiescent_changed.notify_all();
             drop(quiescent);
-            self.async_changed.send_replace(());
+            self.async_changed.set();
         }
     }
 }
@@ -636,16 +632,17 @@ struct AppendWorkerState {
 struct AppendWorkerControl {
     state: Mutex<AppendWorkerState>,
     changed: Condvar,
-    async_changed: watch::Sender<()>,
+    // drain_async holds MutationDrainGuard across every shard wait, so only one async observer
+    // consumes signals. Synchronous drain, reclaim, and close waits use the condvar.
+    async_changed: AutoResetEvent,
 }
 
 impl AppendWorkerControl {
     fn new() -> Self {
-        let (async_changed, _) = watch::channel(());
         Self {
             state: Mutex::new(AppendWorkerState::default()),
             changed: Condvar::new(),
-            async_changed,
+            async_changed: AutoResetEvent::new(),
         }
     }
 
@@ -718,9 +715,8 @@ impl AppendWorkerControl {
     }
 
     async fn wait_for_drain_async(&self, generation: u64) -> io::Result<()> {
-        // Subscribe before inspecting the predicate so a completion racing the check advances the
-        // receiver version and cannot be missed.
-        let mut changed = self.async_changed.subscribe();
+        // Completion lives in state; the event only prompts a recheck. Signals from older
+        // generations may remain stored but cannot satisfy this generation's predicate.
         loop {
             {
                 let state = self.lock()?;
@@ -731,10 +727,7 @@ impl AppendWorkerControl {
                     return Ok(());
                 }
             }
-            changed
-                .changed()
-                .await
-                .expect("the shard control retains its watch sender");
+            self.async_changed.wait().await;
         }
     }
 
@@ -748,7 +741,7 @@ impl AppendWorkerControl {
             .get_or_insert_with(|| AppendWorkerFailure::from_error(error));
         drop(state);
         self.changed.notify_all();
-        self.async_changed.send_replace(());
+        self.async_changed.set();
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, AppendWorkerState>> {
@@ -2091,7 +2084,7 @@ fn complete_shard_drain(control: &AppendWorkerControl, generation: u64) -> io::R
     state.drain_completed = state.drain_completed.max(generation);
     control.changed.notify_all();
     drop(state);
-    control.async_changed.send_replace(());
+    control.async_changed.set();
     Ok(())
 }
 
@@ -2296,6 +2289,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::task::Context;
+    use std::task::Poll;
     use std::task::Wake;
     use std::task::Waker;
 
@@ -3331,6 +3325,64 @@ mod tests {
     }
 
     #[test]
+    fn async_drain_can_retry_after_cancellation_with_an_assigned_signal() {
+        let gate = MutationGate::new();
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+        let mut wait = Box::pin(drain.wait_async());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert!(
+            matches!(gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+
+        drop(mutation);
+        drop(wait); // Cancel after the signal is assigned, before polling the wait again.
+        drop(drain);
+
+        let mutation = gate.try_enter().unwrap();
+        let drain = gate.begin_drain().unwrap();
+        let mut retry = std::pin::pin!(drain.wait_async());
+        assert!(retry.as_mut().poll(&mut context).is_pending());
+        drop(mutation);
+        assert!(retry.as_mut().poll(&mut context).is_ready());
+        assert!(
+            matches!(gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn stale_shard_signals_do_not_complete_later_drain_generations() {
+        let control = Arc::new(AppendWorkerControl::new());
+        let probe = Arc::new(ShardStateLockProbe {
+            control: Arc::clone(&control),
+            observed_unlocked: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut context = Context::from_waker(&waker);
+
+        let first = control.request_drain(false).unwrap();
+        complete_shard_drain(&control, first).unwrap();
+
+        let second = control.request_drain(false).unwrap();
+        let mut cancelled = Box::pin(control.wait_for_drain_async(second));
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        complete_shard_drain(&control, second).unwrap();
+        assert!(probe.observed_unlocked.swap(false, Ordering::AcqRel));
+        drop(cancelled);
+
+        let third = control.request_drain(false).unwrap();
+        let mut next = std::pin::pin!(control.wait_for_drain_async(third));
+        assert!(next.as_mut().poll(&mut context).is_pending());
+        complete_shard_drain(&control, third).unwrap();
+        assert!(probe.observed_unlocked.load(Ordering::Acquire));
+        assert!(matches!(
+            next.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
     fn shard_failure_wakes_async_waiters_after_releasing_state_lock() {
         let control = Arc::new(AppendWorkerControl::new());
         let probe = Arc::new(ShardStateLockProbe {
@@ -3345,6 +3397,10 @@ mod tests {
         control.fail(&io::Error::other("test shard failure"));
 
         assert!(probe.observed_unlocked.load(Ordering::Acquire));
+        let Poll::Ready(Err(error)) = wait.as_mut().poll(&mut context) else {
+            panic!("a shard failure must finish the pending drain");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]
