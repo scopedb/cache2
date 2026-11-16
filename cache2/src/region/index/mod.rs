@@ -27,14 +27,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use self::storage::IndexPartitionWriteGuard;
-use self::storage::IndexSlotState;
-use self::storage::IndexStorageError;
-use self::storage::PartitionedIndexStorage;
 use crate::hashing::route_hash;
 use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::IndexPartitionWriteGuard;
+use crate::region::index::storage::IndexSlotState;
+use crate::region::index::storage::IndexStorageError;
+use crate::region::index::storage::PartitionedIndexStorage;
 use crate::snapshot::CacheIndexSnapshot;
 
 pub mod packed;
@@ -674,6 +674,9 @@ fn candidate_offset(displacement: usize, slot_count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
     use crate::region::index::storage::IndexPhysicalStats;
     use crate::region::record::codec::hash_key;
@@ -701,9 +704,9 @@ mod tests {
     #[test]
     fn heat_clears_preserve_neighboring_slots_in_a_shared_word() {
         let heat = SlotHeat::try_new(REFERENCE_WORD_BITS).unwrap();
-        let barrier = std::sync::Barrier::new(2);
+        let barrier = Barrier::new(2);
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for slot in [0, REFERENCE_WORD_BITS - 1] {
                 let heat = &heat;
                 let barrier = &barrier;

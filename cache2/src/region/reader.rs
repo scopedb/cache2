@@ -24,6 +24,8 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
+use tokio::runtime::Handle;
+
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -80,8 +82,7 @@ impl ReadCompletion {
         }
         self.buffer
             .as_ref()?
-            .prepared(self.desc.read_len)
-            .ok()?
+            .prepared(self.desc.read_len)?
             .get(self.desc.record_range.clone())
     }
 }
@@ -98,11 +99,7 @@ impl PendingRead {
         Self::finish(desc, request_id, completion)
     }
 
-    pub async fn wait_async(
-        self,
-        engine: Arc<IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> ReadCompletion {
+    pub async fn wait_async(self, engine: Arc<IoEngine>, tokio_handle: &Handle) -> ReadCompletion {
         let Self {
             desc,
             request_id,
@@ -145,7 +142,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_none())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -261,9 +258,11 @@ pub fn describe_read(
     let (absolute, io_end) = if align_for_direct_io {
         (
             record_absolute / alignment * alignment,
-            align_up(record_absolute_end, alignment).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow")
-            })?,
+            record_absolute_end
+                .checked_next_multiple_of(alignment)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow")
+                })?,
         )
     } else {
         (record_absolute, record_absolute_end)
@@ -308,12 +307,6 @@ pub fn describe_read(
         read_len,
         record_range,
     })
-}
-
-fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|end| end / alignment * alignment)
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -33,17 +34,18 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use tokio::runtime::Handle;
 use tokio::task::JoinError;
 
+use crate::CacheStatsSnapshot;
 use crate::LatencyMode;
 use crate::RequestOperation;
+use crate::RequestOutcome;
 use crate::cache::runtime::CacheRead;
 use crate::cache::runtime::CacheRuntime;
 use crate::cache::session::CacheSession;
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
-use crate::config::storage_fingerprint;
-use crate::config::storage_geometry;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
@@ -135,7 +137,7 @@ pub struct Cache {
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
-    tokio_handle: tokio::runtime::Handle,
+    tokio_handle: Handle,
 }
 
 impl fmt::Debug for Cache {
@@ -158,7 +160,7 @@ impl Cache {
     /// device support, runtime binding, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self, Error> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+        let handle = Handle::try_current().map_err(|error| {
             from_io(
                 ErrorOperation::Open,
                 io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
@@ -177,7 +179,7 @@ impl Cache {
     pub async fn open_with_handle(
         path: impl AsRef<Path>,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
     ) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
         let cache_handle = tokio_handle.clone();
@@ -197,7 +199,7 @@ impl Cache {
     fn open_blocking(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
         started: Instant,
     ) -> io::Result<Cache> {
         let index_slots = config.storage().index_slots();
@@ -242,15 +244,15 @@ impl Cache {
     fn open_blocking_inner(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
     ) -> io::Result<Cache> {
         let format_data = DataSuperblock {
             generation: 1,
             cache_uuid: next_persistent_id(),
             data_identity: next_persistent_id(),
-            geometry: storage_geometry(config.storage()),
+            geometry: config.storage().geometry(),
             hash_seed: KEY_HASH_SEED,
-            storage_fingerprint: storage_fingerprint(config.storage()),
+            storage_fingerprint: config.storage().fingerprint(),
         };
         let paths = RegionPaths::new(
             &path,
@@ -279,6 +281,7 @@ impl Cache {
             tokio_handle,
         })
     }
+
     /// Reports whether this open started empty or mapped a clean recovery image.
     pub const fn startup_mode(&self) -> StartupMode {
         self.startup
@@ -380,9 +383,9 @@ impl Cache {
             .map(|value| value.map(|inner| Value { inner }))
         };
         let outcome = match &result {
-            Ok(Some(value)) if value.inner.is_l1() => crate::RequestOutcome::L1Hit,
-            Ok(Some(_)) => crate::RequestOutcome::L2Hit,
-            _ => crate::RequestOutcome::Miss,
+            Ok(Some(value)) if value.inner.is_l1() => RequestOutcome::L1Hit,
+            Ok(Some(_)) => RequestOutcome::L2Hit,
+            _ => RequestOutcome::Miss,
         };
         guard.finish(&result, outcome);
         result
@@ -428,7 +431,7 @@ impl Cache {
     /// # Errors
     ///
     /// Uses the same availability and runtime failures as [`Self::snapshot`].
-    pub fn stats_snapshot(&self) -> Result<crate::CacheStatsSnapshot, Error> {
+    pub fn stats_snapshot(&self) -> Result<CacheStatsSnapshot, Error> {
         Ok(self.runtime.stats_recorder().snapshot(self.snapshot()?))
     }
 
@@ -496,7 +499,7 @@ impl Cache {
             .ensure_open(operation)
             .and_then(|()| public_result(operation, mutation()));
         if let Some(guard) = guard {
-            guard.finish(&result, crate::RequestOutcome::Accepted);
+            guard.finish(&result, RequestOutcome::Accepted);
         }
         result
     }
@@ -651,7 +654,7 @@ fn next_persistent_id() -> PersistentId {
         .unwrap_or_default()
         .as_nanos();
     let mut bytes = now.to_le_bytes();
-    let mix = counter ^ u64::from(std::process::id()).rotate_left(32);
+    let mix = counter ^ u64::from(process::id()).rotate_left(32);
     for (target, source) in bytes[8..].iter_mut().zip(mix.to_le_bytes()) {
         *target ^= source;
     }

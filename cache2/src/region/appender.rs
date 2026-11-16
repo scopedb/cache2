@@ -18,14 +18,11 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
+use std::error;
 use std::fmt;
 use std::io;
-#[cfg(test)]
-use std::time::Duration;
 
 use crate::io::background::BackgroundIoAttempt;
-#[cfg(test)]
-use crate::io::background::IoRecovery;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
@@ -63,8 +60,8 @@ impl fmt::Display for WriteSubmitError {
     }
 }
 
-impl std::error::Error for WriteSubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for WriteSubmitError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -136,7 +133,6 @@ impl PendingWrite {
 
 // The error returns the owned aligned buffer without another fallible
 // allocation; boxing it would violate that overload-path property.
-#[allow(clippy::result_large_err)]
 pub fn submit_write(
     engine: &IoEngine,
     geometry: DataGeometry,
@@ -191,7 +187,7 @@ pub fn submit_write(
             return Err(WriteSubmitError {
                 error,
                 span,
-                buffer,
+                buffer: Some(buffer),
             });
         }
     };
@@ -249,8 +245,11 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
+    use crate::io::background::IoRecovery;
     use crate::io::engine::IoEngine;
     use crate::io::file::PositionedIo;
     use crate::managed_memory::BufferLease;
@@ -267,7 +266,7 @@ mod tests {
         }
 
         fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
-            std::thread::sleep(self.delay);
+            thread::sleep(self.delay);
             self.writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

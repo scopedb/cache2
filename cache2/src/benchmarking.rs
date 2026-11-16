@@ -15,6 +15,7 @@
 //! Internal benchmark entry points. This module is available only with the
 //! `benchmarking` feature and is not part of the supported cache API.
 
+use std::error;
 use std::hint::black_box;
 use std::io;
 use std::time::Duration;
@@ -511,7 +512,7 @@ fn out_of_memory(target: &'static str) -> io::Error {
     )
 }
 
-fn index_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+fn index_error(error: impl error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(error)
 }
 

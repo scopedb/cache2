@@ -21,12 +21,17 @@
 //! runtime mutations become private copy-on-write pages.
 
 use std::cell::UnsafeCell;
+use std::error;
 use std::fmt;
 use std::fs::File;
+use std::io;
 use std::io::Write;
-use std::io::{self};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(test)]
+use std::panic;
+#[cfg(test)]
+use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
@@ -37,14 +42,7 @@ use std::sync::TryLockError;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
-use self::page_format::PAGE_CHECKSUM_OFFSET;
-use self::page_format::encode_page_header;
-use self::page_format::page_checksum;
-use self::page_format::read_u64;
-use self::page_format::validate_page_header;
 use crate::codec::put_u32;
-#[cfg(test)]
-use crate::codec::put_u64;
 use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_INDEX_PARTITIONS;
@@ -56,6 +54,11 @@ use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_HEADER_SIZE;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOT_SIZE;
 use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+use crate::region::index::storage::page_format::PAGE_CHECKSUM_OFFSET;
+use crate::region::index::storage::page_format::encode_page_header;
+use crate::region::index::storage::page_format::page_checksum;
+use crate::region::index::storage::page_format::read_u64;
+use crate::region::index::storage::page_format::validate_page_header;
 use crate::region::record::RECORD_ALIGNMENT;
 
 pub mod page_format;
@@ -588,8 +591,8 @@ impl fmt::Display for IndexStorageError {
     }
 }
 
-impl std::error::Error for IndexStorageError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for IndexStorageError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::InvalidArgument(_)
@@ -635,34 +638,19 @@ struct IndexStorage {
 
 impl IndexStorage {
     /// Creates a lazily allocated, zero-filled runtime image.
+    #[cfg(test)]
     fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
-        let layout = ImageLayout::new(slot_count)?;
-        let mut backing = Backing::anonymous(layout.image_len)?;
-        let data_pointer = backing.as_mut_ptr();
-        let page_states = allocate_page_states(layout.page_count, PAGE_STATE_VALID)?;
-        let core = Arc::new(IndexStorageCore {
-            _backing: UnsafeCell::new(backing),
-            data_pointer,
-            data_offset: 0,
-            slot_count,
-            page_count: layout.page_count,
-            expected_binding: None,
-            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
-            page_states,
-        });
+        let core = IndexStorageCore::anonymous(slot_count)?;
+        let page_count = core.page_count;
         Ok(Self {
             core,
-            range: whole_image_range(slot_count, layout.page_count),
+            range: whole_image_range(slot_count, page_count),
             physical_stats: IndexPhysicalStats::default(),
         })
     }
 
     /// Maps an index image range writable and private.
-    ///
-    /// Opening checks only range bounds and establishes the mapping. It does
-    /// not scan page headers, slots, or CRCs. `file_offset` must be 4 KiB image
-    /// aligned, but need not match the host's mmap page size because the
-    /// mapping starts at file offset zero and addresses the requested subrange.
+    #[cfg(test)]
     fn map_private(
         file: &File,
         file_offset: u64,
@@ -670,54 +658,14 @@ impl IndexStorage {
         expected_binding: IndexImageBinding,
         physical_stats: IndexPhysicalStats,
     ) -> Result<Self, IndexStorageError> {
-        if !expected_binding.is_valid() {
-            return Err(IndexStorageError::InvalidArgument(
-                "mapped index image binding must be non-zero",
-            ));
-        }
         if !physical_stats.is_valid_for(slot_count) {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
-        if !file_offset.is_multiple_of(INDEX_IMAGE_PAGE_SIZE as u64) {
-            return Err(IndexStorageError::InvalidArgument(
-                "index image file offset must be 4 KiB aligned",
-            ));
-        }
-        let layout = ImageLayout::new(slot_count)?;
-        let data_offset =
-            usize::try_from(file_offset).map_err(|_| IndexStorageError::SizeOverflow)?;
-        let mapping_len = data_offset
-            .checked_add(layout.image_len)
-            .ok_or(IndexStorageError::SizeOverflow)?;
-        if mapping_len > isize::MAX as usize {
-            return Err(IndexStorageError::SizeOverflow);
-        }
-        let required_len =
-            u64::try_from(mapping_len).map_err(|_| IndexStorageError::SizeOverflow)?;
-        if file.metadata()?.len() < required_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "index image range extends past the end of the file",
-            )
-            .into());
-        }
-
-        let mut backing = Backing::map_file_private(file, mapping_len)?;
-        let data_pointer = backing.as_mut_ptr();
-        let page_states = allocate_page_states(layout.page_count, PAGE_STATE_UNCHECKED)?;
-        let core = Arc::new(IndexStorageCore {
-            _backing: UnsafeCell::new(backing),
-            data_pointer,
-            data_offset,
-            slot_count,
-            page_count: layout.page_count,
-            expected_binding: Some(expected_binding),
-            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
-            page_states,
-        });
+        let core = IndexStorageCore::map_private(file, file_offset, slot_count, expected_binding)?;
+        let page_count = core.page_count;
         Ok(Self {
             core,
-            range: whole_image_range(slot_count, layout.page_count),
+            range: whole_image_range(slot_count, page_count),
             physical_stats,
         })
     }
@@ -930,6 +878,80 @@ struct IndexStorageCore {
 }
 
 impl IndexStorageCore {
+    /// Creates a lazily allocated, zero-filled runtime image.
+    fn anonymous(slot_count: usize) -> Result<Arc<Self>, IndexStorageError> {
+        let layout = ImageLayout::new(slot_count)?;
+        let mut backing = Backing::anonymous(layout.image_len)?;
+        let data_pointer = backing.as_mut_ptr();
+        let page_states = allocate_page_states(layout.page_count, PAGE_STATE_VALID)?;
+        Ok(Arc::new(Self {
+            _backing: UnsafeCell::new(backing),
+            data_pointer,
+            data_offset: 0,
+            slot_count,
+            page_count: layout.page_count,
+            expected_binding: None,
+            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
+            page_states,
+        }))
+    }
+
+    /// Maps an index image range writable and private.
+    ///
+    /// Opening checks only range bounds and establishes the mapping. It does
+    /// not scan page headers, slots, or CRCs. `file_offset` must be 4 KiB image
+    /// aligned, but need not match the host's mmap page size because the
+    /// mapping starts at file offset zero and addresses the requested subrange.
+    fn map_private(
+        file: &File,
+        file_offset: u64,
+        slot_count: usize,
+        expected_binding: IndexImageBinding,
+    ) -> Result<Arc<Self>, IndexStorageError> {
+        if !expected_binding.is_valid() {
+            return Err(IndexStorageError::InvalidArgument(
+                "mapped index image binding must be non-zero",
+            ));
+        }
+        if !file_offset.is_multiple_of(INDEX_IMAGE_PAGE_SIZE as u64) {
+            return Err(IndexStorageError::InvalidArgument(
+                "index image file offset must be 4 KiB aligned",
+            ));
+        }
+        let layout = ImageLayout::new(slot_count)?;
+        let data_offset =
+            usize::try_from(file_offset).map_err(|_| IndexStorageError::SizeOverflow)?;
+        let mapping_len = data_offset
+            .checked_add(layout.image_len)
+            .ok_or(IndexStorageError::SizeOverflow)?;
+        if mapping_len > isize::MAX as usize {
+            return Err(IndexStorageError::SizeOverflow);
+        }
+        let required_len =
+            u64::try_from(mapping_len).map_err(|_| IndexStorageError::SizeOverflow)?;
+        if file.metadata()?.len() < required_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "index image range extends past the end of the file",
+            )
+            .into());
+        }
+
+        let mut backing = Backing::map_file_private(file, mapping_len)?;
+        let data_pointer = backing.as_mut_ptr();
+        let page_states = allocate_page_states(layout.page_count, PAGE_STATE_UNCHECKED)?;
+        Ok(Arc::new(Self {
+            _backing: UnsafeCell::new(backing),
+            data_pointer,
+            data_offset,
+            slot_count,
+            page_count: layout.page_count,
+            expected_binding: Some(expected_binding),
+            image_state: AtomicU8::new(IMAGE_STATE_USABLE),
+            page_states,
+        }))
+    }
+
     #[cfg(test)]
     fn page_validation_state(&self, page: usize) -> Result<PageValidationState, IndexStorageError> {
         let state = self
@@ -1162,6 +1184,7 @@ impl IndexStorageCore {
 unsafe impl Send for IndexStorageCore {}
 unsafe impl Sync for IndexStorageCore {}
 
+#[cfg(test)]
 fn whole_image_range(slot_count: usize, page_count: usize) -> IndexPartitionRange {
     IndexPartitionRange {
         partition_id: 0,
@@ -1234,8 +1257,7 @@ impl IndexPartitionWriteGuard<'_> {
 impl PartitionedIndexStorage {
     pub fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
         let ranges = canonical_index_partition_ranges(slot_count)?;
-        let whole = IndexStorage::anonymous(slot_count)?;
-        let IndexStorage { core, .. } = whole;
+        let core = IndexStorageCore::anonymous(slot_count)?;
         Self::from_core(slot_count, ranges, core, None)
     }
 
@@ -1256,8 +1278,7 @@ impl PartitionedIndexStorage {
             first_slot: 0,
             slot_count,
         });
-        let whole = IndexStorage::anonymous(slot_count)?;
-        let IndexStorage { core, .. } = whole;
+        let core = IndexStorageCore::anonymous(slot_count)?;
         Self::from_core(slot_count, ranges.into_boxed_slice(), core, None)
     }
 
@@ -1281,14 +1302,7 @@ impl PartitionedIndexStorage {
         if !physical_stats.is_valid_for(slot_count) {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
-        let whole = IndexStorage::map_private(
-            file,
-            file_offset,
-            slot_count,
-            expected_binding,
-            physical_stats,
-        )?;
-        let IndexStorage { core, .. } = whole;
+        let core = IndexStorageCore::map_private(file, file_offset, slot_count, expected_binding)?;
         Self::from_core(slot_count, ranges, core, Some(partition_stats))
     }
 
@@ -1534,7 +1548,7 @@ impl PartitionedIndexStorage {
     #[cfg(test)]
     pub fn poison_hash_partition_for_test(&self, hash: u64) {
         let partition = index_partition_for(hash, self.partitions.len());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = self.partitions[partition].write().unwrap();
             panic!("poison index partition for test");
         }));
@@ -1821,6 +1835,7 @@ mod tests {
     use std::io::SeekFrom;
 
     use super::*;
+    use crate::codec::put_u64;
     use crate::fixtures::TestFile;
     use crate::fixtures::assert_golden;
 

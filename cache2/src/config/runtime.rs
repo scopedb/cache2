@@ -20,12 +20,14 @@ use crate::StatsOptions;
 use crate::cache::runtime::metrics::ActivityMetrics;
 use crate::config::CacheConfig;
 use crate::config::StorageLayout;
+use crate::config::invalid_config;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::io_uring_extra_memory_bytes;
+use crate::io::fill_control::FillController;
 use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::MAX_CONFIG_COUNT;
@@ -215,7 +217,7 @@ const IO_URING_UNAVAILABLE_PLATFORM: &str = "io_uring is unavailable on this pla
 const IO_URING_UNAVAILABLE_ARCHITECTURE: &str = "io_uring is unavailable on this architecture";
 
 /// Names the missing io_uring requirement, if any, for this build and target.
-pub(crate) const fn io_uring_unavailability() -> Option<&'static str> {
+pub const fn io_uring_unavailability() -> Option<&'static str> {
     if cfg!(not(target_os = "linux")) {
         Some(IO_URING_UNAVAILABLE_PLATFORM)
     } else if cfg!(not(any(
@@ -568,11 +570,11 @@ impl CacheConfig {
     /// or insufficient managed memory. Device capabilities are checked at open.
     pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self, Error> {
         let build = || -> io::Result<Self> {
-            let geometry = storage.geometry;
-            let index_slots = storage.index_slots;
+            let geometry = storage.geometry();
+            let index_slots = storage.index_slots();
             runtime.resolve()?;
             let stats_bytes = Recorder::allocation_bytes(runtime.stats)?;
-            let fill_bytes = crate::io::fill_control::FillController::allocation_bytes(
+            let fill_bytes = FillController::allocation_bytes(
                 runtime.fill_control,
                 runtime.append_shards as usize
                     + IoPoolTopology::reclaim(runtime.io_engine).max_in_flight(),
@@ -617,10 +619,6 @@ impl CacheConfig {
     }
 }
 
-fn invalid_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
 impl RuntimeOptions {
     fn resolve(&mut self) -> io::Result<()> {
         if !self.io_engine.is_available() {
@@ -636,10 +634,7 @@ impl RuntimeOptions {
             ));
         }
         if self.append_shards == 0 || self.append_shards > MAX_APPEND_SHARDS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "append shards must be in 1..=256",
-            ));
+            return Err(invalid_config("append shards must be in 1..=256"));
         }
         if self.reclaim_io_timeout.is_zero()
             || Instant::now()
@@ -678,16 +673,12 @@ impl RuntimeOptions {
                 if self.io_mode != IoMode::Direct
                     && (options.read.io_poll || options.write.io_poll || options.reclaim.io_poll)
                 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "io_uring IOPOLL requires direct I/O mode",
-                    ));
+                    return Err(invalid_config("io_uring IOPOLL requires direct I/O mode"));
                 }
             }
         }
         if reclaim_topology.max_in_flight() > self.append_shards as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(invalid_config(
                 "reclaim I/O concurrency must be no greater than append shards",
             ));
         }
@@ -708,22 +699,15 @@ impl RuntimeOptions {
             *max_waiters = Some(capacity);
         }
         if self.managed_memory_limit_bytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed memory limit must be non-zero",
-            ));
+            return Err(invalid_config("managed memory limit must be non-zero"));
         }
         if self.l1_capacity_bytes > self.managed_memory_limit_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(invalid_config(
                 "L1 capacity must not exceed the managed memory limit",
             ));
         }
         if self.l1_shards == 0 || self.l1_shards > MAX_CONFIG_COUNT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "L1 shards must be in 1..=65536",
-            ));
+            return Err(invalid_config("L1 shards must be in 1..=65536"));
         }
         if self.write_flush_threshold_bytes == 0
             || self.write_flush_threshold_bytes > MAX_WRITE_FLUSH_THRESHOLD_BYTES
@@ -731,8 +715,7 @@ impl RuntimeOptions {
                 .write_flush_threshold_bytes
                 .is_multiple_of(BUFFER_ALIGNMENT)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(invalid_config(
                 "write flush threshold must be 4 KiB aligned and within 4 KiB..=4 MiB",
             ));
         }
@@ -931,9 +914,7 @@ mod tests {
 
     #[test]
     fn recovery_timeout_allows_zero_and_rejects_overflow() {
-        let storage = crate::StorageOptions::new(1024 * 1024 * 1024)
-            .build()
-            .unwrap();
+        let storage = StorageOptions::new(1024 * 1024 * 1024).build().unwrap();
         assert_eq!(RuntimeOptions::default().io_recovery_timeout, None);
         for timeout in [Duration::ZERO, Duration::from_secs(30)] {
             let options = RuntimeOptions {
@@ -948,7 +929,7 @@ mod tests {
         };
         assert_eq!(
             CacheConfig::new(storage, options).unwrap_err().kind(),
-            crate::ErrorKind::InvalidInput
+            ErrorKind::InvalidInput
         );
     }
 

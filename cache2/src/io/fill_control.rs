@@ -503,6 +503,8 @@ impl Drop for IoObservation<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     fn control(enforcing: bool) -> Arc<FillController> {
@@ -684,7 +686,7 @@ mod tests {
         let control = control(true);
         freeze_refill(&control);
         let accepted = AtomicU64::new(0);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..8 {
                 let control = &control;
                 let accepted = &accepted;
@@ -715,7 +717,7 @@ mod tests {
     #[test]
     fn concurrent_pause_holders_resume_when_all_release() {
         let control = control(true);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..8 {
                 let control = &control;
                 scope.spawn(move || {
@@ -800,7 +802,7 @@ mod tests {
             control.refill();
         }
         assert_eq!(control.last_refill_ns.load(Ordering::Relaxed), one_ms_ago);
-        std::thread::sleep(Duration::from_millis(110));
+        thread::sleep(Duration::from_millis(110));
         control.refill();
         assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }
@@ -817,7 +819,7 @@ mod tests {
         freeze_refill(&control);
         while control.try_acquire_flush_budget(64, 1, false).is_some() {}
         let before = control.credit.load(Ordering::Relaxed);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..32 {
                 let control = &control;
                 scope.spawn(move || {

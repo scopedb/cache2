@@ -30,26 +30,24 @@ use std::sync::MutexGuard;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use asyncband::event::AutoResetEvent;
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
+use thread::JoinHandle;
+use tokio::runtime::Handle;
 
-use self::metrics::RuntimeMetrics;
+use crate::IoRole;
+use crate::cache::runtime::metrics::RuntimeMetrics;
 use crate::config::CacheConfig;
-use crate::config::l1_entry_capacity;
-use crate::config::reserved_memory_bytes;
 use crate::config::runtime::IoMode;
 use crate::config::runtime::IoPoolTopology;
-#[cfg(test)]
-use crate::config::runtime::ReadAdmission;
 use crate::config::runtime::RuntimeOptions;
 use crate::config::runtime::read_io_wait_capacity;
 use crate::config::runtime::read_io_wait_timeout;
-use crate::config::storage_geometry;
 use crate::hashing::route_hash;
 use crate::io::background::BackgroundIoAttempt;
 use crate::io::background::IoRecovery;
@@ -67,13 +65,8 @@ use crate::io::fill_control::FlushCharge;
 use crate::managed_memory::BufferLease;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 use crate::managed_memory::ManagedMemory;
-use crate::managed_memory::ManagedMemoryError;
 use crate::managed_memory::ManagedMemoryLimits;
-#[cfg(test)]
-use crate::managed_memory::ManagedMemorySnapshot;
 use crate::memory::MemoryLookup;
-#[cfg(test)]
-use crate::memory::MemoryMetricsSnapshot;
 use crate::memory::MemoryReadToken;
 use crate::memory::MemoryStore;
 use crate::memory::MemoryValue;
@@ -81,37 +74,24 @@ use crate::region::RegionRotation;
 use crate::region::RegionStageValue;
 use crate::region::RegionStore;
 use crate::region::RegionValue;
-#[cfg(test)]
-use crate::region::index::packed::IndexEntry;
-#[cfg(test)]
-use crate::region::index::packed::PackedLocation;
-#[cfg(test)]
-use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
-#[cfg(test)]
-use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::is_read_pressure;
 use crate::region::reader::PendingRead;
-#[cfg(test)]
-use crate::region::reader::ReadCandidate;
 use crate::region::reader::ReadCompletion;
 use crate::region::reader::ReadDesc;
 use crate::region::reader::describe_read;
 use crate::region::record::MAX_KEY_SIZE;
-#[cfg(test)]
-use crate::region::record::RECORD_HEADER_SIZE;
 use crate::region::record::codec::hash_key;
 use crate::region::record::codec::required_record_bytes;
-#[cfg(test)]
-use crate::region::recovery::DataGeometry;
 use crate::region::recovery::DataSuperblock;
-#[cfg(test)]
-use crate::region::runtime_fixed_memory_bytes;
 use crate::region::staging::AppendStaging;
 use crate::region::staging::StagingError;
+use crate::snapshot::CacheHealth;
 use crate::snapshot::CacheIoDirectionSnapshot;
 use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheSnapshot;
 use crate::snapshot::DetailedCacheSnapshot;
+use crate::stats::recording::Recorder;
+use crate::stats::recording::RequestGuard;
 
 pub mod metrics;
 
@@ -359,7 +339,7 @@ impl PendingGet {
         }
     }
 
-    async fn wait_async(self, tokio_handle: &tokio::runtime::Handle) -> CompletedGet {
+    async fn wait_async(self, tokio_handle: &Handle) -> CompletedGet {
         let Self {
             engine,
             read,
@@ -375,7 +355,7 @@ impl PendingGet {
 }
 
 impl WaitingGet {
-    async fn reserve_async(self, tokio_handle: &tokio::runtime::Handle) -> io::Result<ReservedGet> {
+    async fn reserve_async(self, tokio_handle: &Handle) -> io::Result<ReservedGet> {
         let Self {
             engine,
             slot_waiter,
@@ -419,15 +399,9 @@ pub enum ShutdownDisposition {
 
 #[derive(Clone)]
 pub struct CacheRuntime {
-    regions: Arc<RegionStore>,
     data: DataSuperblock,
-    options: RuntimeOptions,
-    metrics: Arc<RuntimeMetrics>,
     state: Arc<RuntimeState>,
     workers: Arc<Mutex<Option<RuntimeWorkers>>>,
-    // Fences write admission for drain, flush, and shutdown. Reads do not
-    // participate because they cannot extend the set of records being fenced.
-    operations: Arc<MutationGate>,
 }
 
 struct RuntimeWorkers {
@@ -441,6 +415,7 @@ struct RuntimeState {
     read_engines: Box<[Arc<IoEngine>]>,
     read_lane_cursor: AtomicUsize,
     read_waiters: Option<Arc<Semaphore>>,
+    read_wait_timeout: Duration,
     write_engines: Box<[Arc<IoEngine>]>,
     reclaim_engines: Box<[Arc<IoEngine>]>,
     reclaim_control: ReclaimControl,
@@ -451,6 +426,8 @@ struct RuntimeState {
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
     staging: Arc<AppendStaging>,
+    // Fences write admission for drain, flush, and shutdown. Reads do not
+    // participate because they cannot extend the set of records being fenced.
     operations: Arc<MutationGate>,
     append_controls: Box<[Arc<AppendWorkerControl>]>,
     write_flush_threshold_bytes: usize,
@@ -611,6 +588,7 @@ fn should_wake_write(previous_bytes: usize, current_bytes: usize, threshold: usi
 #[derive(Clone)]
 struct AppendWorkerFailure {
     kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
     message: Arc<str>,
 }
 
@@ -618,12 +596,17 @@ impl AppendWorkerFailure {
     fn from_error(error: &io::Error) -> Self {
         Self {
             kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
             message: Arc::from(error.to_string()),
         }
     }
 
     fn to_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.to_string())
+        if let Some(code) = self.raw_os_error {
+            io::Error::from_raw_os_error(code)
+        } else {
+            io::Error::new(self.kind, self.message.as_ref())
+        }
     }
 }
 
@@ -654,28 +637,24 @@ impl AppendWorkerControl {
     }
 
     fn notify(&self, flags: u8) -> io::Result<()> {
-        let mut state = self.lock()?;
-        if let Some(failure) = &state.failure {
-            return Err(failure.to_error());
-        }
-        if state.stop {
-            return Err(closed_runtime_error());
-        }
-        let was_idle = state.wake_flags == 0;
-        state.wake_flags |= flags;
-        if was_idle {
-            self.changed.notify_one();
-        }
-        Ok(())
+        self.notify_inner(flags, false)
     }
 
     fn notify_if_running(&self, flags: u8) -> io::Result<()> {
+        self.notify_inner(flags, true)
+    }
+
+    fn notify_inner(&self, flags: u8, ignore_stopped: bool) -> io::Result<()> {
         let mut state = self.lock()?;
         if let Some(failure) = &state.failure {
             return Err(failure.to_error());
         }
         if state.stop {
-            return Ok(());
+            return if ignore_stopped {
+                Ok(())
+            } else {
+                Err(closed_runtime_error())
+            };
         }
         let was_idle = state.wake_flags == 0;
         state.wake_flags |= flags;
@@ -758,11 +737,11 @@ impl AppendWorkerControl {
 
 impl CacheRuntime {
     pub fn regions(&self) -> &Arc<RegionStore> {
-        &self.regions
+        &self.state.regions
     }
 
-    pub fn stats_recorder(&self) -> &crate::stats::recording::Recorder {
-        &self.metrics.stats
+    pub fn stats_recorder(&self) -> &Recorder {
+        &self.state.metrics.stats
     }
 
     pub fn start(
@@ -774,7 +753,7 @@ impl CacheRuntime {
         // Recovery supplies independently validated metadata. It must still
         // match the configuration selected for this open.
         let storage = config.storage();
-        if data.geometry != storage_geometry(storage)
+        if data.geometry != storage.geometry()
             || regions.region_count()? != storage.region_count() as usize
             || regions.index_slot_count() != storage.index_slots()
             || regions.shard_count() != config.runtime().append_shards as usize
@@ -784,36 +763,25 @@ impl CacheRuntime {
                 "recovered layout does not match the cache configuration",
             ));
         }
-        let options = config.runtime().clone();
+        let options = config.runtime();
         regions.configure_reclaim_workers(
             IoPoolTopology::reclaim(options.io_engine).max_in_flight(),
         )?;
         regions.set_index_activity_counters_enabled(options.stats.activity_counters);
         let metrics = Arc::new(RuntimeMetrics::new(regions.shard_count(), options.stats)?);
         let operations = Arc::new(MutationGate::new());
-        let workers = start_workers(
-            Arc::clone(&regions),
-            data,
-            handles,
-            config,
-            Arc::clone(&metrics),
-            Arc::clone(&operations),
-        )?;
+        let workers = start_workers(regions, data, handles, config, metrics, operations)?;
         let state = Arc::clone(&workers.state);
         Ok(Self {
-            regions,
             data,
-            options,
-            metrics,
             state,
             workers: Arc::new(Mutex::new(Some(workers))),
-            operations,
         })
     }
 
     pub fn start_close(&self) {
         self.state.stop_fill_and_recovery();
-        self.operations.start_close();
+        self.state.operations.start_close();
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
@@ -828,7 +796,7 @@ impl CacheRuntime {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "file-chunk key exceeds the 4 KiB limit",
+                "cache key exceeds the 4 KiB limit",
             ));
         }
         let record_bytes = required_record_bytes(key.len(), value.len())
@@ -836,7 +804,7 @@ impl CacheRuntime {
         if u64::from(record_bytes) > self.data.geometry.region_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "encoded file-chunk entry exceeds one Region",
+                "encoded cache record exceeds one Region",
             ));
         }
         let state = &self.state;
@@ -847,12 +815,12 @@ impl CacheRuntime {
             return Err(write_overload_error());
         }
         let hash = hash_key(self.data.hash_seed, key);
-        let shard_id = self.regions.append_shard(hash);
+        let shard_id = state.regions.append_shard(hash);
         let control = &state.append_controls[shard_id];
         let activity = state
             .activity_counters
             .then(|| state.metrics.activity_for_hash(hash));
-        let operation = match self.operations.try_enter() {
+        let operation = match state.operations.try_enter() {
             Some(operation) => operation,
             None => {
                 if state.activity_counters {
@@ -869,7 +837,7 @@ impl CacheRuntime {
             }
             return Err(write_overload_error());
         }
-        let staged = self.regions.try_stage_value(
+        let staged = state.regions.try_stage_value(
             &state.staging,
             shard_id,
             hash,
@@ -926,7 +894,7 @@ impl CacheRuntime {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "file-chunk key exceeds the 4 KiB limit",
+                "cache key exceeds the 4 KiB limit",
             ));
         }
         let state = &self.state;
@@ -934,7 +902,7 @@ impl CacheRuntime {
         let activity = state
             .activity_counters
             .then(|| state.metrics.activity_for_hash(hash));
-        let operation = match self.operations.try_enter() {
+        let operation = match state.operations.try_enter() {
             Some(operation) => operation,
             None => {
                 if state.activity_counters {
@@ -943,7 +911,7 @@ impl CacheRuntime {
                 return Err(write_overload_error());
             }
         };
-        let Some(seqno) = self.regions.try_delete_value(hash)? else {
+        let Some(seqno) = state.regions.try_delete_value(hash)? else {
             drop(operation);
             if state.activity_counters {
                 state.metrics.record_write_rejection();
@@ -971,8 +939,8 @@ impl CacheRuntime {
     pub async fn get_async(
         &self,
         key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
-        guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
+        tokio_handle: &Handle,
+        guard: Option<&mut RequestGuard<'_>>,
     ) -> io::Result<Option<CacheRead>> {
         match self.prepare_get(key, guard)? {
             PreparedGet::Complete(value) => Ok(value),
@@ -980,10 +948,10 @@ impl CacheRuntime {
                 self.finish_get(pending.wait_async(tokio_handle).await, key)
             }
             PreparedGet::Waiting(waiting) => {
-                let wait_started = self.options.stats.activity_counters.then(Instant::now);
+                let wait_started = self.state.activity_counters.then(Instant::now);
                 let reserved = waiting.reserve_async(tokio_handle).await;
                 if let Some(wait_started) = wait_started {
-                    self.metrics.record_read_wait(wait_started.elapsed());
+                    self.state.metrics.record_read_wait(wait_started.elapsed());
                 }
                 let reserved = reserved.inspect_err(|error| self.record_read_wait_error(error))?;
                 let Some(pending) = self.submit_reserved_get(reserved)? else {
@@ -995,13 +963,13 @@ impl CacheRuntime {
     }
 
     fn record_read_wait_error(&self, error: &io::Error) {
-        if !self.options.stats.activity_counters {
+        if !self.state.activity_counters {
             return;
         }
         if is_read_pressure(error.kind()) {
-            self.metrics.record_read_overload();
+            self.state.metrics.record_read_overload();
         } else {
-            RuntimeMetrics::increment(&self.metrics.io_failures);
+            RuntimeMetrics::increment(&self.state.metrics.io_failures);
         }
     }
 
@@ -1013,16 +981,17 @@ impl CacheRuntime {
             read_token,
             hash,
         } = reserved;
-        let Some(buffer) = self.state.managed_memory.try_read_buffer(desc.read_len) else {
-            if self.options.stats.activity_counters {
-                self.metrics.record_read_overload();
+        let state = &self.state;
+        let Some(buffer) = state.managed_memory.try_read_buffer(desc.read_len) else {
+            if state.activity_counters {
+                state.metrics.record_read_overload();
             }
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "L2 read could not reserve its bounded buffer after waiting",
             ));
         };
-        match self
+        match state
             .regions
             .submit_value_read(engine.as_ref(), slot, buffer, desc)
         {
@@ -1032,10 +1001,10 @@ impl CacheRuntime {
                 read_token,
                 hash,
             })),
-            Err(_) if !self.regions.is_healthy() => {
-                if self.options.stats.activity_counters {
-                    RuntimeMetrics::increment(&self.metrics.io_failures);
-                    RuntimeMetrics::increment(&self.metrics.activity_for_hash(hash).l2_misses);
+            Err(_) if !state.regions.is_healthy() => {
+                if state.activity_counters {
+                    RuntimeMetrics::increment(&state.metrics.io_failures);
+                    RuntimeMetrics::increment(&state.metrics.activity_for_hash(hash).l2_misses);
                 }
                 Ok(None)
             }
@@ -1049,22 +1018,22 @@ impl CacheRuntime {
     fn prepare_get(
         &self,
         key: &[u8],
-        guard: Option<&mut crate::stats::recording::RequestGuard<'_>>,
+        guard: Option<&mut RequestGuard<'_>>,
     ) -> io::Result<PreparedGet> {
+        let state = &self.state;
         if key.len() > MAX_KEY_SIZE {
-            if self.options.stats.activity_counters {
-                let activity = self.metrics.activity(0);
+            if state.activity_counters {
+                let activity = state.metrics.activity(0);
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
             return Ok(PreparedGet::Complete(None));
         }
-        let state = &self.state;
         let hash = hash_key(self.data.hash_seed, key);
         let activity = state
             .activity_counters
             .then(|| state.metrics.activity_for_hash(hash));
-        if !self.regions.is_healthy() {
+        if !state.regions.is_healthy() {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l1_misses);
                 RuntimeMetrics::increment(&activity.l2_misses);
@@ -1092,7 +1061,7 @@ impl CacheRuntime {
                 token
             }
         };
-        let Some(candidate) = self.regions.begin_point_read(hash) else {
+        let Some(candidate) = state.regions.begin_point_read(hash) else {
             if let Some(activity) = activity {
                 RuntimeMetrics::increment(&activity.l2_misses);
             }
@@ -1106,7 +1075,8 @@ impl CacheRuntime {
         ) {
             Ok(desc) => desc,
             Err(error) => {
-                self.regions
+                state
+                    .regions
                     .enter_miss_only_with_error("record_read_descriptor_invalid", &error);
                 if state.activity_counters {
                     RuntimeMetrics::increment(&state.metrics.io_failures);
@@ -1121,10 +1091,10 @@ impl CacheRuntime {
             Ok(reservation) => reservation,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    && !read_io_wait_timeout(&self.options).is_zero() =>
+                    && !state.read_wait_timeout.is_zero() =>
             {
                 let waiting = state
-                    .try_queue_read(hash, desc, read_token, read_io_wait_timeout(&self.options))
+                    .try_queue_read(hash, desc, read_token, state.read_wait_timeout)
                     .inspect_err(|_| {
                         if state.activity_counters {
                             state.metrics.record_read_overload();
@@ -1140,7 +1110,8 @@ impl CacheRuntime {
                 return Ok(PreparedGet::Complete(None));
             }
             Err(error) => {
-                self.regions
+                state
+                    .regions
                     .enter_miss_only_with_error("read_engine_reservation_failed", &error);
                 if state.activity_counters {
                     RuntimeMetrics::increment(&state.metrics.io_failures);
@@ -1152,7 +1123,7 @@ impl CacheRuntime {
             }
         };
         let Some(buffer) = state.managed_memory.try_read_buffer(desc.read_len) else {
-            if !read_io_wait_timeout(&self.options).is_zero() {
+            if !state.read_wait_timeout.is_zero() {
                 if state.activity_counters {
                     state.metrics.record_read_overload();
                 }
@@ -1167,7 +1138,7 @@ impl CacheRuntime {
             }
             return Ok(PreparedGet::Complete(None));
         };
-        match self
+        match state
             .regions
             .submit_value_read(engine.as_ref(), slot, buffer, desc)
         {
@@ -1181,7 +1152,7 @@ impl CacheRuntime {
             // error. The operation that trips the one-way health latch and all
             // later reads therefore fail open as cache misses. Resource
             // overload remains explicit while the regions is still healthy.
-            Err(_) if !self.regions.is_healthy() => {
+            Err(_) if !state.regions.is_healthy() => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&state.metrics.io_failures);
                     RuntimeMetrics::increment(&activity.l2_misses);
@@ -1189,7 +1160,7 @@ impl CacheRuntime {
                 Ok(PreparedGet::Complete(None))
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !read_io_wait_timeout(&self.options).is_zero() {
+                if !state.read_wait_timeout.is_zero() {
                     if state.activity_counters {
                         state.metrics.record_read_overload();
                     }
@@ -1220,9 +1191,9 @@ impl CacheRuntime {
         let activity = state
             .activity_counters
             .then(|| state.metrics.activity_for_hash(hash));
-        let result = self.regions.finish_value_read(read, key);
+        let result = state.regions.finish_value_read(read, key);
         match result {
-            Err(_) if !self.regions.is_healthy() => {
+            Err(_) if !state.regions.is_healthy() => {
                 if let Some(activity) = activity {
                     RuntimeMetrics::increment(&state.metrics.io_failures);
                     RuntimeMetrics::increment(&activity.l2_misses);
@@ -1257,7 +1228,7 @@ impl CacheRuntime {
                 Ok(None)
             }
             Err(error) if is_read_pressure(error.kind()) => {
-                if !read_io_wait_timeout(&self.options).is_zero() {
+                if !state.read_wait_timeout.is_zero() {
                     self.record_read_wait_error(&error);
                     return Err(error);
                 }
@@ -1280,18 +1251,18 @@ impl CacheRuntime {
     /// an I/O completion barrier, not a fdatasync durability boundary.
     #[cfg(test)]
     pub fn drain(&self) -> io::Result<()> {
-        let operations = self.operations.begin_drain()?;
-        operations.wait()?;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
+        let operations = state.operations.begin_drain()?;
+        operations.wait()?;
+        let _draining = LifecycleDrainingGuard::enter(&state.metrics.lifecycle, &state.operations);
         drain_shards(state, false)
     }
 
     pub async fn drain_async(&self) -> io::Result<()> {
-        let operations = self.operations.begin_drain()?;
-        operations.wait_async().await;
-        let _draining = LifecycleDrainingGuard::enter(&self.metrics.lifecycle, &self.operations);
         let state = &self.state;
+        let operations = state.operations.begin_drain()?;
+        operations.wait_async().await;
+        let _draining = LifecycleDrainingGuard::enter(&state.metrics.lifecycle, &state.operations);
         drain_shards_async(state, false).await
     }
 
@@ -1309,22 +1280,20 @@ impl CacheRuntime {
                 .write_buffer_rejections
                 .load(Ordering::Relaxed),
             l1: state.memory.detailed_snapshot()?,
-            index: self.regions.index_snapshot()?,
-            region: self.regions.region_snapshot()?,
+            index: state.regions.index_snapshot()?,
+            region: state.regions.region_snapshot()?,
         })
     }
 
     fn snapshot_state(&self, state: &RuntimeState) -> CacheSnapshot {
-        let mut snapshot = self.metrics.snapshot(
-            self.regions.is_healthy(),
-            self.options.stats.activity_counters,
+        let mut snapshot = state.metrics.snapshot(
+            state.regions.is_healthy(),
+            state.activity_counters,
             state.managed_memory.snapshot(),
             state.memory.metrics_snapshot(),
         );
-        if snapshot.health == crate::snapshot::CacheHealth::Running
-            && state.io_recovery.is_recovering()
-        {
-            snapshot.health = crate::snapshot::CacheHealth::Recovering;
+        if snapshot.health == CacheHealth::Running && state.io_recovery.is_recovering() {
+            snapshot.health = CacheHealth::Recovering;
         }
         if let Some(fill) = &state.fill_control {
             snapshot.fill_control = fill.snapshot();
@@ -1343,8 +1312,8 @@ impl CacheRuntime {
     /// could not be fenced.
     pub fn shutdown(&self) -> io::Result<ShutdownDisposition> {
         self.start_close();
-        self.operations.wait_quiescent()?;
-        let _ = self.metrics.lifecycle.compare_exchange(
+        self.state.operations.wait_quiescent()?;
+        let _ = self.state.metrics.lifecycle.compare_exchange(
             LIFECYCLE_RUNNING,
             LIFECYCLE_DRAINING,
             Ordering::AcqRel,
@@ -1445,27 +1414,21 @@ fn start_workers(
 ) -> io::Result<RuntimeWorkers> {
     let shard_count = regions.shard_count();
     let options = config.runtime();
-    let l1_entry_capacity = l1_entry_capacity(&config);
+    let l1_entry_capacity = config.l1_entry_capacity();
     let memory_limit = options.managed_memory_limit_bytes;
-    let managed_memory = Arc::new(
-        ManagedMemory::try_new(ManagedMemoryLimits {
-            memory_limit_bytes: memory_limit,
-            reserved_memory_bytes: reserved_memory_bytes(&config),
-        })
-        .map_err(managed_memory_io_error)?,
-    );
+    let managed_memory = Arc::new(ManagedMemory::try_new(ManagedMemoryLimits {
+        memory_limit_bytes: memory_limit,
+        reserved_memory_bytes: config.reserved_memory_bytes(),
+    })?);
     let usable_region = usize::try_from(data.geometry.region_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region size is too large"))?;
     let chunk_bytes = usable_region;
-    let staging = Arc::new(
-        AppendStaging::try_new(
-            shard_count,
-            chunk_bytes,
-            data.geometry.region_size,
-            &managed_memory,
-        )
-        .map_err(managed_memory_io_error)?,
-    );
+    let staging = Arc::new(AppendStaging::try_new(
+        shard_count,
+        chunk_bytes,
+        data.geometry.region_size,
+        &managed_memory,
+    )?);
     let memory = Arc::new(MemoryStore::new(
         options.l1_capacity_bytes,
         l1_entry_capacity,
@@ -1497,7 +1460,8 @@ fn start_workers(
     }
     let reclaim_handles = handles.try_clone()?;
     let write_handles = handles.try_clone()?;
-    let read_wait_enabled = !read_io_wait_timeout(options).is_zero();
+    let read_wait_timeout = read_io_wait_timeout(options);
+    let read_wait_enabled = !read_wait_timeout.is_zero();
     let read_engines = build_engine_pool(
         handles,
         options,
@@ -1519,9 +1483,9 @@ fn start_workers(
         false,
     )?;
     for (engines, role) in [
-        (&read_engines, crate::IoRole::Read),
-        (&write_engines, crate::IoRole::Write),
-        (&reclaim_engines, crate::IoRole::Reclaim),
+        (&read_engines, IoRole::Read),
+        (&write_engines, IoRole::Write),
+        (&reclaim_engines, IoRole::Reclaim),
     ] {
         for engine in engines.iter() {
             if let Some(timing) = metrics.stats.io_timing(role) {
@@ -1546,6 +1510,7 @@ fn start_workers(
         read_engines,
         read_lane_cursor: AtomicUsize::new(0),
         read_waiters,
+        read_wait_timeout,
         write_engines,
         reclaim_engines,
         reclaim_control: ReclaimControl::new(),
@@ -1579,7 +1544,7 @@ fn start_workers(
     })?;
     for shard_id in 0..shard_count {
         let worker_state = Arc::clone(&state);
-        match std::thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("cache2-shard-{shard_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || append_worker(worker_state, shard_id))
@@ -1602,7 +1567,7 @@ fn start_workers(
     }
     for (worker_id, buffer) in reclaim_buffers.into_iter().enumerate() {
         let reclaim_shared = Arc::clone(&state);
-        match std::thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("cache2-reclaim-{worker_id}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || reclaim_worker(reclaim_shared, buffer, worker_id, reclaim_worker_count))
@@ -1852,7 +1817,7 @@ fn reclaim_worker_result(
                     io::Error::new(io::ErrorKind::InvalidData, "reclaim worker lost its buffer")
                 })?
                 .prepared(used)
-                .map_err(|()| {
+                .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "reclaim buffer is not initialized",
@@ -2095,7 +2060,10 @@ fn complete_shard_drain(control: &AppendWorkerControl, generation: u64) -> io::R
     Ok(())
 }
 
-fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
+fn request_shard_drains(
+    state: &RuntimeState,
+    stop: bool,
+) -> io::Result<(Vec<Option<u64>>, Option<io::Error>)> {
     let mut generations = Vec::new();
     generations
         .try_reserve_exact(state.append_controls.len())
@@ -2110,6 +2078,11 @@ fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
             }
         }
     }
+    Ok((generations, first_error))
+}
+
+fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
+    let (generations, mut first_error) = request_shard_drains(state, stop)?;
     for (shard, generation) in state.append_controls.iter().zip(generations) {
         if let Some(generation) = generation
             && let Err(error) = shard.wait_for_drain(generation)
@@ -2121,20 +2094,7 @@ fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
 }
 
 async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> {
-    let mut generations = Vec::new();
-    generations
-        .try_reserve_exact(state.append_controls.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate drain fence"))?;
-    let mut first_error = None;
-    for shard in &state.append_controls {
-        match shard.request_drain(stop) {
-            Ok(generation) => generations.push(Some(generation)),
-            Err(error) => {
-                first_error.get_or_insert(error);
-                generations.push(None);
-            }
-        }
-    }
+    let (generations, mut first_error) = request_shard_drains(state, stop)?;
     for (shard, generation) in state.append_controls.iter().zip(generations) {
         if let Some(generation) = generation
             && let Err(error) = shard.wait_for_drain_async(generation).await
@@ -2242,7 +2202,7 @@ fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<ShutdownDisposition> 
 
 fn reap_engine_after_target_fence(engine: &Arc<IoEngine>) {
     let reaper_engine = Arc::clone(engine);
-    let spawn = std::thread::Builder::new()
+    let spawn = thread::Builder::new()
         .name("cache2-io-reaper".to_owned())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
@@ -2256,20 +2216,12 @@ fn reap_engine_after_target_fence(engine: &Arc<IoEngine>) {
     }
 }
 
-fn managed_memory_io_error(error: ManagedMemoryError) -> io::Error {
-    let kind = match error {
-        ManagedMemoryError::Invalid(_) => io::ErrorKind::InvalidInput,
-        ManagedMemoryError::Allocation => io::ErrorKind::OutOfMemory,
-    };
-    io::Error::new(kind, error.to_string())
-}
-
 fn write_overload_error() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "write path is busy")
 }
 
 fn staging_runtime_error(error: StagingError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn poisoned_runtime_error() -> io::Error {
@@ -2290,17 +2242,47 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::pin;
+    use std::process;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
     use std::task::Context;
     use std::task::Poll;
     use std::task::Wake;
     use std::task::Waker;
 
+    use tokio::task;
+
     use super::*;
+    use crate::FillControlOptions;
+    use crate::FillLimits;
+    use crate::L1EvictionPolicy;
+    use crate::StatsOptions;
+    use crate::cache::session::CacheSession;
+    use crate::config::runtime::IoEngineOptions;
+    use crate::config::runtime::PosixIoOptions;
+    use crate::config::runtime::ReadAdmission;
     use crate::fixtures::TestFile;
     use crate::io::engine::IoEngine;
+    use crate::io::file::DIRECT_IO_ALIGNMENT;
+    use crate::managed_memory::ManagedMemorySnapshot;
+    use crate::memory::MemoryMetricsSnapshot;
+    use crate::region::index::packed::IndexEntry;
+    use crate::region::index::packed::PackedLocation;
+    use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
+    use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+    use crate::region::persistence::RegionPaths;
+    use crate::region::reader::ReadCandidate;
+    use crate::region::record::RECORD_ALIGNMENT;
+    use crate::region::record::RECORD_HEADER_SIZE;
+    use crate::region::recovery::DATA_REGION_AREA_OFFSET;
+    use crate::region::recovery::DataGeometry;
+    use crate::region::recovery::PersistentId;
+    use crate::region::runtime_fixed_memory_bytes;
 
     static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2387,20 +2369,14 @@ mod tests {
         assert!(!should_wake_write(4096, 4160, 4096));
     }
 
-    fn write_pressure_store(
-        region_size: u64,
-        append_shards: u32,
-    ) -> (crate::cache::session::CacheSession, std::path::PathBuf) {
-        use crate::FillControlOptions;
-        use crate::FillLimits;
-
+    fn write_pressure_store(region_size: u64, append_shards: u32) -> (CacheSession, PathBuf) {
         runtime_store(
             region_size,
             RuntimeOptions {
                 append_shards,
                 l1_capacity_bytes: 0,
                 fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
-                stats: crate::StatsOptions {
+                stats: StatsOptions {
                     activity_counters: true,
                     ..Default::default()
                 },
@@ -2409,17 +2385,10 @@ mod tests {
         )
     }
 
-    fn runtime_store(
-        region_size: u64,
-        options: RuntimeOptions,
-    ) -> (crate::cache::session::CacheSession, std::path::PathBuf) {
-        use crate::region::persistence::RegionPaths;
-        use crate::region::recovery::PersistentId;
-
+    fn runtime_store(region_size: u64, options: RuntimeOptions) -> (CacheSession, PathBuf) {
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            env::temp_dir().join(format!("cache2-write-pressure-{}-{id}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
+        let path = env::temp_dir().join(format!("cache2-write-pressure-{}-{id}", process::id()));
+        fs::create_dir(&path).unwrap();
         let files = RegionPaths::new(path.join("data"), path.join("state"), path.join("image"));
         let data = DataSuperblock {
             generation: 1,
@@ -2433,16 +2402,12 @@ mod tests {
             hash_seed: 3,
             storage_fingerprint: 4,
         };
-        let store =
-            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, options)
-                .unwrap();
+        let store = CacheSession::for_test_with_options(files, data, 8, options).unwrap();
         (store, path)
     }
 
     #[test]
     fn served_bytes_count_the_value_returned_after_promotion() {
-        use crate::L1EvictionPolicy;
-
         for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
             for (l1_capacity, activity_counters, old_length, new_length) in [
                 (4096, true, 64, Some(128)),
@@ -2458,7 +2423,7 @@ mod tests {
                         l1_capacity_bytes: l1_capacity,
                         l1_shards: 1,
                         l1_eviction_policy: policy,
-                        stats: crate::StatsOptions {
+                        stats: StatsOptions {
                             activity_counters,
                             ..Default::default()
                         },
@@ -2494,7 +2459,7 @@ mod tests {
                 let returned_bytes = observed.value().len() as u64;
                 drop(observed);
                 store.close_warm().unwrap();
-                std::fs::remove_dir_all(path).unwrap();
+                fs::remove_dir_all(path).unwrap();
                 assert_eq!(snapshot.l1_hits, 0);
                 if l1_capacity == 0 {
                     assert_eq!(snapshot.l1_bypasses, 2);
@@ -2511,8 +2476,6 @@ mod tests {
 
     #[test]
     fn promoted_value_retains_its_bytes_and_charge_during_concurrent_replacement() {
-        use crate::L1EvictionPolicy;
-
         for policy in [L1EvictionPolicy::Clock, L1EvictionPolicy::S3Fifo] {
             for activity_counters in [false, true] {
                 for (old_length, returned_length, final_length) in
@@ -2525,7 +2488,7 @@ mod tests {
                             l1_capacity_bytes: 4096,
                             l1_shards: 1,
                             l1_eviction_policy: policy,
-                            stats: crate::StatsOptions {
+                            stats: StatsOptions {
                                 activity_counters,
                                 ..Default::default()
                             },
@@ -2560,13 +2523,13 @@ mod tests {
                     // replaces the L1 entry. Reserve a real logical sequence
                     // and publish directly to isolate L1 ownership from I/O.
                     let seqno = plane
-                        .regions
+                        .regions()
                         .lock_manager_for_test()
                         .allocate_seqno()
                         .unwrap();
                     let concurrent = plane.clone();
                     let replacement = final_value.clone();
-                    std::thread::spawn(move || {
+                    thread::spawn(move || {
                         let hash = hash_key(concurrent.data.hash_seed, key);
                         assert!(
                             concurrent
@@ -2626,7 +2589,7 @@ mod tests {
                     assert_eq!(released.resident_bytes, l1.resident_bytes);
                     assert_eq!(released.retained_bytes, 0);
                     store.close_warm().unwrap();
-                    std::fs::remove_dir_all(path).unwrap();
+                    fs::remove_dir_all(path).unwrap();
                 }
             }
         }
@@ -2634,19 +2597,17 @@ mod tests {
 
     #[test]
     fn contention_rejects_without_waking_but_full_buffers_flush_and_publish() {
-        use crate::region::record::RECORD_HEADER_SIZE;
-
         let (mut store, path) = write_pressure_store(4096, 1);
         let plane = store.runtime().unwrap().clone();
         for manager_contention in [false, true] {
-            let shard = (!manager_contention).then(|| plane.regions.lock_append_for_test(0));
-            let manager = manager_contention.then(|| plane.regions.lock_manager_for_test());
+            let shard = (!manager_contention).then(|| plane.regions().lock_append_for_test(0));
+            let manager = manager_contention.then(|| plane.regions().lock_manager_for_test());
             // A contended producer must not even acquire the worker's wake
             // mutex. Release it before joining so a regression fails, not hangs.
             let state = plane.state.append_controls[0].lock().unwrap();
-            let (send, receive) = std::sync::mpsc::channel();
+            let (send, receive) = mpsc::channel();
             let writer_plane = plane.clone();
-            let writer = std::thread::spawn(move || {
+            let writer = thread::spawn(move || {
                 send.send(writer_plane.put(b"contended", b"value")).unwrap();
             });
             let result = receive.recv_timeout(Duration::from_secs(1));
@@ -2671,7 +2632,7 @@ mod tests {
         let value = vec![7; 4096 - RECORD_HEADER_SIZE - key.len()];
         assert!(matches!(
             plane
-                .regions
+                .regions()
                 .try_stage_value(
                     &plane.state.staging,
                     0,
@@ -2695,7 +2656,7 @@ mod tests {
         // notification. Require automatic completion and publication first.
         let deadline = Instant::now() + Duration::from_secs(2);
         while plane
-            .regions
+            .regions()
             .begin_point_read(hash_key(plane.data.hash_seed, key))
             .is_none()
         {
@@ -2703,17 +2664,15 @@ mod tests {
                 Instant::now() < deadline,
                 "capacity pressure must flush and publish without an explicit drain"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(plane.get(key).unwrap().is_some());
         store.close_warm().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn full_staging_capacity_request_rotates_without_another_put_or_drain() {
-        use crate::region::record::RECORD_HEADER_SIZE;
-
         let (mut store, path) = write_pressure_store(4096, 1);
         let plane = store.runtime().unwrap().clone();
         let key = b"full";
@@ -2722,7 +2681,7 @@ mod tests {
         // public put must preserve rotation despite failing staging preflight.
         assert!(matches!(
             plane
-                .regions
+                .regions()
                 .try_stage_value(
                     &plane.state.staging,
                     0,
@@ -2740,7 +2699,7 @@ mod tests {
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         while plane.snapshot().unwrap().region_rotations == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
         let rotations = plane.snapshot().unwrap().region_rotations;
         assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
@@ -2748,7 +2707,7 @@ mod tests {
         plane.drain().unwrap();
         let snapshot = plane.detailed_snapshot().unwrap();
         store.close_warm().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
         assert_eq!(
             rotations, 1,
             "one rejection must flush and rotate the full Region"
@@ -2763,8 +2722,6 @@ mod tests {
 
     #[test]
     fn staging_record_limit_accounts_for_flush_padding_before_rotation() {
-        use crate::region::record::RECORD_HEADER_SIZE;
-
         const REGION_BYTES: usize = 1024 * 1024;
         for needs_rotation in [false, true] {
             let (mut store, path) = write_pressure_store(REGION_BYTES as u64, 1);
@@ -2776,7 +2733,7 @@ mod tests {
             let first = vec![1; 96 - RECORD_HEADER_SIZE - key.len()];
             assert!(matches!(
                 plane
-                    .regions
+                    .regions()
                     .try_stage_value(&plane.state.staging, 0, hash, 96, key, &first)
                     .unwrap(),
                 RegionStageValue::Staged { .. }
@@ -2784,7 +2741,7 @@ mod tests {
             let mut used = 96;
             loop {
                 match plane
-                    .regions
+                    .regions()
                     .try_stage_value(&plane.state.staging, 0, hash, 64, key, b"value")
                     .unwrap()
                 {
@@ -2822,20 +2779,20 @@ mod tests {
                     Instant::now() < deadline,
                     "record capacity must complete publication and the requested rotation"
                 );
-                std::thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(1));
             }
             // Empty staging means every index entry has been published. An
             // earlier lookup can succeed between publications, then a second
             // lookup can miss on the publisher's next partition lock.
             // Capture progress before drain, which must not supply a missing
             // wake or rotation request on behalf of the rejected producer.
-            let published = plane.regions.begin_point_read(hash).is_some();
+            let published = plane.regions().begin_point_read(hash).is_some();
             let rotations = plane.snapshot().unwrap().region_rotations;
             plane.drain().unwrap();
             let final_rotations = plane.snapshot().unwrap().region_rotations;
             assert_eq!(plane.get(key).unwrap().unwrap().value(), b"value");
             store.close_warm().unwrap();
-            std::fs::remove_dir_all(path).unwrap();
+            fs::remove_dir_all(path).unwrap();
             assert!(published, "record capacity must wake the worker");
             assert_eq!(rotations, u64::from(needs_rotation));
             assert_eq!(final_rotations, rotations);
@@ -2844,10 +2801,8 @@ mod tests {
 
     #[test]
     fn staging_record_limit_distinguishes_exact_fit_from_one_unit_overflow() {
-        use crate::region::record::RECORD_ALIGNMENT;
-
         const REGION_BYTES: usize = 1024 * 1024;
-        const ALIGNMENT: usize = crate::io::file::DIRECT_IO_ALIGNMENT;
+        const ALIGNMENT: usize = DIRECT_IO_ALIGNMENT;
         let unit = RECORD_ALIGNMENT as usize;
         for prefix in [0, ALIGNMENT] {
             for extra in [0, unit, ALIGNMENT - unit] {
@@ -2867,7 +2822,7 @@ mod tests {
                     let first = vec![1; first_bytes - RECORD_HEADER_SIZE - key.len()];
                     assert!(matches!(
                         plane
-                            .regions
+                            .regions()
                             .try_stage_value(
                                 &plane.state.staging,
                                 0,
@@ -2882,7 +2837,7 @@ mod tests {
                     let mut used = prefix + first_bytes;
                     loop {
                         match plane
-                            .regions
+                            .regions()
                             .try_stage_value(&plane.state.staging, 0, hash, 64, key, b"value")
                             .unwrap()
                         {
@@ -2917,10 +2872,10 @@ mod tests {
                             Instant::now() < deadline,
                             "no progress: prefix={prefix}, extra={extra}, overflow={overflow}, rotations={rotations}"
                         );
-                        std::thread::sleep(Duration::from_millis(1));
+                        thread::sleep(Duration::from_millis(1));
                     }
                     {
-                        let manager = plane.regions.lock_manager_for_test();
+                        let manager = plane.regions().lock_manager_for_test();
                         let active = manager.active_regions()[0] as usize;
                         assert_eq!(
                             manager.regions()[active].completed_used,
@@ -2942,7 +2897,7 @@ mod tests {
                                     Instant::now() < deadline,
                                     "write admission did not resume"
                                 );
-                                std::thread::sleep(Duration::from_millis(1));
+                                thread::sleep(Duration::from_millis(1));
                             }
                             Err(error) => panic!("unexpected write failure: {error}"),
                         }
@@ -2954,7 +2909,7 @@ mod tests {
                         expected_rotations
                     );
                     store.close_warm().unwrap();
-                    std::fs::remove_dir_all(path).unwrap();
+                    fs::remove_dir_all(path).unwrap();
                 }
             }
         }
@@ -2962,8 +2917,6 @@ mod tests {
 
     #[test]
     fn capacity_request_flushes_then_rotates_without_another_put_or_drain() {
-        use crate::region::record::RECORD_HEADER_SIZE;
-
         let (mut store, path) = write_pressure_store(8192, 1);
         let plane = store.runtime().unwrap().clone();
         let first = vec![1; 4096 - RECORD_HEADER_SIZE - b"first".len()];
@@ -2975,7 +2928,7 @@ mod tests {
         let tail = vec![2; 4064 - RECORD_HEADER_SIZE - b"tail".len()];
         assert!(matches!(
             plane
-                .regions
+                .regions()
                 .try_stage_value(
                     &plane.state.staging,
                     0,
@@ -2997,7 +2950,7 @@ mod tests {
                 Instant::now() < deadline,
                 "one capacity request must flush and rotate without another put or drain"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(plane.get(b"first").unwrap().unwrap().value(), first);
         assert_eq!(plane.get(b"tail").unwrap().unwrap().value(), tail);
@@ -3008,7 +2961,7 @@ mod tests {
         assert_eq!(plane.snapshot().unwrap().region_rotations, 1);
         assert_eq!(plane.snapshot().unwrap().write_rejections, 1);
         store.close_warm().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -3018,13 +2971,13 @@ mod tests {
         let key = b"fixed-route";
         let value = [7; 64];
         let primary = plane
-            .regions
+            .regions()
             .append_shard(hash_key(plane.data.hash_seed, key));
-        let primary_gate = plane.regions.lock_append_for_test(primary);
+        let primary_gate = plane.regions().lock_append_for_test(primary);
         let primary_wake = plane.state.append_controls[primary].lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
+        let (send, receive) = mpsc::channel();
         let writer_plane = plane.clone();
-        let writer = std::thread::spawn(move || {
+        let writer = thread::spawn(move || {
             send.send(writer_plane.put(key, &value)).unwrap();
         });
         let result = receive.recv_timeout(Duration::from_secs(1));
@@ -3055,7 +3008,7 @@ mod tests {
         assert_eq!(snapshot.summary.write_rejections, 1);
         assert_eq!(snapshot.write_buffer_rejections, 0);
         store.close_warm().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -3064,25 +3017,25 @@ mod tests {
         let plane = store.runtime().unwrap().clone();
         let key = b"stable-route";
         let primary = plane
-            .regions
+            .regions()
             .append_shard(hash_key(plane.data.hash_seed, key));
         plane
-            .regions
+            .regions()
             .lock_manager_for_test()
             .request_rotation_for_test(primary)
             .unwrap();
         assert_eq!(
-            plane.regions.rotate_shard(primary).unwrap(),
+            plane.regions().rotate_shard(primary).unwrap(),
             RegionRotation::Rotated
         );
-        let receipt = plane.regions.begin_reclaim().unwrap().unwrap();
-        plane.regions.complete_reclaim(receipt).unwrap();
+        let receipt = plane.regions().begin_reclaim().unwrap().unwrap();
+        plane.regions().complete_reclaim(receipt).unwrap();
 
-        let primary_gate = plane.regions.lock_append_for_test(primary);
+        let primary_gate = plane.regions().lock_append_for_test(primary);
         let primary_wake = plane.state.append_controls[primary].lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
+        let (send, receive) = mpsc::channel();
         let writer_plane = plane.clone();
-        let writer = std::thread::spawn(move || {
+        let writer = thread::spawn(move || {
             send.send(writer_plane.put(key, &[7; 64])).unwrap();
         });
         let result = receive.recv_timeout(Duration::from_secs(1));
@@ -3104,7 +3057,7 @@ mod tests {
         assert_eq!(snapshot.summary.fill_control.outstanding_operations, 0);
         assert_eq!(
             plane
-                .regions
+                .regions()
                 .begin_point_read(hash_key(plane.data.hash_seed, key)),
             None
         );
@@ -3112,31 +3065,27 @@ mod tests {
         plane.drain().unwrap();
         assert_eq!(plane.get(key).unwrap().unwrap().value(), &[7; 64]);
         store.close_warm().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn existing_alternate_records_survive_reclaim_and_warm_reopen() {
-        use crate::FillControlOptions;
-        use crate::FillLimits;
-        use crate::region::persistence::RegionPaths;
-
         let (mut store, path) = write_pressure_store(8192, 3);
         let plane = store.runtime().unwrap().clone();
         let key = b"fallback-route";
         let value = [9; 64];
         let data = plane.data;
         let hash = hash_key(data.hash_seed, key);
-        let primary = plane.regions.append_shard(hash);
+        let primary = plane.regions().append_shard(hash);
         let alternate = (primary + 1) % plane.state.append_controls.len();
-        let alternate_region = plane.regions.lock_manager_for_test().active_regions()[alternate];
+        let alternate_region = plane.regions().lock_manager_for_test().active_regions()[alternate];
 
         // Model a record written by an older runtime that used another
         // append shard. Reads must follow the stored address, not today's route.
         let record_bytes = required_record_bytes(key.len(), value.len()).unwrap();
         assert!(matches!(
             plane
-                .regions
+                .regions()
                 .try_stage_value(
                     &plane.state.staging,
                     alternate,
@@ -3151,7 +3100,7 @@ mod tests {
         plane.drain().unwrap();
         assert_eq!(
             plane
-                .regions
+                .regions()
                 .begin_point_read(hash)
                 .unwrap()
                 .entry
@@ -3164,23 +3113,23 @@ mod tests {
         // Reclaim an empty primary Region while the alternate record remains
         // live. L1 is disabled, so all read assertions exercise the L2 address.
         plane
-            .regions
+            .regions()
             .lock_manager_for_test()
             .request_rotation_for_test(primary)
             .unwrap();
         assert_eq!(
-            plane.regions.rotate_shard(primary).unwrap(),
+            plane.regions().rotate_shard(primary).unwrap(),
             RegionRotation::Rotated
         );
-        let receipt = plane.regions.begin_reclaim().unwrap().unwrap();
+        let receipt = plane.regions().begin_reclaim().unwrap().unwrap();
         assert_ne!(receipt.region_id, alternate_region);
         assert_eq!(receipt.physical_record_count, 0);
-        plane.regions.complete_reclaim(receipt).unwrap();
-        assert!(!plane.regions.reclaim_needed().unwrap());
+        plane.regions().complete_reclaim(receipt).unwrap();
+        assert!(!plane.regions().reclaim_needed().unwrap());
         assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
         assert_eq!(
             plane
-                .regions
+                .regions()
                 .begin_point_read(hash)
                 .unwrap()
                 .entry
@@ -3197,22 +3146,20 @@ mod tests {
             append_shards: 3,
             l1_capacity_bytes: 0,
             fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 10_000)),
-            stats: crate::StatsOptions {
+            stats: StatsOptions {
                 activity_counters: true,
                 ..Default::default()
             },
             ..RuntimeOptions::default()
         };
-        let mut reopened =
-            crate::cache::session::CacheSession::for_test_with_options(files, data, 8, options)
-                .unwrap();
+        let mut reopened = CacheSession::for_test_with_options(files, data, 8, options).unwrap();
         let plane = reopened.runtime().unwrap().clone();
         // Recovery preserves the old physical address. New foreground writes
         // use the same hash route as they did before reclaim and close.
         assert_eq!(plane.get(key).unwrap().unwrap().value(), value);
         assert_eq!(
             plane
-                .regions
+                .regions()
                 .begin_point_read(hash)
                 .unwrap()
                 .entry
@@ -3223,10 +3170,10 @@ mod tests {
         plane.put_l2(key, &[11; 64]).unwrap();
         plane.drain().unwrap();
         assert_eq!(plane.get(key).unwrap().unwrap().value(), &[11; 64]);
-        let primary_region = plane.regions.lock_manager_for_test().active_regions()[primary];
+        let primary_region = plane.regions().lock_manager_for_test().active_regions()[primary];
         assert_eq!(
             plane
-                .regions
+                .regions()
                 .begin_point_read(hash)
                 .unwrap()
                 .entry
@@ -3237,7 +3184,7 @@ mod tests {
         reopened.close_warm().unwrap();
         drop(plane);
         drop(reopened);
-        std::fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -3246,13 +3193,13 @@ mod tests {
         let mutation = gate.try_enter().unwrap();
         let drain = gate.begin_drain().unwrap();
         let closing_gate = Arc::clone(&gate);
-        let close = std::thread::spawn(move || {
+        let close = thread::spawn(move || {
             closing_gate.start_close();
             closing_gate.wait_quiescent().unwrap();
         });
 
         while gate.state.load(Ordering::Acquire) & MUTATION_CLOSED == 0 {
-            std::thread::yield_now();
+            thread::yield_now();
         }
         drop(mutation);
         drain.wait().unwrap();
@@ -3284,7 +3231,7 @@ mod tests {
         let gate = Arc::new(MutationGate::new());
         let mutation = gate.try_enter().unwrap();
         let drain_gate = Arc::clone(&gate);
-        let drain = tokio::spawn(async move {
+        let drain = task::spawn(async move {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
             assert!(drain_gate.try_enter().is_none());
@@ -3292,7 +3239,7 @@ mod tests {
                 matches!(drain_gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
         });
-        tokio::task::yield_now().await;
+        task::yield_now().await;
         assert!(gate.try_enter().is_none());
 
         drop(mutation);
@@ -3307,11 +3254,11 @@ mod tests {
         for signal_before_cancel in [true, false] {
             let mut mutation = Some(gate.try_enter().unwrap());
             let drain_gate = Arc::clone(&gate);
-            let drain = tokio::spawn(async move {
+            let drain = task::spawn(async move {
                 let drain = drain_gate.begin_drain().unwrap();
                 drain.wait_async().await;
             });
-            tokio::task::yield_now().await;
+            task::yield_now().await;
             assert!(gate.try_enter().is_none());
 
             if signal_before_cancel {
@@ -3334,7 +3281,7 @@ mod tests {
             });
             let waker = Waker::from(Arc::clone(&probe));
             let mut context = Context::from_waker(&waker);
-            let mut wait = std::pin::pin!(control.wait_for_drain_async(1));
+            let mut wait = pin::pin!(control.wait_for_drain_async(1));
 
             assert!(wait.as_mut().poll(&mut context).is_pending());
             if failed {
@@ -3398,7 +3345,7 @@ mod tests {
         }
         assert_eq!(control.lock().unwrap().drain_requested, stop);
 
-        let mut wait = std::pin::pin!(control.wait_for_drain_async(first));
+        let mut wait = pin::pin!(control.wait_for_drain_async(first));
         let mut context = Context::from_waker(Waker::noop());
         assert!(wait.as_mut().poll(&mut context).is_pending());
         complete_shard_drain(&control, stop).unwrap();
@@ -3416,7 +3363,7 @@ mod tests {
         for _ in 0..2 {
             let control = Arc::clone(&control);
             let ready = Arc::clone(&ready);
-            workers.push(std::thread::spawn(move || {
+            workers.push(thread::spawn(move || {
                 let mut observed_generation = 0;
                 ready.wait();
                 let notified = control.wait(&mut observed_generation).unwrap();
@@ -3447,20 +3394,9 @@ mod tests {
 
     #[test]
     fn completion_timeouts_follow_read_wait_mode() {
-        use crate::cache::session::CacheSession;
-        use crate::config::runtime::IoEngineOptions;
-        use crate::config::runtime::PosixIoOptions;
-        use crate::region::index::packed::IndexEntry;
-        use crate::region::index::packed::PackedLocation;
-        use crate::region::persistence::RegionPaths;
-        use crate::region::recovery::DATA_REGION_AREA_OFFSET;
-        use crate::region::recovery::PersistentId;
-
         let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
-            "cache2-completion-timeout-{}-{id}",
-            std::process::id()
-        ));
+        let path =
+            env::temp_dir().join(format!("cache2-completion-timeout-{}-{id}", process::id()));
         let paths = RegionPaths::new(
             path.with_extension("cache"),
             path.with_extension("state"),
@@ -3487,7 +3423,7 @@ mod tests {
                 }),
                 append_shards: 1,
                 l1_capacity_bytes: 0,
-                stats: crate::StatsOptions {
+                stats: StatsOptions {
                     activity_counters: true,
                     ..Default::default()
                 },
@@ -3529,7 +3465,7 @@ mod tests {
                 b"key",
             );
             let snapshot = runtime.snapshot().unwrap();
-            assert!(runtime.regions.is_healthy());
+            assert!(runtime.regions().is_healthy());
             session.close_fast().unwrap();
             if wait.is_zero() {
                 assert!(matches!(result, Ok(None)));
@@ -3541,8 +3477,8 @@ mod tests {
                 assert_eq!(snapshot.l2_read_overloads, 1);
             }
         }
-        std::fs::remove_file(paths.data).unwrap();
-        std::fs::remove_file(paths.state).unwrap();
+        fs::remove_file(paths.data).unwrap();
+        fs::remove_file(paths.state).unwrap();
     }
 
     #[test]
@@ -3576,7 +3512,7 @@ mod tests {
 
     #[test]
     fn read_resource_misses_remain_separately_observable() {
-        let metrics = RuntimeMetrics::new(1, crate::StatsOptions::default()).unwrap();
+        let metrics = RuntimeMetrics::new(1, StatsOptions::default()).unwrap();
         let activity = metrics.activity(0);
         RuntimeMetrics::add(&activity.l2_misses, 2);
         RuntimeMetrics::increment(&activity.l2_read_memory_misses);

@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 
 use crate::snapshot::CacheSnapshot;
 
-pub(crate) mod recording;
+pub mod recording;
 
 /// Duration collection for one timing scope, selected before its outcome is known.
 #[non_exhaustive]

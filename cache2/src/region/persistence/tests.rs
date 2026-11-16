@@ -19,6 +19,7 @@ use std::future::poll_fn;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
+use std::process;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
@@ -29,8 +30,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::task::Poll;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+
+use tokio::runtime::Builder;
+use tokio::runtime::Handle;
 
 use super::*;
 use crate::IoEngineOptions;
@@ -41,6 +46,8 @@ use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
 use crate::config::runtime::RuntimeOptions;
+use crate::io::background::BackgroundIoAttempt;
+use crate::io::background::IoRecovery;
 use crate::io::engine::IoEngine;
 use crate::io::file::MAX_INTERRUPTED_RETRIES;
 use crate::io::file::testing::FaultAction;
@@ -50,6 +57,7 @@ use crate::io::file::testing::FaultHandle;
 use crate::io::file::testing::kill_process;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
+use crate::region::RegionRotation;
 use crate::region::RegionStageValue;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
@@ -88,7 +96,7 @@ impl CacheSession {
     async fn get_value_async(
         &self,
         key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &Handle,
     ) -> io::Result<Option<CacheRead>> {
         self.runtime()?.get_async(key, tokio_handle, None).await
     }
@@ -118,7 +126,7 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
                     Instant::now() < deadline,
                     "write buffer did not make progress"
                 );
-                std::thread::yield_now();
+                thread::yield_now();
             }
             Err(error) => panic!("cache write failed: {error}"),
         }
@@ -141,7 +149,7 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
+        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let paths = RegionPaths::new(
@@ -451,7 +459,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let mut session =
         CacheSession::for_test_with_options(directory.paths.clone(), data, 4096, runtime_options)
             .unwrap();
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+    let tokio_runtime = Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
         .build()
@@ -540,10 +548,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
         runtime_options.clone(),
     )
     .unwrap();
-    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
+    let tokio_runtime = Builder::new_current_thread().enable_time().build().unwrap();
     eventually_admitted(|| session.put_value(b"queued-close", b"value"));
     session.drain().unwrap();
     let runtime = session.runtime().unwrap().clone();
@@ -805,12 +810,12 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
 fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let (data, regions, staging) = foreground_stage_fixture();
     let next_seqno = regions.manager.state.lock().unwrap().next_seqno();
-    let mutation = regions.append_gates[0].mutation.lock().unwrap();
+    let mutation = regions.append_gates[0].lock().unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
     let writer_regions = Arc::clone(&regions);
-    let writer = std::thread::spawn(move || {
+    let writer = thread::spawn(move || {
         let result =
             writer_regions.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
         sender.send((result, staging)).unwrap();
@@ -859,7 +864,7 @@ fn completed_record_publication_does_not_enter_region_manager() {
     );
     let (sender, receiver) = mpsc::sync_channel(1);
     let publisher_regions = Arc::clone(&regions);
-    let publisher = std::thread::spawn(move || {
+    let publisher = thread::spawn(move || {
         sender
             .send(publisher_regions.publish_completed_records(&[record]))
             .unwrap();
@@ -927,10 +932,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
             &staging,
             &engine,
             0,
-            crate::io::background::BackgroundIoAttempt::new(
-                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                None,
-            ),
+            BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         )
         .unwrap()
         .unwrap();
@@ -1124,10 +1126,7 @@ fn reclaim_validates_payload_before_staging_and_counts_rewrites() {
                     &staging,
                     &engine,
                     0,
-                    crate::io::background::BackgroundIoAttempt::new(
-                        &crate::io::background::IoRecovery::new(Some(Duration::ZERO)),
-                        None,
-                    ),
+                    BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
                 )
                 .unwrap()
                 .unwrap();
@@ -1234,10 +1233,7 @@ fn same_hash_candidate_requires_full_key() {
             &staging,
             &engine,
             0,
-            crate::io::background::BackgroundIoAttempt::new(
-                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                None,
-            ),
+            BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         )
         .unwrap()
         .expect("collision owner must publish");
@@ -1377,10 +1373,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
                 &staging,
                 &engine,
                 0,
-                crate::io::background::BackgroundIoAttempt::new(
-                    &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                    None,
-                )
+                BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None,)
             )
             .unwrap_err()
             .raw_os_error(),
@@ -1412,14 +1405,8 @@ fn rotation_is_committed_without_a_metadata_io_boundary() {
         .request_rotation_for_test(0)
         .unwrap();
 
-    assert_eq!(
-        regions.rotate_shard(0).unwrap(),
-        crate::region::RegionRotation::Rotated
-    );
-    assert_eq!(
-        regions.rotate_shard(0).unwrap(),
-        crate::region::RegionRotation::Idle
-    );
+    assert_eq!(regions.rotate_shard(0).unwrap(), RegionRotation::Rotated);
+    assert_eq!(regions.rotate_shard(0).unwrap(), RegionRotation::Idle);
     assert!(regions.health.is_healthy());
     let manager = regions.manager.lock().unwrap();
     assert_eq!(manager.active_regions()[0], REGION_SHARDS);

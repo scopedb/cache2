@@ -14,6 +14,8 @@
 
 //! Configuration construction, independent of file paths and runtime handles.
 
+use std::io;
+
 use crate::config::runtime::RuntimeOptions;
 use crate::region::recovery::DataGeometry;
 
@@ -54,6 +56,14 @@ impl CacheConfig {
     /// need additional headroom. This is not an RSS bound.
     pub const fn minimum_memory_bytes(&self) -> usize {
         self.minimum_memory_bytes
+    }
+
+    pub(crate) const fn l1_entry_capacity(&self) -> usize {
+        self.l1_entry_capacity
+    }
+
+    pub(crate) const fn reserved_memory_bytes(&self) -> usize {
+        self.reserved_memory_bytes
     }
 }
 
@@ -97,20 +107,16 @@ impl StorageLayout {
     pub const fn peak_disk_bytes(&self) -> u64 {
         self.peak_disk_bytes
     }
+
+    pub(crate) const fn geometry(&self) -> DataGeometry {
+        self.geometry
+    }
+
+    pub(crate) const fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
 }
 
-pub const fn storage_geometry(storage: &StorageLayout) -> DataGeometry {
-    storage.geometry
-}
-
-pub const fn storage_fingerprint(storage: &StorageLayout) -> u64 {
-    storage.fingerprint
-}
-
-pub const fn l1_entry_capacity(config: &CacheConfig) -> usize {
-    config.l1_entry_capacity
-}
-
-pub const fn reserved_memory_bytes(config: &CacheConfig) -> usize {
-    config.reserved_memory_bytes
+pub fn invalid_config(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }

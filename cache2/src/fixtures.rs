@@ -25,10 +25,13 @@
 //! when an assertion fails midway.
 
 use std::env;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
+use std::str;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -74,7 +77,7 @@ fn sparse_golden(input: &str) -> Vec<u8> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .map(|pair| u8::from_str_radix(str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>();
         let output = output.as_mut().expect("golden length must come first");
         output[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -94,7 +97,7 @@ impl TestFile {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self {
-            path: env::temp_dir().join(format!("cache2-{label}-{}-{id}.tmp", std::process::id())),
+            path: env::temp_dir().join(format!("cache2-{label}-{}-{id}.tmp", process::id())),
         }
     }
 
@@ -132,6 +135,6 @@ impl TestFile {
 
 impl Drop for TestFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
 }

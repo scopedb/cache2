@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::StatsOptions;
 use crate::cache::runtime::LIFECYCLE_DRAINING;
 use crate::cache::runtime::LIFECYCLE_FAILED;
 use crate::cache::runtime::LIFECYCLE_RUNNING;
@@ -29,12 +31,14 @@ use crate::snapshot::CacheHealth;
 use crate::snapshot::CacheIoSnapshot;
 use crate::snapshot::CacheReclaimSnapshot;
 use crate::snapshot::CacheSnapshot;
+use crate::snapshot::FillControlSnapshot;
+use crate::stats::recording::Recorder;
 
 static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct RuntimeMetrics {
     metrics_epoch: u64,
-    pub stats: std::sync::Arc<crate::stats::recording::Recorder>,
+    pub stats: Arc<Recorder>,
     pub lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
     l2_read_overloads: AtomicU64,
@@ -87,7 +91,7 @@ impl ActivityMetrics {
 }
 
 impl RuntimeMetrics {
-    pub fn new(shard_count: usize, stats: crate::StatsOptions) -> io::Result<Self> {
+    pub fn new(shard_count: usize, stats: StatsOptions) -> io::Result<Self> {
         let mut activity = Vec::new();
         activity.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -98,7 +102,7 @@ impl RuntimeMetrics {
         activity.resize_with(shard_count, ActivityMetrics::new);
         Ok(Self {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
-            stats: std::sync::Arc::new(crate::stats::recording::Recorder::new(stats)?),
+            stats: Arc::new(Recorder::new(stats)?),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
             l2_read_overloads: AtomicU64::new(0),
@@ -215,7 +219,7 @@ impl RuntimeMetrics {
         CacheSnapshot {
             metrics_epoch: self.metrics_epoch,
             health,
-            fill_control: crate::snapshot::FillControlSnapshot::default(),
+            fill_control: FillControlSnapshot::default(),
             activity_counters_enabled,
             puts,
             deletes,

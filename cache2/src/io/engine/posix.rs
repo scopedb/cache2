@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
+use std::thread;
 
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
@@ -115,7 +116,7 @@ fn start_workers(
         let worker_io = Arc::clone(&io);
         let worker_state = Arc::clone(&engine.state);
         let worker_receiver = Arc::clone(&receiver);
-        let worker = std::thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(format!("cache2-sync-io-{worker_index}"))
             .stack_size(CACHE_THREAD_STACK_BYTES)
             .spawn(move || posix_worker(worker_io, worker_state, worker_receiver))?;
