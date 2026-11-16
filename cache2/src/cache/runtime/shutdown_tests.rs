@@ -316,7 +316,7 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     runtime.put(b"existing", b"value").unwrap();
     runtime.drain().unwrap();
     let fill = runtime.state.fill_control.as_ref().unwrap();
-    fill.set_recovering(true);
+    fill.hold_pause();
     let snapshot = runtime.snapshot().unwrap();
     assert_eq!(snapshot.health, CacheHealth::Running);
     assert_eq!(snapshot.fill_control.pressure, FillPressure::Paused);
@@ -332,7 +332,7 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     runtime.delete(b"existing").unwrap();
     assert!(runtime.get(b"existing").unwrap().is_none());
     assert!(runtime.put(b"new", b"value").is_err());
-    fill.set_recovering(false);
+    fill.release_pause();
     eventually_admitted(|| runtime.put(b"new", b"value"));
     runtime.drain().unwrap();
     assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");

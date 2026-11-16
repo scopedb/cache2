@@ -32,9 +32,7 @@ use crate::io::engine::IoCompletion;
 use crate::io::engine::IoDeadlineExceeded;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
-use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
@@ -63,7 +61,6 @@ pub struct ReadDesc {
 
 pub struct PendingRead {
     desc: ReadDesc,
-    request_id: RequestId,
     request: BoundedIoRequest,
 }
 
@@ -90,28 +87,17 @@ impl ReadCompletion {
 impl PendingRead {
     #[cfg(test)]
     pub fn wait(self, engine: &IoEngine) -> ReadCompletion {
-        let Self {
-            desc,
-            request_id,
-            request,
-        } = self;
-        let completion = request.wait(engine);
-        Self::finish(desc, request_id, completion)
+        let completion = self.request.wait(engine);
+        Self::finish(self.desc, completion)
     }
 
     pub async fn wait_async(self, engine: Arc<IoEngine>, tokio_handle: &Handle) -> ReadCompletion {
-        let Self {
-            desc,
-            request_id,
-            request,
-        } = self;
-        let completion = request.wait_async(engine, tokio_handle).await;
-        Self::finish(desc, request_id, completion)
+        let completion = self.request.wait_async(engine, tokio_handle).await;
+        Self::finish(self.desc, completion)
     }
 
     fn finish(
         desc: ReadDesc,
-        request_id: RequestId,
         completion: Result<IoCompletion, IoDeadlineExceeded>,
     ) -> ReadCompletion {
         let completion = match completion {
@@ -125,17 +111,9 @@ impl PendingRead {
                 };
             }
         };
-        let identity_valid =
-            completion.request_id == request_id && completion.kind == OperationKind::Read;
         let (io_result, buffer) = completion.into_lease();
 
         let result = (|| {
-            if !identity_valid {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Region record completion identity does not match its request",
-                ));
-            }
             let buffer = buffer.as_ref().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -177,11 +155,7 @@ pub fn submit_read(
     let buffer = IoBuffer::for_read(buffer, desc.read_len).map_err(|error| error.error)?;
     let request = submit_cache_read(engine, slot, IoOperation::read(buffer, desc.absolute))
         .map_err(|error| error.into_lease().0)?;
-    Ok(PendingRead {
-        desc,
-        request_id: request.id(),
-        request,
-    })
+    Ok(PendingRead { desc, request })
 }
 
 pub fn describe_read(

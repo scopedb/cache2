@@ -18,8 +18,6 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
-use std::error;
-use std::fmt;
 use std::io;
 use std::time::Duration;
 
@@ -29,8 +27,6 @@ use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::OperationKind;
-use crate::io::engine::RequestId;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::io::file::WritePoint;
@@ -44,22 +40,9 @@ pub struct WriteSubmitError {
     pub buffer: IoBuffer,
 }
 
-impl fmt::Display for WriteSubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl error::Error for WriteSubmitError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 pub struct PendingWrite {
     span: RegionWriteSpan,
     expected_len: usize,
-    request_id: RequestId,
     request: BoundedIoRequest,
 }
 
@@ -82,16 +65,8 @@ impl PendingWrite {
                 };
             }
         };
-        let identity_valid =
-            completion.request_id == self.request_id && completion.kind == OperationKind::Write;
         let (io_result, buffer) = completion.into_io_result();
         let result = io_result.and_then(|completed| {
-            if !identity_valid {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Region span completion identity does not match its request",
-                ));
-            }
             if completed != self.expected_len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -193,7 +168,6 @@ fn submit_write_with_timeout(
     Ok(PendingWrite {
         span,
         expected_len,
-        request_id: request.id(),
         request,
     })
 }

@@ -46,10 +46,13 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
+use crate::io::engine::StoredIoError;
 use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
 use crate::io::file::DataFileHandles;
+use crate::io::file::FileIoDirection;
 use crate::io::file::FileIoPath;
+use crate::io::file::WritePoint;
 use crate::io::file::retry_interrupted;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 
@@ -189,7 +192,6 @@ pub fn start(
 struct Flight {
     task: Task,
     transferred: usize,
-    active: bool,
     active_path: Option<FileIoPath>,
     cancel_submitted: bool,
 }
@@ -322,7 +324,7 @@ impl UringDriver {
                 Ok(DriverCommand::Submit(task)) => {
                     if task.completion.cancel_requested.load(Ordering::Acquire) {
                         self.state.finish(task, CompletionStatus::Cancelled, 0);
-                    } else if task.operation_is_empty() {
+                    } else if task.operation.buffer().len() == 0 {
                         self.state.finish(task, CompletionStatus::Completed, 0);
                     } else {
                         let request_id = task.request_id;
@@ -331,7 +333,6 @@ impl UringDriver {
                             Flight {
                                 task,
                                 transferred: 0,
-                                active: false,
                                 active_path: None,
                                 cancel_submitted: false,
                             },
@@ -365,7 +366,7 @@ impl UringDriver {
                     .completion
                     .cancel_requested
                     .load(Ordering::Acquire)
-                    && flight.active
+                    && flight.active_path.is_some()
                     && !flight.cancel_submitted)
                     .then_some(*request_id)
             }));
@@ -379,7 +380,7 @@ impl UringDriver {
         let Some(flight) = self.flights.get_mut(&request_id) else {
             return;
         };
-        if flight.active && !flight.cancel_submitted {
+        if flight.active_path.is_some() && !flight.cancel_submitted {
             flight.cancel_submitted = true;
             if !self.io_poll {
                 // IOPOLL rings cannot cancel with an in-ring async-cancel
@@ -424,7 +425,7 @@ impl UringDriver {
                 .completion
                 .cancel_requested
                 .load(Ordering::Acquire)
-                && !flight.active
+                && flight.active_path.is_none()
             {
                 let flight = self
                     .flights
@@ -473,41 +474,28 @@ impl UringDriver {
         let wake_fd = self.wake_receiver.as_raw_fd();
         Ok(match pending {
             PendingEntry::Target(request_id) => {
-                let path = {
-                    let flight = self
-                        .flights
-                        .get(&request_id)
-                        .expect("pending target has a flight");
-                    flight.task.operation.file_io_path(
-                        self.handles
-                            .as_ref()
-                            .expect("runtime handles exist while driver runs"),
-                        flight.transferred,
-                    )?
-                };
+                let handles = self
+                    .handles
+                    .as_ref()
+                    .expect("runtime handles exist while driver runs");
+                let flight = self
+                    .flights
+                    .get_mut(&request_id)
+                    .expect("pending target has a flight");
+                let path = file_io_path(&flight.task.operation, handles, flight.transferred);
                 if self.io_poll && path != FileIoPath::Direct {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "io_uring IOPOLL operation is not direct-I/O aligned",
                     ));
                 }
-                let file_fd = self
-                    .handles
-                    .as_ref()
-                    .expect("runtime handles exist while driver runs")
-                    .file_for(path)
-                    .as_raw_fd();
-                let flight = self
-                    .flights
-                    .get_mut(&request_id)
-                    .expect("pending target has a flight");
-                flight.active = true;
+                let file_fd = handles.file_for(path).as_raw_fd();
                 flight.active_path = Some(path);
-                build_target_entry(file_fd, request_id, flight)?
+                build_target_entry(file_fd, request_id, flight)
             }
-            PendingEntry::Cancel(request_id) => opcode::AsyncCancel::new(request_id.get())
+            PendingEntry::Cancel(request_id) => opcode::AsyncCancel::new(request_id.0)
                 .build()
-                .user_data(CANCEL_CQE_BIT | request_id.get()),
+                .user_data(CANCEL_CQE_BIT | request_id.0),
             PendingEntry::Wake => {
                 self.wake_active = true;
                 opcode::PollAdd::new(types::Fd(wake_fd), libc::POLLIN as u32)
@@ -639,8 +627,10 @@ impl UringDriver {
         let Some(mut flight) = self.flights.remove(&request_id) else {
             return;
         };
-        flight.active = false;
-        let active_path = flight.active_path.take().unwrap_or(FileIoPath::Buffered);
+        let active_path = flight
+            .active_path
+            .take()
+            .expect("target CQE follows active submission");
         if result < 0 {
             let raw_error = result.saturating_neg();
             let error = io::Error::from_raw_os_error(raw_error);
@@ -662,14 +652,15 @@ impl UringDriver {
             return;
         }
 
-        let remaining = operation_length(&flight.task.operation).saturating_sub(flight.transferred);
+        let total = flight.task.operation.buffer().len();
+        let remaining = total.saturating_sub(flight.transferred);
         let completed = result as usize;
         if completed <= remaining && completed != 0 {
             self.handles
                 .as_ref()
                 .expect("runtime handles exist while driver runs")
                 .record(
-                    flight.task.operation.kind().io_direction(),
+                    io_direction(flight.task.operation.kind()),
                     active_path,
                     completed,
                 );
@@ -696,7 +687,7 @@ impl UringDriver {
             );
         } else {
             flight.transferred += completed;
-            if flight.transferred == operation_length(&flight.task.operation) {
+            if flight.transferred == total {
                 self.state
                     .finish(flight.task, CompletionStatus::Completed, flight.transferred);
             } else if flight
@@ -728,18 +719,17 @@ impl UringDriver {
         // completion consumers so a custom waker may safely re-enter the
         // engine and receive BrokenPipe instead of deadlocking.
         drop(submit_state);
-        let message = error.to_string();
+        let stored_error = StoredIoError::capture(error);
 
         // io_uring_cancelation(7) explicitly says that closing the ring
         // cancels requests but is not a lifetime fence for associated
         // resources. Make a bounded best-effort cancel/drain pass. A
         // target CQE, never its cancel CQE, is the release fence.
-        self.try_cancel_and_drain_fatal(error, &message);
+        self.try_cancel_and_drain_fatal(&stored_error);
 
-        let unfenced_writes = self
-            .flights
-            .values()
-            .any(|flight| flight.active && flight.task.operation.kind().uses_write_slot());
+        let unfenced_writes = self.flights.values().any(|flight| {
+            flight.active_path.is_some() && flight.task.operation.kind().uses_write_slot()
+        });
         if unfenced_writes {
             // A ring close does not wait for hardware writes. Preserve the
             // duplicated open-file description (and therefore its flock)
@@ -752,8 +742,8 @@ impl UringDriver {
         }
 
         for (_, flight) in self.flights.drain() {
-            let status = CompletionStatus::Failed(copy_io_error(error, &message));
-            if flight.active {
+            let status = CompletionStatus::Failed(stored_error.restore());
+            if flight.active_path.is_some() {
                 self.state
                     .finish_quarantined(flight.task, status, flight.transferred);
             } else {
@@ -762,22 +752,19 @@ impl UringDriver {
         }
         while let Ok(command) = self.receiver.try_recv() {
             if let DriverCommand::Submit(task) = command {
-                self.state.finish(
-                    task,
-                    CompletionStatus::Failed(copy_io_error(error, &message)),
-                    0,
-                );
+                self.state
+                    .finish(task, CompletionStatus::Failed(stored_error.restore()), 0);
             }
         }
 
         drop(self.ring.take());
     }
 
-    fn try_cancel_and_drain_fatal(&mut self, error: &io::Error, message: &str) {
+    fn try_cancel_and_drain_fatal(&mut self, error: &StoredIoError) {
         let mut cancel_targets = VecDeque::with_capacity(self.flights.len() + 1);
         for (request_id, flight) in &self.flights {
-            if flight.active {
-                cancel_targets.push_back((request_id.get(), CANCEL_CQE_BIT | request_id.get()));
+            if flight.active_path.is_some() {
+                cancel_targets.push_back((request_id.0, CANCEL_CQE_BIT | request_id.0));
             }
         }
         if self.wake_active {
@@ -785,7 +772,7 @@ impl UringDriver {
         }
 
         for _ in 0..FATAL_DRAIN_ROUNDS {
-            self.drain_fatal_completions(error, message);
+            self.drain_fatal_completions(error);
             if !self.has_active_target() {
                 return;
             }
@@ -806,7 +793,7 @@ impl UringDriver {
                     } else {
                         self.flights
                             .get(&RequestId(target_user_data))
-                            .is_some_and(|flight| flight.active)
+                            .is_some_and(|flight| flight.active_path.is_some())
                     };
                     if target_still_active {
                         entries.push(
@@ -829,7 +816,7 @@ impl UringDriver {
             if self.submit_ring().is_err() {
                 return;
             }
-            self.drain_fatal_completions(error, message);
+            self.drain_fatal_completions(error);
             if !self.has_active_target() {
                 return;
             }
@@ -838,10 +825,14 @@ impl UringDriver {
     }
 
     fn has_active_target(&self) -> bool {
-        self.wake_active || self.flights.values().any(|flight| flight.active)
+        self.wake_active
+            || self
+                .flights
+                .values()
+                .any(|flight| flight.active_path.is_some())
     }
 
-    fn drain_fatal_completions(&mut self, error: &io::Error, message: &str) {
+    fn drain_fatal_completions(&mut self, error: &StoredIoError) {
         let completions: Vec<u64> = {
             let mut cq = self.ring_mut().completion();
             cq.by_ref().map(|entry| entry.user_data()).collect()
@@ -856,7 +847,7 @@ impl UringDriver {
             {
                 self.state.finish(
                     flight.task,
-                    CompletionStatus::Failed(copy_io_error(error, message)),
+                    CompletionStatus::Failed(error.restore()),
                     flight.transferred,
                 );
             }
@@ -864,26 +855,42 @@ impl UringDriver {
     }
 }
 
-impl Task {
-    fn operation_is_empty(&self) -> bool {
-        match &self.operation {
-            IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => {
-                buffer.is_empty()
-            }
-        }
+const fn io_direction(kind: OperationKind) -> FileIoDirection {
+    match kind {
+        OperationKind::Read => FileIoDirection::Read,
+        OperationKind::Write => FileIoDirection::Write,
     }
 }
 
-fn copy_io_error(error: &io::Error, message: &str) -> io::Error {
-    error.raw_os_error().map_or_else(
-        || io::Error::new(error.kind(), message.to_owned()),
-        io::Error::from_raw_os_error,
-    )
-}
-
-fn operation_length(operation: &IoOperation) -> usize {
+fn file_io_path(
+    operation: &IoOperation,
+    handles: &DataFileHandles,
+    transferred: usize,
+) -> FileIoPath {
     match operation {
-        IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len(),
+        IoOperation::Read { buffer, offset } => handles.select_path(
+            buffer.read_target().wrapping_add(transferred),
+            buffer.len() - transferred,
+            *offset + transferred as u64,
+            true,
+        ),
+        IoOperation::Write {
+            point,
+            buffer,
+            offset,
+        } => {
+            let ptr = buffer
+                .as_slice()
+                .expect("write IoBuffer holds prepared range")
+                .as_ptr()
+                .wrapping_add(transferred);
+            handles.select_path(
+                ptr,
+                buffer.len() - transferred,
+                *offset + transferred as u64,
+                *point == WritePoint::Record,
+            )
+        }
     }
 }
 
@@ -898,38 +905,36 @@ fn cancelled_before_resubmit_status(flight: &Flight) -> CompletionStatus {
     }
 }
 
-fn build_target_entry(
-    file_fd: i32,
-    request_id: RequestId,
-    flight: &mut Flight,
-) -> io::Result<squeue::Entry> {
+fn build_target_entry(file_fd: i32, request_id: RequestId, flight: &mut Flight) -> squeue::Entry {
     let transferred = flight.transferred;
     match &mut flight.task.operation {
         IoOperation::Read { buffer, offset } => {
-            let remaining = buffer.len() - transferred;
-            let length = u32::try_from(remaining).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "read length exceeds u32")
-            })?;
+            let length =
+                u32::try_from(buffer.len() - transferred).expect("IoBuffer length fits u32");
             // SAFETY: `transferred <= buffer.len()` and the allocation is
             // kept in this flight until the target CQE.
-            let pointer = unsafe { buffer.read_target()?.add(transferred) };
-            Ok(opcode::Read::new(types::Fd(file_fd), pointer, length)
+            let pointer = unsafe { buffer.read_target().add(transferred) };
+            opcode::Read::new(types::Fd(file_fd), pointer, length)
                 .offset(*offset + transferred as u64)
                 .build()
-                .user_data(request_id.get()))
+                .user_data(request_id.0)
         }
         IoOperation::Write { buffer, offset, .. } => {
-            let remaining = buffer.len() - transferred;
-            let length = u32::try_from(remaining).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "write length exceeds u32")
-            })?;
+            let length =
+                u32::try_from(buffer.len() - transferred).expect("IoBuffer length fits u32");
             // SAFETY: `transferred <= buffer.len()` and the allocation is
             // kept in this flight until the target CQE.
-            let pointer = unsafe { buffer.as_ptr()?.add(transferred) };
-            Ok(opcode::Write::new(types::Fd(file_fd), pointer, length)
+            let pointer = unsafe {
+                buffer
+                    .as_slice()
+                    .expect("write IoBuffer holds prepared range")
+                    .as_ptr()
+                    .add(transferred)
+            };
+            opcode::Write::new(types::Fd(file_fd), pointer, length)
                 .offset(*offset + transferred as u64)
                 .build()
-                .user_data(request_id.get()))
+                .user_data(request_id.0)
         }
     }
 }

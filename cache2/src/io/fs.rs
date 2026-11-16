@@ -44,11 +44,7 @@ impl FileSystem for OsFileSystem {
     type File = CacheFile;
 
     fn open(&self, path: &Path, create: bool, mode: IoMode) -> io::Result<Self::File> {
-        if create {
-            CacheFile::open_with_io_mode(path, mode)
-        } else {
-            CacheFile::open_existing_with_io_mode(path, mode)
-        }
+        CacheFile::open_with_mode(path, mode, create)
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Self::File> {

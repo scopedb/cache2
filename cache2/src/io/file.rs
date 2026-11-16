@@ -178,16 +178,7 @@ pub struct DataFileHandles {
 }
 
 impl DataFileHandles {
-    #[cfg(test)]
-    pub fn buffered(file: File) -> Self {
-        Self {
-            buffered: file,
-            direct: None,
-            stats: FileIoStatsHandle::new(false),
-        }
-    }
-
-    pub fn with_direct(buffered: File, direct: Option<File>) -> Self {
+    pub fn new(buffered: File, direct: Option<File>) -> Self {
         let direct_active = direct.is_some();
         Self {
             buffered,
@@ -357,49 +348,28 @@ pub struct CacheFile {
 impl CacheFile {
     #[cfg(test)]
     pub fn open(path: &Path) -> io::Result<Self> {
-        Self::open_with_io_mode(path, IoMode::Buffered)
-    }
-
-    pub fn open_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
-        Self::open_with_io_mode_and_create(path, mode, true)
-    }
-
-    pub fn open_existing_with_io_mode(path: &Path, mode: IoMode) -> io::Result<Self> {
-        Self::open_with_io_mode_and_create(path, mode, false)
+        Self::open_with_mode(path, IoMode::Buffered, true)
     }
 
     /// Atomically creates a new buffered control file without following a
     /// symbolic link or opening an existing recovery-image target.
     pub fn create_new_buffered(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(SAFE_CACHE_OPEN_FLAGS)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache path must be a regular file",
-            ));
-        }
+        let file = open_regular(
+            OpenOptions::new().read(true).write(true).create_new(true),
+            path,
+        )?;
         Ok(Self { file, direct: None })
     }
 
-    fn open_with_io_mode_and_create(path: &Path, mode: IoMode, create: bool) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .custom_flags(SAFE_CACHE_OPEN_FLAGS)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache path must be a regular file",
-            ));
-        }
+    pub fn open_with_mode(path: &Path, mode: IoMode, create: bool) -> io::Result<Self> {
+        let file = open_regular(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .truncate(false),
+            path,
+        )?;
         if mode == IoMode::Buffered {
             return Ok(Self { file, direct: None });
         }
@@ -420,6 +390,26 @@ impl CacheFile {
             ))
         }
     }
+}
+
+fn open_regular(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    let file = options.custom_flags(SAFE_CACHE_OPEN_FLAGS).open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache path must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -451,7 +441,7 @@ impl StorageFile for CacheFile {
     fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
         let buffered = self.file.try_clone()?;
         let direct = self.direct.as_ref().map(File::try_clone).transpose()?;
-        Ok(DataFileHandles::with_direct(buffered, direct))
+        Ok(DataFileHandles::new(buffered, direct))
     }
 
     fn len(&self) -> io::Result<u64> {
@@ -491,20 +481,16 @@ impl StorageFile for CacheFile {
             // Preserve set_len's exact truncate/extend behavior before
             // allocating physical blocks for the final extent.
             self.file.set_len(len)?;
-            let mut interrupted_retries = 0;
-            let error = loop {
+            retry_interrupted(|| {
                 // SAFETY: `file` owns a valid regular-file descriptor and
                 // both offsets are representable non-negative off_t values.
                 let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), 0, linux_len) };
-                if error != libc::EINTR || interrupted_retries == MAX_INTERRUPTED_RETRIES {
-                    break error;
+                if error == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(error))
                 }
-                interrupted_retries += 1;
-            };
-            if error == 0 {
-                return Ok(());
-            }
-            Err(io::Error::from_raw_os_error(error))
+            })
         }
         #[cfg(not(any(
             all(target_os = "linux", target_pointer_width = "64"),
@@ -550,11 +536,7 @@ impl StorageFile for CacheFile {
     }
 
     fn identity(&self) -> io::Result<FileIdentity> {
-        let metadata = self.file.metadata()?;
-        Ok(FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+        file_identity(&self.file)
     }
 }
 
@@ -626,11 +608,7 @@ fn open_direct(path: &Path, buffered: &File) -> io::Result<File> {
         .write(true)
         .custom_flags(libc::O_DIRECT)
         .open(path)?;
-    let buffered_metadata = buffered.metadata()?;
-    let direct_metadata = direct.metadata()?;
-    if buffered_metadata.dev() != direct_metadata.dev()
-        || buffered_metadata.ino() != direct_metadata.ino()
-    {
+    if file_identity(buffered)? != file_identity(&direct)? {
         return Err(io::Error::other(
             "cache path changed while opening its O_DIRECT descriptor",
         ));
@@ -646,38 +624,34 @@ pub fn read_at_bounded(io: &dyn PositionedIo, buffer: &mut [u8], offset: u64) ->
     retry_interrupted(|| io.read_at(buffer, offset))
 }
 
-fn read_exact_at_with_progress(
-    io: &dyn PositionedIo,
-    mut buffer: &mut [u8],
-    mut offset: u64,
+fn transfer_exact(
+    length: usize,
+    offset: u64,
+    zero_kind: io::ErrorKind,
+    zero_message: &'static str,
+    exceeds_message: &'static str,
+    mut step: impl FnMut(usize, usize, u64) -> io::Result<usize>,
 ) -> (io::Result<()>, usize) {
     let mut transferred = 0_usize;
-    while !buffer.is_empty() {
-        let read = match read_at_bounded(io, buffer, offset) {
+    let mut cursor = offset;
+    while transferred < length {
+        let remaining = length - transferred;
+        let done = match retry_interrupted(|| step(transferred, remaining, cursor)) {
             Err(error) => return (Err(error), transferred),
-            Ok(read) => read,
+            Ok(done) => done,
         };
-        if read == 0 {
+        if done == 0 {
+            return (Err(io::Error::new(zero_kind, zero_message)), transferred);
+        }
+        if done > remaining {
             return (
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "short positioned read",
-                )),
+                Err(io::Error::new(io::ErrorKind::InvalidData, exceeds_message)),
                 transferred,
             );
         }
-        if read > buffer.len() {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "positioned read exceeds the supplied buffer",
-                )),
-                transferred,
-            );
-        }
-        transferred += read;
-        offset = match offset.checked_add(read as u64) {
-            Some(offset) => offset,
+        transferred += done;
+        cursor = match cursor.checked_add(done as u64) {
+            Some(next) => next,
             None => {
                 return (
                     Err(io::Error::new(
@@ -688,61 +662,43 @@ fn read_exact_at_with_progress(
                 );
             }
         };
-        buffer = &mut buffer[read..];
     }
     (Ok(()), transferred)
+}
+
+fn read_exact_at_with_progress(
+    io: &dyn PositionedIo,
+    buffer: &mut [u8],
+    offset: u64,
+) -> (io::Result<()>, usize) {
+    transfer_exact(
+        buffer.len(),
+        offset,
+        io::ErrorKind::UnexpectedEof,
+        "short positioned read",
+        "positioned read exceeds the supplied buffer",
+        |transferred, _, cursor| io.read_at(&mut buffer[transferred..], cursor),
+    )
 }
 
 pub fn read_exact_at_uninit_with_progress(
     io: &dyn PositionedIo,
     buffer: *mut u8,
     length: usize,
-    mut offset: u64,
+    offset: u64,
 ) -> (io::Result<()>, usize) {
-    let mut transferred = 0_usize;
-    while transferred < length {
-        let remaining = length - transferred;
-        let read = match retry_interrupted(|| {
+    transfer_exact(
+        length,
+        offset,
+        io::ErrorKind::UnexpectedEof,
+        "short positioned read",
+        "positioned read exceeds the supplied buffer",
+        |transferred, remaining, cursor| {
             // SAFETY: the caller owns a destination valid for `length` bytes,
             // and the unchanged suffix bounds remain valid across retries.
-            unsafe { io.read_at_uninit(buffer.add(transferred), remaining, offset) }
-        }) {
-            Err(error) => return (Err(error), transferred),
-            Ok(read) => read,
-        };
-        if read == 0 {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "short positioned read",
-                )),
-                transferred,
-            );
-        }
-        if read > remaining {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "positioned read exceeds the supplied buffer",
-                )),
-                transferred,
-            );
-        }
-        transferred += read;
-        offset = match offset.checked_add(read as u64) {
-            Some(offset) => offset,
-            None => {
-                return (
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "offset overflow",
-                    )),
-                    transferred,
-                );
-            }
-        };
-    }
-    (Ok(()), transferred)
+            unsafe { io.read_at_uninit(buffer.add(transferred), remaining, cursor) }
+        },
+    )
 }
 
 #[cfg(unix)]
@@ -779,49 +735,17 @@ pub fn write_all_at(
 pub fn write_all_at_with_progress(
     io: &dyn PositionedIo,
     point: WritePoint,
-    mut buffer: &[u8],
-    mut offset: u64,
+    buffer: &[u8],
+    offset: u64,
 ) -> (io::Result<()>, usize) {
-    let mut transferred = 0_usize;
-    while !buffer.is_empty() {
-        let written = match retry_interrupted(|| io.write_at(point, buffer, offset)) {
-            Err(error) => return (Err(error), transferred),
-            Ok(written) => written,
-        };
-        if written == 0 {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short positioned write",
-                )),
-                transferred,
-            );
-        }
-        if written > buffer.len() {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "positioned write exceeds the supplied buffer",
-                )),
-                transferred,
-            );
-        }
-        transferred += written;
-        offset = match offset.checked_add(written as u64) {
-            Some(offset) => offset,
-            None => {
-                return (
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "offset overflow",
-                    )),
-                    transferred,
-                );
-            }
-        };
-        buffer = &buffer[written..];
-    }
-    (Ok(()), transferred)
+    transfer_exact(
+        buffer.len(),
+        offset,
+        io::ErrorKind::WriteZero,
+        "short positioned write",
+        "positioned write exceeds the supplied buffer",
+        |transferred, _, cursor| io.write_at(point, &buffer[transferred..], cursor),
+    )
 }
 
 pub fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -959,20 +883,34 @@ pub mod testing {
                 handle,
             })
         }
+
+        fn inject<T>(
+            &self,
+            event: FaultEvent,
+            operation: impl FnOnce() -> io::Result<T>,
+        ) -> io::Result<T> {
+            match self.handle.action(event) {
+                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
+                    Err(io::Error::from_raw_os_error(code))
+                }
+                Some(FaultAction::Torn { raw_os_error, .. })
+                    if matches!(event, FaultEvent::Read) =>
+                {
+                    Err(io::Error::from_raw_os_error(raw_os_error))
+                }
+                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "torn actions apply only to positioned I/O",
+                )),
+                Some(FaultAction::KillAfter) => kill_after(operation()),
+                None => operation(),
+            }
+        }
     }
 
     impl PositionedIo for FaultFile {
         fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-            match self.handle.action(FaultEvent::Read) {
-                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
-                    Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::Torn { raw_os_error, .. }) => {
-                    Err(io::Error::from_raw_os_error(raw_os_error))
-                }
-                Some(FaultAction::KillAfter) => kill_after(self.inner.read_at(buffer, offset)),
-                None => self.inner.read_at(buffer, offset),
-            }
+            self.inject(FaultEvent::Read, || self.inner.read_at(buffer, offset))
         }
 
         fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
@@ -1001,17 +939,9 @@ pub mod testing {
     #[cfg(unix)]
     impl StorageFile for FaultFile {
         fn try_clone_data_handles(&self) -> io::Result<DataFileHandles> {
-            match self.handle.action(FaultEvent::CloneDataHandles) {
-                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
-                    Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "torn actions apply only to positioned I/O",
-                )),
-                Some(FaultAction::KillAfter) => kill_after(self.inner.try_clone_data_handles()),
-                None => self.inner.try_clone_data_handles(),
-            }
+            self.inject(FaultEvent::CloneDataHandles, || {
+                self.inner.try_clone_data_handles()
+            })
         }
 
         fn len(&self) -> io::Result<u64> {
@@ -1023,45 +953,15 @@ pub mod testing {
         }
 
         fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()> {
-            match self.handle.action(FaultEvent::Sync(point)) {
-                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
-                    Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "torn actions apply only to positioned I/O",
-                )),
-                Some(FaultAction::KillAfter) => kill_after(self.inner.sync(point, mode)),
-                None => self.inner.sync(point, mode),
-            }
+            self.inject(FaultEvent::Sync(point), || self.inner.sync(point, mode))
         }
 
         fn try_lock_exclusive(&self) -> io::Result<()> {
-            match self.handle.action(FaultEvent::Lock) {
-                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
-                    Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "torn actions apply only to positioned I/O",
-                )),
-                Some(FaultAction::KillAfter) => kill_after(self.inner.try_lock_exclusive()),
-                None => self.inner.try_lock_exclusive(),
-            }
+            self.inject(FaultEvent::Lock, || self.inner.try_lock_exclusive())
         }
 
         fn unlock(&self) -> io::Result<()> {
-            match self.handle.action(FaultEvent::Unlock) {
-                Some(FaultAction::Error(code) | FaultAction::ErrorAlways(code)) => {
-                    Err(io::Error::from_raw_os_error(code))
-                }
-                Some(FaultAction::Torn { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "torn actions apply only to positioned I/O",
-                )),
-                Some(FaultAction::KillAfter) => kill_after(self.inner.unlock()),
-                None => self.inner.unlock(),
-            }
+            self.inject(FaultEvent::Unlock, || self.inner.unlock())
         }
 
         fn try_clone_mapping_file(&self) -> io::Result<File> {
@@ -1191,7 +1091,7 @@ mod tests {
     fn data_handles_route_only_fully_aligned_data_to_direct() {
         let buffered = TestFile::new("buffered-route");
         let direct = TestFile::new("direct-route");
-        let files = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
         let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
         let pointer = bytes.0.as_ptr();
 
@@ -1208,13 +1108,13 @@ mod tests {
             FileIoPath::Buffered
         );
 
-        let buffered_only = DataFileHandles::buffered(buffered.open());
+        let buffered_only = DataFileHandles::new(buffered.open(), None);
         assert_eq!(
             buffered_only.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
             FileIoPath::Buffered
         );
 
-        let required = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        let required = DataFileHandles::new(buffered.open(), Some(direct.open()));
         assert_eq!(
             required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
             FileIoPath::Buffered,
@@ -1231,7 +1131,7 @@ mod tests {
     fn file_io_statistics_are_shared_and_can_be_disabled() {
         let buffered = TestFile::new("buffered-stats");
         let direct = TestFile::new("direct-stats");
-        let files = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
         let cloned = files.try_clone().unwrap();
 
         cloned.record(
@@ -1266,7 +1166,7 @@ mod tests {
             .set_len(2 * DIRECT_IO_ALIGNMENT as u64)
             .unwrap();
         direct_file.set_len(2 * DIRECT_IO_ALIGNMENT as u64).unwrap();
-        let io = DataFileHandles::with_direct(
+        let io = DataFileHandles::new(
             buffered_file.try_clone().unwrap(),
             Some(direct_file.try_clone().unwrap()),
         );

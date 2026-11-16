@@ -56,6 +56,7 @@ use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
 use crate::io::engine::ReadSlot;
 use crate::io::engine::ReadSlotWaiter;
+use crate::io::engine::StoredIoError;
 use crate::io::engine::build_file_engine;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DataFileHandles;
@@ -421,7 +422,7 @@ struct RuntimeState {
     reclaim_control: ReclaimControl,
     reclaim_io_timeout: Duration,
     io_recovery: IoRecovery,
-    fill_control: Option<Arc<FillController>>,
+    fill_control: Option<FillController>,
     managed_memory: Arc<ManagedMemory>,
     metrics: Arc<RuntimeMetrics>,
     memory: Arc<MemoryStore>,
@@ -496,7 +497,7 @@ impl ReclaimControl {
 
 impl RuntimeState {
     fn background_io_attempt(&self) -> BackgroundIoAttempt<'_> {
-        BackgroundIoAttempt::new(&self.io_recovery, self.fill_control.as_deref())
+        BackgroundIoAttempt::new(&self.io_recovery, self.fill_control.as_ref())
     }
 
     fn stop_fill_and_recovery(&self) {
@@ -585,38 +586,13 @@ fn should_wake_write(previous_bytes: usize, current_bytes: usize, threshold: usi
     previous_bytes == 0 || (previous_bytes < threshold && current_bytes >= threshold)
 }
 
-#[derive(Clone)]
-struct AppendWorkerFailure {
-    kind: io::ErrorKind,
-    raw_os_error: Option<i32>,
-    message: Arc<str>,
-}
-
-impl AppendWorkerFailure {
-    fn from_error(error: &io::Error) -> Self {
-        Self {
-            kind: error.kind(),
-            raw_os_error: error.raw_os_error(),
-            message: Arc::from(error.to_string()),
-        }
-    }
-
-    fn to_error(&self) -> io::Error {
-        if let Some(code) = self.raw_os_error {
-            io::Error::from_raw_os_error(code)
-        } else {
-            io::Error::new(self.kind, self.message.as_ref())
-        }
-    }
-}
-
 #[derive(Default)]
 struct AppendWorkerState {
     wake_flags: u8,
     drain_requested: u64,
     drain_completed: u64,
     stop: bool,
-    failure: Option<AppendWorkerFailure>,
+    failure: Option<StoredIoError>,
 }
 
 struct AppendWorkerControl {
@@ -647,7 +623,7 @@ impl AppendWorkerControl {
     fn notify_inner(&self, flags: u8, ignore_stopped: bool) -> io::Result<()> {
         let mut state = self.lock()?;
         if let Some(failure) = &state.failure {
-            return Err(failure.to_error());
+            return Err(failure.restore());
         }
         if state.stop {
             return if ignore_stopped {
@@ -688,7 +664,7 @@ impl AppendWorkerControl {
         if poisoned {
             Err(poisoned_runtime_error())
         } else if let Some(failure) = &state.failure {
-            Err(failure.to_error())
+            Err(failure.restore())
         } else {
             Ok(())
         }
@@ -703,7 +679,7 @@ impl AppendWorkerControl {
                 .map_err(|_| poisoned_runtime_error())?;
         }
         if let Some(failure) = &state.failure {
-            return Err(failure.to_error());
+            return Err(failure.restore());
         }
         Ok(())
     }
@@ -715,7 +691,7 @@ impl AppendWorkerControl {
             {
                 let state = self.lock()?;
                 if let Some(failure) = &state.failure {
-                    return Err(failure.to_error());
+                    return Err(failure.restore());
                 }
                 if state.drain_completed >= generation {
                     return Ok(());
@@ -732,7 +708,7 @@ impl AppendWorkerControl {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state
             .failure
-            .get_or_insert_with(|| AppendWorkerFailure::from_error(error));
+            .get_or_insert_with(|| StoredIoError::capture(error));
         drop(state);
         self.changed.notify_all();
         self.async_changed.set();
@@ -1668,11 +1644,6 @@ fn append_worker(state: Arc<RuntimeState>, shard_id: usize) -> io::Result<()> {
     state.regions.enter_miss_only();
     state.stop_fill_and_recovery();
     control.fail(&error);
-    // Wake engine admission in case another shard is blocked behind work that
-    // can no longer make progress after this runtime entered miss-only.
-    for engine in state.engines() {
-        engine.wake_slot_waiters();
-    }
     for shard in &state.append_controls {
         if !Arc::ptr_eq(shard, &control) {
             shard.fail(&error);
@@ -2039,7 +2010,7 @@ fn wait_for_shard_work(
         }
     }
     if let Some(failure) = &state.failure {
-        return Err(failure.to_error());
+        return Err(failure.restore());
     }
     let flags = mem::take(&mut state.wake_flags);
     let drain_generation = if state.drain_requested > state.drain_completed {

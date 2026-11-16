@@ -203,11 +203,8 @@ impl BufferLease {
         length <= self.capacity
     }
 
-    pub fn read_target(&self, length: usize) -> Option<*mut u8> {
-        if length > self.capacity {
-            return None;
-        }
-        Some(self.ptr.as_ptr())
+    pub const fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
     }
 
     pub fn mark_initialized(&mut self, length: usize) -> bool {
@@ -300,14 +297,8 @@ mod tests {
         let managed_memory = ManagedMemory::try_new(limits()).unwrap();
         let first = managed_memory.try_read_buffer(5000).unwrap();
         let second = managed_memory.try_read_buffer(9000).unwrap();
-        assert_eq!(
-            first.read_target(5000).unwrap() as usize % BUFFER_ALIGNMENT,
-            0
-        );
-        assert_eq!(
-            second.read_target(9000).unwrap() as usize % BUFFER_ALIGNMENT,
-            0
-        );
+        assert_eq!(first.as_mut_ptr() as usize % BUFFER_ALIGNMENT, 0);
+        assert_eq!(second.as_mut_ptr() as usize % BUFFER_ALIGNMENT, 0);
         assert!(first.prepared(5000).is_none());
         assert!(second.prepared(9000).is_none());
         let snapshot = managed_memory.snapshot();
@@ -330,7 +321,7 @@ mod tests {
         let managed_memory = ManagedMemory::try_new(limits()).unwrap();
         let mut buffer = managed_memory.try_read_buffer(5000).unwrap();
         let bytes = b"completed read prefix";
-        let target = buffer.read_target(5000).unwrap();
+        let target = buffer.as_mut_ptr();
         // SAFETY: simulate a completed read into the exclusively owned target;
         // the source and destination do not overlap and the bytes fit.
         unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
@@ -347,7 +338,6 @@ mod tests {
         assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
         assert!(buffer.has_capacity(2 * BUFFER_ALIGNMENT));
         assert!(!buffer.has_capacity(2 * BUFFER_ALIGNMENT + 1));
-        assert!(buffer.read_target(2 * BUFFER_ALIGNMENT + 1).is_none());
         assert!(!buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1));
         assert!(buffer.prepared(bytes.len() + 1).is_none());
     }
@@ -363,7 +353,7 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         buffer.prepared_mut(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
-        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_none());
+        assert!(!buffer.has_capacity(BUFFER_ALIGNMENT + 1));
         assert!(buffer.prepared(BUFFER_ALIGNMENT + 1).is_none());
         assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_none());
         assert!(
