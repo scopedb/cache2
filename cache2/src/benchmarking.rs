@@ -22,15 +22,13 @@ use std::time::Instant;
 
 use crate::region::index::BenchmarkProbeStats;
 use crate::region::index::RegionIndex;
+use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
-use crate::region::index::packed::MAX_INDEX_PROBES;
 use crate::region::index::packed::MAX_PACKED_REGION_COUNT;
 use crate::region::index::packed::MAX_REGION_OFFSET;
 use crate::region::index::packed::PackedLocation;
-use crate::region::index::reset_benchmark_probe_stats;
 use crate::region::index::storage::PartitionedIndexStorage;
 use crate::region::index::storage::validated_index_partition_ranges;
-use crate::region::index::take_benchmark_probe_stats;
 use crate::region::record::codec::hash_key;
 use crate::snapshot::CacheIndexSnapshot;
 
@@ -290,7 +288,7 @@ impl TurnoverWorkload {
     }
 
     fn write_turn(&mut self) -> io::Result<RegionIndexTurnoverPhase> {
-        reset_benchmark_probe_stats();
+        let mut probes = BenchmarkProbeStats::default();
         let started = Instant::now();
         let mut checksum = 0_u64;
         let mut installed = 0_usize;
@@ -316,6 +314,7 @@ impl TurnoverWorkload {
                 let entry = IndexEntry {
                     location: self.locations[location_start + slot],
                 };
+                probes.record(INDEX_CANDIDATES);
                 let accepted = self
                     .index
                     .upsert(black_box(self.hashes[key_ordinal]), black_box(entry))
@@ -340,6 +339,7 @@ impl TurnoverWorkload {
             installed,
             self.config.physical_entries.saturating_sub(installed),
             checksum,
+            probes,
         )
     }
 
@@ -413,7 +413,7 @@ fn measure_lookups(
     operations: usize,
     mut request: impl FnMut(usize) -> io::Result<(u64, LookupExpectation)>,
 ) -> io::Result<RegionIndexTurnoverPhase> {
-    reset_benchmark_probe_stats();
+    let mut probes = BenchmarkProbeStats::default();
     let started = Instant::now();
     let mut hits = 0_usize;
     let mut misses = 0_usize;
@@ -421,7 +421,10 @@ fn measure_lookups(
     let mut checksum = 0_u64;
     for operation in 0..operations {
         let (hash, expected) = request(operation)?;
-        let observed = index.lookup_raw(black_box(hash)).map_err(index_error)?;
+        let (observed, probe_count) = index
+            .lookup_with_probes(black_box(hash))
+            .map_err(index_error)?;
+        probes.record(probe_count);
         match (expected, observed) {
             (LookupExpectation::Live(expected), Some(observed)) if observed == expected => {
                 hits = hits.saturating_add(1);
@@ -441,7 +444,14 @@ fn measure_lookups(
         }
         black_box(observed);
     }
-    let mut phase = finish_phase(started.elapsed(), operations, hits, misses, checksum)?;
+    let mut phase = finish_phase(
+        started.elapsed(),
+        operations,
+        hits,
+        misses,
+        checksum,
+        probes,
+    )?;
     phase.stale_slots = false_candidates;
     Ok(phase)
 }
@@ -452,32 +462,19 @@ fn finish_phase(
     hits: usize,
     misses: usize,
     checksum: u64,
+    probes: BenchmarkProbeStats,
 ) -> io::Result<RegionIndexTurnoverPhase> {
-    let probes = take_benchmark_probe_stats();
     if probes.operations != u64::try_from(operations).unwrap_or(u64::MAX) {
         return Err(io::Error::other(
             "turnover operation and probe counts disagree",
         ));
     }
-    if probes.max_probes > MAX_INDEX_PROBES {
+    if probes.max_probes > INDEX_CANDIDATES {
         return Err(io::Error::other(
             "turnover probe exceeded the production bound",
         ));
     }
-    Ok(phase_from_probe_stats(
-        elapsed, operations, hits, misses, checksum, probes,
-    ))
-}
-
-fn phase_from_probe_stats(
-    elapsed: Duration,
-    operations: usize,
-    hits: usize,
-    misses: usize,
-    checksum: u64,
-    probes: BenchmarkProbeStats,
-) -> RegionIndexTurnoverPhase {
-    RegionIndexTurnoverPhase {
+    Ok(RegionIndexTurnoverPhase {
         elapsed,
         operations,
         hits,
@@ -487,7 +484,7 @@ fn phase_from_probe_stats(
         stale_slots: probes.stale_slots,
         full_windows: probes.full_windows,
         max_probes: probes.max_probes,
-    }
+    })
 }
 
 fn benchmark_hash(domain: u64, ordinal: usize) -> io::Result<u64> {
@@ -556,7 +553,7 @@ mod tests {
             .into_iter()
             .flatten()
             {
-                assert!(phase.max_probes <= MAX_INDEX_PROBES);
+                assert!(phase.max_probes <= INDEX_CANDIDATES);
                 assert_eq!(phase.hits + phase.misses, phase.operations);
             }
             if let Some(stale) = checkpoint.stale_lookup {

@@ -45,8 +45,6 @@ pub const MAX_RECORD_LEN: u32 = (RECORD_LEN_MASK as u32 + 1) * RECORD_LEN_ALIGNM
 pub const MAX_PACKED_REGION_COUNT: u32 = MAX_REGION_ID + 1;
 pub const MAX_PACKED_REGION_SIZE: u64 = MAX_REGION_OFFSET as u64 + OFFSET_ALIGNMENT as u64;
 pub const INDEX_CANDIDATES: usize = 4;
-#[cfg(feature = "benchmarking")]
-pub const MAX_INDEX_PROBES: usize = INDEX_CANDIDATES;
 pub const MAX_INDEX_PARTITIONS: usize = 4096;
 
 /// A record location packed into one machine word.
