@@ -19,6 +19,7 @@
 - Retain a full Region's rotation request across its final write so the shard rotates immediately upon completion without waiting for another rejected put or rotating the replacement empty Region.
 - Count the payload size actually returned in `CacheSnapshot::served_bytes` when L2 promotion selects a newer L1 entry of a different size.
 - Propagate drain and background worker failures during `close_fast` and `close_warm` when foreground L2 reads remain in flight instead of treating shutdown as quiescent.
+- Let idle append workers exit on terminal cache failure without waiting for another data or drain request.
 
 ## v0.6.0 (2026-09-21)
 

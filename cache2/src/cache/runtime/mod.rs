@@ -1999,7 +1999,10 @@ fn wait_for_shard_work(
 ) -> io::Result<(u8, u64, bool, bool)> {
     let mut state = control.lock()?;
     let mut timed_out = false;
-    while state.wake_flags == 0 && state.drain_requested == state.drain_completed {
+    while state.wake_flags == 0
+        && state.drain_requested == state.drain_completed
+        && state.failure.is_none()
+    {
         if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 timed_out = true;
@@ -3292,6 +3295,34 @@ mod tests {
         assert_eq!(drain_generation, 0);
         assert!(!stop);
         assert!(timed_out);
+    }
+
+    #[test]
+    fn failed_idle_shard_exits_without_another_work_notification() {
+        let control = Arc::new(AppendWorkerControl::new());
+        control.fail(&io::Error::new(io::ErrorKind::BrokenPipe, "shard failed"));
+        let worker_control = Arc::clone(&control);
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            completed
+                .send(wait_for_shard_work(&worker_control, None))
+                .unwrap();
+        });
+
+        let result = completion.recv_timeout(Duration::from_secs(1));
+        // Unblock a regressed worker before asserting so failure cannot hang the suite.
+        if result.is_err() {
+            control.state.lock().unwrap().wake_flags = WAKE_URGENT;
+            control.changed.notify_all();
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            result
+                .expect("terminal failure must stop an idle worker")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
