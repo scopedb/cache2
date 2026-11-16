@@ -18,7 +18,6 @@ use std::ffi::OsString;
 use std::iter;
 use std::path::Path;
 use std::process;
-use std::process::Command;
 
 use cargo_metadata::Metadata;
 use cargo_metadata::MetadataCommand;
@@ -28,7 +27,7 @@ use clap::Subcommand;
 const PACKAGE_NAME: &str = "cache2";
 
 fn main() {
-    Cli::parse().run();
+    Command::parse().run();
 }
 
 #[derive(Parser)]
@@ -37,12 +36,12 @@ fn main() {
     bin_name = "cargo x",
     about = "Repository workflows for C²"
 )]
-struct Cli {
+struct Command {
     #[command(subcommand)]
     sub: SubCommand,
 }
 
-impl Cli {
+impl Command {
     fn run(self) {
         match self.sub {
             SubCommand::Bench(command) => command.run(),
@@ -89,7 +88,7 @@ impl CommandBench {
         run(self.command());
     }
 
-    fn command(self) -> Command {
+    fn command(self) -> process::Command {
         let mut command = cargo();
         command.args(["bench", "--package", "benchmarks"]);
         command.args(self.cargo_args);
@@ -237,15 +236,15 @@ impl CommandTest {
     }
 }
 
-fn cargo() -> Command {
+fn cargo() -> process::Command {
     let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(executable);
+    let mut command = process::Command::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command
 }
 
-fn nightly_cargo() -> Command {
-    let mut command = Command::new("rustup");
+fn nightly_cargo() -> process::Command {
+    let mut command = process::Command::new("rustup");
     command
         .args(["run", "nightly", "cargo"])
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
@@ -267,14 +266,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new(executable);
+    let mut command = process::Command::new(executable);
     command
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")))
         .args(args);
     run(command);
 }
 
-fn run(mut command: Command) {
+fn run(mut command: process::Command) {
     println!("{command:?}");
     match command.status() {
         Ok(status) if status.success() => {}
@@ -294,7 +293,7 @@ mod tests {
 
     #[test]
     fn bench_keeps_cargo_and_harness_arguments_separate() {
-        let command = Cli::try_parse_from([
+        let command = Command::try_parse_from([
             "cargo x",
             "bench",
             "--bench",

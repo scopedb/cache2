@@ -60,10 +60,8 @@ use cache2::L1EvictionPolicy;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
-use log::LevelFilter;
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
-use logforth::core;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
 use tokio::runtime::Builder;
@@ -628,7 +626,7 @@ fn run_benchmark() -> io::Result<()> {
 }
 
 fn init_logforth() -> io::Result<()> {
-    let logger = core::builder()
+    let logger = logforth::core::builder()
         .dispatch(|dispatch| {
             dispatch
                 .filter(RustLogFilterBuilder::from_default_env().build())
@@ -637,7 +635,7 @@ fn init_logforth() -> io::Result<()> {
         .build();
     log::set_boxed_logger(Box::new(LogBridge::new(logger)))
         .map_err(|error| io::Error::other(error.to_string()))?;
-    log::set_max_level(LevelFilter::Trace);
+    log::set_max_level(log::LevelFilter::Trace);
     Ok(())
 }
 
