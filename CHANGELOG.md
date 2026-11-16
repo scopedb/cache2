@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.6.1
+
 ### Improvements
 
 - Compare `CacheConfig` and `RuntimeOptions` directly with `==` and `!=` through their new `Eq` and `PartialEq` implementations.
