@@ -19,7 +19,7 @@ use cache2::{Cache, Error, ErrorKind};
 
 fn cache_value(cache: &Cache, key: &[u8], value: &[u8]) -> Result<(), Error> {
     match cache.put(key, value) {
-        Ok(_sequence) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::Overloaded => {
             // Cache admission is saturated. The authoritative write can still
             // proceed, so skipping this cache fill is safe.
@@ -32,21 +32,21 @@ fn cache_value(cache: &Cache, key: &[u8], value: &[u8]) -> Result<(), Error> {
 
 Do not retry without a bound. C² deliberately exposes pressure instead of building unbounded queues. With the default immediate-read policy, read-pool or buffer pressure is `Ok(None)`. When read waiting is enabled, queue saturation, buffer pressure, and deadline expiry are `ErrorKind::Overloaded`.
 
-With `FillControlOptions::Adaptive`, new fills also return `Overloaded` when the controller pauses. Staging back-pressure from paced flush uses the ordinary write-overload path. Inspect `CacheSnapshot::fill_control` to distinguish controller pause from other admission pressure. Pre-timeout pressure does not change `CacheHealth::Running` or identify a hardware failure. `Observe` counts `would_reject` for pause refusals only. Reads, deletes, accepted writes, and essential reclaim retain their ordinary paths.
+With `FillControlOptions::Adaptive`, new fills also return `ErrorKind::Overloaded` during controller pauses or paced-flush back-pressure; inspect `CacheSnapshot::fill_control` to distinguish controller pauses from staging pressure. Pre-timeout pauses leave `CacheHealth::Running` unchanged and do not affect reads or deletes.
 
 ## Classifications
 
-| `ErrorKind` | Meaning | Usual response |
-| --- | --- | --- |
-| `InvalidInput` | Storage/runtime options or a request key/value is invalid. | Fix the input; retrying it unchanged cannot succeed. |
-| `Unsupported` | The selected I/O engine, mode, or platform capability is unavailable. | Select a supported configuration or build target; inspect the I/O source for the missing requirement. |
-| `Busy` | `open` could not acquire exclusive ownership of the cache files. | Coordinate ownership or retry later with a bound. |
-| `Overloaded` | A bounded request-path slot, queue, buffer, or deadline is exhausted. | Fall through to the authoritative path or retry with a bound. |
-| `ResourceExhausted` | Startup or lifecycle work could not satisfy a required allocation/resource requirement. | Reduce the configured footprint or provide more resources. |
-| `Unavailable` | The runtime, worker, or required service has stopped or was interrupted. | Stop using this cache instance and reopen or replace it. |
-| `CorruptData` | Cache data or internal structure failed validation. | Treat the cache as disposable; inspect logs/device health and reopen it. |
-| `Io` | A filesystem or device operation failed. | Inspect `io_kind()`, `raw_os_error()`, and the source chain. |
-| `Internal` | A worker, synchronization primitive, or internal invariant failed without an OS error. | Record diagnostics and replace the cache instance. |
+| `ErrorKind`         | Meaning                                                                                 | Usual response                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `InvalidInput`      | Storage/runtime options or a request key/value is invalid.                              | Fix the input; retrying it unchanged cannot succeed.                                                  |
+| `Unsupported`       | The selected I/O engine, mode, or platform capability is unavailable.                   | Select a supported configuration or build target; inspect the I/O source for the missing requirement. |
+| `Busy`              | `open` could not acquire exclusive ownership of the cache files.                        | Coordinate ownership or retry later with a bound.                                                     |
+| `Overloaded`        | A bounded request-path slot, queue, buffer, or deadline is exhausted.                   | Fall through to the authoritative path or retry with a bound.                                         |
+| `ResourceExhausted` | Startup or lifecycle work could not satisfy a required allocation/resource requirement. | Reduce the configured footprint or provide more resources.                                            |
+| `Unavailable`       | The runtime, worker, or required service has stopped or was interrupted.                | Stop using this cache instance and reopen or replace it.                                              |
+| `CorruptData`       | Cache data or internal structure failed validation.                                     | Treat the cache as disposable; inspect logs/device health and reopen it.                              |
+| `Io`                | A filesystem or device operation failed.                                                | Inspect `io_kind()`, `raw_os_error()`, and the source chain.                                          |
+| `Internal`          | A worker, synchronization primitive, or internal invariant failed without an OS error.  | Record diagnostics and replace the cache instance.                                                    |
 
 The classification is contextual. For example, `WouldBlock` during `open` is `Busy`, while `WouldBlock` during `put` is `Overloaded`. A managed read-buffer allocation failure during `get` is also `Overloaded`; the same low-level kind during startup is `ResourceExhausted`. A `get` wait-deadline expiry is `Overloaded`, while a device completion timeout reported by `drain` or close is `Io`.
 
@@ -97,16 +97,6 @@ async fn flush_cache(cache: Cache) -> std::io::Result<()> {
 
 `Error::into_io_error()` performs the same lossless conversion explicitly. Use `Error::into_io_error_with_context()` when retaining the C² operation and classification in the source chain is more important. That contextual wrapper keeps the original I/O kind, but its outer `raw_os_error()` is `None`; the wrapped `cache2::Error` still exposes the original code.
 
-### Migrating from the `io::Result` API
-
-Before the structured error API, callers commonly wrote:
-
-```text
-error.kind() == std::io::ErrorKind::WouldBlock
-```
-
-Use `error.kind() == cache2::ErrorKind::Overloaded` for application policy. Use `error.io_kind() == std::io::ErrorKind::WouldBlock` only when exact legacy I/O behavior is required. Returning a C² error from a `std::io::Result` function requires `Err(error.into())`; the `?` operator performs that conversion automatically.
-
 ## Configuration and open failures
 
 `StorageOptions::build` reports `BuildStorage`; `CacheConfig::new` reports `BuildConfig`. Correct invalid options or an insufficient managed-memory limit before trying again. Successful results retain the checked layout and resource requirements, so inspecting their disk and memory bounds cannot fail.
@@ -115,4 +105,4 @@ Use `error.kind() == cache2::ErrorKind::Overloaded` for application policy. Use 
 
 ## Transient background timeouts
 
-A background admission or completion deadline enters a reversible `CacheHealth::Recovering` state. New fills return overload; reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` defaults to `None` for recovery until completion or close; a finite `Some(duration)` limits the additional wait, and `Some(Duration::ZERO)` restores immediate cancellation. Workers retain their original requests, buffers, and Regions, checking at fixed one-second intervals. No issued write is retried. Admission is retried only for an operation that was not submitted. All affected work must complete validation and publication before fills resume. Close interrupts recovery and invokes bounded cancellation; drain may wait indefinitely. Actual I/O errors, invalid completions, and finite-budget exhaustion still fail the instance. An unfinished write remains isolated and prevents CLEAN publication; no in-place reset of terminal health is attempted. Recovery events indicate a timeout, not a diagnosis of device unavailability.
+A background write or reclaim timeout enters `CacheHealth::Recovering` instead of failing the cache immediately: new fills return `ErrorKind::Overloaded` while reads and deletes continue, and fills resume after the timed-out background operations finish. `RuntimeOptions::io_recovery_timeout` defaults to `None` (wait until completion or close); set `Some(duration)` to limit the additional recovery wait, or `Some(Duration::ZERO)` to cancel immediately. Finite-budget exhaustion, actual I/O errors, and invalid completions remain terminal failures.

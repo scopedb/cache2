@@ -35,34 +35,18 @@ let adjusted = CacheConfig::new(config.storage().clone(), runtime)?;
 
 `Cache::open` consumes one configuration and uses the current Tokio runtime when first polled. Use `Cache::open_with_handle(path, config, handle)` for an explicit runtime, which must have time enabled and outlive the cache. Clone the configuration before opening when it will be reused. Each open locks files and acquires its own resources; constructing a configuration reserves none of them.
 
-| Stage | Error operation | What can fail |
-|-------|-----------------|---------------|
-| Build storage | `BuildStorage` | Invalid or unrepresentable geometry/index, disk-accounting overflow, bounded layout allocation |
-| Build complete configuration | `BuildConfig` | Runtime limits, Region/shard compatibility, build/platform support, insufficient managed memory |
-| Open cache | `Open` | File locks, filesystem/device capabilities, recovery, actual allocation, runtime binding, worker startup |
-
-Recovery still validates persisted metadata against the selected layout, and reads still validate records. Configuration construction cannot establish the contents of files or guarantee that external resources remain available.
-
-### Migrating from 0.5
-
-Move `runtime.statistics = true` to `runtime.stats.activity_counters = true`. All optional collection now lives under `StatsOptions`: activity counters, terminal request counters, and latency collection remain independent and disabled by default. Replace `snapshot.statistics_enabled` with `snapshot.activity_counters_enabled`; this flag describes the activity family only, while `CacheStatsSnapshot::options` describes all collection settings. The counter populations, memory accounting, and on-disk format are unchanged.
-
-### Migrating from 0.4
-
-Rename unchecked `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` to their `Options` counterparts. The benchmarking input `RegionIndexTurnoverConfig` likewise becomes `RegionIndexTurnoverOptions`. `CacheConfig` remains the validated result, and `StorageLayout` remains the validated persistent layout.
-
-Replace option struct literals with `StorageOptions::new(capacity_bytes)` or `RuntimeOptions::default()` followed by field assignments. For POSIX and io_uring, replace positional `new(...)` calls and `with_*` methods with `Default` and named fields; read fields directly instead of calling getters. Keep `IoUringSqPollOptions::new(idle_millis)` to supply the polling idle time. Defaults, validation boundaries, and persistent data formats are unchanged.
-
-### Migrating from the builder API
-
-Replace `StaticConfig` with `StorageOptions` and call `build()` once to obtain the layout. Replace `RuntimeConfig` setters with `RuntimeOptions` fields, then construct `CacheConfig::new(layout, options)`. Replace `CacheBuilder::open()` with `Cache::open(path, config)`, passing any explicit Tokio handle through `Cache::open_with_handle`. The standalone `validate()` method is removed; disk-usage queries now belong to `StorageLayout` and return `u64` directly. Use `ReadAdmission::Immediate` for the former zero timeout, or `ReadAdmission::Wait { timeout, max_waiters }` for bounded waiting.
+| Stage                        | Error operation | What can fail                                                                                            |
+| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
+| Build storage                | `BuildStorage`  | Invalid or unrepresentable geometry/index, disk-accounting overflow, bounded layout allocation           |
+| Build complete configuration | `BuildConfig`   | Runtime limits, Region/shard compatibility, build/platform support, insufficient managed memory          |
+| Open cache                   | `Open`          | File locks, filesystem/device capabilities, recovery, actual allocation, runtime binding, worker startup |
 
 ## Measure the workload envelope first
 
 Collect these quantities before choosing values:
 
 | Quantity                                                      | Use                                                                                   |
-|---------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Maximum simultaneously live distinct keys                     | Sizes the fixed L2 index. Count current mappings, not lifetime writes.                |
 | Value-size distribution, including the maximum encoded record | Selects Region size, estimates live-key density, and determines read-buffer pressure. |
 | Peak concurrent L2 reads after L1                             | Sizes read admission. Total request concurrency is usually an overestimate.           |
@@ -95,19 +79,19 @@ The managed-memory limit is not an RSS limit. Allocator metadata, Tokio, the app
 
 ### High-impact interaction map
 
-| Change                          | Direct effect                                        | Important coupled effects                                                                                                                   |
-|---------------------------------|------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| Increase `expected_entries`     | Lowers fixed-index load                              | Grows index mapping, heat bits, recovery images, and potentially L1 slot metadata; leaves less managed memory for L1 and reads              |
-| Increase Region size            | Holds larger records and more staged bytes per shard | Multiplies append/reclaim/read allowances, reduces Region count and rotation frequency, and makes reclaim coarser                           |
-| Increase append shards          | Adds mutation gates and staging paths                | Adds two Region buffers, one Active Region, one worker, controls, and minimum geometry per shard; raises the allowed reclaim-worker ceiling |
-| Increase read execution capacity | Admits more L2 reads                                | Adds queues and possible transient-buffer demand; POSIX also adds worker stacks, while io_uring ring count is independent                   |
-| Enable or lengthen read waiting  | Trades immediate misses for bounded wait            | Adds the configured wait capacity, can raise p99, and returns overload when queue, memory, or deadline is exhausted                         |
-| Increase write execution capacity | Adds write I/O concurrency                         | Adds queue pressure and device contention; POSIX also adds worker stacks and neither backend adds foreground staging space                 |
-| Increase reclaim concurrency     | Recycles more Regions concurrently                  | Adds one Region buffer and logical worker per request slot and can compete for device and append-staging capacity                          |
-| Enable Adaptive fill control    | Pauses new fills; paces flush                        | Ceilings are instance-wide; they do not change reads, deletes, or `CacheHealth` on pre-timeout pause                                        |
-| Increase L1 capacity            | Retains more reusable values                         | Reduces L2 demand but consumes retained bytes and fixed metadata from the same managed-memory limit                                         |
-| Increase L1 shards              | Reduces shard-local contention                       | Adds fixed metadata and controls; too many small shards reduce useful capacity efficiency                                                   |
-| Lower write flush threshold     | Requests earlier partial publication                 | Increases write operation count and reduces batching without increasing staging capacity                                                    |
+| Change                            | Direct effect                                        | Important coupled effects                                                                                                                   |
+| --------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Increase `expected_entries`       | Lowers fixed-index load                              | Grows index mapping, heat bits, recovery images, and potentially L1 slot metadata; leaves less managed memory for L1 and reads              |
+| Increase Region size              | Holds larger records and more staged bytes per shard | Multiplies append/reclaim/read allowances, reduces Region count and rotation frequency, and makes reclaim coarser                           |
+| Increase append shards            | Adds mutation gates and staging paths                | Adds two Region buffers, one Active Region, one worker, controls, and minimum geometry per shard; raises the allowed reclaim-worker ceiling |
+| Increase read execution capacity  | Admits more L2 reads                                 | Adds queues and possible transient-buffer demand; POSIX also adds worker stacks, while io_uring ring count is independent                   |
+| Enable or lengthen read waiting   | Trades immediate misses for bounded wait             | Adds the configured wait capacity, can raise p99, and returns overload when queue, memory, or deadline is exhausted                         |
+| Increase write execution capacity | Adds write I/O concurrency                           | Adds queue pressure and device contention; POSIX also adds worker stacks and neither backend adds foreground staging space                  |
+| Increase reclaim concurrency      | Recycles more Regions concurrently                   | Adds one Region buffer and logical worker per request slot and can compete for device and append-staging capacity                           |
+| Enable Adaptive fill control      | Pauses new fills; paces flush                        | Ceilings are instance-wide; they do not change reads, deletes, or `CacheHealth` on pre-timeout pause                                        |
+| Increase L1 capacity              | Retains more reusable values                         | Reduces L2 demand but consumes retained bytes and fixed metadata from the same managed-memory limit                                         |
+| Increase L1 shards                | Reduces shard-local contention                       | Adds fixed metadata and controls; too many small shards reduce useful capacity efficiency                                                   |
+| Lower write flush threshold       | Requests earlier partial publication                 | Increases write operation count and reduces batching without increasing staging capacity                                                    |
 
 ## Persistent layout
 
@@ -118,7 +102,7 @@ The managed-memory limit is not an RSS limit. Allocator metadata, Tokio, the app
 Every encoded key/value record must fit in one Region. Region size also scales several resources and policies at once:
 
 | Smaller Regions                                             | Larger Regions                                                                     |
-|-------------------------------------------------------------|------------------------------------------------------------------------------------|
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | Lower append and reclaim buffer memory                      | More bytes available in the two buffers owned by each append shard                 |
 | Finer-grained FIFO eviction and reclaim                     | Larger write batches and fewer rotations                                           |
 | More rotations and Region metadata activity                 | Supports larger individual records                                                 |
@@ -136,7 +120,7 @@ Choose the smallest Region that safely holds the largest cacheable record, then 
 If `N` is the measured maximum live-key count, deliberately passing a multiple of `N` supplies placement headroom:
 
 | Configured `E` | Slots per live key | Nominal offered load | Approximate index plus heat bytes per live key | Bias                         |
-|---------------:|-------------------:|---------------------:|-----------------------------------------------:|------------------------------|
+| -------------: | -----------------: | -------------------: | ---------------------------------------------: | ---------------------------- |
 |            `N` |                  2 |                  50% |                                           17 B | Minimum fixed memory         |
 |           `2N` |                  4 |                  25% |                                           34 B | Balanced                     |
 |           `4N` |                  8 |                12.5% |                                           67 B | Hit-rate oriented            |
@@ -155,7 +139,7 @@ Use `StorageLayout::peak_disk_bytes()` when planning the data file, state file, 
 These three controls should be tuned together:
 
 | Control                    | Increase when                                          | Cost or failure mode                                                               |
-|----------------------------|--------------------------------------------------------|------------------------------------------------------------------------------------|
+| -------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
 | `l1_capacity_bytes`        | A reusable working set can avoid expensive L2 reads    | Retained bytes and fixed entry metadata consume managed memory                     |
 | `l1_shards`                | L1 try-lock contention causes bypass or promotion loss | More directory, policy, and runtime-control accounting; tiny shards waste capacity |
 | `L1EvictionPolicy::S3Fifo` | Reuse is skewed or scans create one-hit pollution      | More fixed policy metadata than CLOCK                                              |
@@ -180,10 +164,10 @@ Physical execution is backend-specific. `PosixIoOptions::read_workers` is both t
 
 `read_admission` chooses pressure behavior independently of physical capacity:
 
-| Setting | When execution is full | Best fit |
-|---------|------------------------|----------|
-| `ReadAdmission::Immediate` | Return a cache miss immediately | Lowest bounded tail; authoritative fallback is cheap |
-| `ReadAdmission::Wait { timeout, max_waiters }` | Queue within a positive deadline | Preserve more hits within a short latency budget |
+| Setting                                        | When execution is full           | Best fit                                             |
+| ---------------------------------------------- | -------------------------------- | ---------------------------------------------------- |
+| `ReadAdmission::Immediate`                     | Return a cache miss immediately  | Lowest bounded tail; authoritative fallback is cheap |
+| `ReadAdmission::Wait { timeout, max_waiters }` | Queue within a positive deadline | Preserve more hits within a short latency budget     |
 
 `Wait` requires a timeout greater than zero and no longer than five seconds. `max_waiters: None` follows the aggregate read in-flight limit at configuration construction; `Some(n)` sets an independent queue bound. For example:
 
@@ -217,17 +201,17 @@ foreground writer -> hash-routed append shard -> two Region buffers
 The controls operate at different stages:
 
 | Control                       | Primary benefit                                                                    | Main cost                                                                       |
-|-------------------------------|------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| ----------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `append_shards`               | Reduces foreground mutation-gate contention and supplies independent staging paths | Two Region buffers, one Active Region, one worker, and fixed controls per shard |
-| Backend write pool           | Lets more completed batches reach the device concurrently                          | Queue capacity and device contention; POSIX workers also reserve stacks          |
+| Backend write pool            | Lets more completed batches reach the device concurrently                          | Queue capacity and device contention; POSIX workers also reserve stacks         |
 | `write_flush_threshold_bytes` | Controls when a partial buffer requests publication                                | Smaller values issue more, smaller writes; larger values favor batching         |
 | Region size                   | Changes per-shard burst reservoir and rotation frequency                           | Multiplies staging and reclaim memory and changes eviction granularity          |
 
-Start with append shards near the number of genuinely concurrent foreground writers, then measure. More shards are not monotonic: excess shards fragment data across additional partial buffers and Active Regions, consume memory, and can reduce useful capacity. Each fill tries its hash-routed shard once, with the same path during initial growth, reclaim, and recovery. Lock contention returns overload; capacity pressure requests progress on that shard. Hash skew can still overload one shard even when aggregate buffers look empty. Keep append-shard and I/O-worker counts fixed when comparing revisions, and tune them separately to the actual foreground concurrency and storage throughput.
+Start with append shards near the number of genuinely concurrent foreground writers, then measure. More shards are not monotonic: excess shards fragment data across additional partial buffers and Active Regions, consume memory, and can reduce useful capacity. Each fill tries its hash-routed shard once, with the same path during initial growth, reclaim, and recovery. Lock contention returns overload; capacity pressure requests progress on that shard. Hash skew can still overload one shard even when aggregate buffers look empty.
 
 Start write execution capacity near the append-shard count. Increase it only when write I/O in-flight peaks at the configured capacity or slot-wait time grows while the device still has headroom. More execution capacity cannot fix a foreground mutation-gate collision, a full shard-local staging pair, or a saturated SSD.
 
-The flush threshold is per append shard, defaults to 4 MiB, is 4 KiB-aligned, and ranges from 4 KiB through 4 MiB. Smaller thresholds start writes sooner and reduce the final batch left for `drain`; larger thresholds reduce write-request overhead but can delay publication and capacity recovery. Compare accepted puts plus `drain` as well as continuous traffic when tuning it. Pressure, the bounded flush delay, rotation, and `drain` can flush below the threshold, so it is not a visibility deadline. When a record requires a new Region, its capacity request remains pending through the final write and the worker rotates as soon as it can safely do so, without requiring another rejected put.
+The flush threshold is per append shard, defaults to 4 MiB, is 4 KiB-aligned, and ranges from 4 KiB through 4 MiB. Smaller thresholds start writes sooner and reduce the final batch left for `drain`; larger thresholds reduce write-request overhead but can delay publication and capacity recovery. Compare accepted puts plus `drain` as well as continuous traffic when tuning it. Pressure, the bounded flush delay, rotation, and `drain` can flush below the threshold, so it is not a visibility deadline.
 
 `put` and `put_l2` intentionally do not wait for staging capacity. A larger Region or more appropriately placed shards can absorb more of a finite burst, but configuration does not turn immediate admission into an unbounded lossless queue. Applications that require higher acceptance must retry with their own deadline, bypass the cache, or split bursts with completion barriers. `put` attempts immediate L1 visibility; L2 visibility for both operations follows publication. `drain` waits for accepted Region writes and index publication.
 
@@ -282,11 +266,11 @@ runtime.io_engine = IoEngineOptions::IoUring(io);
 
 `rings` is driver-thread and kernel-ring count. `max_in_flight` is the aggregate admission bound and is divided as evenly as possible across those rings. Extra rings do not add execution slots. POSIX `read_workers` is both thread count and depth; map that depth to `read.max_in_flight` with `rings = 1`, not to `rings`. Configuration construction fails with `ErrorKind::Unsupported` if the crate feature, OS, or architecture is missing; the I/O source names the requirement. Kernel opcode and NODROP checks happen at open.
 
-| Pool    | `rings` | `max_in_flight`                         | Pattern                                              |
-| ------- | ------- | --------------------------------------- | ---------------------------------------------------- |
-| Read    | 1       | Concurrent L2 `get` futures             | Start here; this is admission depth                  |
-| Write   | 1       | Leave the default 64                    | Sequential fill; do not copy the read depth          |
-| Reclaim | 1       | Leave the default 1                     | Raise only for observed Free-Region lag              |
+| Pool    | `rings` | `max_in_flight`             | Pattern                                     |
+| ------- | ------- | --------------------------- | ------------------------------------------- |
+| Read    | 1       | Concurrent L2 `get` futures | Start here; this is admission depth         |
+| Write   | 1       | Leave the default 64        | Sequential fill; do not copy the read depth |
+| Reclaim | 1       | Leave the default 1         | Raise only for observed Free-Region lag     |
 
 Keep `rings = 1` until a single driver thread is CPU-bound, then raise `rings` while holding `max_in_flight` fixed. `rings` must not exceed that pool's in-flight limit; each ring receives a floor or ceiling share of the same depth. Under `ReadAdmission::Immediate`, extra gets beyond read depth are busy misses, so do not set `max_in_flight` far above caller concurrency.
 
@@ -380,18 +364,12 @@ Use this profile when the data set exceeds host RAM and the goal is device behav
 - Leave SQPOLL and IOPOLL off during ring and in-flight sweeps. They are independent advanced flags; profile at most one of them, and only after depth is set. IOPOLL still requires Direct I/O on a polling-capable filesystem.
 - Watch `requests_in_flight_peak`, `slot_wait_ns`, `l2_read_busy_misses`, and Direct versus served-byte amplification instead of throughput alone.
 
-Keep the library default of one ring per pool. Set `read.max_in_flight` to concurrent L2 gets; use 32 or 64 when that is the caller depth, and lower it when the caller issues fewer gets. Do not raise `rings` with vCPU count. Leave write and reclaim at their defaults. Leave SQPOLL and IOPOLL off.
-
-| Read rings | Read `max_in_flight`         | Write / reclaim                    | SQPOLL / IOPOLL |
-| ---------- | ---------------------------- | ---------------------------------- | --------------- |
-| 1          | Concurrent L2 gets, 32 or 64 | Library default (1 / 64 and 1 / 1) | Off             |
-
 ## Diagnostic map
 
 Use `Cache::snapshot()` for regular telemetry and `Cache::detailed_snapshot()` for periodic diagnosis.
 
 | Observation                                                         | Likely constraint                                 | Tuning direction                                                                             |
-|---------------------------------------------------------------------|---------------------------------------------------|----------------------------------------------------------------------------------------------|
+| ------------------------------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Rising `index.overflow_evictions` or high slot occupancy            | Fixed index load                                  | Increase `expected_entries`; this is a static-layout change                                  |
 | `l2_read_busy_misses`                                               | Immediate read execution pressure                 | Increase read capacity, improve L1, or deliberately enable bounded waiting                   |
 | `l2_read_memory_misses`                                             | No managed buffer available                       | Add memory headroom, reduce retained values/fixed allocations, or reduce read concurrency    |
@@ -432,23 +410,23 @@ Change one resource family at a time and alternate baseline and candidate runs o
 
 ## Hard configuration bounds
 
-| Setting                  | Bound                                                                                                                                                      |
-|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Region size              | Nonzero 4 KiB multiple, at most 32 MiB                                                                                                                     |
-| Capacity                 | Exact Region multiple with more Regions than append shards                                                                                                 |
+| Setting                  | Bound                                                                                                                                                 |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Region size              | Nonzero 4 KiB multiple, at most 32 MiB                                                                                                                |
+| Capacity                 | Exact Region multiple with more Regions than append shards                                                                                            |
 | Index slots              | At least 8; the upper bound is derived from the addressable page, mapping, and recovery-image layout; `expected_entries` requests two slots per entry |
-| Append shards            | 1 through 256                                                                                                                                              |
-| Reclaim concurrency      | 1 through append-shard count                                                                                                                               |
-| POSIX pool workers       | 1 through 4,096 for read, write, and reclaim                                                                                                               |
-| io_uring rings           | 1 through 65,536 per pool and no greater than that pool's aggregate in-flight limit                                                                        |
-| io_uring in-flight limit | 1 through 65,536 per pool, with at most 4,096 requests assigned to one ring                                                                                 |
-| Read wait timeout        | Greater than zero through five seconds in `Wait`; `Immediate` disables waiting                                                                                                                                  |
-| Maximum waiting reads    | 1 through 65,536 in `Wait`; defaults to the read execution capacity |
-| L1 shards                | 1 through 65,536                                                                                                                                           |
-| Write flush threshold    | 4 KiB multiple from 4 KiB through 4 MiB                                                                                                                    |
-| Fill bytes per second    | 640 through 1 TiB/s when fill control is enabled; instance-wide                                                                                            |
-| Fill records per second  | 10 through 4,294,967,295 when fill control is enabled; instance-wide                                                                                       |
-| Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed footprint                                                                               |
+| Append shards            | 1 through 256                                                                                                                                         |
+| Reclaim concurrency      | 1 through append-shard count                                                                                                                          |
+| POSIX pool workers       | 1 through 4,096 for read, write, and reclaim                                                                                                          |
+| io_uring rings           | 1 through 65,536 per pool and no greater than that pool's aggregate in-flight limit                                                                   |
+| io_uring in-flight limit | 1 through 65,536 per pool, with at most 4,096 requests assigned to one ring                                                                           |
+| Read wait timeout        | Greater than zero through five seconds in `Wait`; `Immediate` disables waiting                                                                        |
+| Maximum waiting reads    | 1 through 65,536 in `Wait`; defaults to the read execution capacity                                                                                   |
+| L1 shards                | 1 through 65,536                                                                                                                                      |
+| Write flush threshold    | 4 KiB multiple from 4 KiB through 4 MiB                                                                                                               |
+| Fill bytes per second    | 640 through 1 TiB/s when fill control is enabled; instance-wide                                                                                       |
+| Fill records per second  | 10 through 4,294,967,295 when fill control is enabled; instance-wide                                                                                  |
+| Managed-memory limit     | Nonzero, at least L1 capacity, and large enough for the validated fixed footprint                                                                     |
 
 Storage and configuration construction enforce these bounds before file access. Open checks the selected filesystem, device, and runtime environment.
 
@@ -458,11 +436,11 @@ Set `options.reclaim_io_timeout = Duration::from_secs(30)` after constructing `R
 
 ### Background I/O recovery
 
-`options.io_recovery_timeout = None` is the default: background admission/completion timeouts enter `CacheHealth::Recovering` and wait until the original operation completes or close interrupts recovery. Set `Some(Duration::from_secs(300))` for a five-minute additional budget, or `Some(Duration::ZERO)` for immediate cancellation. Finite combined deadlines must be representable. Recovery uses fixed one-second checks, without an exponential backoff or repeated submission of issued I/O. Admission retries are allowed only when the engine returns the unsubmitted operation. New `put` and `put_l2` calls return overload while any background operation is recovering; reads and deletes keep their normal behavior. Already accepted work retains its bounded resources. Fills resume only after every affected operation passes validation and publication. Drain can wait indefinitely in the default mode; close interrupts recovery within a polling interval, then applies bounded cancellation. Normal close work still has its ordinary deadlines. Actual I/O errors, invalid completions, and finite-budget exhaustion retain terminal failure safeguards. This is not an automatic reopen of a failed instance.
+`options.io_recovery_timeout = None` is the default: background admission and completion timeouts enter `CacheHealth::Recovering` and wait until the original operation completes or close interrupts recovery. Set `Some(Duration::from_secs(300))` for a five-minute additional budget, or `Some(Duration::ZERO)` for immediate cancellation. Finite combined deadlines must be representable. Recovery uses fixed one-second checks without exponential backoff or repeated submission of issued I/O; admission retries apply only when the engine returns an unsubmitted operation. New `put` and `put_l2` calls return overload while any background operation is recovering, whereas reads and deletes continue normally and accepted work retains its bounded resources. Fills resume only after every affected operation passes validation and publication. Drain can wait indefinitely in the default mode; close interrupts recovery within one polling interval and applies bounded cancellation, while normal close steps retain their ordinary deadlines. Actual I/O errors, invalid completions, and finite-budget exhaustion retain terminal failure safeguards.
 
 ### Adaptive fill admission
 
-`RuntimeOptions::fill_control` defaults to `FillControlOptions::Disabled`. `Observe` records pause pressure and hypothetical rejections while retaining ordinary admission and flush cadence. `Adaptive` rejects new `put` and `put_l2` fills with `ErrorKind::Overloaded` when paused, and paces non-essential background flush by the configured ceilings. Neither mode changes foreground reads, deletes, accepted flushes, essential reclaim, or the existing timeout recovery policy. Adaptive also suppresses optional hot-record reinsertion while paused. Pressure is separate from `CacheHealth`: a pre-timeout pause leaves a healthy cache `Running`.
+`RuntimeOptions::fill_control` defaults to `FillControlOptions::Disabled`. `FillControlOptions::Observe(limits)` records pre-timeout pause pressure and hypothetical rejections (`would_reject`) without altering admission or flush cadence. `FillControlOptions::Adaptive(limits)` rejects new `put` and `put_l2` fills with `ErrorKind::Overloaded` when paused, paces non-essential background flushes against the configured ceilings, and suppresses optional hot-record reinsertion while paused. Neither mode changes foreground reads, deletes, accepted flushes, urgent/drain/rotation flushes, essential reclaim, or timeout recovery, and pre-timeout pauses leave `CacheHealth::Running` unchanged.
 
 ```rust
 use cache2::{FillControlOptions, FillLimits, RuntimeOptions};
@@ -475,12 +453,6 @@ options.fill_control = FillControlOptions::Observe(limits);
 options.fill_control = FillControlOptions::Adaptive(limits);
 ```
 
-The two ceilings are instance-wide: every append shard shares one token bucket. They constrain logical encoded fill bytes (charged in 64-byte units) and fill records from the worker's staging snapshot, not device bandwidth or physical IOPS. `put` and `put_l2` do not consume the bucket; Adaptive rejects those calls only while paused. The sealed span may grow by later encodes before the lock. Valid ceilings are 640 bytes/s through 1 TiB/s and 10 through 4,294,967,295 records/s. Adaptive refill adds elapsed credit up to 100 ms of the configured ceilings and at least one maximum-size record; intervals too short to mint a unit or record do not move the refill clock. An idle controller never accumulates more than that bounded burst. A flush larger than that burst still proceeds on remaining credit, and a flush that cannot take a span refunds only what it consumed. Urgent, drain, and rotation flushes always proceed; other flushes wait for budget and back-pressure staging into ordinary write overload. Observe does not delay flush and counts `would_reject` only for pause.
+`FillLimits` enforces instance-wide ceilings across one shared token bucket covering logical encoded fill bytes (charged in 64-byte units, where the sealed span may grow by later encodes before the lock) and fill records from worker staging snapshots rather than physical device bandwidth or IOPS (`put` and `put_l2` do not consume the bucket). Valid ceilings range from `640` bytes/s through `1 TiB/s` and `10` through `4,294,967,295` records/s. Adaptive refill credits elapsed time up to a bounded burst of `100 ms` of the configured ceilings (or at least one maximum-size record), advancing the refill clock only when at least one unit or record is minted; an idle controller never accumulates more than that bounded burst, flushes larger than the burst proceed on remaining credit, failed span acquisitions refund only consumed credit, and unbudgeted non-essential flushes wait and back-pressure staging into ordinary write overload. Background workers also checkpoint outstanding I/O at one quarter of the normal I/O deadline (capped at `500 ms`) to pause new Adaptive fills (and record `would_reject` under Observe) while live holder counts remain nonzero, lifting the pause as soon as the slow I/O completes rather than waiting for validation or reclaim scanning; idle time never triggers a pause, though very short deadlines or descheduled workers can still reach timeout recovery first (which keeps its admission fence until all affected work completes validation and publication).
 
-Background workers checkpoint outstanding I/O at one quarter of the normal deadline, capped at 500 ms, and pause new Adaptive fills without entering timeout recovery. Checkpoint pause follows live holder counts and lifts when that I/O completes, even if later validation or reclaim scanning is still running. Observe uses the same checkpoints so it can report `would_reject`. Estimated drain time is reported for snapshots from validated throughput since open and does not pause admission. These are conservative pressure signals: very short deadlines or a descheduled worker can still reach timeout first. Idle time alone never looks like a stall. Pause and the rate bucket are independent: a busy device is shed by checkpoint or timeout recovery, not by copying sequential-write specifications into `FillLimits`. Normal timeout recovery keeps its admission fence until all affected work is validated and published.
-
-Start with `Observe` and the same ceilings you plan to enforce. Inspect `CacheSnapshot::fill_control` (`pressure`, `would_reject`, `oldest_operation_ns`) together with device queueing, then switch to `Adaptive` without changing the numbers. The example `256 MiB/s` and `20_000` records/s is a conservative mixed-write starting point, not an NVMe datasheet copy. Both dimensions must hold: if typical encoded records are about 1 KiB, a 256 MiB/s byte ceiling needs on the order of 200_000–500_000 records/s or the record limit fires first. To pause ingest on stalls while leaving healthy flush uncapped, raise both ceilings until they no longer clip measured fill (for example 1–2 GiB/s with a matching record rate). To keep headroom for reads and reclaim on a shared NVMe, set the byte ceiling around one third to one half of measured sustainable cache write; four write workers and a 4 MiB flush threshold often land in the 256–512 MiB/s range. Do not use the legal minima (640 bytes/s, 10 records/s) as NVMe defaults. Buffered macOS results do not qualify Linux NVMe; use [Validation](BENCHMARK.md) on the target device.
-
-`CacheSnapshot::fill_control` reports pressure, enforcement, configured or paused rates, rejections, hypothetical pause refusals, dropped observations, outstanding bytes/operations, oldest age, and estimated drain time independently of `RuntimeOptions::stats`. Outstanding bytes exclude unflushed staging. A zero drain estimate means no estimate is available when work is pending. A full observation table skips that request rather than failing I/O. These measurements cannot distinguish device throttling from CPU scheduling, kernel queueing, or slow validation; correlate them with host metrics before diagnosing hardware. `cache_fill_pressure_changed` logs state transitions under `cache2::health`.
-
-Enabled modes preallocate one observation per append/reclaim worker, included in `CacheConfig::minimum_memory_bytes()`. Background observations use atomics over this bounded table. Foreground fill admission loads pause-holder and recovery counters without allocation, clocks, or locks from the controller. Reinsertion suppression reads atomics. Close stops admission independently of outstanding I/O. Disabled mode creates no controller or observations.
+Start with `Observe` using the target ceilings, inspect `CacheSnapshot::fill_control` (`pressure`, `would_reject`, `oldest_operation_ns`) alongside device queueing (since observations cannot distinguish device throttling from CPU scheduling, kernel queueing, or slow validation), and switch to `Adaptive` without changing the numbers. The example `256 MiB/s` and `20,000` records/s is a conservative mixed-write starting point rather than an NVMe datasheet spec: scale both ceilings together (for ~1 KiB encoded records, `256 MiB/s` needs roughly `200_000–500_000` records/s so the record ceiling does not clip first), raise both above measured fill (for example `1–2 GiB/s` with matching records/s) to shed only stalls, or set the byte ceiling to roughly one third to one half of measured sustainable cache write (`256–512 MiB/s` with four write workers and a 4 MiB flush threshold) to reserve NVMe headroom for reads and reclaim; avoid using the legal minima (`640` bytes/s, `10` records/s) as NVMe defaults, and qualify Linux NVMe via [Validation](BENCHMARK.md) rather than buffered macOS runs. `CacheSnapshot::fill_control` exposes `pressure`, enforcement, configured and paused rates, rejections, `would_reject`, `dropped_observations`, outstanding bytes (excluding unflushed staging) and operations, oldest age, and an informational drain-time estimate derived from validated throughput since open (`0` when unavailable with pending work) independently of `RuntimeOptions::stats`; transitions log `cache_fill_pressure_changed` under `cache2::health`. Enabled modes preallocate one atomic observation per append and reclaim worker (included in `CacheConfig::minimum_memory_bytes()`), skipping an observation (`dropped_observations`) instead of failing I/O if the table is full, while foreground fill admission checks pause and recovery counters without allocation, clocks, or locks from the controller, close stops admission independently of outstanding I/O, and `Disabled` creates no controller or observations.

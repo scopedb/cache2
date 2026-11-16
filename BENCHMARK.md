@@ -6,7 +6,7 @@ Compare revisions only on the same host, filesystem, device, toolchain, and work
 
 Start from a saved source tree and binary, including any uncommitted changes. Change one mechanism per experimental build, record its patch and binary checksum, and keep routing, workload, memory limits, admission ceilings, statistics, and I/O topology fixed. Run builds and timed workloads separately. Retain every sample, including regressions and failed runs; a correctness or memory-bound failure disqualifies a candidate regardless of throughput.
 
-Use isolated measurements to explain a cost before changing the architecture. For L1 accounting, compare same-key replacement with new-key eviction at a full fixed byte budget: replacement has no eviction-counter increment, while both paths transfer an exclusive memory charge. Measure each change separately and together to expose interactions. Check small and 16 KiB values, and retain data-validation and exact memory-accounting checks. An isolated speedup does not establish a whole-cache speedup.
+Use isolated measurements to explain a cost before changing the architecture, measuring each change separately and together to expose interactions across representative value sizes while keeping data-validation and resource-accounting checks active. An isolated speedup does not establish a whole-cache speedup.
 
 Before editing the measured production path, qualify the measurement with byte-identical A/A runs. Use the comparison procedure below, and stop if its uncertainty or drift gate fails. Qualify the chosen implementation with balanced baseline/candidate runs using the batch-plus-drain and mixed-turnover workloads below. Compare effective hit throughput, accepted writes, rejections, latency, CPU, and RSS together. Include a single-writer case and a longer sampled Adaptive run when the changed mechanism affects contention or allocation. Treat variation in an unaffected path as a noise control; repeat or lengthen measurements before attributing small differences to a change. Keep experimental switches and rejected candidates out of the production request path.
 
@@ -70,16 +70,16 @@ The benchmark measures accepted puts plus drain, resident L1 reads, warm close, 
 
 The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults and validation rules.
 
-| Purpose        | Variables                                                                                                                                                                                                                                                             |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Data shape     | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES`                                                                                                                                                                                      |
-| Capacity       | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_L1_CAPACITY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                                                                                                     |
-| Concurrency    | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_POSIX_READ_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_POSIX_WRITE_WORKERS`, `CACHE_BENCH_POSIX_RECLAIM_WORKERS` |
-| I/O path       | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                                                                                                                     |
-| Cache policy   | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                                                                                                                  |
-| Batching       | `CACHE_BENCH_WRITE_FLUSH_THRESHOLD_BYTES` (defaults to the library threshold; the effective byte value is printed)                                                                                                                                                    |
-| Measurement    | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_ACTIVITY_COUNTERS` (default false), `CACHE_BENCH_WRITE_ROUNDS` (default 0), `CACHE_BENCH_WRITE_WARMUP_ROUNDS` (default 2), `CACHE_BENCH_WRITE_ONLY` (default false)              |
-| Gates          | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                                                                                                               |
+| Purpose      | Variables                                                                                                                                                                                                                                                             |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data shape   | `CACHE_BENCH_ENTRIES`, `CACHE_BENCH_VALUE_BYTES`, `CACHE_BENCH_RESIDENT_ENTRIES`                                                                                                                                                                                      |
+| Capacity     | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_L1_CAPACITY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                                                                                                     |
+| Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_POSIX_READ_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_POSIX_WRITE_WORKERS`, `CACHE_BENCH_POSIX_RECLAIM_WORKERS` |
+| I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                                                                                                                     |
+| Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                                                                                                                  |
+| Batching     | `CACHE_BENCH_WRITE_FLUSH_THRESHOLD_BYTES` (defaults to the library threshold; the effective byte value is printed)                                                                                                                                                    |
+| Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_ACTIVITY_COUNTERS` (default false), `CACHE_BENCH_WRITE_ROUNDS` (default 0), `CACHE_BENCH_WRITE_WARMUP_ROUNDS` (default 2), `CACHE_BENCH_WRITE_ONLY` (default false)              |
+| Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                                                                                                               |
 
 Request and latency collection are controlled independently by `CACHE_BENCH_REQUEST_STATS` (complete request counters, default false), `CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL`, `CACHE_BENCH_L2_LATENCY_SAMPLE_INTERVAL`, and `CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL` (independent: 0 off, 1 full, greater values sample with that mean interval; default 0), `CACHE_BENCH_IO_LATENCY` (full engine latency, default false), and `CACHE_BENCH_STATS_SHARDS` (default 16). These instrument the library itself. `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` remains the independent benchmark observer and should be held constant across comparisons. The effective statistics settings are printed with each run. Compare disabled, counters-only, full and sampled modes on the same workload, keeping actual hit/overload populations in view.
 
@@ -95,23 +95,23 @@ cargo +1.98.0 x bench --locked --bench mixed_workloads
 
 This harness runs three deterministic request profiles:
 
-| Scenario            | Request semantics                                                                    | Scaled default                                                     |
-| ------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| `mixed`             | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes           | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2               |
-| `reinsertion`       | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation   | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2               |
-| `negative-lookup`   | Every lookup uses a new key that cannot already exist                                | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2   |
+| Scenario          | Request semantics                                                                  | Scaled default                                                   |
+| ----------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `mixed`           | 15% get, 80% set, 5% delete; two key groups; piecewise key and value sizes         | 2 × 1,000 operations, 625 keys, 32 MiB L1, 64 MiB L2             |
+| `reinsertion`     | 50% get, 50% set; truncated-normal popularity; 1–10 KiB values; version validation | 8 × 5,000 operations, 1,000 keys, 1 MiB L1, 8 MiB L2             |
+| `negative-lookup` | Every lookup uses a new key that cannot already exist                              | 8 × 25,000 operations, 1,000 configured keys, 1 MiB L1, 5 MiB L2 |
 
 Operation counts are per thread. The scaled `mixed` and `reinsertion` defaults use total-operation-to-key ratios of 3.2 and 40. Select one or several scenarios with `CACHE_WORKLOAD_SCENARIO=mixed`, `reinsertion`, `negative-lookup`, or a comma-separated list; the default is `all`. The scaled Region size is 4 MiB for `mixed` and 1 MiB for the other scenarios.
 
 Use the following controls to scale a run:
 
-| Purpose          | Variables                                                                                                                                         |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Request stream   | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED`                                           |
-| Capacity         | `CACHE_WORKLOAD_L1_CAPACITY_MIB`, `CACHE_WORKLOAD_CAPACITY_MIB`, `CACHE_WORKLOAD_REGION_SIZE_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB`      |
-| Concurrency      | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_POSIX_READ_WORKERS`, `CACHE_WORKLOAD_POSIX_WRITE_WORKERS`, `CACHE_WORKLOAD_POSIX_RECLAIM_WORKERS` |
-| I/O and policy   | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                                          |
-| Measurement      | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables)                                                                              |
+| Purpose        | Variables                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request stream | `CACHE_WORKLOAD_OPS_PER_THREAD`, `CACHE_WORKLOAD_THREADS`, `CACHE_WORKLOAD_KEYS`, `CACHE_WORKLOAD_SEED`                                           |
+| Capacity       | `CACHE_WORKLOAD_L1_CAPACITY_MIB`, `CACHE_WORKLOAD_CAPACITY_MIB`, `CACHE_WORKLOAD_REGION_SIZE_MIB`, `CACHE_WORKLOAD_MANAGED_MEMORY_LIMIT_MIB`      |
+| Concurrency    | `CACHE_WORKLOAD_APPEND_SHARDS`, `CACHE_WORKLOAD_POSIX_READ_WORKERS`, `CACHE_WORKLOAD_POSIX_WRITE_WORKERS`, `CACHE_WORKLOAD_POSIX_RECLAIM_WORKERS` |
+| I/O and policy | `CACHE_WORKLOAD_IO_ENGINE`, `CACHE_WORKLOAD_IO_MODE`, `CACHE_WORKLOAD_L1_EVICTION`, `CACHE_WORKLOAD_DIR`                                          |
+| Measurement    | `CACHE_WORKLOAD_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables)                                                                              |
 
 The harness uses a fixed seed, truncated-normal popularity, and piecewise-constant key and value sizes. Keys are at least eight bytes so their identity is verifiable. Values are at least 24 bytes so every hit can be checked for key, length, version, and payload. `negative-lookup` uses the fixed seed and operation ordinal for guaranteed-unique deterministic keys.
 
@@ -149,24 +149,20 @@ Repeat sizes in `CACHE_SOAK_VALUE_BYTES` to weight a production distribution. Us
 
 `cache`, `cache_soak`, and `mixed_workloads` share the same pool parser, using the `CACHE_BENCH`, `CACHE_SOAK`, and `CACHE_WORKLOAD` prefixes respectively. `<ROLE>` is `READ`, `WRITE`, or `RECLAIM`.
 
-| Backend   | Variable suffix                  | Default (read / write / reclaim)  |
-| --------- | -------------------------------- | --------------------------------- |
-| POSIX     | `_POSIX_<ROLE>_WORKERS`          | 4 / 4 / 1                         |
-| io_uring  | `_IO_URING_<ROLE>_RINGS`         | 1 / 1 / 1                         |
-| io_uring  | `_IO_URING_<ROLE>_MAX_IN_FLIGHT` | 64 / 64 / 1                       |
-| io_uring  | `_IO_URING_<ROLE>_IOPOLL`        | false                             |
-| io_uring  | `_IO_URING_<ROLE>_SQPOLL_MS`     | absent (disabled)                 |
-| io_uring  | `_IO_URING_<ROLE>_SQPOLL_CPU`    | absent (unpinned)                 |
+| Backend  | Variable suffix                  | Default (read / write / reclaim) |
+| -------- | -------------------------------- | -------------------------------- |
+| POSIX    | `_POSIX_<ROLE>_WORKERS`          | 4 / 4 / 1                        |
+| io_uring | `_IO_URING_<ROLE>_RINGS`         | 1 / 1 / 1                        |
+| io_uring | `_IO_URING_<ROLE>_MAX_IN_FLIGHT` | 64 / 64 / 1                      |
+| io_uring | `_IO_URING_<ROLE>_IOPOLL`        | false                            |
+| io_uring | `_IO_URING_<ROLE>_SQPOLL_MS`     | absent (disabled)                |
+| io_uring | `_IO_URING_<ROLE>_SQPOLL_CPU`    | absent (unpinned)                |
 
 Optional fill admission uses `_FILL_CONTROL=disabled|observe|adaptive` under the same three prefixes. Enabled modes require explicit `_FILL_BYTES_PER_SECOND` and `_FILL_OPERATIONS_PER_SECOND` ceilings. The harness prints the effective options and adds a `type=fill_control` report beside cache records. Compare the modes in alternating order with identical ceilings and traffic; record rejected and hypothetical fills alongside completed throughput. High ceilings help measure instrumentation overhead, while lower ceilings and injected storage stalls exercise admission behavior. Buffered macOS results do not qualify Linux NVMe or cgroup throttling.
 
 Select the backend with `_IO_ENGINE=posix|io-uring`. POSIX workers bound concurrent operations. io_uring ring count and aggregate in-flight limit are independent; changing one does not rewrite the other. Start with one ring per pool and set `_IO_URING_READ_MAX_IN_FLIGHT` to the concurrent L2 get count (`CACHE_BENCH_CLIENTS` in the request benchmark). Leave write and reclaim unset so they follow library defaults. Extra rings split the same depth and do not add slots. Ring count must not exceed the in-flight limit. SQPOLL and IOPOLL environment variables are advanced follow-ups with different requirements: IOPOLL requires `_IO_MODE=direct`; SQPOLL CPU requires an idle timeout. Do not enable them in the same sweep as rings or in-flight depth, and do not enable both as a pair. Only the selected backend's settings are read. Each harness prints the resulting `IoEngineOptions`, and buffer estimates use its actual concurrency. The request benchmark's default read-wait capacity follows the selected read pool's in-flight limit. POSIX Immediate L2 reads still cap `CACHE_BENCH_CLIENTS` at the POSIX read-worker count, so a worker sweep must set clients at least as high as the worker count.
 
-`CACHE_BENCH_STATS` is now `CACHE_BENCH_ACTIVITY_COUNTERS`. Machine-readable reports use `version=2`, renaming the cache record field `statistics_enabled` to `activity_counters_enabled`; the counter population is unchanged.
-
-The previous `_READ_IO_WORKERS`, `_WRITE_IO_WORKERS`, and `_RECLAIM_WORKERS` variables are rejected with a migration error. For POSIX, use `_POSIX_<ROLE>_WORKERS`. For io_uring, specify ring count and total in-flight depth separately. Unset io_uring knobs follow `IoUringOptions::default()`: one ring and 64 in-flight requests for read and write, and one ring and one in-flight request for reclaim. To reproduce a previous POSIX-shaped default of 4 workers, set 4 rings and 256 in-flight requests.
-
-Capacity variables follow the library's terms: `_CAPACITY_MIB` is L2, `_L1_CAPACITY_MIB` is L1, `_MANAGED_MEMORY_LIMIT_MIB` is the overall managed-memory budget, and `_REGION_SIZE_MIB` selects Region size where supported. The former `_MEMORY_MIB`, `_L1_MIB`, `_L2_MIB`, and `_REGION_MIB` names are rejected with their replacements. `recovery_scale` uses the same L1 naming under `CACHE_RECOVERY`.
+Capacity variables follow the library's terms: `_CAPACITY_MIB` is L2, `_L1_CAPACITY_MIB` is L1, `_MANAGED_MEMORY_LIMIT_MIB` is the overall managed-memory budget, and `_REGION_SIZE_MIB` selects Region size where supported; `recovery_scale` uses the same L1 naming under `CACHE_RECOVERY`.
 
 ## Linux NVMe qualification
 
