@@ -16,7 +16,14 @@
 builtin = "Apache-2.0"
 
 [files]
-includes = ["**/*.rs", "**/*.sh", "**/*.toml", "**/*.yml", "**/*.yaml"]
+includes = [
+  "**/*.py",
+  "**/*.rs",
+  "**/*.sh",
+  "**/*.toml",
+  "**/*.yml",
+  "**/*.yaml",
+]
 
 [props]
 copyright_owner = "ScopeDB, Inc."

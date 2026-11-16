@@ -87,12 +87,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-06-26
+      RUSTUP_TOOLCHAIN: nightly-2026-11-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust nightly
         run: >-
-          rustup toolchain install nightly-2026-06-26
+          rustup toolchain install nightly-2026-11-15
           --profile minimal
           --component rust-src
           --no-self-update
@@ -100,11 +100,11 @@ jobs:
       - name: Check library with AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
-        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --package cache2 --lib -- --test-threads=1
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --package cache2 --lib --features io-uring -- --test-threads=1
       - name: Check concurrency with ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread
-        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --package cache2 --lib -- --test-threads=1
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --package cache2 --lib --features io-uring -- --test-threads=1
 
   required:
     name: Required

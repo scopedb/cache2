@@ -15,7 +15,10 @@
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::iter;
 use std::path::Path;
+use std::process;
+use std::process::Command;
 
 use cargo_metadata::Metadata;
 use cargo_metadata::MetadataCommand;
@@ -25,7 +28,7 @@ use clap::Subcommand;
 const PACKAGE_NAME: &str = "cache2";
 
 fn main() {
-    Command::parse().run();
+    Cli::parse().run();
 }
 
 #[derive(Parser)]
@@ -34,12 +37,12 @@ fn main() {
     bin_name = "cargo x",
     about = "Repository workflows for C²"
 )]
-struct Command {
+struct Cli {
     #[command(subcommand)]
     sub: SubCommand,
 }
 
-impl Command {
+impl Cli {
     fn run(self) {
         match self.sub {
             SubCommand::Bench(command) => command.run(),
@@ -86,7 +89,7 @@ impl CommandBench {
         run(self.command());
     }
 
-    fn command(self) -> std::process::Command {
+    fn command(self) -> Command {
         let mut command = cargo();
         command.args(["bench", "--package", "benchmarks"]);
         command.args(self.cargo_args);
@@ -115,7 +118,7 @@ impl CommandCheck {
                 "check",
                 "--package",
                 PACKAGE_NAME,
-                "--lib",
+                "--all-targets",
                 "--no-default-features",
                 "--features",
             ]);
@@ -181,10 +184,10 @@ impl CommandLint {
             command_run("taplo", ["format", "--check"]);
             command_run("hawkeye", ["check"]);
         }
-        command_run("typos", std::iter::empty::<&str>());
+        command_run("typos", iter::empty::<&str>());
 
         let mut docs = nightly_cargo();
-        docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs --cfg docsrs");
+        docs.env("RUSTDOCFLAGS", "-D warnings -D missing_docs");
         docs.args([
             "doc",
             "--package",
@@ -219,6 +222,7 @@ struct CommandTest;
 
 impl CommandTest {
     fn run(self) {
+        cargo_run(["test", "--workspace"]);
         cargo_run(["test", "--workspace", "--all-features"]);
         cargo_run([
             "test",
@@ -229,19 +233,19 @@ impl CommandTest {
             "--",
             "--ignored",
         ]);
-        command_run("python3", ["scripts/test_compare_benchmarks.py"]);
+        command_run("python3", ["-B", "scripts/test_compare_benchmarks.py"]);
     }
 }
 
-fn cargo() -> std::process::Command {
+fn cargo() -> Command {
     let executable = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = std::process::Command::new(executable);
+    let mut command = Command::new(executable);
     command.current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
     command
 }
 
-fn nightly_cargo() -> std::process::Command {
-    let mut command = std::process::Command::new("rustup");
+fn nightly_cargo() -> Command {
+    let mut command = Command::new("rustup");
     command
         .args(["run", "nightly", "cargo"])
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")));
@@ -263,25 +267,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = std::process::Command::new(executable);
+    let mut command = Command::new(executable);
     command
         .current_dir(Path::new(env!("CARGO_WORKSPACE_DIR")))
         .args(args);
     run(command);
 }
 
-fn run(mut command: std::process::Command) {
+fn run(mut command: Command) {
     println!("{command:?}");
     match command.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Ok(status) => process::exit(status.code().unwrap_or(1)),
         Err(error) => fail(&format!("failed to run {command:?}: {error}")),
     }
 }
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
-    std::process::exit(2)
+    process::exit(2)
 }
 
 #[cfg(test)]
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn bench_keeps_cargo_and_harness_arguments_separate() {
-        let command = Command::try_parse_from([
+        let command = Cli::try_parse_from([
             "cargo x",
             "bench",
             "--bench",
