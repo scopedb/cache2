@@ -33,9 +33,7 @@ use crate::region::recovery::DataGeometry;
 use crate::region::recovery::KEY_HASH_ALGORITHM_XXH3_64;
 use crate::region::recovery::RECOVERY_IMAGE_INDEX_OFFSET;
 use crate::region::recovery::STATE_FILE_SIZE;
-use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
-use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
+use crate::region::recovery::metadata::region_metadata_encoded_len;
 use crate::region::recovery::recovery_image_index_len;
 
 const DEFAULT_REGION_SIZE: u64 = 32 * 1024 * 1024;
@@ -142,19 +140,13 @@ fn disk_peak_bytes(geometry: DataGeometry, index_slots: usize) -> io::Result<u64
         .map_err(|_| invalid_config("index capacity does not fit u64"))?;
     let index_len = recovery_image_index_len(image_slots)
         .ok_or_else(|| invalid_config("index image length overflow"))?;
-    let partition_count = u64::try_from(
+    let partition_count = u32::try_from(
         validated_index_partition_ranges(index_slots)
             .map_err(index_layout_error)?
             .len(),
     )
-    .map_err(|_| invalid_config("index partition count does not fit u64"))?;
-    let region_pages =
-        u64::from(geometry.region_count).div_ceil(REGION_METADATA_REGIONS_PER_PAGE as u64);
-    let partition_pages = partition_count.div_ceil(REGION_METADATA_PARTITIONS_PER_PAGE as u64);
-    let metadata_len = 1_u64
-        .checked_add(region_pages)
-        .and_then(|pages| pages.checked_add(partition_pages))
-        .and_then(|pages| pages.checked_mul(REGION_METADATA_PAGE_SIZE as u64))
+    .map_err(|_| invalid_config("index partition count does not fit u32"))?;
+    let metadata_len = region_metadata_encoded_len(geometry.region_count, partition_count)
         .ok_or_else(|| invalid_config("Region metadata length overflow"))?;
     let image_len = RECOVERY_IMAGE_INDEX_OFFSET
         .checked_add(index_len)

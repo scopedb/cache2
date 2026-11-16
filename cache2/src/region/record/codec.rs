@@ -222,9 +222,11 @@ fn encode_value_into_hashed_with_seqno(
     .map_err(RecordEncodeError::InvalidLocation)?;
     let value_len = u32::try_from(value.len()).map_err(|_| RecordEncodeError::LengthOverflow)?;
     let key_len = u16::try_from(key.len()).map_err(|_| RecordEncodeError::KeyTooLarge)?;
-    let payload_end = RECORD_HEADER_SIZE
+    let value_start = RECORD_HEADER_SIZE
         .checked_add(key.len())
-        .and_then(|end| end.checked_add(value.len()))
+        .ok_or(RecordEncodeError::LengthOverflow)?;
+    let payload_end = value_start
+        .checked_add(value.len())
         .ok_or(RecordEncodeError::LengthOverflow)?;
     if payload_end > destination_len {
         return Err(RecordEncodeError::ReservationTooSmall {
@@ -236,11 +238,7 @@ fn encode_value_into_hashed_with_seqno(
     // Header, key, and value bytes are overwritten below. Clear only the
     // alignment tail so a reused staging span cannot leak old padding.
     destination[payload_end..].fill(0);
-    let key_start = RECORD_HEADER_SIZE;
-    let value_start = key_start
-        .checked_add(key.len())
-        .ok_or(RecordEncodeError::LengthOverflow)?;
-    destination[key_start..value_start].copy_from_slice(key);
+    destination[RECORD_HEADER_SIZE..value_start].copy_from_slice(key);
     destination[value_start..payload_end].copy_from_slice(value);
 
     let header = RecordHeader {

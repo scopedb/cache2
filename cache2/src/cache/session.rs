@@ -90,17 +90,7 @@ impl<F: FileSystem> CacheSession<F> {
         persistence.acquire_exclusive(config.runtime().io_mode)?;
 
         let opened = (|| {
-            let regions = match persistence.inspect_recovery(index_slots)? {
-                Some(image) => persistence.recover_regions(image, index_slots, append_shards)?,
-                None => None,
-            };
-            let (regions, startup) = match regions {
-                Some(regions) => (regions, StartupMode::Warm),
-                None => (
-                    persistence.cold_regions(index_slots, append_shards)?,
-                    StartupMode::Cold,
-                ),
-            };
+            let (regions, startup) = persistence.open_regions(index_slots, append_shards)?;
             persistence.publish_running()?;
             let runtime = CacheRuntime::start(
                 Arc::new(regions),

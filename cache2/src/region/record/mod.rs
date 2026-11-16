@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Explicit little-endian codecs for the persistent cache metadata and records.
+//! Explicit little-endian header codec for persistent Region value records.
 //!
-//! These types are deliberately encoded field-by-field. Their Rust layout is
-//! not part of the disk format.
+//! These headers are encoded field-by-field; Rust struct layout is not part of
+//! the on-disk format.
 
 use crate::checksum::crc32c;
 use crate::codec::get_u16;
@@ -125,9 +125,7 @@ impl RecordHeader {
             return false;
         }
         Self::aligned_len(key_len, value_len).is_some_and(|minimum| {
-            self.record_len >= minimum
-                && self.record_len != 0
-                && self.record_len.is_multiple_of(RECORD_ALIGNMENT)
+            self.record_len >= minimum && self.record_len.is_multiple_of(RECORD_ALIGNMENT)
         })
     }
 }
@@ -147,6 +145,7 @@ mod tests {
         let value = b"value";
         let mut payload = key.to_vec();
         payload.extend_from_slice(value);
+        let record_len = RecordHeader::aligned_len(key.len(), value.len()).unwrap();
         let header = RecordHeader {
             key_len: key.len() as u16,
             value_len: value.len() as u32,
@@ -154,9 +153,8 @@ mod tests {
             key_hash: 0x1122_3344_5566_7788,
             payload_crc: crc32c(&[&payload]),
             region_generation: 17,
-            record_len: RecordHeader::aligned_len(key.len(), value.len()).unwrap(),
+            record_len,
         };
-        let record_len = RecordHeader::aligned_len(key.len(), value.len()).unwrap();
         let mut encoded = vec![0_u8; record_len as usize];
         encoded[..RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
         encoded[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + payload.len()].copy_from_slice(&payload);

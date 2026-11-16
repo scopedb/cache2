@@ -38,7 +38,6 @@ use crate::region::manager::RegionWriteSpan;
 use crate::region::record::RECORD_ALIGNMENT;
 use crate::region::record::RECORD_HEADER_SIZE;
 use crate::region::record::RecordHeader;
-use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::RECOVERY_PAGE_SIZE;
 
 const MAX_STAGING_RECORDS: usize = 4096;
@@ -129,7 +128,6 @@ impl StagedRecord {
 pub struct StagedWrite {
     pub span: RegionWriteSpan,
     pub buffer: IoBuffer,
-    pub absolute: u64,
     pub records: Vec<StagedRecord>,
 }
 
@@ -403,10 +401,7 @@ impl AppendStaging {
             .ok_or(StagingError::InvalidShard)?;
         let state = lock_unpoisoned(&shard.state);
         ensure_open(&state)?;
-        if state.encoding.is_some() {
-            return Err(StagingError::WouldBlock);
-        }
-        if state.submitted.is_some() {
+        if state.encoding.is_some() || state.submitted.is_some() {
             return Err(StagingError::WouldBlock);
         }
         if state.fill.is_empty() {
@@ -435,30 +430,25 @@ impl AppendStaging {
         receipt: RegionAppendReservation,
         encode: impl FnOnce(&mut [u8]) -> Result<StagedRecord, E>,
     ) -> Result<StageAppend, StagingEncodeError<E>> {
-        self.validate_reservation(receipt)
-            .map_err(StagingEncodeError::Staging)?;
+        self.validate_reservation(receipt)?;
         let shard = self
             .shards
             .get(receipt.shard_id)
-            .ok_or(StagingEncodeError::Staging(StagingError::InvalidShard))?;
+            .ok_or(StagingError::InvalidShard)?;
 
         let (start, end, buffer) = {
             let mut state = lock_unpoisoned(&shard.state);
-            ensure_open(&state).map_err(StagingEncodeError::Staging)?;
+            ensure_open(&state)?;
             if state.encoding.is_some() {
-                return Err(StagingEncodeError::Staging(StagingError::WouldBlock));
+                return Err(StagingError::WouldBlock.into());
             }
             let fill = &state.fill;
             let used = fill
                 .used()
-                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
-                    "staging fill length overflow",
-                )))?;
+                .ok_or(StagingError::Invariant("staging fill length overflow"))?;
             let record_bytes = receipt.record_bytes as usize;
             if record_bytes > self.chunk_bytes {
-                return Err(StagingEncodeError::Staging(StagingError::Invariant(
-                    "staging record exceeds one chunk",
-                )));
+                return Err(StagingError::Invariant("staging record exceeds one chunk").into());
             }
             if fill.records.len() == MAX_STAGING_RECORDS
                 || used
@@ -472,16 +462,16 @@ impl AppendStaging {
                     || fill.end_offset != u64::from(receipt.offset)
                     || receipt.seqno <= fill.max_seqno)
             {
-                return Err(StagingEncodeError::Staging(StagingError::StaleReceipt));
+                return Err(StagingError::StaleReceipt.into());
             }
             let end = used
                 .checked_add(record_bytes)
-                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
-                    "staging fill cursor overflow",
-                )))?;
-            let buffer = state.fill.buffer.take().ok_or(StagingEncodeError::Staging(
-                StagingError::Invariant("staging fill lost its buffer"),
-            ))?;
+                .ok_or(StagingError::Invariant("staging fill cursor overflow"))?;
+            let buffer = state
+                .fill
+                .buffer
+                .take()
+                .ok_or(StagingError::Invariant("staging fill lost its buffer"))?;
             state.encoding = Some(receipt);
             (used, end, buffer)
         };
@@ -496,35 +486,26 @@ impl AppendStaging {
             .as_mut()
             .expect("encoding guard owns its buffer")
             .prepared_mut(end)
-            .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
-                "staging fill buffer is undersized",
-            )))?;
+            .ok_or(StagingError::Invariant("staging fill buffer is undersized"))?;
         let record = encode(&mut encoded[start..end]).map_err(StagingEncodeError::Encode)?;
-        self.validate_record(receipt, record)
-            .map_err(StagingEncodeError::Staging)?;
+        validate_record(receipt, record)?;
 
         let mut state = lock_unpoisoned(&shard.state);
         if state.encoding != Some(receipt) || state.fill.buffer.is_some() {
             state.failed = true;
-            return Err(StagingEncodeError::Staging(StagingError::StaleReceipt));
+            return Err(StagingError::StaleReceipt.into());
         }
-        if let Err(error) = ensure_open(&state) {
-            return Err(StagingEncodeError::Staging(error));
-        }
-        let buffer =
-            encoding
-                .buffer
-                .take()
-                .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
-                    "staging encoding lost its buffer",
-                )))?;
+        ensure_open(&state)?;
+        let buffer = encoding
+            .buffer
+            .take()
+            .ok_or(StagingError::Invariant("staging encoding lost its buffer"))?;
         if state.fill.is_empty() {
             state.fill.region_id = receipt.region_id;
             state.fill.start_offset = u64::from(receipt.offset);
         }
-        state.fill.end_offset = reservation_end(receipt).ok_or(StagingEncodeError::Staging(
-            StagingError::Invariant("staging reservation end overflow"),
-        ))?;
+        state.fill.end_offset = reservation_end(receipt)
+            .ok_or(StagingError::Invariant("staging reservation end overflow"))?;
         state.fill.max_seqno = state.fill.max_seqno.max(receipt.seqno);
         state.fill.records.push(record);
         state.fill.buffer = Some(buffer);
@@ -591,14 +572,6 @@ impl AppendStaging {
                 .ok_or(StagingError::Invariant(
                     "staging padding exceeds its fixed chunk",
                 ))?;
-            let expected_padded_used = receipt
-                .padded_end_offset
-                .checked_sub(receipt.span_start_offset)
-                .and_then(|length| usize::try_from(length).ok())
-                .ok_or(StagingError::StaleReceipt)?;
-            if padded_used != expected_padded_used {
-                return Err(StagingError::StaleReceipt);
-            }
 
             let last = *fill.records.last().ok_or(StagingError::StaleReceipt)?;
             let last_entry = last.entry();
@@ -690,11 +663,10 @@ impl AppendStaging {
                 .ok_or(StagingError::StaleReceipt)?,
         )
         .map_err(|_| StagingError::StaleReceipt)?;
-        if length == 0 || length > self.chunk_bytes {
+        if length == 0 || length > self.chunk_bytes || span.end_offset > self.region_size {
             state.failed = true;
             return Err(StagingError::StaleReceipt);
         }
-        let absolute = self.span_absolute(span)?;
         let fill_buffer = state.fill.buffer.take().ok_or_else(|| {
             state.failed = true;
             StagingError::Invariant("staging fill lost its buffer")
@@ -724,7 +696,6 @@ impl AppendStaging {
         Ok(Some(StagedWrite {
             span,
             buffer,
-            absolute,
             records,
         }))
     }
@@ -803,24 +774,6 @@ impl AppendStaging {
         }
     }
 
-    fn validate_record(
-        &self,
-        receipt: RegionAppendReservation,
-        record: StagedRecord,
-    ) -> Result<(), StagingError> {
-        self.validate_reservation(receipt)?;
-        let entry = record.entry();
-        let location = entry.location;
-        if location.region_id() != receipt.region_id
-            || location.offset() != receipt.offset
-            || location.record_len() != receipt.record_bytes
-            || record.seqno() != receipt.seqno
-        {
-            return Err(StagingError::StaleReceipt);
-        }
-        Ok(())
-    }
-
     fn validate_reservation(&self, receipt: RegionAppendReservation) -> Result<(), StagingError> {
         let end = reservation_end(receipt).ok_or(StagingError::StaleReceipt)?;
         if receipt.seqno == 0
@@ -833,20 +786,21 @@ impl AppendStaging {
         }
         Ok(())
     }
+}
 
-    fn span_absolute(&self, span: RegionWriteSpan) -> Result<u64, StagingError> {
-        if span.end_offset > self.region_size {
-            return Err(StagingError::StaleReceipt);
-        }
-        DATA_REGION_AREA_OFFSET
-            .checked_add(
-                u64::from(span.region_id)
-                    .checked_mul(self.region_size)
-                    .ok_or(StagingError::Invariant("staging Region offset overflow"))?,
-            )
-            .and_then(|base| base.checked_add(span.start_offset))
-            .ok_or(StagingError::Invariant("staging absolute offset overflow"))
+fn validate_record(
+    receipt: RegionAppendReservation,
+    record: StagedRecord,
+) -> Result<(), StagingError> {
+    let location = record.entry().location;
+    if location.region_id() != receipt.region_id
+        || location.offset() != receipt.offset
+        || location.record_len() != receipt.record_bytes
+        || record.seqno() != receipt.seqno
+    {
+        return Err(StagingError::StaleReceipt);
     }
+    Ok(())
 }
 
 fn try_staged_records() -> Result<Vec<StagedRecord>, ManagedMemoryError> {
@@ -1012,7 +966,6 @@ mod tests {
             first_pointer
         );
         assert_eq!(first_job.buffer.as_slice().unwrap(), &[0x11; 64]);
-        assert_eq!(first_job.absolute, DATA_REGION_AREA_OFFSET + 64 * 1024);
 
         let (second, second_record) = reservation(64, 96, 12);
         let mut second_pointer = 0_usize;

@@ -738,7 +738,7 @@ impl CacheRuntime {
         // match the configuration selected for this open.
         let storage = config.storage();
         if data.geometry != storage.geometry()
-            || regions.region_count()? != storage.region_count() as usize
+            || regions.region_count() != storage.region_count() as usize
             || regions.index_slot_count() != storage.index_slots()
             || regions.shard_count() != config.runtime().append_shards as usize
         {
@@ -3467,7 +3467,6 @@ mod tests {
                             record_range: 0..64,
                         },
                         result: Err(io::Error::from(io::ErrorKind::TimedOut)),
-                        buffer: None,
                     },
                     read_token,
                     hash: 7,
