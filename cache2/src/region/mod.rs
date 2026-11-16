@@ -1271,7 +1271,10 @@ impl RegionStore {
         for record in records.iter().copied() {
             let entry = record.entry();
             let published = match record.previous_location() {
-                Some(previous) => self.index.replace_if_match(record.hash(), previous, entry),
+                Some(previous) => self
+                    .index
+                    .replace_if_match(record.hash(), previous, entry)
+                    .map(|_| ()),
                 None => self.index.upsert(record.hash(), entry),
             };
             if let Err(error) = published {
@@ -1502,7 +1505,7 @@ fn partition_metadata_from_stats(
                 )
             })?,
             physical_value_slots: stats.value,
-            physical_deleted_slots: stats.deleted,
+            physical_deleted_slots: 0,
         });
     }
     Ok(partitions.into_boxed_slice())
@@ -1519,9 +1522,14 @@ fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexP
             )
         })?;
     for partition in &metadata.partitions {
+        if partition.physical_deleted_slots != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition metadata contains unsupported deleted slots",
+            ));
+        }
         stats.push(IndexPhysicalStats {
             value: partition.physical_value_slots,
-            deleted: partition.physical_deleted_slots,
         });
     }
     Ok(stats.into_boxed_slice())
@@ -1535,7 +1543,7 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
             .zip(stats)
             .all(|(metadata, actual)| {
                 metadata.physical_value_slots == actual.value
-                    && metadata.physical_deleted_slots == actual.deleted
+                    && metadata.physical_deleted_slots == 0
             })
 }
 

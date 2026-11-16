@@ -39,6 +39,7 @@ use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
 use std::sync::TryLockError;
+use std::sync::TryLockResult;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
@@ -57,7 +58,6 @@ use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
 use crate::region::index::storage::page_format::PAGE_CHECKSUM_OFFSET;
 use crate::region::index::storage::page_format::encode_page_header;
 use crate::region::index::storage::page_format::page_checksum;
-use crate::region::index::storage::page_format::read_u64;
 use crate::region::index::storage::page_format::validate_page_header;
 use crate::region::record::RECORD_ALIGNMENT;
 
@@ -133,19 +133,6 @@ impl IndexPartitionRange {
             .checked_add(slot)
             .ok_or(IndexStorageError::SizeOverflow)
     }
-
-    #[cfg(test)]
-    fn global_page(&self, page: usize) -> Result<usize, IndexStorageError> {
-        if page >= self.page_count {
-            return Err(IndexStorageError::PageOutOfBounds {
-                page,
-                page_count: self.page_count,
-            });
-        }
-        self.first_page
-            .checked_add(page)
-            .ok_or(IndexStorageError::SizeOverflow)
-    }
 }
 
 /// Builds the stable page-balanced partition directory for one slot capacity.
@@ -170,13 +157,7 @@ pub fn canonical_index_partition_ranges(
     let base_pages = layout.page_count / partition_count;
     let extra_pages = layout.page_count % partition_count;
     let first_extra = partition_count - extra_pages;
-    let mut ranges = Vec::new();
-    ranges.try_reserve_exact(partition_count).map_err(|_| {
-        IndexStorageError::Io(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "unable to allocate canonical index partition directory",
-        ))
-    })?;
+    let mut ranges = try_vec(partition_count, "canonical index partition directory")?;
     let mut first_page = 0_usize;
     for partition_id in 0..partition_count {
         let page_count = base_pages + usize::from(partition_id >= first_extra);
@@ -240,16 +221,12 @@ fn final_partition_slots(
         .ok_or(IndexStorageError::SizeOverflow)
 }
 
-/// Logical fields in one index image bucket.
+/// Encoded 8-byte representation of one index image bucket.
 ///
-/// This type is intentionally not `repr(C)` and is never copied directly to
-/// or from an image. Its stable representation is exactly 8 bytes encoded by
-/// [`Self::encode`] and [`Self::decode`]. A zeroed bucket is the empty state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct IndexSlot {
-    encoded: u64,
-}
+/// Zero represents an empty bucket; non-zero encodes a value bucket in
+/// little-endian bit layout via [`Self::encode`] and [`Self::decode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexSlot(u64);
 
 const SLOT_REGION_BITS: u32 = 20;
 const SLOT_OFFSET_BITS: u32 = 20;
@@ -270,6 +247,7 @@ const SLOT_FINGERPRINT_MASK: u64 = (1_u64 << SLOT_FINGERPRINT_BITS) - 1;
 const SLOT_DISPLACEMENT_MASK: u64 = (1_u64 << SLOT_DISPLACEMENT_BITS) - 1;
 
 const _: () = assert!(SLOT_DISPLACEMENT_SHIFT + SLOT_DISPLACEMENT_BITS == u64::BITS);
+const _: () = assert!((1 << SLOT_DISPLACEMENT_BITS) == INDEX_CANDIDATES);
 
 /// Typed runtime meaning of one canonical index image bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,7 +278,7 @@ impl fmt::Display for IndexSlotSemanticError {
 }
 
 impl IndexSlot {
-    pub const EMPTY: Self = Self { encoded: 0 };
+    pub const EMPTY: Self = Self(0);
 
     pub fn from_state(state: IndexSlotState) -> Self {
         match state {
@@ -312,55 +290,48 @@ impl IndexSlot {
             } => {
                 let location = entry.location;
                 let offset_units = u64::from(location.offset() / RECORD_ALIGNMENT);
-                Self {
-                    encoded: u64::from(location.region_id())
+                Self(
+                    u64::from(location.region_id())
                         | (offset_units << SLOT_OFFSET_SHIFT)
                         | (u64::from(location.index_size_class()) << SLOT_SIZE_CLASS_SHIFT)
                         | ((u64::from(fingerprint) & SLOT_FINGERPRINT_MASK)
                             << SLOT_FINGERPRINT_SHIFT)
                         | ((u64::from(displacement) & SLOT_DISPLACEMENT_MASK)
                             << SLOT_DISPLACEMENT_SHIFT),
-                }
+                )
             }
         }
     }
 
     pub fn encode(self, output: &mut [u8; INDEX_IMAGE_SLOT_SIZE]) {
-        output.copy_from_slice(&self.encoded.to_le_bytes());
+        output.copy_from_slice(&self.0.to_le_bytes());
     }
 
     pub fn decode(input: &[u8; INDEX_IMAGE_SLOT_SIZE]) -> Self {
-        Self {
-            encoded: read_u64(input, 0),
-        }
+        Self(u64::from_le_bytes(*input))
     }
 
     pub fn runtime_state(self) -> Result<IndexSlotState, IndexSlotSemanticError> {
-        if self.encoded == 0 {
+        if self.0 == 0 {
             return Ok(IndexSlotState::Empty);
         }
-        let size_class = ((self.encoded >> SLOT_SIZE_CLASS_SHIFT) & SLOT_SIZE_CLASS_MASK) as u8;
+        let size_class = ((self.0 >> SLOT_SIZE_CLASS_SHIFT) & SLOT_SIZE_CLASS_MASK) as u8;
         let record_len = record_size_class_upper_bound(size_class)
             .ok_or(IndexSlotSemanticError::NonCanonicalMarker)?;
-        let region_id = ((self.encoded >> SLOT_REGION_SHIFT) & SLOT_REGION_MASK) as u32;
-        let offset_units = ((self.encoded >> SLOT_OFFSET_SHIFT) & SLOT_OFFSET_MASK) as u32;
+        let region_id = ((self.0 >> SLOT_REGION_SHIFT) & SLOT_REGION_MASK) as u32;
+        let offset_units = ((self.0 >> SLOT_OFFSET_SHIFT) & SLOT_OFFSET_MASK) as u32;
         let offset = offset_units * RECORD_ALIGNMENT;
         let location = PackedLocation::new(region_id, offset, record_len)
             .map_err(IndexSlotSemanticError::InvalidLocation)?;
         Ok(IndexSlotState::Value {
-            fingerprint: ((self.encoded >> SLOT_FINGERPRINT_SHIFT) & SLOT_FINGERPRINT_MASK) as u16,
-            displacement: ((self.encoded >> SLOT_DISPLACEMENT_SHIFT) & SLOT_DISPLACEMENT_MASK)
-                as u8,
+            fingerprint: ((self.0 >> SLOT_FINGERPRINT_SHIFT) & SLOT_FINGERPRINT_MASK) as u16,
+            displacement: ((self.0 >> SLOT_DISPLACEMENT_SHIFT) & SLOT_DISPLACEMENT_MASK) as u8,
             entry: IndexEntry { location },
         })
     }
 
-    fn physical_kind(self) -> SlotPhysicalKind {
-        if self.encoded == 0 {
-            SlotPhysicalKind::Empty
-        } else {
-            SlotPhysicalKind::Value
-        }
+    const fn is_value(self) -> bool {
+        self.0 != 0
     }
 }
 
@@ -381,63 +352,30 @@ impl IndexImageBinding {
     }
 }
 
-/// Counts carried by clean metadata. Deleted buckets are forbidden by v1.
+/// Populated-bucket count carried by clean recovery metadata.
 ///
-/// Clean recovery metadata validates these counts before passing them to
-/// [`IndexStorage::map_private`], avoiding an O(slot-count) startup scan.
+/// Clean recovery metadata validates this count before passing it to
+/// [`PartitionedIndexStorage::map_private`], avoiding an O(slot-count) startup
+/// scan.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IndexPhysicalStats {
     pub value: u64,
-    pub deleted: u64,
 }
 
 impl IndexPhysicalStats {
-    fn total(self) -> Option<u64> {
-        self.value.checked_add(self.deleted)
-    }
-
     fn is_valid_for(self, slot_count: usize) -> bool {
-        let Ok(slot_count) = u64::try_from(slot_count) else {
-            return false;
-        };
-        self.deleted == 0 && self.total().is_some_and(|total| total <= slot_count)
+        u64::try_from(slot_count).is_ok_and(|slot_count| self.value <= slot_count)
     }
 
-    fn transitioned(
-        self,
-        old: SlotPhysicalKind,
-        new: SlotPhysicalKind,
-        slot_count: usize,
-    ) -> Option<Self> {
-        let mut next = self;
-        next.decrement(old)?;
-        next.increment(new)?;
+    fn updated(self, old_present: bool, new_present: bool, slot_count: usize) -> Option<Self> {
+        let value = match (old_present, new_present) {
+            (false, true) => self.value.checked_add(1)?,
+            (true, false) => self.value.checked_sub(1)?,
+            _ => self.value,
+        };
+        let next = Self { value };
         next.is_valid_for(slot_count).then_some(next)
     }
-
-    fn decrement(&mut self, kind: SlotPhysicalKind) -> Option<()> {
-        let counter = match kind {
-            SlotPhysicalKind::Empty => return Some(()),
-            SlotPhysicalKind::Value => &mut self.value,
-        };
-        *counter = counter.checked_sub(1)?;
-        Some(())
-    }
-
-    fn increment(&mut self, kind: SlotPhysicalKind) -> Option<()> {
-        let counter = match kind {
-            SlotPhysicalKind::Empty => return Some(()),
-            SlotPhysicalKind::Value => &mut self.value,
-        };
-        *counter = counter.checked_add(1)?;
-        Some(())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum SlotPhysicalKind {
-    Empty,
-    Value,
 }
 
 /// The lazy validation state of one physical image page.
@@ -618,18 +556,16 @@ impl From<io::Error> for IndexStorageError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WarmImageStats {
-    pages_written: usize,
-    slots_written: usize,
     pub bytes_written: u64,
     pub physical_stats: IndexPhysicalStats,
 }
 
-/// Fixed-capacity bytes backing the Region index.
+/// Fixed-capacity bytes backing one canonical index partition.
 ///
 /// Anonymous storage uses a zero-filled private mapping and treats its pages
 /// as valid without materializing page headers. File-backed storage validates
 /// each source page only when a slot on that page is first read or mutated.
-/// Callers must freeze mutations while [`Self::write_warm_image`] runs.
+/// Callers must freeze mutations while [`PartitionedIndexStorage::write_warm_image`] runs.
 struct IndexStorage {
     core: Arc<IndexStorageCore>,
     range: IndexPartitionRange,
@@ -637,51 +573,8 @@ struct IndexStorage {
 }
 
 impl IndexStorage {
-    /// Creates a lazily allocated, zero-filled runtime image.
-    #[cfg(test)]
-    fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
-        let core = IndexStorageCore::anonymous(slot_count)?;
-        let page_count = core.page_count;
-        Ok(Self {
-            core,
-            range: whole_image_range(slot_count, page_count),
-            physical_stats: IndexPhysicalStats::default(),
-        })
-    }
-
-    /// Maps an index image range writable and private.
-    #[cfg(test)]
-    fn map_private(
-        file: &File,
-        file_offset: u64,
-        slot_count: usize,
-        expected_binding: IndexImageBinding,
-        physical_stats: IndexPhysicalStats,
-    ) -> Result<Self, IndexStorageError> {
-        if !physical_stats.is_valid_for(slot_count) {
-            return Err(IndexStorageError::InvalidPhysicalStats);
-        }
-        let core = IndexStorageCore::map_private(file, file_offset, slot_count, expected_binding)?;
-        let page_count = core.page_count;
-        Ok(Self {
-            core,
-            range: whole_image_range(slot_count, page_count),
-            physical_stats,
-        })
-    }
-
     const fn physical_stats(&self) -> IndexPhysicalStats {
         self.physical_stats
-    }
-
-    #[cfg(test)]
-    fn page_validation_state(&self, page: usize) -> Result<PageValidationState, IndexStorageError> {
-        self.core.page_validation_state(self.global_page(page)?)
-    }
-
-    #[cfg(test)]
-    fn read_slot(&self, slot: usize) -> Result<IndexSlot, IndexStorageError> {
-        self.core.read_slot(self.global_slot(slot)?)
     }
 
     fn state_at(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
@@ -712,63 +605,15 @@ impl IndexStorage {
         // The exclusive partition guard keeps the state observed by the probe
         // stable, so updating its physical count needs no second slot decode.
         let global_slot = self.global_slot(slot)?;
-        let previous_kind = match previous {
-            IndexSlotState::Empty => SlotPhysicalKind::Empty,
-            IndexSlotState::Value { .. } => SlotPhysicalKind::Value,
-        };
+        let previous_present = matches!(previous, IndexSlotState::Value { .. });
         let value = IndexSlot::from_state(state);
         let next_stats = self
             .physical_stats
-            .transitioned(previous_kind, value.physical_kind(), self.range.slot_count)
+            .updated(previous_present, value.is_value(), self.range.slot_count)
             .ok_or(IndexStorageError::InvalidPhysicalStats)?;
         self.core.write_slot(global_slot, value)?;
         self.physical_stats = next_stats;
         Ok(())
-    }
-
-    /// Encodes one range-local slot.
-    ///
-    /// Exclusive access owns this complete page-aligned range. Canonical range
-    /// construction guarantees that another view of the same core cannot
-    /// address these slot bytes.
-    #[cfg(test)]
-    fn write_slot(&mut self, slot: usize, value: IndexSlot) -> Result<(), IndexStorageError> {
-        let global_slot = self.global_slot(slot)?;
-        value
-            .runtime_state()
-            .map_err(IndexStorageError::InvalidSlot)?;
-        let old = self.core.read_slot(global_slot)?;
-        let next_stats = self
-            .physical_stats
-            .transitioned(
-                old.physical_kind(),
-                value.physical_kind(),
-                self.range.slot_count,
-            )
-            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
-        self.core.write_slot(global_slot, value)?;
-        self.physical_stats = next_stats;
-        Ok(())
-    }
-
-    /// Sequentially emits a new, fully checksummed index image.
-    ///
-    /// Encoding uses one 4 KiB stack page and one lazily allocated, fixed
-    /// 1 MiB write batch regardless of index size. The destination should be
-    /// an unpublished temporary image because an error can leave a prefix written.
-    #[cfg(test)]
-    fn write_warm_image<W>(
-        &self,
-        writer: &mut W,
-        binding: IndexImageBinding,
-    ) -> Result<WarmImageStats, IndexStorageError>
-    where
-        W: Write + ?Sized,
-    {
-        let mut batch_writer = WarmImageBatchWriter::new(writer);
-        let stats = self.write_warm_image_pages(&mut batch_writer, binding)?;
-        batch_writer.finish()?;
-        Ok(stats)
     }
 
     /// Emits checksummed pages into a caller-owned batching boundary.
@@ -790,42 +635,24 @@ impl IndexStorage {
         }
         self.core.ensure_image_usable(self.range.first_page)?;
         let mut output = [0_u8; INDEX_IMAGE_PAGE_SIZE];
-        let mut emitted_physical_stats = IndexPhysicalStats::default();
+        let mut emitted = IndexPhysicalStats::default();
         for local_page in 0..self.range.page_count {
-            let page = self
-                .range
-                .first_page
-                .checked_add(local_page)
-                .ok_or(IndexStorageError::SizeOverflow)?;
+            let page = self.range.first_page + local_page;
             self.core.ensure_page_valid(page)?;
             output.fill(0);
-            let first_slot = page
-                .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
-                .ok_or(IndexStorageError::SizeOverflow)?;
+            let first_slot = page * INDEX_IMAGE_SLOTS_PER_PAGE;
             let valid_slots = self.core.valid_slots_in_page(page);
-            encode_page_header(&mut output, page, first_slot, valid_slots, binding)?;
+            encode_page_header(&mut output, page, first_slot, valid_slots, binding);
 
             for slot_in_page in 0..valid_slots {
-                let source_offset = page
-                    .checked_mul(INDEX_IMAGE_PAGE_SIZE)
-                    .and_then(|base| base.checked_add(INDEX_IMAGE_PAGE_HEADER_SIZE))
-                    .and_then(|base| {
-                        base.checked_add(slot_in_page.checked_mul(INDEX_IMAGE_SLOT_SIZE)?)
-                    })
-                    .ok_or(IndexStorageError::SizeOverflow)?;
-                let value = self.core.decode_at(source_offset);
+                let value = self.core.decode_at(slot_offset(page, slot_in_page));
                 value
                     .runtime_state()
                     .map_err(IndexStorageError::InvalidSlot)?;
-                emitted_physical_stats = emitted_physical_stats
-                    .transitioned(
-                        SlotPhysicalKind::Empty,
-                        value.physical_kind(),
-                        self.range.slot_count,
-                    )
-                    .ok_or(IndexStorageError::InvalidPhysicalStats)?;
-                let target_offset =
-                    INDEX_IMAGE_PAGE_HEADER_SIZE + slot_in_page * INDEX_IMAGE_SLOT_SIZE;
+                if value.is_value() {
+                    emitted.value += 1;
+                }
+                let target_offset = slot_offset(0, slot_in_page);
                 let target: &mut [u8; INDEX_IMAGE_SLOT_SIZE] = (&mut output
                     [target_offset..target_offset + INDEX_IMAGE_SLOT_SIZE])
                     .try_into()
@@ -838,31 +665,19 @@ impl IndexStorage {
             writer.write_all(&output)?;
         }
 
-        if emitted_physical_stats != self.physical_stats {
+        if emitted != self.physical_stats {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
 
-        let bytes_written = self
-            .range
-            .page_count
-            .checked_mul(INDEX_IMAGE_PAGE_SIZE)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(IndexStorageError::SizeOverflow)?;
+        let bytes_written = (self.range.page_count * INDEX_IMAGE_PAGE_SIZE) as u64;
         Ok(WarmImageStats {
-            pages_written: self.range.page_count,
-            slots_written: self.range.slot_count,
             bytes_written,
-            physical_stats: emitted_physical_stats,
+            physical_stats: emitted,
         })
     }
 
     fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
         self.range.global_slot(slot)
-    }
-
-    #[cfg(test)]
-    fn global_page(&self, page: usize) -> Result<usize, IndexStorageError> {
-        self.range.global_page(page)
     }
 }
 
@@ -1010,12 +825,7 @@ impl IndexStorageCore {
         }
         let page = slot / INDEX_IMAGE_SLOTS_PER_PAGE;
         let slot_in_page = slot % INDEX_IMAGE_SLOTS_PER_PAGE;
-        let offset = page
-            .checked_mul(INDEX_IMAGE_PAGE_SIZE)
-            .and_then(|base| base.checked_add(INDEX_IMAGE_PAGE_HEADER_SIZE))
-            .and_then(|base| base.checked_add(slot_in_page.checked_mul(INDEX_IMAGE_SLOT_SIZE)?))
-            .ok_or(IndexStorageError::SizeOverflow)?;
-        Ok((page, offset))
+        Ok((page, slot_offset(page, slot_in_page)))
     }
 
     fn ensure_page_valid(&self, page: usize) -> Result<(), IndexStorageError> {
@@ -1078,9 +888,7 @@ impl IndexStorageCore {
             .ok_or(IndexStorageError::InvalidArgument(
                 "anonymous index page unexpectedly requires validation",
             ))?;
-        let offset = page_index
-            .checked_mul(INDEX_IMAGE_PAGE_SIZE)
-            .ok_or(IndexStorageError::SizeOverflow)?;
+        let offset = page_index * INDEX_IMAGE_PAGE_SIZE;
         // SAFETY: `offset` and the fixed page length are inside `image_len` by
         // construction, and the mapping remains alive for this borrow.
         let page =
@@ -1088,9 +896,7 @@ impl IndexStorageCore {
         let page: &[u8; INDEX_IMAGE_PAGE_SIZE] = page
             .try_into()
             .expect("fixed mapped page has the index image page size");
-        let expected_first_slot = page_index
-            .checked_mul(INDEX_IMAGE_SLOTS_PER_PAGE)
-            .ok_or(IndexStorageError::SizeOverflow)?;
+        let expected_first_slot = page_index * INDEX_IMAGE_SLOTS_PER_PAGE;
         let expected_valid_slots = self.valid_slots_in_page(page_index);
         validate_page_header(
             page,
@@ -1102,16 +908,8 @@ impl IndexStorageCore {
         .map_err(|reason| IndexStorageError::CorruptPage { page_index, reason })?;
 
         for slot_in_page in 0..expected_valid_slots {
-            let slot_index = expected_first_slot
-                .checked_add(slot_in_page)
-                .ok_or(IndexStorageError::SizeOverflow)?;
-            let offset = INDEX_IMAGE_PAGE_HEADER_SIZE
-                .checked_add(
-                    slot_in_page
-                        .checked_mul(INDEX_IMAGE_SLOT_SIZE)
-                        .ok_or(IndexStorageError::SizeOverflow)?,
-                )
-                .ok_or(IndexStorageError::SizeOverflow)?;
+            let slot_index = expected_first_slot + slot_in_page;
+            let offset = slot_offset(0, slot_in_page);
             let encoded: &[u8; INDEX_IMAGE_SLOT_SIZE] = page
                 [offset..offset + INDEX_IMAGE_SLOT_SIZE]
                 .try_into()
@@ -1184,15 +982,10 @@ impl IndexStorageCore {
 unsafe impl Send for IndexStorageCore {}
 unsafe impl Sync for IndexStorageCore {}
 
-#[cfg(test)]
-fn whole_image_range(slot_count: usize, page_count: usize) -> IndexPartitionRange {
-    IndexPartitionRange {
-        partition_id: 0,
-        first_page: 0,
-        page_count,
-        first_slot: 0,
-        slot_count,
-    }
+const fn slot_offset(page: usize, slot_in_page: usize) -> usize {
+    page * INDEX_IMAGE_PAGE_SIZE
+        + INDEX_IMAGE_PAGE_HEADER_SIZE
+        + slot_in_page * INDEX_IMAGE_SLOT_SIZE
 }
 
 /// Canonically sharded views over one anonymous or MAP_PRIVATE index image.
@@ -1208,13 +1001,12 @@ pub struct PartitionedIndexStorage {
 }
 
 pub struct IndexPartitionReadGuard<'a> {
-    range: IndexPartitionRange,
     guard: RwLockReadGuard<'a, IndexStorage>,
 }
 
 impl IndexPartitionReadGuard<'_> {
-    pub const fn slot_count(&self) -> usize {
-        self.range.slot_count
+    pub fn slot_count(&self) -> usize {
+        self.guard.range.slot_count
     }
 
     pub fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
@@ -1222,18 +1014,17 @@ impl IndexPartitionReadGuard<'_> {
     }
 
     pub fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
-        self.range.global_slot(slot)
+        self.guard.global_slot(slot)
     }
 }
 
 pub struct IndexPartitionWriteGuard<'a> {
-    range: IndexPartitionRange,
     guard: RwLockWriteGuard<'a, IndexStorage>,
 }
 
 impl IndexPartitionWriteGuard<'_> {
-    pub const fn slot_count(&self) -> usize {
-        self.range.slot_count
+    pub fn slot_count(&self) -> usize {
+        self.guard.range.slot_count
     }
 
     pub fn slot_state(&self, slot: usize) -> Result<IndexSlotState, IndexStorageError> {
@@ -1241,7 +1032,7 @@ impl IndexPartitionWriteGuard<'_> {
     }
 
     pub fn global_slot(&self, slot: usize) -> Result<usize, IndexStorageError> {
-        self.range.global_slot(slot)
+        self.guard.global_slot(slot)
     }
 
     pub fn replace_observed(
@@ -1258,19 +1049,13 @@ impl PartitionedIndexStorage {
     pub fn anonymous(slot_count: usize) -> Result<Self, IndexStorageError> {
         let ranges = canonical_index_partition_ranges(slot_count)?;
         let core = IndexStorageCore::anonymous(slot_count)?;
-        Self::from_core(slot_count, ranges, core, None)
+        Self::from_core(ranges, core, None)
     }
 
     #[cfg(feature = "benchmarking")]
     pub fn anonymous_single_partition(slot_count: usize) -> Result<Self, IndexStorageError> {
         let layout = ImageLayout::new(slot_count)?;
-        let mut ranges = Vec::new();
-        ranges.try_reserve_exact(1).map_err(|_| {
-            IndexStorageError::Io(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "unable to allocate benchmark index partition",
-            ))
-        })?;
+        let mut ranges = try_vec(1, "benchmark index partition")?;
         ranges.push(IndexPartitionRange {
             partition_id: 0,
             first_page: 0,
@@ -1279,7 +1064,7 @@ impl PartitionedIndexStorage {
             slot_count,
         });
         let core = IndexStorageCore::anonymous(slot_count)?;
-        Self::from_core(slot_count, ranges.into_boxed_slice(), core, None)
+        Self::from_core(ranges.into_boxed_slice(), core, None)
     }
 
     pub fn map_private(
@@ -1290,20 +1075,16 @@ impl PartitionedIndexStorage {
         partition_stats: &[IndexPhysicalStats],
     ) -> Result<Self, IndexStorageError> {
         let ranges = canonical_index_partition_ranges(slot_count)?;
-        if partition_stats.len() != ranges.len() {
-            return Err(IndexStorageError::InvalidPhysicalStats);
-        }
-        for (range, stats) in ranges.iter().zip(partition_stats) {
-            if !stats.is_valid_for(range.slot_count) {
-                return Err(IndexStorageError::InvalidPhysicalStats);
-            }
-        }
-        let physical_stats = checked_sum_physical_stats(partition_stats)?;
-        if !physical_stats.is_valid_for(slot_count) {
+        if partition_stats.len() != ranges.len()
+            || ranges
+                .iter()
+                .zip(partition_stats)
+                .any(|(range, stats)| !stats.is_valid_for(range.slot_count))
+        {
             return Err(IndexStorageError::InvalidPhysicalStats);
         }
         let core = IndexStorageCore::map_private(file, file_offset, slot_count, expected_binding)?;
-        Self::from_core(slot_count, ranges, core, Some(partition_stats))
+        Self::from_core(ranges, core, Some(partition_stats))
     }
 
     pub const fn slot_count(&self) -> usize {
@@ -1323,23 +1104,8 @@ impl PartitionedIndexStorage {
         hash: u64,
     ) -> Result<IndexPartitionReadGuard<'_>, IndexStorageError> {
         let partition = index_partition_for(hash, self.partitions.len());
-        let guard = match self.partitions[partition].try_read() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => {
-                return Err(IndexStorageError::PartitionBusy {
-                    partition_id: partition,
-                });
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(IndexStorageError::PartitionPoisoned {
-                    partition_id: partition,
-                });
-            }
-        };
-        Ok(IndexPartitionReadGuard {
-            range: self.ranges[partition],
-            guard,
-        })
+        let guard = map_try_lock(self.partitions[partition].try_read(), partition)?;
+        Ok(IndexPartitionReadGuard { guard })
     }
 
     pub fn write_hash_partition(
@@ -1348,7 +1114,6 @@ impl PartitionedIndexStorage {
     ) -> Result<IndexPartitionWriteGuard<'_>, IndexStorageError> {
         let partition = index_partition_for(hash, self.partitions.len());
         Ok(IndexPartitionWriteGuard {
-            range: self.ranges[partition],
             guard: write_partition(&self.partitions[partition], partition)?,
         })
     }
@@ -1358,49 +1123,22 @@ impl PartitionedIndexStorage {
         hash: u64,
     ) -> Result<IndexPartitionWriteGuard<'_>, IndexStorageError> {
         let partition = index_partition_for(hash, self.partitions.len());
-        let guard = match self.partitions[partition].try_write() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => {
-                return Err(IndexStorageError::PartitionBusy {
-                    partition_id: partition,
-                });
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(IndexStorageError::PartitionPoisoned {
-                    partition_id: partition,
-                });
-            }
-        };
-        Ok(IndexPartitionWriteGuard {
-            range: self.ranges[partition],
-            guard,
-        })
+        let guard = map_try_lock(self.partitions[partition].try_write(), partition)?;
+        Ok(IndexPartitionWriteGuard { guard })
     }
 
     pub fn physical_stats(&self) -> Result<IndexPhysicalStats, IndexStorageError> {
-        let mut stats = IndexPhysicalStats::default();
+        let mut value = 0_u64;
         for (partition_id, partition) in self.partitions.iter().enumerate() {
-            stats = checked_add_physical_stats(
-                stats,
-                read_partition(partition, partition_id)?.physical_stats(),
-            )?;
+            value += read_partition(partition, partition_id)?
+                .physical_stats()
+                .value;
         }
-        stats
-            .is_valid_for(self.slot_count)
-            .then_some(stats)
-            .ok_or(IndexStorageError::InvalidPhysicalStats)
+        Ok(IndexPhysicalStats { value })
     }
 
     pub fn partition_stats(&self) -> Result<Box<[IndexPhysicalStats]>, IndexStorageError> {
-        let mut stats = Vec::new();
-        stats
-            .try_reserve_exact(self.partitions.len())
-            .map_err(|_| {
-                IndexStorageError::Io(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "unable to allocate index partition statistics",
-                ))
-            })?;
+        let mut stats = try_vec(self.partitions.len(), "index partition statistics")?;
         for (partition_id, partition) in self.partitions.iter().enumerate() {
             stats.push(read_partition(partition, partition_id)?.physical_stats());
         }
@@ -1409,14 +1147,34 @@ impl PartitionedIndexStorage {
 
     #[cfg(test)]
     pub fn read_slot(&self, slot: usize) -> Result<IndexSlot, IndexStorageError> {
-        let (partition, local_slot) = self.partition_for_slot(slot)?;
-        read_partition(&self.partitions[partition], partition)?.read_slot(local_slot)
+        let (partition_id, local_slot) = self.partition_for_slot(slot)?;
+        let partition = read_partition(&self.partitions[partition_id], partition_id)?;
+        partition.core.read_slot(partition.global_slot(local_slot)?)
     }
 
     #[cfg(test)]
     pub fn write_slot(&self, slot: usize, value: IndexSlot) -> Result<(), IndexStorageError> {
-        let (partition, local_slot) = self.partition_for_slot(slot)?;
-        write_partition(&self.partitions[partition], partition)?.write_slot(local_slot, value)
+        let (partition_id, local_slot) = self.partition_for_slot(slot)?;
+        let mut partition = write_partition(&self.partitions[partition_id], partition_id)?;
+        let global_slot = partition.global_slot(local_slot)?;
+        value
+            .runtime_state()
+            .map_err(IndexStorageError::InvalidSlot)?;
+        let old = partition.core.read_slot(global_slot)?;
+        let next_stats = partition
+            .physical_stats
+            .updated(old.is_value(), value.is_value(), partition.range.slot_count)
+            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
+        partition.core.write_slot(global_slot, value)?;
+        partition.physical_stats = next_stats;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn page_validation_state(&self, page: usize) -> Result<PageValidationState, IndexStorageError> {
+        read_partition(&self.partitions[0], 0)?
+            .core
+            .page_validation_state(page)
     }
 
     /// Sequentially writes all canonical ranges in global page order.
@@ -1432,78 +1190,39 @@ impl PartitionedIndexStorage {
     where
         W: Write + ?Sized,
     {
-        let mut frozen_partitions = Vec::new();
-        frozen_partitions
-            .try_reserve_exact(self.partitions.len())
-            .map_err(|_| {
-                IndexStorageError::Io(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "unable to allocate frozen index partition guards",
-                ))
-            })?;
+        let mut frozen_partitions =
+            try_vec(self.partitions.len(), "frozen index partition guards")?;
         for (partition_id, partition) in self.partitions.iter().enumerate() {
             frozen_partitions.push(read_partition(partition, partition_id)?);
         }
 
-        let physical_stats = frozen_partitions
-            .iter()
-            .try_fold(IndexPhysicalStats::default(), |stats, partition| {
-                checked_add_physical_stats(stats, partition.physical_stats())
-            })?;
-        if !physical_stats.is_valid_for(self.slot_count) {
-            return Err(IndexStorageError::InvalidPhysicalStats);
-        }
-        let mut total = WarmImageStats {
-            pages_written: 0,
-            slots_written: 0,
-            bytes_written: 0,
-            physical_stats: IndexPhysicalStats::default(),
-        };
+        let mut bytes_written = 0_u64;
+        let mut value = 0_u64;
         let mut batch_writer = WarmImageBatchWriter::new(writer);
         for partition in &frozen_partitions {
             let written = partition.write_warm_image_pages(&mut batch_writer, binding)?;
-            total.pages_written = total
-                .pages_written
-                .checked_add(written.pages_written)
-                .ok_or(IndexStorageError::SizeOverflow)?;
-            total.slots_written = total
-                .slots_written
-                .checked_add(written.slots_written)
-                .ok_or(IndexStorageError::SizeOverflow)?;
-            total.bytes_written = total
-                .bytes_written
-                .checked_add(written.bytes_written)
-                .ok_or(IndexStorageError::SizeOverflow)?;
-            total.physical_stats =
-                checked_add_physical_stats(total.physical_stats, written.physical_stats)?;
+            bytes_written += written.bytes_written;
+            value += written.physical_stats.value;
         }
         batch_writer.finish()?;
-        if total.slots_written != self.slot_count || total.physical_stats != physical_stats {
-            return Err(IndexStorageError::InvalidArgument(
-                "canonical index partition image emission is inconsistent",
-            ));
-        }
-        Ok(total)
+        Ok(WarmImageStats {
+            bytes_written,
+            physical_stats: IndexPhysicalStats { value },
+        })
     }
 
     fn from_core(
-        slot_count: usize,
         ranges: Box<[IndexPartitionRange]>,
         core: Arc<IndexStorageCore>,
         partition_stats: Option<&[IndexPhysicalStats]>,
     ) -> Result<Self, IndexStorageError> {
-        if core.slot_count != slot_count || ranges.is_empty() {
+        if ranges.is_empty() {
             return Err(IndexStorageError::InvalidArgument(
-                "index partition directory does not match the shared image",
+                "index partition directory must not be empty",
             ));
         }
-        let mut partitions = Vec::new();
-        partitions.try_reserve_exact(ranges.len()).map_err(|_| {
-            IndexStorageError::Io(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "unable to allocate index partition locks",
-            ))
-        })?;
+        let slot_count = core.slot_count;
+        let mut partitions = try_vec(ranges.len(), "index partition locks")?;
         for (index, range) in ranges.iter().copied().enumerate() {
             let physical_stats = partition_stats
                 .map(|stats| stats[index])
@@ -1556,29 +1275,25 @@ impl PartitionedIndexStorage {
     }
 }
 
-fn checked_sum_physical_stats(
-    stats: &[IndexPhysicalStats],
-) -> Result<IndexPhysicalStats, IndexStorageError> {
-    stats
-        .iter()
-        .copied()
-        .try_fold(IndexPhysicalStats::default(), checked_add_physical_stats)
+fn try_vec<T>(capacity: usize, label: &str) -> Result<Vec<T>, IndexStorageError> {
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(capacity).map_err(|_| {
+        IndexStorageError::Io(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("unable to allocate {label}"),
+        ))
+    })?;
+    Ok(vec)
 }
 
-fn checked_add_physical_stats(
-    left: IndexPhysicalStats,
-    right: IndexPhysicalStats,
-) -> Result<IndexPhysicalStats, IndexStorageError> {
-    Ok(IndexPhysicalStats {
-        value: left
-            .value
-            .checked_add(right.value)
-            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
-        deleted: left
-            .deleted
-            .checked_add(right.deleted)
-            .ok_or(IndexStorageError::InvalidPhysicalStats)?,
-    })
+fn map_try_lock<T>(result: TryLockResult<T>, partition_id: usize) -> Result<T, IndexStorageError> {
+    match result {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => Err(IndexStorageError::PartitionBusy { partition_id }),
+        Err(TryLockError::Poisoned(_)) => {
+            Err(IndexStorageError::PartitionPoisoned { partition_id })
+        }
+    }
 }
 
 fn read_partition(
@@ -1707,13 +1422,7 @@ fn allocate_page_states(
     page_count: usize,
     initial: u8,
 ) -> Result<Box<[AtomicU8]>, IndexStorageError> {
-    let mut states = Vec::new();
-    states.try_reserve_exact(page_count).map_err(|_| {
-        IndexStorageError::Io(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "unable to allocate index page validation bitmap",
-        ))
-    })?;
+    let mut states = try_vec(page_count, "index page validation bitmap")?;
     for _ in 0..page_count {
         states.push(AtomicU8::new(initial));
     }
@@ -1735,13 +1444,7 @@ impl Backing {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(length).map_err(|_| {
-                IndexStorageError::Io(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "unable to allocate anonymous index image",
-                ))
-            })?;
+            let mut bytes = try_vec(length, "anonymous index image")?;
             bytes.resize(length, 0);
             Ok(Self::Heap(bytes.into_boxed_slice()))
         }
@@ -1958,22 +1661,13 @@ mod tests {
         );
 
         let expected_partition_stats: Box<[IndexPhysicalStats]> = Box::new([
-            IndexPhysicalStats {
-                value: 1,
-                deleted: 0,
-            },
-            IndexPhysicalStats {
-                value: 2,
-                deleted: 0,
-            },
+            IndexPhysicalStats { value: 1 },
+            IndexPhysicalStats { value: 2 },
         ]);
         assert_eq!(storage.partition_stats().unwrap(), expected_partition_stats);
         assert_eq!(
             storage.physical_stats().unwrap(),
-            IndexPhysicalStats {
-                value: 3,
-                deleted: 0,
-            }
+            IndexPhysicalStats { value: 3 }
         );
 
         storage
@@ -1997,8 +1691,6 @@ mod tests {
         let written = source
             .write_warm_image(&mut file, binding(GENERATION))
             .unwrap();
-        assert_eq!(written.pages_written, 3);
-        assert_eq!(written.slots_written, PARTITIONED_SLOT_COUNT);
         assert_eq!(written.bytes_written, (3 * INDEX_IMAGE_PAGE_SIZE) as u64);
         assert_eq!(written.physical_stats, source.physical_stats().unwrap());
         file.sync_all().unwrap();
@@ -2088,8 +1780,7 @@ mod tests {
         let mut sink = CountingSink::default();
         let written = source.write_warm_image(&mut sink, binding(149)).unwrap();
 
-        assert_eq!(written.pages_written, PAGE_COUNT);
-        assert_eq!(written.slots_written, SLOT_COUNT);
+        assert_eq!(written.bytes_written, sink.bytes as u64);
         assert_eq!(sink.bytes, PAGE_COUNT * INDEX_IMAGE_PAGE_SIZE);
         assert_eq!(
             sink.calls,
@@ -2261,8 +1952,8 @@ mod tests {
 
     #[test]
     fn warm_writer_rejects_counter_drift_while_emitting_the_image() {
-        let mut storage = IndexStorage::anonymous(8).unwrap();
-        storage.physical_stats.value = 1;
+        let storage = PartitionedIndexStorage::anonymous(8).unwrap();
+        storage.partitions[0].write().unwrap().physical_stats.value = 1;
 
         assert!(matches!(
             storage.write_warm_image(&mut Vec::new(), binding(1)),
@@ -2275,15 +1966,12 @@ mod tests {
         let test_file = TestFile::new("index-image");
         let file = test_file.create_new();
         assert!(matches!(
-            IndexStorage::map_private(
+            PartitionedIndexStorage::map_private(
                 &file,
                 0,
-                1,
+                4,
                 binding(1),
-                IndexPhysicalStats {
-                    value: 1,
-                    deleted: 1,
-                }
+                &[IndexPhysicalStats { value: 5 }],
             ),
             Err(IndexStorageError::InvalidPhysicalStats)
         ));
@@ -2293,7 +1981,8 @@ mod tests {
     fn mapped_image_rejects_unaligned_offset_and_zero_binding() {
         const PREFIX: usize = INDEX_IMAGE_PAGE_SIZE;
 
-        let source = IndexStorage::anonymous(1).unwrap();
+        let source = PartitionedIndexStorage::anonymous(4).unwrap();
+        let stats = source.partition_stats().unwrap();
         let test_file = TestFile::new("index-image");
         let mut file = test_file.create_new();
         file.set_len(PREFIX as u64).unwrap();
@@ -2302,27 +1991,27 @@ mod tests {
         file.sync_all().unwrap();
 
         assert!(matches!(
-            IndexStorage::map_private(
+            PartitionedIndexStorage::map_private(
                 &file,
                 (PREFIX + 1) as u64,
-                1,
+                4,
                 binding(47),
-                source.physical_stats()
+                &stats
             ),
             Err(IndexStorageError::InvalidArgument(
                 "index image file offset must be 4 KiB aligned"
             ))
         ));
         assert!(matches!(
-            IndexStorage::map_private(
+            PartitionedIndexStorage::map_private(
                 &file,
                 PREFIX as u64,
-                1,
+                4,
                 IndexImageBinding {
                     generation: 0,
                     image_tag: 1
                 },
-                source.physical_stats()
+                &stats
             ),
             Err(IndexStorageError::InvalidArgument(
                 "mapped index image binding must be non-zero"
@@ -2336,11 +2025,12 @@ mod tests {
         const GENERATION: u64 = 47;
         const PREFIX: usize = INDEX_IMAGE_PAGE_SIZE;
 
-        let mut source = IndexStorage::anonymous(SLOT_COUNT).unwrap();
+        let source = PartitionedIndexStorage::anonymous(SLOT_COUNT).unwrap();
         source.write_slot(0, sample_slot(1)).unwrap();
         source
             .write_slot(INDEX_IMAGE_SLOTS_PER_PAGE + 2, sample_slot(2))
             .unwrap();
+        let source_stats = source.partition_stats().unwrap();
 
         let test_file = TestFile::new("index-image");
         let mut file = test_file.create_new();
@@ -2351,15 +2041,15 @@ mod tests {
             .unwrap();
         file.sync_all().unwrap();
 
-        let mut recovered = IndexStorage::map_private(
+        let recovered = PartitionedIndexStorage::map_private(
             &file,
             PREFIX as u64,
             SLOT_COUNT,
             binding(GENERATION),
-            source.physical_stats(),
+            &source_stats,
         )
         .unwrap();
-        assert_eq!(recovered.physical_stats(), source.physical_stats());
+        assert_eq!(recovered.partition_stats().unwrap(), source_stats);
         assert_eq!(
             recovered.page_validation_state(0).unwrap(),
             PageValidationState::Unchecked
@@ -2387,7 +2077,7 @@ mod tests {
 
     #[test]
     fn image_binding_is_checked_on_first_page_touch() {
-        let source = IndexStorage::anonymous(1).unwrap();
+        let source = PartitionedIndexStorage::anonymous(4).unwrap();
         assert!(matches!(
             source.write_warm_image(
                 &mut Vec::new(),
@@ -2407,9 +2097,14 @@ mod tests {
         file.write_all(&image).unwrap();
         file.sync_all().unwrap();
 
-        let recovered =
-            IndexStorage::map_private(&file, 0, 1, binding(8), IndexPhysicalStats::default())
-                .unwrap();
+        let recovered = PartitionedIndexStorage::map_private(
+            &file,
+            0,
+            4,
+            binding(8),
+            &[IndexPhysicalStats::default()],
+        )
+        .unwrap();
         assert_eq!(
             recovered.page_validation_state(0).unwrap(),
             PageValidationState::Unchecked
@@ -2425,15 +2120,15 @@ mod tests {
             })
         ));
 
-        let recovered = IndexStorage::map_private(
+        let recovered = PartitionedIndexStorage::map_private(
             &file,
             0,
-            1,
+            4,
             IndexImageBinding {
                 generation: 7,
                 image_tag: binding(7).image_tag ^ 1,
             },
-            IndexPhysicalStats::default(),
+            &[IndexPhysicalStats::default()],
         )
         .unwrap();
         assert!(matches!(
