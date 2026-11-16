@@ -38,21 +38,10 @@ use crate::region::manager::RegionWriteSpan;
 use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 
+#[derive(Debug)]
 pub struct WriteSubmitError {
     pub error: io::Error,
-    pub span: RegionWriteSpan,
-    pub buffer: Option<IoBuffer>,
-}
-
-impl fmt::Debug for WriteSubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WriteSubmitError")
-            .field("error", &self.error)
-            .field("span", &self.span)
-            .field("buffer_returned", &self.buffer.is_some())
-            .finish()
-    }
+    pub buffer: IoBuffer,
 }
 
 impl fmt::Display for WriteSubmitError {
@@ -165,11 +154,7 @@ fn submit_write_with_timeout(
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
         Err(error) => {
-            return Err(WriteSubmitError {
-                error,
-                span,
-                buffer: Some(buffer),
-            });
+            return Err(WriteSubmitError { error, buffer });
         }
     };
     if buffer.len() != expected_len || absolute != expected_absolute {
@@ -178,8 +163,7 @@ fn submit_write_with_timeout(
                 io::ErrorKind::InvalidInput,
                 "staging job does not match its Region span",
             ),
-            span,
-            buffer: Some(buffer),
+            buffer,
         });
     }
     let buffer_is_direct_aligned = buffer.as_slice().is_ok_and(|bytes| {
@@ -192,8 +176,7 @@ fn submit_write_with_timeout(
                 io::ErrorKind::InvalidInput,
                 "Region span buffer is not direct-I/O aligned",
             ),
-            span,
-            buffer: Some(buffer),
+            buffer,
         });
     }
     let request = match submit_background_io(
@@ -205,11 +188,7 @@ fn submit_write_with_timeout(
         Ok(request) => request,
         Err(error) => {
             let (error, buffer) = error.into_buffer();
-            return Err(WriteSubmitError {
-                error,
-                span,
-                buffer: Some(buffer),
-            });
+            return Err(WriteSubmitError { error, buffer });
         }
     };
     Ok(PendingWrite {
@@ -393,6 +372,7 @@ mod tests {
         let mut invalid = span();
         invalid.end_offset += 1;
         let buffer = IoBuffer::for_write(BufferLease::try_fixed(4096).unwrap(), 4096).unwrap();
+        let original_buffer = buffer.as_slice().unwrap().as_ptr();
         let error = match submit_write(
             &engine,
             geometry(),
@@ -405,7 +385,7 @@ mod tests {
             Ok(_) => panic!("unaligned span must not be submitted"),
         };
         assert_eq!(error.error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.buffer.is_some());
+        assert_eq!(error.buffer.as_slice().unwrap().as_ptr(), original_buffer);
         drop(error.buffer);
         assert!(
             io.writes
