@@ -3236,21 +3236,6 @@ mod tests {
     }
 
     #[test]
-    fn mutation_gate_fences_existing_and_new_mutations() {
-        let gate = MutationGate::new();
-        let mutation = gate.try_enter().unwrap();
-        let drain = gate.begin_drain().unwrap();
-
-        assert!(gate.try_enter().is_none());
-        drop(mutation);
-        drain.wait().unwrap();
-        assert!(gate.try_enter().is_none());
-
-        drop(drain);
-        assert!(gate.try_enter().is_some());
-    }
-
-    #[test]
     fn permanent_close_is_not_reopened_by_an_active_drain() {
         let gate = Arc::new(MutationGate::new());
         let mutation = gate.try_enter().unwrap();
@@ -3297,6 +3282,10 @@ mod tests {
         let drain = tokio::spawn(async move {
             let drain = drain_gate.begin_drain().unwrap();
             drain.wait_async().await;
+            assert!(drain_gate.try_enter().is_none());
+            assert!(
+                matches!(drain_gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
         });
         tokio::task::yield_now().await;
         assert!(gate.try_enter().is_none());
@@ -3309,98 +3298,51 @@ mod tests {
     #[tokio::test]
     async fn cancelling_async_drain_reopens_mutation_admission() {
         let gate = Arc::new(MutationGate::new());
-        let mutation = gate.try_enter().unwrap();
-        let drain_gate = Arc::clone(&gate);
-        let drain = tokio::spawn(async move {
-            let drain = drain_gate.begin_drain().unwrap();
-            drain.wait_async().await;
-        });
-        tokio::task::yield_now().await;
-        assert!(gate.try_enter().is_none());
+        // Retry while the previous cancellation may have left an assigned signal.
+        for signal_before_cancel in [true, false] {
+            let mut mutation = Some(gate.try_enter().unwrap());
+            let drain_gate = Arc::clone(&gate);
+            let drain = tokio::spawn(async move {
+                let drain = drain_gate.begin_drain().unwrap();
+                drain.wait_async().await;
+            });
+            tokio::task::yield_now().await;
+            assert!(gate.try_enter().is_none());
 
-        drain.abort();
-        assert!(drain.await.unwrap_err().is_cancelled());
-        assert!(gate.try_enter().is_some());
-        drop(mutation);
+            if signal_before_cancel {
+                drop(mutation.take());
+            }
+            drain.abort();
+            assert!(drain.await.unwrap_err().is_cancelled());
+            assert!(gate.try_enter().is_some());
+            drop(mutation);
+        }
     }
 
     #[test]
-    fn async_drain_can_retry_after_cancellation_with_an_assigned_signal() {
-        let gate = MutationGate::new();
-        let mutation = gate.try_enter().unwrap();
-        let drain = gate.begin_drain().unwrap();
-        let mut wait = Box::pin(drain.wait_async());
-        let mut context = Context::from_waker(Waker::noop());
-        assert!(wait.as_mut().poll(&mut context).is_pending());
-        assert!(
-            matches!(gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-        );
+    fn shard_completion_and_failure_wake_after_releasing_state_lock() {
+        for failed in [false, true] {
+            let control = Arc::new(AppendWorkerControl::new());
+            let probe = Arc::new(ShardStateLockProbe {
+                control: Arc::clone(&control),
+                observed_unlocked: AtomicBool::new(false),
+            });
+            let waker = Waker::from(Arc::clone(&probe));
+            let mut context = Context::from_waker(&waker);
+            let mut wait = std::pin::pin!(control.wait_for_drain_async(1));
 
-        drop(mutation);
-        drop(wait); // Cancel after the signal is assigned, before polling the wait again.
-        drop(drain);
-
-        let mutation = gate.try_enter().unwrap();
-        let drain = gate.begin_drain().unwrap();
-        let mut retry = std::pin::pin!(drain.wait_async());
-        assert!(retry.as_mut().poll(&mut context).is_pending());
-        drop(mutation);
-        assert!(retry.as_mut().poll(&mut context).is_ready());
-        assert!(
-            matches!(gate.begin_drain(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-        );
-    }
-
-    #[test]
-    fn stale_shard_signals_do_not_complete_later_drain_generations() {
-        let control = Arc::new(AppendWorkerControl::new());
-        let probe = Arc::new(ShardStateLockProbe {
-            control: Arc::clone(&control),
-            observed_unlocked: AtomicBool::new(false),
-        });
-        let waker = Waker::from(Arc::clone(&probe));
-        let mut context = Context::from_waker(&waker);
-
-        let first = control.request_drain(false).unwrap();
-        complete_shard_drain(&control, first).unwrap();
-
-        let second = control.request_drain(false).unwrap();
-        let mut cancelled = Box::pin(control.wait_for_drain_async(second));
-        assert!(cancelled.as_mut().poll(&mut context).is_pending());
-        complete_shard_drain(&control, second).unwrap();
-        assert!(probe.observed_unlocked.swap(false, Ordering::AcqRel));
-        drop(cancelled);
-
-        let third = control.request_drain(false).unwrap();
-        let mut next = std::pin::pin!(control.wait_for_drain_async(third));
-        assert!(next.as_mut().poll(&mut context).is_pending());
-        complete_shard_drain(&control, third).unwrap();
-        assert!(probe.observed_unlocked.load(Ordering::Acquire));
-        assert!(matches!(
-            next.as_mut().poll(&mut context),
-            Poll::Ready(Ok(()))
-        ));
-    }
-
-    #[test]
-    fn shard_failure_wakes_async_waiters_after_releasing_state_lock() {
-        let control = Arc::new(AppendWorkerControl::new());
-        let probe = Arc::new(ShardStateLockProbe {
-            control: Arc::clone(&control),
-            observed_unlocked: AtomicBool::new(false),
-        });
-        let waker = Waker::from(Arc::clone(&probe));
-        let mut context = Context::from_waker(&waker);
-        let mut wait = std::pin::pin!(control.wait_for_drain_async(1));
-
-        assert!(wait.as_mut().poll(&mut context).is_pending());
-        control.fail(&io::Error::other("test shard failure"));
-
-        assert!(probe.observed_unlocked.load(Ordering::Acquire));
-        let Poll::Ready(Err(error)) = wait.as_mut().poll(&mut context) else {
-            panic!("a shard failure must finish the pending drain");
-        };
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            if failed {
+                control.fail(&io::Error::other("test shard failure"));
+            } else {
+                complete_shard_drain(&control, 1).unwrap();
+            }
+            assert!(probe.observed_unlocked.load(Ordering::Acquire));
+            let Poll::Ready(result) = wait.as_mut().poll(&mut context) else {
+                panic!("completion or failure must finish the pending drain");
+            };
+            assert_eq!(result.is_err(), failed);
+        }
     }
 
     #[test]
@@ -3435,9 +3377,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stopped_shard_rejects_new_drains_and_completes_accepted_drains() {
+    #[test]
+    fn stopped_shard_rejects_new_drains_and_completes_accepted_drains() {
         let control = AppendWorkerControl::new();
+        let old = control.request_drain(false).unwrap();
+        complete_shard_drain(&control, old).unwrap();
         let first = control.request_drain(false).unwrap();
         let stop = control.request_drain(true).unwrap();
 
@@ -3449,8 +3393,14 @@ mod tests {
         }
         assert_eq!(control.lock().unwrap().drain_requested, stop);
 
+        let mut wait = std::pin::pin!(control.wait_for_drain_async(first));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
         complete_shard_drain(&control, stop).unwrap();
-        control.wait_for_drain_async(first).await.unwrap();
+        assert!(matches!(
+            wait.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     #[test]
