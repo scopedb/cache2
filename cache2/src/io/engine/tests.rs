@@ -32,9 +32,9 @@ use crate::io::background::BackgroundIoAttempt;
 use crate::io::background::IoRecovery;
 use crate::io::file::PositionedIo;
 use crate::io::fill_control::FillController;
+use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
-use crate::managed_memory::aligned_buffer_capacity;
 use crate::stats::recording::Recorder;
 
 async fn wait_for_registered_read_waiters(engine: &IoEngine, expected: usize) {
@@ -1030,10 +1030,7 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
 
     // The uncertain buffer remains charged instead of being reused while
     // the kernel may still own its address.
-    assert_eq!(
-        managed_memory.snapshot().current_bytes,
-        aligned_buffer_capacity(1).unwrap()
-    );
+    assert_eq!(managed_memory.snapshot().current_bytes, BUFFER_ALIGNMENT);
     assert!(managed_memory.try_read_buffer(1).is_some());
 
     drop(completed);

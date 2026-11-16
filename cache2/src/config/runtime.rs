@@ -30,7 +30,6 @@ use crate::io::engine::io_uring_extra_memory_bytes;
 use crate::io::fill_control::FillController;
 use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
-use crate::managed_memory::MAX_CONFIG_COUNT;
 use crate::memory::MemoryStore;
 use crate::region::recovery::DataGeometry;
 use crate::region::runtime_fixed_memory_bytes;
@@ -38,6 +37,7 @@ use crate::region::staging::AppendStaging;
 use crate::stats::recording::Recorder;
 
 const DEFAULT_L1_SHARDS: usize = 32;
+const MAX_CONFIG_COUNT: usize = 65_536;
 const MAX_APPEND_SHARDS: u32 = 256;
 pub const MAX_WRITE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READ_IO_WAIT_TIMEOUT: Duration = Duration::from_secs(5);

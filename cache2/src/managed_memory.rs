@@ -14,9 +14,8 @@
 
 //! Managed-memory accounting and aligned record buffers.
 //!
-//! Foreground reads allocate one alignment-rounded transient buffer for the
-//! size-class-bounded read range after an L2 index hit. Write waiting uses
-//! a separate request gate.
+//! Allocations for L2 read paths (foreground point reads and fixed reclaim
+//! buffers) use alignment-rounded buffers charged against the hard limit.
 
 use std::alloc::Layout;
 use std::alloc::alloc;
@@ -34,7 +33,6 @@ pub const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured
 /// topology cannot inherit an environment-dependent `RUST_MIN_STACK` value.
 pub const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
-pub const MAX_CONFIG_COUNT: usize = 65_536;
 
 pub struct ManagedMemoryLimits {
     pub memory_limit_bytes: usize,
@@ -110,9 +108,10 @@ impl ManagedMemory {
         })
     }
 
-    /// Allocates one alignment-rounded foreground read buffer against the
-    /// cache-wide hard memory limit. The caller maps failure to either a
-    /// fail-open miss or an explicit bounded-wait overload.
+    /// Allocates an alignment-rounded L2 read buffer against the cache-wide
+    /// hard memory limit. Foreground callers map allocation failure to either
+    /// a fail-open miss or bounded-wait overload; runtime startup allocates
+    /// fixed reclaim buffers from the same helper.
     pub fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
         let capacity = length.checked_next_multiple_of(BUFFER_ALIGNMENT)?;
         if capacity == 0 || capacity > isize::MAX as usize {
@@ -273,11 +272,6 @@ impl MemoryTracker {
             self.current.fetch_sub(bytes, Ordering::Relaxed);
         }
     }
-}
-
-#[cfg(test)]
-pub fn aligned_buffer_capacity(value: usize) -> Option<usize> {
-    value.checked_next_multiple_of(BUFFER_ALIGNMENT)
 }
 
 fn update_peak(peak: &AtomicUsize, candidate: usize) {

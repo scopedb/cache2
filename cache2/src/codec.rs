@@ -22,31 +22,31 @@
 /// Reads the little-endian `u16` at `offset`, or returns `None` when the field
 /// range falls outside `input`.
 pub fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
-    let bytes: [u8; size_of::<u16>()] = input
-        .get(offset..offset.checked_add(size_of::<u16>())?)?
-        .try_into()
-        .ok()?;
-    Some(u16::from_le_bytes(bytes))
+    input
+        .get(offset..)?
+        .first_chunk()
+        .copied()
+        .map(u16::from_le_bytes)
 }
 
 /// Reads the little-endian `u32` at `offset`, or returns `None` when the field
 /// range falls outside `input`.
 pub fn get_u32(input: &[u8], offset: usize) -> Option<u32> {
-    let bytes: [u8; size_of::<u32>()] = input
-        .get(offset..offset.checked_add(size_of::<u32>())?)?
-        .try_into()
-        .ok()?;
-    Some(u32::from_le_bytes(bytes))
+    input
+        .get(offset..)?
+        .first_chunk()
+        .copied()
+        .map(u32::from_le_bytes)
 }
 
 /// Reads the little-endian `u64` at `offset`, or returns `None` when the field
 /// range falls outside `input`.
 pub fn get_u64(input: &[u8], offset: usize) -> Option<u64> {
-    let bytes: [u8; size_of::<u64>()] = input
-        .get(offset..offset.checked_add(size_of::<u64>())?)?
-        .try_into()
-        .ok()?;
-    Some(u64::from_le_bytes(bytes))
+    input
+        .get(offset..)?
+        .first_chunk()
+        .copied()
+        .map(u64::from_le_bytes)
 }
 
 /// Writes `value` as little-endian bytes at `offset`.

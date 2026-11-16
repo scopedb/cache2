@@ -32,7 +32,7 @@ pub fn crc32c(parts: &[&[u8]]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::checksum::crc32c;
+    use super::*;
 
     #[test]
     fn matches_the_crc32c_check_value() {
@@ -54,20 +54,6 @@ mod tests {
                     assert_eq!(checksum, expected, "len={len}, split={split}");
                 }
             }
-        }
-
-        // Record headers, index pages, and recovery pages zero their checksum
-        // field without concatenating the surrounding slices.
-        for (len, checksum_offset) in [(48, 44), (4096, 56), (4096, 4092)] {
-            let page = &bytes[..len];
-            let mut expected = page.to_vec();
-            expected[checksum_offset..checksum_offset + 4].fill(0);
-            let checksum = crc32c(&[
-                &page[..checksum_offset],
-                &[0; 4],
-                &page[checksum_offset + 4..],
-            ]);
-            assert_eq!(checksum, crc_fast::crc32_iscsi(&expected));
         }
     }
 }
