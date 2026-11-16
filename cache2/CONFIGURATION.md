@@ -4,6 +4,13 @@ C² keeps cache-owned memory, queues, probes, and request-path work bounded. Con
 
 This guide explains the interactions between `StorageLayout` and `RuntimeOptions`, then gives tuning directions for common operating goals. The profiles are starting points. Validate them with the production key count, value-size distribution, concurrency, device, and hit-cost model.
 
+For a first integration, start with [Getting started](README.md). For shutdown, recovery, and metric export, see [Operating a cache](OPERATIONS.md).
+
+- [Construct a configuration](#configuration-lifecycle) and [measure the workload](#measure-the-workload-envelope-first).
+- Size [memory](#resource-model), [persistent storage](#persistent-layout), and [runtime concurrency](#runtime-topology).
+- Choose a [starting profile](#goal-oriented-profiles), interpret [diagnostics](#diagnostic-map), and follow the [tuning sequence](#tuning-sequence).
+- Check [hard bounds](#hard-configuration-bounds), [background recovery](#background-io-recovery), and [adaptive fill admission](#adaptive-fill-admission).
+
 ## Configuration lifecycle
 
 Unchecked inputs consistently use `*Options` names and public fields. These structs are `#[non_exhaustive]`: start with `new(required_input)` or `Default`, then assign the fields to customize. This allows new optional fields without breaking callers; struct literals, including `..Default::default()`, cannot be used outside the crate. `StorageOptions::build()` returns an immutable `StorageLayout` with checked geometry and disk accounting. `CacheConfig::new(storage, runtime)` checks the complete combination and retains the resolved runtime choices and memory requirements. Neither step opens files, starts workers, or needs Tokio.
@@ -121,10 +128,10 @@ If `N` is the measured maximum live-key count, deliberately passing a multiple o
 
 | Configured `E` | Slots per live key | Nominal offered load | Approximate index plus heat bytes per live key | Bias                         |
 | -------------: | -----------------: | -------------------: | ---------------------------------------------: | ---------------------------- |
-|            `N` |                  2 |                  50% |                                           17 B | Minimum fixed memory         |
-|           `2N` |                  4 |                  25% |                                           34 B | Balanced                     |
-|           `4N` |                  8 |                12.5% |                                           67 B | Hit-rate oriented            |
-|           `8N` |                 16 |                6.25% |                                          134 B | Aggressive hit-rate headroom |
+| `N`            | 2                  | 50%                  | 17 B                                           | Minimum fixed memory         |
+| `2N`           | 4                  | 25%                  | 34 B                                           | Balanced                     |
+| `4N`           | 8                  | 12.5%                | 67 B                                           | Hit-rate oriented            |
+| `8N`           | 16                 | 6.25%                | 134 B                                          | Aggressive hit-rate headroom |
 
 The byte estimates use about 8.13 bytes per persisted slot plus two volatile heat bits. Lower load reduces bounded-placement overflow and compact-identity aliases, but it cannot mathematically guarantee that a cache lookup never misses. C² validates the complete key after I/O, so an index collision becomes a safe miss rather than a wrong-key hit.
 
@@ -430,13 +437,19 @@ Change one resource family at a time and alternate baseline and candidate runs o
 
 Storage and configuration construction enforce these bounds before file access. Open checks the selected filesystem, device, and runtime environment.
 
+## Background I/O and fill control
+
 ### Reclaim read timeout
 
 Set `options.reclaim_io_timeout = Duration::from_secs(30)` after constructing `RuntimeOptions::default()` to allow longer background reclaim reads. The default remains five seconds; positive durations must fit an absolute deadline. Foreground read deadlines are unchanged; background expiry enters recovery as described below. Longer normal deadlines can delay shutdown and cause fill overload when free Regions run out.
 
 ### Background I/O recovery
 
-`options.io_recovery_timeout = None` is the default: background admission and completion timeouts enter `CacheHealth::Recovering` and wait until the original operation completes or close interrupts recovery. Set `Some(Duration::from_secs(300))` for a five-minute additional budget, or `Some(Duration::ZERO)` for immediate cancellation. Finite combined deadlines must be representable. Recovery uses fixed one-second checks without exponential backoff or repeated submission of issued I/O; admission retries apply only when the engine returns an unsubmitted operation. New `put` and `put_l2` calls return overload while any background operation is recovering, whereas reads and deletes continue normally and accepted work retains its bounded resources. Fills resume only after every affected operation passes validation and publication. Drain can wait indefinitely in the default mode; close interrupts recovery within one polling interval and applies bounded cancellation, while normal close steps retain their ordinary deadlines. Actual I/O errors, invalid completions, and finite-budget exhaustion retain terminal failure safeguards.
+`options.io_recovery_timeout = None` is the default: background admission and completion timeouts enter `CacheHealth::Recovering` and wait until the original operation completes or close interrupts recovery. Set `Some(Duration::from_secs(300))` for a five-minute additional budget, or `Some(Duration::ZERO)` for immediate cancellation. Finite combined deadlines must be representable.
+
+New `put` and `put_l2` calls return overload while any background operation is recovering, whereas reads and deletes continue normally and accepted work retains its bounded resources. Fills resume only after every affected operation passes validation and publication. Actual I/O errors, invalid completions, and finite-budget exhaustion retain terminal failure safeguards.
+
+Drain can wait indefinitely in the default mode. Recovery uses fixed one-second checks without exponential backoff or repeated submission of issued I/O; admission retries apply only when the engine returns an unsubmitted operation. Close interrupts recovery within one polling interval and applies bounded cancellation, while normal close steps retain their ordinary deadlines.
 
 ### Adaptive fill admission
 
@@ -453,6 +466,32 @@ options.fill_control = FillControlOptions::Observe(limits);
 options.fill_control = FillControlOptions::Adaptive(limits);
 ```
 
-`FillLimits` enforces instance-wide ceilings across one shared token bucket covering logical encoded fill bytes (charged in 64-byte units, where the sealed span may grow by later encodes before the lock) and fill records from worker staging snapshots rather than physical device bandwidth or IOPS (`put` and `put_l2` do not consume the bucket). Valid ceilings range from `640` bytes/s through `1 TiB/s` and `10` through `4,294,967,295` records/s. Adaptive refill credits elapsed time up to a bounded burst of `100 ms` of the configured ceilings (or at least one maximum-size record), advancing the refill clock only when at least one unit or record is minted; an idle controller never accumulates more than that bounded burst, flushes larger than the burst proceed on remaining credit, failed span acquisitions refund only consumed credit, and unbudgeted non-essential flushes wait and back-pressure staging into ordinary write overload. Background workers also checkpoint outstanding I/O at one quarter of the normal I/O deadline (capped at `500 ms`) to pause new Adaptive fills (and record `would_reject` under Observe) while live holder counts remain nonzero, lifting the pause as soon as the slow I/O completes rather than waiting for validation or reclaim scanning; idle time never triggers a pause, though very short deadlines or descheduled workers can still reach timeout recovery first (which keeps its admission fence until all affected work completes validation and publication).
+#### Rate ceilings and bursts
 
-Start with `Observe` using the target ceilings, inspect `CacheSnapshot::fill_control` (`pressure`, `would_reject`, `oldest_operation_ns`) alongside device queueing (since observations cannot distinguish device throttling from CPU scheduling, kernel queueing, or slow validation), and switch to `Adaptive` without changing the numbers. The example `256 MiB/s` and `20,000` records/s is a conservative mixed-write starting point rather than an NVMe datasheet spec: scale both ceilings together (for ~1 KiB encoded records, `256 MiB/s` needs roughly `200_000–500_000` records/s so the record ceiling does not clip first), raise both above measured fill (for example `1–2 GiB/s` with matching records/s) to shed only stalls, or set the byte ceiling to roughly one third to one half of measured sustainable cache write (`256–512 MiB/s` with four write workers and a 4 MiB flush threshold) to reserve NVMe headroom for reads and reclaim; avoid using the legal minima (`640` bytes/s, `10` records/s) as NVMe defaults, and qualify Linux NVMe via [Validation](BENCHMARK.md) rather than buffered macOS runs. `CacheSnapshot::fill_control` exposes `pressure`, enforcement, configured and paused rates, rejections, `would_reject`, `dropped_observations`, outstanding bytes (excluding unflushed staging) and operations, oldest age, and an informational drain-time estimate derived from validated throughput since open (`0` when unavailable with pending work) independently of `RuntimeOptions::stats`; transitions log `cache_fill_pressure_changed` under `cache2::health`. Enabled modes preallocate one atomic observation per append and reclaim worker (included in `CacheConfig::minimum_memory_bytes()`), skipping an observation (`dropped_observations`) instead of failing I/O if the table is full, while foreground fill admission checks pause and recovery counters without allocation, clocks, or locks from the controller, close stops admission independently of outstanding I/O, and `Disabled` creates no controller or observations.
+`FillLimits` applies instance-wide ceilings to logical encoded fill bytes and fill records, not physical device bandwidth or IOPS. Workers share one token bucket; foreground `put` and `put_l2` calls do not consume it directly. Byte accounting uses 64-byte units from worker staging snapshots, and later encodes may grow the span before it is sealed. Valid ceilings range from `640` bytes/s through `1 TiB/s` and `10` through `4,294,967,295` records/s.
+
+Adaptive refill permits a bounded burst of `100 ms` of the configured ceilings, or at least one maximum-size record. Idle time never accumulates more credit than that burst. Flushes larger than the burst may proceed on remaining credit; failed span acquisitions refund only consumed credit. Non-essential flushes without budget wait, so staging pressure can produce ordinary write overload.
+
+#### Detecting slow I/O
+
+Background workers check outstanding I/O at one quarter of the normal I/O deadline, capped at `500 ms`. While operations remain outstanding beyond that checkpoint, Adaptive pauses new fills and Observe records `would_reject`. The pre-timeout pause lifts when the slow I/O completes, without waiting for validation or reclaim scanning.
+
+Idle time never triggers a pause. Very short deadlines or descheduled workers can still reach timeout recovery first; that recovery fence remains until affected work completes validation and publication.
+
+#### Choosing limits
+
+Start with `Observe` using the target ceilings. Inspect `CacheSnapshot::fill_control` (`pressure`, `would_reject`, `oldest_operation_ns`) alongside device queueing, then switch to `Adaptive` without changing the numbers. Observations alone cannot distinguish device throttling from CPU scheduling, kernel queueing, or slow validation.
+
+The example `256 MiB/s` and `20,000` records/s is a conservative mixed-write starting point. Choose both ceilings for the workload:
+
+- Scale bytes and records together. For approximately 1 KiB encoded records, `256 MiB/s` needs roughly `200_000–500_000` records/s so the record ceiling does not clip first.
+- To shed only stalls, raise both ceilings above measured fill, for example `1–2 GiB/s` with matching records/s.
+- To reserve NVMe headroom for reads and reclaim, start around one third to one half of measured sustainable cache write throughput. `256–512 MiB/s` with four write workers and a 4 MiB flush threshold is a starting point to measure.
+
+Do not use the legal minima as NVMe defaults or infer sustainable cache throughput from a device's sequential-write specification. Qualify Linux NVMe using [Validation](BENCHMARK.md); buffered macOS runs cannot substitute for that qualification.
+
+#### Observing the controller
+
+`CacheSnapshot::fill_control` reports pressure, enforcement, configured and paused rates, rejections, `would_reject`, and `dropped_observations` independently of `RuntimeOptions::stats`. It also reports outstanding bytes (excluding unflushed staging), outstanding operations, oldest age, and an informational drain-time estimate based on validated throughput since open. The estimate is `0` when throughput is unavailable with work pending. Transitions log `cache_fill_pressure_changed` under `cache2::health`.
+
+Enabled modes preallocate one atomic observation per append and reclaim worker, included in `CacheConfig::minimum_memory_bytes()`. A full observation table increments `dropped_observations` instead of failing I/O. Foreground admission checks controller counters without allocating, reading clocks, or taking controller locks; close stops admission independently. `Disabled` creates no controller or observations.

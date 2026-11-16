@@ -1,5 +1,7 @@
 # C² validation
 
+Use this guide to qualify a configuration against a workload and device. Read [Configuration](CONFIGURATION.md) for sizing and [Operating a cache](OPERATIONS.md) for interpreting runtime metrics. Run the commands below from a repository checkout's workspace root; benchmark tooling is not part of the published library.
+
 Compare revisions only on the same host, filesystem, device, toolchain, and workload. Keep raw output with the tested commit; this repository intentionally does not publish machine-specific historical numbers.
 
 ## Ablation experiments
@@ -76,7 +78,7 @@ The main controls are grouped below. See `benchmarks/cache/main.rs` for defaults
 | Capacity     | `CACHE_BENCH_CAPACITY_MIB`, `CACHE_BENCH_L1_CAPACITY_MIB`, `CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB`                                                                                                                                                                     |
 | Concurrency  | `CACHE_BENCH_CLIENTS`, `CACHE_BENCH_WRITE_CLIENTS`, `CACHE_BENCH_APPEND_SHARDS`, `CACHE_BENCH_POSIX_READ_WORKERS`, `CACHE_BENCH_READ_IO_WAIT_CAPACITY`, `CACHE_BENCH_READ_IO_WAIT_TIMEOUT_US`, `CACHE_BENCH_POSIX_WRITE_WORKERS`, `CACHE_BENCH_POSIX_RECLAIM_WORKERS` |
 | I/O path     | `CACHE_BENCH_IO_ENGINE`, `CACHE_BENCH_IO_MODE`, `CACHE_BENCH_DIR`                                                                                                                                                                                                     |
-| Cache policy | `CACHE_BENCH_L1_EVICTION=clock\|s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL`                                                                                                                                                                  |
+| Cache policy | `CACHE_BENCH_L1_EVICTION=clock\                                                                                                                                                                                                                                       | s3-fifo`, `CACHE_BENCH_HOT_ENTRIES`, `CACHE_BENCH_HOT_READ_INTERVAL` |
 | Batching     | `CACHE_BENCH_WRITE_FLUSH_THRESHOLD_BYTES` (defaults to the library threshold; the effective byte value is printed)                                                                                                                                                    |
 | Measurement  | `CACHE_BENCH_READ_LATENCY_SAMPLE_INTERVAL` (default 16; zero disables), `CACHE_BENCH_ACTIVITY_COUNTERS` (default false), `CACHE_BENCH_WRITE_ROUNDS` (default 0), `CACHE_BENCH_WRITE_WARMUP_ROUNDS` (default 2), `CACHE_BENCH_WRITE_ONLY` (default false)              |
 | Gates        | `CACHE_BENCH_MIN_PUT_OPS`, `CACHE_BENCH_MIN_RESIDENT_L1_OPS`, `CACHE_BENCH_MIN_L2_OPS`, `CACHE_BENCH_MAX_WARM_CLOSE_MS`                                                                                                                                               |

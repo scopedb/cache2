@@ -33,7 +33,7 @@
 
 ### New features
 
-- Add optional fill-pressure control through `RuntimeOptions::fill_control`. `Observe` reports pressure through `CacheSnapshot::fill_control`; `Adaptive` also pauses new `put` and `put_l2` fills during slow background I/O, limits non-essential background flush rates, and suppresses optional hot-record reinsertion while paused. The default is `Disabled`. See [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for configuration and tuning.
+- Add optional fill-pressure control through `RuntimeOptions::fill_control`. `Observe` reports pressure through `CacheSnapshot::fill_control`; `Adaptive` also pauses new `put` and `put_l2` fills during slow background I/O, limits non-essential background flush rates, and suppresses optional hot-record reinsertion while paused. The default is `Disabled`. See [adaptive fill admission](cache2/CONFIGURATION.md#adaptive-fill-admission) for configuration and tuning.
 - Allow background I/O timeouts to recover instead of immediately disabling the cache. `CacheHealth::Recovering` reports this state; new fills pause while reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` bounds the recovery period, with `None` allowing unlimited recovery by default. Close interrupts recovery; actual I/O errors, invalid completions, or an exhausted recovery timeout remain terminal failures.
 
 ### Improvements
