@@ -27,11 +27,11 @@ cargo x lint
 
 `check` covers the workspace and optional features, `test` includes the extended library and benchmark-tool tests, and `lint` checks formatting, code, documentation, packaging, and dependencies. Use `cargo x lint --fix` to apply supported automatic fixes, then review the diff.
 
-See [BENCHMARK.md](BENCHMARK.md) for performance workloads and qualification.
+See [Validation](cache2/BENCHMARK.md) for performance workloads and qualification.
 
 ## Design and Rust Style
 
-Follow the surrounding code and the design constraints in [ARCHITECTURE.md](ARCHITECTURE.md), including bounded resource use, best-effort consistency, request-path priorities, and recovery guarantees.
+Follow the surrounding code and the design constraints in [Architecture](cache2/ARCHITECTURE.md), including bounded resource use, best-effort consistency, request-path priorities, and recovery guarantees.
 
 Name types by their concrete domain role. Use `Options` for editable inputs awaiting validation and `Config` for validated or resolved configuration. Keep names such as `Layout` for geometry and use specific domain nouns such as `Desc`, `Candidate`, `Victims`, or `Inspection` for runtime data. Avoid `Plan` as a type-name suffix; computing data before using it does not by itself make that data a plan. Keep related fields, local variables, and functions consistent with the type's role.
 
@@ -51,7 +51,8 @@ Name types by their concrete domain role. Use `Options` for editable inputs awai
 - Keep each Markdown prose paragraph and each list item's prose on one source line; do not wrap lines to fit a column limit.
 - Format every Markdown table with aligned columns and consistent `| --- |` or `| ---: |` delimiter rows (a single space inside each pipe across header, delimiter, and data rows).
 - Use repository-relative links for files within this repository rather than GitHub blob or raw URLs.
-- Keep evergreen guides ([README.md](README.md), [CONFIGURATION.md](CONFIGURATION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [BENCHMARK.md](BENCHMARK.md), and [cache2/ERRORS.md](cache2/ERRORS.md)) free of pre-1.0 migration history; record migrations in [CHANGELOG.md](CHANGELOG.md).
+- Keep the repository [README](README.md) focused on project discovery and guide navigation. The crate-level documentation in `cache2/src/lib.rs` is the self-contained API entry point, with a compiled integration example and links to public contracts. Keep guides under `cache2/` so that version-relative links also work in the published source package.
+- Keep evergreen guides ([Getting started](cache2/README.md), [Configuration](cache2/CONFIGURATION.md), [Operating a cache](cache2/OPERATIONS.md), [Architecture](cache2/ARCHITECTURE.md), [Validation](cache2/BENCHMARK.md), and [Error handling](cache2/ERRORS.md)) free of pre-1.0 migration history; record migrations in [CHANGELOG.md](CHANGELOG.md).
 
 ## Changelog
 

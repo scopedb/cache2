@@ -1,5 +1,7 @@
 # C² architecture
 
+This is the design reference for request paths, resource bounds, and recovery invariants. For application integration, start with [Getting started](README.md), [Configuration](CONFIGURATION.md), and [Operating a cache](OPERATIONS.md).
+
 C² is a bounded, best-effort lookaside cache. Each L2 attempt uses one index lookup and one validation pass and may return a stale value.
 
 It is not an authoritative store. A miss, bypass, eviction, stale hit, rejected recovery image, or complete cache loss must leave the caller able to continue through its authoritative path.
@@ -223,7 +225,7 @@ The ordering makes crash outcomes unambiguous:
 
 There is no in-place repair or Region scan after rejected recovery. Cache data is disposable, so cold fallback is safer and keeps startup work bounded.
 
-Stale data, overload, and cache loss are valid outcomes. Every returned value passes address, key, and checksum validation. Structural or device faults move the cache to miss-only when reads can fail open safely; mutations still report errors. Public failures carry an `ErrorKind`, `ErrorOperation`, and the original `std::io::Error`; the complete policy is documented in [Error handling](cache2/ERRORS.md).
+Stale data, overload, and cache loss are valid outcomes. Every returned value passes address, key, and checksum validation. Structural or device faults move the cache to miss-only when reads can fail open safely; mutations still report errors. Public failures carry an `ErrorKind`, `ErrorOperation`, and the original `std::io::Error`; the complete policy is documented in [Error handling](ERRORS.md).
 
 ### Background I/O timeout recovery
 
