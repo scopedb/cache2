@@ -20,6 +20,7 @@
 - Count the payload size actually returned in `CacheSnapshot::served_bytes` when L2 promotion selects a newer L1 entry of a different size.
 - Propagate drain and background worker failures during `close_fast` and `close_warm` when foreground L2 reads remain in flight instead of treating shutdown as quiescent.
 - Let idle append workers exit on terminal cache failure without waiting for another data or drain request.
+- Stop background workers during close without allocating drain receipts or requiring another drain generation, avoiding a hung close when those operations fail.
 
 ## v0.6.0 (2026-09-21)
 

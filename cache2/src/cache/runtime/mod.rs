@@ -406,8 +406,8 @@ pub struct CacheRuntime {
 
 struct RuntimeWorkers {
     state: Arc<RuntimeState>,
-    append_workers: Vec<JoinHandle<()>>,
-    reclaim_workers: Vec<JoinHandle<()>>,
+    append_workers: Vec<JoinHandle<io::Result<()>>>,
+    reclaim_workers: Vec<JoinHandle<io::Result<()>>>,
 }
 
 struct RuntimeState {
@@ -664,11 +664,8 @@ impl AppendWorkerControl {
         Ok(())
     }
 
-    fn request_drain(&self, stop: bool) -> io::Result<u64> {
-        let (mut state, poisoned) = match self.state.lock() {
-            Ok(state) => (state, false),
-            Err(error) => (error.into_inner(), true),
-        };
+    fn request_drain(&self) -> io::Result<u64> {
+        let mut state = self.lock()?;
         if state.stop {
             return Err(closed_runtime_error());
         }
@@ -676,13 +673,24 @@ impl AppendWorkerControl {
             .drain_requested
             .checked_add(1)
             .ok_or_else(|| io::Error::other("shard drain generation exhausted"))?;
-        state.stop |= stop;
         let generation = state.drain_requested;
         self.changed.notify_one();
+        Ok(generation)
+    }
+
+    fn stop(&self) -> io::Result<()> {
+        let (mut state, poisoned) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        state.stop = true;
+        self.changed.notify_all();
         if poisoned {
             Err(poisoned_runtime_error())
+        } else if let Some(failure) = &state.failure {
+            Err(failure.to_error())
         } else {
-            Ok(generation)
+            Ok(())
         }
     }
 
@@ -1255,7 +1263,7 @@ impl CacheRuntime {
         let operations = state.operations.begin_drain()?;
         operations.wait()?;
         let _draining = LifecycleDrainingGuard::enter(&state.metrics.lifecycle, &state.operations);
-        drain_shards(state, false)
+        drain_shards(state)
     }
 
     pub async fn drain_async(&self) -> io::Result<()> {
@@ -1263,7 +1271,7 @@ impl CacheRuntime {
         let operations = state.operations.begin_drain()?;
         operations.wait_async().await;
         let _draining = LifecycleDrainingGuard::enter(&state.metrics.lifecycle, &state.operations);
-        drain_shards_async(state, false).await
+        drain_shards_async(state).await
     }
 
     pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
@@ -1552,7 +1560,7 @@ fn start_workers(
             Ok(worker) => append_workers.push(worker),
             Err(error) => {
                 for shard in &state.append_controls {
-                    let _ = shard.request_drain(true);
+                    let _ = shard.stop();
                 }
                 for worker in append_workers {
                     let _ = worker.join();
@@ -1579,7 +1587,7 @@ fn start_workers(
                     let _ = worker.join();
                 }
                 for shard in &state.append_controls {
-                    let _ = shard.request_drain(true);
+                    let _ = shard.stop();
                 }
                 for worker in append_workers {
                     let _ = worker.join();
@@ -1630,13 +1638,13 @@ fn build_engine_pool(
     Ok(engines.into_boxed_slice())
 }
 
-fn append_worker(state: Arc<RuntimeState>, shard_id: usize) {
+fn append_worker(state: Arc<RuntimeState>, shard_id: usize) -> io::Result<()> {
     let control = Arc::clone(&state.append_controls[shard_id]);
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         append_worker_result(&state, shard_id, &control)
     }));
     let error = match result {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) => return Ok(()),
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("shard worker panicked"),
     };
@@ -1670,6 +1678,7 @@ fn append_worker(state: Arc<RuntimeState>, shard_id: usize) {
             shard.fail(&error);
         }
     }
+    Err(error)
 }
 
 struct ReinsertShardCursor {
@@ -1707,13 +1716,13 @@ fn reclaim_worker(
     buffer: BufferLease,
     worker_id: usize,
     worker_count: usize,
-) {
+) -> io::Result<()> {
     let mut buffer = Some(buffer);
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         reclaim_worker_result(&state, &mut buffer, worker_id, worker_count)
     }));
     let error = match result {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) => return Ok(()),
         Ok(Err(error)) => error,
         Err(_) => io::Error::other("Region reclaim worker panicked"),
     };
@@ -1736,6 +1745,7 @@ fn reclaim_worker(
     for shard in &state.append_controls {
         shard.fail(&error);
     }
+    Err(error)
 }
 
 fn reclaim_worker_result(
@@ -1850,7 +1860,7 @@ fn reclaim_worker_result(
                 },
             )?;
             if stats.reinsert_records != 0 {
-                let generation = state.append_controls[reinsert_shard].request_drain(false)?;
+                let generation = state.append_controls[reinsert_shard].request_drain()?;
                 state.append_controls[reinsert_shard].wait_for_drain(generation)?;
             }
             state.regions.complete_reclaim(receipt)?;
@@ -1892,7 +1902,7 @@ fn append_worker_result(
     let mut rotate_pending = false;
     loop {
         let (flags, drain_generation, stop, timed_out) = wait_for_shard_work(control, deadline)?;
-        let draining = drain_generation != 0;
+        let draining = drain_generation != 0 || stop;
         let force_flush = flags & WAKE_URGENT != 0 || timed_out || draining || rotate_pending;
         let rotate = flags & WAKE_ROTATE != 0;
 
@@ -2001,6 +2011,7 @@ fn wait_for_shard_work(
     let mut timed_out = false;
     while state.wake_flags == 0
         && state.drain_requested == state.drain_completed
+        && !state.stop
         && state.failure.is_none()
     {
         if let Some(deadline) = deadline {
@@ -2063,17 +2074,14 @@ fn complete_shard_drain(control: &AppendWorkerControl, generation: u64) -> io::R
     Ok(())
 }
 
-fn request_shard_drains(
-    state: &RuntimeState,
-    stop: bool,
-) -> io::Result<(Vec<Option<u64>>, Option<io::Error>)> {
+fn request_shard_drains(state: &RuntimeState) -> io::Result<(Vec<Option<u64>>, Option<io::Error>)> {
     let mut generations = Vec::new();
     generations
         .try_reserve_exact(state.append_controls.len())
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate drain fence"))?;
     let mut first_error = None;
     for shard in &state.append_controls {
-        match shard.request_drain(stop) {
+        match shard.request_drain() {
             Ok(generation) => generations.push(Some(generation)),
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -2084,8 +2092,9 @@ fn request_shard_drains(
     Ok((generations, first_error))
 }
 
-fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
-    let (generations, mut first_error) = request_shard_drains(state, stop)?;
+#[cfg(test)]
+fn drain_shards(state: &RuntimeState) -> io::Result<()> {
+    let (generations, mut first_error) = request_shard_drains(state)?;
     for (shard, generation) in state.append_controls.iter().zip(generations) {
         if let Some(generation) = generation
             && let Err(error) = shard.wait_for_drain(generation)
@@ -2096,8 +2105,8 @@ fn drain_shards(state: &RuntimeState, stop: bool) -> io::Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> {
-    let (generations, mut first_error) = request_shard_drains(state, stop)?;
+async fn drain_shards_async(state: &RuntimeState) -> io::Result<()> {
+    let (generations, mut first_error) = request_shard_drains(state)?;
     for (shard, generation) in state.append_controls.iter().zip(generations) {
         if let Some(generation) = generation
             && let Err(error) = shard.wait_for_drain_async(generation).await
@@ -2110,19 +2119,31 @@ async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> 
 
 fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<ShutdownDisposition> {
     workers.state.stop_fill_and_recovery();
-    let drain = drain_shards(&workers.state, true);
-    let mut join_error = None;
+    // Joining is the terminal fence. Signal every shard before waiting, without
+    // allocating drain receipts or advancing generations on the close path.
+    let mut worker_error = None;
+    for shard in &workers.state.append_controls {
+        if let Err(error) = shard.stop() {
+            worker_error.get_or_insert(error);
+        }
+    }
     for worker in workers.append_workers.drain(..) {
-        if worker.join().is_err() {
-            join_error.get_or_insert_with(|| io::Error::other("shard worker panicked"));
+        let result = worker
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("shard worker panicked")));
+        if let Err(error) = result {
+            worker_error.get_or_insert(error);
         }
     }
     if let Err(error) = workers.state.reclaim_control.stop() {
-        join_error.get_or_insert(error);
+        worker_error.get_or_insert(error);
     }
     for worker in workers.reclaim_workers.drain(..) {
-        if worker.join().is_err() {
-            join_error.get_or_insert_with(|| io::Error::other("Region reclaim worker panicked"));
+        let result = worker
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("Region reclaim worker panicked")));
+        if let Err(error) = result {
+            worker_error.get_or_insert(error);
         }
     }
     workers.state.staging.close();
@@ -2175,9 +2196,7 @@ fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<ShutdownDisposition> 
             .state
             .engines()
             .any(|engine| engine.has_unfenced_writes());
-    let result = drain
-        .and_then(|()| join_error.map_or(Ok(()), Err))
-        .and(shutdown);
+    let result = worker_error.map_or(Ok(()), Err).and(shutdown);
     if skip_shutdown || unfenced {
         // A merely pending target gets a detached reaper: close returns now,
         // while eventual target completion still shuts the engine down and
@@ -3326,9 +3345,43 @@ mod tests {
     }
 
     #[test]
+    fn close_does_not_need_a_new_drain_generation() {
+        let (mut session, _directory) = runtime_store(
+            4096,
+            RuntimeOptions {
+                append_shards: 1,
+                ..RuntimeOptions::default()
+            },
+        );
+        let control = Arc::clone(&session.runtime().unwrap().state.append_controls[0]);
+        {
+            let mut state = control.state.lock().unwrap();
+            state.drain_requested = u64::MAX;
+            state.drain_completed = u64::MAX;
+        }
+        let (closed, completion) = mpsc::channel();
+        let close = thread::spawn(move || closed.send(session.close_warm()).unwrap());
+
+        let result = completion.recv_timeout(Duration::from_secs(5));
+        // Supply a drain only to clean up a regressed close that is stuck joining its worker.
+        if result.is_err() {
+            let mut state = control.state.lock().unwrap();
+            state.stop = true;
+            state.drain_requested = 1;
+            state.drain_completed = 0;
+            drop(state);
+            control.changed.notify_all();
+        }
+        close.join().unwrap();
+        result
+            .expect("close must stop workers even when drain generations are exhausted")
+            .unwrap();
+    }
+
+    #[test]
     fn reclaim_progress_does_not_fail_after_a_shard_stops() {
         let control = AppendWorkerControl::new();
-        control.request_drain(true).unwrap();
+        control.stop().unwrap();
 
         control.notify_if_running(WAKE_ROTATE).unwrap();
         assert_eq!(
@@ -3340,23 +3393,21 @@ mod tests {
     #[test]
     fn stopped_shard_rejects_new_drains_and_completes_accepted_drains() {
         let control = AppendWorkerControl::new();
-        let old = control.request_drain(false).unwrap();
+        let old = control.request_drain().unwrap();
         complete_shard_drain(&control, old).unwrap();
-        let first = control.request_drain(false).unwrap();
-        let stop = control.request_drain(true).unwrap();
+        let first = control.request_drain().unwrap();
+        control.stop().unwrap();
 
-        for stopping in [false, true] {
-            assert_eq!(
-                control.request_drain(stopping).unwrap_err().kind(),
-                io::ErrorKind::NotConnected
-            );
-        }
-        assert_eq!(control.lock().unwrap().drain_requested, stop);
+        assert_eq!(
+            control.request_drain().unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(control.lock().unwrap().drain_requested, first);
 
         let mut wait = pin::pin!(control.wait_for_drain_async(first));
         let mut context = Context::from_waker(Waker::noop());
         assert!(wait.as_mut().poll(&mut context).is_pending());
-        complete_shard_drain(&control, stop).unwrap();
+        complete_shard_drain(&control, first).unwrap();
         assert!(matches!(
             wait.as_mut().poll(&mut context),
             Poll::Ready(Ok(()))
