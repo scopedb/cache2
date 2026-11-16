@@ -21,6 +21,7 @@
 use std::error;
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use crate::io::background::BackgroundIoAttempt;
 use crate::io::engine::BoundedIoRequest;
@@ -141,6 +142,26 @@ pub fn submit_write(
     absolute: u64,
     attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<PendingWrite, WriteSubmitError> {
+    submit_write_with_timeout(
+        engine,
+        geometry,
+        span,
+        buffer,
+        absolute,
+        CACHE_IO_COMPLETION_TIMEOUT,
+        attempt,
+    )
+}
+
+fn submit_write_with_timeout(
+    engine: &IoEngine,
+    geometry: DataGeometry,
+    span: RegionWriteSpan,
+    buffer: IoBuffer,
+    absolute: u64,
+    timeout: Duration,
+    attempt: &mut BackgroundIoAttempt<'_>,
+) -> Result<PendingWrite, WriteSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
         Err(error) => {
@@ -178,7 +199,7 @@ pub fn submit_write(
     let request = match submit_background_io(
         engine,
         IoOperation::write(WritePoint::Record, buffer, absolute),
-        CACHE_IO_COMPLETION_TIMEOUT,
+        timeout,
         attempt,
     ) {
         Ok(request) => request,
@@ -246,7 +267,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
     use crate::io::background::IoRecovery;
@@ -299,7 +319,7 @@ mod tests {
     #[test]
     fn late_span_completion_remains_valid_and_keeps_engine_usable() {
         let io = Arc::new(RecordingIo {
-            delay: CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(50),
+            delay: Duration::from_millis(50),
             ..RecordingIo::default()
         });
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
@@ -308,12 +328,13 @@ mod tests {
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
         let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
-        let completion = submit_write(
+        let completion = submit_write_with_timeout(
             &engine,
             geometry(),
             span(),
             IoBuffer::for_write(lease, 4096).unwrap(),
             absolute,
+            Duration::from_millis(20),
             &mut attempt,
         )
         .unwrap()

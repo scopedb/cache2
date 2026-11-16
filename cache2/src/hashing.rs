@@ -24,6 +24,8 @@ struct FixedMapSlot {
     value: u32,
 }
 
+const _: () = assert!(size_of::<FixedMapSlot>() == 8);
+
 impl Default for FixedMapSlot {
     fn default() -> Self {
         Self {
@@ -234,11 +236,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-
-    #[test]
-    fn fixed_map_slot_is_one_u64() {
-        assert_eq!(size_of::<FixedMapSlot>(), 8);
-    }
+    use crate::fixtures::splitmix64;
 
     #[test]
     fn fixed_map_keeps_exactly_one_empty_slot_per_entry() {
@@ -360,12 +358,5 @@ mod tests {
                 assert_eq!(route_hash(hash, buckets), (hash % buckets as u64) as usize);
             }
         }
-    }
-
-    fn splitmix64(mut value: u64) -> u64 {
-        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
     }
 }

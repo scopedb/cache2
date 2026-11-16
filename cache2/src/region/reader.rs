@@ -321,6 +321,8 @@ mod tests {
     use crate::managed_memory::ManagedMemory;
     use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
+    use crate::region::record::RECORD_HEADER_SIZE;
+    use crate::region::record::codec::required_record_bytes;
 
     #[derive(Default)]
     struct RecordingIo {
@@ -484,5 +486,34 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn maximum_read_buffer_is_derived_from_runtime_limits() {
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
+            region_size: 512 * 1024,
+            region_count: 10,
+        };
+        let value_len = geometry.region_size as usize - RECORD_HEADER_SIZE;
+        let record_len = required_record_bytes(0, value_len).unwrap();
+        assert_eq!(u64::from(record_len), geometry.region_size);
+        let entry = IndexEntry {
+            location: PackedLocation::new(0, 0, record_len).unwrap(),
+        };
+        assert_eq!(
+            describe_read(
+                geometry,
+                1,
+                ReadCandidate {
+                    entry,
+                    region_generation: 1,
+                },
+                true,
+            )
+            .unwrap()
+            .read_len,
+            geometry.region_size as usize
+        );
     }
 }

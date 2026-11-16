@@ -150,9 +150,8 @@ impl Error {
 
     /// Returns the underlying standard-library I/O error kind.
     ///
-    /// Prefer [`Self::kind`] for application policy. This method is intended
-    /// for detailed diagnostics and migration from the former `io::Result`
-    /// API.
+    /// Prefer [`Self::kind`] for application policy; reserve this method for
+    /// detailed diagnostics.
     pub fn io_kind(&self) -> io::ErrorKind {
         self.source.kind()
     }

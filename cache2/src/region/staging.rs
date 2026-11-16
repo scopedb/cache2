@@ -71,6 +71,8 @@ pub struct StagedRecord {
     previous_location: u64,
 }
 
+const _: () = assert!(size_of::<StagedRecord>() == 32);
+
 impl StagedRecord {
     pub const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
         Self {
@@ -978,7 +980,6 @@ mod tests {
 
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
-        assert_eq!(size_of::<StagedRecord>(), 32);
         let managed_memory = managed_memory(4 * 1024 * 1024);
         let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);

@@ -45,12 +45,18 @@ impl CacheConfig {
     }
 
     /// Returns the selected runtime options with dependent defaults resolved.
-    /// Clone these inputs to construct a new configuration with different tuning.
+    ///
+    /// Clone these inputs to derive a new configuration with adjusted tuning.
+    /// When [`ReadAdmission::Wait`](crate::ReadAdmission::Wait) was configured
+    /// with `max_waiters: None`, this accessor returns the resolved `Some(...)`
+    /// count, so reset `max_waiters` to `None` before changing read concurrency
+    /// if you want it recomputed automatically.
     pub const fn runtime(&self) -> &RuntimeOptions {
         &self.runtime
     }
 
     /// Returns the minimum managed-memory budget required by this configuration.
+    ///
     /// Includes metadata, L1 capacity, workers, queues, append/reclaim buffers,
     /// and one Region-sized read allowance. Concurrent reads and retained values
     /// need additional headroom. This is not an RSS bound.
@@ -101,9 +107,11 @@ impl StorageLayout {
         self.index_slots
     }
 
-    /// Returns the maximum cache-owned logical disk usage: data and state files,
-    /// plus both the current and temporary recovery images used by warm close.
-    /// Filesystem metadata and block-allocation granularity are outside this bound.
+    /// Returns the maximum cache-owned logical disk usage in bytes.
+    ///
+    /// Covers data and state files plus both the current and temporary recovery
+    /// images used by warm close. Filesystem metadata and block-allocation
+    /// granularity are outside this bound.
     pub const fn peak_disk_bytes(&self) -> u64 {
         self.peak_disk_bytes
     }

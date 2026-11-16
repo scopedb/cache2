@@ -2241,14 +2241,9 @@ fn invalid_runtime_config(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::fs;
-    use std::path::PathBuf;
     use std::pin;
-    use std::process;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::task::Context;
     use std::task::Poll;
@@ -2266,6 +2261,7 @@ mod tests {
     use crate::config::runtime::IoEngineOptions;
     use crate::config::runtime::PosixIoOptions;
     use crate::config::runtime::ReadAdmission;
+    use crate::fixtures::TestDirectory;
     use crate::fixtures::TestFile;
     use crate::io::engine::IoEngine;
     use crate::io::file::DIRECT_IO_ALIGNMENT;
@@ -2273,18 +2269,11 @@ mod tests {
     use crate::memory::MemoryMetricsSnapshot;
     use crate::region::index::packed::IndexEntry;
     use crate::region::index::packed::PackedLocation;
-    use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
-    use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
-    use crate::region::persistence::RegionPaths;
-    use crate::region::reader::ReadCandidate;
     use crate::region::record::RECORD_ALIGNMENT;
     use crate::region::record::RECORD_HEADER_SIZE;
     use crate::region::recovery::DATA_REGION_AREA_OFFSET;
     use crate::region::recovery::DataGeometry;
     use crate::region::recovery::PersistentId;
-    use crate::region::runtime_fixed_memory_bytes;
-
-    static LANE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
     struct ShardStateLockProbe {
         control: Arc<AppendWorkerControl>,
@@ -2369,7 +2358,7 @@ mod tests {
         assert!(!should_wake_write(4096, 4160, 4096));
     }
 
-    fn write_pressure_store(region_size: u64, append_shards: u32) -> (CacheSession, PathBuf) {
+    fn write_pressure_store(region_size: u64, append_shards: u32) -> (CacheSession, TestDirectory) {
         runtime_store(
             region_size,
             RuntimeOptions {
@@ -2385,11 +2374,8 @@ mod tests {
         )
     }
 
-    fn runtime_store(region_size: u64, options: RuntimeOptions) -> (CacheSession, PathBuf) {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!("cache2-write-pressure-{}-{id}", process::id()));
-        fs::create_dir(&path).unwrap();
-        let files = RegionPaths::new(path.join("data"), path.join("state"), path.join("image"));
+    fn runtime_store(region_size: u64, options: RuntimeOptions) -> (CacheSession, TestDirectory) {
+        let directory = TestDirectory::new("write-pressure");
         let data = DataSuperblock {
             generation: 1,
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -2402,8 +2388,9 @@ mod tests {
             hash_seed: 3,
             storage_fingerprint: 4,
         };
-        let store = CacheSession::for_test_with_options(files, data, 8, options).unwrap();
-        (store, path)
+        let store =
+            CacheSession::for_test_with_options(directory.paths.clone(), data, 8, options).unwrap();
+        (store, directory)
     }
 
     #[test]
@@ -2416,7 +2403,7 @@ mod tests {
                 (0, true, 64, Some(128)),
                 (4096, false, 64, Some(128)),
             ] {
-                let (mut store, path) = runtime_store(
+                let (mut store, _directory) = runtime_store(
                     8192,
                     RuntimeOptions {
                         append_shards: 1,
@@ -2459,7 +2446,6 @@ mod tests {
                 let returned_bytes = observed.value().len() as u64;
                 drop(observed);
                 store.close_warm().unwrap();
-                fs::remove_dir_all(path).unwrap();
                 assert_eq!(snapshot.l1_hits, 0);
                 if l1_capacity == 0 {
                     assert_eq!(snapshot.l1_bypasses, 2);
@@ -2481,7 +2467,7 @@ mod tests {
                 for (old_length, returned_length, final_length) in
                     [(0, 1, 0), (1, 0, 1), (64, 128, 128), (128, 64, 257)]
                 {
-                    let (mut store, path) = runtime_store(
+                    let (mut store, _directory) = runtime_store(
                         8192,
                         RuntimeOptions {
                             append_shards: 1,
@@ -2589,7 +2575,6 @@ mod tests {
                     assert_eq!(released.resident_bytes, l1.resident_bytes);
                     assert_eq!(released.retained_bytes, 0);
                     store.close_warm().unwrap();
-                    fs::remove_dir_all(path).unwrap();
                 }
             }
         }
@@ -2597,7 +2582,7 @@ mod tests {
 
     #[test]
     fn contention_rejects_without_waking_but_full_buffers_flush_and_publish() {
-        let (mut store, path) = write_pressure_store(4096, 1);
+        let (mut store, _directory) = write_pressure_store(4096, 1);
         let plane = store.runtime().unwrap().clone();
         for manager_contention in [false, true] {
             let shard = (!manager_contention).then(|| plane.regions().lock_append_for_test(0));
@@ -2668,12 +2653,11 @@ mod tests {
         }
         assert!(plane.get(key).unwrap().is_some());
         store.close_warm().unwrap();
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn full_staging_capacity_request_rotates_without_another_put_or_drain() {
-        let (mut store, path) = write_pressure_store(4096, 1);
+        let (mut store, _directory) = write_pressure_store(4096, 1);
         let plane = store.runtime().unwrap().clone();
         let key = b"full";
         let value = vec![7; 4096 - RECORD_HEADER_SIZE - key.len()];
@@ -2707,7 +2691,6 @@ mod tests {
         plane.drain().unwrap();
         let snapshot = plane.detailed_snapshot().unwrap();
         store.close_warm().unwrap();
-        fs::remove_dir_all(path).unwrap();
         assert_eq!(
             rotations, 1,
             "one rejection must flush and rotate the full Region"
@@ -2724,7 +2707,7 @@ mod tests {
     fn staging_record_limit_accounts_for_flush_padding_before_rotation() {
         const REGION_BYTES: usize = 1024 * 1024;
         for needs_rotation in [false, true] {
-            let (mut store, path) = write_pressure_store(REGION_BYTES as u64, 1);
+            let (mut store, _directory) = write_pressure_store(REGION_BYTES as u64, 1);
             let plane = store.runtime().unwrap().clone();
             let key = b"key";
             let hash = hash_key(plane.data.hash_seed, key);
@@ -2792,7 +2775,6 @@ mod tests {
             let final_rotations = plane.snapshot().unwrap().region_rotations;
             assert_eq!(plane.get(key).unwrap().unwrap().value(), b"value");
             store.close_warm().unwrap();
-            fs::remove_dir_all(path).unwrap();
             assert!(published, "record capacity must wake the worker");
             assert_eq!(rotations, u64::from(needs_rotation));
             assert_eq!(final_rotations, rotations);
@@ -2807,7 +2789,7 @@ mod tests {
         for prefix in [0, ALIGNMENT] {
             for extra in [0, unit, ALIGNMENT - unit] {
                 for overflow in [0, unit] {
-                    let (mut store, path) = write_pressure_store(REGION_BYTES as u64, 1);
+                    let (mut store, _directory) = write_pressure_store(REGION_BYTES as u64, 1);
                     let plane = store.runtime().unwrap().clone();
                     if prefix != 0 {
                         let value = vec![8; prefix - RECORD_HEADER_SIZE - b"prefix".len()];
@@ -2909,7 +2891,6 @@ mod tests {
                         expected_rotations
                     );
                     store.close_warm().unwrap();
-                    fs::remove_dir_all(path).unwrap();
                 }
             }
         }
@@ -2917,7 +2898,7 @@ mod tests {
 
     #[test]
     fn capacity_request_flushes_then_rotates_without_another_put_or_drain() {
-        let (mut store, path) = write_pressure_store(8192, 1);
+        let (mut store, _directory) = write_pressure_store(8192, 1);
         let plane = store.runtime().unwrap().clone();
         let first = vec![1; 4096 - RECORD_HEADER_SIZE - b"first".len()];
         plane.put(b"first", &first).unwrap();
@@ -2961,12 +2942,11 @@ mod tests {
         assert_eq!(plane.snapshot().unwrap().region_rotations, 1);
         assert_eq!(plane.snapshot().unwrap().write_rejections, 1);
         store.close_warm().unwrap();
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn primary_contention_rejects_without_probing_other_shards() {
-        let (mut store, path) = write_pressure_store(8192, 3);
+        let (mut store, _directory) = write_pressure_store(8192, 3);
         let plane = store.runtime().unwrap().clone();
         let key = b"fixed-route";
         let value = [7; 64];
@@ -3008,12 +2988,11 @@ mod tests {
         assert_eq!(snapshot.summary.write_rejections, 1);
         assert_eq!(snapshot.write_buffer_rejections, 0);
         store.close_warm().unwrap();
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn reclaimed_cache_rejects_primary_contention_without_trying_a_free_neighbor() {
-        let (mut store, path) = write_pressure_store(8192, 3);
+        let (mut store, _directory) = write_pressure_store(8192, 3);
         let plane = store.runtime().unwrap().clone();
         let key = b"stable-route";
         let primary = plane
@@ -3065,12 +3044,11 @@ mod tests {
         plane.drain().unwrap();
         assert_eq!(plane.get(key).unwrap().unwrap().value(), &[7; 64]);
         store.close_warm().unwrap();
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn existing_alternate_records_survive_reclaim_and_warm_reopen() {
-        let (mut store, path) = write_pressure_store(8192, 3);
+        let (mut store, directory) = write_pressure_store(8192, 3);
         let plane = store.runtime().unwrap().clone();
         let key = b"fallback-route";
         let value = [9; 64];
@@ -3141,7 +3119,6 @@ mod tests {
         drop(plane);
         drop(store);
 
-        let files = RegionPaths::new(path.join("data"), path.join("state"), path.join("image"));
         let options = RuntimeOptions {
             append_shards: 3,
             l1_capacity_bytes: 0,
@@ -3152,7 +3129,8 @@ mod tests {
             },
             ..RuntimeOptions::default()
         };
-        let mut reopened = CacheSession::for_test_with_options(files, data, 8, options).unwrap();
+        let mut reopened =
+            CacheSession::for_test_with_options(directory.paths.clone(), data, 8, options).unwrap();
         let plane = reopened.runtime().unwrap().clone();
         // Recovery preserves the old physical address. New foreground writes
         // use the same hash route as they did before reclaim and close.
@@ -3184,7 +3162,6 @@ mod tests {
         reopened.close_warm().unwrap();
         drop(plane);
         drop(reopened);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -3379,29 +3356,8 @@ mod tests {
     }
 
     #[test]
-    fn transient_read_pressure_is_not_a_cache_failure() {
-        for kind in [
-            io::ErrorKind::OutOfMemory,
-            io::ErrorKind::WouldBlock,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::BrokenPipe,
-        ] {
-            assert!(is_read_pressure(kind));
-        }
-        assert!(!is_read_pressure(io::ErrorKind::InvalidData));
-    }
-
-    #[test]
     fn completion_timeouts_follow_read_wait_mode() {
-        let id = LANE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            env::temp_dir().join(format!("cache2-completion-timeout-{}-{id}", process::id()));
-        let paths = RegionPaths::new(
-            path.with_extension("cache"),
-            path.with_extension("state"),
-            path.with_extension("image"),
-        );
+        let directory = TestDirectory::new("completion-timeout");
         let data = DataSuperblock {
             generation: 1,
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -3438,7 +3394,8 @@ mod tests {
                 ..RuntimeOptions::default()
             };
             let mut session =
-                CacheSession::for_test_with_options(paths.clone(), data, 8, config).unwrap();
+                CacheSession::for_test_with_options(directory.paths.clone(), data, 8, config)
+                    .unwrap();
             let runtime = session.runtime().unwrap().clone();
             let MemoryLookup::Miss(read_token) = runtime.state.memory.lookup(7, b"key") else {
                 panic!("empty L1 must miss");
@@ -3477,37 +3434,6 @@ mod tests {
                 assert_eq!(snapshot.l2_read_overloads, 1);
             }
         }
-        fs::remove_file(paths.data).unwrap();
-        fs::remove_file(paths.state).unwrap();
-    }
-
-    #[test]
-    fn maximum_read_buffer_is_derived_from_runtime_limits() {
-        let geometry = DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
-            region_size: 512 * 1024,
-            region_count: 10,
-        };
-        let value_len = geometry.region_size as usize - RECORD_HEADER_SIZE;
-        let record_len = required_record_bytes(0, value_len).unwrap();
-        assert_eq!(u64::from(record_len), geometry.region_size);
-        let entry = IndexEntry {
-            location: PackedLocation::new(0, 0, record_len).unwrap(),
-        };
-        assert_eq!(
-            describe_read(
-                geometry,
-                1,
-                ReadCandidate {
-                    entry,
-                    region_generation: 1,
-                },
-                true,
-            )
-            .unwrap()
-            .read_len,
-            geometry.region_size as usize
-        );
     }
 
     #[test]
@@ -3535,17 +3461,6 @@ mod tests {
         assert_eq!(snapshot.l2_read_busy_misses, 1);
         assert_eq!(snapshot.l2_read_overloads, 1);
         assert_eq!(snapshot.l2_read_wait_ns, 7);
-    }
-
-    #[test]
-    fn index_page_validation_state_is_fixed_memory_accounted() {
-        let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
-        let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
-
-        assert_eq!(
-            two_pages - one_page,
-            INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
-        );
     }
 
     #[test]

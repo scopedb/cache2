@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn sub_tick_refills_do_not_burn_elapsed_time() {
-        let control = FillController::new(
+        let mut control = FillController::new(
             FillControlOptions::Adaptive(FillLimits::new(640, 10)),
             1,
             4096,
@@ -802,7 +802,8 @@ mod tests {
             control.refill();
         }
         assert_eq!(control.last_refill_ns.load(Ordering::Relaxed), one_ms_ago);
-        thread::sleep(Duration::from_millis(110));
+        let origin = &mut Arc::get_mut(&mut control).unwrap().origin;
+        *origin = origin.checked_sub(Duration::from_millis(110)).unwrap();
         control.refill();
         assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }

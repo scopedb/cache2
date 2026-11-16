@@ -282,6 +282,9 @@ struct MemoryEntry {
     hash_next: u32,
 }
 
+const _: () = assert!(size_of::<MemoryEntry>() == 2 * size_of::<usize>());
+const _: () = assert!(size_of::<Option<MemoryEntry>>() == 2 * size_of::<usize>());
+
 #[derive(Clone, Copy)]
 struct DetachedAdmissionEntry {
     index: usize,
@@ -1162,13 +1165,6 @@ mod tests {
 
     fn assert_miss(store: &MemoryStore, hash: u64, key: &[u8]) {
         assert!(matches!(store.lookup(hash, key), MemoryLookup::Miss(_)));
-    }
-
-    #[test]
-    fn memory_entry_slot_uses_two_machine_words() {
-        let expected = 2 * size_of::<usize>();
-        assert_eq!(size_of::<MemoryEntry>(), expected);
-        assert_eq!(size_of::<Option<MemoryEntry>>(), expected);
     }
 
     #[test]

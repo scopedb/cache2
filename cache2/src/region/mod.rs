@@ -1538,3 +1538,20 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
                     && metadata.physical_deleted_slots == actual.deleted
             })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+
+    #[test]
+    fn index_page_validation_state_is_fixed_memory_accounted() {
+        let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
+        let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
+
+        assert_eq!(
+            two_pages - one_page,
+            INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
+        );
+    }
+}

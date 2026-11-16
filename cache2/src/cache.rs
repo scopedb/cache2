@@ -151,6 +151,7 @@ impl fmt::Debug for Cache {
 
 impl Cache {
     /// Opens a configured cache using the current Tokio runtime at first poll.
+    ///
     /// The runtime must have time enabled and outlive the cache. File setup and
     /// recovery run on its blocking pool.
     ///
@@ -169,9 +170,11 @@ impl Cache {
         Self::open_with_handle(path, config, handle).await
     }
 
-    /// Opens on an explicit Tokio runtime, including from a caller without an
-    /// active runtime. The selected runtime must have time enabled and outlive
-    /// the cache. Each open independently locks files and acquires resources.
+    /// Opens a configured cache on an explicit Tokio runtime.
+    ///
+    /// Usable from callers without an active runtime. The selected runtime must
+    /// have time enabled and outlive the cache. Each open independently locks
+    /// files and acquires resources.
     ///
     /// # Errors
     ///
@@ -282,7 +285,7 @@ impl Cache {
         })
     }
 
-    /// Reports whether this open started empty or mapped a clean recovery image.
+    /// Reports whether this open started empty or accepted a clean recovery image.
     pub const fn startup_mode(&self) -> StartupMode {
         self.startup
     }
@@ -308,15 +311,16 @@ impl Cache {
     /// Stages a value directly for L2 and returns its monotonic mutation
     /// sequence.
     ///
-    /// An older L1 value is removed with the best effort. Success means the value entered
-    /// bounded staging; use [`Self::drain`] to wait for L2 publication. Keys are
-    /// limited to 4 KiB, and the encoded record must fit one Region.
+    /// An older L1 value is removed on a best-effort basis. Success means the
+    /// value entered bounded staging; use [`Self::drain`] to wait for L2
+    /// publication. Keys are limited to 4 KiB, and the encoded record must fit
+    /// one Region.
     ///
     /// # Errors
     ///
     /// Uses the same input, overload, runtime, and device classifications as
-    /// [`Self::put`], including unavailable after close starts, with
-    /// [`ErrorOperation::PutL2`](ErrorOperation::PutL2) as its context.
+    /// [`Self::put`], including [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable)
+    /// after close starts, with [`ErrorOperation::PutL2`] as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.mutate(ErrorOperation::PutL2, RequestOperation::PutL2, || {
             self.runtime.put_l2(key.as_ref(), value.as_ref())
@@ -392,8 +396,9 @@ impl Cache {
     }
 
     /// Waits until all accepted mutations have completed their Region writes
-    /// and index publication. Use [`Self::close_warm`] to publish a recoverable
-    /// image.
+    /// and index publication.
+    ///
+    /// Use [`Self::close_warm`] to publish a recoverable image.
     ///
     /// # Errors
     ///
@@ -405,10 +410,11 @@ impl Cache {
         public_result(ErrorOperation::Drain, self.runtime.drain_async().await)
     }
 
-    /// Returns an operational snapshot using atomics. Activity and I/O counters are
-    /// cumulative for this open and are populated only when
-    /// `RuntimeOptions::stats.activity_counters` is enabled; health and resource gauges are
-    /// always available.
+    /// Returns a point-in-time operational snapshot.
+    ///
+    /// Activity and I/O counters are cumulative for this open and are populated
+    /// only when `RuntimeOptions::stats.activity_counters` is enabled; health
+    /// and resource gauges are always available.
     ///
     /// # Errors
     ///
@@ -436,9 +442,11 @@ impl Cache {
     }
 
     /// Samples L1, index, write-buffer rejection, I/O, and Region state in
-    /// addition to the regular cache summary. This periodic diagnostic briefly
-    /// reads every configured L1 shard and index partition and scans Region
-    /// metadata. Sampling is limited to metadata.
+    /// addition to the regular cache summary.
+    ///
+    /// This periodic diagnostic briefly reads every configured L1 shard and
+    /// index partition and scans Region metadata. Sampling is limited to
+    /// metadata.
     ///
     /// # Errors
     ///
@@ -456,6 +464,7 @@ impl Cache {
     }
 
     /// Stops on Tokio's blocking pool and makes the next open a cold start.
+    ///
     /// Calling this method immediately rejects new operations through every
     /// shared handle; unique [`Arc`] ownership is not required. The first close
     /// call wins and continues even if the returned future is dropped.
@@ -469,11 +478,13 @@ impl Cache {
         self.close(false)
     }
 
-    /// Publishes a clean recovery image on Tokio's blocking pool. Calling this
-    /// method immediately rejects new operations through every shared handle;
-    /// unique [`Arc`] ownership is not required. Accepted mutations and their
-    /// submitted writes are fenced before the image is frozen. The first close
-    /// call wins and continues even if the returned future is dropped.
+    /// Publishes a clean recovery image on Tokio's blocking pool.
+    ///
+    /// Calling this method immediately rejects new operations through every
+    /// shared handle; unique [`Arc`] ownership is not required. Accepted
+    /// mutations and their submitted writes are fenced before the image is
+    /// frozen. The first close call wins and continues even if the returned
+    /// future is dropped.
     ///
     /// # Errors
     ///

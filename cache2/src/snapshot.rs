@@ -52,7 +52,9 @@ pub enum FillPressure {
     Paused,
 }
 
-/// Always available when fill control is enabled, independent of statistics.
+/// Fill-pressure controller state and accounting.
+///
+/// Always populated when fill control is enabled, independent of statistics.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FillControlSnapshot {
@@ -81,8 +83,9 @@ pub struct FillControlSnapshot {
 }
 
 /// Point-in-time operational counters and cache-owned resource accounting.
-/// Sampling uses atomics. Counters are process-local and reset on every open.
-/// Concurrent updates may appear across fields at slightly different instants.
+///
+/// Counters are process-local and reset on every open. Concurrent updates may
+/// appear across fields at slightly different instants.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheSnapshot {
@@ -157,9 +160,10 @@ pub struct CacheIoSnapshot {
     pub write: CacheIoDirectionSnapshot,
 }
 
-/// Cumulative engine-request and runtime-file-I/O statistics for one
-/// direction. Request counters describe logical engine requests. Path counters
-/// describe positive runtime file operations and are not physical device I/O.
+/// Cumulative engine-request and runtime-file-I/O statistics for one direction.
+///
+/// Request counters describe logical engine requests. Path counters describe
+/// positive runtime file operations and are not physical device I/O.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheIoDirectionSnapshot {
@@ -282,9 +286,10 @@ pub struct RegionSnapshot {
     pub rotations: u64,
 }
 
-/// On-demand operational detail. Producing this value briefly reads every L1
-/// shard and index partition and scans Region metadata. It does not scan index
-/// slots or Region data.
+/// On-demand operational detail across all cache tiers.
+///
+/// Producing this value briefly reads every L1 shard and index partition and
+/// scans Region metadata. It does not scan index slots or Region data.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetailedCacheSnapshot {

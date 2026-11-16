@@ -399,6 +399,8 @@ struct S3FifoLink {
     weight: u32,
 }
 
+const _: () = assert!(size_of::<S3FifoLink>() == 12);
+
 impl Default for S3FifoLink {
     fn default() -> Self {
         Self {
@@ -904,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_clock_plan_restores_a_detached_entry() {
+    fn failed_clock_admission_restores_a_detached_entry() {
         let mut policy = policy(L1EvictionPolicy::Clock, 1024, 1);
         let mut slots = Vec::new();
         let index = install(&mut policy, &mut slots, 7, 11);
@@ -975,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_s3fifo_plan_restores_queue_and_frequency() {
+    fn failed_s3fifo_admission_restores_queue_and_frequency() {
         let mut policy = policy(L1EvictionPolicy::S3Fifo, 1000, 1);
         let mut slots = Vec::new();
         let index = install(&mut policy, &mut slots, 7, 100);
@@ -1025,7 +1027,6 @@ mod tests {
     #[test]
     fn ghost_storage_uses_twenty_bytes_per_entry() {
         const ENTRIES: usize = 5;
-        assert_eq!(size_of::<S3FifoLink>(), 12);
         assert_eq!(
             GhostQueue::allocation_bytes(ENTRIES).unwrap()
                 - FixedPrehashedMap::allocation_bytes(ENTRIES).unwrap(),

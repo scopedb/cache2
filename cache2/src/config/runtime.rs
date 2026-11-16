@@ -47,9 +47,8 @@ const DEFAULT_POSIX_IO_WORKERS: usize = 4;
 const DEFAULT_IO_URING_MAX_IN_FLIGHT: usize = 64;
 const DEFAULT_RECLAIM_IO_CONCURRENCY: usize = 1;
 
-/// Unchecked worker topology for POSIX positioned I/O.
+/// Worker topology for POSIX positioned I/O.
 ///
-/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
 /// Every admitted request occupies one worker until its blocking system call
 /// completes, so worker counts are also the per-pool in-flight limits.
 #[non_exhaustive]
@@ -73,39 +72,39 @@ impl Default for PosixIoOptions {
     }
 }
 
-/// Unchecked physical rings and aggregate execution bound for one pool of the
-/// experimental io_uring engine.
+/// Ring count and aggregate execution bound for one pool of the experimental
+/// `io_uring` engine.
 ///
-/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
 /// Keep [`Self::rings`] at 1 and size [`Self::max_in_flight`] to concurrent work
-/// for this pool. Extra rings split the same depth across driver threads; they
-/// do not add execution slots. Leave [`Self::sq_poll`] and [`Self::io_poll`]
+/// for this pool. Extra rings split the same depth across driver threads and do
+/// not add execution slots. Leave [`Self::sq_poll`] and [`Self::io_poll`]
 /// unset unless a host profile needs one of them; they are independent advanced
-/// flags and are easy to combine incorrectly.
+/// opt-ins with distinct kernel requirements.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringPoolOptions {
-    /// Independent rings and driver threads. Defaults to 1.
+    /// Independent rings and driver threads.
     ///
-    /// Raise this only after `max_in_flight` matches caller concurrency and a
-    /// single driver thread is CPU-bound. Must not exceed `max_in_flight`.
+    /// Defaults to 1. Raise this only after `max_in_flight` matches caller
+    /// concurrency and a single driver thread is CPU-bound; must not exceed
+    /// `max_in_flight`.
     pub rings: usize,
-    /// Aggregate maximum in-flight requests. Defaults to 64.
+    /// Aggregate maximum in-flight requests across all rings in the pool.
     ///
-    /// This is the admission bound. It is distributed as evenly as possible
-    /// across `rings`. For the read pool, set it to concurrent L2 gets.
+    /// Defaults to 64 (or 1 for reclaim). For the read pool, size this to
+    /// concurrent L2 `get` calls.
     pub max_in_flight: usize,
-    /// Advanced kernel submission-queue polling for every ring in this pool.
+    /// Kernel submission-queue polling configuration for every ring in this pool.
     ///
-    /// Defaults to `None`, which disables SQPOLL. SQPOLL does not require
-    /// Direct I/O. Optional CPU affinity applies to every ring in the pool.
+    /// Defaults to `None` (disabled). SQPOLL does not require Direct I/O.
+    /// Optional CPU affinity applies to every ring in the pool.
     pub sq_poll: Option<IoUringSqPollOptions>,
-    /// Advanced completion polling for every ring in this pool.
+    /// Completion polling toggle for every ring in this pool.
     ///
-    /// Defaults to false. Requires Direct I/O on a polling-capable filesystem
-    /// and block device. Consumes CPU while requests are outstanding, and a
-    /// cancellation stays advisory until the polled operation completes.
-    /// Independent of [`Self::sq_poll`].
+    /// Defaults to `false`. Requires Direct I/O on a polling-capable
+    /// filesystem and block device. Consumes CPU while requests are
+    /// outstanding, and cancellation stays advisory until the polled operation
+    /// completes. Independent of [`Self::sq_poll`].
     pub io_poll: bool,
 }
 
@@ -120,19 +119,20 @@ impl Default for IoUringPoolOptions {
     }
 }
 
-/// Unchecked kernel submission queue polling parameters for the experimental
-/// io_uring engine.
+/// Kernel submission-queue polling parameters for the experimental `io_uring`
+/// engine.
 ///
-/// This is an advanced opt-in. Start with [`Self::new`] and assign fields
-/// before building [`CacheConfig`]. For a multi-ring pool, every ring's
-/// polling thread uses the same optional CPU affinity.
+/// For a multi-ring pool, every ring's polling thread shares the same optional
+/// CPU affinity.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringSqPollOptions {
     /// Idle time in milliseconds before the kernel polling thread can sleep.
     pub idle_millis: u32,
-    /// Optional CPU affinity. Defaults to `None`, which leaves the thread unpinned.
-    /// For a multi-ring pool, every ring's polling thread uses this CPU.
+    /// Optional CPU affinity.
+    ///
+    /// Defaults to `None`, leaving the polling thread unpinned. For a multi-ring
+    /// pool, every ring's polling thread uses this CPU.
     pub cpu: Option<u32>,
 }
 
@@ -146,21 +146,18 @@ impl IoUringSqPollOptions {
     }
 }
 
-/// Unchecked topology for the experimental io_uring engine's independent read,
+/// Pool topology for the experimental `io_uring` engine's independent read,
 /// write, and reclaim pools.
 ///
-/// Start with [`Self::default`] and assign fields before building [`CacheConfig`].
-/// Keep one ring per pool. Set [`IoUringPoolOptions::max_in_flight`] on the read
-/// pool to concurrent L2 gets; leave write and reclaim at their defaults unless
-/// write slot wait or reclaim lag is the limiter.
+/// See [`IoUringPoolOptions`] for ring sizing and polling guidance.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringOptions {
-    /// Read pool. Defaults to one ring and 64 in-flight requests.
+    /// Read pool (defaults to 1 ring and 64 in-flight requests).
     pub read: IoUringPoolOptions,
-    /// Write pool. Defaults to one ring and 64 in-flight requests.
+    /// Write pool (defaults to 1 ring and 64 in-flight requests).
     pub write: IoUringPoolOptions,
-    /// Reclaim pool. Defaults to one ring and one in-flight request.
+    /// Reclaim pool (defaults to 1 ring and 1 in-flight request).
     pub reclaim: IoUringPoolOptions,
 }
 
@@ -177,23 +174,18 @@ impl Default for IoUringOptions {
     }
 }
 
-/// Unchecked engine selection and topology for the independent read, write,
-/// and reclaim I/O pools, validated by [`CacheConfig::new`].
+/// Engine selection and topology for the independent read, write, and reclaim
+/// I/O pools, validated by [`CacheConfig::new`].
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoEngineOptions {
     /// Worker-backed POSIX positioned I/O with explicit thread counts.
     Posix(PosixIoOptions),
-    /// Experimental Linux io_uring engine with independent ring and in-flight
-    /// bounds.
+    /// Experimental Linux `io_uring` engine with independent pool options.
     ///
     /// Its API, configuration, and runtime behavior may change between
-    /// releases. Keep one ring per pool and size read `max_in_flight` to
-    /// concurrent L2 gets. SQPOLL and IOPOLL are advanced per-pool opt-ins
-    /// with different requirements.
-    ///
-    /// This variant is available only with the `io-uring` crate feature on a
-    /// supported Linux target.
+    /// releases. Available only with the `io-uring` crate feature on a
+    /// supported Linux target. See [`IoUringPoolOptions`] for tuning guidance.
     IoUring(IoUringOptions),
 }
 
@@ -402,22 +394,24 @@ pub enum FillControlOptions {
 }
 
 /// Logical fill-rate ceilings shared by [`FillControlOptions::Observe`] and
-/// [`FillControlOptions::Adaptive`]. They are instance-wide, not per worker,
-/// and are not device bandwidth or IOPS guarantees. Foreground `put` does not
-/// consume them; Adaptive uses them to pace non-essential background flush.
+/// [`FillControlOptions::Adaptive`].
+///
+/// Limits are instance-wide, not per worker, and are not device bandwidth or
+/// IOPS guarantees. Foreground `put` does not consume them; `Adaptive` uses
+/// them to pace non-essential background flush.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FillLimits {
-    /// Maximum encoded fill bytes per second, from 640 through 1 TiB/s.
-    /// Instance-wide across all shard workers.
+    /// Maximum encoded fill bytes per second, from 640 through 1 TiB/s,
+    /// instance-wide across all shard workers.
     pub max_bytes_per_second: u64,
-    /// Maximum fill records per second, from 10 through 4,294,967,295.
-    /// Instance-wide across all shard workers.
+    /// Maximum fill records per second, from 10 through 4,294,967,295,
+    /// instance-wide across all shard workers.
     pub max_records_per_second: u32,
 }
 
 impl FillLimits {
-    /// Creates unchecked rate ceilings. [`CacheConfig::new`] validates them.
+    /// Creates fill-rate ceilings validated when [`CacheConfig::new`] runs.
     pub const fn new(max_bytes_per_second: u64, max_records_per_second: u32) -> Self {
         Self {
             max_bytes_per_second,
@@ -426,67 +420,81 @@ impl FillLimits {
     }
 }
 
-/// Process-local resource choices, checked together by [`CacheConfig::new`].
+/// Process-local runtime configuration checked together by [`CacheConfig::new`].
 ///
-/// These values may change across opens. Warm recovery rebinds append shards
+/// These options may change across opens. Warm recovery rebinds append shards
 /// from recovered Active and Free Regions when the requested topology fits.
-/// Fields are unchecked inputs. Configuration construction resolves defaults and
-/// checks the complete combination before any files are opened.
 /// Start with [`Self::default`] and assign the fields to customize.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeOptions {
-    /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
-    /// and 1 workers.
+    /// Independent read, write, and reclaim pools (defaults to POSIX with 4,
+    /// 4, and 1 workers).
     pub io_engine: IoEngineOptions,
-    /// Record I/O mode. Defaults to buffered; direct I/O requires supported Linux storage.
+    /// Record I/O mode (defaults to buffered; direct I/O requires supported
+    /// Linux storage).
     pub io_mode: IoMode,
     /// Admission policy after an L2 candidate has been selected.
     pub read_admission: ReadAdmission,
     /// Deadline for each background reclaim read, including I/O admission.
+    ///
     /// Defaults to five seconds. Must be positive and representable as an
     /// absolute deadline. Does not change foreground reads or writes. Longer
     /// deadlines can delay shutdown and exhaust free Regions while waiting;
     /// expiration enters `io_recovery_timeout` recovery before cancellation
     /// can fail the cache instance.
     pub reclaim_io_timeout: Duration,
-    /// Background timeout recovery budget after the normal admission/completion
-    /// deadline. Defaults to `None`: recover until completion or close. Use
+    /// Background timeout recovery budget after the normal
+    /// admission/completion deadline.
+    ///
+    /// Defaults to `None` (recover until completion or close). Use
     /// `Some(Duration::ZERO)` for immediate cancellation, or a finite duration
-    /// to limit recovery. While recovering, new fills return overload; existing
-    /// reads and deletes remain available. Original requests retain their slots,
-    /// buffers, and Regions and are never resubmitted. Recovery checks completion
-    /// and shutdown at one-second intervals. Close interrupts recovery; drain
-    /// can wait indefinitely with `None`. Actual I/O errors and invalid
-    /// completions still fail the instance.
+    /// to limit recovery. While recovering, new fills return overload while
+    /// existing reads and deletes remain available; original requests retain
+    /// their slots, buffers, and Regions and are never resubmitted. Close
+    /// interrupts recovery, whereas drain can wait indefinitely with `None`.
+    /// Actual I/O errors and invalid completions still fail the instance.
     pub io_recovery_timeout: Option<Duration>,
-    /// Optional pre-timeout fill pressure control. Disabled by default.
-    /// Enabled modes reserve bounded worker observations; Adaptive paces
-    /// background flush and pauses new fills when outstanding work is old.
+    /// Optional pre-timeout fill pressure control.
+    ///
+    /// Disabled by default. Enabled modes reserve bounded worker observations;
+    /// `Adaptive` paces background flush and pauses new fills when outstanding
+    /// work is old.
     pub fill_control: FillControlOptions,
-    /// Hash-routed append paths, from 1 through 256 (default 4). Each needs one
-    /// Active Region, two Region-sized buffers, and a worker. The layout also needs a
-    /// spare Region.
+    /// Hash-routed append paths, from 1 through 256 (default 4).
+    ///
+    /// Each shard needs one Active Region, two Region-sized buffers, and a
+    /// worker; the layout also needs one spare Region.
     pub append_shards: u32,
     /// Retained L1 byte budget, including keys, values, and ownership charges.
+    ///
     /// Defaults to 256 MiB; zero disables L1. Fixed L1 metadata is charged
     /// separately.
     pub l1_capacity_bytes: usize,
-    /// Bounded L1 eviction policy. Defaults to CLOCK; S3-FIFO adds ghost metadata.
+    /// Bounded L1 eviction policy (defaults to CLOCK; S3-FIFO adds ghost
+    /// metadata).
     pub l1_eviction_policy: L1EvictionPolicy,
-    /// Aggregate cache-managed memory limit, defaulting to 1 GiB. Covers index
-    /// mappings, L1, buffers, metadata, queues, and cache threads. Allocator
-    /// overhead, Tokio, application memory, and the kernel page cache are outside it.
+    /// Aggregate cache-managed memory limit, defaulting to 1 GiB.
+    ///
+    /// Covers index mappings, L1, buffers, metadata, queues, and cache threads.
+    /// Allocator overhead, Tokio, application memory, and the kernel page
+    /// cache are outside it.
     pub managed_memory_limit_bytes: usize,
-    /// Independently locked L1 shards, from 1 through 65536 (default 32). Powers
-    /// of two give the cheapest routing; more shards require more metadata.
+    /// Independently locked L1 shards, from 1 through 65536 (default 32).
+    ///
+    /// Powers of two give the cheapest routing; more shards require more
+    /// metadata.
     pub l1_shards: usize,
     /// Per-append-shard threshold for requesting a flush, in 4 KiB multiples
-    /// through 4 MiB (the default). Partial buffers also flush on a bounded delay,
-    /// pressure, and completion barriers.
+    /// through 4 MiB (the default).
+    ///
+    /// Partial buffers also flush on a bounded delay, pressure, and completion
+    /// barriers.
     pub write_flush_threshold_bytes: usize,
     /// Activity counters, request outcomes, and latency distributions.
-    /// Defaults disable collection; health and resource gauges remain available.
+    ///
+    /// Defaults disable collection; health and resource gauges remain
+    /// available.
     pub stats: StatsOptions,
 }
 
@@ -538,6 +546,14 @@ const MIN_L1_SIZING_ENTRY_BYTES: usize = 4 * 1024;
 impl CacheConfig {
     /// Checks the complete combination and resolves dependent runtime defaults.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
+    /// counts, invalid runtime settings, unavailable build/platform features,
+    /// or insufficient managed memory. Device capabilities are checked at open.
+    ///
+    /// # Examples
+    ///
     /// ```no_run
     /// # async fn example() -> Result<(), cache2::Error> {
     /// use cache2::Cache;
@@ -546,14 +562,18 @@ impl CacheConfig {
     /// use cache2::PosixIoOptions;
     /// use cache2::RuntimeOptions;
     /// use cache2::StorageOptions;
+    ///
     /// let mut storage = StorageOptions::new(1024 * 1024 * 1024);
     /// storage.expected_entries = Some(100_000);
     /// let storage = storage.build()?;
+    ///
     /// let mut io = PosixIoOptions::default();
     /// io.read_workers = 8;
+    ///
     /// let mut runtime = RuntimeOptions::default();
     /// runtime.io_engine = IoEngineOptions::Posix(io);
     /// runtime.stats.activity_counters = true;
+    ///
     /// let config = CacheConfig::new(storage, runtime)?;
     /// let disk_peak = config.storage().peak_disk_bytes();
     /// let memory_floor = config.minimum_memory_bytes();
@@ -562,12 +582,6 @@ impl CacheConfig {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorOperation::BuildConfig`] for incompatible Region/shard
-    /// counts, invalid runtime settings, unavailable build/platform features,
-    /// or insufficient managed memory. Device capabilities are checked at open.
     pub fn new(storage: StorageLayout, mut runtime: RuntimeOptions) -> Result<Self, Error> {
         let build = || -> io::Result<Self> {
             let geometry = storage.geometry();
@@ -1131,56 +1145,6 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
-    }
-
-    #[test]
-    fn io_uring_unavailability_names_the_missing_requirement() {
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            io_uring_unavailability(),
-            Some(IO_URING_UNAVAILABLE_PLATFORM)
-        );
-        #[cfg(all(
-            target_os = "linux",
-            not(any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            ))
-        ))]
-        assert_eq!(
-            io_uring_unavailability(),
-            Some(IO_URING_UNAVAILABLE_ARCHITECTURE)
-        );
-        #[cfg(all(
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            ),
-            not(feature = "io-uring")
-        ))]
-        assert_eq!(
-            io_uring_unavailability(),
-            Some(IO_URING_UNAVAILABLE_FEATURE)
-        );
-        #[cfg(all(
-            feature = "io-uring",
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "loongarch64",
-                target_arch = "powerpc64"
-            )
-        ))]
-        assert_eq!(io_uring_unavailability(), None);
     }
 
     #[cfg(all(

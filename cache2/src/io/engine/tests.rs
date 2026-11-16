@@ -1095,19 +1095,23 @@ fn background_read_can_complete_after_default_deadline() {
     let io = Arc::new(BlockingIo::default());
     let engine = IoEngine::for_test(io.clone(), 1).unwrap();
     let managed_memory = managed_memory();
-    let request = submit_cache_io_with_timeout(
+    let request = submit_cache_io_until(
         &engine,
         IoOperation::read(read_buffer(&managed_memory, 4096), 0),
-        Duration::from_secs(30),
+        Instant::now() + Duration::from_millis(20),
+        CACHE_IO_CANCEL_GRACE,
     )
     .unwrap();
     assert!(io.wait_for_entered(1));
     let release = thread::spawn(move || {
-        thread::sleep(CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(40));
         io.release();
     });
-    let completion = request.wait(&engine);
+    let io_recovery = IoRecovery::new(Some(Duration::from_secs(2)));
+    let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
+    let completion = request.wait_background(&engine, &mut attempt);
     release.join().unwrap();
+    attempt.finish();
     engine.shutdown().unwrap();
     assert!(completion.is_ok());
 }
@@ -1367,7 +1371,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
                 let request = submit_background_io(
                     engine,
                     IoOperation::write(WritePoint::Record, write_buffer(memory, &[5; 4096]), 0),
-                    Duration::from_secs(4),
+                    Duration::from_millis(80),
                     &mut attempt,
                 )
                 .unwrap();
@@ -1395,10 +1399,6 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             assert!(control.try_admit_fill());
             validate_tx.send(()).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while control.snapshot().pressure == FillPressure::Paused && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
         assert!(control.try_admit_fill());
         assert_eq!(lock_unpoisoned(&io.state).entered, 1);
