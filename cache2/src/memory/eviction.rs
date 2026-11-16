@@ -162,11 +162,7 @@ impl DetachedPolicy {
     }
 }
 
-pub struct EvictionState {
-    policy: EvictionPolicyState,
-}
-
-enum EvictionPolicyState {
+pub enum EvictionState {
     Clock(ClockState),
     S3Fifo(S3FifoState),
 }
@@ -177,15 +173,13 @@ impl EvictionState {
         capacity_bytes: usize,
         maximum_entries: usize,
     ) -> io::Result<Self> {
-        let policy = match policy {
-            L1EvictionPolicy::Clock => {
-                EvictionPolicyState::Clock(ClockState::new(maximum_entries)?)
-            }
-            L1EvictionPolicy::S3Fifo => {
-                EvictionPolicyState::S3Fifo(S3FifoState::new(capacity_bytes, maximum_entries)?)
-            }
-        };
-        Ok(Self { policy })
+        match policy {
+            L1EvictionPolicy::Clock => Ok(Self::Clock(ClockState::new(maximum_entries)?)),
+            L1EvictionPolicy::S3Fifo => Ok(Self::S3Fifo(S3FifoState::new(
+                capacity_bytes,
+                maximum_entries,
+            )?)),
+        }
     }
 
     pub fn allocation_bytes(policy: L1EvictionPolicy, maximum_entries: usize) -> io::Result<usize> {
@@ -197,22 +191,22 @@ impl EvictionState {
 
     pub fn insert(&mut self, slots: &mut [PolicySlot], index: usize, hash: u64, weight: usize) {
         debug_assert!(!slots[index].is_resident());
-        match &mut self.policy {
-            EvictionPolicyState::Clock(state) => {
+        match self {
+            Self::Clock(state) => {
                 // One-shot scans receive no free second chance. A real L1 hit
                 // sets the bit before this entry reaches the hand.
                 state.insert(slots, index, hash, false);
             }
-            EvictionPolicyState::S3Fifo(state) => {
+            Self::S3Fifo(state) => {
                 state.insert(slots, index, hash, weight);
             }
         }
     }
 
     pub fn record_hit(&mut self, slots: &mut [PolicySlot], index: usize) {
-        match &mut self.policy {
-            EvictionPolicyState::Clock(_) => slots[index].set_clock_visited(true),
-            EvictionPolicyState::S3Fifo(_) => slots[index].increment_s3fifo_frequency(),
+        match self {
+            Self::Clock(_) => slots[index].set_clock_visited(true),
+            Self::S3Fifo(_) => slots[index].increment_s3fifo_frequency(),
         }
     }
 
@@ -220,9 +214,9 @@ impl EvictionState {
         if !slots.get(index).is_some_and(PolicySlot::is_resident) {
             return;
         }
-        match &mut self.policy {
-            EvictionPolicyState::Clock(state) => state.remove(slots, index),
-            EvictionPolicyState::S3Fifo(state) => state.remove(slots, index),
+        match self {
+            Self::Clock(state) => state.remove(slots, index),
+            Self::S3Fifo(state) => state.remove(slots, index),
         }
     }
 
@@ -235,8 +229,8 @@ impl EvictionState {
         index: usize,
         weight: usize,
     ) -> DetachedPolicy {
-        match &mut self.policy {
-            EvictionPolicyState::Clock(state) => {
+        match self {
+            Self::Clock(state) => {
                 let hash = slots[index].hash();
                 state.remove(slots, index);
                 DetachedPolicy {
@@ -245,7 +239,7 @@ impl EvictionState {
                     kind: DetachedPolicyKind::Clock,
                 }
             }
-            EvictionPolicyState::S3Fifo(state) => state.detach(slots, index, weight),
+            Self::S3Fifo(state) => state.detach(slots, index, weight),
         }
     }
 
@@ -256,32 +250,30 @@ impl EvictionState {
         detached: DetachedPolicy,
     ) {
         debug_assert!(!slots[index].is_resident());
-        match (&mut self.policy, detached.kind) {
-            (EvictionPolicyState::Clock(state), DetachedPolicyKind::Clock) => {
+        match (self, detached.kind) {
+            (Self::Clock(state), DetachedPolicyKind::Clock) => {
                 // A failed admission is optional work and must not make its
                 // temporarily detached victim immediately vulnerable again.
                 state.insert(slots, index, detached.hash, true);
             }
-            (
-                EvictionPolicyState::S3Fifo(state),
-                DetachedPolicyKind::S3Fifo { queue, frequency },
-            ) => state.restore(
-                slots,
-                index,
-                detached.hash,
-                detached.weight,
-                queue,
-                frequency,
-            ),
+            (Self::S3Fifo(state), DetachedPolicyKind::S3Fifo { queue, frequency }) => state
+                .restore(
+                    slots,
+                    index,
+                    detached.hash,
+                    detached.weight,
+                    queue,
+                    frequency,
+                ),
             _ => unreachable!("detached L1 policy does not match the configured policy"),
         }
     }
 
     /// Records policy history only after the associated memory victim commits.
     pub fn commit_eviction(&mut self, detached: DetachedPolicy) {
-        match (&mut self.policy, detached.kind) {
-            (EvictionPolicyState::Clock(_), DetachedPolicyKind::Clock) => {}
-            (EvictionPolicyState::S3Fifo(state), DetachedPolicyKind::S3Fifo { queue, .. }) => {
+        match (self, detached.kind) {
+            (Self::Clock(_), DetachedPolicyKind::Clock) => {}
+            (Self::S3Fifo(state), DetachedPolicyKind::S3Fifo { queue, .. }) => {
                 if queue == QueueKind::Small {
                     state.ghost.insert(detached.hash, detached.weight);
                 }
@@ -299,18 +291,14 @@ impl EvictionState {
     where
         F: Fn(usize) -> bool,
     {
-        match &mut self.policy {
-            EvictionPolicyState::Clock(state) => {
-                state.select_victim(slots, remaining_steps, can_reclaim)
-            }
-            EvictionPolicyState::S3Fifo(state) => {
-                state.select_victim(slots, remaining_steps, can_reclaim)
-            }
+        match self {
+            Self::Clock(state) => state.select_victim(slots, remaining_steps, can_reclaim),
+            Self::S3Fifo(state) => state.select_victim(slots, remaining_steps, can_reclaim),
         }
     }
 }
 
-struct ClockState {
+pub struct ClockState {
     hand: usize,
     residents: Vec<u32>,
 }
@@ -411,6 +399,8 @@ struct S3FifoLink {
     weight: u32,
 }
 
+const _: () = assert!(size_of::<S3FifoLink>() == 12);
+
 impl Default for S3FifoLink {
     fn default() -> Self {
         Self {
@@ -498,7 +488,7 @@ impl PolicyQueue {
     }
 }
 
-struct S3FifoState {
+pub struct S3FifoState {
     links: Box<[S3FifoLink]>,
     small: PolicyQueue,
     main: PolicyQueue,
@@ -666,9 +656,7 @@ struct GhostQueue {
     links: Box<[S3FifoLink]>,
     free_head: u32,
     free_count: usize,
-    head: u32,
-    tail: u32,
-    bytes: usize,
+    queue: PolicyQueue,
     capacity_bytes: usize,
 }
 
@@ -708,9 +696,7 @@ impl GhostQueue {
                 0
             },
             free_count: maximum_entries,
-            head: NO_POLICY_SLOT,
-            tail: NO_POLICY_SLOT,
-            bytes: 0,
+            queue: PolicyQueue::empty(),
             capacity_bytes,
         })
     }
@@ -745,10 +731,8 @@ impl GhostQueue {
     }
 
     fn insert(&mut self, hash: u64, weight: usize) {
-        let Ok(packed_weight) = u32::try_from(weight) else {
-            return;
-        };
-        if packed_weight == 0
+        if u32::try_from(weight).is_err()
+            || weight == 0
             || weight > self.capacity_bytes
             || self.links.is_empty()
             || self.capacity_bytes == 0
@@ -756,13 +740,14 @@ impl GhostQueue {
             return;
         }
         if self.free_head == NO_POLICY_SLOT
-            || self.bytes.saturating_add(weight) > self.capacity_bytes
+            || self.queue.bytes.saturating_add(weight) > self.capacity_bytes
         {
-            let Some(head) = self.head_index() else {
+            let Some(head) = self.queue.front() else {
                 return;
             };
             let head_weight = self.links[head].weight as usize;
             if self
+                .queue
                 .bytes
                 .saturating_sub(head_weight)
                 .saturating_add(weight)
@@ -783,19 +768,7 @@ impl GhostQueue {
         debug_assert_ne!(self.free_count, 0);
         self.free_count -= 1;
         self.hashes[index] = hash;
-        self.links[index] = S3FifoLink {
-            previous: self.tail,
-            next: NO_POLICY_SLOT,
-            weight: packed_weight,
-        };
-        if self.tail == NO_POLICY_SLOT {
-            self.head = packed;
-        } else {
-            let tail = usize::try_from(self.tail).expect("ghost slot index exceeds usize");
-            self.links[tail].next = packed;
-        }
-        self.tail = packed;
-        self.bytes = self.bytes.saturating_add(weight);
+        self.queue.push_back(&mut self.links, index, weight);
         match self.directory.insert(hash, packed) {
             Some(Some(previous)) => {
                 let previous = usize::try_from(previous).expect("ghost slot index exceeds usize");
@@ -807,39 +780,18 @@ impl GhostQueue {
     }
 
     fn remove_head(&mut self) -> bool {
-        let Some(index) = self.head_index() else {
+        let Some(index) = self.queue.front() else {
             return false;
         };
         let removed = self.directory.remove(self.hashes[index]);
-        debug_assert_eq!(removed, Some(self.head));
+        debug_assert_eq!(removed, Some(self.queue.head));
         self.unlink(index);
         true
     }
 
-    fn head_index(&self) -> Option<usize> {
-        (self.head != NO_POLICY_SLOT)
-            .then(|| usize::try_from(self.head).expect("ghost slot index exceeds usize"))
-    }
-
     fn unlink(&mut self, index: usize) {
         let packed = u32::try_from(index).expect("ghost slot index exceeds u32");
-        let link = self.links[index];
-        debug_assert_ne!(link.weight, 0);
-        if link.previous == NO_POLICY_SLOT {
-            debug_assert_eq!(self.head, packed);
-            self.head = link.next;
-        } else {
-            let previous = usize::try_from(link.previous).expect("ghost slot index exceeds usize");
-            self.links[previous].next = link.next;
-        }
-        if link.next == NO_POLICY_SLOT {
-            debug_assert_eq!(self.tail, packed);
-            self.tail = link.previous;
-        } else {
-            let next = usize::try_from(link.next).expect("ghost slot index exceeds usize");
-            self.links[next].previous = link.previous;
-        }
-        self.bytes = self.bytes.saturating_sub(link.weight as usize);
+        let _ = self.queue.remove(&mut self.links, index);
         self.hashes[index] = 0;
         self.links[index] = S3FifoLink {
             next: self.free_head,
@@ -954,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_clock_plan_restores_a_detached_entry() {
+    fn failed_clock_admission_restores_a_detached_entry() {
         let mut policy = policy(L1EvictionPolicy::Clock, 1024, 1);
         let mut slots = Vec::new();
         let index = install(&mut policy, &mut slots, 7, 11);
@@ -1025,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_s3fifo_plan_restores_queue_and_frequency() {
+    fn failed_s3fifo_admission_restores_queue_and_frequency() {
         let mut policy = policy(L1EvictionPolicy::S3Fifo, 1000, 1);
         let mut slots = Vec::new();
         let index = install(&mut policy, &mut slots, 7, 100);
@@ -1064,7 +1016,7 @@ mod tests {
         // history is skipped without gradually erasing the existing queue.
         ghost.insert(4, 80);
 
-        assert_eq!(ghost.bytes, 100);
+        assert_eq!(ghost.queue.bytes, 100);
         assert_eq!(ghost.free_count, 0);
         assert_eq!(ghost.directory.get(1), Some(0));
         assert_eq!(ghost.directory.get(2), Some(1));
@@ -1075,7 +1027,6 @@ mod tests {
     #[test]
     fn ghost_storage_uses_twenty_bytes_per_entry() {
         const ENTRIES: usize = 5;
-        assert_eq!(size_of::<S3FifoLink>(), 12);
         assert_eq!(
             GhostQueue::allocation_bytes(ENTRIES).unwrap()
                 - FixedPrehashedMap::allocation_bytes(ENTRIES).unwrap(),
@@ -1091,7 +1042,7 @@ mod tests {
         ghost.insert(first, 10);
 
         assert!(!ghost.take(colliding));
-        assert_eq!(ghost.bytes, 0);
+        assert_eq!(ghost.queue.bytes, 0);
         assert!(!ghost.take(first));
     }
 

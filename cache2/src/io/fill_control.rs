@@ -50,9 +50,11 @@ pub struct FlushCharge {
 fn packed_records(value: u64) -> u64 {
     value >> 32
 }
+
 fn packed_byte_units(value: u64) -> u64 {
     value & u64::from(u32::MAX)
 }
+
 fn pack_credit(records: u64, byte_units: u64) -> u64 {
     (records << 32) | byte_units
 }
@@ -98,7 +100,6 @@ pub struct FillController {
     would_reject: AtomicU64,
     dropped_observations: AtomicU64,
     completed_bytes: AtomicU64,
-    completed_io_operations: AtomicU64,
     slots: Box<[Slot]>,
 }
 
@@ -176,7 +177,6 @@ impl FillController {
             would_reject: AtomicU64::new(0),
             dropped_observations: AtomicU64::new(0),
             completed_bytes: AtomicU64::new(0),
-            completed_io_operations: AtomicU64::new(0),
             slots: table.into_boxed_slice(),
         })))
     }
@@ -220,19 +220,20 @@ impl FillController {
     }
 
     fn publish(&self) {
-        let paused = self.stopped.load(Ordering::Acquire)
-            || self.recovering.load(Ordering::Acquire) != 0
-            || self.pause_holders.load(Ordering::Acquire) != 0;
-        let next = if paused {
-            FillPressure::Paused
+        let (next, pressure) = if self.paused() {
+            (FillPressure::Paused, "paused")
         } else {
-            FillPressure::Healthy
+            (FillPressure::Healthy, "healthy")
         };
         let previous =
             decode_pressure(self.pressure.swap(encode_pressure(next), Ordering::Release));
         if previous != next && previous != FillPressure::Disabled {
-            log::info!(target: "cache2::health", event = "cache_fill_pressure_changed", pressure:? = next;
-                "cache fill admission pressure changed");
+            log::info!(
+                target: "cache2::health",
+                event = "cache_fill_pressure_changed",
+                pressure;
+                "cache fill admission pressure changed"
+            );
         }
     }
 
@@ -461,6 +462,7 @@ pub struct IoObservation<'a> {
     succeeded: bool,
     slow: bool,
 }
+
 impl IoObservation<'_> {
     pub fn note_slow(&mut self) {
         if self.slow {
@@ -482,15 +484,13 @@ impl IoObservation<'_> {
         self.succeeded = true;
     }
 }
+
 impl Drop for IoObservation<'_> {
     fn drop(&mut self) {
         let slot = &self.control.slots[self.index];
         let bytes = slot.bytes.load(Ordering::Relaxed);
         slot.start_ns.store(0, Ordering::Release);
         if self.succeeded {
-            self.control
-                .completed_io_operations
-                .fetch_add(1, Ordering::Relaxed);
             self.control
                 .completed_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
@@ -503,6 +503,8 @@ impl Drop for IoObservation<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     fn control(enforcing: bool) -> Arc<FillController> {
@@ -675,7 +677,6 @@ mod tests {
         drop(pending);
         let pending = control.observe_io(4096).unwrap();
         drop(pending);
-        assert_eq!(control.completed_io_operations.load(Ordering::Relaxed), 0);
         assert_eq!(control.completed_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(control.slots[0].start_ns.load(Ordering::Acquire), 0);
     }
@@ -685,7 +686,7 @@ mod tests {
         let control = control(true);
         freeze_refill(&control);
         let accepted = AtomicU64::new(0);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..8 {
                 let control = &control;
                 let accepted = &accepted;
@@ -716,7 +717,7 @@ mod tests {
     #[test]
     fn concurrent_pause_holders_resume_when_all_release() {
         let control = control(true);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..8 {
                 let control = &control;
                 scope.spawn(move || {
@@ -786,7 +787,7 @@ mod tests {
 
     #[test]
     fn sub_tick_refills_do_not_burn_elapsed_time() {
-        let control = FillController::new(
+        let mut control = FillController::new(
             FillControlOptions::Adaptive(FillLimits::new(640, 10)),
             1,
             4096,
@@ -801,7 +802,8 @@ mod tests {
             control.refill();
         }
         assert_eq!(control.last_refill_ns.load(Ordering::Relaxed), one_ms_ago);
-        std::thread::sleep(Duration::from_millis(110));
+        let origin = &mut Arc::get_mut(&mut control).unwrap().origin;
+        *origin = origin.checked_sub(Duration::from_millis(110)).unwrap();
         control.refill();
         assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }
@@ -818,7 +820,7 @@ mod tests {
         freeze_refill(&control);
         while control.try_acquire_flush_budget(64, 1, false).is_some() {}
         let before = control.credit.load(Ordering::Relaxed);
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..32 {
                 let control = &control;
                 scope.spawn(move || {

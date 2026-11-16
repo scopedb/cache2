@@ -19,13 +19,12 @@
 //! no allocation. Payload preparation computes the CRC before the append
 //! transaction copies the borrowed key and value into staging.
 
+use std::error;
 use std::fmt;
 
 use hashcrew::xxhash::xxh3_64_with_seed;
 
 use crate::checksum::crc32c;
-#[cfg(test)]
-use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::MAX_RECORD_LEN;
 use crate::region::index::packed::PackedLocation;
@@ -76,8 +75,8 @@ impl fmt::Display for RecordEncodeError {
     }
 }
 
-impl std::error::Error for RecordEncodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for RecordEncodeError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::InvalidLocation(error) => Some(error),
             _ => None,
@@ -122,10 +121,6 @@ pub fn required_record_bytes(key_len: usize, value_len: usize) -> Result<u32, Re
     Ok(record_bytes)
 }
 
-/// Returns the minimum record envelope used while filling an append staging span.
-///
-/// Direct-I/O alignment belongs to the batch seal: staging extends only the
-/// final record under a manager-issued padding receipt.
 /// Encodes one value into its exact reserved range and returns its index key.
 ///
 /// `reservation.record_bytes` is the minimum record envelope on the
@@ -269,6 +264,7 @@ pub fn hash_key(seed: u64, key: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::file::DIRECT_IO_ALIGNMENT;
 
     #[test]
     fn seeded_xxh3_vectors_define_key_hashing() {

@@ -18,14 +18,29 @@
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
+use std::error;
 use std::fmt;
 use std::future::Future;
 use std::io;
+#[cfg(all(
+    not(test),
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+))]
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::TryLockError;
 use std::sync::atomic::AtomicBool;
@@ -45,9 +60,26 @@ use std::time::Instant;
 
 use asyncband::semaphore::OwnedSemaphorePermit;
 use asyncband::semaphore::Semaphore;
+use tokio::runtime::Handle;
 
+use crate::IoOutcome;
 #[cfg(unix)]
 use crate::config::runtime::IoEngineConfig;
+#[cfg(all(
+    unix,
+    not(all(
+        feature = "io-uring",
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        )
+    ))
+))]
+use crate::config::runtime::io_uring_unavailability;
 use crate::io::background::BackgroundIoAttempt;
 #[cfg(unix)]
 use crate::io::file::DataFileHandles;
@@ -80,6 +112,7 @@ use crate::io::file::FileIoStatsHandle;
 use crate::io::file::WritePoint;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
+use crate::stats::recording::IoTiming;
 
 mod posix;
 
@@ -156,7 +189,7 @@ impl IoBuffer {
                 lease,
             });
         }
-        if lease.prepared_mut(length).is_err() {
+        if lease.prepared_mut(length).is_none() {
             return Err(IoBufferError {
                 error: io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -210,7 +243,7 @@ impl IoBuffer {
     }
 
     pub fn as_slice(&self) -> io::Result<&[u8]> {
-        self.lease.prepared(self.length).map_err(|()| {
+        self.lease.prepared(self.length).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "buffer lease lost its prepared range",
@@ -219,7 +252,7 @@ impl IoBuffer {
     }
 
     fn read_target(&self) -> io::Result<*mut u8> {
-        self.lease.read_target(self.length).map_err(|()| {
+        self.lease.read_target(self.length).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "buffer lease lost its read target range",
@@ -228,12 +261,13 @@ impl IoBuffer {
     }
 
     fn mark_initialized(&mut self, length: usize) -> io::Result<()> {
-        self.lease.mark_initialized(length).map_err(|()| {
-            io::Error::new(
+        if !self.lease.mark_initialized(length) {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "I/O completion exceeds the owned buffer",
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 
     pub fn into_lease(self) -> BufferLease {
@@ -253,21 +287,6 @@ impl IoBuffer {
     ))]
     fn as_ptr(&self) -> io::Result<*const u8> {
         Ok(self.as_slice()?.as_ptr())
-    }
-
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    fn as_mut_ptr(&mut self) -> io::Result<*mut u8> {
-        self.read_target()
     }
 }
 
@@ -301,8 +320,8 @@ impl fmt::Display for IoBufferError {
     }
 }
 
-impl std::error::Error for IoBufferError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for IoBufferError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -396,21 +415,15 @@ impl IoOperation {
                 (buffer.len(), *offset)
             }
         };
-        if length > u32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "I/O length exceeds u32::MAX",
-            ));
-        }
         offset
             .checked_add(length as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "I/O offset overflow"))?;
         Ok(())
     }
 
-    fn into_buffer(self) -> Option<IoBuffer> {
+    fn into_buffer(self) -> IoBuffer {
         match self {
-            Self::Read { buffer, .. } | Self::Write { buffer, .. } => Some(buffer),
+            Self::Read { buffer, .. } | Self::Write { buffer, .. } => buffer,
         }
     }
 
@@ -558,25 +571,20 @@ impl fmt::Display for SubmitError {
     }
 }
 
-impl std::error::Error for SubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for SubmitError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
 impl SubmitError {
-    fn into_parts(self) -> (io::Error, IoOperation) {
-        (self.error, self.operation)
-    }
-
-    pub fn into_lease(self) -> (io::Error, Option<BufferLease>) {
+    pub fn into_lease(self) -> (io::Error, BufferLease) {
         let (error, buffer) = self.into_buffer();
-        (error, buffer.map(IoBuffer::into_lease))
+        (error, buffer.into_lease())
     }
 
-    pub fn into_buffer(self) -> (io::Error, Option<IoBuffer>) {
-        let (error, operation) = self.into_parts();
-        (error, operation.into_buffer())
+    pub fn into_buffer(self) -> (io::Error, IoBuffer) {
+        (self.error, self.operation.into_buffer())
     }
 }
 
@@ -842,7 +850,7 @@ impl BoundedIoRequest {
     pub async fn wait_async(
         self,
         engine: Arc<IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &Handle,
     ) -> Result<IoCompletion, IoDeadlineExceeded> {
         let mut request = AsyncRequestGuard::new(self.request, engine);
         let deadline = tokio::time::Instant::from_std(self.deadline);
@@ -1135,7 +1143,7 @@ impl ReadSlotAdmission {
     async fn acquire_until(
         &self,
         deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &Handle,
     ) -> io::Result<OwnedSemaphorePermit> {
         self.ensure_open()?;
         let acquire = Arc::clone(&self.slots).acquire_owned(1);
@@ -1172,7 +1180,7 @@ impl ReadSlotWaiter {
     pub async fn reserve_until(
         self,
         deadline: Instant,
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &Handle,
     ) -> io::Result<ReadSlot> {
         let admission = self
             .state
@@ -1216,7 +1224,7 @@ const fn active_write_slots(state: u64) -> usize {
 }
 
 struct EngineState {
-    latency: std::sync::OnceLock<crate::stats::recording::IoTiming>,
+    latency: OnceLock<IoTiming>,
     max_in_flight: usize,
     activity_counters_enabled: bool,
     accepting: AtomicBool,
@@ -1248,7 +1256,7 @@ enum SlotWaitError {
 impl EngineState {
     fn new(max_in_flight: usize, activity_counters_enabled: bool, read_wait_enabled: bool) -> Self {
         Self {
-            latency: std::sync::OnceLock::new(),
+            latency: OnceLock::new(),
             max_in_flight,
             activity_counters_enabled,
             accepting: AtomicBool::new(true),
@@ -1306,7 +1314,7 @@ impl EngineState {
             ) {
                 Ok(_) => {
                     if self.activity_counters_enabled {
-                        update_peak(&self.in_flight_peak, total + 1);
+                        self.in_flight_peak.fetch_max(total + 1, Ordering::Relaxed);
                     }
                     return Some(IoSlot {
                         state: Arc::clone(self),
@@ -1448,11 +1456,13 @@ impl EngineState {
         }
         let buffer = operation.into_buffer();
         self.publish_completion(
-            request_id,
-            kind,
-            status,
-            bytes_transferred,
-            buffer,
+            IoCompletion {
+                request_id,
+                kind,
+                status,
+                bytes_transferred,
+                buffer: Some(buffer),
+            },
             completion,
             slot,
             submitted_at,
@@ -1486,40 +1496,36 @@ impl EngineState {
             submitted_at,
         } = task;
         let kind = operation.kind();
-        if let Some(buffer) = operation.into_buffer() {
-            #[cfg(test)]
-            // Keep it unreachable until fixture teardown without creating an
-            // intentional LeakSanitizer finding.
-            lock_unpoisoned(&self.quarantined_buffers).push(buffer);
-            #[cfg(not(test))]
-            std::mem::forget(buffer);
-        }
+        let buffer = operation.into_buffer();
+        #[cfg(test)]
+        // Keep it unreachable until fixture teardown without creating an
+        // intentional LeakSanitizer finding.
+        lock_unpoisoned(&self.quarantined_buffers).push(buffer);
+        #[cfg(not(test))]
+        mem::forget(buffer);
         self.publish_completion(
-            request_id,
-            kind,
-            status,
-            bytes_transferred,
-            None,
+            IoCompletion {
+                request_id,
+                kind,
+                status,
+                bytes_transferred,
+                buffer: None,
+            },
             completion,
             slot,
             submitted_at,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn publish_completion(
         &self,
-        request_id: RequestId,
-        kind: OperationKind,
-        status: CompletionStatus,
-        bytes_transferred: usize,
-        buffer: Option<IoBuffer>,
+        io_completion: IoCompletion,
         completion: Arc<CompletionState>,
         slot: IoSlot,
         submitted_at: Option<Instant>,
     ) {
         if self.activity_counters_enabled {
-            match &status {
+            match &io_completion.status {
                 CompletionStatus::Completed => {
                     self.requests_succeeded.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1537,22 +1543,16 @@ impl EngineState {
                 add_duration_ns(&self.request_time_ns, elapsed);
             }
             if let Some(recorder) = self.latency.get() {
-                let outcome = match &status {
-                    CompletionStatus::Completed => crate::IoOutcome::Completed,
-                    CompletionStatus::Cancelled => crate::IoOutcome::Cancelled,
-                    CompletionStatus::Failed(_) => crate::IoOutcome::Failed,
+                let outcome = match &io_completion.status {
+                    CompletionStatus::Completed => IoOutcome::Completed,
+                    CompletionStatus::Cancelled => IoOutcome::Cancelled,
+                    CompletionStatus::Failed(_) => IoOutcome::Failed,
                 };
                 recorder.record(elapsed, outcome);
             }
         }
         drop(slot);
-        completion.complete(IoCompletion {
-            request_id,
-            kind,
-            status,
-            bytes_transferred,
-            buffer,
-        });
+        completion.complete(io_completion);
     }
 
     fn snapshot(&self) -> CacheIoDirectionSnapshot {
@@ -1647,7 +1647,7 @@ enum SlotMode<'a> {
 
 impl IoEngine {
     /// Installed once during construction, before any requests are admitted.
-    pub fn set_latency_recorder(&self, recorder: crate::stats::recording::IoTiming) {
+    pub fn set_latency_recorder(&self, recorder: IoTiming) {
         assert!(
             self.state.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"
@@ -2138,16 +2138,11 @@ pub fn build_file_engine(
                 let _ = config;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    crate::config::runtime::io_uring_unavailability()
-                        .expect("unavailable io_uring names a reason"),
+                    io_uring_unavailability().expect("unavailable io_uring names a reason"),
                 ))
             }
         }
     }
-}
-
-fn update_peak(peak: &AtomicUsize, value: usize) {
-    peak.fetch_max(value, Ordering::Relaxed);
 }
 
 fn add_duration_ns(counter: &AtomicU64, duration: Duration) {

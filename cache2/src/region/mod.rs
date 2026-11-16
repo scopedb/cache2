@@ -25,33 +25,6 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use self::appender::submit_write;
-use self::index::ReclaimIndexAction;
-use self::index::RegionIndex;
-use self::index::heat_memory_bytes;
-use self::index::storage::IndexStorageError;
-use self::index::storage::WARM_IMAGE_WRITE_BATCH_BYTES;
-use self::index::storage::canonical_index_partition_ranges;
-use self::manager::RegionManager;
-use self::manager::RegionMutationError;
-use self::manager::RegionReclaimReceipt;
-use self::reader::PendingRead;
-use self::reader::ReadCandidate;
-use self::reader::ReadCompletion;
-use self::reader::ReadDesc;
-#[cfg(test)]
-use self::reader::describe_read;
-use self::reader::submit_read;
-use self::record::RECORD_ALIGNMENT;
-use self::record::RECORD_HEADER_SIZE;
-use self::record::RecordHeader;
-use self::recovery::DATA_REGION_AREA_OFFSET;
-use self::recovery::recovery_image_index_len;
-use self::staging::StageAppend;
-use self::staging::StagedRecord;
-use self::staging::StagedWrite;
-use self::staging::StagingEncodeError;
-use self::staging::StagingError;
 use crate::checksum::crc32c;
 use crate::hashing::route_hash;
 use crate::io::background::BackgroundIoAttempt;
@@ -61,20 +34,41 @@ use crate::io::engine::ReadSlot;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::region::appender::WriteCompletion;
+use crate::region::appender::submit_write;
+use crate::region::index::ReclaimIndexAction;
+use crate::region::index::RegionIndex;
+use crate::region::index::heat_memory_bytes;
 #[cfg(test)]
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
 use crate::region::index::storage::IndexPartitionRange;
 use crate::region::index::storage::IndexPhysicalStats;
+use crate::region::index::storage::IndexStorageError;
 use crate::region::index::storage::PartitionedIndexStorage;
+use crate::region::index::storage::WARM_IMAGE_WRITE_BATCH_BYTES;
+use crate::region::index::storage::canonical_index_partition_ranges;
 use crate::region::index::storage::page_format::INDEX_IMAGE_PAGE_SIZE;
+use crate::region::manager::RegionManager;
+use crate::region::manager::RegionMutationError;
+use crate::region::manager::RegionReclaimReceipt;
 use crate::region::manager::RegionWriteSpan;
+use crate::region::reader::PendingRead;
+use crate::region::reader::ReadCandidate;
+use crate::region::reader::ReadCompletion;
+use crate::region::reader::ReadDesc;
+#[cfg(test)]
+use crate::region::reader::describe_read;
+use crate::region::reader::submit_read;
+use crate::region::record::RECORD_ALIGNMENT;
+use crate::region::record::RECORD_HEADER_SIZE;
+use crate::region::record::RecordHeader;
 use crate::region::record::codec::RecordEncodeError;
 use crate::region::record::codec::RecordPayload;
 use crate::region::record::codec::encode_reinsert_into_hashed;
 use crate::region::record::codec::encode_value_into_hashed;
 #[cfg(test)]
 use crate::region::record::codec::hash_key;
+use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::metadata::PartitionMetadataRecord;
 use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
@@ -82,7 +76,13 @@ use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
 use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
+use crate::region::recovery::recovery_image_index_len;
 use crate::region::staging::AppendStaging;
+use crate::region::staging::StageAppend;
+use crate::region::staging::StagedRecord;
+use crate::region::staging::StagedWrite;
+use crate::region::staging::StagingEncodeError;
+use crate::region::staging::StagingError;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
@@ -224,7 +224,7 @@ pub struct FrozenRegionStore {
 pub struct RegionStore {
     index: RegionIndex,
     manager: RegionManagerLock,
-    append_gates: Box<[AppendShardGate]>,
+    append_gates: Box<[Mutex<()>]>,
     region_generations: Box<[AtomicU64]>,
     rotation: Mutex<()>,
     health: RegionHealthLatch,
@@ -249,14 +249,6 @@ pub struct RegionReinsertRecord<'a> {
     // Constructed only after payload validation; the same borrowed bytes and
     // checksum travel together into staging without a second payload scan.
     payload: RecordPayload<'a>,
-}
-
-/// Short shard-local transaction gate. `mutation` makes manager receipts and
-/// staging transitions one operation. Span completion and rotation are already
-/// ordered by the shard's single production worker.
-#[derive(Default)]
-struct AppendShardGate {
-    mutation: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,7 +303,7 @@ impl RegionStore {
 
     #[cfg(test)]
     pub fn lock_append_for_test(&self, shard_id: usize) -> MutexGuard<'_, ()> {
-        self.append_gates[shard_id].mutation.lock().unwrap()
+        self.append_gates[shard_id].lock().unwrap()
     }
 
     /// Consume the index and Region metadata into one live store.
@@ -342,7 +334,7 @@ impl RegionStore {
                     "cannot allocate append shard gates",
                 )
             })?;
-        append_gates.resize_with(manager.active_regions().len(), AppendShardGate::default);
+        append_gates.resize_with(manager.active_regions().len(), || Mutex::new(()));
         let mut region_generations = Vec::new();
         region_generations
             .try_reserve_exact(manager.regions().len())
@@ -372,12 +364,7 @@ impl RegionStore {
     pub fn freeze(self: Arc<Self>) -> io::Result<FrozenRegionStore> {
         self.health.require_healthy()?;
         let regions = self;
-        if regions
-            .append_gates
-            .iter()
-            .any(|shard| shard.mutation.is_poisoned())
-            || regions.rotation.is_poisoned()
-        {
+        if regions.append_gates.iter().any(Mutex::is_poisoned) || regions.rotation.is_poisoned() {
             regions.health.enter_miss_only();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -651,11 +638,11 @@ impl RegionStore {
     }
 
     fn lock_shard_mutation(&self, shard_id: usize) -> io::Result<MutexGuard<'_, ()>> {
-        let shard = self.append_gate(shard_id)?;
-        self.lock_shard_gate(&shard.mutation)
+        let gate = self.append_gate(shard_id)?;
+        self.lock_shard_gate(gate)
     }
 
-    fn append_gate(&self, shard_id: usize) -> io::Result<&AppendShardGate> {
+    fn append_gate(&self, shard_id: usize) -> io::Result<&Mutex<()>> {
         self.append_gates.get(shard_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "data shard is out of bounds")
         })
@@ -678,7 +665,6 @@ impl RegionStore {
             return Ok(None);
         }
         match self.index.lookup_raw(hash) {
-            Ok(Some(entry)) if self.health.is_healthy() => Ok(Some(entry)),
             Ok(result) if self.health.is_healthy() => Ok(result),
             Ok(_) => Ok(None),
             Err(error) => {
@@ -910,7 +896,7 @@ impl RegionStore {
         payload: &RecordPayload<'_>,
         reinsert: Option<(u64, PackedLocation)>,
     ) -> io::Result<RegionStageValue> {
-        let _shard_mutation = match self.append_gate(shard_id)?.mutation.try_lock() {
+        let _shard_mutation = match self.append_gate(shard_id)?.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(RegionStageValue::Contended),
             Err(TryLockError::Poisoned(_)) => {
@@ -1415,7 +1401,7 @@ fn staging_io_error(error: StagingError) -> io::Error {
         StagingError::InvalidShard => io::ErrorKind::InvalidInput,
         _ => io::ErrorKind::InvalidData,
     };
-    io::Error::new(kind, error.to_string())
+    io::Error::new(kind, error)
 }
 
 fn index_storage_io_error(error: IndexStorageError) -> io::Error {
@@ -1551,4 +1537,21 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
                 metadata.physical_value_slots == actual.value
                     && metadata.physical_deleted_slots == actual.deleted
             })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::region::index::storage::page_format::INDEX_IMAGE_SLOTS_PER_PAGE;
+
+    #[test]
+    fn index_page_validation_state_is_fixed_memory_accounted() {
+        let one_page = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE, 2).unwrap();
+        let two_pages = runtime_fixed_memory_bytes(INDEX_IMAGE_SLOTS_PER_PAGE + 1, 2).unwrap();
+
+        assert_eq!(
+            two_pages - one_page,
+            INDEX_IMAGE_PAGE_SIZE + size_of::<AtomicU8>()
+        );
+    }
 }

@@ -18,10 +18,14 @@
 //! manager or index mapping becomes visible. Index slots remain independently
 //! lazy-validated; this section contains only O(regions + index partitions) state.
 
+use std::error;
 use std::fmt;
 use std::mem;
 
 use crate::checksum::crc32c;
+use crate::codec::get_u16;
+use crate::codec::get_u32;
+use crate::codec::get_u64;
 use crate::codec::put_u16;
 use crate::codec::put_u32;
 use crate::codec::put_u64;
@@ -234,7 +238,7 @@ impl fmt::Display for RegionMetadataError {
     }
 }
 
-impl std::error::Error for RegionMetadataError {}
+impl error::Error for RegionMetadataError {}
 
 impl RegionMetadata {
     pub fn encoded_len(&self) -> Result<u64, RegionMetadataError> {
@@ -299,23 +303,27 @@ impl RegionMetadata {
 
         encode_record_pages(
             &mut output,
-            layout.region_first_page,
-            PageKind::Region,
-            REGION_METADATA_REGION_SIZE,
-            REGION_METADATA_REGIONS_PER_PAGE,
-            self.root.image_identity,
-            self.root.image_generation,
+            RecordSectionSpec {
+                first_page: layout.region_first_page,
+                kind: PageKind::Region,
+                record_size: REGION_METADATA_REGION_SIZE,
+                records_per_page: REGION_METADATA_REGIONS_PER_PAGE,
+                image_identity: self.root.image_identity,
+                image_generation: self.root.image_generation,
+            },
             &self.regions,
             encode_region,
         )?;
         encode_record_pages(
             &mut output,
-            layout.partition_first_page,
-            PageKind::Partition,
-            REGION_METADATA_PARTITION_SIZE,
-            REGION_METADATA_PARTITIONS_PER_PAGE,
-            self.root.image_identity,
-            self.root.image_generation,
+            RecordSectionSpec {
+                first_page: layout.partition_first_page,
+                kind: PageKind::Partition,
+                record_size: REGION_METADATA_PARTITION_SIZE,
+                records_per_page: REGION_METADATA_PARTITIONS_PER_PAGE,
+                image_identity: self.root.image_identity,
+                image_generation: self.root.image_generation,
+            },
             &self.partitions,
             encode_partition,
         )?;
@@ -370,23 +378,27 @@ impl RegionMetadata {
 
         let regions = decode_record_pages(
             input,
-            layout.region_first_page,
-            PageKind::Region,
-            REGION_METADATA_REGION_SIZE,
-            REGION_METADATA_REGIONS_PER_PAGE,
-            root.image_identity,
-            root.image_generation,
+            RecordSectionSpec {
+                first_page: layout.region_first_page,
+                kind: PageKind::Region,
+                record_size: REGION_METADATA_REGION_SIZE,
+                records_per_page: REGION_METADATA_REGIONS_PER_PAGE,
+                image_identity: root.image_identity,
+                image_generation: root.image_generation,
+            },
             root.region_count as usize,
             decode_region,
         )?;
         let counters = decode_record_pages(
             input,
-            layout.partition_first_page,
-            PageKind::Partition,
-            REGION_METADATA_PARTITION_SIZE,
-            REGION_METADATA_PARTITIONS_PER_PAGE,
-            root.image_identity,
-            root.image_generation,
+            RecordSectionSpec {
+                first_page: layout.partition_first_page,
+                kind: PageKind::Partition,
+                record_size: REGION_METADATA_PARTITION_SIZE,
+                records_per_page: REGION_METADATA_PARTITIONS_PER_PAGE,
+                image_identity: root.image_identity,
+                image_generation: root.image_generation,
+            },
             root.partition_count as usize,
             decode_partition,
         )?;
@@ -626,10 +638,17 @@ fn validate_encoded_root_directory(
     input: &[u8],
     layout: MetadataLayout,
 ) -> Result<(), RegionMetadataError> {
-    if get_u32(input, ROOT_REGION_FIRST_PAGE_OFFSET)? != layout.region_first_page
-        || get_u32(input, ROOT_REGION_PAGE_COUNT_OFFSET)? != layout.region_page_count
-        || get_u32(input, ROOT_PARTITION_FIRST_PAGE_OFFSET)? != layout.partition_first_page
-        || get_u32(input, ROOT_PARTITION_PAGE_COUNT_OFFSET)? != layout.partition_page_count
+    if get_u32(input, ROOT_REGION_FIRST_PAGE_OFFSET).ok_or(RegionMetadataError::InvalidLength)?
+        != layout.region_first_page
+        || get_u32(input, ROOT_REGION_PAGE_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?
+            != layout.region_page_count
+        || get_u32(input, ROOT_PARTITION_FIRST_PAGE_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?
+            != layout.partition_first_page
+        || get_u32(input, ROOT_PARTITION_PAGE_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?
+            != layout.partition_page_count
     {
         return Err(RegionMetadataError::InvalidField("section_directory"));
     }
@@ -802,16 +821,17 @@ fn decode_page_envelope(page: &[u8]) -> Result<PageEnvelope, RegionMetadataError
     if page[..8] != PAGE_MAGIC {
         return Err(RegionMetadataError::InvalidMagic);
     }
-    if page_crc(page) != get_u32(page, PAGE_CRC_OFFSET)? {
+    if page_crc(page) != get_u32(page, PAGE_CRC_OFFSET).ok_or(RegionMetadataError::InvalidLength)? {
         return Err(RegionMetadataError::ChecksumMismatch);
     }
-    let version = get_u16(page, PAGE_VERSION_OFFSET)?;
+    let version = get_u16(page, PAGE_VERSION_OFFSET).ok_or(RegionMetadataError::InvalidLength)?;
     if version != FORMAT_VERSION {
         return Err(RegionMetadataError::UnsupportedVersion(version));
     }
-    if get_u16(page, PAGE_HEADER_SIZE_OFFSET)? != REGION_METADATA_PAGE_HEADER_SIZE as u16
-        || get_u32(page, PAGE_FLAGS_OFFSET)? != 0
-        || get_u32(page, PAGE_RESERVED_OFFSET)? != 0
+    if get_u16(page, PAGE_HEADER_SIZE_OFFSET).ok_or(RegionMetadataError::InvalidLength)?
+        != REGION_METADATA_PAGE_HEADER_SIZE as u16
+        || get_u32(page, PAGE_FLAGS_OFFSET).ok_or(RegionMetadataError::InvalidLength)? != 0
+        || get_u32(page, PAGE_RESERVED_OFFSET).ok_or(RegionMetadataError::InvalidLength)? != 0
     {
         return Err(RegionMetadataError::InvalidField("page_header"));
     }
@@ -821,15 +841,21 @@ fn decode_page_envelope(page: &[u8]) -> Result<PageEnvelope, RegionMetadataError
         .try_into()
         .map_err(|_| RegionMetadataError::InvalidLength)?;
     Ok(PageEnvelope {
-        kind: PageKind::decode(get_u16(page, PAGE_KIND_OFFSET)?)
-            .ok_or(RegionMetadataError::InvalidField("page_kind"))?,
-        record_size: get_u16(page, PAGE_RECORD_SIZE_OFFSET)?,
+        kind: PageKind::decode(
+            get_u16(page, PAGE_KIND_OFFSET).ok_or(RegionMetadataError::InvalidLength)?,
+        )
+        .ok_or(RegionMetadataError::InvalidField("page_kind"))?,
+        record_size: get_u16(page, PAGE_RECORD_SIZE_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
         image_identity: PersistentId::from_bytes(identity)
             .ok_or(RegionMetadataError::InvalidField("page_image_identity"))?,
-        image_generation: get_u64(page, PAGE_IMAGE_GENERATION_OFFSET)?,
-        page_index: get_u32(page, PAGE_INDEX_OFFSET)?,
-        first_record: get_u32(page, PAGE_FIRST_RECORD_OFFSET)?,
-        record_count: get_u32(page, PAGE_RECORD_COUNT_OFFSET)?,
+        image_generation: get_u64(page, PAGE_IMAGE_GENERATION_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        page_index: get_u32(page, PAGE_INDEX_OFFSET).ok_or(RegionMetadataError::InvalidLength)?,
+        first_record: get_u32(page, PAGE_FIRST_RECORD_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        record_count: get_u32(page, PAGE_RECORD_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
     })
 }
 
@@ -866,23 +892,26 @@ fn page_crc(page: &[u8]) -> u32 {
     ])
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_record_pages<T>(
-    output: &mut [u8],
+struct RecordSectionSpec {
     first_page: u32,
     kind: PageKind,
     record_size: usize,
     records_per_page: usize,
     image_identity: PersistentId,
     image_generation: u64,
+}
+
+fn encode_record_pages<T>(
+    output: &mut [u8],
+    section: RecordSectionSpec,
     records: &[T],
     encode_record: fn(&T, &mut [u8]),
 ) -> Result<(), RegionMetadataError> {
-    for (page_in_section, records) in records.chunks(records_per_page).enumerate() {
+    for (page_in_section, records) in records.chunks(section.records_per_page).enumerate() {
         let first_record = page_in_section
-            .checked_mul(records_per_page)
+            .checked_mul(section.records_per_page)
             .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-        let page_index = usize::try_from(first_page)
+        let page_index = usize::try_from(section.first_page)
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?
             .checked_add(page_in_section)
             .ok_or(RegionMetadataError::ArithmeticOverflow)?;
@@ -890,11 +919,11 @@ fn encode_record_pages<T>(
         encode_page_envelope(
             page,
             PageEnvelope {
-                kind,
-                record_size: u16::try_from(record_size)
+                kind: section.kind,
+                record_size: u16::try_from(section.record_size)
                     .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
-                image_identity,
-                image_generation,
+                image_identity: section.image_identity,
+                image_generation: section.image_generation,
                 page_index: u32::try_from(page_index)
                     .map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
                 first_record: u32::try_from(first_record)
@@ -904,22 +933,16 @@ fn encode_record_pages<T>(
             },
         );
         for (index, record) in records.iter().enumerate() {
-            encode_record(record, page_payload_mut(page, index, record_size));
+            encode_record(record, page_payload_mut(page, index, section.record_size));
         }
         finish_page(page);
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_record_pages<T>(
     input: &[u8],
-    first_page: u32,
-    kind: PageKind,
-    record_size: usize,
-    records_per_page: usize,
-    image_identity: PersistentId,
-    image_generation: u64,
+    section: RecordSectionSpec,
     record_count: usize,
     decode_record: fn(&[u8]) -> Result<T, RegionMetadataError>,
 ) -> Result<Vec<T>, RegionMetadataError> {
@@ -927,31 +950,35 @@ fn decode_record_pages<T>(
     output
         .try_reserve_exact(record_count)
         .map_err(|_| RegionMetadataError::Allocation)?;
-    let page_count = record_count.div_ceil(records_per_page);
+    let page_count = record_count.div_ceil(section.records_per_page);
     for page_in_section in 0..page_count {
         let first_record = page_in_section
-            .checked_mul(records_per_page)
+            .checked_mul(section.records_per_page)
             .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-        let records_here = (record_count - first_record).min(records_per_page);
-        let page_index = first_page as usize + page_in_section;
+        let records_here = (record_count - first_record).min(section.records_per_page);
+        let page_index = section.first_page as usize + page_in_section;
         let source = page(input, page_index)?;
         let envelope = decode_page_envelope(source)?;
         validate_envelope_shape(
             envelope,
-            kind,
-            record_size,
+            section.kind,
+            section.record_size,
             u32::try_from(page_index).map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
             u32::try_from(first_record).map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
             u32::try_from(records_here).map_err(|_| RegionMetadataError::ArithmeticOverflow)?,
         )?;
-        if envelope.image_identity != image_identity
-            || envelope.image_generation != image_generation
+        if envelope.image_identity != section.image_identity
+            || envelope.image_generation != section.image_generation
         {
             return Err(RegionMetadataError::InvalidField("page_image_binding"));
         }
-        require_zero_padding(source, records_here * record_size)?;
+        require_zero_padding(source, records_here * section.record_size)?;
         for record in 0..records_here {
-            output.push(decode_record(page_payload(source, record, record_size))?);
+            output.push(decode_record(page_payload(
+                source,
+                record,
+                section.record_size,
+            ))?);
         }
     }
     Ok(output)
@@ -1034,36 +1061,52 @@ fn encode_root(root: &RegionMetadataRoot, layout: MetadataLayout, output: &mut [
 
 fn decode_root(input: &[u8]) -> Result<RegionMetadataRoot, RegionMetadataError> {
     if input.len() != REGION_METADATA_ROOT_SIZE
-        || get_u32(input, ROOT_RESERVED32_OFFSET)? != 0
-        || get_u64(input, ROOT_RESERVED_EPOCH_OFFSET)? != 0
-        || get_u64(input, ROOT_RESERVED_CLEAR_FLOOR_OFFSET)? != 0
+        || get_u32(input, ROOT_RESERVED32_OFFSET).ok_or(RegionMetadataError::InvalidLength)? != 0
+        || get_u64(input, ROOT_RESERVED_EPOCH_OFFSET).ok_or(RegionMetadataError::InvalidLength)?
+            != 0
+        || get_u64(input, ROOT_RESERVED_CLEAR_FLOOR_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?
+            != 0
         || input[ROOT_RESERVED_ACCOUNTING_START..ROOT_RESERVED_ACCOUNTING_END]
             .iter()
             .any(|byte| *byte != 0)
         || input[ROOT_RESERVED_TAIL_START..ROOT_RESERVED_TAIL_END]
             .iter()
             .any(|byte| *byte != 0)
-        || get_u32(input, ROOT_RESERVED_OFFSET)? != 0
+        || get_u32(input, ROOT_RESERVED_OFFSET).ok_or(RegionMetadataError::InvalidLength)? != 0
     {
         return Err(RegionMetadataError::InvalidField("root_encoding"));
     }
     Ok(RegionMetadataRoot {
         cache_uuid: get_id(input, ROOT_CACHE_UUID_OFFSET)?,
         data_identity: get_id(input, ROOT_DATA_IDENTITY_OFFSET)?,
-        data_superblock_generation: get_u64(input, ROOT_DATA_GENERATION_OFFSET)?,
+        data_superblock_generation: get_u64(input, ROOT_DATA_GENERATION_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
         image_identity: get_id(input, ROOT_IMAGE_IDENTITY_OFFSET)?,
-        image_generation: get_u64(input, ROOT_IMAGE_GENERATION_OFFSET)?,
-        storage_fingerprint: get_u64(input, ROOT_STORAGE_FINGERPRINT_OFFSET)?,
-        index_slots: get_u64(input, ROOT_INDEX_SLOTS_OFFSET)?,
-        index_page_count: get_u64(input, ROOT_INDEX_PAGE_COUNT_OFFSET)?,
-        region_size: get_u64(input, ROOT_REGION_SIZE_OFFSET)?,
-        region_count: get_u32(input, ROOT_REGION_COUNT_OFFSET)?,
-        partition_count: get_u32(input, ROOT_PARTITION_COUNT_OFFSET)?,
-        shard_count: get_u32(input, ROOT_SHARD_COUNT_OFFSET)?,
-        max_seqno: get_u64(input, ROOT_MAX_SEQNO_OFFSET)?,
-        free_region_count: get_u32(input, ROOT_FREE_REGION_COUNT_OFFSET)?,
-        active_region_count: get_u32(input, ROOT_ACTIVE_REGION_COUNT_OFFSET)?,
-        sealed_region_count: get_u32(input, ROOT_SEALED_REGION_COUNT_OFFSET)?,
+        image_generation: get_u64(input, ROOT_IMAGE_GENERATION_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        storage_fingerprint: get_u64(input, ROOT_STORAGE_FINGERPRINT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        index_slots: get_u64(input, ROOT_INDEX_SLOTS_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        index_page_count: get_u64(input, ROOT_INDEX_PAGE_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        region_size: get_u64(input, ROOT_REGION_SIZE_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        region_count: get_u32(input, ROOT_REGION_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        partition_count: get_u32(input, ROOT_PARTITION_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        shard_count: get_u32(input, ROOT_SHARD_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        max_seqno: get_u64(input, ROOT_MAX_SEQNO_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        free_region_count: get_u32(input, ROOT_FREE_REGION_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        active_region_count: get_u32(input, ROOT_ACTIVE_REGION_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        sealed_region_count: get_u32(input, ROOT_SEALED_REGION_COUNT_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
     })
 }
 
@@ -1086,10 +1129,16 @@ fn decode_region(input: &[u8]) -> Result<RegionMetadataRecord, RegionMetadataErr
     Ok(RegionMetadataRecord {
         state: RegionState::decode(input[REGION_STATE_OFFSET])
             .ok_or(RegionMetadataError::InvalidField("region_state"))?,
-        queue_ordinal: get_u32(input, REGION_QUEUE_ORDINAL_OFFSET)?,
-        created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)?,
-        durable_used_offset: u64::from(get_u32(input, REGION_DURABLE_USED_OFFSET)?),
-        physical_record_count: u64::from(get_u32(input, REGION_RECORD_COUNT_OFFSET)?),
+        queue_ordinal: get_u32(input, REGION_QUEUE_ORDINAL_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        created_seqno: get_u64(input, REGION_CREATED_SEQNO_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        durable_used_offset: u64::from(
+            get_u32(input, REGION_DURABLE_USED_OFFSET).ok_or(RegionMetadataError::InvalidLength)?,
+        ),
+        physical_record_count: u64::from(
+            get_u32(input, REGION_RECORD_COUNT_OFFSET).ok_or(RegionMetadataError::InvalidLength)?,
+        ),
     })
 }
 
@@ -1114,14 +1163,17 @@ fn encode_partition(partition: &PartitionMetadataRecord, output: &mut [u8]) {
 
 fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters, RegionMetadataError> {
     if input.len() != REGION_METADATA_PARTITION_SIZE
-        || get_u32(input, PARTITION_RESERVED_OFFSET)? != 0
+        || get_u32(input, PARTITION_RESERVED_OFFSET).ok_or(RegionMetadataError::InvalidLength)? != 0
     {
         return Err(RegionMetadataError::InvalidField("partition_encoding"));
     }
     Ok(EncodedPartitionCounters {
-        partition_id: get_u32(input, PARTITION_ID_OFFSET)?,
-        physical_value_slots: get_u32(input, PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET)?,
-        physical_deleted_slots: get_u32(input, PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET)?,
+        partition_id: get_u32(input, PARTITION_ID_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        physical_value_slots: get_u32(input, PARTITION_PHYSICAL_VALUE_SLOTS_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
+        physical_deleted_slots: get_u32(input, PARTITION_PHYSICAL_DELETED_SLOTS_OFFSET)
+            .ok_or(RegionMetadataError::InvalidLength)?,
     })
 }
 
@@ -1170,18 +1222,6 @@ fn get_id(input: &[u8], offset: usize) -> Result<PersistentId, RegionMetadataErr
 
 fn put_id(output: &mut [u8], offset: usize, id: PersistentId) {
     output[offset..offset + 16].copy_from_slice(&id.to_bytes());
-}
-
-fn get_u16(input: &[u8], offset: usize) -> Result<u16, RegionMetadataError> {
-    crate::codec::get_u16(input, offset).ok_or(RegionMetadataError::InvalidLength)
-}
-
-fn get_u32(input: &[u8], offset: usize) -> Result<u32, RegionMetadataError> {
-    crate::codec::get_u32(input, offset).ok_or(RegionMetadataError::InvalidLength)
-}
-
-fn get_u64(input: &[u8], offset: usize) -> Result<u64, RegionMetadataError> {
-    crate::codec::get_u64(input, offset).ok_or(RegionMetadataError::InvalidLength)
 }
 
 #[cfg(test)]

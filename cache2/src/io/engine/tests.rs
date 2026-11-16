@@ -13,9 +13,17 @@
 // limitations under the License.
 
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
+use tokio::runtime::Handle;
+use tokio::task;
+use tokio::task::JoinHandle;
+
 use super::*;
+use crate::FillControlOptions;
+use crate::FillLimits;
+use crate::FillPressure;
 use crate::IoOutcome;
 use crate::IoRole;
 use crate::StatsOptions;
@@ -23,6 +31,7 @@ use crate::fixtures::TestFile;
 use crate::io::background::BackgroundIoAttempt;
 use crate::io::background::IoRecovery;
 use crate::io::file::PositionedIo;
+use crate::io::fill_control::FillController;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
 use crate::managed_memory::aligned_buffer_capacity;
@@ -38,7 +47,7 @@ async fn wait_for_registered_read_waiters(engine: &IoEngine, expected: usize) {
         if actual == expected {
             return;
         }
-        tokio::task::yield_now().await;
+        task::yield_now().await;
     }
     panic!("expected {expected} registered read waiters");
 }
@@ -47,18 +56,18 @@ async fn spawn_registered_read_slot_waiter(
     engine: &IoEngine,
     timeout: Duration,
     expected_waiters: usize,
-) -> tokio::task::JoinHandle<io::Result<ReadSlot>> {
+) -> JoinHandle<io::Result<ReadSlot>> {
     let slot_waiter = engine.read_slot_waiter();
-    let waiter = tokio::spawn(async move {
+    let waiter = task::spawn(async move {
         slot_waiter
-            .reserve_until(Instant::now() + timeout, &tokio::runtime::Handle::current())
+            .reserve_until(Instant::now() + timeout, &Handle::current())
             .await
     });
     wait_for_registered_read_waiters(engine, expected_waiters).await;
     waiter
 }
 
-async fn read_wait_error(waiter: tokio::task::JoinHandle<io::Result<ReadSlot>>) -> io::Error {
+async fn read_wait_error(waiter: JoinHandle<io::Result<ReadSlot>>) -> io::Error {
     match waiter.await.unwrap() {
         Ok(_) => panic!("read waiter unexpectedly reserved a slot"),
         Err(error) => error,
@@ -203,7 +212,7 @@ fn write_buffer(managed_memory: &Arc<ManagedMemory>, bytes: &[u8]) -> IoBuffer {
     // SAFETY: the exclusively owned target fits the source, and the allocations
     // do not overlap. Publish the initialized range only after copying it.
     unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-    lease.mark_initialized(bytes.len()).unwrap();
+    assert!(lease.mark_initialized(bytes.len()));
     IoBuffer::for_write(lease, bytes.len()).unwrap()
 }
 
@@ -296,7 +305,7 @@ async fn async_request_is_woken_by_driver_completion() {
     .unwrap();
 
     let completion = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+        .wait_async(Arc::clone(&engine), &Handle::current())
         .await
         .unwrap();
 
@@ -324,12 +333,9 @@ async fn dropping_async_wait_requests_bounded_cancellation() {
     )
     .unwrap();
     let waiter_engine = Arc::clone(&engine);
-    let waiter = tokio::spawn(async move {
-        request
-            .wait_async(waiter_engine, &tokio::runtime::Handle::current())
-            .await
-    });
-    tokio::task::yield_now().await;
+    let waiter =
+        task::spawn(async move { request.wait_async(waiter_engine, &Handle::current()).await });
+    task::yield_now().await;
     assert!(io.wait_for_entered(1));
 
     waiter.abort();
@@ -418,12 +424,9 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
     )
     .unwrap();
     let request_engine = Arc::clone(&engine);
-    let request_waiter = tokio::spawn(async move {
-        request
-            .wait_async(request_engine, &tokio::runtime::Handle::current())
-            .await
-    });
-    tokio::task::yield_now().await;
+    let request_waiter =
+        task::spawn(async move { request.wait_async(request_engine, &Handle::current()).await });
+    task::yield_now().await;
     assert!(io.wait_for_entered(1));
 
     request_waiter.abort();
@@ -432,7 +435,7 @@ async fn read_slot_waits_for_cancelled_request_to_release_physical_capacity() {
 
     let slot_waiter = engine.read_slot_waiter();
     let deadline = Instant::now() + Duration::from_secs(1);
-    let tokio_handle = tokio::runtime::Handle::current();
+    let tokio_handle = Handle::current();
     let mut reservation = Box::pin(slot_waiter.reserve_until(deadline, &tokio_handle));
     assert!(
         tokio::time::timeout(Duration::from_millis(20), reservation.as_mut())
@@ -501,7 +504,7 @@ async fn queued_read_reservations_are_fifo() {
 
     drop(held);
     let first_slot = first.await.unwrap().unwrap();
-    tokio::task::yield_now().await;
+    task::yield_now().await;
     assert!(
         !second.is_finished(),
         "the second waiter bypassed the first"
@@ -587,7 +590,7 @@ async fn async_read_deadline_keeps_other_slots_available() {
     assert!(io.wait_for_entered(1));
 
     let timeout = request
-        .wait_async(Arc::clone(&engine), &tokio::runtime::Handle::current())
+        .wait_async(Arc::clone(&engine), &Handle::current())
         .await
         .unwrap_err();
     let (error, buffer) = timeout.into_buffer();
@@ -610,7 +613,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
     buffered_file.set_len(8192).unwrap();
     direct_file.set_len(8192).unwrap();
     let engine = posix::start(
-        DataFileHandles::new(buffered_file, Some(direct_file)),
+        DataFileHandles::with_direct(buffered_file, Some(direct_file)),
         2,
         2,
         true,
@@ -755,7 +758,7 @@ fn engine_request_capacity_is_hard_bounded() {
 #[test]
 fn configured_posix_engine_shares_its_worker_capacity() {
     let file = TestFile::new("io-engine");
-    let handles = DataFileHandles::new(file.open(), None);
+    let handles = DataFileHandles::buffered(file.open());
     let engine =
         build_file_engine(handles, IoEngineConfig::Posix { workers: 4 }, false, false).unwrap();
 
@@ -876,10 +879,10 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
         .submit(IoOperation::read(waiting_buffer, 1))
         .unwrap_err();
     assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
-    let (_, waiting_operation) = rejected.into_parts();
+    let waiting_operation = rejected.operation;
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (sender, receiver) = mpsc::sync_channel(1);
-    let submitter = std::thread::spawn(move || {
+    let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         sender
             .send(waiting_engine.submit_wait(waiting_operation))
@@ -925,7 +928,7 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
     let waiting_operation = IoOperation::read(read_buffer(&managed_memory, 1), 1);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
-    let submitter = std::thread::spawn(move || {
+    let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         result_sender
             .send(waiting_engine.submit_wait_controlled(
@@ -1092,19 +1095,23 @@ fn background_read_can_complete_after_default_deadline() {
     let io = Arc::new(BlockingIo::default());
     let engine = IoEngine::for_test(io.clone(), 1).unwrap();
     let managed_memory = managed_memory();
-    let request = submit_cache_io_with_timeout(
+    let request = submit_cache_io_until(
         &engine,
         IoOperation::read(read_buffer(&managed_memory, 4096), 0),
-        Duration::from_secs(30),
+        Instant::now() + Duration::from_millis(20),
+        CACHE_IO_CANCEL_GRACE,
     )
     .unwrap();
     assert!(io.wait_for_entered(1));
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(200));
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
         io.release();
     });
-    let completion = request.wait(&engine);
+    let io_recovery = IoRecovery::new(Some(Duration::from_secs(2)));
+    let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
+    let completion = request.wait_background(&engine, &mut attempt);
     release.join().unwrap();
+    attempt.finish();
     engine.shutdown().unwrap();
     assert!(completion.is_ok());
 }
@@ -1129,7 +1136,7 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
         // Force the normal deadline to expire while the io still owns I/O.
         request.deadline = Instant::now();
         let id = request.id();
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
             scope.spawn(move || {
@@ -1214,7 +1221,7 @@ fn background_admission_recovers_without_duplicate_submission() {
         .read_exact_at(read_buffer(&managed_memory, 4096), 0)
         .unwrap();
     assert!(io.wait_for_entered(1));
-    std::thread::scope(|scope| {
+    thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
         let engine = &engine;
         let managed_memory = &managed_memory;
@@ -1265,7 +1272,7 @@ fn unlimited_recovery_keeps_admission_paused_until_validation() {
     .unwrap();
     assert!(io.wait_for_entered(1));
     request.deadline = Instant::now();
-    std::thread::scope(|scope| {
+    thread::scope(|scope| {
         let (completed_tx, completed_rx) = mpsc::channel();
         let (validate_tx, validate_rx) = mpsc::channel();
         let io_recovery = &io_recovery;
@@ -1313,7 +1320,7 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
     .unwrap();
     assert!(io.wait_for_entered(1));
     request.deadline = Instant::now();
-    std::thread::scope(|scope| {
+    thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
         let io_recovery = &io_recovery;
         let engine = &engine;
@@ -1340,10 +1347,6 @@ fn shutdown_interrupts_unlimited_recovery_without_releasing_pending_write() {
 
 #[test]
 fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_completes() {
-    use crate::FillControlOptions;
-    use crate::FillLimits;
-    use crate::FillPressure;
-    use crate::io::fill_control::FillController;
     for enforcing in [false, true] {
         let settings = FillLimits::new(1024 * 1024, 1000);
         let mode = if enforcing {
@@ -1356,7 +1359,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
         let io = Arc::new(BlockingIo::default());
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let memory = managed_memory();
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let (returned_tx, returned_rx) = mpsc::channel();
             let (validate_tx, validate_rx) = mpsc::channel();
             let io_recovery = &io_recovery;
@@ -1368,7 +1371,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
                 let request = submit_background_io(
                     engine,
                     IoOperation::write(WritePoint::Record, write_buffer(memory, &[5; 4096]), 0),
-                    Duration::from_secs(4),
+                    Duration::from_millis(800),
                     &mut attempt,
                 )
                 .unwrap();
@@ -1380,7 +1383,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             assert!(io.wait_for_entered(1));
             let deadline = Instant::now() + Duration::from_secs(2);
             while control.snapshot().pressure != FillPressure::Paused && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(5));
             }
             let paused = control.snapshot();
             let recovered = io_recovery.is_recovering();
@@ -1396,10 +1399,6 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             assert!(control.try_admit_fill());
             validate_tx.send(()).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while control.snapshot().pressure == FillPressure::Paused && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
         assert!(control.try_admit_fill());
         assert_eq!(lock_unpoisoned(&io.state).entered, 1);

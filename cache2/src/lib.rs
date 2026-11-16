@@ -63,19 +63,6 @@ pub use self::snapshot::FillPressure;
 pub use self::snapshot::RegionSnapshot;
 pub use self::snapshot::StartupMode;
 
-mod checksum;
-mod codec;
-mod hashing;
-mod io;
-mod managed_memory;
-mod memory;
-mod region;
-
-#[cfg(test)]
-mod fixtures;
-#[cfg(test)]
-mod property_tests;
-
 mod stats;
 pub use self::stats::CacheStatsSnapshot;
 pub use self::stats::IoLatencySnapshot;
@@ -89,3 +76,16 @@ pub use self::stats::RequestOperation;
 pub use self::stats::RequestOutcome;
 pub use self::stats::RequestStatsSnapshot;
 pub use self::stats::StatsOptions;
+
+mod checksum;
+mod codec;
+mod hashing;
+mod io;
+mod managed_memory;
+mod memory;
+mod region;
+
+#[cfg(test)]
+mod fixtures;
+#[cfg(test)]
+mod property_tests;

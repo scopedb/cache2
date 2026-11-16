@@ -21,7 +21,9 @@
 use std::alloc::Layout;
 use std::alloc::alloc;
 use std::alloc::dealloc;
+use std::error;
 use std::fmt;
+use std::io;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
@@ -51,6 +53,18 @@ impl fmt::Display for ManagedMemoryError {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Allocation => formatter.write_str("managed memory cannot be allocated"),
         }
+    }
+}
+
+impl error::Error for ManagedMemoryError {}
+
+impl From<ManagedMemoryError> for io::Error {
+    fn from(error: ManagedMemoryError) -> Self {
+        let kind = match error {
+            ManagedMemoryError::Invalid(_) => io::ErrorKind::InvalidInput,
+            ManagedMemoryError::Allocation => io::ErrorKind::OutOfMemory,
+        };
+        Self::new(kind, error)
     }
 }
 
@@ -100,7 +114,7 @@ impl ManagedMemory {
     /// cache-wide hard memory limit. The caller maps failure to either a
     /// fail-open miss or an explicit bounded-wait overload.
     pub fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
-        let capacity = align_up(length, BUFFER_ALIGNMENT)?;
+        let capacity = length.checked_next_multiple_of(BUFFER_ALIGNMENT)?;
         if capacity == 0 || capacity > isize::MAX as usize {
             return None;
         }
@@ -168,41 +182,41 @@ impl BufferLease {
         })
     }
 
-    pub fn prepared(&self, length: usize) -> Result<&[u8], ()> {
+    pub fn prepared(&self, length: usize) -> Option<&[u8]> {
         if length > self.initialized {
-            return Err(());
+            return None;
         }
         // SAFETY: the allocation holds `initialized` initialized bytes and the
         // returned shared slice cannot mutate the exclusively leased buffer.
-        Ok(unsafe { slice::from_raw_parts(self.ptr.as_ptr(), length) })
+        Some(unsafe { slice::from_raw_parts(self.ptr.as_ptr(), length) })
     }
 
-    pub fn prepared_mut(&mut self, length: usize) -> Result<&mut [u8], ()> {
+    pub fn prepared_mut(&mut self, length: usize) -> Option<&mut [u8]> {
         if length > self.initialized {
-            return Err(());
+            return None;
         }
         // SAFETY: the allocation holds `initialized` initialized bytes, this
         // mutable borrow is exclusive, and `length <= initialized`.
-        Ok(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), length) })
+        Some(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), length) })
     }
 
     pub fn has_capacity(&self, length: usize) -> bool {
         length <= self.capacity
     }
 
-    pub fn read_target(&self, length: usize) -> Result<*mut u8, ()> {
+    pub fn read_target(&self, length: usize) -> Option<*mut u8> {
         if length > self.capacity {
-            return Err(());
+            return None;
         }
-        Ok(self.ptr.as_ptr())
+        Some(self.ptr.as_ptr())
     }
 
-    pub fn mark_initialized(&mut self, length: usize) -> Result<(), ()> {
+    pub fn mark_initialized(&mut self, length: usize) -> bool {
         if length > self.capacity {
-            return Err(());
+            return false;
         }
         self.initialized = self.initialized.max(length);
-        Ok(())
+        true
     }
 }
 
@@ -240,12 +254,10 @@ impl MemoryTracker {
             if next > self.limit {
                 return false;
             }
-            match self.current.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .current
+                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => {
                     update_peak(&self.peak, next);
                     return true;
@@ -265,13 +277,7 @@ impl MemoryTracker {
 
 #[cfg(test)]
 pub fn aligned_buffer_capacity(value: usize) -> Option<usize> {
-    align_up(value, BUFFER_ALIGNMENT)
-}
-
-fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    value
-        .checked_add(alignment - 1)
-        .map(|sum| sum / alignment * alignment)
+    value.checked_next_multiple_of(BUFFER_ALIGNMENT)
 }
 
 fn update_peak(peak: &AtomicUsize, candidate: usize) {
@@ -308,8 +314,8 @@ mod tests {
             second.read_target(9000).unwrap() as usize % BUFFER_ALIGNMENT,
             0
         );
-        assert!(first.prepared(5000).is_err());
-        assert!(second.prepared(9000).is_err());
+        assert!(first.prepared(5000).is_none());
+        assert!(second.prepared(9000).is_none());
         let snapshot = managed_memory.snapshot();
         assert_eq!(
             snapshot.current_bytes,
@@ -335,21 +341,21 @@ mod tests {
         // the source and destination do not overlap and the bytes fit.
         unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
 
-        assert!(buffer.prepared(bytes.len()).is_err());
-        assert!(buffer.prepared_mut(bytes.len()).is_err());
-        buffer.mark_initialized(bytes.len()).unwrap();
+        assert!(buffer.prepared(bytes.len()).is_none());
+        assert!(buffer.prepared_mut(bytes.len()).is_none());
+        assert!(buffer.mark_initialized(bytes.len()));
         assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
-        assert!(buffer.prepared(bytes.len() + 1).is_err());
-        assert!(buffer.prepared_mut(bytes.len() + 1).is_err());
+        assert!(buffer.prepared(bytes.len() + 1).is_none());
+        assert!(buffer.prepared_mut(bytes.len() + 1).is_none());
 
         // Reusing the buffer for a shorter read preserves initialized bytes.
-        buffer.mark_initialized(1).unwrap();
+        assert!(buffer.mark_initialized(1));
         assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
         assert!(buffer.has_capacity(2 * BUFFER_ALIGNMENT));
         assert!(!buffer.has_capacity(2 * BUFFER_ALIGNMENT + 1));
-        assert!(buffer.read_target(2 * BUFFER_ALIGNMENT + 1).is_err());
-        assert!(buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1).is_err());
-        assert!(buffer.prepared(bytes.len() + 1).is_err());
+        assert!(buffer.read_target(2 * BUFFER_ALIGNMENT + 1).is_none());
+        assert!(!buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1));
+        assert!(buffer.prepared(bytes.len() + 1).is_none());
     }
 
     #[test]
@@ -363,9 +369,9 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         buffer.prepared_mut(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
-        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_err());
-        assert!(buffer.prepared(BUFFER_ALIGNMENT + 1).is_err());
-        assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_err());
+        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_none());
+        assert!(buffer.prepared(BUFFER_ALIGNMENT + 1).is_none());
+        assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_none());
         assert!(
             buffer
                 .prepared(BUFFER_ALIGNMENT)

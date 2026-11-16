@@ -22,21 +22,19 @@
 //! tombstones, generation tables, retries, or request-time allocations.
 
 use std::array;
-#[cfg(feature = "benchmarking")]
-use std::cell::Cell;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use self::storage::IndexPartitionWriteGuard;
-use self::storage::IndexSlotState;
-use self::storage::IndexStorageError;
-use self::storage::PartitionedIndexStorage;
 use crate::hashing::route_hash;
 use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
+use crate::region::index::storage::IndexPartitionWriteGuard;
+use crate::region::index::storage::IndexSlotState;
+use crate::region::index::storage::IndexStorageError;
+use crate::region::index::storage::PartitionedIndexStorage;
 use crate::snapshot::CacheIndexSnapshot;
 
 pub mod packed;
@@ -154,46 +152,17 @@ pub struct BenchmarkProbeStats {
 }
 
 #[cfg(feature = "benchmarking")]
-thread_local! {
-    static BENCHMARK_PROBE_STATS: Cell<BenchmarkProbeStats> =
-        const { Cell::new(BenchmarkProbeStats::EMPTY) };
-}
-
-#[cfg(feature = "benchmarking")]
 impl BenchmarkProbeStats {
-    const EMPTY: Self = Self {
-        operations: 0,
-        probes: 0,
-        stale_slots: 0,
-        full_windows: 0,
-        max_probes: 0,
-    };
-}
-
-#[cfg(feature = "benchmarking")]
-pub fn reset_benchmark_probe_stats() {
-    BENCHMARK_PROBE_STATS.set(BenchmarkProbeStats::EMPTY);
-}
-
-#[cfg(feature = "benchmarking")]
-pub fn take_benchmark_probe_stats() -> BenchmarkProbeStats {
-    BENCHMARK_PROBE_STATS.replace(BenchmarkProbeStats::EMPTY)
-}
-
-#[cfg(feature = "benchmarking")]
-fn record_benchmark_probe(probes: usize) {
-    BENCHMARK_PROBE_STATS.with(|cell| {
-        let mut stats = cell.get();
-        stats.operations = stats.operations.saturating_add(1);
-        stats.probes = stats
+    pub fn record(&mut self, probes: usize) {
+        self.operations = self.operations.saturating_add(1);
+        self.probes = self
             .probes
             .saturating_add(u64::try_from(probes).unwrap_or(u64::MAX));
-        stats.full_windows = stats
+        self.full_windows = self
             .full_windows
             .saturating_add(u64::from(probes == INDEX_CANDIDATES));
-        stats.max_probes = stats.max_probes.max(probes);
-        cell.set(stats);
-    });
+        self.max_probes = self.max_probes.max(probes);
+    }
 }
 
 impl RegionIndex {
@@ -239,21 +208,31 @@ impl RegionIndex {
 
     /// Returns one fingerprint candidate. Record validation owns correctness.
     pub fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
+        let (entry, _) = self.lookup_probed(hash)?;
+        Ok(entry)
+    }
+
+    #[cfg(feature = "benchmarking")]
+    pub fn lookup_with_probes(
+        &self,
+        hash: u64,
+    ) -> Result<(Option<IndexEntry>, usize), IndexStorageError> {
+        self.lookup_probed(hash)
+    }
+
+    #[inline]
+    fn lookup_probed(&self, hash: u64) -> Result<(Option<IndexEntry>, usize), IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let fingerprint = fingerprint(hash);
         let candidates = candidate_slots(hash, slot_count);
-        #[cfg(feature = "benchmarking")]
         let mut probes = 0;
         for displacement in 0..INDEX_CANDIDATES {
             let slot = candidates[displacement];
             if candidates[..displacement].contains(&slot) {
                 continue;
             }
-            #[cfg(feature = "benchmarking")]
-            {
-                probes += 1;
-            }
+            probes += 1;
             if let IndexSlotState::Value {
                 fingerprint: current,
                 displacement: current_displacement,
@@ -263,20 +242,14 @@ impl RegionIndex {
                 && usize::from(current_displacement) == displacement
             {
                 self.heat.mark(partition.global_slot(slot)?);
-                #[cfg(feature = "benchmarking")]
-                record_benchmark_probe(probes);
-                return Ok(Some(entry));
+                return Ok((Some(entry), probes));
             }
         }
-        #[cfg(feature = "benchmarking")]
-        record_benchmark_probe(probes);
-        Ok(None)
+        Ok((None, probes))
     }
 
     /// Installs a value with up to two bounded relocations and one bounded eviction.
     pub fn upsert(&self, hash: u64, supplied: IndexEntry) -> Result<bool, IndexStorageError> {
-        #[cfg(feature = "benchmarking")]
-        record_benchmark_probe(INDEX_CANDIDATES);
         let mut partition = self.storage.write_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let fingerprint = fingerprint(hash);
@@ -701,6 +674,9 @@ fn candidate_offset(displacement: usize, slot_count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
     use crate::region::index::storage::IndexPhysicalStats;
     use crate::region::record::codec::hash_key;
@@ -728,9 +704,9 @@ mod tests {
     #[test]
     fn heat_clears_preserve_neighboring_slots_in_a_shared_word() {
         let heat = SlotHeat::try_new(REFERENCE_WORD_BITS).unwrap();
-        let barrier = std::sync::Barrier::new(2);
+        let barrier = Barrier::new(2);
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for slot in [0, REFERENCE_WORD_BITS - 1] {
                 let heat = &heat;
                 let barrier = &barrier;

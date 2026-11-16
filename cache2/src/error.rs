@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::error;
 use std::fmt;
 use std::io;
 
@@ -149,9 +150,8 @@ impl Error {
 
     /// Returns the underlying standard-library I/O error kind.
     ///
-    /// Prefer [`Self::kind`] for application policy. This method is intended
-    /// for detailed diagnostics and migration from the former `io::Result`
-    /// API.
+    /// Prefer [`Self::kind`] for application policy; reserve this method for
+    /// detailed diagnostics.
     pub fn io_kind(&self) -> io::ErrorKind {
         self.source.kind()
     }
@@ -196,8 +196,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(&self.source)
     }
 }

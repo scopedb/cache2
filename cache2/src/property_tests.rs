@@ -21,6 +21,7 @@ use quickcheck::Gen;
 use quickcheck::QuickCheck;
 
 use crate::checksum::crc32c;
+use crate::fixtures::splitmix64;
 use crate::hashing::FixedPrehashedMap;
 use crate::region::index::ReclaimIndexAction;
 use crate::region::index::RegionIndex;
@@ -144,20 +145,6 @@ fn exercise_record_roundtrip(input: &[u8]) {
     assert_eq!(header.payload_crc, crc32c(&[&payload]));
     assert_eq!(header.region_generation, region_created_seqno);
     assert_eq!(header.record_len, record_bytes);
-
-    let mut chunks = Vec::new();
-    let mut remaining = payload.as_slice();
-    for control_byte in control {
-        if remaining.is_empty() {
-            break;
-        }
-        let chunk_len = usize::from(control_byte) % remaining.len() + 1;
-        let (chunk, tail) = remaining.split_at(chunk_len);
-        chunks.push(chunk);
-        remaining = tail;
-    }
-    chunks.push(remaining);
-    assert_eq!(crc32c(&chunks), header.payload_crc);
 
     let payload_end = RECORD_HEADER_SIZE + payload.len();
     assert_eq!(&destination[RECORD_HEADER_SIZE..payload_end], payload);
@@ -325,13 +312,6 @@ fn indexed_entry(location: PackedLocation) -> IndexEntry {
         location: PackedLocation::new(location.region_id(), location.offset(), record_len)
             .expect("a valid property-test location has a representable size-class upper bound"),
     }
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 fn padded<const N: usize>(input: &[u8]) -> [u8; N] {

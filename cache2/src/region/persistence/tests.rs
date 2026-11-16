@@ -14,23 +14,22 @@
 
 use std::env;
 use std::fs;
-use std::future::Future;
-use std::future::poll_fn;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::pin::Pin;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::task::Poll;
+use std::thread;
 use std::time::Duration;
-use std::time::Instant;
+
+use tokio::runtime::Builder;
+use tokio::runtime::Handle;
 
 use super::*;
 use crate::IoEngineOptions;
@@ -41,6 +40,11 @@ use crate::config::runtime::MAX_WRITE_FLUSH_THRESHOLD_BYTES;
 use crate::config::runtime::PosixIoOptions;
 use crate::config::runtime::ReadAdmission;
 use crate::config::runtime::RuntimeOptions;
+use crate::fixtures::TestDirectory;
+use crate::fixtures::assert_pending;
+use crate::fixtures::eventually_admitted;
+use crate::io::background::BackgroundIoAttempt;
+use crate::io::background::IoRecovery;
 use crate::io::engine::IoEngine;
 use crate::io::file::MAX_INTERRUPTED_RETRIES;
 use crate::io::file::testing::FaultAction;
@@ -50,6 +54,7 @@ use crate::io::file::testing::FaultHandle;
 use crate::io::file::testing::kill_process;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
+use crate::region::RegionRotation;
 use crate::region::RegionStageValue;
 use crate::region::index::packed::IndexEntry;
 use crate::region::index::packed::PackedLocation;
@@ -88,7 +93,7 @@ impl CacheSession {
     async fn get_value_async(
         &self,
         key: &[u8],
-        tokio_handle: &tokio::runtime::Handle,
+        tokio_handle: &Handle,
     ) -> io::Result<Option<CacheRead>> {
         self.runtime()?.get_async(key, tokio_handle, None).await
     }
@@ -106,63 +111,10 @@ impl CacheSession {
     }
 }
 
-static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match put() {
-            Ok(value) => return value,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                assert!(
-                    Instant::now() < deadline,
-                    "write buffer did not make progress"
-                );
-                std::thread::yield_now();
-            }
-            Err(error) => panic!("cache write failed: {error}"),
-        }
-    }
-}
-
-async fn assert_pending<F: Future>(mut future: Pin<&mut F>, message: &str) {
-    poll_fn(|context| match Future::poll(future.as_mut(), context) {
-        Poll::Pending => Poll::Ready(()),
-        Poll::Ready(_) => panic!("{message}"),
-    })
-    .await;
-}
-
-struct TestDirectory {
-    root: PathBuf,
-    paths: RegionPaths,
-}
-
-impl TestDirectory {
-    fn new() -> Self {
-        let ordinal = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!("cache2-region-{}-{ordinal}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
-        let paths = RegionPaths::new(
-            root.join("data"),
-            root.join("state"),
-            root.join("recovery.image"),
-        );
-        Self { root, paths }
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn state_page_reads_stop_after_the_interrupted_retry_budget() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let (state, faults) = FaultFile::open(&directory.paths.state).unwrap();
     state.set_len(STATE_FILE_SIZE as u64).unwrap();
     faults.arm(FaultEvent::Read, 1, FaultAction::ErrorAlways(libc::EINTR));
@@ -327,7 +279,7 @@ fn external_process_kill_recovery_contract() {
         ("warm-image", false),
         ("clean-state", true),
     ] {
-        let directory = TestDirectory::new();
+        let directory = TestDirectory::new("region");
         let data = data_path_superblock();
         let mut initial = CacheSession::for_test(directory.paths.clone(), data, 4096).unwrap();
         eventually_admitted(|| initial.put_value(b"survivor", b"old"));
@@ -429,7 +381,7 @@ fn key_for_shard(data: DataSuperblock, shard: u64, ordinal: u64) -> Vec<u8> {
 
 #[test]
 fn configured_read_wait_is_bounded_and_cancel_safe() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
         io_engine: IoEngineOptions::Posix(PosixIoOptions {
@@ -451,7 +403,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
     let mut session =
         CacheSession::for_test_with_options(directory.paths.clone(), data, 4096, runtime_options)
             .unwrap();
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+    let tokio_runtime = Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
         .build()
@@ -518,7 +470,7 @@ fn configured_read_wait_is_bounded_and_cancel_safe() {
 
 #[test]
 fn queued_l2_read_does_not_pin_warm_close() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
         io_engine: IoEngineOptions::Posix(PosixIoOptions {
@@ -540,10 +492,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
         runtime_options.clone(),
     )
     .unwrap();
-    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
+    let tokio_runtime = Builder::new_current_thread().enable_time().build().unwrap();
     eventually_admitted(|| session.put_value(b"queued-close", b"value"));
     session.drain().unwrap();
     let runtime = session.runtime().unwrap().clone();
@@ -572,7 +521,7 @@ fn queued_l2_read_does_not_pin_warm_close() {
 
 #[test]
 fn cache_runtime_reads_mixed_chunks_rotates_and_warm_recovers() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let data = production_data_superblock(512 * 1024);
     let runtime_options = RuntimeOptions {
         l1_capacity_bytes: 0,
@@ -670,7 +619,7 @@ fn cache_runtime_reads_mixed_chunks_rotates_and_warm_recovers() {
 #[test]
 fn poisoned_runtime_gates_stop_workers_and_reject_warm_close() {
     for case in ["shard", "index"] {
-        let directory = TestDirectory::new();
+        let directory = TestDirectory::new("region");
         let data = production_data_superblock(512 * 1024);
         let runtime_options = RuntimeOptions {
             io_engine: IoEngineOptions::Posix(PosixIoOptions {
@@ -805,12 +754,12 @@ fn foreground_stage_bypasses_busy_manager_without_consuming_a_sequence() {
 fn foreground_stage_rejects_busy_shard_without_reserving_then_stages_once() {
     let (data, regions, staging) = foreground_stage_fixture();
     let next_seqno = regions.manager.state.lock().unwrap().next_seqno();
-    let mutation = regions.append_gates[0].mutation.lock().unwrap();
+    let mutation = regions.append_gates[0].lock().unwrap();
     let hash = hash_key(data.hash_seed, b"key");
     let record_bytes = required_record_bytes(b"key".len(), b"value".len()).unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
     let writer_regions = Arc::clone(&regions);
-    let writer = std::thread::spawn(move || {
+    let writer = thread::spawn(move || {
         let result =
             writer_regions.try_stage_value(&staging, 0, hash, record_bytes, b"key", b"value");
         sender.send((result, staging)).unwrap();
@@ -859,7 +808,7 @@ fn completed_record_publication_does_not_enter_region_manager() {
     );
     let (sender, receiver) = mpsc::sync_channel(1);
     let publisher_regions = Arc::clone(&regions);
-    let publisher = std::thread::spawn(move || {
+    let publisher = thread::spawn(move || {
         sender
             .send(publisher_regions.publish_completed_records(&[record]))
             .unwrap();
@@ -889,7 +838,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
         &managed_memory,
     )
     .unwrap();
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let (file, faults) = FaultFile::open(&directory.paths.data).unwrap();
     file.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(file), 2).unwrap();
@@ -927,10 +876,7 @@ fn completed_owned_span_publishes_index_without_a_steady_state_sync() {
             &staging,
             &engine,
             0,
-            crate::io::background::BackgroundIoAttempt::new(
-                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                None,
-            ),
+            BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         )
         .unwrap()
         .unwrap();
@@ -1115,7 +1061,7 @@ fn reclaim_validates_payload_before_staging_and_counts_rewrites() {
             // Destroy the source before I/O: staging must own the validated bytes.
             bytes.fill(0xcc);
             drop(bytes);
-            let directory = TestDirectory::new();
+            let directory = TestDirectory::new("region");
             let (file, _) = FaultFile::open(&directory.paths.data).unwrap();
             file.set_len(data.geometry.data_file_len).unwrap();
             let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
@@ -1124,10 +1070,7 @@ fn reclaim_validates_payload_before_staging_and_counts_rewrites() {
                     &staging,
                     &engine,
                     0,
-                    crate::io::background::BackgroundIoAttempt::new(
-                        &crate::io::background::IoRecovery::new(Some(Duration::ZERO)),
-                        None,
-                    ),
+                    BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
                 )
                 .unwrap()
                 .unwrap();
@@ -1207,7 +1150,7 @@ fn same_hash_candidate_requires_full_key() {
         &managed_memory,
     )
     .unwrap();
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let (file, _) = FaultFile::open(&directory.paths.data).unwrap();
     file.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
@@ -1234,10 +1177,7 @@ fn same_hash_candidate_requires_full_key() {
             &staging,
             &engine,
             0,
-            crate::io::background::BackgroundIoAttempt::new(
-                &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                None,
-            ),
+            BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         )
         .unwrap()
         .expect("collision owner must publish");
@@ -1353,7 +1293,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
         &managed_memory,
     )
     .unwrap();
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let (file, faults) = FaultFile::open(&directory.paths.data).unwrap();
     file.set_len(data.geometry.data_file_len).unwrap();
     let engine = IoEngine::for_test(Arc::new(file), 1).unwrap();
@@ -1377,10 +1317,7 @@ fn failed_span_write_never_publishes_and_latches_miss_only() {
                 &staging,
                 &engine,
                 0,
-                crate::io::background::BackgroundIoAttempt::new(
-                    &crate::io::background::IoRecovery::new(Some(std::time::Duration::ZERO)),
-                    None,
-                )
+                BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None,)
             )
             .unwrap_err()
             .raw_os_error(),
@@ -1412,14 +1349,8 @@ fn rotation_is_committed_without_a_metadata_io_boundary() {
         .request_rotation_for_test(0)
         .unwrap();
 
-    assert_eq!(
-        regions.rotate_shard(0).unwrap(),
-        crate::region::RegionRotation::Rotated
-    );
-    assert_eq!(
-        regions.rotate_shard(0).unwrap(),
-        crate::region::RegionRotation::Idle
-    );
+    assert_eq!(regions.rotate_shard(0).unwrap(), RegionRotation::Rotated);
+    assert_eq!(regions.rotate_shard(0).unwrap(), RegionRotation::Idle);
     assert!(regions.health.is_healthy());
     let manager = regions.manager.lock().unwrap();
     assert_eq!(manager.active_regions()[0], REGION_SHARDS);
@@ -1441,7 +1372,7 @@ fn assert_no_runtime_data_write_during_startup(events: &[FaultEvent]) {
 
 #[test]
 fn fresh_and_dirty_startup_do_not_write_runtime_region_metadata() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
 
@@ -1495,7 +1426,7 @@ fn publish_custom_clean_image(
 
 #[test]
 fn clean_image_rebinds_a_different_append_shard_topology() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
 
@@ -1527,7 +1458,7 @@ fn clean_image_rebinds_a_different_append_shard_topology() {
 
 #[test]
 fn append_shard_growth_without_free_regions_cold_starts_safely() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
     let mut metadata = empty_region_metadata(data, config, 1).unwrap();
@@ -1554,9 +1485,7 @@ fn append_shard_growth_without_free_regions_cold_starts_safely() {
 
 #[test]
 fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
-    use std::os::unix::fs::FileExt;
-
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
     let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
@@ -1584,7 +1513,7 @@ fn dirty_cold_start_discards_stale_region_bytes_without_scanning() {
 
 #[test]
 fn dropping_a_warm_runtime_releases_ownership_and_reopens_cold() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let data = test_data_superblock();
     let mut initial = CacheSession::for_test(directory.paths.clone(), data, 8).unwrap();
     initial.close_warm().unwrap();
@@ -1600,7 +1529,7 @@ fn dropping_a_warm_runtime_releases_ownership_and_reopens_cold() {
 
 #[test]
 fn complete_warm_image_maps_without_rebuilding_index_slots() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
     let value = IndexSlot::from_state(IndexSlotState::Value {
@@ -1646,9 +1575,7 @@ fn complete_warm_image_maps_without_rebuilding_index_slots() {
 
 #[test]
 fn corrupt_region_metadata_rejects_the_complete_clean_image() {
-    use std::os::unix::fs::FileExt;
-
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 130;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
     let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
@@ -1680,9 +1607,7 @@ fn corrupt_region_metadata_rejects_the_complete_clean_image() {
 
 #[test]
 fn one_corrupt_lazy_index_page_rejects_all_pages() {
-    use std::os::unix::fs::FileExt;
-
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = INDEX_IMAGE_SLOTS_PER_PAGE + 8;
     let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
     let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();
@@ -1775,7 +1700,7 @@ fn every_prepublication_failure_leaves_no_selectable_clean_state() {
     ];
 
     for (case, (io_fault, file_system_fault)) in cases.into_iter().enumerate() {
-        let directory = TestDirectory::new();
+        let directory = TestDirectory::new("region");
         let config = 8;
         let data = test_data_superblock_with_regions(REGION_SHARDS + 1);
         let (file_system, io_faults, file_system_faults) = FaultFileSystem::new();
@@ -1824,7 +1749,7 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
     ];
 
     for (case, (event, occurrence, action)) in cases.into_iter().enumerate() {
-        let directory = TestDirectory::new();
+        let directory = TestDirectory::new("region");
         let config = 8;
         let data = test_data_superblock();
         let (file_system, faults, _) = FaultFileSystem::new();
@@ -1849,7 +1774,7 @@ fn concrete_running_barrier_failures_abort_before_runtime_start() {
 
 #[test]
 fn runtime_file_failure_after_running_releases_ownership_and_reopens_cold() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let data = test_data_superblock();
     let (file_system, faults, _) = FaultFileSystem::new();
     faults.arm(FaultEvent::CloneDataHandles, 1, FaultAction::Error(5));
@@ -1870,7 +1795,7 @@ fn runtime_file_failure_after_running_releases_ownership_and_reopens_cold() {
 
 #[test]
 fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
     let (file_system, faults, _) = FaultFileSystem::new();
@@ -1898,7 +1823,7 @@ fn final_clean_sync_failure_reopens_as_safe_clean_or_empty() {
 
 #[test]
 fn data_and_state_inode_alias_is_rejected_without_truncation() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
     let marker = b"do-not-truncate";
@@ -1915,7 +1840,7 @@ fn data_and_state_inode_alias_is_rejected_without_truncation() {
 
 #[test]
 fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let marker = b"keep-data";
     let image = directory.root.join("recovery");
     let data_path = directory.root.join("recovery.next");
@@ -1936,7 +1861,7 @@ fn recovery_temporary_path_cannot_name_the_data_or_state_file() {
 
 #[test]
 fn recovery_sidecars_must_share_one_directory() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let other = directory.root.join("other");
     fs::create_dir(&other).unwrap();
     let paths = RegionPaths::new(
@@ -1955,7 +1880,7 @@ fn recovery_sidecars_must_share_one_directory() {
 
 #[test]
 fn state_sidecar_lock_prevents_cross_data_file_races() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("region");
     let config = 8;
     let data = test_data_superblock();
     let mut first = CacheSession::for_test(directory.paths.clone(), data, config).unwrap();

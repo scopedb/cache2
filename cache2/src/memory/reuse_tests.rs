@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Barrier;
+use std::thread;
 
 use super::*;
 
@@ -237,7 +239,7 @@ fn concurrent_publication_clone_and_drop_preserve_old_values() {
                     panic!("preloaded value must be resident before writers start");
                 };
                 let initial = RetainedValueSnapshot::new(value);
-                workers.push(std::thread::spawn(move || {
+                workers.push(thread::spawn(move || {
                     let mut random = worker as u64 + 1;
                     let mut retained: Vec<RetainedValueSnapshot> = Vec::new();
                     start.wait();
@@ -269,7 +271,7 @@ fn concurrent_publication_clone_and_drop_preserve_old_values() {
                             retained.swap_remove(index);
                         }
                         if iteration % 31 == 0 {
-                            std::thread::yield_now();
+                            thread::yield_now();
                         }
                     }
                     retained.push(initial);
@@ -310,9 +312,9 @@ fn last_external_drop_before_reuse_releases_original_charge_once() {
         assert_eq!(shard.budget.used_bytes(), 2 * required);
         assert!(!recycled.as_ref().unwrap().releases_charge_on_remove());
 
-        // Force the last caller to drop after detachment but before the
-        // factory rechecks exclusivity. The original charge is still armed.
-        std::thread::spawn(move || drop(held)).join().unwrap();
+        // Drop the last caller handle after detachment and before exclusivity
+        // rechecking. The original charge is still armed.
+        drop(held);
         let replacement = MemoryValue::try_new(b"new", &[2; 128], 2, charge, recycled)
             .ok()
             .unwrap();

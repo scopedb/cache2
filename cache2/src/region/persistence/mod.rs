@@ -16,8 +16,8 @@
 
 use std::fmt;
 use std::fs::File;
+use std::io;
 use std::io::Write;
-use std::io::{self};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -101,6 +101,7 @@ impl RegionPaths {
         }
     }
 }
+
 pub struct RecoveryImage {
     file: File,
     header: RecoveryImageHeader,

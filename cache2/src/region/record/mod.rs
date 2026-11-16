@@ -66,7 +66,7 @@ impl RecordHeader {
         let unaligned = RECORD_HEADER_SIZE
             .checked_add(key_len)?
             .checked_add(value_len)?;
-        let aligned = checked_align_up(unaligned, RECORD_ALIGNMENT as usize)?;
+        let aligned = unaligned.checked_next_multiple_of(RECORD_ALIGNMENT as usize)?;
         u32::try_from(aligned).ok()
     }
 
@@ -134,15 +134,6 @@ impl RecordHeader {
 
 fn header_crc(header: &[u8]) -> u32 {
     crc32c(&[&header[..RECORD_HEADER_CRC_OFFSET], &[0; 4]])
-}
-
-fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
-    if !alignment.is_power_of_two() {
-        return None;
-    }
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|rounded| rounded & !(alignment - 1))
 }
 
 #[cfg(test)]

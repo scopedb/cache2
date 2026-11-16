@@ -17,23 +17,26 @@
 //! Activity counters, public request outcomes, and timing are independent. Sampled
 //! durations describe observed requests only; they are not full-population SLOs.
 
+use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::snapshot::CacheSnapshot;
 
-pub(crate) mod recording;
+pub mod recording;
 
 /// Duration collection for one timing scope, selected before its outcome is known.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum LatencyMode {
     /// No clocks or histogram updates for this scope.
     #[default]
     Off,
-    /// Observe every terminal operation in this scope; no sampling RNG work.
+    /// Observe every terminal operation in this scope.
     Full,
     /// Observe each request with probability approximately `1 / interval`.
-    /// Counts and sums retain sampled semantics. One is equivalent to full.
+    ///
+    /// Counts and sums retain sampled semantics; an interval of one is
+    /// equivalent to [`Self::Full`].
     Sampled {
         /// Mean number of requests per observation.
         interval: NonZeroU32,
@@ -42,29 +45,36 @@ pub enum LatencyMode {
 
 /// Statistics collection selected once per open.
 ///
-/// Defaults allocate no counter or histogram stripes. Enable `request_counters` for complete
-/// terminal accounting even when durations are sampled. All enabled storage is
-/// included in the managed memory limit. Configuration cannot change while open.
+/// Enable `request_counters` for complete terminal accounting even when
+/// durations are sampled. All enabled storage is included in the managed memory
+/// limit, and configuration cannot change while open.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatsOptions {
-    /// Count cache, index, reclaim, and I/O activity. Defaults to false;
-    /// health and resource gauges remain available independently.
+    /// Count cache, index, reclaim, and I/O activity.
+    ///
+    /// Defaults to `false`; health and resource gauges remain available
+    /// independently.
     pub activity_counters: bool,
-    /// Count every terminal get, put, put_l2 and delete by exclusive result.
+    /// Count every terminal `get`, `put`, `put_l2`, and `delete` by exclusive
+    /// result.
     pub request_counters: bool,
     /// Time L1 hits from the first poll to return. L1 misses discard this timer.
     pub l1_latency: LatencyMode,
-    /// Time reads from L1 miss through L2 lookup, waiting, I/O and promotion.
-    /// Excludes the initial L1 lookup. Early misses before L1 lookup are not timed.
+    /// Time reads from L1 miss through L2 lookup, waiting, I/O, and promotion.
+    ///
+    /// Excludes the initial L1 lookup. Early misses before L1 lookup are not
+    /// timed.
     pub l2_latency: LatencyMode,
-    /// Time put, put_l2 and delete from entry to their terminal result.
+    /// Time `put`, `put_l2`, and `delete` from entry to their terminal result.
     pub mutation_latency: LatencyMode,
-    /// Fully observe engine requests from slot reservation to terminal completion.
-    /// Split by foreground read, append write and reclaim read; not device latency.
+    /// Observe engine requests from slot reservation to terminal completion.
+    ///
+    /// Split by foreground read, append write, and reclaim read; excludes
+    /// device latency.
     pub io_latency: bool,
-    /// Fixed recorder stripes. Must be a power of two in 1..=64; defaults to 16.
-    /// Colliding threads use relaxed atomic updates, never a recorder lock.
+    /// Fixed recorder stripes, required to be a power of two in `1..=64`
+    /// (defaults to 16).
     pub shards: usize,
 }
 
@@ -101,7 +111,7 @@ impl StatsOptions {
 
 /// Public operation whose terminal outcome is recorded.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestOperation {
     /// Lookup, starting at first poll; an unpolled future is not a request.
     Get,
@@ -114,7 +124,7 @@ pub enum RequestOperation {
 }
 
 impl RequestOperation {
-    /// Stable low-cardinality metric label.
+    /// Returns the stable low-cardinality metric label.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Get => "get",
@@ -125,9 +135,15 @@ impl RequestOperation {
     }
 }
 
+impl fmt::Display for RequestOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Mutually exclusive terminal result; internal events may overlap these counts.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestOutcome {
     /// A value found in L1 at lookup, not an L2 value subsequently promoted.
     L1Hit,
@@ -150,7 +166,7 @@ pub enum RequestOutcome {
 }
 
 impl RequestOutcome {
-    /// Stable low-cardinality metric label.
+    /// Returns the stable low-cardinality metric label.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::L1Hit => "l1_hit",
@@ -166,9 +182,15 @@ impl RequestOutcome {
     }
 }
 
+impl fmt::Display for RequestOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Engine ownership, independent of buffered/direct file-operation accounting.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IoRole {
     /// Foreground L2 lookups.
     Read,
@@ -179,7 +201,7 @@ pub enum IoRole {
 }
 
 impl IoRole {
-    /// Stable metric label.
+    /// Returns the stable metric label.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
@@ -189,9 +211,15 @@ impl IoRole {
     }
 }
 
+impl fmt::Display for IoRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Terminal engine result, distinct from caller cancellation or timeout.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IoOutcome {
     /// Operation completed successfully.
     Completed,
@@ -202,7 +230,7 @@ pub enum IoOutcome {
 }
 
 impl IoOutcome {
-    /// Stable metric label.
+    /// Returns the stable metric label.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
@@ -212,7 +240,13 @@ impl IoOutcome {
     }
 }
 
-/// Version-one explicit duration bucket boundaries, in nanoseconds, inclusive.
+impl fmt::Display for IoOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Explicit duration bucket upper bounds in nanoseconds, inclusive.
 ///
 /// A final unbounded bucket follows these finite bounds. The layout includes
 /// common SLO thresholds and is shared by all instances. Quantiles have bucket
@@ -261,7 +295,7 @@ pub struct LatencySnapshot {
     pub bucket_counts: Box<[u64]>,
     /// Sum of these bucket counts, not an estimate of full request volume.
     pub count: u64,
-    /// Sum of observed durations in nanoseconds, widened when stripes are merged.
+    /// Sum of observed durations in nanoseconds.
     pub sum_ns: u128,
     /// False after recorder arithmetic overflow. Do not export invalid distributions.
     pub valid: bool,
@@ -269,14 +303,16 @@ pub struct LatencySnapshot {
 
 /// Interval measured by a request duration distribution.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestLatencyScope {
-    /// First public get poll through return of an L1 hit.
+    /// First public `get` poll through return of an L1 hit.
     L1Hit,
-    /// L1 miss through terminal result, including index lookup, waiting and promotion.
-    /// This is not the full public get duration.
+    /// L1 miss through terminal result, including index lookup, waiting, and
+    /// promotion.
+    ///
+    /// This is not the full public `get` duration.
     L2Lookup,
-    /// Public put, put_l2 or delete entry through its terminal result.
+    /// Public `put`, `put_l2`, or `delete` entry through its terminal result.
     Mutation,
 }
 
@@ -298,14 +334,15 @@ pub struct RequestStatsSnapshot {
     pub operation: RequestOperation,
     /// Exclusive terminal result.
     pub outcome: RequestOutcome,
-    /// Full event count, or None when request counters are disabled.
+    /// Full event count, or `None` when request counters are disabled.
     pub count: Option<u64>,
     /// Interval covered by this row's optional duration distribution.
     pub latency_scope: RequestLatencyScope,
     /// Collection mode for this row, independent of other tiers and mutations.
     pub latency_mode: LatencyMode,
-    /// Full or sampled duration distribution, or None when timing is disabled.
-    /// L1 hits cover the public lookup; other get rows start at L1 miss.
+    /// Full or sampled duration distribution, or `None` when timing is disabled.
+    ///
+    /// L1 hits cover the public lookup; other `get` rows start at L1 miss.
     /// Early misses before L1 lookup contribute only to the request counter.
     pub latency: Option<LatencySnapshot>,
 }
@@ -322,22 +359,23 @@ pub struct IoLatencySnapshot {
     pub latency: LatencySnapshot,
 }
 
-/// Cumulative monitoring view without metadata scans or recorder locks.
+/// Cumulative monitoring snapshot without metadata scans.
 ///
-/// Activity availability is given by `summary.activity_counters_enabled`; request
-/// and latency families use explicit options and optional values. The application owns
-/// collection scheduling, timestamp assignment and export to its monitoring SDK. Empty vectors
-/// indicate a disabled family, not a zero-event population. Returned allocations belong to
-/// the caller; cache-owned recorder storage is fixed and charged at open.
+/// Activity availability is given by `summary.activity_counters_enabled`;
+/// request and latency families use explicit options and optional values. The
+/// application owns collection scheduling, timestamp assignment, and export to
+/// its monitoring SDK. Empty vectors indicate a disabled family, not a
+/// zero-event population. Returned allocations belong to the caller;
+/// cache-owned recorder storage is fixed and charged at open.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheStatsSnapshot {
-    /// Health, resource, activity, I/O and reclaim metrics and reset epoch.
+    /// Health, resource, activity, I/O, and reclaim metrics, plus the reset
+    /// epoch.
     pub summary: CacheSnapshot,
     /// Exact collection settings for this open.
     pub options: StatsOptions,
     /// Bytes reserved for counter/histogram stripes, excluding this snapshot.
-    /// Recorder controls are covered by the fixed runtime control reservation.
     pub recorder_bytes: usize,
     /// Finite operation/result series, independent of user keys and error strings.
     pub requests: Vec<RequestStatsSnapshot>,

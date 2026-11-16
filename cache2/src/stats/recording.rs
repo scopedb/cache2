@@ -12,18 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::array;
 use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use super::*;
 use crate::Error;
 use crate::ErrorKind;
+use crate::snapshot::CacheSnapshot;
+use crate::stats::CacheStatsSnapshot;
+use crate::stats::IoLatencySnapshot;
+use crate::stats::IoOutcome;
+use crate::stats::IoRole;
+use crate::stats::LATENCY_BUCKET_UPPER_BOUNDS_NS;
+use crate::stats::LatencyMode;
+use crate::stats::LatencySnapshot;
+use crate::stats::RequestLatencyScope;
+use crate::stats::RequestOperation;
+use crate::stats::RequestOutcome;
+use crate::stats::RequestStatsSnapshot;
+use crate::stats::StatsOptions;
 
 const BUCKETS: usize = LATENCY_BUCKET_UPPER_BOUNDS_NS.len() + 1;
 const REQUEST_SERIES: &[(RequestOperation, RequestOutcome)] = &[
@@ -82,7 +96,7 @@ struct Histogram {
 impl Histogram {
     fn new() -> Self {
         Self {
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            buckets: array::from_fn(|_| AtomicU64::new(0)),
             sum_ns: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
         }
@@ -90,14 +104,14 @@ impl Histogram {
 
     fn record(&self, duration: Duration) {
         let Ok(ns) = u64::try_from(duration.as_nanos()) else {
-            self.invalid.store(true, Relaxed);
+            self.invalid.store(true, Ordering::Relaxed);
             return;
         };
         let bucket = LATENCY_BUCKET_UPPER_BOUNDS_NS.partition_point(|bound| *bound < ns);
-        let old_count = self.buckets[bucket].fetch_add(1, Relaxed);
-        let old_sum = self.sum_ns.fetch_add(ns, Relaxed);
+        let old_count = self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        let old_sum = self.sum_ns.fetch_add(ns, Ordering::Relaxed);
         if old_count == u64::MAX || old_sum.checked_add(ns).is_none() {
-            self.invalid.store(true, Relaxed);
+            self.invalid.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -107,7 +121,7 @@ thread_local! {
     // A bounded scalar per thread, not a map of cache instances. A different
     // sampling rate uses the same uniform random stream without reinitializing.
     static THREAD: Cell<(u64, u64)> = {
-        let id = NEXT_THREAD.fetch_add(1, Relaxed);
+        let id = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
         Cell::new((id, id.wrapping_mul(0x9e3779b97f4a7c15).max(1)))
     };
 }
@@ -164,7 +178,7 @@ impl Recorder {
         Self::allocation_bytes(options)?;
         let counters = allocate(
             usize::from(options.request_counters) * options.shards,
-            || Counters(std::array::from_fn(|_| AtomicU64::new(0))),
+            || Counters(array::from_fn(|_| AtomicU64::new(0))),
         )?;
         let mut histogram_indices = [usize::MAX; REQUEST_SERIES.len()];
         let mut histogram_series = 0;
@@ -235,7 +249,7 @@ impl Recorder {
                     outcome,
                     count: self.options.request_counters.then(|| {
                         self.counters.iter().fold(0u64, |sum, stripe| {
-                            sum.saturating_add(stripe.0[index].load(Relaxed))
+                            sum.saturating_add(stripe.0[index].load(Ordering::Relaxed))
                         })
                     }),
                     latency_scope: scope,
@@ -260,6 +274,7 @@ impl Recorder {
             io_latency: self.io_snapshot(),
         }
     }
+
     pub fn io_snapshot(&self) -> Vec<IoLatencySnapshot> {
         let mut io_latency = Vec::new();
         if self.options.io_latency {
@@ -302,7 +317,7 @@ fn histogram_snapshot(histograms: &[Histogram], series: usize, index: usize) -> 
     };
     for histogram in histograms.iter().skip(index).step_by(series) {
         for (sum, bucket) in snapshot.bucket_counts.iter_mut().zip(&histogram.buckets) {
-            match sum.checked_add(bucket.load(Relaxed)) {
+            match sum.checked_add(bucket.load(Ordering::Relaxed)) {
                 Some(value) => *sum = value,
                 None => {
                     snapshot.valid = false;
@@ -310,8 +325,8 @@ fn histogram_snapshot(histograms: &[Histogram], series: usize, index: usize) -> 
                 }
             }
         }
-        snapshot.sum_ns += u128::from(histogram.sum_ns.load(Relaxed));
-        snapshot.valid &= !histogram.invalid.load(Relaxed);
+        snapshot.sum_ns += u128::from(histogram.sum_ns.load(Ordering::Relaxed));
+        snapshot.valid &= !histogram.invalid.load(Ordering::Relaxed);
     }
     for count in &snapshot.bucket_counts {
         match snapshot.count.checked_add(*count) {
@@ -376,7 +391,7 @@ impl RequestGuard<'_> {
             .filter(|(timed_scope, _)| *timed_scope == scope)
             .map(|(_, start)| start.elapsed());
         if recorder.options.request_counters {
-            recorder.counters[self.stripe].0[index].fetch_add(1, Relaxed);
+            recorder.counters[self.stripe].0[index].fetch_add(1, Ordering::Relaxed);
         }
         if let Some(elapsed) = elapsed {
             recorder.request_histograms
@@ -388,7 +403,7 @@ impl RequestGuard<'_> {
 
 impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
-        if self.operation == RequestOperation::Get && !std::thread::panicking() {
+        if self.operation == RequestOperation::Get && !thread::panicking() {
             self.record(RequestOutcome::Cancelled);
         }
     }
@@ -414,6 +429,9 @@ fn io_index(role: IoRole, outcome: IoOutcome) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::slice;
+
     use super::*;
 
     #[test]
@@ -426,12 +444,12 @@ mod tests {
         }
         histogram.record(Duration::from_nanos(60_000_000_001));
         expected_sum += 60_000_000_001;
-        let snapshot = histogram_snapshot(std::slice::from_ref(&histogram), 1, 0);
+        let snapshot = histogram_snapshot(slice::from_ref(&histogram), 1, 0);
         assert!(snapshot.valid);
         assert_eq!(snapshot.bucket_counts.as_ref(), &[1; BUCKETS]);
         assert_eq!(snapshot.count, BUCKETS as u64);
         assert_eq!(snapshot.sum_ns, expected_sum);
-        histogram.sum_ns.store(u64::MAX, Relaxed);
+        histogram.sum_ns.store(u64::MAX, Ordering::Relaxed);
         histogram.record(Duration::from_nanos(1));
         assert!(!histogram_snapshot(&[histogram], 1, 0).valid);
     }
@@ -453,8 +471,8 @@ mod tests {
         let mut cancelled = recorder.begin(RequestOperation::Get);
         cancelled.enter_l2();
         drop(cancelled);
-        assert_eq!(recorder.counters[0].0[1].load(Relaxed), 1);
-        assert_eq!(recorder.counters[0].0[5].load(Relaxed), 1);
+        assert_eq!(recorder.counters[0].0[1].load(Ordering::Relaxed), 1);
+        assert_eq!(recorder.counters[0].0[5].load(Ordering::Relaxed), 1);
         assert_eq!(
             histogram_snapshot(&recorder.request_histograms, REQUEST_SERIES.len(), 1).count,
             1
@@ -467,7 +485,7 @@ mod tests {
             recorder.counters[0]
                 .0
                 .iter()
-                .map(|count| count.load(Relaxed))
+                .map(|count| count.load(Ordering::Relaxed))
                 .sum::<u64>(),
             2
         );
@@ -539,7 +557,7 @@ mod tests {
             ..StatsOptions::default()
         })
         .unwrap();
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for _ in 0..8 {
                 let recorder = &recorder;
                 scope.spawn(move || {
@@ -567,7 +585,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(recorder.counters[0].0[0].load(Relaxed), 80_000);
+        assert_eq!(recorder.counters[0].0[0].load(Ordering::Relaxed), 80_000);
         let first = histogram_snapshot(&recorder.request_histograms, REQUEST_SERIES.len(), 0);
         assert_eq!(first.count, 80_000);
         assert_eq!(

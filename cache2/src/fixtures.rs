@@ -25,16 +25,28 @@
 //! when an assertion fails midway.
 
 use std::env;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::future::Future;
+use std::future::poll_fn;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::process;
+use std::str;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::io::file::CacheFile;
 use crate::io::file::PositionedIo;
+use crate::region::persistence::RegionPaths;
 
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.
@@ -74,7 +86,7 @@ fn sparse_golden(input: &str) -> Vec<u8> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .map(|pair| u8::from_str_radix(str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>();
         let output = output.as_mut().expect("golden length must come first");
         output[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -94,7 +106,7 @@ impl TestFile {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self {
-            path: env::temp_dir().join(format!("cache2-{label}-{}-{id}.tmp", std::process::id())),
+            path: env::temp_dir().join(format!("cache2-{label}-{}-{id}.tmp", process::id())),
         }
     }
 
@@ -132,6 +144,69 @@ impl TestFile {
 
 impl Drop for TestFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Unique temporary directory with cache sidecar paths removed when dropped.
+pub struct TestDirectory {
+    pub root: PathBuf,
+    pub paths: RegionPaths,
+}
+
+impl TestDirectory {
+    /// Creates a unique `cache2-{label}-*` directory and its cache paths in the
+    /// system temp directory.
+    pub fn new(label: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!("cache2-{label}-{}-{id}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let paths = RegionPaths::new(
+            root.join("data"),
+            root.join("state"),
+            root.join("recovery.image"),
+        );
+        Self { root, paths }
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+pub fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+#[track_caller]
+pub fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match put() {
+            Ok(value) => return value,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "write buffer did not make progress"
+                );
+                thread::yield_now();
+            }
+            Err(error) => panic!("cache write failed: {error}"),
+        }
+    }
+}
+
+pub async fn assert_pending<F: Future>(mut future: Pin<&mut F>, message: &str) {
+    poll_fn(|context| match Future::poll(future.as_mut(), context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("{message}"),
+    })
+    .await;
 }

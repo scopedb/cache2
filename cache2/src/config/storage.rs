@@ -19,6 +19,7 @@ use std::io;
 #[cfg(test)]
 use crate::CacheConfig;
 use crate::config::StorageLayout;
+use crate::config::invalid_config;
 #[cfg(test)]
 use crate::config::runtime::RuntimeOptions;
 use crate::error::Error;
@@ -72,6 +73,7 @@ impl StorageOptions {
     }
 
     /// Checks the inputs and computes an immutable layout without opening files.
+    ///
     /// Use [`StorageLayout::peak_disk_bytes`] to compare a candidate with a disk
     /// budget, then pass the chosen layout to [`CacheConfig::new`](crate::CacheConfig::new).
     ///
@@ -182,9 +184,6 @@ fn fingerprint(geometry: DataGeometry, index_slots: usize, hash_algorithm_id: u6
         }
     }
     hash.max(1)
-}
-fn invalid_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 fn index_layout_error(error: IndexStorageError) -> io::Error {

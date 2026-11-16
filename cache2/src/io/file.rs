@@ -41,8 +41,6 @@ use crate::snapshot::CacheIoPathSnapshot;
 
 pub const DIRECT_IO_ALIGNMENT: usize = 4096;
 pub const MAX_INTERRUPTED_RETRIES: usize = 4;
-#[cfg(target_os = "linux")]
-const LINUX_EINTR: i32 = 4;
 #[cfg(unix)]
 const SAFE_CACHE_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
@@ -189,12 +187,7 @@ impl DataFileHandles {
         }
     }
 
-    #[cfg(test)]
-    pub fn new(buffered: File, direct: Option<File>) -> Self {
-        Self::with_direct(buffered, direct)
-    }
-
-    fn with_direct(buffered: File, direct: Option<File>) -> Self {
+    pub fn with_direct(buffered: File, direct: Option<File>) -> Self {
         let direct_active = direct.is_some();
         Self {
             buffered,
@@ -312,6 +305,7 @@ pub trait PositionedIo: Send + Sync {
             self.read_at(slice::from_raw_parts_mut(buffer, length), offset)
         }
     }
+
     fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize>;
 }
 
@@ -327,6 +321,7 @@ pub trait StorageFile: PositionedIo {
     fn preallocate(&self, len: u64) -> io::Result<()> {
         self.set_len(len)
     }
+
     fn sync(&self, point: SyncPoint, mode: SyncMode) -> io::Result<()>;
     fn try_lock_exclusive(&self) -> io::Result<()>;
     fn unlock(&self) -> io::Result<()>;
@@ -500,8 +495,8 @@ impl StorageFile for CacheFile {
             let error = loop {
                 // SAFETY: `file` owns a valid regular-file descriptor and
                 // both offsets are representable non-negative off_t values.
-                let error = unsafe { posix_fallocate(self.file.as_raw_fd(), 0, linux_len) };
-                if error != LINUX_EINTR || interrupted_retries == MAX_INTERRUPTED_RETRIES {
+                let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), 0, linux_len) };
+                if error != libc::EINTR || interrupted_retries == MAX_INTERRUPTED_RETRIES {
                     break error;
                 }
                 interrupted_retries += 1;
@@ -531,10 +526,8 @@ impl StorageFile for CacheFile {
     }
 
     fn try_lock_exclusive(&self) -> io::Result<()> {
-        const LOCK_EX: i32 = 2;
-        const LOCK_NB: i32 = 4;
         // SAFETY: `file` owns a valid descriptor for the duration of this call.
-        let result = unsafe { flock(self.file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
             Ok(())
         } else {
@@ -543,9 +536,8 @@ impl StorageFile for CacheFile {
     }
 
     fn unlock(&self) -> io::Result<()> {
-        const LOCK_UN: i32 = 8;
         // SAFETY: `file` owns a valid descriptor for the duration of this call.
-        let result = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
         if result == 0 {
             Ok(())
         } else {
@@ -847,361 +839,12 @@ pub fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io:
     }
 }
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-unsafe extern "C" {
-    fn posix_fallocate(fd: i32, offset: i64, len: i64) -> i32;
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use super::*;
-    use crate::fixtures::TestFile;
-
-    #[repr(align(4096))]
-    struct AlignedBytes([u8; 2 * DIRECT_IO_ALIGNMENT]);
-
-    #[derive(Default)]
-    struct InterruptedIo {
-        calls: AtomicUsize,
-    }
-
-    impl PositionedIo for InterruptedIo {
-        fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "interrupted read",
-            ))
-        }
-
-        fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "interrupted write",
-            ))
-        }
-    }
-
-    #[test]
-    fn exact_io_stops_after_the_interrupted_retry_budget() {
-        let mut initialized = [0_u8; 1];
-        let io = InterruptedIo::default();
-        let (result, transferred) = read_exact_at_with_progress(&io, &mut initialized, 0);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
-        assert_eq!(transferred, 0);
-        assert_eq!(
-            io.calls.load(Ordering::Relaxed),
-            MAX_INTERRUPTED_RETRIES + 1
-        );
-
-        let mut uninitialized = std::mem::MaybeUninit::<u8>::uninit();
-        let io = InterruptedIo::default();
-        let (result, transferred) =
-            read_exact_at_uninit_with_progress(&io, uninitialized.as_mut_ptr(), 1, 0);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
-        assert_eq!(transferred, 0);
-        assert_eq!(
-            io.calls.load(Ordering::Relaxed),
-            MAX_INTERRUPTED_RETRIES + 1
-        );
-
-        let io = InterruptedIo::default();
-        let (result, transferred) = write_all_at_with_progress(&io, WritePoint::Record, &[1], 0);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
-        assert_eq!(transferred, 0);
-        assert_eq!(
-            io.calls.load(Ordering::Relaxed),
-            MAX_INTERRUPTED_RETRIES + 1
-        );
-    }
-
-    #[test]
-    fn direct_alignment_requires_pointer_length_and_offset() {
-        let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
-        let pointer = bytes.0.as_ptr();
-        assert!(direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT, 0));
-        assert!(direct_io_aligned(
-            pointer,
-            2 * DIRECT_IO_ALIGNMENT,
-            DIRECT_IO_ALIGNMENT as u64
-        ));
-        assert!(!direct_io_aligned(
-            pointer.wrapping_add(1),
-            DIRECT_IO_ALIGNMENT,
-            0
-        ));
-        assert!(!direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT - 1, 0));
-        assert!(!direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT, 1));
-        assert!(!direct_io_aligned(pointer, 0, 0));
-    }
-
-    #[test]
-    fn data_handles_route_only_fully_aligned_data_to_direct() {
-        let buffered = TestFile::new("buffered-route");
-        let direct = TestFile::new("direct-route");
-        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
-        let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
-        let pointer = bytes.0.as_ptr();
-
-        assert_eq!(
-            files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
-            FileIoPath::Direct
-        );
-        assert_eq!(
-            files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, false),
-            FileIoPath::Buffered
-        );
-        assert_eq!(
-            files.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
-            FileIoPath::Buffered
-        );
-
-        let buffered_only = DataFileHandles::buffered(buffered.open());
-        assert_eq!(
-            buffered_only.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
-            FileIoPath::Buffered
-        );
-
-        let required = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
-        assert_eq!(
-            required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
-            FileIoPath::Buffered,
-            "required mode must preserve the buffered unaligned-I/O path"
-        );
-        assert_eq!(
-            required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, false),
-            FileIoPath::Buffered,
-            "metadata remains on the buffered control descriptor"
-        );
-    }
-
-    #[test]
-    fn file_io_statistics_are_shared_and_can_be_disabled() {
-        let buffered = TestFile::new("buffered-stats");
-        let direct = TestFile::new("direct-stats");
-        let files = DataFileHandles::new(buffered.open(), Some(direct.open()));
-        let cloned = files.try_clone().unwrap();
-
-        cloned.record(
-            FileIoDirection::Read,
-            FileIoPath::Direct,
-            DIRECT_IO_ALIGNMENT,
-        );
-        cloned.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
-        let stats = files.stats_handle().snapshot();
-        assert_eq!(stats.read.direct.operations, 1);
-        assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
-        assert_eq!(stats.write.buffered.operations, 1);
-        assert_eq!(stats.write.buffered.bytes, 32);
-
-        cloned.stats_handle().set_activity_counters_enabled(false);
-        files.record(
-            FileIoDirection::Read,
-            FileIoPath::Direct,
-            DIRECT_IO_ALIGNMENT,
-        );
-        files.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
-        assert_eq!(files.stats_handle().snapshot(), stats);
-    }
-
-    #[test]
-    fn data_handles_route_record_data_and_reports_bytes() {
-        let buffered = TestFile::new("posix-buffered-data");
-        let direct = TestFile::new("posix-direct-data");
-        let buffered_file = buffered.open();
-        let direct_file = direct.open();
-        buffered_file
-            .set_len(2 * DIRECT_IO_ALIGNMENT as u64)
-            .unwrap();
-        direct_file.set_len(2 * DIRECT_IO_ALIGNMENT as u64).unwrap();
-        let io = DataFileHandles::new(
-            buffered_file.try_clone().unwrap(),
-            Some(direct_file.try_clone().unwrap()),
-        );
-        let record = AlignedBytes([0x5a; 2 * DIRECT_IO_ALIGNMENT]);
-
-        assert_eq!(
-            io.write_at(WritePoint::Record, &record.0[..DIRECT_IO_ALIGNMENT], 0,)
-                .unwrap(),
-            DIRECT_IO_ALIGNMENT
-        );
-        assert_eq!(
-            io.write_at(
-                WritePoint::DataSuperblock,
-                &record.0[..DIRECT_IO_ALIGNMENT],
-                DIRECT_IO_ALIGNMENT as u64,
-            )
-            .unwrap(),
-            DIRECT_IO_ALIGNMENT
-        );
-
-        let mut observed = vec![0_u8; DIRECT_IO_ALIGNMENT];
-        direct_file.read_at(&mut observed, 0).unwrap();
-        assert!(observed.iter().all(|byte| *byte == 0x5a));
-        observed.fill(0);
-        buffered_file
-            .read_at(&mut observed, DIRECT_IO_ALIGNMENT as u64)
-            .unwrap();
-        assert!(observed.iter().all(|byte| *byte == 0x5a));
-
-        assert_eq!(io.read_at(&mut [], 0).unwrap(), 0);
-        assert_eq!(io.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
-
-        assert_eq!(
-            io.stats_handle().snapshot(),
-            FileIoStats {
-                direct_active: true,
-                write: FileIoDirectionStats {
-                    buffered: CacheIoPathSnapshot {
-                        operations: 1,
-                        bytes: DIRECT_IO_ALIGNMENT as u64,
-                    },
-                    direct: CacheIoPathSnapshot {
-                        operations: 1,
-                        bytes: DIRECT_IO_ALIGNMENT as u64,
-                    },
-                },
-                ..FileIoStats::default()
-            }
-        );
-    }
-
-    #[cfg(any(
-        target_os = "macos",
-        all(target_os = "linux", target_pointer_width = "64")
-    ))]
-    #[test]
-    fn preallocate_sets_the_exact_file_extent() {
-        let file = TestFile::new("preallocate");
-        let io = CacheFile::open(file.path()).unwrap();
-        let len = 2 * DIRECT_IO_ALIGNMENT as u64;
-        io.preallocate(len).unwrap();
-        assert_eq!(io.len().unwrap(), len);
-        #[cfg(target_os = "macos")]
-        assert!(io.file.metadata().unwrap().blocks() * 512 >= len);
-    }
-
-    #[cfg(not(any(
-        target_os = "macos",
-        all(target_os = "linux", target_pointer_width = "64")
-    )))]
-    #[test]
-    fn unsupported_physical_preallocation_fails_closed() {
-        let file = TestFile::new("preallocate-unsupported");
-        let io = CacheFile::open(file.path()).unwrap();
-        let error = io.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(io.len().unwrap(), 0);
-    }
-
-    #[test]
-    fn storage_file_clones_exact_file_and_detects_aliases() {
-        let primary = TestFile::new("control-primary");
-        let alias = TestFile::new("control-alias");
-        let other = TestFile::new("control-other");
-        drop(primary.open());
-        std::fs::hard_link(primary.path(), alias.path()).unwrap();
-
-        let primary = CacheFile::open(primary.path()).unwrap();
-        let alias = CacheFile::open(alias.path()).unwrap();
-        let other = CacheFile::open(other.path()).unwrap();
-        let cloned = StorageFile::try_clone_mapping_file(&primary).unwrap();
-
-        primary
-            .write_at(WritePoint::RecoveryImageHeader, b"image-ok", 0)
-            .unwrap();
-        let mut observed = [0_u8; 8];
-        cloned.read_at(&mut observed, 0).unwrap();
-        assert_eq!(&observed, b"image-ok");
-        assert!(StorageFile::is_same_file(&primary, &alias).unwrap());
-        assert!(!StorageFile::is_same_file(&primary, &other).unwrap());
-    }
-
-    #[test]
-    fn recovery_temp_creation_never_reopens_an_existing_target() {
-        let image = TestFile::new("recovery-create-new");
-        let io = CacheFile::create_new_buffered(image.path()).unwrap();
-        io.write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
-            .unwrap();
-
-        let error = CacheFile::create_new_buffered(image.path())
-            .err()
-            .expect("create_new must reject an existing recovery target");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn one_fault_handle_controls_multiple_recovery_files() {
-        use crate::io::file::testing::FaultAction;
-        use crate::io::file::testing::FaultEvent;
-        use crate::io::file::testing::FaultFile;
-        use crate::io::file::testing::FaultHandle;
-
-        let state = TestFile::new("shared-fault-state");
-        let image = TestFile::new("shared-fault-image");
-        let temp = TestFile::new("shared-fault-temp");
-        let faults = FaultHandle::default();
-        let state = FaultFile::open_with_handle(state.path(), faults.clone()).unwrap();
-        let image = FaultFile::open_with_handle(image.path(), faults.clone()).unwrap();
-        let temp = FaultFile::create_new_buffered_with_handle(temp.path(), faults.clone()).unwrap();
-
-        faults.arm(
-            FaultEvent::Write(WritePoint::State),
-            2,
-            FaultAction::Error(5),
-        );
-        assert_eq!(state.write_at(WritePoint::State, b"running", 0).unwrap(), 7);
-        assert_eq!(
-            image
-                .write_at(WritePoint::State, b"clean", 0)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(5)
-        );
-
-        for (point, offset) in [
-            (WritePoint::RecoveryImageIndex, 0),
-            (WritePoint::RecoveryImageMetadata, 8),
-        ] {
-            temp.write_at(point, b"12345678", offset).unwrap();
-        }
-        for point in [
-            SyncPoint::StateReset,
-            SyncPoint::RunningState,
-            SyncPoint::WarmData,
-            SyncPoint::RecoveryImage,
-            SyncPoint::CleanState,
-        ] {
-            temp.sync(point, SyncMode::Data).unwrap();
-        }
-    }
-
-    #[test]
-    fn cache_open_rejects_symbolic_links() {
-        use std::os::unix::fs::symlink;
-
-        let target = TestFile::new("symlink-target");
-        let link = TestFile::new("symlink-link");
-        drop(target.open());
-        symlink(target.path(), link.path()).unwrap();
-
-        assert!(CacheFile::open(link.path()).is_err());
-    }
-}
-
 #[cfg(test)]
 pub mod testing {
+    use std::process;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::thread;
 
     use super::*;
 
@@ -1439,20 +1082,354 @@ pub mod testing {
 
     #[cfg(unix)]
     pub fn kill_process() -> ! {
-        const SIGKILL: i32 = 9;
         // SAFETY: both functions have no pointer arguments; SIGKILL cannot
         // run user code in the target process.
-        if unsafe { kill(getpid(), SIGKILL) } == 0 {
+        if unsafe { libc::kill(libc::getpid(), libc::SIGKILL) } == 0 {
             loop {
-                std::thread::park();
+                thread::park();
             }
         }
-        std::process::abort()
+        process::abort()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::mem::MaybeUninit;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::fixtures::TestFile;
+    use crate::io::file::testing::FaultAction;
+    use crate::io::file::testing::FaultEvent;
+    use crate::io::file::testing::FaultFile;
+    use crate::io::file::testing::FaultHandle;
+
+    #[repr(align(4096))]
+    struct AlignedBytes([u8; 2 * DIRECT_IO_ALIGNMENT]);
+
+    #[derive(Default)]
+    struct InterruptedIo {
+        calls: AtomicUsize,
     }
 
-    #[cfg(unix)]
-    unsafe extern "C" {
-        fn getpid() -> i32;
-        fn kill(pid: i32, signal: i32) -> i32;
+    impl PositionedIo for InterruptedIo {
+        fn read_at(&self, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted read",
+            ))
+        }
+
+        fn write_at(&self, _point: WritePoint, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted write",
+            ))
+        }
+    }
+
+    #[test]
+    fn exact_io_stops_after_the_interrupted_retry_budget() {
+        let mut initialized = [0_u8; 1];
+        let io = InterruptedIo::default();
+        let (result, transferred) = read_exact_at_with_progress(&io, &mut initialized, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            io.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+
+        let mut uninitialized = MaybeUninit::<u8>::uninit();
+        let io = InterruptedIo::default();
+        let (result, transferred) =
+            read_exact_at_uninit_with_progress(&io, uninitialized.as_mut_ptr(), 1, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            io.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+
+        let io = InterruptedIo::default();
+        let (result, transferred) = write_all_at_with_progress(&io, WritePoint::Record, &[1], 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(transferred, 0);
+        assert_eq!(
+            io.calls.load(Ordering::Relaxed),
+            MAX_INTERRUPTED_RETRIES + 1
+        );
+    }
+
+    #[test]
+    fn direct_alignment_requires_pointer_length_and_offset() {
+        let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
+        let pointer = bytes.0.as_ptr();
+        assert!(direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT, 0));
+        assert!(direct_io_aligned(
+            pointer,
+            2 * DIRECT_IO_ALIGNMENT,
+            DIRECT_IO_ALIGNMENT as u64
+        ));
+        assert!(!direct_io_aligned(
+            pointer.wrapping_add(1),
+            DIRECT_IO_ALIGNMENT,
+            0
+        ));
+        assert!(!direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT - 1, 0));
+        assert!(!direct_io_aligned(pointer, DIRECT_IO_ALIGNMENT, 1));
+        assert!(!direct_io_aligned(pointer, 0, 0));
+    }
+
+    #[test]
+    fn data_handles_route_only_fully_aligned_data_to_direct() {
+        let buffered = TestFile::new("buffered-route");
+        let direct = TestFile::new("direct-route");
+        let files = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        let bytes = AlignedBytes([0; 2 * DIRECT_IO_ALIGNMENT]);
+        let pointer = bytes.0.as_ptr();
+
+        assert_eq!(
+            files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
+            FileIoPath::Direct
+        );
+        assert_eq!(
+            files.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, false),
+            FileIoPath::Buffered
+        );
+        assert_eq!(
+            files.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
+            FileIoPath::Buffered
+        );
+
+        let buffered_only = DataFileHandles::buffered(buffered.open());
+        assert_eq!(
+            buffered_only.select_path(pointer, DIRECT_IO_ALIGNMENT, 0, true),
+            FileIoPath::Buffered
+        );
+
+        let required = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        assert_eq!(
+            required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, true),
+            FileIoPath::Buffered,
+            "required mode must preserve the buffered unaligned-I/O path"
+        );
+        assert_eq!(
+            required.select_path(pointer, DIRECT_IO_ALIGNMENT - 1, 0, false),
+            FileIoPath::Buffered,
+            "metadata remains on the buffered control descriptor"
+        );
+    }
+
+    #[test]
+    fn file_io_statistics_are_shared_and_can_be_disabled() {
+        let buffered = TestFile::new("buffered-stats");
+        let direct = TestFile::new("direct-stats");
+        let files = DataFileHandles::with_direct(buffered.open(), Some(direct.open()));
+        let cloned = files.try_clone().unwrap();
+
+        cloned.record(
+            FileIoDirection::Read,
+            FileIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        cloned.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
+        let stats = files.stats_handle().snapshot();
+        assert_eq!(stats.read.direct.operations, 1);
+        assert_eq!(stats.read.direct.bytes, DIRECT_IO_ALIGNMENT as u64);
+        assert_eq!(stats.write.buffered.operations, 1);
+        assert_eq!(stats.write.buffered.bytes, 32);
+
+        cloned.stats_handle().set_activity_counters_enabled(false);
+        files.record(
+            FileIoDirection::Read,
+            FileIoPath::Direct,
+            DIRECT_IO_ALIGNMENT,
+        );
+        files.record(FileIoDirection::Write, FileIoPath::Buffered, 32);
+        assert_eq!(files.stats_handle().snapshot(), stats);
+    }
+
+    #[test]
+    fn data_handles_route_record_data_and_reports_bytes() {
+        let buffered = TestFile::new("posix-buffered-data");
+        let direct = TestFile::new("posix-direct-data");
+        let buffered_file = buffered.open();
+        let direct_file = direct.open();
+        buffered_file
+            .set_len(2 * DIRECT_IO_ALIGNMENT as u64)
+            .unwrap();
+        direct_file.set_len(2 * DIRECT_IO_ALIGNMENT as u64).unwrap();
+        let io = DataFileHandles::with_direct(
+            buffered_file.try_clone().unwrap(),
+            Some(direct_file.try_clone().unwrap()),
+        );
+        let record = AlignedBytes([0x5a; 2 * DIRECT_IO_ALIGNMENT]);
+
+        assert_eq!(
+            io.write_at(WritePoint::Record, &record.0[..DIRECT_IO_ALIGNMENT], 0,)
+                .unwrap(),
+            DIRECT_IO_ALIGNMENT
+        );
+        assert_eq!(
+            io.write_at(
+                WritePoint::DataSuperblock,
+                &record.0[..DIRECT_IO_ALIGNMENT],
+                DIRECT_IO_ALIGNMENT as u64,
+            )
+            .unwrap(),
+            DIRECT_IO_ALIGNMENT
+        );
+
+        let mut observed = vec![0_u8; DIRECT_IO_ALIGNMENT];
+        direct_file.read_at(&mut observed, 0).unwrap();
+        assert!(observed.iter().all(|byte| *byte == 0x5a));
+        observed.fill(0);
+        buffered_file
+            .read_at(&mut observed, DIRECT_IO_ALIGNMENT as u64)
+            .unwrap();
+        assert!(observed.iter().all(|byte| *byte == 0x5a));
+
+        assert_eq!(io.read_at(&mut [], 0).unwrap(), 0);
+        assert_eq!(io.write_at(WritePoint::Record, &[], 0).unwrap(), 0);
+
+        assert_eq!(
+            io.stats_handle().snapshot(),
+            FileIoStats {
+                direct_active: true,
+                write: FileIoDirectionStats {
+                    buffered: CacheIoPathSnapshot {
+                        operations: 1,
+                        bytes: DIRECT_IO_ALIGNMENT as u64,
+                    },
+                    direct: CacheIoPathSnapshot {
+                        operations: 1,
+                        bytes: DIRECT_IO_ALIGNMENT as u64,
+                    },
+                },
+                ..FileIoStats::default()
+            }
+        );
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn preallocate_sets_the_exact_file_extent() {
+        let file = TestFile::new("preallocate");
+        let io = CacheFile::open(file.path()).unwrap();
+        let len = 2 * DIRECT_IO_ALIGNMENT as u64;
+        io.preallocate(len).unwrap();
+        assert_eq!(io.len().unwrap(), len);
+        #[cfg(target_os = "macos")]
+        assert!(io.file.metadata().unwrap().blocks() * 512 >= len);
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    )))]
+    #[test]
+    fn unsupported_physical_preallocation_fails_closed() {
+        let file = TestFile::new("preallocate-unsupported");
+        let io = CacheFile::open(file.path()).unwrap();
+        let error = io.preallocate(DIRECT_IO_ALIGNMENT as u64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(io.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn storage_file_clones_exact_file_and_detects_aliases() {
+        let primary = TestFile::new("control-primary");
+        let alias = TestFile::new("control-alias");
+        let other = TestFile::new("control-other");
+        drop(primary.open());
+        fs::hard_link(primary.path(), alias.path()).unwrap();
+
+        let primary = CacheFile::open(primary.path()).unwrap();
+        let alias = CacheFile::open(alias.path()).unwrap();
+        let other = CacheFile::open(other.path()).unwrap();
+        let cloned = StorageFile::try_clone_mapping_file(&primary).unwrap();
+
+        primary
+            .write_at(WritePoint::RecoveryImageHeader, b"image-ok", 0)
+            .unwrap();
+        let mut observed = [0_u8; 8];
+        cloned.read_at(&mut observed, 0).unwrap();
+        assert_eq!(&observed, b"image-ok");
+        assert!(StorageFile::is_same_file(&primary, &alias).unwrap());
+        assert!(!StorageFile::is_same_file(&primary, &other).unwrap());
+    }
+
+    #[test]
+    fn recovery_temp_creation_never_reopens_an_existing_target() {
+        let image = TestFile::new("recovery-create-new");
+        let io = CacheFile::create_new_buffered(image.path()).unwrap();
+        io.write_at(WritePoint::RecoveryImageMetadata, b"metadata", 0)
+            .unwrap();
+
+        let error = CacheFile::create_new_buffered(image.path())
+            .err()
+            .expect("create_new must reject an existing recovery target");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn one_fault_handle_controls_multiple_recovery_files() {
+        let state = TestFile::new("shared-fault-state");
+        let image = TestFile::new("shared-fault-image");
+        let temp = TestFile::new("shared-fault-temp");
+        let faults = FaultHandle::default();
+        let state = FaultFile::open_with_handle(state.path(), faults.clone()).unwrap();
+        let image = FaultFile::open_with_handle(image.path(), faults.clone()).unwrap();
+        let temp = FaultFile::create_new_buffered_with_handle(temp.path(), faults.clone()).unwrap();
+
+        faults.arm(
+            FaultEvent::Write(WritePoint::State),
+            2,
+            FaultAction::Error(5),
+        );
+        assert_eq!(state.write_at(WritePoint::State, b"running", 0).unwrap(), 7);
+        assert_eq!(
+            image
+                .write_at(WritePoint::State, b"clean", 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(5)
+        );
+
+        for (point, offset) in [
+            (WritePoint::RecoveryImageIndex, 0),
+            (WritePoint::RecoveryImageMetadata, 8),
+        ] {
+            temp.write_at(point, b"12345678", offset).unwrap();
+        }
+        for point in [
+            SyncPoint::StateReset,
+            SyncPoint::RunningState,
+            SyncPoint::WarmData,
+            SyncPoint::RecoveryImage,
+            SyncPoint::CleanState,
+        ] {
+            temp.sync(point, SyncMode::Data).unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_open_rejects_symbolic_links() {
+        let target = TestFile::new("symlink-target");
+        let link = TestFile::new("symlink-link");
+        drop(target.open());
+        symlink(target.path(), link.path()).unwrap();
+
+        assert!(CacheFile::open(link.path()).is_err());
     }
 }

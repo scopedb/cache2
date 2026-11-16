@@ -16,6 +16,7 @@
 //!
 //! Region manager receipts are the only span authority.
 
+use std::error;
 use std::fmt;
 use std::mem;
 use std::sync::Mutex;
@@ -69,6 +70,8 @@ pub struct StagedRecord {
     seqno: u64,
     previous_location: u64,
 }
+
+const _: () = assert!(size_of::<StagedRecord>() == 32);
 
 impl StagedRecord {
     pub const fn new(hash: u64, entry: IndexEntry, seqno: u64) -> Self {
@@ -152,6 +155,8 @@ impl fmt::Display for StagingError {
         }
     }
 }
+
+impl error::Error for StagingError {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum StagingEncodeError<E> {
@@ -491,11 +496,9 @@ impl AppendStaging {
             .as_mut()
             .expect("encoding guard owns its buffer")
             .prepared_mut(end)
-            .map_err(|()| {
-                StagingEncodeError::Staging(StagingError::Invariant(
-                    "staging fill buffer is undersized",
-                ))
-            })?;
+            .ok_or(StagingEncodeError::Staging(StagingError::Invariant(
+                "staging fill buffer is undersized",
+            )))?;
         let record = encode(&mut encoded[start..end]).map_err(StagingEncodeError::Encode)?;
         self.validate_record(receipt, record)
             .map_err(StagingEncodeError::Staging)?;
@@ -622,7 +625,7 @@ impl AppendStaging {
                 .ok_or(StagingError::Invariant("staging fill lost its buffer"))?;
             let bytes = buffer
                 .prepared_mut(padded_used)
-                .map_err(|()| StagingError::Invariant("staging buffer is undersized"))?;
+                .ok_or(StagingError::Invariant("staging buffer is undersized"))?;
             let padded_location =
                 PackedLocation::new(receipt.region_id, location.offset(), new_record_len)
                     .map_err(|_| StagingError::Invariant("padded location is invalid"))?;
@@ -902,6 +905,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -976,7 +980,6 @@ mod tests {
 
     #[test]
     fn seal_moves_the_aligned_fill_lease_and_keeps_filling_the_second_buffer() {
-        assert_eq!(size_of::<StagedRecord>(), 32);
         let managed_memory = managed_memory(4 * 1024 * 1024);
         let staging = AppendStaging::try_new(1, 4096, 64 * 1024, &managed_memory).unwrap();
         assert_eq!(staging.chunk_bytes(), 4096);
@@ -1111,7 +1114,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let encoder_staging = Arc::clone(&staging);
-        let encoder = std::thread::spawn(move || {
+        let encoder = thread::spawn(move || {
             encoder_staging.encode_reserved(receipt, |target| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

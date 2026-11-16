@@ -1413,10 +1413,6 @@ mod tests {
         metadata
     }
 
-    fn request_rotation(manager: &mut RegionManager, shard_id: usize) {
-        manager.request_rotation_for_test(shard_id).unwrap();
-    }
-
     #[test]
     fn restores_non_id_queue_and_shard_order() {
         let manager = RegionManager::from_metadata(sample()).unwrap();
@@ -1762,7 +1758,7 @@ mod tests {
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
 
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         let candidate = manager.rotation_candidate(0).unwrap();
         assert_eq!(
             candidate,
@@ -1816,7 +1812,7 @@ mod tests {
         let metadata = sample_without_free_regions();
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
             manager.rotation_candidate(0),
             Err(RegionMutationError::WouldBlock)
@@ -1900,7 +1896,7 @@ mod tests {
     #[test]
     fn reclaim_preserves_hot_records_while_one_free_region_remains() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         let rotation = manager
             .begin_rotation(manager.rotation_candidate(0).unwrap())
             .unwrap();
@@ -1927,10 +1923,10 @@ mod tests {
     #[test]
     fn stale_rotation_candidate_does_not_consume_the_next_victim_or_seqno() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         let stale = manager.rotation_candidate(0).unwrap();
 
-        request_rotation(&mut manager, 1);
+        manager.request_rotation_for_test(1).unwrap();
         let other_candidate = manager.rotation_candidate(1).unwrap();
         let other_rotation = manager.begin_rotation(other_candidate).unwrap();
         manager.finish_rotation(other_rotation).unwrap();
@@ -1959,7 +1955,7 @@ mod tests {
 
         // Region 4 is Sealed, so it cannot be selected from the Free FIFO.
         manager.free_regions[0] = 4;
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
             manager.rotation_candidate(0),
             Err(RegionMutationError::Invariant(
@@ -1978,7 +1974,7 @@ mod tests {
         manager.stage_reservation(reservation).unwrap();
         let padding = manager.reserve_write_padding(0).unwrap().unwrap();
         let span = manager.seal_write_span_with_padding(padding).unwrap();
-        request_rotation(&mut manager, 0);
+        manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
             manager.rotation_candidate(0),
             Err(RegionMutationError::WouldBlock)

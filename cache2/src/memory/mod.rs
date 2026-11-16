@@ -22,8 +22,6 @@ use std::hint::spin_loop;
 use std::io;
 use std::ops::Deref;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::TryLockError;
@@ -31,20 +29,17 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use self::eviction::DetachedPolicy;
-use self::eviction::EvictionState;
-use self::eviction::MAX_POLICY_SCAN_STEPS;
-use self::eviction::MAX_POLICY_SLOT_INDEX;
-use self::eviction::PolicySlot;
 use crate::config::runtime::L1EvictionPolicy;
 use crate::hashing::FixedPrehashedMap;
 use crate::hashing::route_hash;
+use crate::memory::eviction::DetachedPolicy;
+use crate::memory::eviction::EvictionState;
+use crate::memory::eviction::MAX_POLICY_SCAN_STEPS;
+use crate::memory::eviction::MAX_POLICY_SLOT_INDEX;
+use crate::memory::eviction::PolicySlot;
 use crate::snapshot::CacheL1Snapshot;
 
 mod eviction;
-
-#[cfg(test)]
-mod reuse_tests;
 
 /// Charged retained-value ownership. Fixed entry, policy, and directory
 /// storage is planned and allocated separately during open.
@@ -287,6 +282,9 @@ struct MemoryEntry {
     hash_next: u32,
 }
 
+const _: () = assert!(size_of::<MemoryEntry>() == 2 * size_of::<usize>());
+const _: () = assert!(size_of::<Option<MemoryEntry>>() == 2 * size_of::<usize>());
+
 #[derive(Clone, Copy)]
 struct DetachedAdmissionEntry {
     index: usize,
@@ -392,26 +390,8 @@ impl MemoryShard {
         })
     }
 
-    fn directory_head(&self, hash: u64) -> Option<u32> {
-        self.directory.get(hash)
-    }
-
-    fn directory_can_upsert(&self, hash: u64) -> bool {
-        self.directory.can_upsert(hash)
-    }
-
-    fn directory_upsert(&mut self, hash: u64, head: u32) -> Option<u32> {
-        self.directory
-            .insert(hash, head)
-            .expect("preflighted fixed L1 directory insertion")
-    }
-
-    fn directory_remove(&mut self, hash: u64) -> Option<u32> {
-        self.directory.remove(hash)
-    }
-
     fn find(&self, hash: u64, key: &[u8]) -> Option<usize> {
-        let mut cursor = self.directory_head(hash)?;
+        let mut cursor = self.directory.get(hash)?;
         for _ in 0..MAX_SAME_HASH_ENTRIES {
             let index = usize::try_from(cursor).ok()?;
             let entry = self.slots.get(index).and_then(Option::as_ref)?;
@@ -429,7 +409,7 @@ impl MemoryShard {
     }
 
     fn hash_chain_is_full(&self, hash: u64) -> bool {
-        let Some(mut cursor) = self.directory_head(hash) else {
+        let Some(mut cursor) = self.directory.get(hash) else {
             return false;
         };
         for depth in 0..MAX_SAME_HASH_ENTRIES {
@@ -464,7 +444,7 @@ impl MemoryShard {
         hash: u64,
         transfer_charge: bool,
     ) -> Option<MemoryValue> {
-        let mut cursor = self.directory_head(hash)?;
+        let mut cursor = self.directory.get(hash)?;
         let mut predecessor = None;
         let mut found = false;
         for _ in 0..MAX_SAME_HASH_ENTRIES {
@@ -499,10 +479,13 @@ impl MemoryShard {
                 .expect("hash-chain predecessor disappeared")
                 .hash_next = entry_next;
         } else if entry_next == NO_SLOT_INDEX {
-            let removed = self.directory_remove(hash);
+            let removed = self.directory.remove(hash);
             debug_assert_eq!(removed, u32::try_from(index).ok());
         } else {
-            let replaced = self.directory_upsert(hash, entry_next);
+            let replaced = self
+                .directory
+                .insert(hash, entry_next)
+                .expect("preflighted fixed L1 directory insertion");
             debug_assert!(replaced.is_some());
         }
 
@@ -591,7 +574,7 @@ impl MemoryShard {
         replacement: Option<usize>,
     ) -> ChargeResult {
         if required > self.budget.capacity_bytes {
-            return ChargeResult::Rejected { evictions: 0 };
+            return ChargeResult::Rejected;
         }
         let needs_slot = replacement.is_none() && self.free_head == NO_SLOT_INDEX;
         match self.budget.try_charge(required) {
@@ -607,7 +590,7 @@ impl MemoryShard {
                 };
             }
             MemoryChargeAttempt::Contended => {
-                return ChargeResult::Rejected { evictions: 0 };
+                return ChargeResult::Rejected;
             }
             MemoryChargeAttempt::Full => {}
         }
@@ -645,14 +628,14 @@ impl MemoryShard {
         let required_release = required.saturating_sub(self.budget.available_bytes());
         if released < required_release {
             self.restore_admission(replacement, &victims);
-            return ChargeResult::Rejected { evictions: 0 };
+            return ChargeResult::Rejected;
         }
 
         let charge = match self.budget.try_transfer_charge(released, required) {
             MemoryChargeAttempt::Charged(charge) => charge,
             MemoryChargeAttempt::Full | MemoryChargeAttempt::Contended => {
                 self.restore_admission(replacement, &victims);
-                return ChargeResult::Rejected { evictions: 0 };
+                return ChargeResult::Rejected;
             }
         };
 
@@ -679,7 +662,7 @@ impl MemoryShard {
                 .select_victim(&mut self.policy_slots, &mut remaining_steps, |_| true)
         };
         let Some(candidate) = candidate else {
-            return ChargeResult::Rejected { evictions: 0 };
+            return ChargeResult::Rejected;
         };
         let mut victim = self.detach_for_admission(candidate);
         // The candidate was charged independently because byte capacity was
@@ -703,7 +686,7 @@ impl MemoryShard {
         replacement: Option<usize>,
     ) -> MemoryInsertResult {
         if (replacement.is_none() && self.hash_chain_is_full(hash))
-            || !self.directory_can_upsert(hash)
+            || !self.directory.can_upsert(hash)
         {
             return MemoryInsertResult::bypassed();
         }
@@ -715,8 +698,8 @@ impl MemoryShard {
                     evictions,
                     recycled,
                 } => (charge, evictions, recycled),
-                ChargeResult::Rejected { evictions } => {
-                    return MemoryInsertResult::rejected(evictions);
+                ChargeResult::Rejected => {
+                    return MemoryInsertResult::bypassed();
                 }
             };
         let packed_index = self.free_head;
@@ -729,7 +712,10 @@ impl MemoryShard {
         let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge, recycled) else {
             return MemoryInsertResult::rejected(evictions);
         };
-        let previous_head = self.directory_upsert(hash, packed_index);
+        let previous_head = self
+            .directory
+            .insert(hash, packed_index)
+            .expect("preflighted fixed L1 directory insertion");
         let entry = MemoryEntry {
             value: memory_value,
             hash_next: previous_head.unwrap_or(NO_SLOT_INDEX),
@@ -754,9 +740,7 @@ enum ChargeResult {
         evictions: usize,
         recycled: Option<MemoryValue>,
     },
-    Rejected {
-        evictions: usize,
-    },
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -846,8 +830,7 @@ impl MemoryStore {
         activity_counters_enabled: bool,
     ) -> io::Result<Self> {
         if shard_count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(invalid_memory_layout(
                 "memory tier requires at least one shard",
             ));
         }
@@ -862,13 +845,11 @@ impl MemoryStore {
         })?;
         let mut actual_entry_capacity = 0_usize;
         for shard_id in 0..shard_count {
-            let shard_capacity = shard_share(capacity_bytes, shard_count, shard_id);
-            let shard_entries = shard_share(entry_capacity, shard_count, shard_id)
-                .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
-                .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+            let (shard_capacity, shard_entries) =
+                shard_geometry(capacity_bytes, entry_capacity, shard_count, shard_id);
             actual_entry_capacity = actual_entry_capacity
                 .checked_add(shard_entries)
-                .ok_or_else(|| invalid_memory_plan("L1 entry capacity overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 entry capacity overflow"))?;
             shards.push(MemoryShardLock(Mutex::new(MemoryShard::new(
                 shard_capacity,
                 shard_entries,
@@ -894,16 +875,14 @@ impl MemoryStore {
         eviction_policy: L1EvictionPolicy,
     ) -> io::Result<usize> {
         if shard_count == 0 {
-            return Err(invalid_memory_plan(
+            return Err(invalid_memory_layout(
                 "memory tier requires at least one shard",
             ));
         }
         let mut total = 0_usize;
         for shard_id in 0..shard_count {
-            let shard_capacity = shard_share(capacity_bytes, shard_count, shard_id);
-            let shard_entries = shard_share(entry_capacity, shard_count, shard_id)
-                .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
-                .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+            let (_, shard_entries) =
+                shard_geometry(capacity_bytes, entry_capacity, shard_count, shard_id);
             let fixed_slots = shard_entries
                 .checked_mul(size_of::<Option<MemoryEntry>>())
                 .and_then(|bytes| {
@@ -911,14 +890,14 @@ impl MemoryStore {
                         .checked_mul(size_of::<PolicySlot>())
                         .and_then(|policy| bytes.checked_add(policy))
                 })
-                .ok_or_else(|| invalid_memory_plan("L1 slot memory plan overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 slot memory layout overflow"))?;
             let directory = FixedPrehashedMap::allocation_bytes(shard_entries)?;
             let eviction = EvictionState::allocation_bytes(eviction_policy, shard_entries)?;
             total = total
                 .checked_add(fixed_slots)
                 .and_then(|bytes| bytes.checked_add(directory))
                 .and_then(|bytes| bytes.checked_add(eviction))
-                .ok_or_else(|| invalid_memory_plan("L1 metadata memory plan overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 metadata memory layout overflow"))?;
         }
         Ok(total)
     }
@@ -1083,13 +1062,13 @@ impl MemoryStore {
                 .map_err(|_| io::Error::other("L1 shard is poisoned"))?;
             resident_entries = resident_entries
                 .checked_add(shard.slots.len().saturating_sub(shard.free_count))
-                .ok_or_else(|| invalid_memory_plan("L1 resident entry count overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 resident entry count overflow"))?;
             resident_bytes = resident_bytes
                 .checked_add(shard.resident_bytes)
-                .ok_or_else(|| invalid_memory_plan("L1 resident byte count overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 resident byte count overflow"))?;
             charged_bytes = charged_bytes
                 .checked_add(shard.budget.used_bytes())
-                .ok_or_else(|| invalid_memory_plan("L1 charged byte count overflow"))?;
+                .ok_or_else(|| invalid_memory_layout("L1 charged byte count overflow"))?;
         }
         Ok(CacheL1Snapshot {
             entry_capacity: self.entry_capacity,
@@ -1130,16 +1109,35 @@ fn memory_entry_bytes(key: &[u8], value: &[u8]) -> Option<usize> {
         .and_then(|bytes| bytes.checked_add(value.len()))
 }
 
+fn shard_geometry(
+    capacity_bytes: usize,
+    entry_capacity: usize,
+    shard_count: usize,
+    shard_id: usize,
+) -> (usize, usize) {
+    let shard_capacity = shard_share(capacity_bytes, shard_count, shard_id);
+    let shard_entries = shard_share(entry_capacity, shard_count, shard_id)
+        .min(shard_capacity / MEMORY_ENTRY_OVERHEAD_BYTES)
+        .min(MAX_POLICY_SLOT_INDEX.saturating_add(1));
+    (shard_capacity, shard_entries)
+}
+
 fn shard_share(total: usize, shard_count: usize, shard_id: usize) -> usize {
     total / shard_count + usize::from(shard_id < total % shard_count)
 }
 
-fn invalid_memory_plan(message: &'static str) -> io::Error {
+fn invalid_memory_layout(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]
+mod reuse_tests;
+
+#[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
 
     fn store(capacity_bytes: usize, shard_count: usize) -> MemoryStore {
@@ -1167,13 +1165,6 @@ mod tests {
 
     fn assert_miss(store: &MemoryStore, hash: u64, key: &[u8]) {
         assert!(matches!(store.lookup(hash, key), MemoryLookup::Miss(_)));
-    }
-
-    #[test]
-    fn memory_entry_slot_uses_two_machine_words() {
-        let expected = 2 * size_of::<usize>();
-        assert_eq!(size_of::<MemoryEntry>(), expected);
-        assert_eq!(size_of::<Option<MemoryEntry>>(), expected);
     }
 
     #[test]
@@ -1576,7 +1567,7 @@ mod tests {
 
         assert!(!store.publish(22, b"b", &[2; 300], 2));
         let barrier = Arc::new(Barrier::new(clones.len() + 1));
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             for value in clones {
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {

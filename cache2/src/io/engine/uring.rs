@@ -25,11 +25,10 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::thread;
 
 use hashcrew::xxhash::Xxh3_64Builder;
 use io_uring::IoUring;
@@ -39,26 +38,16 @@ use io_uring::squeue;
 use io_uring::types;
 
 use crate::config::runtime::IoUringEngineConfig;
-#[cfg(test)]
-use crate::io::engine::CompletionState;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::DriverCommand;
 use crate::io::engine::DriverWake;
 use crate::io::engine::EngineState;
-#[cfg(test)]
-use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
-#[cfg(test)]
-use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-#[cfg(test)]
-use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::OperationKind;
 use crate::io::engine::RequestId;
 use crate::io::engine::SubmitState;
 use crate::io::engine::Task;
-#[cfg(test)]
-use crate::io::engine::io_uring_extra_memory_bytes;
 use crate::io::file::DataFileHandles;
 use crate::io::file::FileIoPath;
 use crate::io::file::retry_interrupted;
@@ -68,9 +57,6 @@ const CANCEL_CQE_BIT: u64 = 1_u64 << 63;
 const INTERNAL_CQE_BIT: u64 = 1_u64 << 62;
 const WAKE_REQUEST_ID: u64 = INTERNAL_CQE_BIT | 1;
 const WAKE_CANCEL_ID: u64 = CANCEL_CQE_BIT | WAKE_REQUEST_ID;
-const LINUX_EINTR: i32 = 4;
-const LINUX_ECANCELED: i32 = 125;
-const LINUX_POLLIN: u32 = 0x0001;
 const FATAL_DRAIN_ROUNDS: usize = 64;
 const MAX_WAKE_ATTEMPTS: usize = 4;
 const MAX_COMMANDS_PER_DRAIN: usize = 64;
@@ -182,7 +168,7 @@ pub fn start(
     engine.wake = Some(wake);
     let worker_state = Arc::clone(&engine.state);
     let worker_submit_state = Arc::clone(&engine.submit_state);
-    let worker = std::thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("cache2-uring-io".into())
         .stack_size(CACHE_THREAD_STACK_BYTES)
         .spawn(move || {
@@ -303,7 +289,9 @@ impl UringDriver {
 
             if self.shutting_down && self.flights.is_empty() {
                 if self.wake_active && !self.wake_cancel_submitted {
-                    self.push_entries(&[PendingEntry::WakeCancel])?;
+                    self.pending_entries.clear();
+                    self.pending_entries.push(PendingEntry::WakeCancel);
+                    self.push_pending_entries()?;
                     self.wake_cancel_submitted = true;
                 }
                 if !self.wake_active && (!self.wake_cancel_submitted || self.wake_cancel_completed)
@@ -462,16 +450,23 @@ impl UringDriver {
             let entry = self.build_submission_entry(pending)?;
             self.submission_entries.push(entry);
         }
-        self.push_submission_entries()
-    }
-
-    fn push_entries(&mut self, pending: &[PendingEntry]) -> io::Result<()> {
-        self.submission_entries.clear();
-        for pending_entry in pending {
-            let entry = self.build_submission_entry(*pending_entry)?;
-            self.submission_entries.push(entry);
+        let UringDriver {
+            ring,
+            submission_entries,
+            ..
+        } = self;
+        let mut sq = ring
+            .as_mut()
+            .expect("ring exists while driver runs")
+            .submission();
+        // SAFETY: every file descriptor and data buffer is owned by this
+        // driver. Target buffers remain in `flights` until their target
+        // CQE; the wake entry is a pointer-free poll operation.
+        unsafe {
+            sq.push_multiple(submission_entries)
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ is full"))?;
         }
-        self.push_submission_entries()
+        Ok(())
     }
 
     fn build_submission_entry(&mut self, pending: PendingEntry) -> io::Result<squeue::Entry> {
@@ -515,7 +510,7 @@ impl UringDriver {
                 .user_data(CANCEL_CQE_BIT | request_id.get()),
             PendingEntry::Wake => {
                 self.wake_active = true;
-                opcode::PollAdd::new(types::Fd(wake_fd), LINUX_POLLIN)
+                opcode::PollAdd::new(types::Fd(wake_fd), libc::POLLIN as u32)
                     .build()
                     .user_data(WAKE_REQUEST_ID)
             }
@@ -523,26 +518,6 @@ impl UringDriver {
                 .build()
                 .user_data(WAKE_CANCEL_ID),
         })
-    }
-
-    fn push_submission_entries(&mut self) -> io::Result<()> {
-        let UringDriver {
-            ring,
-            submission_entries,
-            ..
-        } = self;
-        let mut sq = ring
-            .as_mut()
-            .expect("ring exists while driver runs")
-            .submission();
-        // SAFETY: every file descriptor and data buffer is owned by this
-        // driver. Target buffers remain in `flights` until their target
-        // CQE; the wake entry is a pointer-free poll operation.
-        unsafe {
-            sq.push_multiple(submission_entries)
-                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ is full"))?;
-        }
-        Ok(())
     }
 
     fn submit_ring(&mut self) -> io::Result<usize> {
@@ -674,10 +649,10 @@ impl UringDriver {
                 .completion
                 .cancel_requested
                 .load(Ordering::Acquire)
-                && matches!(raw_error, LINUX_EINTR | LINUX_ECANCELED);
+                && matches!(raw_error, libc::EINTR | libc::ECANCELED);
             let status = if cancelled
                 && (flight.task.operation.kind() == OperationKind::Read
-                    || (raw_error == LINUX_ECANCELED && flight.transferred == 0))
+                    || (raw_error == libc::ECANCELED && flight.transferred == 0))
             {
                 CompletionStatus::Cancelled
             } else {
@@ -687,62 +662,54 @@ impl UringDriver {
             return;
         }
 
-        match flight.task.operation.kind() {
-            OperationKind::Read | OperationKind::Write => {
-                let remaining =
-                    operation_length(&flight.task.operation).saturating_sub(flight.transferred);
-                let completed = result as usize;
-                if completed <= remaining && completed != 0 {
-                    self.handles
-                        .as_ref()
-                        .expect("runtime handles exist while driver runs")
-                        .record(
-                            flight.task.operation.kind().io_direction(),
-                            active_path,
-                            completed,
-                        );
-                }
-                if completed == 0 && remaining != 0 {
-                    let kind = if flight.task.operation.kind() == OperationKind::Read {
-                        io::ErrorKind::UnexpectedEof
-                    } else {
-                        io::ErrorKind::WriteZero
-                    };
-                    self.state.finish(
-                        flight.task,
-                        CompletionStatus::Failed(io::Error::new(kind, "short io_uring I/O")),
-                        flight.transferred,
-                    );
-                } else if completed > remaining {
-                    self.state.finish(
-                        flight.task,
-                        CompletionStatus::Failed(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "io_uring completion exceeds submitted length",
-                        )),
-                        flight.transferred,
-                    );
-                } else {
-                    flight.transferred += completed;
-                    if flight.transferred == operation_length(&flight.task.operation) {
-                        self.state.finish(
-                            flight.task,
-                            CompletionStatus::Completed,
-                            flight.transferred,
-                        );
-                    } else if flight
-                        .task
-                        .completion
-                        .cancel_requested
-                        .load(Ordering::Acquire)
-                    {
-                        let status = cancelled_before_resubmit_status(&flight);
-                        self.state.finish(flight.task, status, flight.transferred);
-                    } else {
-                        self.flights.insert(request_id, flight);
-                        self.pending_targets.push_back(request_id);
-                    }
-                }
+        let remaining = operation_length(&flight.task.operation).saturating_sub(flight.transferred);
+        let completed = result as usize;
+        if completed <= remaining && completed != 0 {
+            self.handles
+                .as_ref()
+                .expect("runtime handles exist while driver runs")
+                .record(
+                    flight.task.operation.kind().io_direction(),
+                    active_path,
+                    completed,
+                );
+        }
+        if completed == 0 && remaining != 0 {
+            let kind = if flight.task.operation.kind() == OperationKind::Read {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                io::ErrorKind::WriteZero
+            };
+            self.state.finish(
+                flight.task,
+                CompletionStatus::Failed(io::Error::new(kind, "short io_uring I/O")),
+                flight.transferred,
+            );
+        } else if completed > remaining {
+            self.state.finish(
+                flight.task,
+                CompletionStatus::Failed(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "io_uring completion exceeds submitted length",
+                )),
+                flight.transferred,
+            );
+        } else {
+            flight.transferred += completed;
+            if flight.transferred == operation_length(&flight.task.operation) {
+                self.state
+                    .finish(flight.task, CompletionStatus::Completed, flight.transferred);
+            } else if flight
+                .task
+                .completion
+                .cancel_requested
+                .load(Ordering::Acquire)
+            {
+                let status = cancelled_before_resubmit_status(&flight);
+                self.state.finish(flight.task, status, flight.transferred);
+            } else {
+                self.flights.insert(request_id, flight);
+                self.pending_targets.push_back(request_id);
             }
         }
     }
@@ -866,7 +833,7 @@ impl UringDriver {
             if !self.has_active_target() {
                 return;
             }
-            std::thread::yield_now();
+            thread::yield_now();
         }
     }
 
@@ -945,7 +912,7 @@ fn build_target_entry(
             })?;
             // SAFETY: `transferred <= buffer.len()` and the allocation is
             // kept in this flight until the target CQE.
-            let pointer = unsafe { buffer.as_mut_ptr()?.add(transferred) };
+            let pointer = unsafe { buffer.read_target()?.add(transferred) };
             Ok(opcode::Read::new(types::Fd(file_fd), pointer, length)
                 .offset(*offset + transferred as u64)
                 .build()
@@ -970,10 +937,16 @@ fn build_target_entry(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
     use std::task::Waker;
 
     use super::*;
+    use crate::io::engine::CompletionState;
+    use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
+    use crate::io::engine::IoBuffer;
+    use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
+    use crate::io::engine::io_uring_extra_memory_bytes;
     use crate::managed_memory::ManagedMemory;
     use crate::managed_memory::ManagedMemoryLimits;
 

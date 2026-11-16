@@ -23,6 +23,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -33,17 +34,18 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use tokio::runtime::Handle;
 use tokio::task::JoinError;
 
+use crate::CacheStatsSnapshot;
 use crate::LatencyMode;
 use crate::RequestOperation;
+use crate::RequestOutcome;
 use crate::cache::runtime::CacheRead;
 use crate::cache::runtime::CacheRuntime;
 use crate::cache::session::CacheSession;
 use crate::config::CacheConfig;
 use crate::config::storage::KEY_HASH_SEED;
-use crate::config::storage_fingerprint;
-use crate::config::storage_geometry;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
@@ -64,7 +66,7 @@ pub mod session;
 /// An L2 value promoted before return still reports L2, even though its owned
 /// bytes are backed by L1. This agrees with the hit counters.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CacheTier {
     /// Process-local in-memory storage.
     L1,
@@ -91,6 +93,16 @@ impl Deref for Value {
 impl AsRef<[u8]> for Value {
     fn as_ref(&self) -> &[u8] {
         self
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Value")
+            .field("tier", &self.tier())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -125,7 +137,7 @@ pub struct Cache {
     startup: StartupMode,
     path: PathBuf,
     logical_disk_peak_bytes: u64,
-    tokio_handle: tokio::runtime::Handle,
+    tokio_handle: Handle,
 }
 
 impl fmt::Debug for Cache {
@@ -139,6 +151,7 @@ impl fmt::Debug for Cache {
 
 impl Cache {
     /// Opens a configured cache using the current Tokio runtime at first poll.
+    ///
     /// The runtime must have time enabled and outlive the cache. File setup and
     /// recovery run on its blocking pool.
     ///
@@ -148,7 +161,7 @@ impl Cache {
     /// device support, runtime binding, or worker startup failures. Configuration
     /// has already been checked by [`CacheConfig::new`].
     pub async fn open(path: impl AsRef<Path>, config: CacheConfig) -> Result<Self, Error> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+        let handle = Handle::try_current().map_err(|error| {
             from_io(
                 ErrorOperation::Open,
                 io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
@@ -157,9 +170,11 @@ impl Cache {
         Self::open_with_handle(path, config, handle).await
     }
 
-    /// Opens on an explicit Tokio runtime, including from a caller without an
-    /// active runtime. The selected runtime must have time enabled and outlive
-    /// the cache. Each open independently locks files and acquires resources.
+    /// Opens a configured cache on an explicit Tokio runtime.
+    ///
+    /// Usable from callers without an active runtime. The selected runtime must
+    /// have time enabled and outlive the cache. Each open independently locks
+    /// files and acquires resources.
     ///
     /// # Errors
     ///
@@ -167,7 +182,7 @@ impl Cache {
     pub async fn open_with_handle(
         path: impl AsRef<Path>,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
     ) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
         let cache_handle = tokio_handle.clone();
@@ -187,7 +202,7 @@ impl Cache {
     fn open_blocking(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
         started: Instant,
     ) -> io::Result<Cache> {
         let index_slots = config.storage().index_slots();
@@ -232,15 +247,15 @@ impl Cache {
     fn open_blocking_inner(
         path: PathBuf,
         config: CacheConfig,
-        tokio_handle: tokio::runtime::Handle,
+        tokio_handle: Handle,
     ) -> io::Result<Cache> {
         let format_data = DataSuperblock {
             generation: 1,
             cache_uuid: next_persistent_id(),
             data_identity: next_persistent_id(),
-            geometry: storage_geometry(config.storage()),
+            geometry: config.storage().geometry(),
             hash_seed: KEY_HASH_SEED,
-            storage_fingerprint: storage_fingerprint(config.storage()),
+            storage_fingerprint: config.storage().fingerprint(),
         };
         let paths = RegionPaths::new(
             &path,
@@ -269,7 +284,8 @@ impl Cache {
             tokio_handle,
         })
     }
-    /// Reports whether this open started empty or mapped a clean recovery image.
+
+    /// Reports whether this open started empty or accepted a clean recovery image.
     pub const fn startup_mode(&self) -> StartupMode {
         self.startup
     }
@@ -295,15 +311,16 @@ impl Cache {
     /// Stages a value directly for L2 and returns its monotonic mutation
     /// sequence.
     ///
-    /// An older L1 value is removed with the best effort. Success means the value entered
-    /// bounded staging; use [`Self::drain`] to wait for L2 publication. Keys are
-    /// limited to 4 KiB, and the encoded record must fit one Region.
+    /// An older L1 value is removed on a best-effort basis. Success means the
+    /// value entered bounded staging; use [`Self::drain`] to wait for L2
+    /// publication. Keys are limited to 4 KiB, and the encoded record must fit
+    /// one Region.
     ///
     /// # Errors
     ///
     /// Uses the same input, overload, runtime, and device classifications as
-    /// [`Self::put`], including unavailable after close starts, with
-    /// [`ErrorOperation::PutL2`](ErrorOperation::PutL2) as its context.
+    /// [`Self::put`], including [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable)
+    /// after close starts, with [`ErrorOperation::PutL2`] as its context.
     pub fn put_l2(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<u64, Error> {
         self.mutate(ErrorOperation::PutL2, RequestOperation::PutL2, || {
             self.runtime.put_l2(key.as_ref(), value.as_ref())
@@ -370,17 +387,18 @@ impl Cache {
             .map(|value| value.map(|inner| Value { inner }))
         };
         let outcome = match &result {
-            Ok(Some(value)) if value.inner.is_l1() => crate::RequestOutcome::L1Hit,
-            Ok(Some(_)) => crate::RequestOutcome::L2Hit,
-            _ => crate::RequestOutcome::Miss,
+            Ok(Some(value)) if value.inner.is_l1() => RequestOutcome::L1Hit,
+            Ok(Some(_)) => RequestOutcome::L2Hit,
+            _ => RequestOutcome::Miss,
         };
         guard.finish(&result, outcome);
         result
     }
 
     /// Waits until all accepted mutations have completed their Region writes
-    /// and index publication. Use [`Self::close_warm`] to publish a recoverable
-    /// image.
+    /// and index publication.
+    ///
+    /// Use [`Self::close_warm`] to publish a recoverable image.
     ///
     /// # Errors
     ///
@@ -392,10 +410,11 @@ impl Cache {
         public_result(ErrorOperation::Drain, self.runtime.drain_async().await)
     }
 
-    /// Returns an operational snapshot using atomics. Activity and I/O counters are
-    /// cumulative for this open and are populated only when
-    /// `RuntimeOptions::stats.activity_counters` is enabled; health and resource gauges are
-    /// always available.
+    /// Returns a point-in-time operational snapshot.
+    ///
+    /// Activity and I/O counters are cumulative for this open and are populated
+    /// only when `RuntimeOptions::stats.activity_counters` is enabled; health
+    /// and resource gauges are always available.
     ///
     /// # Errors
     ///
@@ -418,14 +437,16 @@ impl Cache {
     /// # Errors
     ///
     /// Uses the same availability and runtime failures as [`Self::snapshot`].
-    pub fn stats_snapshot(&self) -> Result<crate::CacheStatsSnapshot, Error> {
+    pub fn stats_snapshot(&self) -> Result<CacheStatsSnapshot, Error> {
         Ok(self.runtime.stats_recorder().snapshot(self.snapshot()?))
     }
 
     /// Samples L1, index, write-buffer rejection, I/O, and Region state in
-    /// addition to the regular cache summary. This periodic diagnostic briefly
-    /// reads every configured L1 shard and index partition and scans Region
-    /// metadata. Sampling is limited to metadata.
+    /// addition to the regular cache summary.
+    ///
+    /// This periodic diagnostic briefly reads every configured L1 shard and
+    /// index partition and scans Region metadata. Sampling is limited to
+    /// metadata.
     ///
     /// # Errors
     ///
@@ -443,6 +464,7 @@ impl Cache {
     }
 
     /// Stops on Tokio's blocking pool and makes the next open a cold start.
+    ///
     /// Calling this method immediately rejects new operations through every
     /// shared handle; unique [`Arc`] ownership is not required. The first close
     /// call wins and continues even if the returned future is dropped.
@@ -456,11 +478,13 @@ impl Cache {
         self.close(false)
     }
 
-    /// Publishes a clean recovery image on Tokio's blocking pool. Calling this
-    /// method immediately rejects new operations through every shared handle;
-    /// unique [`Arc`] ownership is not required. Accepted mutations and their
-    /// submitted writes are fenced before the image is frozen. The first close
-    /// call wins and continues even if the returned future is dropped.
+    /// Publishes a clean recovery image on Tokio's blocking pool.
+    ///
+    /// Calling this method immediately rejects new operations through every
+    /// shared handle; unique [`Arc`] ownership is not required. Accepted
+    /// mutations and their submitted writes are fenced before the image is
+    /// frozen. The first close call wins and continues even if the returned
+    /// future is dropped.
     ///
     /// # Errors
     ///
@@ -486,7 +510,7 @@ impl Cache {
             .ensure_open(operation)
             .and_then(|()| public_result(operation, mutation()));
         if let Some(guard) = guard {
-            guard.finish(&result, crate::RequestOutcome::Accepted);
+            guard.finish(&result, RequestOutcome::Accepted);
         }
         result
     }
@@ -641,7 +665,7 @@ fn next_persistent_id() -> PersistentId {
         .unwrap_or_default()
         .as_nanos();
     let mut bytes = now.to_le_bytes();
-    let mix = counter ^ u64::from(std::process::id()).rotate_left(32);
+    let mix = counter ^ u64::from(process::id()).rotate_left(32);
     for (target, source) in bytes[8..].iter_mut().zip(mix.to_le_bytes()) {
         *target ^= source;
     }
@@ -654,6 +678,9 @@ fn next_persistent_id() -> PersistentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::L1EvictionPolicy;
+    use crate::memory::MemoryLookup;
+    use crate::memory::MemoryStore;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -661,5 +688,22 @@ mod tests {
     fn public_cache_and_values_are_send_and_sync() {
         assert_send_sync::<Cache>();
         assert_send_sync::<Value>();
+    }
+
+    #[test]
+    fn value_debug_omits_payload_bytes() {
+        let store = MemoryStore::new(4096, 8, 1, L1EvictionPolicy::Clock, false).unwrap();
+        assert!(store.publish(1, b"key", b"secret-payload", 1));
+        let MemoryLookup::Hit(entry) = store.lookup(1, b"key") else {
+            panic!("expected L1 hit");
+        };
+        let l1_value = Value {
+            inner: CacheRead::L1(entry.clone()),
+        };
+        assert_eq!(format!("{l1_value:?}"), "Value { tier: L1, len: 14 }");
+        let l2_value = Value {
+            inner: CacheRead::PromotedL2(entry),
+        };
+        assert_eq!(format!("{l2_value:?}"), "Value { tier: L2, len: 14 }");
     }
 }

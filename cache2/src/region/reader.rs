@@ -24,6 +24,8 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
+use tokio::runtime::Handle;
+
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoCompletion;
@@ -80,8 +82,7 @@ impl ReadCompletion {
         }
         self.buffer
             .as_ref()?
-            .prepared(self.desc.read_len)
-            .ok()?
+            .prepared(self.desc.read_len)?
             .get(self.desc.record_range.clone())
     }
 }
@@ -98,11 +99,7 @@ impl PendingRead {
         Self::finish(desc, request_id, completion)
     }
 
-    pub async fn wait_async(
-        self,
-        engine: Arc<IoEngine>,
-        tokio_handle: &tokio::runtime::Handle,
-    ) -> ReadCompletion {
+    pub async fn wait_async(self, engine: Arc<IoEngine>, tokio_handle: &Handle) -> ReadCompletion {
         let Self {
             desc,
             request_id,
@@ -145,7 +142,7 @@ impl PendingRead {
             ))
         } else if buffer
             .as_ref()
-            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_err())
+            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_none())
         {
             Some(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -261,9 +258,11 @@ pub fn describe_read(
     let (absolute, io_end) = if align_for_direct_io {
         (
             record_absolute / alignment * alignment,
-            align_up(record_absolute_end, alignment).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow")
-            })?,
+            record_absolute_end
+                .checked_next_multiple_of(alignment)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "aligned read overflow")
+                })?,
         )
     } else {
         (record_absolute, record_absolute_end)
@@ -310,12 +309,6 @@ pub fn describe_read(
     })
 }
 
-fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|end| end / alignment * alignment)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -328,6 +321,8 @@ mod tests {
     use crate::managed_memory::ManagedMemory;
     use crate::managed_memory::ManagedMemoryLimits;
     use crate::region::index::packed::PackedLocation;
+    use crate::region::record::RECORD_HEADER_SIZE;
+    use crate::region::record::codec::required_record_bytes;
 
     #[derive(Default)]
     struct RecordingIo {
@@ -491,5 +486,34 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn maximum_read_buffer_is_derived_from_runtime_limits() {
+        let geometry = DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(512 * 1024, 10).unwrap(),
+            region_size: 512 * 1024,
+            region_count: 10,
+        };
+        let value_len = geometry.region_size as usize - RECORD_HEADER_SIZE;
+        let record_len = required_record_bytes(0, value_len).unwrap();
+        assert_eq!(u64::from(record_len), geometry.region_size);
+        let entry = IndexEntry {
+            location: PackedLocation::new(0, 0, record_len).unwrap(),
+        };
+        assert_eq!(
+            describe_read(
+                geometry,
+                1,
+                ReadCandidate {
+                    entry,
+                    region_generation: 1,
+                },
+                true,
+            )
+            .unwrap()
+            .read_len,
+            geometry.region_size as usize
+        );
     }
 }

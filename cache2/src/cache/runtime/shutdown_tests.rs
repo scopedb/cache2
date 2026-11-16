@@ -12,15 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
 use std::sync::mpsc;
 
 use super::*;
+use crate::FillControlOptions;
+use crate::FillLimits;
+use crate::FillPressure;
 use crate::IoEngineOptions;
+use crate::cache::session::CacheSession;
+use crate::config::runtime::PosixIoOptions;
+use crate::fixtures::TestDirectory;
+use crate::fixtures::eventually_admitted;
+use crate::io::engine::CompletionStatus;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoRequest;
 use crate::io::file::PositionedIo;
 use crate::io::file::WritePoint;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::PersistentId;
+use crate::snapshot::CacheHealth;
 
 #[derive(Default)]
 struct BlockedReadState {
@@ -69,25 +79,32 @@ impl PositionedIo for BlockedRead {
 
 #[test]
 fn late_read_must_not_pin_close() {
-    assert_close_does_not_wait_for_read(false);
+    assert_close_with_blocked_read(false, None);
 }
 
 #[test]
 fn submitted_read_must_not_pin_close() {
-    assert_close_does_not_wait_for_read(true);
+    assert_close_with_blocked_read(true, None);
 }
 
-fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
-    use crate::cache::session::CacheSession;
-    use crate::config::runtime::PosixIoOptions;
-    use crate::region::persistence::RegionPaths;
-    use crate::region::recovery::PersistentId;
-    let root = env::temp_dir().join(format!(
-        "cache2-close-race-{}-{submit_before_close}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
+#[test]
+fn drain_failure_propagates_when_read_is_in_flight() {
+    assert_close_with_blocked_read(
+        true,
+        Some(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "shard drain failed",
+        )),
+    );
+}
+
+fn assert_close_with_blocked_read(submit_before_close: bool, drain_failure: Option<io::Error>) {
+    let suffix = if drain_failure.is_some() {
+        "drain-failure"
+    } else {
+        "ok"
+    };
+    let directory = TestDirectory::new(&format!("close-race-{submit_before_close}-{suffix}"));
     let data = DataSuperblock {
         generation: 1,
         cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -110,7 +127,8 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
         }),
         ..RuntimeOptions::default()
     };
-    let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+    let mut session =
+        CacheSession::for_test_with_options(directory.paths.clone(), data, 8, config).unwrap();
     let mut runtime = session.runtime().unwrap().clone();
     session.close_fast().unwrap();
     // Reuse a stopped runtime's fixed resources without unrelated workers.
@@ -134,6 +152,8 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     if submit_before_close {
         submitted.send(submit_read()).unwrap();
         assert_eq!(engine.in_flight(), 1);
+        assert_eq!(engine.writes_in_flight(), 0);
+        assert!(!engine.has_unfenced_writes());
     } else {
         // Exercise the interval between the idle snapshot and synchronous shutdown.
         *state.after_io_snapshot.get_mut().unwrap() = Some(Box::new(move || {
@@ -143,10 +163,17 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     state.read_engines = vec![engine.clone()].into_boxed_slice();
     state.write_engines = Box::new([]);
     state.reclaim_engines = Box::new([]);
-    state.append_controls = Box::new([]);
+    let expected_failure_kind = drain_failure.as_ref().map(io::Error::kind);
+    if let Some(error) = drain_failure {
+        let control = Arc::new(AppendWorkerControl::new());
+        control.fail(&error);
+        state.append_controls = vec![control].into_boxed_slice();
+    } else {
+        state.append_controls = Box::new([]);
+    }
     let state = Arc::clone(&runtime.state);
     let (tx, rx) = mpsc::channel();
-    let thread = std::thread::spawn(move || {
+    let thread = thread::spawn(move || {
         let result = stop_workers(RuntimeWorkers {
             state,
             append_workers: vec![],
@@ -158,16 +185,23 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     io.release();
     thread.join().unwrap();
     engine.shutdown().unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-    assert!(
-        matches!(result, Ok(Ok(false))),
-        "close synchronously joined a blocked read"
-    );
+    drop(directory);
+    let result = result.expect("close synchronously joined a blocked read");
+    match expected_failure_kind {
+        Some(kind) => {
+            let error = result.expect_err("drain failure must propagate despite in-flight read");
+            assert_eq!(error.kind(), kind);
+        }
+        None => assert_eq!(
+            result.expect("close with only reads in flight succeeds"),
+            ShutdownDisposition::Quiescent
+        ),
+    }
     let submitted = submission.recv_timeout(Duration::from_secs(1)).unwrap();
     if submit_before_close {
         assert!(matches!(
             submitted.unwrap().wait().status,
-            crate::io::engine::CompletionStatus::Completed
+            CompletionStatus::Completed
         ));
     } else {
         assert_eq!(submitted.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
@@ -176,22 +210,12 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
 
 #[test]
 fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
-    use crate::FillControlOptions;
-    use crate::FillLimits;
-    use crate::FillPressure;
-    use crate::cache::session::CacheSession;
-    use crate::region::persistence::RegionPaths;
-    use crate::region::recovery::PersistentId;
-    use crate::snapshot::CacheHealth;
     for fill_control in [
         FillControlOptions::Disabled,
         FillControlOptions::Observe(FillLimits::new(1_048_576, 1000)),
         FillControlOptions::Adaptive(FillLimits::new(1_048_576, 1000)),
     ] {
-        let root =
-            env::temp_dir().join(format!("cache2-recovery-admission-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
+        let directory = TestDirectory::new("recovery-admission");
         let data = DataSuperblock {
             generation: 1,
             cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -210,7 +234,8 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
             l1_capacity_bytes: 0,
             ..RuntimeOptions::default()
         };
-        let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+        let mut session =
+            CacheSession::for_test_with_options(directory.paths.clone(), data, 8, config).unwrap();
         let runtime = session.runtime().unwrap().clone();
         runtime.put(b"existing", b"value").unwrap();
         runtime.drain().unwrap();
@@ -242,17 +267,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         }
         second.finish();
         assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Running);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match runtime.put(b"new", b"value") {
-                Ok(_) => break,
-                Err(error) => {
-                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                    assert!(Instant::now() < deadline, "fills did not resume");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }
+        eventually_admitted(|| runtime.put(b"new", b"value"));
         runtime.drain().unwrap();
         assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");
         // A completion after close starts must release recovery without reopening fills.
@@ -271,19 +286,12 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
             assert_eq!(fill.snapshot().pressure, FillPressure::Paused);
         }
         session.close_fast().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
 #[test]
 fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
-    use crate::cache::session::CacheSession;
-    use crate::region::persistence::RegionPaths;
-    use crate::region::recovery::PersistentId;
-    use crate::snapshot::CacheHealth;
-    let root = env::temp_dir().join(format!("cache2-fill-admission-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let paths = RegionPaths::new(root.join("data"), root.join("state"), root.join("image"));
+    let directory = TestDirectory::new("fill-admission");
     let data = DataSuperblock {
         generation: 1,
         cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
@@ -297,25 +305,21 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
         storage_fingerprint: 4,
     };
     let config = RuntimeOptions {
-        fill_control: crate::FillControlOptions::Adaptive(crate::FillLimits::new(1_048_576, 1000)),
+        fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 1000)),
         append_shards: 1,
         l1_capacity_bytes: 0,
         ..RuntimeOptions::default()
     };
-    let mut session = CacheSession::for_test_with_options(paths, data, 8, config).unwrap();
+    let mut session =
+        CacheSession::for_test_with_options(directory.paths.clone(), data, 8, config).unwrap();
     let runtime = session.runtime().unwrap().clone();
     runtime.put(b"existing", b"value").unwrap();
     runtime.drain().unwrap();
     let fill = runtime.state.fill_control.as_ref().unwrap();
     fill.set_recovering(true);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while fill.snapshot().pressure != crate::FillPressure::Paused {
-        assert!(Instant::now() < deadline, "controller did not pause fills");
-        std::thread::sleep(Duration::from_millis(1));
-    }
     let snapshot = runtime.snapshot().unwrap();
     assert_eq!(snapshot.health, CacheHealth::Running);
-    assert_eq!(snapshot.fill_control.pressure, crate::FillPressure::Paused);
+    assert_eq!(snapshot.fill_control.pressure, FillPressure::Paused);
     assert_eq!(
         runtime.put(b"new", b"value").unwrap_err().kind(),
         io::ErrorKind::WouldBlock
@@ -329,19 +333,8 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     assert!(runtime.get(b"existing").unwrap().is_none());
     assert!(runtime.put(b"new", b"value").is_err());
     fill.set_recovering(false);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match runtime.put(b"new", b"value") {
-            Ok(_) => break,
-            Err(error) => {
-                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                assert!(Instant::now() < deadline, "fills did not resume");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
+    eventually_admitted(|| runtime.put(b"new", b"value"));
     runtime.drain().unwrap();
     assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");
     session.close_fast().unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }

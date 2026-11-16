@@ -18,14 +18,12 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
+use std::error;
 use std::fmt;
 use std::io;
-#[cfg(test)]
 use std::time::Duration;
 
 use crate::io::background::BackgroundIoAttempt;
-#[cfg(test)]
-use crate::io::background::IoRecovery;
 use crate::io::engine::BoundedIoRequest;
 use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
@@ -63,8 +61,8 @@ impl fmt::Display for WriteSubmitError {
     }
 }
 
-impl std::error::Error for WriteSubmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for WriteSubmitError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -136,13 +134,32 @@ impl PendingWrite {
 
 // The error returns the owned aligned buffer without another fallible
 // allocation; boxing it would violate that overload-path property.
-#[allow(clippy::result_large_err)]
 pub fn submit_write(
     engine: &IoEngine,
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
     absolute: u64,
+    attempt: &mut BackgroundIoAttempt<'_>,
+) -> Result<PendingWrite, WriteSubmitError> {
+    submit_write_with_timeout(
+        engine,
+        geometry,
+        span,
+        buffer,
+        absolute,
+        CACHE_IO_COMPLETION_TIMEOUT,
+        attempt,
+    )
+}
+
+fn submit_write_with_timeout(
+    engine: &IoEngine,
+    geometry: DataGeometry,
+    span: RegionWriteSpan,
+    buffer: IoBuffer,
+    absolute: u64,
+    timeout: Duration,
     attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<PendingWrite, WriteSubmitError> {
     let (expected_len, expected_absolute) = match validate_span(geometry, span) {
@@ -182,7 +199,7 @@ pub fn submit_write(
     let request = match submit_background_io(
         engine,
         IoOperation::write(WritePoint::Record, buffer, absolute),
-        CACHE_IO_COMPLETION_TIMEOUT,
+        timeout,
         attempt,
     ) {
         Ok(request) => request,
@@ -191,7 +208,7 @@ pub fn submit_write(
             return Err(WriteSubmitError {
                 error,
                 span,
-                buffer,
+                buffer: Some(buffer),
             });
         }
     };
@@ -249,8 +266,10 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::thread;
 
     use super::*;
+    use crate::io::background::IoRecovery;
     use crate::io::engine::IoEngine;
     use crate::io::file::PositionedIo;
     use crate::managed_memory::BufferLease;
@@ -267,7 +286,7 @@ mod tests {
         }
 
         fn write_at(&self, point: WritePoint, buffer: &[u8], offset: u64) -> io::Result<usize> {
-            std::thread::sleep(self.delay);
+            thread::sleep(self.delay);
             self.writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -300,7 +319,7 @@ mod tests {
     #[test]
     fn late_span_completion_remains_valid_and_keeps_engine_usable() {
         let io = Arc::new(RecordingIo {
-            delay: CACHE_IO_COMPLETION_TIMEOUT + Duration::from_millis(50),
+            delay: Duration::from_millis(50),
             ..RecordingIo::default()
         });
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
@@ -309,12 +328,13 @@ mod tests {
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
         let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
-        let completion = submit_write(
+        let completion = submit_write_with_timeout(
             &engine,
             geometry(),
             span(),
             IoBuffer::for_write(lease, 4096).unwrap(),
             absolute,
+            Duration::from_millis(20),
             &mut attempt,
         )
         .unwrap()
