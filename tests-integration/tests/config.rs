@@ -12,27 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
+use std::io;
 use std::time::Duration;
 
 use cache2::CacheConfig;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
 use cache2::IoEngineOptions;
+#[cfg(not(target_os = "linux"))]
+use cache2::IoMode;
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
+use cache2::IoUringOptions;
 use cache2::L1EvictionPolicy;
+use cache2::LatencyMode;
 use cache2::PosixIoOptions;
 use cache2::ReadAdmission;
 use cache2::RuntimeOptions;
-use cache2::StorageLayout;
 use cache2::StorageOptions;
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
+use tests_integration::test_runtime_options;
+use tests_integration::test_storage;
 
 type StorageOptionsCase = (&'static str, fn(&mut StorageOptions));
 type RuntimeOptionsCase = (&'static str, fn(&mut RuntimeOptions));
-
-fn test_storage() -> StorageLayout {
-    let mut options = StorageOptions::new(3 * 512 * 1024);
-    options.region_size_bytes = 512 * 1024;
-    options.build().unwrap()
-}
 
 #[test]
 fn storage_rejects_unrepresentable_inputs() {
@@ -244,9 +277,9 @@ fn stats_storage_is_bounded_and_included_in_the_memory_floor() {
     }
     let mut enabled = options;
     enabled.stats.request_counters = true;
-    enabled.stats.l1_latency = cache2::LatencyMode::Full;
-    enabled.stats.l2_latency = cache2::LatencyMode::Full;
-    enabled.stats.mutation_latency = cache2::LatencyMode::Full;
+    enabled.stats.l1_latency = LatencyMode::Full;
+    enabled.stats.l2_latency = LatencyMode::Full;
+    enabled.stats.mutation_latency = LatencyMode::Full;
     enabled.stats.io_latency = true;
     enabled.stats.shards = 64;
     let configured = CacheConfig::new(test_storage(), enabled.clone()).unwrap();
@@ -258,4 +291,68 @@ fn stats_storage_is_bounded_and_included_in_the_memory_floor() {
             .kind(),
         ErrorKind::InvalidInput
     );
+}
+
+#[cfg(not(all(
+    feature = "io-uring",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64"
+    )
+)))]
+#[test]
+fn unavailable_io_engine_is_rejected_when_building_configuration() {
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.io_engine = IoEngineOptions::IoUring(IoUringOptions::default());
+    runtime.write_flush_threshold_bytes = 128 * 1024;
+    runtime.stats.activity_counters = false;
+
+    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
+    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
+    let message = error.as_io_error().to_string();
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(message, "io_uring is unavailable on this platform");
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        ))
+    ))]
+    assert_eq!(message, "io_uring is unavailable on this architecture");
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64"
+        ),
+        not(feature = "io-uring")
+    ))]
+    assert_eq!(message, "io_uring requires the io-uring crate feature");
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unavailable_direct_io_is_rejected_when_building_configuration() {
+    let mut runtime = test_runtime_options(1, 2);
+    runtime.io_mode = IoMode::Direct;
+    runtime.write_flush_threshold_bytes = 128 * 1024;
+    runtime.stats.activity_counters = false;
+
+    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
+    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
 }

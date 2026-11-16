@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::error;
 use std::io;
 
 use cache2::Error;
@@ -27,8 +28,9 @@ fn storage_construction_errors_expose_structured_context() {
     assert_eq!(error.operation(), ErrorOperation::BuildStorage);
     assert_eq!(error.io_kind(), io::ErrorKind::InvalidInput);
     assert!(error.raw_os_error().is_none());
-    assert!(std::error::Error::source(&error).is_some());
-    assert!(error.to_string().contains("build_storage"));
+    assert!(error::Error::source(&error).is_some());
+    assert_eq!(error.kind().as_str(), "invalid_input");
+    assert_eq!(error.operation().as_str(), "build_storage");
 }
 
 #[test]

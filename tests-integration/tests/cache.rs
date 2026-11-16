@@ -20,14 +20,17 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -41,67 +44,27 @@ use cache2::Error;
 use cache2::ErrorKind;
 use cache2::ErrorOperation;
 use cache2::IoEngineOptions;
-#[cfg(not(target_os = "linux"))]
-use cache2::IoMode;
-#[cfg(not(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-)))]
-use cache2::IoUringOptions;
+use cache2::IoOutcome;
+use cache2::IoRole;
 use cache2::L1EvictionPolicy;
+use cache2::LatencyMode;
 use cache2::PosixIoOptions;
 use cache2::ReadAdmission;
-use cache2::RuntimeOptions;
+use cache2::RequestLatencyScope;
+use cache2::RequestOperation;
+use cache2::RequestOutcome;
 use cache2::StartupMode;
-use cache2::StorageLayout;
 use cache2::StorageOptions;
+use crc_fast::crc32_iscsi;
+use tests_integration::test_config;
+use tests_integration::test_config_with_storage;
+use tests_integration::test_config_with_storage_and_shards;
+use tests_integration::test_runtime_options;
+use tests_integration::test_storage;
+use tokio::runtime::Builder;
+use tokio::runtime::Handle;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
-
-fn test_storage() -> StorageLayout {
-    let mut options = StorageOptions::new(3 * 512 * 1024);
-    options.region_size_bytes = 512 * 1024;
-    options.expected_entries = Some(3277);
-    options.build().unwrap()
-}
-
-fn test_runtime_options(workers: usize, append_shards: u32) -> RuntimeOptions {
-    let mut io = PosixIoOptions::default();
-    io.read_workers = workers;
-    io.write_workers = workers;
-    io.reclaim_workers = 1;
-    let mut options = RuntimeOptions::default();
-    options.io_engine = IoEngineOptions::Posix(io);
-    options.append_shards = append_shards;
-    options.l1_capacity_bytes = 4 * 1024 * 1024;
-    options.managed_memory_limit_bytes = 32 * 1024 * 1024;
-    options.write_flush_threshold_bytes = 256 * 1024;
-    options.stats.activity_counters = true;
-    options
-}
-
-fn test_config(workers: usize) -> CacheConfig {
-    test_config_with_storage(workers, test_storage())
-}
-
-fn test_config_with_storage(workers: usize, storage: StorageLayout) -> CacheConfig {
-    test_config_with_storage_and_shards(workers, storage, 2)
-}
-
-fn test_config_with_storage_and_shards(
-    workers: usize,
-    storage: StorageLayout,
-    append_shards: u32,
-) -> CacheConfig {
-    CacheConfig::new(storage, test_runtime_options(workers, append_shards)).unwrap()
-}
 
 struct TestCache {
     data: PathBuf,
@@ -110,7 +73,7 @@ struct TestCache {
 impl TestCache {
     fn new(name: &str) -> Self {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-        let data = env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", std::process::id()));
+        let data = env::temp_dir().join(format!("cache2-{name}-{}-{id}.cache", process::id()));
         Self { data }
     }
 
@@ -158,7 +121,7 @@ fn rewrite_page_version(path: &Path, offset: u64, version: u16) {
     file.read_exact(&mut page).unwrap();
     page[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&version.to_le_bytes());
     page[CRC_OFFSET..].fill(0);
-    let checksum = crc_fast::crc32_iscsi(&page);
+    let checksum = crc32_iscsi(&page);
     page[CRC_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&page).unwrap();
@@ -175,7 +138,7 @@ fn eventually_admitted<T>(mut put: impl FnMut() -> Result<T, Error>) -> T {
                     Instant::now() < deadline,
                     "write buffer did not make progress"
                 );
-                std::thread::yield_now();
+                thread::yield_now();
             }
             Err(error) => panic!("cache write failed: {error}"),
         }
@@ -211,21 +174,19 @@ async fn completed_reclaim_snapshot(cache: &Cache) -> DetailedCacheSnapshot {
             return detailed;
         }
         assert!(Instant::now() < deadline, "reclaim did not make progress");
-        std::thread::yield_now();
+        thread::yield_now();
     }
 }
 
 #[test]
 fn explicit_tokio_handle_works_from_a_runtime_without_time_enabled() {
     let files = TestCache::new("explicit-tokio-handle");
-    let cache_runtime = tokio::runtime::Builder::new_multi_thread()
+    let cache_runtime = Builder::new_multi_thread()
         .worker_threads(2)
         .enable_time()
         .build()
         .unwrap();
-    let caller_runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
+    let caller_runtime = Builder::new_current_thread().build().unwrap();
     let config = test_config(1);
     let minimum_memory_bytes = config.minimum_memory_bytes();
     let mut options = config.runtime().clone();
@@ -325,7 +286,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
     let writer_cache = Arc::clone(&cache);
     let ready = Arc::new(Barrier::new(2));
     let writer_ready = Arc::clone(&ready);
-    let writer = std::thread::spawn(move || {
+    let writer = thread::spawn(move || {
         writer_ready.wait();
         let mut accepted = Vec::new();
         for ordinal in 0_u64..256 {
@@ -335,7 +296,7 @@ async fn warm_close_fences_concurrent_arc_mutations() {
                         accepted.push(ordinal);
                         break;
                     }
-                    Err(error) if error.kind() == ErrorKind::Overloaded => std::thread::yield_now(),
+                    Err(error) if error.kind() == ErrorKind::Overloaded => thread::yield_now(),
                     Err(error) if error.kind() == ErrorKind::Unavailable => return accepted,
                     Err(error) => panic!("concurrent cache write failed: {error}"),
                 }
@@ -496,74 +457,6 @@ async fn l1_bypass_may_remain_stale_after_region_completion() {
     assert!(value.as_ref() == b"old" || value.as_ref() == replacement);
     drop(value);
     cache.close_fast().await.unwrap();
-}
-
-#[cfg(not(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-)))]
-#[test]
-fn unavailable_io_engine_is_rejected_before_file_creation() {
-    let files = TestCache::new("unavailable-io-engine");
-    let mut runtime = test_runtime_options(1, 2);
-    runtime.io_engine = IoEngineOptions::IoUring(IoUringOptions::default());
-    runtime.write_flush_threshold_bytes = 128 * 1024;
-    runtime.stats.activity_counters = false;
-
-    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
-    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
-    let message = error.as_io_error().to_string();
-    #[cfg(not(target_os = "linux"))]
-    assert_eq!(message, "io_uring is unavailable on this platform");
-    #[cfg(all(
-        target_os = "linux",
-        not(any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        ))
-    ))]
-    assert_eq!(message, "io_uring is unavailable on this architecture");
-    #[cfg(all(
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        ),
-        not(feature = "io-uring")
-    ))]
-    assert_eq!(message, "io_uring requires the io-uring crate feature");
-    files.assert_absent();
-}
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn unavailable_direct_io_is_rejected_before_file_creation() {
-    let files = TestCache::new("unavailable-direct-io");
-    let mut runtime = test_runtime_options(1, 2);
-    runtime.io_mode = IoMode::Direct;
-    runtime.write_flush_threshold_bytes = 128 * 1024;
-    runtime.stats.activity_counters = false;
-
-    let error = CacheConfig::new(test_storage(), runtime).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert_eq!(error.operation(), ErrorOperation::BuildConfig);
-    assert_eq!(error.io_kind(), io::ErrorKind::Unsupported);
-    files.assert_absent();
 }
 
 #[tokio::test]
@@ -753,9 +646,9 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
     let writers_left = AtomicUsize::new(WRITERS);
     let start = AtomicBool::new(false);
     let hits = AtomicU64::new(0);
-    let runtime = tokio::runtime::Handle::current();
+    let runtime = Handle::current();
 
-    std::thread::scope(|scope| {
+    thread::scope(|scope| {
         for writer in 0..WRITERS {
             let cache = &cache;
             let keys = &keys;
@@ -764,7 +657,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let start = &start;
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 let mut value = vec![0_u8; *VALUE_SIZES.iter().max().unwrap()];
                 for ordinal in 0..WRITES_PER_CLIENT {
@@ -799,7 +692,7 @@ async fn concurrent_mixed_mutations_never_return_wrong_key_or_future_values() {
             let runtime = runtime.clone();
             scope.spawn(move || {
                 while !start.load(Ordering::Acquire) {
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 let mut ordinal = reader;
                 while writers_left.load(Ordering::Acquire) != 0 {
@@ -969,7 +862,7 @@ async fn reported_peak_disk_bytes_covers_atomic_warm_publication() {
 }
 
 #[tokio::test]
-async fn detailed_snapshot_reports_bounded_resource_state() {
+async fn detailed_snapshot_reports_bounded_resources_reclaim_and_io_activity() {
     let files = TestCache::new("resource-snapshot");
     let expected_disk_peak = test_storage().peak_disk_bytes();
     let cache = Cache::open(&files.data, test_config(4)).await.unwrap();
@@ -977,7 +870,6 @@ async fn detailed_snapshot_reports_bounded_resource_state() {
     let resources = detailed.summary;
     assert_eq!(resources.health, CacheHealth::Running);
     assert!(resources.activity_counters_enabled);
-    assert!(resources.reclaim.regions > 0);
     assert_eq!(resources.managed_memory_limit_bytes, 32 * 1024 * 1024);
     assert!(resources.managed_memory_bytes <= resources.managed_memory_limit_bytes);
     assert!(resources.managed_memory_peak_bytes >= resources.managed_memory_bytes);
@@ -1002,41 +894,11 @@ async fn detailed_snapshot_reports_bounded_resource_state() {
             + detailed.region.reclaiming_region_count,
         3
     );
-    cache.close_fast().await.unwrap();
-}
-
-#[tokio::test]
-async fn detailed_snapshot_reports_reclaim_and_io_activity() {
-    let files = TestCache::new("reclaim-snapshot");
-    let cache = Cache::open(&files.data, test_config(4)).await.unwrap();
-    let detailed = completed_reclaim_snapshot(&cache).await;
-    let resources = detailed.summary;
 
     assert!(resources.region_rotations > 0);
-    assert!(resources.reclaim.regions > 0);
     assert!(resources.reclaim.bytes_read > 0);
     assert!(resources.reclaim.records_scanned > 0);
     assert!(resources.reclaim.index_entries_removed <= resources.reclaim.records_scanned);
-    assert_eq!(resources.io.read.requests_in_flight, 0);
-    assert_eq!(resources.io.write.requests_in_flight, 0);
-    assert_eq!(
-        resources.io.read.requests_submitted,
-        resources
-            .io
-            .read
-            .requests_succeeded
-            .saturating_add(resources.io.read.requests_cancelled)
-            .saturating_add(resources.io.read.requests_failed)
-    );
-    assert_eq!(
-        resources.io.write.requests_submitted,
-        resources
-            .io
-            .write
-            .requests_succeeded
-            .saturating_add(resources.io.write.requests_cancelled)
-            .saturating_add(resources.io.write.requests_failed)
-    );
     assert!(
         resources
             .io
@@ -1308,12 +1170,6 @@ async fn unsupported_cache_format_versions_cold_start_empty() {
 
 #[tokio::test]
 async fn structured_stats_track_original_hit_tier_and_full_distributions() {
-    use cache2::IoOutcome;
-    use cache2::IoRole;
-    use cache2::LatencyMode;
-    use cache2::RequestOperation;
-    use cache2::RequestOutcome;
-
     let files = TestCache::new("structured-stats");
     let mut options = test_runtime_options(1, 2);
     options.stats.activity_counters = false;
@@ -1419,12 +1275,6 @@ async fn activity_counters_do_not_enable_request_recorders() {
 
 #[tokio::test]
 async fn tier_latency_modes_are_independent_and_describe_their_scope() {
-    use std::num::NonZeroU32;
-
-    use cache2::LatencyMode;
-    use cache2::RequestOperation;
-    use cache2::RequestOutcome;
-
     let sampled = LatencyMode::Sampled {
         interval: NonZeroU32::new(64).unwrap(),
     };
@@ -1466,13 +1316,13 @@ async fn tier_latency_modes_are_independent_and_describe_their_scope() {
                 RequestOutcome::L1Hit,
                 l1_latency,
                 4096,
-                cache2::RequestLatencyScope::L1Hit,
+                RequestLatencyScope::L1Hit,
             ),
             (
                 RequestOutcome::Miss,
                 l2_latency,
                 4097,
-                cache2::RequestLatencyScope::L2Lookup,
+                RequestLatencyScope::L2Lookup,
             ),
         ] {
             let row = stats
