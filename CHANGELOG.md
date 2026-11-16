@@ -4,7 +4,7 @@
 
 ### Improvements
 
-- Implement `Debug` for `Value`, `Eq` and `PartialEq` for `CacheConfig` and `RuntimeOptions`, `Copy` for `DetailedCacheSnapshot`, `Hash` for public configuration, health, tier, and statistics enums, and `Display` for `RequestOperation`, `RequestOutcome`, `IoRole`, and `IoOutcome`.
+- Implement `Debug` for `Value`, `Eq` and `PartialEq` for `CacheConfig` and `RuntimeOptions`, `Hash` for public configuration, health, tier, and statistics enums, and `Display` for `RequestOperation`, `RequestOutcome`, `IoRole`, and `IoOutcome`.
 
 ### Performance improvements
 
