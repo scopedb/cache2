@@ -567,17 +567,6 @@ fn cache_runtime_reads_mixed_chunks_rotates_and_warm_recovers() {
         31,
         "one full-Region signal must cause exactly one rotation"
     );
-    let reclaim = session.detailed_snapshot().unwrap().summary.reclaim;
-    // The explicit drain may fence the optional reinsertion before its
-    // reclaimer enters the mutation gate. Heat classification must still
-    // offer the candidate, while either admission or a bounded skip is a
-    // valid best-effort outcome.
-    assert!(
-        reclaim.reinsert_records + reclaim.reinsert_skipped > 0,
-        "{reclaim:?}"
-    );
-    assert_eq!(reclaim.reinsert_bytes == 0, reclaim.reinsert_records == 0);
-    assert!(reclaim.reinsert_bytes.saturating_mul(8) <= reclaim.bytes_read);
     for key in recent.iter().rev().take(1) {
         assert_eq!(
             session.get_value(key).unwrap().unwrap().value(),
@@ -600,7 +589,29 @@ fn cache_runtime_reads_mixed_chunks_rotates_and_warm_recovers() {
 
     // Retained zero-copy hits own their transient aligned allocations, but
     // cannot pin the runtime operation barrier or prevent a warm shutdown.
+    let runtime = session.runtime().unwrap().clone();
     session.close_warm().unwrap();
+    // Returning a Region to the free queue precedes its counter updates.
+    // Join the workers before comparing independently sampled counters.
+    let detailed = runtime.detailed_snapshot().unwrap();
+    drop(runtime);
+    assert_eq!(detailed.region.reclaiming_region_count, 0);
+    assert!(detailed.summary.region_rotations > 0);
+    let reclaim = detailed.summary.reclaim;
+    assert!(reclaim.regions > 0);
+    assert!(reclaim.bytes_read > 0);
+    assert!(reclaim.records_scanned > 0);
+    assert!(reclaim.index_entries_removed <= reclaim.records_scanned);
+    // The explicit drain may fence the optional reinsertion before its
+    // reclaimer enters the mutation gate. Heat classification must still
+    // offer the candidate, while either admission or a bounded skip is a
+    // valid best-effort outcome.
+    assert!(
+        reclaim.reinsert_records + reclaim.reinsert_skipped > 0,
+        "{reclaim:?}"
+    );
+    assert_eq!(reclaim.reinsert_bytes == 0, reclaim.reinsert_records == 0);
+    assert!(reclaim.reinsert_bytes.saturating_mul(8) <= reclaim.bytes_read);
     assert_eq!(retained_hits[0].value(), rotation_value);
     drop(retained_hits);
     let mut recovered = CacheSession::for_test(directory.paths.clone(), data, 4096).unwrap();
