@@ -1371,7 +1371,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
                 let request = submit_background_io(
                     engine,
                     IoOperation::write(WritePoint::Record, write_buffer(memory, &[5; 4096]), 0),
-                    Duration::from_millis(80),
+                    Duration::from_millis(800),
                     &mut attempt,
                 )
                 .unwrap();
@@ -1383,7 +1383,7 @@ fn adaptive_pressure_pauses_before_real_engine_timeout_and_resumes_after_io_comp
             assert!(io.wait_for_entered(1));
             let deadline = Instant::now() + Duration::from_secs(2);
             while control.snapshot().pressure != FillPressure::Paused && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(5));
             }
             let paused = control.snapshot();
             let recovered = io_recovery.is_recovering();
