@@ -183,14 +183,8 @@ impl MemoryValue {
         seqno: u64,
         charge: MemoryCharge,
         recycled: Option<Self>,
-    ) -> Result<Self, MemoryCharge> {
-        let Some(length) = key
-            .len()
-            .checked_add(value.len())
-            .and_then(|bytes| bytes.checked_add(MEMORY_VALUE_SEQNO_BYTES))
-        else {
-            return Err(charge);
-        };
+    ) -> Option<Self> {
+        let length = MEMORY_VALUE_SEQNO_BYTES + key.len() + value.len();
         // Reuse only a detached, exclusively owned allocation of the exact
         // size. Caller-held values remain immutable and keep their own charge.
         if let Some(mut recycled) = recycled
@@ -202,16 +196,14 @@ impl MemoryValue {
             inner.bytes[length - MEMORY_VALUE_SEQNO_BYTES..].copy_from_slice(&seqno.to_le_bytes());
             inner.key_length = key.len();
             inner.charge = charge;
-            return Ok(recycled);
+            return Some(recycled);
         }
         let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(length).is_err() {
-            return Err(charge);
-        }
+        bytes.try_reserve_exact(length).ok()?;
         bytes.extend_from_slice(key);
         bytes.extend_from_slice(value);
         bytes.extend_from_slice(&seqno.to_le_bytes());
-        Ok(Self(Arc::new(MemoryValueInner {
+        Some(Self(Arc::new(MemoryValueInner {
             bytes: bytes.into_boxed_slice(),
             key_length: key.len(),
             charge,
@@ -222,7 +214,7 @@ impl MemoryValue {
         MEMORY_ENTRY_OVERHEAD_BYTES + self.0.bytes.len() - MEMORY_VALUE_SEQNO_BYTES
     }
 
-    pub fn key(&self) -> &[u8] {
+    fn key(&self) -> &[u8] {
         &self.0.bytes[..self.0.key_length]
     }
 
@@ -289,7 +281,6 @@ const _: () = assert!(size_of::<Option<MemoryEntry>>() == 2 * size_of::<usize>()
 struct DetachedAdmissionEntry {
     index: usize,
     policy: DetachedPolicy,
-    weight: usize,
     transfers_charge: bool,
 }
 
@@ -315,7 +306,7 @@ impl AdmissionVictims {
             .expect("admission victims exceed their fixed budget");
         *slot = Some(victim);
         self.len += 1;
-        self.released_bytes = self.released_bytes.saturating_add(victim.weight);
+        self.released_bytes = self.released_bytes.saturating_add(victim.policy.weight());
     }
 
     fn iter(&self) -> impl Iterator<Item = DetachedAdmissionEntry> + '_ {
@@ -469,47 +460,28 @@ impl MemoryShard {
             return None;
         }
 
-        let entry_next = self.slots[index]
-            .as_ref()
-            .expect("resident slot disappeared")
-            .hash_next;
+        let mut entry = self.slots[index].take().expect("resident slot disappeared");
         if let Some(predecessor) = predecessor {
             self.slots[predecessor]
                 .as_mut()
                 .expect("hash-chain predecessor disappeared")
-                .hash_next = entry_next;
-        } else if entry_next == NO_SLOT_INDEX {
+                .hash_next = entry.hash_next;
+        } else if entry.hash_next == NO_SLOT_INDEX {
             let removed = self.directory.remove(hash);
             debug_assert_eq!(removed, u32::try_from(index).ok());
         } else {
             let replaced = self
                 .directory
-                .insert(hash, entry_next)
+                .insert(hash, entry.hash_next)
                 .expect("preflighted fixed L1 directory insertion");
             debug_assert!(replaced.is_some());
         }
 
-        let resident_bytes = self.slots[index]
-            .as_ref()
-            .expect("resident slot disappeared")
-            .value
-            .charged_bytes();
+        let resident_bytes = entry.value.charged_bytes();
         if transfer_charge {
-            let released = self.slots[index]
-                .as_mut()
-                .expect("resident slot disappeared")
-                .value
-                .disarm_exclusive_charge();
-            debug_assert_eq!(
-                released,
-                self.slots[index]
-                    .as_ref()
-                    .expect("resident slot disappeared")
-                    .value
-                    .charged_bytes()
-            );
+            let released = entry.value.disarm_exclusive_charge();
+            debug_assert_eq!(released, resident_bytes);
         }
-        let entry = self.slots[index].take().expect("resident slot disappeared");
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_bytes);
         debug_assert!(self.free_count < self.slots.len());
         let packed = u32::try_from(index).expect("memory slot index exceeds u32");
@@ -528,11 +500,9 @@ impl MemoryShard {
         let policy = self
             .eviction
             .detach_for_admission(&mut self.policy_slots, index, weight);
-        debug_assert_eq!(policy.weight(), weight);
         DetachedAdmissionEntry {
             index,
             policy,
-            weight,
             transfers_charge,
         }
     }
@@ -598,7 +568,7 @@ impl MemoryShard {
         let replacement = replacement.map(|index| self.detach_for_admission(index));
         let replacement_bytes = replacement
             .filter(|entry| entry.transfers_charge)
-            .map_or(0, |entry| entry.weight);
+            .map_or(0, |entry| entry.policy.weight());
         let mut victims = AdmissionVictims::new();
         let mut remaining_steps = MAX_POLICY_SCAN_STEPS;
         while replacement_bytes.saturating_add(victims.released_bytes)
@@ -688,7 +658,7 @@ impl MemoryShard {
         if (replacement.is_none() && self.hash_chain_is_full(hash))
             || !self.directory.can_upsert(hash)
         {
-            return MemoryInsertResult::bypassed();
+            return MemoryInsertResult::bypassed(0);
         }
 
         let (charge, evictions, recycled) =
@@ -699,18 +669,18 @@ impl MemoryShard {
                     recycled,
                 } => (charge, evictions, recycled),
                 ChargeResult::Rejected => {
-                    return MemoryInsertResult::bypassed();
+                    return MemoryInsertResult::bypassed(0);
                 }
             };
         let packed_index = self.free_head;
         if packed_index == NO_SLOT_INDEX {
-            return MemoryInsertResult::rejected(evictions);
+            return MemoryInsertResult::bypassed(evictions);
         }
         let Ok(index) = usize::try_from(packed_index) else {
-            return MemoryInsertResult::rejected(evictions);
+            return MemoryInsertResult::bypassed(evictions);
         };
-        let Ok(memory_value) = MemoryValue::try_new(key, value, seqno, charge, recycled) else {
-            return MemoryInsertResult::rejected(evictions);
+        let Some(memory_value) = MemoryValue::try_new(key, value, seqno, charge, recycled) else {
+            return MemoryInsertResult::bypassed(evictions);
         };
         let previous_head = self
             .directory
@@ -743,21 +713,14 @@ enum ChargeResult {
     Rejected,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy)]
 struct MemoryInsertResult {
     slot: Option<u32>,
     evictions: usize,
 }
 
 impl MemoryInsertResult {
-    const fn bypassed() -> Self {
-        Self {
-            slot: None,
-            evictions: 0,
-        }
-    }
-
-    const fn rejected(evictions: usize) -> Self {
+    const fn bypassed(evictions: usize) -> Self {
         Self {
             slot: None,
             evictions,
@@ -829,11 +792,6 @@ impl MemoryStore {
         eviction_policy: L1EvictionPolicy,
         activity_counters_enabled: bool,
     ) -> io::Result<Self> {
-        if shard_count == 0 {
-            return Err(invalid_memory_layout(
-                "memory tier requires at least one shard",
-            ));
-        }
         let metadata_bytes =
             Self::allocation_bytes(capacity_bytes, entry_capacity, shard_count, eviction_policy)?;
         let mut shards = Vec::new();
@@ -847,9 +805,7 @@ impl MemoryStore {
         for shard_id in 0..shard_count {
             let (shard_capacity, shard_entries) =
                 shard_geometry(capacity_bytes, entry_capacity, shard_count, shard_id);
-            actual_entry_capacity = actual_entry_capacity
-                .checked_add(shard_entries)
-                .ok_or_else(|| invalid_memory_layout("L1 entry capacity overflow"))?;
+            actual_entry_capacity += shard_entries;
             shards.push(MemoryShardLock(Mutex::new(MemoryShard::new(
                 shard_capacity,
                 shard_entries,
@@ -904,16 +860,16 @@ impl MemoryStore {
 
     pub fn publish(&self, hash: u64, key: &[u8], value: &[u8], seqno: u64) -> bool {
         if self.entry_capacity == 0 {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return false;
         }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return false;
         };
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return false;
         };
         let existing = shard.find(hash, key);
@@ -929,7 +885,7 @@ impl MemoryStore {
                 shard.remove_slot(index);
             }
             drop(shard);
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return false;
         }
         let result = shard.insert(hash, key, value, seqno, charged_bytes, existing);
@@ -946,7 +902,7 @@ impl MemoryStore {
         }
         let shard_id = self.route(hash);
         let Some(mut shard) = self.try_lock_shard(shard_id) else {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return false;
         };
         let Some(index) = shard.find(hash, key) else {
@@ -1003,15 +959,15 @@ impl MemoryStore {
             return None;
         }
         if self.entry_capacity == 0 {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return None;
         }
         let Some(charged_bytes) = memory_entry_bytes(key, value) else {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return None;
         };
         if charged_bytes > MAX_L1_ENTRY_BYTES {
-            self.record_insert(MemoryInsertResult::bypassed());
+            self.record_insert(MemoryInsertResult::bypassed(0));
             return None;
         }
         let mut shard = self.try_lock_shard(token.shard_id)?;
@@ -1060,15 +1016,9 @@ impl MemoryStore {
             let shard = shard
                 .lock()
                 .map_err(|_| io::Error::other("L1 shard is poisoned"))?;
-            resident_entries = resident_entries
-                .checked_add(shard.slots.len().saturating_sub(shard.free_count))
-                .ok_or_else(|| invalid_memory_layout("L1 resident entry count overflow"))?;
-            resident_bytes = resident_bytes
-                .checked_add(shard.resident_bytes)
-                .ok_or_else(|| invalid_memory_layout("L1 resident byte count overflow"))?;
-            charged_bytes = charged_bytes
-                .checked_add(shard.budget.used_bytes())
-                .ok_or_else(|| invalid_memory_layout("L1 charged byte count overflow"))?;
+            resident_entries += shard.slots.len().saturating_sub(shard.free_count);
+            resident_bytes += shard.resident_bytes;
+            charged_bytes += shard.budget.used_bytes();
         }
         Ok(CacheL1Snapshot {
             entry_capacity: self.entry_capacity,

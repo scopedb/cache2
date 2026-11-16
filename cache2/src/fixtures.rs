@@ -47,6 +47,9 @@ use std::time::Instant;
 use crate::io::file::CacheFile;
 use crate::io::file::PositionedIo;
 use crate::region::persistence::RegionPaths;
+use crate::region::recovery::DataGeometry;
+use crate::region::recovery::DataSuperblock;
+use crate::region::recovery::PersistentId;
 
 /// Checks every byte, including zero padding, and returns the committed bytes
 /// for decoder compatibility checks.
@@ -200,6 +203,21 @@ pub fn eventually_admitted<T>(mut put: impl FnMut() -> io::Result<T>) -> T {
             }
             Err(error) => panic!("cache write failed: {error}"),
         }
+    }
+}
+
+pub fn test_data_superblock(region_size: u64, region_count: u32) -> DataSuperblock {
+    DataSuperblock {
+        generation: 1,
+        cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
+        data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
+        geometry: DataGeometry {
+            data_file_len: DataGeometry::expected_file_len(region_size, region_count).unwrap(),
+            region_size,
+            region_count,
+        },
+        hash_seed: 3,
+        storage_fingerprint: 4,
     }
 }
 

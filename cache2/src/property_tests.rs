@@ -223,7 +223,7 @@ fn exercise_region_index_operations(input: &[u8]) {
 
         match operation[0] % 7 {
             0 => {
-                assert!(index.upsert(hash, IndexEntry { location }).unwrap());
+                index.upsert(hash, IndexEntry { location }).unwrap();
                 assert_eq!(
                     index.lookup_raw(hash).unwrap(),
                     Some(indexed_entry(location))
@@ -281,7 +281,7 @@ fn exercise_region_index_operations(input: &[u8]) {
                 }
             }
             _ => {
-                assert!(index.upsert(hash, IndexEntry { location }).unwrap());
+                index.upsert(hash, IndexEntry { location }).unwrap();
                 assert_eq!(
                     index.prepare_reclaim(hash, location).unwrap(),
                     ReclaimIndexAction::Removed

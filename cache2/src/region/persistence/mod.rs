@@ -63,18 +63,17 @@ use crate::region::recovery::StateRecord;
 use crate::region::recovery::StateSelectionError;
 use crate::region::recovery::clean_image_matches;
 use crate::region::recovery::latest_state;
-use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
-use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
 use crate::region::recovery::metadata::RegionMetadataRecord;
 use crate::region::recovery::metadata::RegionMetadataRoot;
 use crate::region::recovery::metadata::RegionState;
+use crate::region::recovery::metadata::region_metadata_encoded_len;
 use crate::region::recovery::prepare_next_state;
 use crate::region::recovery::prepare_running_barrier;
 use crate::region::recovery::recovery_image_index_len;
 use crate::region::region_metadata_io_error;
+use crate::snapshot::StartupMode;
 
 /// Shared shard count for compact concrete-file fixtures.
 #[cfg(test)]
@@ -102,10 +101,21 @@ impl RegionPaths {
     }
 }
 
-pub struct RecoveryImage {
+struct RecoveryImage {
     file: File,
     header: RecoveryImageHeader,
     metadata: RegionMetadata,
+}
+
+enum InspectOutcome {
+    FreshCold,
+    ExistingCold,
+    Warm(Box<RecoveryImage>),
+}
+
+struct LockedFiles<F> {
+    data: F,
+    state: F,
 }
 
 pub struct PreparedClean {
@@ -124,13 +134,10 @@ where
     /// storage-layout fingerprint.
     format_data: DataSuperblock,
     file_system: F,
-    data_file: Option<F::File>,
-    state_file: Option<F::File>,
+    files: Option<LockedFiles<F::File>>,
     data: Option<DataSuperblock>,
     current_state: Option<SelectedState>,
     prepared_clean: Option<(u8, StateRecord)>,
-    cold_reset_needed: bool,
-    locked: bool,
     retain_lock: bool,
 }
 
@@ -140,21 +147,18 @@ impl<F: FileSystem> RegionPersistence<F> {
             paths,
             format_data,
             file_system,
-            data_file: None,
-            state_file: None,
+            files: None,
             data: None,
             current_state: None,
             prepared_clean: None,
-            cold_reset_needed: false,
-            locked: false,
             retain_lock: false,
         }
     }
 
-    fn state_file(&self) -> io::Result<&F::File> {
-        self.state_file
+    fn files(&self) -> io::Result<&LockedFiles<F::File>> {
+        self.files
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "state file is not open"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "cache files are not open"))
     }
 
     pub fn data_superblock(&self) -> io::Result<DataSuperblock> {
@@ -212,14 +216,18 @@ impl<F: FileSystem> RegionPersistence<F> {
         );
     }
 
-    fn cold_recovery(&self, reason: &'static str) -> io::Result<Option<RecoveryImage>> {
+    fn cold_recovery(&self, reason: &'static str, reset_files: bool) -> io::Result<InspectOutcome> {
         self.log_cold_recovery(reason);
-        Ok(None)
+        Ok(if reset_files {
+            InspectOutcome::ExistingCold
+        } else {
+            InspectOutcome::FreshCold
+        })
     }
 
     /// Acquire exclusive ownership of the data and state files before inspection.
     pub fn acquire_exclusive(&mut self, io_mode: IoMode) -> io::Result<()> {
-        if self.locked {
+        if self.files.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "cache files are already locked",
@@ -282,31 +290,51 @@ impl<F: FileSystem> RegionPersistence<F> {
             let _ = data.unlock();
             return Err(error);
         }
-        self.data_file = Some(data);
-        self.state_file = Some(state);
-        self.locked = true;
+        self.files = Some(LockedFiles { data, state });
         Ok(())
     }
 
-    /// Return an eligible clean image, or `None` to select a cold start.
-    /// This must not allocate or scan the full index or Region data extents.
-    pub fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<Option<RecoveryImage>> {
+    pub fn open_regions(
+        &mut self,
+        index_slots: usize,
+        append_shards: u32,
+    ) -> io::Result<(RegionStore, StartupMode)> {
+        match self.inspect_recovery(index_slots)? {
+            InspectOutcome::FreshCold => Ok((
+                self.cold_regions(index_slots, append_shards, false)?,
+                StartupMode::Cold,
+            )),
+            InspectOutcome::ExistingCold => Ok((
+                self.cold_regions(index_slots, append_shards, true)?,
+                StartupMode::Cold,
+            )),
+            InspectOutcome::Warm(image) => {
+                match self.recover_regions(*image, index_slots, append_shards)? {
+                    Some(regions) => Ok((regions, StartupMode::Warm)),
+                    None => Ok((
+                        self.cold_regions(index_slots, append_shards, true)?,
+                        StartupMode::Cold,
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Return an eligible clean image or select a cold start without scanning
+    /// the full index or Region data extents.
+    fn inspect_recovery(&mut self, index_slots: usize) -> io::Result<InspectOutcome> {
+        self.prepared_clean = None;
         self.file_system
             .remove_file(&recovery_temporary_path(&self.paths.image))?;
         let format_data = self.format_data;
-        let (data, fresh) = {
-            let data_file = self.data_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "data file is not open")
-            })?;
-            let state_file = self.state_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "state file is not open")
-            })?;
-            inspect_or_format_data(data_file, state_file, format_data)?
+        let (data, fresh, pages) = {
+            let files = self.files()?;
+            let (data, fresh) = inspect_or_format_data(&files.data, &files.state, format_data)?;
+            let pages = read_state_pages(&files.state)?;
+            (data, fresh, pages)
         };
         self.data = Some(data);
-        self.cold_reset_needed = !fresh;
 
-        let pages = read_state_pages(self.state_file()?)?;
         let (recovery_state, state_rejection) = match latest_state([&pages[0], &pages[1]]) {
             Ok(Some(selected)) => (Some(selected), None),
             Ok(None) => (None, Some("no_valid_state")),
@@ -321,16 +349,16 @@ impl<F: FileSystem> RegionPersistence<F> {
         // the greatest decodable record only so RUNNING advances beyond it.
         self.current_state = select_state_for_fence(&pages);
         if fresh {
-            return self.cold_recovery("fresh_data_file");
+            return self.cold_recovery("fresh_data_file", false);
         }
         let Some(selected) = recovery_state else {
-            return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"));
+            return self.cold_recovery(state_rejection.unwrap_or("no_valid_state"), true);
         };
         if selected.record.state != SessionState::Clean {
-            return self.cold_recovery("unclean_shutdown");
+            return self.cold_recovery("unclean_shutdown", true);
         }
         if !selected.record.binding.matches_data(data) {
-            return self.cold_recovery("state_data_mismatch");
+            return self.cold_recovery("state_data_mismatch", true);
         }
 
         let image = match self
@@ -339,46 +367,41 @@ impl<F: FileSystem> RegionPersistence<F> {
         {
             Ok(image) => image,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return self.cold_recovery("image_missing");
+                return self.cold_recovery("image_missing", true);
             }
             Err(error) => return Err(error),
         };
-        let data_file = self
-            .data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        let state_file = self
-            .state_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "state file is not open"))?;
-        if image.is_same_file(data_file)? || image.is_same_file(state_file)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache image aliases the data or state file",
-            ));
+        {
+            let files = self.files()?;
+            if image.is_same_file(&files.data)? || image.is_same_file(&files.state)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cache image aliases the data or state file",
+                ));
+            }
         }
 
         let actual_file_len = image.len()?;
         if actual_file_len < RECOVERY_PAGE_SIZE as u64 {
-            return self.cold_recovery("image_truncated");
+            return self.cold_recovery("image_truncated", true);
         }
         let mut header_page = [0_u8; RECOVERY_PAGE_SIZE];
         if let Err(error) = read_exact_at(&image, &mut header_page, 0) {
             if error.kind() == io::ErrorKind::UnexpectedEof {
-                return self.cold_recovery("image_truncated");
+                return self.cold_recovery("image_truncated", true);
             }
             return Err(error);
         }
         let header = match RecoveryImageHeader::probe(&header_page) {
             RecoveryImageHeaderProbe::Valid(header) => header,
             RecoveryImageHeaderProbe::Unsupported(_) => {
-                return self.cold_recovery("image_version_unsupported");
+                return self.cold_recovery("image_version_unsupported", true);
             }
             RecoveryImageHeaderProbe::Empty
             | RecoveryImageHeaderProbe::Corrupt
             | RecoveryImageHeaderProbe::Unrecognized
             | RecoveryImageHeaderProbe::Truncated => {
-                return self.cold_recovery("image_header_invalid");
+                return self.cold_recovery("image_header_invalid", true);
             }
         };
         let expected_slots = u64::try_from(index_slots).map_err(|_| {
@@ -387,21 +410,20 @@ impl<F: FileSystem> RegionPersistence<F> {
                 "index capacity does not fit u64",
             )
         })?;
-        let expected_index_len = recovery_image_index_len(expected_slots).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid index image length")
-        })?;
         if !clean_image_matches(
             selected.record,
             data,
             header,
             actual_file_len,
             expected_slots,
-            expected_index_len,
         ) {
-            return self.cold_recovery("image_identity_or_layout_mismatch");
+            return self.cold_recovery("image_identity_or_layout_mismatch", true);
         }
-        if header.region_table_len > maximum_region_metadata_len(data.geometry.region_count)? {
-            return self.cold_recovery("metadata_too_large");
+        let max_metadata_len =
+            region_metadata_encoded_len(data.geometry.region_count, MAX_INDEX_PARTITIONS as u32)
+                .ok_or_else(|| io::Error::other("Region metadata length overflow"))?;
+        if header.region_table_len > max_metadata_len {
+            return self.cold_recovery("metadata_too_large", true);
         }
 
         let metadata_len = usize::try_from(header.region_table_len).map_err(|_| {
@@ -422,14 +444,14 @@ impl<F: FileSystem> RegionPersistence<F> {
         metadata_bytes.resize(metadata_len, 0);
         if let Err(error) = read_exact_at(&image, &mut metadata_bytes, header.region_table_offset) {
             if error.kind() == io::ErrorKind::UnexpectedEof {
-                return self.cold_recovery("metadata_truncated");
+                return self.cold_recovery("metadata_truncated", true);
             }
             return Err(error);
         }
         let metadata = match RegionMetadata::decode_owned(metadata_bytes) {
             Ok(metadata) => metadata,
             Err(RegionMetadataError::UnsupportedVersion(_)) => {
-                return self.cold_recovery("metadata_version_unsupported");
+                return self.cold_recovery("metadata_version_unsupported", true);
             }
             Err(RegionMetadataError::Allocation) => {
                 return Err(io::Error::new(
@@ -437,40 +459,34 @@ impl<F: FileSystem> RegionPersistence<F> {
                     "cannot decode Region metadata",
                 ));
             }
-            Err(_) => return self.cold_recovery("metadata_invalid"),
+            Err(_) => return self.cold_recovery("metadata_invalid", true),
         };
         if !metadata.matches_image(data, header) {
-            return self.cold_recovery("metadata_identity_mismatch");
+            return self.cold_recovery("metadata_identity_mismatch", true);
         }
         let file = image.try_clone_mapping_file()?;
-        self.cold_reset_needed = false;
-        Ok(Some(RecoveryImage {
+        Ok(InspectOutcome::Warm(Box::new(RecoveryImage {
             file,
             header,
             metadata,
-        }))
+        })))
     }
 
     /// Discard stale recovery artifacts and construct an empty Region store.
-    pub fn cold_regions(
+    fn cold_regions(
         &mut self,
         index_slots: usize,
         append_shards: u32,
+        reset_files: bool,
     ) -> io::Result<RegionStore> {
         self.file_system.remove_file(&self.paths.image)?;
         self.file_system
             .remove_file(&recovery_temporary_path(&self.paths.image))?;
         let data = self.data_superblock()?;
-        if self.cold_reset_needed {
-            let data_file = self.data_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "data file is not open")
-            })?;
-            let state_file = self.state_file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "state file is not open")
-            })?;
-            format_empty_data(data_file, state_file, data)?;
+        if reset_files {
+            let files = self.files()?;
+            format_empty_data(&files.data, &files.state, data)?;
             self.current_state = None;
-            self.cold_reset_needed = false;
         }
         let metadata = empty_region_metadata(data, index_slots, append_shards)?;
         let index = match PartitionedIndexStorage::anonymous(index_slots) {
@@ -497,49 +513,20 @@ impl<F: FileSystem> RegionPersistence<F> {
     }
 
     /// `Ok(None)` rejects the complete image and selects a cold start.
-    pub fn recover_regions(
+    fn recover_regions(
         &mut self,
         mut image: RecoveryImage,
         index_slots: usize,
         append_shards: u32,
     ) -> io::Result<Option<RegionStore>> {
-        let data = self.data_superblock()?;
-        let expected_slots = u64::try_from(index_slots).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "index capacity does not fit u64",
-            )
-        })?;
-        let expected_index_len = recovery_image_index_len(expected_slots).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid index image length")
-        })?;
-        let actual_file_len = image.file.metadata()?.len();
-        let eligible = self.current_state.is_some_and(|selected| {
-            clean_image_matches(
-                selected.record,
-                data,
-                image.header,
-                actual_file_len,
-                expected_slots,
-                expected_index_len,
-            )
-        }) && image.metadata.matches_image(data, image.header)
-            && image.metadata.validate().is_ok();
-        if !eligible {
-            self.cold_reset_needed = true;
-            self.log_cold_recovery("image_became_ineligible");
-            return Ok(None);
-        }
         let previous_append_shards = image.metadata.root.shard_count;
         if previous_append_shards != append_shards {
             let added_shards = append_shards.saturating_sub(previous_append_shards);
             if added_shards > image.metadata.root.free_region_count {
-                self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_insufficient_free_regions");
                 return Ok(None);
             }
             if image.metadata.rebind_append_shards(append_shards).is_err() {
-                self.cold_reset_needed = true;
                 self.log_cold_recovery("append_shards_rebind_invalid");
                 return Ok(None);
             }
@@ -547,7 +534,10 @@ impl<F: FileSystem> RegionPersistence<F> {
         }
         let partition_stats = metadata_partition_stats(&image.metadata)?;
         let binding = index_image_binding(image.header);
-        let index_mapping_bytes = image.header.index_offset.saturating_add(expected_index_len);
+        let index_mapping_bytes = image
+            .header
+            .index_offset
+            .saturating_add(image.header.index_len);
         let index = match PartitionedIndexStorage::map_private(
             &image.file,
             image.header.index_offset,
@@ -557,7 +547,6 @@ impl<F: FileSystem> RegionPersistence<F> {
         ) {
             Ok(index) => index,
             Err(error) => {
-                self.cold_reset_needed = true;
                 self.log_cold_recovery_error(
                     "index_private_mmap_failed",
                     index_slots,
@@ -574,10 +563,11 @@ impl<F: FileSystem> RegionPersistence<F> {
     /// Replace both state slots with durable `RUNNING` generations so a torn
     /// page cannot revive a previous `CLEAN` generation after Region reuse.
     pub fn publish_running(&mut self) -> io::Result<()> {
+        self.prepared_clean = None;
         let binding = StateBinding::from_data(self.data_superblock()?, None);
         let barrier = prepare_running_barrier(self.current_state, binding)
             .map_err(|_| io::Error::other("RUNNING generation cannot advance"))?;
-        let state = self.state_file()?;
+        let state = &self.files()?.state;
         state.set_len(STATE_FILE_SIZE as u64)?;
         write_state_page(state, &barrier.first.page, barrier.first.offset())?;
         write_state_page(state, &barrier.second.page, barrier.second.offset())?;
@@ -592,10 +582,7 @@ impl<F: FileSystem> RegionPersistence<F> {
     }
 
     pub fn clone_data_handles(&self) -> io::Result<DataFileHandles> {
-        self.data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?
-            .try_clone_data_handles()
+        self.files()?.data.try_clone_data_handles()
     }
 
     /// Keep ownership with issued writes whose completion cannot be fenced.
@@ -612,12 +599,12 @@ impl<F: FileSystem> RegionPersistence<F> {
             .validate()
             .map_err(region_metadata_io_error)?;
         let storage = frozen.regions.index.storage();
+        let index_slots = u64::try_from(storage.slot_count()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
+        })?;
         let physical_stats = guarded_index_result(health, storage.physical_stats())?;
         let partition_stats = guarded_index_result(health, storage.partition_stats())?;
-        if source_metadata.root.index_slots
-            != u64::try_from(storage.slot_count()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
-            })?
+        if source_metadata.root.index_slots != index_slots
             || !metadata_partition_stats_match(source_metadata, &partition_stats)
         {
             return Err(io::Error::new(
@@ -635,9 +622,6 @@ impl<F: FileSystem> RegionPersistence<F> {
         let metadata_bytes = metadata.encode().map_err(region_metadata_io_error)?;
         let metadata_len = u64::try_from(metadata_bytes.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "Region metadata is too large")
-        })?;
-        let index_slots = u64::try_from(storage.slot_count()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "index capacity is too large")
         })?;
         let index_len = recovery_image_index_len(index_slots).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid index image length")
@@ -672,17 +656,10 @@ impl<F: FileSystem> RegionPersistence<F> {
             StateBinding::from_data(data, Some(header.image_binding())),
         )
         .map_err(|_| io::Error::other("CLEAN generation cannot advance"))?;
-        if clean_state.record.generation != image_generation {
-            return Err(io::Error::other(
-                "image and state generations were not frozen together",
-            ));
-        }
 
-        let data_file = self
-            .data_file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "data file is not open"))?;
-        data_file.sync(SyncPoint::WarmData, SyncMode::Data)?;
+        self.files()?
+            .data
+            .sync(SyncPoint::WarmData, SyncMode::Data)?;
 
         let temporary = recovery_temporary_path(&self.paths.image);
         self.file_system.remove_file(&temporary)?;
@@ -740,14 +717,7 @@ impl<F: FileSystem> RegionPersistence<F> {
             ));
         }
         let data = self.data_superblock()?;
-        let expected = prepare_next_state(
-            self.current_state,
-            SessionState::Clean,
-            prepared.state.record.binding,
-        )
-        .map_err(|_| io::Error::other("CLEAN generation cannot advance"))?;
-        if expected != prepared.state
-            || !prepared.state.record.binding.matches_data(data)
+        if !prepared.state.record.binding.matches_data(data)
             || prepared.state.record.binding.image.is_none()
         {
             return Err(io::Error::new(
@@ -755,7 +725,7 @@ impl<F: FileSystem> RegionPersistence<F> {
                 "CLEAN token no longer matches current data/state authority",
             ));
         }
-        let state = self.state_file()?;
+        let state = &self.files()?.state;
         prepared.health.require_healthy()?;
         write_state_page(state, &prepared.state.page, prepared.state.offset())?;
         state.sync(SyncPoint::CleanState, SyncMode::Data)?;
@@ -768,26 +738,16 @@ impl<F: FileSystem> RegionPersistence<F> {
 
     /// Release ownership, including during error unwinding after acquisition.
     pub fn release_exclusive(&mut self) -> io::Result<()> {
-        if !self.locked {
+        self.prepared_clean = None;
+        let Some(files) = self.files.take() else {
             return Ok(());
-        }
-        let state_result = self
-            .state_file
-            .as_ref()
-            .map(StorageFile::unlock)
-            .unwrap_or(Ok(()));
+        };
+        let state_result = files.state.unlock();
         let data_result = if self.retain_lock {
             Ok(())
         } else {
-            self.data_file
-                .as_ref()
-                .map(StorageFile::unlock)
-                .unwrap_or(Ok(()))
+            files.data.unlock()
         };
-        self.locked = false;
-        self.prepared_clean = None;
-        self.state_file.take();
-        self.data_file.take();
         state_result.and(data_result)
     }
 }
@@ -898,29 +858,6 @@ where
     B: PositionedIo,
 {
     write_all_at(file, WritePoint::State, page, offset)
-}
-
-fn maximum_region_metadata_len(region_count: u32) -> io::Result<u64> {
-    fn pages_for(count: u64, per_page: u64) -> io::Result<u64> {
-        count
-            .checked_add(per_page - 1)
-            .map(|rounded| rounded / per_page)
-            .ok_or_else(|| io::Error::other("Region metadata page count overflow"))
-    }
-
-    let region_pages = pages_for(
-        u64::from(region_count),
-        REGION_METADATA_REGIONS_PER_PAGE as u64,
-    )?;
-    let shard_pages = pages_for(
-        MAX_INDEX_PARTITIONS as u64,
-        REGION_METADATA_PARTITIONS_PER_PAGE as u64,
-    )?;
-    1_u64
-        .checked_add(region_pages)
-        .and_then(|pages| pages.checked_add(shard_pages))
-        .and_then(|pages| pages.checked_mul(REGION_METADATA_PAGE_SIZE as u64))
-        .ok_or_else(|| io::Error::other("Region metadata length overflow"))
 }
 
 fn empty_region_metadata(

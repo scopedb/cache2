@@ -146,7 +146,7 @@ impl<'a> BackgroundIoAttempt<'a> {
         if !self.recovering {
             self.recovering = true;
             if let Some(fill) = self.fill_control {
-                fill.set_recovering(true);
+                fill.hold_pause();
             }
             if self.io_recovery.pending.fetch_add(1, Ordering::AcqRel) == 0 {
                 log::warn!(target: "cache2::health", event = "cache_io_recovery_started";
@@ -164,7 +164,7 @@ impl<'a> BackgroundIoAttempt<'a> {
         if self.recovering {
             let last = self.io_recovery.pending.fetch_sub(1, Ordering::AcqRel) == 1;
             if let Some(fill) = self.fill_control {
-                fill.set_recovering(false);
+                fill.release_pause();
             }
             if last {
                 log::info!(target: "cache2::health", event = "cache_io_recovery_completed";

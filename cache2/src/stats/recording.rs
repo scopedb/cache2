@@ -154,6 +154,22 @@ pub struct Recorder {
     io_histograms: Box<[Histogram]>,
 }
 
+const NO_HISTOGRAM: usize = usize::MAX;
+
+fn request_histogram_layout(options: StatsOptions) -> ([usize; REQUEST_SERIES.len()], usize) {
+    let mut indices = [NO_HISTOGRAM; REQUEST_SERIES.len()];
+    let mut series = 0;
+    for (index, &(operation, outcome)) in REQUEST_SERIES.iter().enumerate() {
+        if options.latency_mode(RequestLatencyScope::for_request(operation, outcome))
+            != LatencyMode::Off
+        {
+            indices[index] = series;
+            series += 1;
+        }
+    }
+    (indices, series)
+}
+
 impl Recorder {
     pub fn allocation_bytes(options: StatsOptions) -> io::Result<usize> {
         if !options.shards.is_power_of_two() || options.shards > 64 {
@@ -163,13 +179,7 @@ impl Recorder {
             ));
         }
         let counters = usize::from(options.request_counters) * size_of::<Counters>();
-        let request = REQUEST_SERIES
-            .iter()
-            .filter(|&&(operation, outcome)| {
-                options.latency_mode(RequestLatencyScope::for_request(operation, outcome))
-                    != LatencyMode::Off
-            })
-            .count();
+        let (_, request) = request_histogram_layout(options);
         let io = usize::from(options.io_latency) * IO_SERIES;
         Ok(options.shards * (counters + (request + io) * size_of::<Histogram>()))
     }
@@ -180,16 +190,7 @@ impl Recorder {
             usize::from(options.request_counters) * options.shards,
             || Counters(array::from_fn(|_| AtomicU64::new(0))),
         )?;
-        let mut histogram_indices = [usize::MAX; REQUEST_SERIES.len()];
-        let mut histogram_series = 0;
-        for (index, &(operation, outcome)) in REQUEST_SERIES.iter().enumerate() {
-            if options.latency_mode(RequestLatencyScope::for_request(operation, outcome))
-                != LatencyMode::Off
-            {
-                histogram_indices[index] = histogram_series;
-                histogram_series += 1;
-            }
-        }
+        let (histogram_indices, histogram_series) = request_histogram_layout(options);
         Ok(Self {
             options,
             counters,
@@ -254,7 +255,7 @@ impl Recorder {
                     }),
                     latency_scope: scope,
                     latency_mode: self.options.latency_mode(scope),
-                    latency: (self.histogram_indices[index] != usize::MAX).then(|| {
+                    latency: (self.histogram_indices[index] != NO_HISTOGRAM).then(|| {
                         histogram_snapshot(
                             &self.request_histograms,
                             self.histogram_series,

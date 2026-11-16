@@ -113,13 +113,9 @@ pub struct RegionWriteSpan {
     pub max_seqno: u64,
 }
 
-/// Exact in-memory authority carried across a Region rotation. Until
-/// [`RegionManager::finish_rotation`] accepts this receipt, the shard rejects
-/// new reservations and the sealed Region stays out of the reclaim FIFO.
+/// Exact in-memory authority produced by one atomic Region rotation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegionRotationReceipt {
-    pub shard_id: usize,
-    sealed_region_id: u32,
     pub activated_region_id: u32,
     pub activated_created_seqno: u64,
 }
@@ -132,26 +128,6 @@ pub struct RegionReclaimReceipt {
     pub created_seqno: u64,
     pub used_offset: u64,
     pub physical_record_count: u64,
-}
-
-/// Read-only selection of the next FIFO rotation victim.
-///
-/// A caller may retain this value while it drops manager authority. It must
-/// hold the process-wide rotation gate until
-/// [`RegionManager::begin_rotation`] consumes the candidate.
-/// `victim_created_seqno` identifies the generation being replaced.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RegionRotationCandidate {
-    pub shard_id: usize,
-    victim_region_id: u32,
-    victim_created_seqno: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RegionRotationSelection {
-    candidate: RegionRotationCandidate,
-    old_index: usize,
-    victim_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,7 +146,6 @@ struct AppendShardState {
     pending_padding: Option<RegionPaddingReceipt>,
     submitted_span: Option<RegionWriteSpan>,
     rotation_requested: bool,
-    rotation: Option<RegionRotationReceipt>,
 }
 
 impl AppendShardState {
@@ -179,7 +154,6 @@ impl AppendShardState {
             && self.open_span.is_none()
             && self.pending_padding.is_none()
             && self.submitted_span.is_none()
-            && self.rotation.is_none()
     }
 }
 
@@ -302,6 +276,7 @@ impl RegionManager {
         })
     }
 
+    #[cfg(test)]
     pub const fn region_size(&self) -> u64 {
         self.region_size
     }
@@ -462,7 +437,7 @@ impl RegionManager {
             .append_states
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail.is_some() || shard.pending_padding.is_some() || shard.rotation.is_some() {
+        if shard.tail.is_some() || shard.pending_padding.is_some() {
             return Err(RegionMutationError::WouldBlock);
         }
         let region_id = *self
@@ -582,10 +557,7 @@ impl RegionManager {
             .get(shard_id)
             .copied()
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail.is_some()
-            || shard.pending_padding.is_some()
-            || shard.submitted_span.is_some()
-            || shard.rotation.is_some()
+        if shard.tail.is_some() || shard.pending_padding.is_some() || shard.submitted_span.is_some()
         {
             return Err(RegionMutationError::WouldBlock);
         }
@@ -653,42 +625,6 @@ impl RegionManager {
         Ok(Some(receipt))
     }
 
-    /// Cancels only the current, not-yet-staged tail. Sequence numbers remain
-    /// consumed, but the reservation cursor is rolled back exactly because no
-    /// later reservation can exist on the same shard.
-    #[cfg(test)]
-    fn cancel_reservation(
-        &mut self,
-        receipt: RegionAppendReservation,
-    ) -> Result<(), RegionMutationError> {
-        let shard = self
-            .append_states
-            .get(receipt.shard_id)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail != Some(receipt) {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let region_index = usize::try_from(receipt.region_id)
-            .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
-        let region = self
-            .regions
-            .get(region_index)
-            .ok_or(RegionMutationError::StaleReceipt)?;
-        if self.active_regions.get(receipt.shard_id) != Some(&receipt.region_id)
-            || region.state != RegionState::Active
-            || receipt.seqno < region.created_seqno
-            || region.reserved_used
-                != receipt
-                    .end_offset()
-                    .ok_or(RegionMutationError::ArithmeticOverflow)?
-        {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        self.regions[region_index].reserved_used = u64::from(receipt.offset);
-        self.append_states[receipt.shard_id].tail = None;
-        Ok(())
-    }
-
     /// Seals the shard's accumulated resident records into one ordered device
     /// span. A second span may be built concurrently in resident staging, but
     /// only one submitted span per shard is admitted at a time.
@@ -700,10 +636,7 @@ impl RegionManager {
             .append_states
             .get(shard_id)
             .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.tail.is_some()
-            || shard.pending_padding.is_some()
-            || shard.rotation.is_some()
-            || shard.submitted_span.is_some()
+        if shard.tail.is_some() || shard.pending_padding.is_some() || shard.submitted_span.is_some()
         {
             return Err(RegionMutationError::WouldBlock);
         }
@@ -726,37 +659,8 @@ impl RegionManager {
             .copied()
             .ok_or(RegionMutationError::InvalidShard)?;
         if shard.tail.is_some()
-            || shard.rotation.is_some()
             || shard.submitted_span.is_some()
             || shard.pending_padding != Some(padding)
-        {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let open = shard.open_span.ok_or(RegionMutationError::StaleReceipt)?;
-        if open.region_id != padding.region_id
-            || open.start_offset != padding.span_start_offset
-            || open.end_offset != padding.unpadded_end_offset
-            || open.record_count != padding.record_count
-            || open.max_seqno != padding.max_seqno
-            || padding
-                .padding_bytes()
-                .is_none_or(|bytes| bytes == 0 || bytes as usize >= DIRECT_IO_ALIGNMENT)
-            || !padding
-                .padded_end_offset
-                .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
-        {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let region_index = usize::try_from(padding.region_id)
-            .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
-        let region = self
-            .regions
-            .get(region_index)
-            .ok_or(RegionMutationError::StaleReceipt)?;
-        if self.active_regions.get(padding.shard_id) != Some(&padding.region_id)
-            || region.state != RegionState::Active
-            || padding.max_seqno < region.created_seqno
-            || region.reserved_used != padding.padded_end_offset
         {
             return Err(RegionMutationError::StaleReceipt);
         }
@@ -841,17 +745,6 @@ impl RegionManager {
         Ok(())
     }
 
-    /// Selects the next FIFO victim without changing manager authority.
-    ///
-    /// [`Self::begin_rotation`] validates the same FIFO selection again before
-    /// it mutates any state.
-    pub fn rotation_candidate(
-        &self,
-        shard_id: usize,
-    ) -> Result<RegionRotationCandidate, RegionMutationError> {
-        Ok(self.select_rotation(shard_id)?.candidate)
-    }
-
     #[cfg(test)]
     pub fn request_rotation_for_test(
         &mut self,
@@ -865,61 +758,12 @@ impl RegionManager {
         Ok(())
     }
 
-    /// Starts one previously selected FIFO rotation without performing I/O.
-    /// Only a Region already cleaned into the Free queue may be activated. The
-    /// outgoing Active Region is withheld from the FIFO until
-    /// [`Self::finish_rotation`] commits the in-memory rotation.
-    ///
-    /// This remains the only rotation mutation authority. A stale candidate is
-    /// rejected before a sequence number or queue entry is consumed.
-    pub fn begin_rotation(
+    /// Atomically rotates an empty shard from the Free FIFO and seals its
+    /// outgoing Active Region into the reclaim FIFO without performing I/O.
+    pub fn rotate_shard(
         &mut self,
-        candidate: RegionRotationCandidate,
-    ) -> Result<RegionRotationReceipt, RegionMutationError> {
-        let selection = self.select_rotation(candidate.shard_id)?;
-        if selection.candidate != candidate {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let RegionRotationSelection {
-            old_index,
-            victim_index,
-            ..
-        } = selection;
-        let shard_id = candidate.shard_id;
-        let victim_region_id = candidate.victim_region_id;
-        let created_seqno = self.allocate_seqno()?;
-        let removed = self.free_regions.pop_front();
-        if removed != Some(victim_region_id) {
-            return Err(RegionMutationError::Invariant(
-                "rotation victim changed during selection",
-            ));
-        }
-
-        self.regions[old_index].state = RegionState::Sealed;
-        self.regions[victim_index] = RegionDesc {
-            state: RegionState::Active,
-            created_seqno,
-            completed_used: 0,
-            reserved_used: 0,
-            physical_record_count: 0,
-        };
-        self.active_regions[shard_id] = victim_region_id;
-        let receipt = RegionRotationReceipt {
-            shard_id,
-            sealed_region_id: u32::try_from(old_index)
-                .map_err(|_| RegionMutationError::ArithmeticOverflow)?,
-            activated_region_id: victim_region_id,
-            activated_created_seqno: created_seqno,
-        };
-        self.append_states[shard_id].rotation_requested = false;
-        self.append_states[shard_id].rotation = Some(receipt);
-        Ok(receipt)
-    }
-
-    fn select_rotation(
-        &self,
         shard_id: usize,
-    ) -> Result<RegionRotationSelection, RegionMutationError> {
+    ) -> Result<RegionRotationReceipt, RegionMutationError> {
         let shard = self
             .append_states
             .get(shard_id)
@@ -929,7 +773,6 @@ impl RegionManager {
             || shard.open_span.is_some()
             || shard.pending_padding.is_some()
             || shard.submitted_span.is_some()
-            || shard.rotation.is_some()
         {
             return Err(RegionMutationError::WouldBlock);
         }
@@ -969,64 +812,37 @@ impl RegionManager {
                 "rotation victim queue is inconsistent",
             ));
         }
-        Ok(RegionRotationSelection {
-            candidate: RegionRotationCandidate {
-                shard_id,
-                victim_region_id,
-                victim_created_seqno: victim.created_seqno,
-            },
-            old_index,
-            victim_index,
-        })
-    }
-
-    /// Publishes the outgoing Region at the tail of the sealed FIFO. A
-    /// repeated or late receipt cannot make a Region reachable by the current
-    /// generation.
-    pub fn finish_rotation(
-        &mut self,
-        receipt: RegionRotationReceipt,
-    ) -> Result<(), RegionMutationError> {
-        let shard = self
-            .append_states
-            .get(receipt.shard_id)
-            .ok_or(RegionMutationError::InvalidShard)?;
-        if shard.rotation != Some(receipt) {
-            return Err(RegionMutationError::StaleReceipt);
-        }
-        let sealed_index = usize::try_from(receipt.sealed_region_id)
-            .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
-        let activated_index = usize::try_from(receipt.activated_region_id)
-            .map_err(|_| RegionMutationError::ArithmeticOverflow)?;
-        let sealed = self
-            .regions
-            .get(sealed_index)
-            .ok_or(RegionMutationError::StaleReceipt)?;
-        let activated = self
-            .regions
-            .get(activated_index)
-            .ok_or(RegionMutationError::StaleReceipt)?;
-        if self.active_regions.get(receipt.shard_id) != Some(&receipt.activated_region_id)
-            || sealed.state != RegionState::Sealed
-            || activated.state != RegionState::Active
-            || activated.created_seqno != receipt.activated_created_seqno
-        {
-            return Err(RegionMutationError::StaleReceipt);
-        }
         if self
             .free_regions
             .len()
             .saturating_add(self.sealed_regions.len())
-            >= self.queue_capacity
+            > self.queue_capacity
         {
             return Err(RegionMutationError::Invariant(
                 "sealed Region queue exceeded its reserved capacity",
             ));
         }
-        self.sealed_regions.push_back(receipt.sealed_region_id);
+
+        let created_seqno = self.allocate_seqno()?;
+        let removed = self.free_regions.pop_front();
+        debug_assert_eq!(removed, Some(victim_region_id));
+
+        self.regions[old_index].state = RegionState::Sealed;
+        self.regions[victim_index] = RegionDesc {
+            state: RegionState::Active,
+            created_seqno,
+            completed_used: 0,
+            reserved_used: 0,
+            physical_record_count: 0,
+        };
+        self.active_regions[shard_id] = victim_region_id;
+        self.sealed_regions.push_back(old_region_id);
         self.rotations = self.rotations.saturating_add(1);
-        self.append_states[receipt.shard_id].rotation = None;
-        Ok(())
+        self.append_states[shard_id].rotation_requested = false;
+        Ok(RegionRotationReceipt {
+            activated_region_id: victim_region_id,
+            activated_created_seqno: created_seqno,
+        })
     }
 
     /// Removes the oldest sealed Region from the reusable queues while a
@@ -1504,15 +1320,10 @@ mod tests {
         let mut stale = reservation;
         stale.seqno += 1;
         assert_eq!(
-            manager.cancel_reservation(stale),
+            manager.stage_reservation(stale),
             Err(RegionMutationError::StaleReceipt)
         );
-        manager.cancel_reservation(reservation).unwrap();
-        assert_eq!(manager.regions[3].reserved_used, 0);
-        assert_eq!(
-            manager.cancel_reservation(reservation),
-            Err(RegionMutationError::StaleReceipt)
-        );
+        manager.stage_reservation(reservation).unwrap();
         assert_eq!(manager.next_seqno(), 9);
     }
 
@@ -1648,7 +1459,7 @@ mod tests {
                         assert_eq!(manager.regions()[active as usize].reserved_used, used);
                         assert_eq!(manager.regions()[active as usize].completed_used, completed);
                         assert_eq!(
-                            manager.rotation_candidate(0),
+                            manager.rotate_shard(0),
                             Err(RegionMutationError::WouldBlock)
                         );
                     }
@@ -1672,20 +1483,18 @@ mod tests {
                     };
                     assert_eq!(span.end_offset, padded);
                     assert_eq!(
-                        manager.rotation_candidate(0),
+                        manager.rotate_shard(0),
                         Err(RegionMutationError::WouldBlock)
                     );
                     manager.complete_write_span(span).unwrap();
                     assert_eq!(manager.regions()[active as usize].completed_used, padded);
                     if needs_rotation {
-                        let candidate = manager.rotation_candidate(0).unwrap();
-                        let receipt = manager.begin_rotation(candidate).unwrap();
-                        manager.finish_rotation(receipt).unwrap();
+                        manager.rotate_shard(0).unwrap();
                         assert!(!manager.rotation_requested(0).unwrap());
                         assert_ne!(manager.active_regions()[0], active);
                     }
                     assert_eq!(
-                        manager.rotation_candidate(0),
+                        manager.rotate_shard(0),
                         Err(RegionMutationError::WouldBlock)
                     );
                     let next_reservation = manager.reserve_append(0, next).unwrap();
@@ -1716,7 +1525,7 @@ mod tests {
                     Err(RegionMutationError::FlushBeforeRotation)
                 );
                 assert_eq!(
-                    manager.rotation_candidate(0),
+                    manager.rotate_shard(0),
                     Err(RegionMutationError::WouldBlock)
                 );
             }
@@ -1730,7 +1539,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                manager.rotation_candidate(0),
+                manager.rotate_shard(0),
                 Err(RegionMutationError::WouldBlock)
             );
             manager.complete_write_span(span).unwrap();
@@ -1739,13 +1548,10 @@ mod tests {
                 manager.region_size()
             );
             // No new failed reservation is needed to make rotation eligible.
-            let rotation = manager
-                .begin_rotation(manager.rotation_candidate(0).unwrap())
-                .unwrap();
-            manager.finish_rotation(rotation).unwrap();
+            manager.rotate_shard(0).unwrap();
             assert_ne!(manager.active_regions()[0] as usize, active_region);
             assert_eq!(
-                manager.rotation_candidate(0),
+                manager.rotate_shard(0),
                 Err(RegionMutationError::WouldBlock),
                 "the retained request must rotate exactly once"
             );
@@ -1753,25 +1559,20 @@ mod tests {
     }
 
     #[test]
-    fn rotation_prefers_free_and_withholds_old_active_until_finish() {
+    fn rotation_prefers_free_and_seals_outgoing_region() {
         let metadata = sample();
         let shards = metadata.partitions.clone();
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
 
         manager.request_rotation_for_test(0).unwrap();
-        let candidate = manager.rotation_candidate(0).unwrap();
+        let rotation = manager.rotate_shard(0).unwrap();
         assert_eq!(
-            candidate,
-            RegionRotationCandidate {
-                shard_id: 0,
-                victim_region_id: 5,
-                victim_created_seqno: 0,
+            rotation,
+            RegionRotationReceipt {
+                activated_region_id: 5,
+                activated_created_seqno: 8,
             }
         );
-        let rotation = manager.begin_rotation(candidate).unwrap();
-        assert_eq!(rotation.sealed_region_id, 3);
-        assert_eq!(rotation.activated_region_id, 5);
-        assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.active_regions(), &[5, 0]);
         assert_eq!(
             manager.free_regions().iter().copied().collect::<Vec<_>>(),
@@ -1779,30 +1580,12 @@ mod tests {
         );
         assert_eq!(
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
-            [4, 2]
-        );
-        assert_eq!(
-            manager.reserve_append(0, 64),
-            Err(RegionMutationError::WouldBlock)
-        );
-        assert_eq!(
-            manager.freeze_metadata(shards.clone()),
-            Err(RegionMetadataError::InvalidField("live_region_authority"))
-        );
-
-        manager.finish_rotation(rotation).unwrap();
-        assert_eq!(
-            manager.rotation_candidate(0),
-            Err(RegionMutationError::WouldBlock),
-            "a delayed duplicate wake must not rotate the new empty Region"
-        );
-        assert_eq!(
-            manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
             [4, 2, 3]
         );
         assert_eq!(
-            manager.finish_rotation(rotation),
-            Err(RegionMutationError::StaleReceipt)
+            manager.rotate_shard(0),
+            Err(RegionMutationError::WouldBlock),
+            "a delayed duplicate wake must not rotate the new empty Region"
         );
         manager.freeze_metadata(shards).unwrap();
     }
@@ -1814,27 +1597,16 @@ mod tests {
         let mut manager = RegionManager::from_metadata(metadata).unwrap();
         manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
-            manager.rotation_candidate(0),
+            manager.rotate_shard(0),
             Err(RegionMutationError::WouldBlock)
         );
         let reclaim = manager.begin_reclaim().unwrap().unwrap();
         assert_eq!(reclaim.region_id, 4);
         manager.finish_reclaim(reclaim).unwrap();
-        let candidate = manager.rotation_candidate(0).unwrap();
-        assert_eq!(
-            candidate,
-            RegionRotationCandidate {
-                shard_id: 0,
-                victim_region_id: 4,
-                victim_created_seqno: 0,
-            }
-        );
-        let rotation = manager.begin_rotation(candidate).unwrap();
+        let rotation = manager.rotate_shard(0).unwrap();
         assert_eq!(rotation.activated_region_id, 4);
         assert_eq!(rotation.activated_created_seqno, 8);
         assert_eq!(manager.regions[4].physical_record_count, 0);
-
-        manager.finish_rotation(rotation).unwrap();
         assert_eq!(
             manager.sealed_regions().iter().copied().collect::<Vec<_>>(),
             [1, 5, 2, 3]
@@ -1897,10 +1669,7 @@ mod tests {
     fn reclaim_preserves_hot_records_while_one_free_region_remains() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         manager.request_rotation_for_test(0).unwrap();
-        let rotation = manager
-            .begin_rotation(manager.rotation_candidate(0).unwrap())
-            .unwrap();
-        manager.finish_rotation(rotation).unwrap();
+        manager.rotate_shard(0).unwrap();
 
         assert_eq!(manager.free_regions().len(), 1);
         assert!(manager.reclaim_can_reinsert());
@@ -1921,33 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_rotation_candidate_does_not_consume_the_next_victim_or_seqno() {
-        let mut manager = RegionManager::from_metadata(sample()).unwrap();
-        manager.request_rotation_for_test(0).unwrap();
-        let stale = manager.rotation_candidate(0).unwrap();
-
-        manager.request_rotation_for_test(1).unwrap();
-        let other_candidate = manager.rotation_candidate(1).unwrap();
-        let other_rotation = manager.begin_rotation(other_candidate).unwrap();
-        manager.finish_rotation(other_rotation).unwrap();
-        let next_seqno = manager.next_seqno();
-        let active = manager.active_regions().to_vec();
-        let free = manager.free_regions().clone();
-        let sealed = manager.sealed_regions().clone();
-
-        assert_eq!(
-            manager.begin_rotation(stale),
-            Err(RegionMutationError::StaleReceipt)
-        );
-        assert_eq!(manager.next_seqno(), next_seqno);
-        assert_eq!(manager.active_regions(), active);
-        assert_eq!(manager.free_regions(), &free);
-        assert_eq!(manager.sealed_regions(), &sealed);
-        assert_eq!(manager.rotation_candidate(0).unwrap().victim_region_id, 1);
-    }
-
-    #[test]
-    fn rotation_candidate_rejects_a_victim_queue_state_mismatch() {
+    fn rotation_rejects_a_victim_queue_state_mismatch() {
         let mut manager = RegionManager::from_metadata(sample()).unwrap();
         let next_seqno = manager.next_seqno();
         let active = manager.active_regions().to_vec();
@@ -1957,7 +1700,7 @@ mod tests {
         manager.free_regions[0] = 4;
         manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
-            manager.rotation_candidate(0),
+            manager.rotate_shard(0),
             Err(RegionMutationError::Invariant(
                 "rotation victim queue is inconsistent"
             ))
@@ -1976,14 +1719,12 @@ mod tests {
         let span = manager.seal_write_span_with_padding(padding).unwrap();
         manager.request_rotation_for_test(0).unwrap();
         assert_eq!(
-            manager.rotation_candidate(0),
+            manager.rotate_shard(0),
             Err(RegionMutationError::WouldBlock)
         );
         manager.complete_write_span(span).unwrap();
 
-        let candidate = manager.rotation_candidate(0).unwrap();
-        let rotation = manager.begin_rotation(candidate).unwrap();
-        manager.finish_rotation(rotation).unwrap();
+        let rotation = manager.rotate_shard(0).unwrap();
         let activated = manager.regions[rotation.activated_region_id as usize];
         assert_eq!(
             manager.complete_write_span(span),

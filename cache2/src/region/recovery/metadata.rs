@@ -21,6 +21,7 @@
 use std::error;
 use std::fmt;
 use std::mem;
+use std::ops::Range;
 
 use crate::checksum::crc32c;
 use crate::codec::get_u16;
@@ -42,14 +43,14 @@ use crate::region::recovery::PersistentId;
 use crate::region::recovery::RECOVERY_PAGE_SIZE;
 use crate::region::recovery::RecoveryImageHeader;
 
-pub const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
+const REGION_METADATA_PAGE_SIZE: usize = RECOVERY_PAGE_SIZE;
 const REGION_METADATA_PAGE_HEADER_SIZE: usize = 64;
 const REGION_METADATA_ROOT_SIZE: usize = 256;
 const REGION_METADATA_REGION_SIZE: usize = 21;
 const REGION_METADATA_PARTITION_SIZE: usize = 16;
-pub const REGION_METADATA_REGIONS_PER_PAGE: usize =
+const REGION_METADATA_REGIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_REGION_SIZE;
-pub const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
+const REGION_METADATA_PARTITIONS_PER_PAGE: usize =
     (REGION_METADATA_PAGE_SIZE - REGION_METADATA_PAGE_HEADER_SIZE) / REGION_METADATA_PARTITION_SIZE;
 
 const PAGE_MAGIC: [u8; 8] = *b"CRRMD\0\0\0";
@@ -242,7 +243,7 @@ impl error::Error for RegionMetadataError {}
 
 impl RegionMetadata {
     pub fn encoded_len(&self) -> Result<u64, RegionMetadataError> {
-        encoded_len_for_counts(self.root.region_count, self.root.partition_count)
+        Ok(MetadataLayout::new(self.root.region_count, self.root.partition_count)?.encoded_len)
     }
 
     /// Proves that this section belongs to the exact data and image authority
@@ -374,7 +375,7 @@ impl RegionMetadata {
             return Err(RegionMetadataError::InvalidLength);
         }
         validate_encoded_root_directory(page_payload(first, 0, REGION_METADATA_ROOT_SIZE), layout)?;
-        validate_root_directory(root, layout)?;
+        validate_root_directory(root)?;
 
         let regions = decode_record_pages(
             input,
@@ -405,11 +406,7 @@ impl RegionMetadata {
         let index_slots = usize::try_from(root.index_slots)
             .map_err(|_| RegionMetadataError::ArithmeticOverflow)?;
         let canonical =
-            canonical_index_partition_ranges(index_slots).map_err(|error| match error {
-                IndexStorageError::SizeOverflow => RegionMetadataError::ArithmeticOverflow,
-                IndexStorageError::Io(_) => RegionMetadataError::Allocation,
-                _ => RegionMetadataError::InvalidField("canonical_partition_directory"),
-            })?;
+            canonical_index_partition_ranges(index_slots).map_err(index_layout_metadata_error)?;
         if counters.len() != canonical.len() {
             return Err(RegionMetadataError::InvalidField(
                 "canonical_partition_directory",
@@ -443,8 +440,8 @@ impl RegionMetadata {
     }
 
     pub fn validate(&self) -> Result<(), RegionMetadataError> {
-        let layout = MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
-        validate_root_directory(self.root, layout)?;
+        MetadataLayout::new(self.root.region_count, self.root.partition_count)?;
+        validate_root_directory(self.root)?;
         if self.regions.len() != self.root.region_count as usize {
             return Err(RegionMetadataError::InvalidField("region_count"));
         }
@@ -571,11 +568,10 @@ impl MetadataLayout {
     }
 }
 
-fn encoded_len_for_counts(
-    region_count: u32,
-    partition_count: u32,
-) -> Result<u64, RegionMetadataError> {
-    Ok(MetadataLayout::new(region_count, partition_count)?.encoded_len)
+pub fn region_metadata_encoded_len(region_count: u32, partition_count: u32) -> Option<u64> {
+    MetadataLayout::new(region_count, partition_count)
+        .ok()
+        .map(|layout| layout.encoded_len)
 }
 
 fn pages_for_records(records: u64, per_page: u64) -> Result<u32, RegionMetadataError> {
@@ -586,10 +582,7 @@ fn pages_for_records(records: u64, per_page: u64) -> Result<u32, RegionMetadataE
     u32::try_from(pages).map_err(|_| RegionMetadataError::ArithmeticOverflow)
 }
 
-fn validate_root_directory(
-    root: RegionMetadataRoot,
-    layout: MetadataLayout,
-) -> Result<(), RegionMetadataError> {
+fn validate_root_directory(root: RegionMetadataRoot) -> Result<(), RegionMetadataError> {
     if root.index_slots < 8 {
         return Err(RegionMetadataError::InvalidField("root"));
     }
@@ -621,15 +614,6 @@ fn validate_root_directory(
             != Some(root.region_count)
     {
         return Err(RegionMetadataError::InvalidField("root"));
-    }
-    if layout.region_first_page != 1
-        || layout.partition_first_page
-            != layout
-                .region_first_page
-                .checked_add(layout.region_page_count)
-                .ok_or(RegionMetadataError::ArithmeticOverflow)?
-    {
-        return Err(RegionMetadataError::InvalidField("section_directory"));
     }
     Ok(())
 }
@@ -1177,27 +1161,25 @@ fn decode_partition(input: &[u8]) -> Result<EncodedPartitionCounters, RegionMeta
     })
 }
 
-fn page(input: &[u8], page_index: usize) -> Result<&[u8], RegionMetadataError> {
+fn page_range(page_index: usize) -> Result<Range<usize>, RegionMetadataError> {
     let start = page_index
         .checked_mul(REGION_METADATA_PAGE_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
     let end = start
         .checked_add(REGION_METADATA_PAGE_SIZE)
         .ok_or(RegionMetadataError::ArithmeticOverflow)?;
+    Ok(start..end)
+}
+
+fn page(input: &[u8], page_index: usize) -> Result<&[u8], RegionMetadataError> {
     input
-        .get(start..end)
+        .get(page_range(page_index)?)
         .ok_or(RegionMetadataError::InvalidLength)
 }
 
 fn page_mut(input: &mut [u8], page_index: usize) -> Result<&mut [u8], RegionMetadataError> {
-    let start = page_index
-        .checked_mul(REGION_METADATA_PAGE_SIZE)
-        .ok_or(RegionMetadataError::ArithmeticOverflow)?;
-    let end = start
-        .checked_add(REGION_METADATA_PAGE_SIZE)
-        .ok_or(RegionMetadataError::ArithmeticOverflow)?;
     input
-        .get_mut(start..end)
+        .get_mut(page_range(page_index)?)
         .ok_or(RegionMetadataError::InvalidLength)
 }
 

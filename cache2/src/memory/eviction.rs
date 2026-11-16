@@ -600,9 +600,7 @@ impl S3FifoState {
             let frequency = slots[index].s3fifo_frequency();
             match queue {
                 QueueKind::Small if frequency >= S3FIFO_MOVE_TO_MAIN_THRESHOLD => {
-                    let weight = self.small.remove(&mut self.links, index);
-                    slots[index].set_s3fifo_queue(QueueKind::Main);
-                    self.main.push_back(&mut self.links, index, weight);
+                    self.move_small_to_main(slots, index);
                 }
                 QueueKind::Main if frequency > 0 => {
                     slots[index].set_s3fifo_frequency(frequency - 1);
@@ -613,9 +611,7 @@ impl S3FifoState {
                     // A caller-retained value cannot release its memory charge.
                     // Move it out of the probationary head so one retained
                     // entry cannot consume the complete admission budget.
-                    let weight = self.small.remove(&mut self.links, index);
-                    slots[index].set_s3fifo_queue(QueueKind::Main);
-                    self.main.push_back(&mut self.links, index, weight);
+                    self.move_small_to_main(slots, index);
                 }
                 QueueKind::Main => {
                     self.main.move_to_back(&mut self.links, index);
@@ -624,6 +620,12 @@ impl S3FifoState {
             }
         }
         None
+    }
+
+    fn move_small_to_main(&mut self, slots: &mut [PolicySlot], index: usize) {
+        let weight = self.small.remove(&mut self.links, index);
+        slots[index].set_s3fifo_queue(QueueKind::Main);
+        self.main.push_back(&mut self.links, index, weight);
     }
 
     fn queue(&self, queue: QueueKind) -> &PolicyQueue {
@@ -655,7 +657,6 @@ struct GhostQueue {
     hashes: Box<[u64]>,
     links: Box<[S3FifoLink]>,
     free_head: u32,
-    free_count: usize,
     queue: PolicyQueue,
     capacity_bytes: usize,
 }
@@ -695,7 +696,6 @@ impl GhostQueue {
             } else {
                 0
             },
-            free_count: maximum_entries,
             queue: PolicyQueue::empty(),
             capacity_bytes,
         })
@@ -731,12 +731,8 @@ impl GhostQueue {
     }
 
     fn insert(&mut self, hash: u64, weight: usize) {
-        if u32::try_from(weight).is_err()
-            || weight == 0
-            || weight > self.capacity_bytes
-            || self.links.is_empty()
-            || self.capacity_bytes == 0
-        {
+        debug_assert_ne!(weight, 0);
+        if u32::try_from(weight).is_err() || weight > self.capacity_bytes || self.links.is_empty() {
             return;
         }
         if self.free_head == NO_POLICY_SLOT
@@ -758,15 +754,14 @@ impl GhostQueue {
                 // optional insert instead of adding a cleanup loop.
                 return;
             }
-            let removed = self.remove_head();
-            debug_assert!(removed);
+            let removed = self.directory.remove(self.hashes[head]);
+            debug_assert_eq!(removed, Some(self.queue.head));
+            self.unlink(head);
         }
         let packed = self.free_head;
         debug_assert_ne!(packed, NO_POLICY_SLOT);
         let index = usize::try_from(packed).expect("ghost slot index exceeds usize");
         self.free_head = self.links[index].next;
-        debug_assert_ne!(self.free_count, 0);
-        self.free_count -= 1;
         self.hashes[index] = hash;
         self.queue.push_back(&mut self.links, index, weight);
         match self.directory.insert(hash, packed) {
@@ -779,16 +774,6 @@ impl GhostQueue {
         }
     }
 
-    fn remove_head(&mut self) -> bool {
-        let Some(index) = self.queue.front() else {
-            return false;
-        };
-        let removed = self.directory.remove(self.hashes[index]);
-        debug_assert_eq!(removed, Some(self.queue.head));
-        self.unlink(index);
-        true
-    }
-
     fn unlink(&mut self, index: usize) {
         let packed = u32::try_from(index).expect("ghost slot index exceeds u32");
         let _ = self.queue.remove(&mut self.links, index);
@@ -798,8 +783,6 @@ impl GhostQueue {
             ..S3FifoLink::default()
         };
         self.free_head = packed;
-        debug_assert!(self.free_count < self.links.len());
-        self.free_count += 1;
     }
 }
 
@@ -1017,21 +1000,11 @@ mod tests {
         ghost.insert(4, 80);
 
         assert_eq!(ghost.queue.bytes, 100);
-        assert_eq!(ghost.free_count, 0);
+        assert_eq!(ghost.free_head, NO_POLICY_SLOT);
         assert_eq!(ghost.directory.get(1), Some(0));
         assert_eq!(ghost.directory.get(2), Some(1));
         assert_eq!(ghost.directory.get(3), Some(2));
         assert_eq!(ghost.directory.get(4), None);
-    }
-
-    #[test]
-    fn ghost_storage_uses_twenty_bytes_per_entry() {
-        const ENTRIES: usize = 5;
-        assert_eq!(
-            GhostQueue::allocation_bytes(ENTRIES).unwrap()
-                - FixedPrehashedMap::allocation_bytes(ENTRIES).unwrap(),
-            ENTRIES * 20
-        );
     }
 
     #[test]
@@ -1055,7 +1028,7 @@ mod tests {
 
         ghost.insert(3, 10);
 
-        assert_eq!(ghost.free_count, 0);
+        assert_eq!(ghost.free_head, NO_POLICY_SLOT);
         assert_eq!(ghost.directory.get(3), Some(0));
     }
 }

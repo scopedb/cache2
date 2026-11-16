@@ -18,7 +18,6 @@
 //! buffer is returned only with the target operation's completion, which is
 //! the lifetime rule required by both positioned I/O workers and `io_uring`.
 
-use std::error;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -83,33 +82,10 @@ use crate::config::runtime::io_uring_unavailability;
 use crate::io::background::BackgroundIoAttempt;
 #[cfg(unix)]
 use crate::io::file::DataFileHandles;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-use crate::io::file::FileIoDirection;
-#[cfg(all(
-    feature = "io-uring",
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64"
-    )
-))]
-use crate::io::file::FileIoPath;
 use crate::io::file::FileIoStats;
 use crate::io::file::FileIoStatsHandle;
 use crate::io::file::WritePoint;
+use crate::managed_memory::BUFFER_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::snapshot::CacheIoDirectionSnapshot;
 use crate::stats::recording::IoTiming;
@@ -143,7 +119,6 @@ pub struct IoEngine {
     io_stats: FileIoStatsHandle,
 }
 
-const IO_BUFFER_ALIGNMENT: usize = 4096;
 pub const MAX_IO_REQUESTS_PER_ENGINE: usize = 4096;
 // Common bounded command, completion, and request bookkeeping. Payload
 // buffers are charged by ManagedMemory separately.
@@ -172,6 +147,22 @@ pub struct EngineIoSnapshot {
     pub file_io: FileIoStats,
 }
 
+fn validate_buffer_len(length: usize, in_range: bool) -> io::Result<()> {
+    if length > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "I/O buffer length exceeds the per-request limit",
+        ));
+    }
+    if !in_range {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "buffer lease does not contain the requested logical range",
+        ));
+    }
+    Ok(())
+}
+
 /// A logical range of an engine-budgeted aligned buffer lease.
 pub struct IoBuffer {
     lease: BufferLease,
@@ -179,67 +170,23 @@ pub struct IoBuffer {
 }
 
 impl IoBuffer {
-    pub fn for_write(mut lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
-        if length > u32::MAX as usize {
-            return Err(IoBufferError {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "I/O buffer length exceeds the per-request limit",
-                ),
-                lease,
-            });
-        }
-        if lease.prepared_mut(length).is_none() {
-            return Err(IoBufferError {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "buffer lease does not contain the requested logical range",
-                ),
-                lease,
-            });
+    pub fn for_write(lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
+        let valid = lease.has_capacity(length) && lease.prepared(length).is_some();
+        if let Err(error) = validate_buffer_len(length, valid) {
+            return Err(IoBufferError { error, lease });
         }
         Ok(Self { lease, length })
     }
 
     pub fn for_read(lease: BufferLease, length: usize) -> Result<Self, IoBufferError> {
-        if length > u32::MAX as usize {
-            return Err(IoBufferError {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "I/O buffer length exceeds the per-request limit",
-                ),
-                lease,
-            });
-        }
-        if !lease.has_capacity(length) {
-            return Err(IoBufferError {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "buffer lease does not contain the requested logical range",
-                ),
-                lease,
-            });
+        if let Err(error) = validate_buffer_len(length, lease.has_capacity(length)) {
+            return Err(IoBufferError { error, lease });
         }
         Ok(Self { lease, length })
     }
 
     pub const fn len(&self) -> usize {
         self.length
-    }
-
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    pub const fn is_empty(&self) -> bool {
-        self.length == 0
     }
 
     pub fn as_slice(&self) -> io::Result<&[u8]> {
@@ -251,42 +198,12 @@ impl IoBuffer {
         })
     }
 
-    fn read_target(&self) -> io::Result<*mut u8> {
-        self.lease.read_target(self.length).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "buffer lease lost its read target range",
-            )
-        })
-    }
-
-    fn mark_initialized(&mut self, length: usize) -> io::Result<()> {
-        if !self.lease.mark_initialized(length) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "I/O completion exceeds the owned buffer",
-            ));
-        }
-        Ok(())
+    fn read_target(&self) -> *mut u8 {
+        self.lease.as_mut_ptr()
     }
 
     pub fn into_lease(self) -> BufferLease {
         self.lease
-    }
-
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    fn as_ptr(&self) -> io::Result<*const u8> {
-        Ok(self.as_slice()?.as_ptr())
     }
 }
 
@@ -295,7 +212,7 @@ impl fmt::Debug for IoBuffer {
         formatter
             .debug_struct("IoBuffer")
             .field("length", &self.length)
-            .field("alignment", &IO_BUFFER_ALIGNMENT)
+            .field("alignment", &BUFFER_ALIGNMENT)
             .finish_non_exhaustive()
     }
 }
@@ -314,37 +231,8 @@ impl fmt::Debug for IoBufferError {
     }
 }
 
-impl fmt::Display for IoBufferError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl error::Error for IoBufferError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(u64);
-
-impl RequestId {
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationKind {
@@ -355,24 +243,6 @@ pub enum OperationKind {
 impl OperationKind {
     const fn uses_write_slot(self) -> bool {
         matches!(self, Self::Write)
-    }
-
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    const fn io_direction(self) -> FileIoDirection {
-        match self {
-            Self::Read => FileIoDirection::Read,
-            Self::Write => FileIoDirection::Write,
-        }
     }
 }
 
@@ -409,11 +279,16 @@ impl IoOperation {
         }
     }
 
+    pub const fn buffer(&self) -> &IoBuffer {
+        match self {
+            Self::Read { buffer, .. } | Self::Write { buffer, .. } => buffer,
+        }
+    }
+
     fn validate(&self) -> io::Result<()> {
-        let (length, offset) = match self {
-            Self::Read { buffer, offset } | Self::Write { buffer, offset, .. } => {
-                (buffer.len(), *offset)
-            }
+        let length = self.buffer().len();
+        let offset = match self {
+            Self::Read { offset, .. } | Self::Write { offset, .. } => *offset,
         };
         offset
             .checked_add(length as u64)
@@ -430,65 +305,19 @@ impl IoOperation {
     fn mark_completed_read(&mut self, bytes_transferred: usize) -> io::Result<()> {
         match self {
             Self::Read { buffer, .. } if bytes_transferred == buffer.len() => {
-                buffer.mark_initialized(bytes_transferred)
+                if !buffer.lease.mark_initialized(bytes_transferred) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "I/O completion exceeds the owned buffer",
+                    ));
+                }
+                Ok(())
             }
             Self::Read { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "completed read did not initialize its complete buffer",
             )),
             Self::Write { .. } => Ok(()),
-        }
-    }
-
-    #[cfg(all(
-        feature = "io-uring",
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "powerpc64"
-        )
-    ))]
-    fn file_io_path(
-        &self,
-        handles: &DataFileHandles,
-        transferred: usize,
-    ) -> io::Result<FileIoPath> {
-        match self {
-            Self::Read { buffer, offset } => {
-                let remaining = buffer.len().checked_sub(transferred).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "read progress exceeds buffer")
-                })?;
-                let offset = offset.checked_add(transferred as u64).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow")
-                })?;
-                Ok(handles.select_path(
-                    buffer.read_target()?.wrapping_add(transferred),
-                    remaining,
-                    offset,
-                    true,
-                ))
-            }
-            Self::Write {
-                point,
-                buffer,
-                offset,
-            } => {
-                let remaining = buffer.len().checked_sub(transferred).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "write progress exceeds buffer")
-                })?;
-                let offset = offset.checked_add(transferred as u64).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "write offset overflow")
-                })?;
-                Ok(handles.select_path(
-                    buffer.as_ptr()?.wrapping_add(transferred),
-                    remaining,
-                    offset,
-                    *point == WritePoint::Record,
-                ))
-            }
         }
     }
 }
@@ -537,8 +366,6 @@ impl CompletionStatus {
 
 #[derive(Debug)]
 pub struct IoCompletion {
-    pub request_id: RequestId,
-    pub kind: OperationKind,
     pub status: CompletionStatus,
     pub bytes_transferred: usize,
     pub buffer: Option<IoBuffer>,
@@ -563,18 +390,6 @@ impl IoCompletion {
 pub struct SubmitError {
     pub error: io::Error,
     pub operation: IoOperation,
-}
-
-impl fmt::Display for SubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl error::Error for SubmitError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(&self.error)
-    }
 }
 
 impl SubmitError {
@@ -711,10 +526,6 @@ impl fmt::Debug for IoRequest {
 }
 
 impl IoRequest {
-    pub const fn id(&self) -> RequestId {
-        self.request_id
-    }
-
     #[cfg(test)]
     pub fn wait(mut self) -> IoCompletion {
         let completion = self.completion.wait();
@@ -769,10 +580,6 @@ pub struct BoundedIoRequest {
 }
 
 impl BoundedIoRequest {
-    pub const fn id(&self) -> RequestId {
-        self.request.id()
-    }
-
     /// Observes slow background I/O before its normal deadline, then applies
     /// timeout recovery. The same request keeps its slot and buffer; callers
     /// must still validate completion before publishing or reusing it.
@@ -825,7 +632,7 @@ impl BoundedIoRequest {
             Err(request) => request,
         };
         let cancel_error = engine
-            .cancel(request.id(), request.completion.as_ref())
+            .cancel(request.request_id, request.completion.as_ref())
             .err();
         let grace_deadline = Instant::now()
             .checked_add(self.cancel_grace)
@@ -900,10 +707,10 @@ impl AsyncRequestGuard {
         self.request.as_mut().expect("async request is armed")
     }
 
-    fn cancel(&self) -> io::Result<bool> {
+    fn cancel(&self) -> io::Result<()> {
         let request = self.request.as_ref().expect("async request is armed");
         self.engine
-            .cancel(request.id(), request.completion.as_ref())
+            .cancel(request.request_id, request.completion.as_ref())
     }
 
     fn disarm(&mut self) {
@@ -959,28 +766,6 @@ impl IoDeadlineExceeded {
     }
 }
 
-/// Submit one cache-device request with a hard end-to-end deadline.
-#[cfg(test)]
-pub fn submit_cache_io(
-    engine: &IoEngine,
-    operation: IoOperation,
-) -> Result<BoundedIoRequest, SubmitError> {
-    submit_cache_io_with_timeout(engine, operation, CACHE_IO_COMPLETION_TIMEOUT)
-}
-
-/// Submits background I/O with its configured admission and completion budget.
-#[cfg(test)]
-pub fn submit_cache_io_with_timeout(
-    engine: &IoEngine,
-    operation: IoOperation,
-    timeout: Duration,
-) -> Result<BoundedIoRequest, SubmitError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    submit_cache_io_until(engine, operation, deadline, CACHE_IO_CANCEL_GRACE)
-}
-
 /// Retries admission only when ownership of an unsubmitted operation returns.
 /// Issued I/O is never resubmitted; both stages share the original deadline.
 pub fn submit_background_io(
@@ -989,9 +774,7 @@ pub fn submit_background_io(
     timeout: Duration,
     attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<BoundedIoRequest, SubmitError> {
-    let bytes = match &operation {
-        IoOperation::Read { buffer, .. } | IoOperation::Write { buffer, .. } => buffer.len() as u64,
-    };
+    let bytes = operation.buffer().len() as u64;
     attempt.start(bytes, timeout);
     let original = Instant::now()
         .checked_add(timeout)
@@ -1045,9 +828,8 @@ fn submit_cache_io_until(
     deadline: Instant,
     cancel_grace: Duration,
 ) -> Result<BoundedIoRequest, SubmitError> {
-    let cancelled = AtomicBool::new(false);
     let stop_engine_on_deadline = operation.kind().uses_write_slot();
-    let request = engine.submit_wait_controlled(operation, &cancelled, Some(deadline))?;
+    let request = engine.submit_until(operation, deadline)?;
     Ok(BoundedIoRequest {
         request,
         deadline,
@@ -1249,7 +1031,6 @@ struct EngineState {
 
 enum SlotWaitError {
     Shutdown,
-    Cancelled,
     TimedOut,
 }
 
@@ -1353,69 +1134,29 @@ impl EngineState {
         }
     }
 
-    #[cfg(test)]
-    fn reserve_slot_wait(self: &Arc<Self>, write: bool) -> Option<IoSlot> {
-        let mut slot = lock_unpoisoned(&self.slot_lock);
-        loop {
-            if !self.accepting.load(Ordering::Acquire) {
-                return None;
-            }
-            if let Some(reserved) = self.try_reserve_slot(write) {
-                return Some(reserved);
-            }
-            slot = self
-                .slot_available
-                .wait(slot)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-    }
-
-    fn reserve_slot_controlled(
+    fn reserve_slot_until(
         self: &Arc<Self>,
         write: bool,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
+        deadline: Instant,
     ) -> Result<IoSlot, SlotWaitError> {
         let mut slot = lock_unpoisoned(&self.slot_lock);
         loop {
             if !self.accepting.load(Ordering::Acquire) {
                 return Err(SlotWaitError::Shutdown);
             }
-            if cancelled.load(Ordering::Acquire) {
-                self.slot_available.notify_all();
-                return Err(SlotWaitError::Cancelled);
-            }
-            let remaining =
-                deadline.map(|deadline| deadline.checked_duration_since(Instant::now()));
-            if matches!(remaining, Some(None)) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 self.slot_available.notify_all();
                 return Err(SlotWaitError::TimedOut);
-            }
+            };
             if let Some(reserved) = self.try_reserve_slot(write) {
                 return Ok(reserved);
             }
-            slot = match remaining {
-                Some(Some(remaining)) => {
-                    self.slot_available
-                        .wait_timeout(slot, remaining)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .0
-                }
-                Some(None) => unreachable!("expired deadline returned above"),
-                None => self
-                    .slot_available
-                    .wait(slot)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            };
+            slot = self
+                .slot_available
+                .wait_timeout(slot, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
-    }
-
-    /// Wake controlled waiters after publishing their cancellation flag.
-    /// Taking the same mutex used around the check-and-wait transition makes
-    /// `cancelled.store(true, Release); wake_slot_waiters()` lossless.
-    fn wake_slot_waiters(&self) {
-        let _slot = lock_unpoisoned(&self.slot_lock);
-        self.slot_available.notify_all();
     }
 
     fn has_unfenced_writes(&self) -> bool {
@@ -1442,13 +1183,12 @@ impl EngineState {
 
     fn finish(&self, task: Task, mut status: CompletionStatus, bytes_transferred: usize) {
         let Task {
-            request_id,
             mut operation,
             completion,
             slot,
             submitted_at,
+            ..
         } = task;
-        let kind = operation.kind();
         if matches!(status, CompletionStatus::Completed)
             && let Err(error) = operation.mark_completed_read(bytes_transferred)
         {
@@ -1457,8 +1197,6 @@ impl EngineState {
         let buffer = operation.into_buffer();
         self.publish_completion(
             IoCompletion {
-                request_id,
-                kind,
                 status,
                 bytes_transferred,
                 buffer: Some(buffer),
@@ -1489,13 +1227,12 @@ impl EngineState {
     ))]
     fn finish_quarantined(&self, task: Task, status: CompletionStatus, bytes_transferred: usize) {
         let Task {
-            request_id,
             operation,
             completion,
             slot,
             submitted_at,
+            ..
         } = task;
-        let kind = operation.kind();
         let buffer = operation.into_buffer();
         #[cfg(test)]
         // Keep it unreachable until fixture teardown without creating an
@@ -1505,8 +1242,6 @@ impl EngineState {
         mem::forget(buffer);
         self.publish_completion(
             IoCompletion {
-                request_id,
-                kind,
                 status,
                 bytes_transferred,
                 buffer: None,
@@ -1577,6 +1312,20 @@ impl EngineState {
 }
 
 struct Task {
+    #[cfg_attr(
+        not(all(
+            feature = "io-uring",
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            )
+        )),
+        expect(dead_code)
+    )]
     request_id: RequestId,
     operation: IoOperation,
     completion: Arc<CompletionState>,
@@ -1605,24 +1354,24 @@ enum ShutdownPhase {
 }
 
 #[derive(Clone)]
-struct StoredIoError {
+pub struct StoredIoError {
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
-    message: String,
+    message: Arc<str>,
 }
 
 impl StoredIoError {
-    fn capture(error: &io::Error) -> Self {
+    pub fn capture(error: &io::Error) -> Self {
         Self {
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),
-            message: error.to_string(),
+            message: Arc::from(error.to_string()),
         }
     }
 
-    fn restore(&self) -> io::Error {
+    pub fn restore(&self) -> io::Error {
         self.raw_os_error.map_or_else(
-            || io::Error::new(self.kind, self.message.clone()),
+            || io::Error::new(self.kind, self.message.as_ref()),
             io::Error::from_raw_os_error,
         )
     }
@@ -1634,15 +1383,10 @@ struct ShutdownState {
 }
 
 #[derive(Clone, Copy)]
-enum SlotMode<'a> {
+enum SlotMode {
     #[cfg(test)]
     Try,
-    #[cfg(test)]
-    Wait,
-    Controlled {
-        cancelled: &'a AtomicBool,
-        deadline: Option<Instant>,
-    },
+    Until(Instant),
 }
 
 impl IoEngine {
@@ -1652,10 +1396,6 @@ impl IoEngine {
             self.state.latency.set(recorder).is_ok(),
             "I/O recorder installed twice"
         );
-    }
-
-    pub fn wake_slot_waiters(&self) {
-        self.state.wake_slot_waiters();
     }
 
     pub fn in_flight(&self) -> usize {
@@ -1797,75 +1537,51 @@ impl IoEngine {
         self.submit_with_slot(operation, slot.slot, slot.reserved_at, true)
     }
 
-    #[cfg(test)]
-    pub fn submit_wait(&self, operation: IoOperation) -> Result<IoRequest, SubmitError> {
-        self.submit_inner(operation, SlotMode::Wait)
-    }
-
-    pub fn submit_wait_controlled(
+    pub fn submit_until(
         &self,
         operation: IoOperation,
-        cancelled: &AtomicBool,
-        deadline: Option<Instant>,
+        deadline: Instant,
     ) -> Result<IoRequest, SubmitError> {
-        self.submit_inner(
-            operation,
-            SlotMode::Controlled {
-                cancelled,
-                deadline,
-            },
-        )
+        self.submit_inner(operation, SlotMode::Until(deadline))
     }
 
     fn submit_inner(
         &self,
         operation: IoOperation,
-        slot_mode: SlotMode<'_>,
+        slot_mode: SlotMode,
     ) -> Result<IoRequest, SubmitError> {
         let nonblocking = match slot_mode {
             #[cfg(test)]
             SlotMode::Try => true,
-            #[cfg(test)]
-            SlotMode::Wait => false,
-            SlotMode::Controlled { .. } => false,
+            SlotMode::Until(_) => false,
         };
         if let Err(error) = operation.validate() {
             return Err(SubmitError { error, operation });
         }
         let write = operation.kind().uses_write_slot();
         let slot_wait_started = self.state.activity_counters_enabled.then(Instant::now);
-        let slot = match slot_mode {
-            #[cfg(test)]
-            SlotMode::Try if !self.state.accepting.load(Ordering::Acquire) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "I/O engine is shut down",
-            )),
-            #[cfg(test)]
-            SlotMode::Try => self.state.try_reserve_slot(write).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
-            }),
-            #[cfg(test)]
-            SlotMode::Wait => self.state.reserve_slot_wait(write).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
-            }),
-            SlotMode::Controlled {
-                cancelled,
-                deadline,
-            } => self
-                .state
-                .reserve_slot_controlled(write, cancelled, deadline)
-                .map_err(|error| match error {
-                    SlotWaitError::Shutdown => {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
-                    }
-                    SlotWaitError::Cancelled => {
-                        io::Error::new(io::ErrorKind::Interrupted, "I/O slot wait was cancelled")
-                    }
-                    SlotWaitError::TimedOut => {
-                        io::Error::new(io::ErrorKind::TimedOut, "I/O slot deadline expired")
-                    }
+        let slot =
+            match slot_mode {
+                #[cfg(test)]
+                SlotMode::Try if !self.state.accepting.load(Ordering::Acquire) => Err(
+                    io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down"),
+                ),
+                #[cfg(test)]
+                SlotMode::Try => self.state.try_reserve_slot(write).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "no I/O slot is available")
                 }),
-        };
+                SlotMode::Until(deadline) => self
+                    .state
+                    .reserve_slot_until(write, deadline)
+                    .map_err(|error| match error {
+                        SlotWaitError::Shutdown => {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "I/O engine is shut down")
+                        }
+                        SlotWaitError::TimedOut => {
+                            io::Error::new(io::ErrorKind::TimedOut, "I/O slot deadline expired")
+                        }
+                    }),
+            };
         let slot = match slot {
             Ok(slot) => slot,
             Err(error) => {
@@ -1978,7 +1694,7 @@ impl IoEngine {
         }
     }
 
-    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<bool> {
+    fn cancel(&self, request_id: RequestId, state: &CompletionState) -> io::Result<()> {
         state.cancel_requested.store(true, Ordering::Release);
         if !state.cancel_notified.swap(true, Ordering::AcqRel) {
             match self.commands.try_send(DriverCommand::Cancel(request_id)) {
@@ -1997,7 +1713,7 @@ impl IoEngine {
         if let Some(wake) = &self.wake {
             wake.wake();
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Permanently stop accepting requests before shutdown or after an unfenced timeout.
@@ -2015,13 +1731,13 @@ impl IoEngine {
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
-        let leader = {
+        {
             let mut phase = lock_unpoisoned(&self.shutdown.phase);
             loop {
                 match &*phase {
                     ShutdownPhase::Running => {
                         *phase = ShutdownPhase::Draining;
-                        break true;
+                        break;
                     }
                     ShutdownPhase::Draining => {
                         phase = self
@@ -2035,8 +1751,7 @@ impl IoEngine {
                     }
                 }
             }
-        };
-        debug_assert!(leader);
+        }
 
         let worker_count = lock_unpoisoned(&self.workers).len();
         let send_error = {
@@ -2095,7 +1810,6 @@ pub fn build_file_engine(
     match config {
         IoEngineConfig::Posix { workers } => posix::start(
             handles,
-            workers,
             workers,
             activity_counters_enabled,
             read_wait_enabled,

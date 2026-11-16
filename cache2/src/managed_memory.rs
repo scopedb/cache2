@@ -14,9 +14,8 @@
 
 //! Managed-memory accounting and aligned record buffers.
 //!
-//! Foreground reads allocate one alignment-rounded transient buffer for the
-//! size-class-bounded read range after an L2 index hit. Write waiting uses
-//! a separate request gate.
+//! Allocations for L2 read paths (foreground point reads and fixed reclaim
+//! buffers) use alignment-rounded buffers charged against the hard limit.
 
 use std::alloc::Layout;
 use std::alloc::alloc;
@@ -34,7 +33,6 @@ pub const BUFFER_ALIGNMENT: usize = 4096;
 /// Every cache-owned thread uses an explicit stack reservation so configured
 /// topology cannot inherit an environment-dependent `RUST_MIN_STACK` value.
 pub const CACHE_THREAD_STACK_BYTES: usize = 512 * 1024;
-pub const MAX_CONFIG_COUNT: usize = 65_536;
 
 pub struct ManagedMemoryLimits {
     pub memory_limit_bytes: usize,
@@ -110,9 +108,10 @@ impl ManagedMemory {
         })
     }
 
-    /// Allocates one alignment-rounded foreground read buffer against the
-    /// cache-wide hard memory limit. The caller maps failure to either a
-    /// fail-open miss or an explicit bounded-wait overload.
+    /// Allocates an alignment-rounded L2 read buffer against the cache-wide
+    /// hard memory limit. Foreground callers map allocation failure to either
+    /// a fail-open miss or bounded-wait overload; runtime startup allocates
+    /// fixed reclaim buffers from the same helper.
     pub fn try_read_buffer(&self, length: usize) -> Option<BufferLease> {
         let capacity = length.checked_next_multiple_of(BUFFER_ALIGNMENT)?;
         if capacity == 0 || capacity > isize::MAX as usize {
@@ -204,11 +203,8 @@ impl BufferLease {
         length <= self.capacity
     }
 
-    pub fn read_target(&self, length: usize) -> Option<*mut u8> {
-        if length > self.capacity {
-            return None;
-        }
-        Some(self.ptr.as_ptr())
+    pub const fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
     }
 
     pub fn mark_initialized(&mut self, length: usize) -> bool {
@@ -275,11 +271,6 @@ impl MemoryTracker {
     }
 }
 
-#[cfg(test)]
-pub fn aligned_buffer_capacity(value: usize) -> Option<usize> {
-    value.checked_next_multiple_of(BUFFER_ALIGNMENT)
-}
-
 fn update_peak(peak: &AtomicUsize, candidate: usize) {
     // The peak only grows; a stale lower observation can cause an extra RMW,
     // but cannot suppress a new maximum.
@@ -306,14 +297,8 @@ mod tests {
         let managed_memory = ManagedMemory::try_new(limits()).unwrap();
         let first = managed_memory.try_read_buffer(5000).unwrap();
         let second = managed_memory.try_read_buffer(9000).unwrap();
-        assert_eq!(
-            first.read_target(5000).unwrap() as usize % BUFFER_ALIGNMENT,
-            0
-        );
-        assert_eq!(
-            second.read_target(9000).unwrap() as usize % BUFFER_ALIGNMENT,
-            0
-        );
+        assert_eq!(first.as_mut_ptr() as usize % BUFFER_ALIGNMENT, 0);
+        assert_eq!(second.as_mut_ptr() as usize % BUFFER_ALIGNMENT, 0);
         assert!(first.prepared(5000).is_none());
         assert!(second.prepared(9000).is_none());
         let snapshot = managed_memory.snapshot();
@@ -336,7 +321,7 @@ mod tests {
         let managed_memory = ManagedMemory::try_new(limits()).unwrap();
         let mut buffer = managed_memory.try_read_buffer(5000).unwrap();
         let bytes = b"completed read prefix";
-        let target = buffer.read_target(5000).unwrap();
+        let target = buffer.as_mut_ptr();
         // SAFETY: simulate a completed read into the exclusively owned target;
         // the source and destination do not overlap and the bytes fit.
         unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
@@ -353,7 +338,6 @@ mod tests {
         assert_eq!(buffer.prepared(bytes.len()).unwrap(), bytes);
         assert!(buffer.has_capacity(2 * BUFFER_ALIGNMENT));
         assert!(!buffer.has_capacity(2 * BUFFER_ALIGNMENT + 1));
-        assert!(buffer.read_target(2 * BUFFER_ALIGNMENT + 1).is_none());
         assert!(!buffer.mark_initialized(2 * BUFFER_ALIGNMENT + 1));
         assert!(buffer.prepared(bytes.len() + 1).is_none());
     }
@@ -369,7 +353,7 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         buffer.prepared_mut(BUFFER_ALIGNMENT).unwrap().fill(0xa5);
-        assert!(buffer.read_target(BUFFER_ALIGNMENT + 1).is_none());
+        assert!(!buffer.has_capacity(BUFFER_ALIGNMENT + 1));
         assert!(buffer.prepared(BUFFER_ALIGNMENT + 1).is_none());
         assert!(buffer.prepared_mut(BUFFER_ALIGNMENT + 1).is_none());
         assert!(

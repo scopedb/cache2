@@ -38,8 +38,7 @@ use crate::managed_memory::CACHE_THREAD_STACK_BYTES;
 #[cfg(unix)]
 pub fn start(
     handles: DataFileHandles,
-    max_in_flight: usize,
-    worker_count: usize,
+    workers: usize,
     activity_counters_enabled: bool,
     read_wait_enabled: bool,
 ) -> io::Result<IoEngine> {
@@ -48,8 +47,8 @@ pub fn start(
     start_workers(
         io,
         io_stats,
-        max_in_flight,
-        worker_count,
+        workers,
+        workers,
         activity_counters_enabled,
         read_wait_enabled,
     )
@@ -169,14 +168,11 @@ fn execute_operation(
     operation: &mut IoOperation,
 ) -> (CompletionStatus, usize) {
     match operation {
-        IoOperation::Read { buffer, offset } => match buffer.read_target() {
-            Ok(buffer_pointer) => {
-                let (result, transferred) =
-                    read_exact_at_uninit_with_progress(io, buffer_pointer, buffer.len(), *offset);
-                completion_result(result, transferred)
-            }
-            Err(error) => completion_result(Err(error), 0),
-        },
+        IoOperation::Read { buffer, offset } => {
+            let (result, transferred) =
+                read_exact_at_uninit_with_progress(io, buffer.read_target(), buffer.len(), *offset);
+            completion_result(result, transferred)
+        }
         IoOperation::Write {
             point,
             buffer,

@@ -38,6 +38,7 @@ static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct RuntimeMetrics {
     metrics_epoch: u64,
+    logical_disk_peak_bytes: u64,
     pub stats: Arc<Recorder>,
     pub lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
@@ -57,6 +58,7 @@ pub struct RuntimeMetrics {
     reclaim_reinsert_budget_skipped: AtomicU64,
 }
 
+#[derive(Default)]
 #[repr(align(64))]
 pub struct ActivityMetrics {
     pub puts: AtomicU64,
@@ -72,26 +74,12 @@ pub struct ActivityMetrics {
     pub l1_promotions: AtomicU64,
 }
 
-impl ActivityMetrics {
-    fn new() -> Self {
-        Self {
-            puts: AtomicU64::new(0),
-            deletes: AtomicU64::new(0),
-            written_bytes: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l1_misses: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            l2_misses: AtomicU64::new(0),
-            l2_read_memory_misses: AtomicU64::new(0),
-            l2_read_busy_misses: AtomicU64::new(0),
-            served_bytes: AtomicU64::new(0),
-            l1_promotions: AtomicU64::new(0),
-        }
-    }
-}
-
 impl RuntimeMetrics {
-    pub fn new(shard_count: usize, stats: StatsOptions) -> io::Result<Self> {
+    pub fn new(
+        shard_count: usize,
+        stats: StatsOptions,
+        logical_disk_peak_bytes: u64,
+    ) -> io::Result<Self> {
         let mut activity = Vec::new();
         activity.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -99,9 +87,10 @@ impl RuntimeMetrics {
                 "cannot allocate shard activity counters",
             )
         })?;
-        activity.resize_with(shard_count, ActivityMetrics::new);
+        activity.resize_with(shard_count, ActivityMetrics::default);
         Ok(Self {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
+            logical_disk_peak_bytes,
             stats: Arc::new(Recorder::new(stats)?),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
@@ -254,7 +243,7 @@ impl RuntimeMetrics {
             managed_memory_bytes: memory.current_bytes,
             managed_memory_peak_bytes: memory.peak_bytes,
             managed_memory_limit_bytes: memory.limit_bytes,
-            logical_disk_peak_bytes: 0,
+            logical_disk_peak_bytes: self.logical_disk_peak_bytes,
             io: CacheIoSnapshot::default(),
         }
     }

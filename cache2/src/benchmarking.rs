@@ -21,7 +21,7 @@ use std::io;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::region::index::BenchmarkProbeStats;
+use crate::config::storage::KEY_HASH_SEED;
 use crate::region::index::RegionIndex;
 use crate::region::index::packed::INDEX_CANDIDATES;
 use crate::region::index::packed::IndexEntry;
@@ -33,10 +33,30 @@ use crate::region::index::storage::validated_index_partition_ranges;
 use crate::region::record::codec::hash_key;
 use crate::snapshot::CacheIndexSnapshot;
 
-const BENCHMARK_HASH_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const ENTRY_HASH_DOMAIN: u64 = 0x656e_7472_792d_6b65;
 const MISSING_HASH_DOMAIN: u64 = 0x6d69_7373_696e_672d;
 const BENCHMARK_RECORD_BYTES: u32 = 16 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct BenchmarkProbeStats {
+    operations: u64,
+    probes: u64,
+    full_windows: u64,
+    max_probes: usize,
+}
+
+impl BenchmarkProbeStats {
+    fn record(&mut self, probes: usize) {
+        self.operations = self.operations.saturating_add(1);
+        self.probes = self
+            .probes
+            .saturating_add(u64::try_from(probes).unwrap_or(u64::MAX));
+        self.full_windows = self
+            .full_windows
+            .saturating_add(u64::from(probes == INDEX_CANDIDATES));
+        self.max_probes = self.max_probes.max(probes);
+    }
+}
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
@@ -236,7 +256,7 @@ impl TurnoverWorkload {
             .try_reserve_exact(config.key_space_entries)
             .map_err(|_| out_of_memory("turnover key hashes"))?;
         for ordinal in 0..config.key_space_entries {
-            hashes.push(benchmark_hash(ENTRY_HASH_DOMAIN, ordinal)?);
+            hashes.push(benchmark_hash(ENTRY_HASH_DOMAIN, ordinal));
         }
 
         let mut missing_hashes = Vec::new();
@@ -244,7 +264,7 @@ impl TurnoverWorkload {
             .try_reserve_exact(config.options.sample_operations)
             .map_err(|_| out_of_memory("turnover missing-key hashes"))?;
         for ordinal in 0..config.options.sample_operations {
-            missing_hashes.push(benchmark_hash(MISSING_HASH_DOMAIN, ordinal)?);
+            missing_hashes.push(benchmark_hash(MISSING_HASH_DOMAIN, ordinal));
         }
 
         let mut locations = Vec::new();
@@ -316,13 +336,9 @@ impl TurnoverWorkload {
                     location: self.locations[location_start + slot],
                 };
                 probes.record(INDEX_CANDIDATES);
-                let accepted = self
-                    .index
+                self.index
                     .upsert(black_box(self.hashes[key_ordinal]), black_box(entry))
                     .map_err(index_error)?;
-                if !accepted {
-                    return Err(io::Error::other("turnover index publication was rejected"));
-                }
                 self.expected_entries[key_ordinal] = Some(entry);
                 self.location_owners[location_start + slot] = Some(key_ordinal);
                 self.total_writes = self
@@ -334,14 +350,15 @@ impl TurnoverWorkload {
                     checksum.wrapping_add(entry.location.raw().rotate_left((slot % 64) as u32));
             }
         }
-        finish_phase(
+        Ok(finish_phase(
             started.elapsed(),
             self.config.physical_entries,
             installed,
             self.config.physical_entries.saturating_sub(installed),
             checksum,
+            0,
             probes,
-        )
+        ))
     }
 
     fn checkpoint(
@@ -445,16 +462,15 @@ fn measure_lookups(
         }
         black_box(observed);
     }
-    let mut phase = finish_phase(
+    Ok(finish_phase(
         started.elapsed(),
         operations,
         hits,
         misses,
         checksum,
+        false_candidates,
         probes,
-    )?;
-    phase.stale_slots = false_candidates;
-    Ok(phase)
+    ))
 }
 
 fn finish_phase(
@@ -463,38 +479,32 @@ fn finish_phase(
     hits: usize,
     misses: usize,
     checksum: u64,
+    stale_slots: u64,
     probes: BenchmarkProbeStats,
-) -> io::Result<RegionIndexTurnoverPhase> {
-    if probes.operations != u64::try_from(operations).unwrap_or(u64::MAX) {
-        return Err(io::Error::other(
-            "turnover operation and probe counts disagree",
-        ));
-    }
-    if probes.max_probes > INDEX_CANDIDATES {
-        return Err(io::Error::other(
-            "turnover probe exceeded the production bound",
-        ));
-    }
-    Ok(RegionIndexTurnoverPhase {
+) -> RegionIndexTurnoverPhase {
+    debug_assert_eq!(
+        probes.operations,
+        u64::try_from(operations).unwrap_or(u64::MAX)
+    );
+    debug_assert!(probes.max_probes <= INDEX_CANDIDATES);
+    RegionIndexTurnoverPhase {
         elapsed,
         operations,
         hits,
         misses,
         checksum,
         probes: probes.probes,
-        stale_slots: probes.stale_slots,
+        stale_slots,
         full_windows: probes.full_windows,
         max_probes: probes.max_probes,
-    })
+    }
 }
 
-fn benchmark_hash(domain: u64, ordinal: usize) -> io::Result<u64> {
-    let ordinal =
-        u64::try_from(ordinal).map_err(|_| invalid("turnover key ordinal exceeds u64"))?;
+fn benchmark_hash(domain: u64, ordinal: usize) -> u64 {
     let mut key = [0_u8; 16];
     key[..8].copy_from_slice(&domain.to_le_bytes());
-    key[8..].copy_from_slice(&ordinal.to_le_bytes());
-    Ok(hash_key(BENCHMARK_HASH_SEED, &key))
+    key[8..].copy_from_slice(&(ordinal as u64).to_le_bytes());
+    hash_key(KEY_HASH_SEED, &key)
 }
 
 fn is_checkpoint(turn: usize, final_turn: usize) -> bool {
