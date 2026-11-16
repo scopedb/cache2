@@ -443,7 +443,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         .transpose()?;
     report(
         "put_drain",
-        "put + drain",
         "write",
         config.write_clients,
         &write.measurement,
@@ -483,7 +482,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
     cache.close_warm().await?;
     drop(cache);
     let warm_close = started.elapsed();
-    report_latency("warm_close", "warm close", warm_close);
+    report_latency("warm_close", warm_close);
 
     let cache = Arc::new(Cache::open(files.data(), cache_config.clone()).await?);
     if cache.startup_mode() != StartupMode::Warm {
@@ -505,7 +504,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         if l1_entry_eligible {
             report(
                 "l2_promote",
-                "L2 get + promote",
                 "read",
                 config.l2_clients(),
                 &l2_read.measurement,
@@ -516,7 +514,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         } else {
             report(
                 "l2_read",
-                "L2 get",
                 "read",
                 config.l2_clients(),
                 &l2_read.measurement,
@@ -531,7 +528,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             l2_read.measurement.elapsed,
             &l2_read.primary,
         );
-        report_read_latency("l2_latency", "L2 get latency", &l2_read.latency);
+        report_read_latency("l2_latency", &l2_read.latency);
         l2_read.measurement
     } else {
         let _ = concurrent_writes(
@@ -568,7 +565,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         .await?;
         report(
             "l2_hot_scan",
-            "L2 cold scan",
             "read",
             config.l2_clients(),
             &cold_scan.measurement,
@@ -582,7 +578,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             cold_scan.measurement.elapsed,
             &cold_scan.primary,
         );
-        report_read_latency("l2_scan_latency", "L2 scan latency", &cold_scan.latency);
+        report_read_latency("l2_scan_latency", &cold_scan.latency);
         report_tiers(
             "hot_during_scan",
             "hot during scan",
@@ -714,7 +710,6 @@ async fn run(config: BenchConfig) -> io::Result<()> {
         .await?;
         report(
             "resident_l1",
-            "resident L1 get",
             "read",
             config.clients,
             &resident.measurement,
@@ -722,7 +717,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
             Some(&resident.latency),
             config.read_latency_sample_interval,
         );
-        report_read_latency("resident_l1_latency", "L1 get latency", &resident.latency);
+        report_read_latency("resident_l1_latency", &resident.latency);
         if let Some(before) = before {
             let after = cache.snapshot()?;
             println!(
@@ -1023,10 +1018,8 @@ fn verify_value(ordinal: usize, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn report(
     phase: &str,
-    _name: &str,
     operation: &str,
     workers: usize,
     measurement: &Measurement,
@@ -1094,7 +1087,7 @@ fn report_tiers(phase: &str, name: &str, elapsed: Duration, tiers: &TierCounts) 
     );
 }
 
-fn report_latency(phase: &str, _name: &str, elapsed: Duration) {
+fn report_latency(phase: &str, elapsed: Duration) {
     JobReport::new("cache", None, phase, "control", elapsed, 1).emit();
     println!(
         "result phase={phase} elapsed_ns={} operations=0 bytes=0 ops_per_sec=0.000 mib_per_sec=0.000 checksum=0000000000000000",
@@ -1102,7 +1095,7 @@ fn report_latency(phase: &str, _name: &str, elapsed: Duration) {
     );
 }
 
-fn report_read_latency(phase: &str, _name: &str, latency: &LatencyHistogram) {
+fn report_read_latency(phase: &str, latency: &LatencyHistogram) {
     let summary = latency.summary();
     if summary.samples == 0 {
         return;

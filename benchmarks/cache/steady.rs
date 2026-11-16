@@ -118,7 +118,6 @@ pub async fn run(cache: Arc<Cache>, config: &BenchConfig) -> io::Result<()> {
     }
     report(
         "put_steady",
-        "steady put + drain",
         "write",
         config.write_clients,
         &measurement,

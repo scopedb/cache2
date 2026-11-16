@@ -75,15 +75,15 @@ fn assert_accounting(store: &MemoryStore, retained: &[RetainedValueSnapshot]) {
     let mut total_entries = 0;
     let mut record = |value: &MemoryValue| {
         let inner = &value.0;
-        assert_eq!(inner._charge.bytes, value.charged_bytes());
+        assert_eq!(inner.charge.bytes, value.charged_bytes());
         let budget = inner
-            ._charge
+            .charge
             .budget
             .as_ref()
             .expect("live allocation must keep its charge armed");
         allocations.insert(
             Arc::as_ptr(inner),
-            (Arc::as_ptr(budget), inner._charge.bytes),
+            (Arc::as_ptr(budget), inner.charge.bytes),
         );
     };
     for shard in &store.shards {
@@ -95,7 +95,7 @@ fn assert_accounting(store: &MemoryStore, retained: &[RetainedValueSnapshot]) {
                 let hash = shard.policy_slots[index].hash();
                 assert_eq!(shard.find(hash, entry.value.key()), Some(index));
                 assert!(Arc::ptr_eq(
-                    entry.value.0._charge.budget.as_ref().unwrap(),
+                    entry.value.0.charge.budget.as_ref().unwrap(),
                     &shard.budget,
                 ));
                 record(&entry.value);

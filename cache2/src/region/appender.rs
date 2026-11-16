@@ -305,7 +305,7 @@ mod tests {
         });
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
-        lease.prepare(4096).unwrap().fill(0x5a);
+        lease.prepared_mut(4096).unwrap().fill(0x5a);
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
         let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
@@ -337,7 +337,7 @@ mod tests {
         let io = Arc::new(RecordingIo::default());
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
-        lease.prepare(4096).unwrap().fill(0x5a);
+        lease.prepared_mut(4096).unwrap().fill(0x5a);
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
         let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
