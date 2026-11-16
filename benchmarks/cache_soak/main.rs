@@ -13,21 +13,26 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::env;
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Barrier;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use benchmarks::config::MIB;
 use benchmarks::config::env_bool;
+use benchmarks::config::env_dir;
+use benchmarks::config::env_mib_u64;
+use benchmarks::config::env_mib_usize;
 use benchmarks::config::env_u32;
 use benchmarks::config::env_u64;
 use benchmarks::config::env_usize;
 use benchmarks::config::env_usize_list;
+use benchmarks::config::fill_control_from_env;
 use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
 use benchmarks::config::parse_io_mode;
@@ -47,6 +52,8 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::DetailedCacheSnapshot;
+use cache2::ErrorKind;
+use cache2::FillControlOptions;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
 use cache2::L1EvictionPolicy;
@@ -57,8 +64,10 @@ use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
+use tokio::runtime::Builder;
+use tokio::runtime::Handle;
+use tokio::runtime::Runtime;
 
-const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
 const KEY_BYTES: usize = 25;
 const KEY_PREFIX: &[u8; 17] = b"cache2-soak-key-v";
@@ -90,7 +99,7 @@ struct SoakConfig {
     require_path_coverage: bool,
     require_reinsert_coverage: bool,
     io_engine: IoEngineOptions,
-    fill_control: cache2::FillControlOptions,
+    fill_control: FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -100,13 +109,8 @@ impl SoakConfig {
     fn from_env() -> io::Result<Self> {
         let duration = Duration::from_secs(env_u64("CACHE_SOAK_SECONDS", 60)?);
         let sample_period = Duration::from_secs(env_u64("CACHE_SOAK_SAMPLE_SECONDS", 10)?);
-        let capacity_bytes = env_u64("CACHE_SOAK_CAPACITY_MIB", 256)?
-            .checked_mul(MIB as u64)
-            .ok_or_else(|| invalid("soak capacity is too large"))?;
-        let l1_capacity_mib = env_usize("CACHE_SOAK_L1_CAPACITY_MIB", 64)?;
-        let l1_capacity_bytes = l1_capacity_mib
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("soak memory capacity is too large"))?;
+        let capacity_bytes = env_mib_u64("CACHE_SOAK_CAPACITY_MIB", 256)?;
+        let l1_capacity_bytes = env_mib_usize("CACHE_SOAK_L1_CAPACITY_MIB", 64)?;
         let append_shards = env_u32("CACHE_SOAK_APPEND_SHARDS", 4)?;
         let io_engine = io_engine_from_env("CACHE_SOAK")?;
         let shard_count = usize::try_from(append_shards)
@@ -124,16 +128,12 @@ impl SoakConfig {
             .and_then(|bytes| bytes.checked_add(REGION_BYTES))
             .ok_or_else(|| invalid("soak default managed memory limit is too large"))?
             .div_ceil(MIB);
-        let managed_memory_limit_bytes = env_usize(
+        let managed_memory_limit_bytes = env_mib_usize(
             "CACHE_SOAK_MANAGED_MEMORY_LIMIT_MIB",
             default_managed_memory_limit_mib,
-        )?
-        .checked_mul(MIB)
-        .ok_or_else(|| invalid("soak managed memory limit is too large"))?;
+        )?;
         let value_bytes = env_usize_list("CACHE_SOAK_VALUE_BYTES", &DEFAULT_VALUE_BYTES)?;
-        let rss_slack_bytes = env_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("soak RSS slack is too large"))?;
+        let rss_slack_bytes = env_mib_usize("CACHE_SOAK_RSS_SLACK_MIB", 128)?;
         let key_count = env_usize("CACHE_SOAK_KEYS", 32_768)?;
         let writers = env_usize("CACHE_SOAK_WRITERS", 4)?;
         let readers = env_usize("CACHE_SOAK_READERS", 4)?;
@@ -159,9 +159,7 @@ impl SoakConfig {
         }
         let io_mode = parse_io_mode("CACHE_SOAK_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_SOAK_L1_EVICTION")?;
-        let directory = env::var_os("CACHE_SOAK_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+        let directory = env_dir("CACHE_SOAK")?;
         if Instant::now().checked_add(duration).is_none()
             || Instant::now().checked_add(sample_period).is_none()
             || duration.is_zero()
@@ -175,10 +173,9 @@ impl SoakConfig {
             || (writers == 0 && !warm_reopen)
             || readers == 0
             || operation_interval > Duration::from_secs(1)
-            || !directory.is_dir()
         {
             return Err(invalid(
-                "invalid soak duration, pacing, topology, value, or directory",
+                "invalid soak duration, pacing, topology, or value size",
             ));
         }
         Ok(Self {
@@ -202,7 +199,7 @@ impl SoakConfig {
             require_path_coverage,
             require_reinsert_coverage,
             io_engine,
-            fill_control: benchmarks::config::fill_control_from_env("CACHE_SOAK")?,
+            fill_control: fill_control_from_env("CACHE_SOAK")?,
             io_mode,
             l1_eviction_policy,
             directory,
@@ -220,7 +217,6 @@ impl SoakConfig {
         let mut options = RuntimeOptions::default();
         options.io_engine = self.io_engine;
         options.fill_control = self.fill_control;
-        println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
         options.l1_capacity_bytes = self.l1_capacity_bytes;
@@ -315,6 +311,16 @@ fn counter_snapshot(workers: &[SoakCounters]) -> CounterSnapshot {
 #[repr(align(128))]
 struct WorkOrdinal(AtomicU64);
 
+#[derive(Clone, Copy)]
+struct SoakContext<'a> {
+    cache: &'a Cache,
+    config: &'a SoakConfig,
+    expected: &'a [AtomicU64],
+    key_count: u64,
+    value_size_count: u64,
+    stop: &'a AtomicBool,
+}
+
 struct ResourceSample {
     detailed: DetailedCacheSnapshot,
     logical_bytes: u64,
@@ -323,21 +329,13 @@ struct ResourceSample {
 }
 
 fn main() -> io::Result<()> {
-    let reporter = RunReporter::start("cache_soak", None);
-    let result = run_benchmark();
-    reporter.finish(
-        result
-            .as_ref()
-            .err()
-            .map(|error| error as &dyn fmt::Display),
-    );
-    result
+    RunReporter::start("cache_soak", None).finish_result(run_benchmark())
 }
 
 fn run_benchmark() -> io::Result<()> {
     init_logforth()?;
     let config = SoakConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(config.readers.max(2))
         .thread_name("cache2-soak")
         .enable_time()
@@ -353,9 +351,19 @@ fn run_benchmark() -> io::Result<()> {
     let value_size_count = u64::try_from(config.value_bytes.len())
         .map_err(|_| invalid("soak value-size count exceeds u64"))?;
     let expected: Vec<_> = (0..config.key_count).map(|_| AtomicU64::new(0)).collect();
+    let stop = AtomicBool::new(false);
     let first_write = if config.warm_reopen {
-        let next =
-            populate_for_warm_reopen(&cache, &config, &expected, key_count, value_size_count)?;
+        let next = {
+            let prep = SoakContext {
+                cache: &cache,
+                config: &config,
+                expected: &expected,
+                key_count,
+                value_size_count,
+                stop: &stop,
+            };
+            populate_for_warm_reopen(&prep)?
+        };
         runtime.block_on(cache.drain())?;
         runtime.block_on(cache.close_warm())?;
         report_process_memory("prepare_close")?;
@@ -374,14 +382,13 @@ fn run_benchmark() -> io::Result<()> {
     };
     let next_write = WorkOrdinal(AtomicU64::new(first_write));
     let next_read = WorkOrdinal(AtomicU64::new(0));
-    let stop = AtomicBool::new(false);
     let client_count = config
         .writers
         .checked_add(config.readers)
         .ok_or_else(|| invalid("soak client count is too large"))?;
     let counters: Vec<_> = (0..client_count).map(|_| SoakCounters::default()).collect();
-    let ready = std::sync::Barrier::new(client_count + 1);
-    let start = std::sync::Barrier::new(client_count + 1);
+    let ready = Barrier::new(client_count + 1);
+    let start = Barrier::new(client_count + 1);
 
     let mut max_managed_memory = 0_usize;
 
@@ -417,41 +424,34 @@ fn run_benchmark() -> io::Result<()> {
         config.rss_reopen_allowance_bytes,
         files.data().display(),
     );
+    println!("fill_control={:?}", config.fill_control);
 
-    let started = std::thread::scope(|scope| -> io::Result<Instant> {
+    let context = SoakContext {
+        cache: &cache,
+        config: &config,
+        expected: &expected,
+        key_count,
+        value_size_count,
+        stop: &stop,
+    };
+
+    let started = thread::scope(|scope| -> io::Result<Instant> {
         let mut workers = Vec::with_capacity(client_count);
         for counters in &counters[..config.writers] {
             let next_write = &next_write.0;
             let ready = &ready;
             let start = &start;
-            let cache = &cache;
-            let config = &config;
-            let expected = &expected;
-            let stop = &stop;
             workers.push(scope.spawn(move || {
                 ready.wait();
                 start.wait();
-                let result = run_writer(
-                    cache,
-                    config,
-                    expected,
-                    key_count,
-                    value_size_count,
-                    next_write,
-                    stop,
-                    counters,
-                );
+                let result = run_writer(context, next_write, counters);
                 if result.is_err() {
-                    stop.store(true, Ordering::Release);
+                    context.stop.store(true, Ordering::Release);
                 }
                 result
             }));
         }
         for reader_id in 0..config.readers {
-            let cache = &cache;
-            let config = &config;
-            let expected = &expected;
-            let stop = &stop;
             let next_read = &next_read.0;
             let counters = &counters[config.writers + reader_id];
             let runtime = runtime.handle().clone();
@@ -460,20 +460,9 @@ fn run_benchmark() -> io::Result<()> {
             workers.push(scope.spawn(move || {
                 ready.wait();
                 start.wait();
-                let result = run_reader(
-                    cache,
-                    config,
-                    expected,
-                    key_count,
-                    value_size_count,
-                    reader_id,
-                    next_read,
-                    stop,
-                    counters,
-                    &runtime,
-                );
+                let result = run_reader(context, reader_id, next_read, counters, &runtime);
                 if result.is_err() {
-                    stop.store(true, Ordering::Release);
+                    context.stop.store(true, Ordering::Release);
                 }
                 result
             }));
@@ -496,7 +485,7 @@ fn run_benchmark() -> io::Result<()> {
         while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
             let wake_at = min(next_sample, deadline);
             if let Some(remaining) = wake_at.checked_duration_since(Instant::now()) {
-                std::thread::sleep(remaining);
+                thread::sleep(remaining);
             }
             let now = Instant::now();
             if now >= next_sample && now < deadline {
@@ -650,43 +639,39 @@ fn init_logforth() -> io::Result<()> {
     Ok(())
 }
 
-fn open_cache(
-    runtime: &tokio::runtime::Runtime,
-    files: &BenchFiles,
-    config: &CacheConfig,
-) -> io::Result<Cache> {
+fn open_cache(runtime: &Runtime, files: &BenchFiles, config: &CacheConfig) -> io::Result<Cache> {
     Ok(runtime.block_on(Cache::open(files.data(), config.clone()))?)
 }
 
-fn populate_for_warm_reopen(
-    cache: &Cache,
-    config: &SoakConfig,
-    expected: &[AtomicU64],
-    key_count: u64,
-    value_size_count: u64,
-) -> io::Result<u64> {
-    let total = key_count;
-    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
+fn populate_for_warm_reopen(context: &SoakContext<'_>) -> io::Result<u64> {
+    let total = context.key_count;
+    let maximum_value_bytes = context
+        .config
+        .value_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     for ordinal in 0..total {
         let announced = ordinal
             .checked_add(1)
             .ok_or_else(|| invalid("warm-reopen write ordinal exhausted"))?;
-        let key_index = usize::try_from(ordinal % key_count)
+        let key_index = usize::try_from(ordinal % context.key_count)
             .map_err(|_| invalid("warm-reopen key index exceeds usize"))?;
-        let value_index = mixed_value_index(ordinal, value_size_count)?;
-        let value_bytes = config.value_bytes[value_index];
+        let value_index = mixed_value_index(ordinal, context.value_size_count)?;
+        let value_bytes = context.config.value_bytes[value_index];
         let pattern = (ordinal ^ key_index as u64) as u8;
         value[..value_bytes].fill(pattern);
         value[..8].copy_from_slice(&ordinal.to_le_bytes());
         value[8..VALUE_HEADER_BYTES].copy_from_slice(&(key_index as u64).to_le_bytes());
-        expected[key_index].fetch_max(announced, Ordering::SeqCst);
+        context.expected[key_index].fetch_max(announced, Ordering::SeqCst);
         let key = soak_key(key_index as u64);
         loop {
-            match cache.put(key, &value[..value_bytes]) {
+            match context.cache.put(key, &value[..value_bytes]) {
                 Ok(_) => break,
-                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
-                    std::thread::sleep(OVERLOAD_DELAY);
+                Err(error) if error.kind() == ErrorKind::Overloaded => {
+                    thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -695,33 +680,33 @@ fn populate_for_warm_reopen(
     Ok(total)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_writer(
-    cache: &Cache,
-    config: &SoakConfig,
-    expected: &[AtomicU64],
-    key_count: u64,
-    value_size_count: u64,
+    context: SoakContext<'_>,
     next_write: &AtomicU64,
-    stop: &AtomicBool,
     counters: &SoakCounters,
 ) -> io::Result<()> {
-    let maximum_value_bytes = config.value_bytes.iter().copied().max().unwrap_or(0);
+    let maximum_value_bytes = context
+        .config
+        .value_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
     let mut value = vec![0_u8; maximum_value_bytes];
     let mut written_bytes = 0_u64;
-    while !stop.load(Ordering::Acquire) {
-        pace(config.operation_interval);
-        if stop.load(Ordering::Acquire) {
+    while !context.stop.load(Ordering::Acquire) {
+        pace(context.config.operation_interval);
+        if context.stop.load(Ordering::Acquire) {
             break;
         }
         let ordinal = next_write.fetch_add(1, Ordering::Relaxed);
         let announced = ordinal
             .checked_add(1)
             .ok_or_else(|| invalid("soak write ordinal exhausted"))?;
-        let key_index = usize::try_from(ordinal % key_count)
+        let key_index = usize::try_from(ordinal % context.key_count)
             .map_err(|_| invalid("soak key index exceeds usize"))?;
-        let value_index = mixed_value_index(ordinal, value_size_count)?;
-        let value_bytes = config.value_bytes[value_index];
+        let value_index = mixed_value_index(ordinal, context.value_size_count)?;
+        let value_bytes = context.config.value_bytes[value_index];
         let pattern = (ordinal ^ key_index as u64) as u8;
         value[..value_bytes].fill(pattern);
         value[..8].copy_from_slice(&ordinal.to_le_bytes());
@@ -730,19 +715,20 @@ fn run_writer(
         // Announce before publication so a reader can never classify a newly
         // visible value as future. Rejected attempts only make validation more
         // conservative; stale and missing values are permitted.
-        expected[key_index].fetch_max(announced, Ordering::SeqCst);
+        context.expected[key_index].fetch_max(announced, Ordering::SeqCst);
         let key = soak_key(key_index as u64);
-        let put_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
-        match cache.put(key, &value[..value_bytes]) {
+        let put_started =
+            should_sample(ordinal, context.config.latency_sample_interval).then(Instant::now);
+        match context.cache.put(key, &value[..value_bytes]) {
             Ok(_) => {
                 counters.put_latency.record_sampled(put_started);
                 counters.writes.fetch_add(1, Ordering::Relaxed);
                 written_bytes = written_bytes.saturating_add(value_bytes as u64);
             }
-            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+            Err(error) if error.kind() == ErrorKind::Overloaded => {
                 counters.put_latency.record_sampled(put_started);
                 counters.write_rejections.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(OVERLOAD_DELAY);
+                thread::sleep(OVERLOAD_DELAY);
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -751,16 +737,17 @@ fn run_writer(
         if announced.is_multiple_of(DELETE_INTERVAL) {
             let delete_ordinal = announced / DELETE_INTERVAL;
             let delete_started =
-                should_sample(delete_ordinal, config.latency_sample_interval).then(Instant::now);
-            match cache.delete(key) {
+                should_sample(delete_ordinal, context.config.latency_sample_interval)
+                    .then(Instant::now);
+            match context.cache.delete(key) {
                 Ok(_) => {
                     counters.delete_latency.record_sampled(delete_started);
                     counters.deletes.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                Err(error) if error.kind() == ErrorKind::Overloaded => {
                     counters.delete_latency.record_sampled(delete_started);
                     counters.delete_rejections.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(OVERLOAD_DELAY);
+                    thread::sleep(OVERLOAD_DELAY);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -772,41 +759,37 @@ fn run_writer(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_reader(
-    cache: &Cache,
-    config: &SoakConfig,
-    expected: &[AtomicU64],
-    key_count: u64,
-    value_size_count: u64,
+    context: SoakContext<'_>,
     reader_id: usize,
     next_read: &AtomicU64,
-    stop: &AtomicBool,
     counters: &SoakCounters,
-    runtime: &tokio::runtime::Handle,
+    runtime: &Handle,
 ) -> io::Result<()> {
     let reader_id = u64::try_from(reader_id).map_err(|_| invalid("reader id exceeds u64"))?;
     let mut read_bytes = 0_u64;
-    while !stop.load(Ordering::Acquire) {
-        pace(config.operation_interval);
-        if stop.load(Ordering::Acquire) {
+    while !context.stop.load(Ordering::Acquire) {
+        pace(context.config.operation_interval);
+        if context.stop.load(Ordering::Acquire) {
             break;
         }
         let ordinal = next_read.fetch_add(1, Ordering::Relaxed);
-        let sampled = usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % key_count)
-            .map_err(|_| invalid("soak sampled key exceeds usize"))?;
+        let sampled =
+            usize::try_from(ordinal.wrapping_mul(17).wrapping_add(reader_id) % context.key_count)
+                .map_err(|_| invalid("soak sampled key exceeds usize"))?;
         let key = soak_key(sampled as u64);
-        let get_started = should_sample(ordinal, config.latency_sample_interval).then(Instant::now);
-        match runtime.block_on(cache.get(&key))? {
+        let get_started =
+            should_sample(ordinal, context.config.latency_sample_interval).then(Instant::now);
+        match runtime.block_on(context.cache.get(&key))? {
             Some(observed) => {
                 counters.get_latency.record_sampled(get_started);
-                let latest = expected[sampled].load(Ordering::SeqCst);
+                let latest = context.expected[sampled].load(Ordering::SeqCst);
                 let stale = validate_observed(
                     sampled,
                     &observed,
                     latest,
-                    value_size_count,
-                    &config.value_bytes,
+                    context.value_size_count,
+                    &context.config.value_bytes,
                 )?;
                 counters.hits.fetch_add(1, Ordering::Relaxed);
                 read_bytes = read_bytes.saturating_add(observed.len() as u64);
@@ -825,7 +808,7 @@ fn run_reader(
 }
 
 fn verify_warm_reopen(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &Runtime,
     cache: &Cache,
     expected: &[AtomicU64],
     value_size_count: u64,
@@ -1134,7 +1117,7 @@ fn report_sample(
 
 fn pace(interval: Duration) {
     if !interval.is_zero() {
-        std::thread::sleep(interval);
+        thread::sleep(interval);
     }
 }
 

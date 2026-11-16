@@ -14,7 +14,6 @@
 
 use std::env;
 use std::f64::consts::TAU;
-use std::fmt;
 use std::hint::black_box;
 use std::io;
 use std::path::PathBuf;
@@ -25,12 +24,17 @@ use std::time::Duration;
 use std::time::Instant;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::MIB;
+use benchmarks::config::env_dir;
 use benchmarks::config::env_optional_usize;
 use benchmarks::config::env_u32;
 use benchmarks::config::env_u64;
 use benchmarks::config::env_usize;
+use benchmarks::config::fill_control_from_env;
 use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
+use benchmarks::config::mib_to_u64;
+use benchmarks::config::mib_to_usize;
 use benchmarks::config::parse_io_mode;
 use benchmarks::config::parse_l1_eviction_policy;
 use benchmarks::config::read_max_in_flight;
@@ -47,13 +51,15 @@ use cache2::CacheConfig;
 use cache2::CacheHealth;
 use cache2::CacheSnapshot;
 use cache2::DetailedCacheSnapshot;
+use cache2::ErrorKind;
+use cache2::FillControlOptions;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
 use cache2::L1EvictionPolicy;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
+use tokio::runtime::Builder;
 
-const MIB: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 64;
 const NEGATIVE_LOOKUP_KEY_BYTES: usize = 24;
 const VALUE_HEADER_BYTES: usize = 24;
@@ -217,7 +223,7 @@ struct HarnessOptions {
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
-    fill_control: cache2::FillControlOptions,
+    fill_control: FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -240,19 +246,16 @@ impl HarnessOptions {
         let seed = env_u64("CACHE_WORKLOAD_SEED", DEFAULT_SEED)?;
         let io_mode = parse_io_mode("CACHE_WORKLOAD_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_WORKLOAD_L1_EVICTION")?;
-        let directory = env::var_os("CACHE_WORKLOAD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+        let directory = env_dir("CACHE_WORKLOAD")?;
 
         if operations_per_thread == Some(0)
             || threads == Some(0)
             || key_count == Some(0)
             || region_size_mib.is_some_and(|value| value == 0 || value > 32)
             || append_shards == 0
-            || !directory.is_dir()
         {
             return Err(invalid(
-                "invalid workload size, Region size, worker topology, or directory",
+                "invalid workload size, Region size, or worker topology",
             ));
         }
 
@@ -269,7 +272,7 @@ impl HarnessOptions {
             latency_sample_interval,
             seed,
             io_engine,
-            fill_control: benchmarks::config::fill_control_from_env("CACHE_WORKLOAD")?,
+            fill_control: fill_control_from_env("CACHE_WORKLOAD")?,
             io_mode,
             l1_eviction_policy,
             directory,
@@ -301,7 +304,11 @@ impl HarnessOptions {
             .checked_mul(threads)
             .ok_or_else(|| invalid("total operation count is too large"))?;
         let region_size_bytes = mib_to_usize("CACHE_WORKLOAD_REGION_SIZE_MIB", region_size_mib)?;
-        let capacity_bytes = mib_to_u64("CACHE_WORKLOAD_CAPACITY_MIB", capacity_mib)?;
+        let capacity_bytes = mib_to_u64(
+            "CACHE_WORKLOAD_CAPACITY_MIB",
+            u64::try_from(capacity_mib)
+                .map_err(|_| invalid("CACHE_WORKLOAD_CAPACITY_MIB is too large"))?,
+        )?;
         let l1_capacity_bytes = mib_to_usize("CACHE_WORKLOAD_L1_CAPACITY_MIB", l1_capacity_mib)?;
         if capacity_bytes % region_size_bytes as u64 != 0
             || capacity_bytes / region_size_bytes as u64 <= u64::from(self.append_shards)
@@ -370,7 +377,7 @@ struct ScenarioConfig {
     latency_sample_interval: usize,
     seed: u64,
     io_engine: IoEngineOptions,
-    fill_control: cache2::FillControlOptions,
+    fill_control: FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
     directory: PathBuf,
@@ -388,7 +395,6 @@ impl ScenarioConfig {
         let mut options = RuntimeOptions::default();
         options.io_engine = self.io_engine;
         options.fill_control = self.fill_control;
-        println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
         options.l1_capacity_bytes = self.l1_capacity_bytes;
@@ -509,7 +515,7 @@ fn main() -> io::Result<()> {
         .max()
         .unwrap_or(2)
         .max(2);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(runtime_threads)
         .thread_name("cache2-mixed-workload")
         .enable_time()
@@ -523,15 +529,9 @@ fn main() -> io::Result<()> {
 }
 
 async fn run_scenario(config: ScenarioConfig) -> io::Result<()> {
-    let reporter = RunReporter::start("mixed_workloads", Some(config.scenario.slug()));
-    let result = run_scenario_inner(config).await;
-    reporter.finish(
-        result
-            .as_ref()
-            .err()
-            .map(|error| error as &dyn fmt::Display),
-    );
-    result
+    let scenario = config.scenario.slug();
+    RunReporter::start("mixed_workloads", Some(scenario))
+        .finish_result(run_scenario_inner(config).await)
 }
 
 async fn run_scenario_inner(config: ScenarioConfig) -> io::Result<()> {
@@ -554,6 +554,7 @@ async fn run_scenario_inner(config: ScenarioConfig) -> io::Result<()> {
         config.io_engine,
         config.io_mode,
     );
+    println!("fill_control={:?}", config.fill_control);
 
     let files = BenchFiles::new(
         &config.directory,
@@ -676,7 +677,7 @@ async fn run_worker(
                     ));
                 }
                 Ok(None) => result.misses = result.misses.saturating_add(1),
-                Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                Err(error) if error.kind() == ErrorKind::Overloaded => {
                     result.get_overloaded = result.get_overloaded.saturating_add(1);
                 }
                 Err(error) => return Err(error.into()),
@@ -713,7 +714,7 @@ async fn run_worker(
                         ));
                     }
                     Ok(None) => result.misses = result.misses.saturating_add(1),
-                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                    Err(error) if error.kind() == ErrorKind::Overloaded => {
                         result.get_overloaded = result.get_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -740,7 +741,7 @@ async fn run_worker(
                             .accepted_value_bytes
                             .saturating_add(value_size as u64);
                     }
-                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                    Err(error) if error.kind() == ErrorKind::Overloaded => {
                         result.set_overloaded = result.set_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -755,7 +756,7 @@ async fn run_worker(
                     Ok(_) => {
                         result.delete_accepted = result.delete_accepted.saturating_add(1);
                     }
-                    Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+                    Err(error) if error.kind() == ErrorKind::Overloaded => {
                         result.delete_overloaded = result.delete_overloaded.saturating_add(1);
                     }
                     Err(error) => return Err(error.into()),
@@ -1065,21 +1066,11 @@ fn report(
 }
 
 fn report_latency(scenario: Scenario, operation: &str, latency: &LatencyHistogram) {
-    let summary = latency.summary();
     println!(
-        "result benchmark=mixed_workloads scenario={} phase=latency operation={} samples={} min_ns={} mean_estimate_ns={:.3} stddev_estimate_ns={:.3} p50_upper_ns={} p90_upper_ns={} p95_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
+        "result benchmark=mixed_workloads scenario={} phase=latency operation={} {}",
         scenario.slug(),
         operation,
-        summary.samples,
-        summary.minimum_ns,
-        summary.mean_ns,
-        summary.standard_deviation_ns,
-        summary.p50_upper_ns,
-        summary.p90_upper_ns,
-        summary.p95_upper_ns,
-        summary.p99_upper_ns,
-        summary.p999_upper_ns,
-        summary.maximum_ns,
+        latency.summary(),
     );
 }
 
@@ -1140,19 +1131,6 @@ fn default_managed_memory_limit(
         .div_ceil(MIB)
         .checked_mul(MIB)
         .ok_or_else(|| invalid("managed-memory estimate rounding overflow"))
-}
-
-fn mib_to_usize(name: &str, value: usize) -> io::Result<usize> {
-    value
-        .checked_mul(MIB)
-        .ok_or_else(|| invalid(format!("{name} is too large")))
-}
-
-fn mib_to_u64(name: &str, value: usize) -> io::Result<u64> {
-    u64::try_from(value)
-        .ok()
-        .and_then(|mib| mib.checked_mul(MIB as u64))
-        .ok_or_else(|| invalid(format!("{name} is too large")))
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {

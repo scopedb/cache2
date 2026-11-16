@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
 use std::io;
 
 use benchmarks::config::env_usize;
@@ -23,15 +22,7 @@ use cache2::benchmarking::RegionIndexTurnoverPhase;
 use cache2::benchmarking::run_region_index_turnover;
 
 fn main() -> io::Result<()> {
-    let reporter = RunReporter::start("region_index_turnover", None);
-    let result = run_benchmark();
-    reporter.finish(
-        result
-            .as_ref()
-            .err()
-            .map(|error| error as &dyn fmt::Display),
-    );
-    result
+    RunReporter::start("region_index_turnover", None).finish_result(run_benchmark())
 }
 
 fn run_benchmark() -> io::Result<()> {

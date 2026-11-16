@@ -18,7 +18,6 @@ use std::array;
 use std::env::consts::ARCH;
 use std::env::consts::OS;
 use std::fmt;
-use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -26,6 +25,11 @@ use std::time::Instant;
 
 use cache2::CacheIoDirectionSnapshot;
 use cache2::DetailedCacheSnapshot;
+
+#[cfg(unix)]
+use crate::harness::maximum_rss_bytes;
+#[cfg(unix)]
+use crate::harness::self_rusage;
 
 const LATENCY_BUCKETS: usize = 65;
 
@@ -225,6 +229,25 @@ pub struct LatencySummary {
     pub maximum_ns: u64,
 }
 
+impl fmt::Display for LatencySummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "samples={} min_ns={} mean_estimate_ns={:.3} stddev_estimate_ns={:.3} p50_upper_ns={} p90_upper_ns={} p95_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
+            self.samples,
+            self.minimum_ns,
+            self.mean_ns,
+            self.standard_deviation_ns,
+            self.p50_upper_ns,
+            self.p90_upper_ns,
+            self.p95_upper_ns,
+            self.p99_upper_ns,
+            self.p999_upper_ns,
+            self.maximum_ns,
+        )
+    }
+}
+
 /// One fio-style benchmark job.
 pub struct JobReport<'a> {
     benchmark: &'a str,
@@ -396,6 +419,17 @@ impl RunReporter {
             started: Instant::now(),
             usage: ProcessUsage::capture(),
         }
+    }
+
+    /// Finishes the report for `result` and returns it unchanged.
+    pub fn finish_result<T, E: fmt::Display>(self, result: Result<T, E>) -> Result<T, E> {
+        self.finish(
+            result
+                .as_ref()
+                .err()
+                .map(|error| error as &dyn fmt::Display),
+        );
+        result
     }
 
     /// Finishes the report with CPU, scheduler, memory, and status metrics.
@@ -634,13 +668,9 @@ struct ProcessUsage {
 impl ProcessUsage {
     #[cfg(unix)]
     fn capture() -> Self {
-        let mut usage = MaybeUninit::<libc::rusage>::zeroed();
-        // SAFETY: `usage` points to writable storage for one `rusage` value.
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        let Some(usage) = self_rusage() else {
             return Self::default();
-        }
-        // SAFETY: a successful `getrusage` initialized the complete value.
-        let usage = unsafe { usage.assume_init() };
+        };
         Self {
             user_cpu: timeval_duration(usage.ru_utime),
             system_cpu: timeval_duration(usage.ru_stime),
@@ -753,16 +783,6 @@ fn format_duration(duration: Duration) -> String {
 fn timeval_duration(value: libc::timeval) -> Duration {
     Duration::from_secs(nonnegative_u64(value.tv_sec))
         .saturating_add(Duration::from_micros(nonnegative_u64(value.tv_usec)))
-}
-
-#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
-fn maximum_rss_bytes(value: libc::c_long) -> u64 {
-    nonnegative_u64(value)
-}
-
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-fn maximum_rss_bytes(value: libc::c_long) -> u64 {
-    nonnegative_u64(value).saturating_mul(1024)
 }
 
 #[cfg(unix)]

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::env;
+use std::error::Error;
 use std::num::NonZeroU32;
 
 use cache2::Cache;
@@ -22,7 +23,7 @@ use cache2::RuntimeOptions;
 use cache2::StorageOptions;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
         .nth(1)
         .ok_or("usage: stats <cache-data-path>")?;
