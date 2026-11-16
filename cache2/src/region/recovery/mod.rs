@@ -137,6 +137,22 @@ impl DataGeometry {
             .checked_add(DATA_REGION_AREA_OFFSET)
     }
 
+    pub fn region_offset(self, region_id: u32) -> Option<u64> {
+        if region_id >= self.region_count {
+            return None;
+        }
+        u64::from(region_id)
+            .checked_mul(self.region_size)?
+            .checked_add(DATA_REGION_AREA_OFFSET)
+    }
+
+    pub fn span_offset(self, region_id: u32, offset: u64, len: u64) -> Option<u64> {
+        if len == 0 || offset.checked_add(len)? > self.region_size {
+            return None;
+        }
+        self.region_offset(region_id)?.checked_add(offset)
+    }
+
     pub fn is_valid(self) -> bool {
         self.region_count != 0
             && self.region_count <= MAX_PACKED_REGION_COUNT
@@ -713,16 +729,12 @@ pub fn clean_image_matches(
     header: RecoveryImageHeader,
     actual_file_len: u64,
     expected_slots: u64,
-    expected_index_len: u64,
 ) -> bool {
     header.is_valid()
-        && recovery_image_index_len(expected_slots) == Some(expected_index_len)
         && state.matches_clean(data, header.image_binding())
         && header.matches_data(data)
         && header.image_file_len == actual_file_len
         && header.index_slots == expected_slots
-        && header.index_offset == RECOVERY_IMAGE_INDEX_OFFSET
-        && header.index_len == expected_index_len
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1345,7 +1357,6 @@ mod tests {
             header,
             TEST_IMAGE_FILE_LEN,
             TEST_INDEX_SLOTS,
-            TEST_INDEX_LEN
         ));
         assert!(!clean_image_matches(
             clean,
@@ -1353,7 +1364,6 @@ mod tests {
             header,
             TEST_IMAGE_FILE_LEN + 1,
             TEST_INDEX_SLOTS,
-            TEST_INDEX_LEN
         ));
         assert!(!clean_image_matches(
             clean,
@@ -1361,7 +1371,6 @@ mod tests {
             header,
             TEST_IMAGE_FILE_LEN,
             TEST_INDEX_SLOTS + 1,
-            TEST_INDEX_LEN
         ));
         assert!(!clean_image_matches(
             record(24, SessionState::Running),
@@ -1369,7 +1378,6 @@ mod tests {
             header,
             TEST_IMAGE_FILE_LEN,
             TEST_INDEX_SLOTS,
-            TEST_INDEX_LEN
         ));
     }
 

@@ -18,8 +18,6 @@
 //! disposable-cache protocol establishes durability once, when publishing a
 //! CLEAN image, and deliberately has no per-span sync.
 
-use std::error;
-use std::fmt;
 use std::io;
 use std::time::Duration;
 
@@ -29,13 +27,10 @@ use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IoBuffer;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::OperationKind;
-use crate::io::engine::RequestId;
 use crate::io::engine::submit_background_io;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::io::file::WritePoint;
 use crate::region::manager::RegionWriteSpan;
-use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 
 #[derive(Debug)]
@@ -44,22 +39,9 @@ pub struct WriteSubmitError {
     pub buffer: IoBuffer,
 }
 
-impl fmt::Display for WriteSubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl error::Error for WriteSubmitError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 pub struct PendingWrite {
     span: RegionWriteSpan,
     expected_len: usize,
-    request_id: RequestId,
     request: BoundedIoRequest,
 }
 
@@ -82,16 +64,8 @@ impl PendingWrite {
                 };
             }
         };
-        let identity_valid =
-            completion.request_id == self.request_id && completion.kind == OperationKind::Write;
         let (io_result, buffer) = completion.into_io_result();
         let result = io_result.and_then(|completed| {
-            if !identity_valid {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Region span completion identity does not match its request",
-                ));
-            }
             if completed != self.expected_len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -127,7 +101,6 @@ pub fn submit_write(
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
-    absolute: u64,
     attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<PendingWrite, WriteSubmitError> {
     submit_write_with_timeout(
@@ -135,7 +108,6 @@ pub fn submit_write(
         geometry,
         span,
         buffer,
-        absolute,
         CACHE_IO_COMPLETION_TIMEOUT,
         attempt,
     )
@@ -146,17 +118,16 @@ fn submit_write_with_timeout(
     geometry: DataGeometry,
     span: RegionWriteSpan,
     buffer: IoBuffer,
-    absolute: u64,
     timeout: Duration,
     attempt: &mut BackgroundIoAttempt<'_>,
 ) -> Result<PendingWrite, WriteSubmitError> {
-    let (expected_len, expected_absolute) = match validate_span(geometry, span) {
+    let (expected_len, absolute) = match validate_span(geometry, span) {
         Ok(validated) => validated,
         Err(error) => {
             return Err(WriteSubmitError { error, buffer });
         }
     };
-    if buffer.len() != expected_len || absolute != expected_absolute {
+    if buffer.len() != expected_len {
         return Err(WriteSubmitError {
             error: io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -193,18 +164,15 @@ fn submit_write_with_timeout(
     Ok(PendingWrite {
         span,
         expected_len,
-        request_id: request.id(),
         request,
     })
 }
 
 fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(usize, u64)> {
     if !geometry.is_valid()
-        || span.region_id >= geometry.region_count
         || !span.start_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
         || !span.end_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
         || span.end_offset <= span.start_offset
-        || span.end_offset > geometry.region_size
         || span.record_count == 0
     {
         return Err(io::Error::new(
@@ -212,31 +180,21 @@ fn validate_span(geometry: DataGeometry, span: RegionWriteSpan) -> io::Result<(u
             "invalid Region write span",
         ));
     }
-    let length = span
-        .end_offset
-        .checked_sub(span.start_offset)
-        .and_then(|length| usize::try_from(length).ok())
-        .filter(|length| *length != 0 && *length % DIRECT_IO_ALIGNMENT == 0)
+    let length_u64 = span.end_offset - span.start_offset;
+    let length = usize::try_from(length_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Region write span length is invalid",
+        )
+    })?;
+    let absolute = geometry
+        .span_offset(span.region_id, span.start_offset, length_u64)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Region write span length is invalid",
+                "Region write span exceeds the data file",
             )
         })?;
-    let absolute = u64::from(span.region_id)
-        .checked_mul(geometry.region_size)
-        .and_then(|offset| offset.checked_add(DATA_REGION_AREA_OFFSET))
-        .and_then(|offset| offset.checked_add(span.start_offset))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write offset overflow"))?;
-    let absolute_end = absolute
-        .checked_add(length as u64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write end overflow"))?;
-    if absolute % DIRECT_IO_ALIGNMENT as u64 != 0 || absolute_end > geometry.data_file_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region write span exceeds the data file",
-        ));
-    }
     Ok((length, absolute))
 }
 
@@ -251,6 +209,7 @@ mod tests {
     use crate::io::engine::IoEngine;
     use crate::io::file::PositionedIo;
     use crate::managed_memory::BufferLease;
+    use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 
     #[derive(Default)]
     struct RecordingIo {
@@ -303,7 +262,6 @@ mod tests {
         let engine = IoEngine::for_test(io.clone(), 1).unwrap();
         let mut lease = BufferLease::try_fixed(4096).unwrap();
         lease.prepared_mut(4096).unwrap().fill(0x5a);
-        let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::from_secs(5)));
         let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
         let completion = submit_write_with_timeout(
@@ -311,7 +269,6 @@ mod tests {
             geometry(),
             span(),
             IoBuffer::for_write(lease, 4096).unwrap(),
-            absolute,
             Duration::from_millis(20),
             &mut attempt,
         )
@@ -338,10 +295,9 @@ mod tests {
         lease.prepared_mut(4096).unwrap().fill(0x5a);
 
         let buffer = IoBuffer::for_write(lease, 4096).unwrap();
-        let absolute = DATA_REGION_AREA_OFFSET + geometry().region_size;
         let io_recovery = IoRecovery::new(Some(Duration::ZERO));
         let mut attempt = BackgroundIoAttempt::new(&io_recovery, None);
-        let completion = submit_write(&engine, geometry(), span(), buffer, absolute, &mut attempt)
+        let completion = submit_write(&engine, geometry(), span(), buffer, &mut attempt)
             .unwrap()
             .wait(&engine, &mut attempt);
         assert!(completion.result.is_ok());
@@ -377,7 +333,6 @@ mod tests {
             geometry(),
             invalid,
             buffer,
-            0,
             &mut BackgroundIoAttempt::new(&IoRecovery::new(Some(Duration::ZERO)), None),
         ) {
             Err(error) => error,

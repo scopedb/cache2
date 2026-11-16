@@ -141,30 +141,6 @@ pub struct RegionIndex {
     conditional_replace_misses: AtomicU64,
 }
 
-#[cfg(feature = "benchmarking")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BenchmarkProbeStats {
-    pub operations: u64,
-    pub probes: u64,
-    pub stale_slots: u64,
-    pub full_windows: u64,
-    pub max_probes: usize,
-}
-
-#[cfg(feature = "benchmarking")]
-impl BenchmarkProbeStats {
-    pub fn record(&mut self, probes: usize) {
-        self.operations = self.operations.saturating_add(1);
-        self.probes = self
-            .probes
-            .saturating_add(u64::try_from(probes).unwrap_or(u64::MAX));
-        self.full_windows = self
-            .full_windows
-            .saturating_add(u64::from(probes == INDEX_CANDIDATES));
-        self.max_probes = self.max_probes.max(probes);
-    }
-}
-
 impl RegionIndex {
     pub fn from_storage(storage: PartitionedIndexStorage) -> Result<Self, IndexStorageError> {
         let heat = SlotHeat::try_new(storage.slot_count())?;
@@ -192,13 +168,10 @@ impl RegionIndex {
         let physical = self.storage.physical_stats()?;
         let slot_capacity = u64::try_from(self.storage.slot_count())
             .map_err(|_| IndexStorageError::SizeOverflow)?;
-        let empty_slots = slot_capacity
-            .checked_sub(physical.value)
-            .ok_or(IndexStorageError::InvalidPhysicalStats)?;
         Ok(CacheIndexSnapshot {
             slot_capacity,
             physical_value_slots: physical.value,
-            empty_slots,
+            empty_slots: slot_capacity.saturating_sub(physical.value),
             relocations: self.relocations.load(Ordering::Relaxed),
             overflow_evictions: self.overflow_evictions.load(Ordering::Relaxed),
             conditional_remove_misses: self.conditional_remove_misses.load(Ordering::Relaxed),
@@ -208,20 +181,14 @@ impl RegionIndex {
 
     /// Returns one fingerprint candidate. Record validation owns correctness.
     pub fn lookup_raw(&self, hash: u64) -> Result<Option<IndexEntry>, IndexStorageError> {
-        let (entry, _) = self.lookup_probed(hash)?;
-        Ok(entry)
+        self.lookup_with_probes(hash).map(|(entry, _)| entry)
     }
 
-    #[cfg(feature = "benchmarking")]
+    #[inline]
     pub fn lookup_with_probes(
         &self,
         hash: u64,
     ) -> Result<(Option<IndexEntry>, usize), IndexStorageError> {
-        self.lookup_probed(hash)
-    }
-
-    #[inline]
-    fn lookup_probed(&self, hash: u64) -> Result<(Option<IndexEntry>, usize), IndexStorageError> {
         let partition = self.storage.try_read_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let fingerprint = fingerprint(hash);
@@ -249,7 +216,7 @@ impl RegionIndex {
     }
 
     /// Installs a value with up to two bounded relocations and one bounded eviction.
-    pub fn upsert(&self, hash: u64, supplied: IndexEntry) -> Result<bool, IndexStorageError> {
+    pub fn upsert(&self, hash: u64, supplied: IndexEntry) -> Result<(), IndexStorageError> {
         let mut partition = self.storage.write_hash_partition(hash)?;
         let slot_count = partition.slot_count();
         let fingerprint = fingerprint(hash);
@@ -281,7 +248,7 @@ impl RegionIndex {
                         state,
                         value_state(fingerprint, displacement, supplied),
                     )?;
-                    return Ok(true);
+                    return Ok(());
                 }
                 IndexSlotState::Value { .. } => {}
             }
@@ -294,7 +261,7 @@ impl RegionIndex {
                 IndexSlotState::Empty,
                 value_state(fingerprint, displacement, supplied),
             )?;
-            return Ok(true);
+            return Ok(());
         }
 
         // One hop recovers common candidate-set collisions without a cuckoo
@@ -314,11 +281,6 @@ impl RegionIndex {
                 continue;
             };
             let occupant_displacement = usize::from(occupant_displacement);
-            if occupant_displacement >= INDEX_CANDIDATES {
-                return Err(IndexStorageError::InvalidArgument(
-                    "index bucket displacement is out of range",
-                ));
-            }
             let occupant_home = home_from_slot(source_slot, occupant_displacement, slot_count);
             for target_displacement in 0..INDEX_CANDIDATES {
                 if target_displacement == occupant_displacement {
@@ -345,7 +307,7 @@ impl RegionIndex {
                 if self.activity_counters_enabled.load(Ordering::Relaxed) {
                     self.relocations.fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(true);
+                return Ok(());
             }
         }
 
@@ -367,11 +329,6 @@ impl RegionIndex {
                 continue;
             };
             let source_current_displacement = usize::from(source_current_displacement);
-            if source_current_displacement >= INDEX_CANDIDATES {
-                return Err(IndexStorageError::InvalidArgument(
-                    "index bucket displacement is out of range",
-                ));
-            }
             let source_home = home_from_slot(source_slot, source_current_displacement, slot_count);
             for middle_displacement in 0..INDEX_CANDIDATES {
                 if middle_displacement == source_current_displacement {
@@ -391,11 +348,6 @@ impl RegionIndex {
                     continue;
                 };
                 let middle_current_displacement = usize::from(middle_current_displacement);
-                if middle_current_displacement >= INDEX_CANDIDATES {
-                    return Err(IndexStorageError::InvalidArgument(
-                        "index bucket displacement is out of range",
-                    ));
-                }
                 let middle_home =
                     home_from_slot(middle_slot, middle_current_displacement, slot_count);
                 for target_displacement in 0..INDEX_CANDIDATES {
@@ -430,7 +382,7 @@ impl RegionIndex {
                     if self.activity_counters_enabled.load(Ordering::Relaxed) {
                         self.relocations.fetch_add(2, Ordering::Relaxed);
                     }
-                    return Ok(true);
+                    return Ok(());
                 }
             }
         }
@@ -450,7 +402,7 @@ impl RegionIndex {
         if self.activity_counters_enabled.load(Ordering::Relaxed) {
             self.overflow_evictions.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn try_delete(&self, hash: u64) -> Result<bool, IndexStorageError> {
@@ -738,18 +690,15 @@ mod tests {
         let second = entry(2, 32);
 
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
-        assert!(index.upsert(hash, first).unwrap());
+        index.upsert(hash, first).unwrap();
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(first));
-        assert!(index.upsert(hash, second).unwrap());
+        index.upsert(hash, second).unwrap();
         assert_eq!(index.lookup_raw(hash).unwrap(), Some(second));
         assert!(index.try_delete(hash).unwrap());
         assert_eq!(index.lookup_raw(hash).unwrap(), None);
         assert_eq!(
             index.storage().physical_stats().unwrap(),
-            IndexPhysicalStats {
-                value: 0,
-                deleted: 0,
-            }
+            IndexPhysicalStats { value: 0 }
         );
     }
 
@@ -919,10 +868,9 @@ mod tests {
     fn duplicate_candidates_in_a_minimum_partition_keep_exact_stats() {
         let index = anonymous(INDEX_CANDIDATES);
         for hash in 0_u64..1_000 {
-            assert!(index.upsert(hash, entry(1, (hash as u32) * 32)).unwrap());
+            index.upsert(hash, entry(1, (hash as u32) * 32)).unwrap();
             let physical = index.storage().physical_stats().unwrap();
             assert!(physical.value <= INDEX_CANDIDATES as u64);
-            assert_eq!(physical.deleted, 0);
         }
         index.snapshot().unwrap();
     }

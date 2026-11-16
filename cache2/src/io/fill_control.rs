@@ -15,9 +15,7 @@
 //! Bounded pre-timeout observation and worker-paced fill admission.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -59,22 +57,6 @@ fn pack_credit(records: u64, byte_units: u64) -> u64 {
     (records << 32) | byte_units
 }
 
-fn encode_pressure(pressure: FillPressure) -> u8 {
-    match pressure {
-        FillPressure::Disabled => 0,
-        FillPressure::Healthy => 1,
-        FillPressure::Paused => 2,
-    }
-}
-
-fn decode_pressure(value: u8) -> FillPressure {
-    match value {
-        1 => FillPressure::Healthy,
-        2 => FillPressure::Paused,
-        _ => FillPressure::Disabled,
-    }
-}
-
 fn nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
@@ -92,9 +74,8 @@ pub struct FillController {
     origin: Instant,
     credit: AtomicU64,
     last_refill_ns: AtomicU64,
-    pressure: AtomicU8,
+    paused: AtomicBool,
     stopped: AtomicBool,
-    recovering: AtomicUsize,
     pause_holders: AtomicUsize,
     rejections: AtomicU64,
     would_reject: AtomicU64,
@@ -133,7 +114,7 @@ impl FillController {
         options: FillControlOptions,
         slots: usize,
         max_flush_bytes: u64,
-    ) -> io::Result<Option<Arc<Self>>> {
+    ) -> io::Result<Option<Self>> {
         Self::allocation_bytes(options, slots)?;
         let (limits, enforcing) = match options {
             FillControlOptions::Disabled => return Ok(None),
@@ -161,7 +142,7 @@ impl FillController {
             start_ns: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         });
-        Ok(Some(Arc::new(Self {
+        Ok(Some(Self {
             limits,
             enforcing,
             max_byte_units,
@@ -169,16 +150,15 @@ impl FillController {
             origin: Instant::now(),
             credit: AtomicU64::new(pack_credit(max_records, max_byte_units)),
             last_refill_ns: AtomicU64::new(0),
-            pressure: AtomicU8::new(encode_pressure(FillPressure::Healthy)),
+            paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
-            recovering: AtomicUsize::new(0),
             pause_holders: AtomicUsize::new(0),
             rejections: AtomicU64::new(0),
             would_reject: AtomicU64::new(0),
             dropped_observations: AtomicU64::new(0),
             completed_bytes: AtomicU64::new(0),
             slots: table.into_boxed_slice(),
-        })))
+        }))
     }
 
     fn elapsed_ns(&self) -> u64 {
@@ -190,44 +170,20 @@ impl FillController {
         self.publish();
     }
 
-    pub fn set_recovering(&self, recovering: bool) {
-        if recovering {
-            self.recovering.fetch_add(1, Ordering::AcqRel);
-        } else {
-            loop {
-                let holds = self.recovering.load(Ordering::Acquire);
-                if holds == 0
-                    || self
-                        .recovering
-                        .compare_exchange(holds, holds - 1, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    break;
-                }
-            }
-        }
-        self.publish();
-    }
-
-    fn hold_pause(&self) {
+    pub fn hold_pause(&self) {
         self.pause_holders.fetch_add(1, Ordering::AcqRel);
         self.publish();
     }
 
-    fn release_pause(&self) {
+    pub fn release_pause(&self) {
         self.pause_holders.fetch_sub(1, Ordering::AcqRel);
         self.publish();
     }
 
     fn publish(&self) {
-        let (next, pressure) = if self.paused() {
-            (FillPressure::Paused, "paused")
-        } else {
-            (FillPressure::Healthy, "healthy")
-        };
-        let previous =
-            decode_pressure(self.pressure.swap(encode_pressure(next), Ordering::Release));
-        if previous != next && previous != FillPressure::Disabled {
+        let next = self.is_paused();
+        if self.paused.swap(next, Ordering::Release) != next {
+            let pressure = if next { "paused" } else { "healthy" };
             log::info!(
                 target: "cache2::health",
                 event = "cache_fill_pressure_changed",
@@ -237,18 +193,17 @@ impl FillController {
         }
     }
 
-    fn paused(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-            || self.recovering.load(Ordering::Acquire) != 0
-            || self.pause_holders.load(Ordering::Acquire) != 0
+    fn is_paused(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.pause_holders.load(Ordering::Acquire) != 0
     }
 
     pub fn suppress_reinsertion(&self) -> bool {
-        self.enforcing && self.paused()
+        self.enforcing && self.is_paused()
     }
 
     pub fn snapshot(&self) -> FillControlSnapshot {
-        let pressure = if self.paused() {
+        let paused = self.is_paused();
+        let pressure = if paused {
             FillPressure::Paused
         } else {
             FillPressure::Healthy
@@ -274,7 +229,7 @@ impl FillController {
         } else {
             0
         };
-        let (byte_rate, record_rate) = if pressure == FillPressure::Paused {
+        let (byte_rate, record_rate) = if paused {
             (0, 0)
         } else {
             (
@@ -299,13 +254,14 @@ impl FillController {
 
     /// Foreground admission: Adaptive rejects only while paused.
     pub fn try_admit_fill(&self) -> bool {
+        let paused = self.is_paused();
         if !self.enforcing {
-            if self.paused() {
+            if paused {
                 self.would_reject.fetch_add(1, Ordering::Relaxed);
             }
             return true;
         }
-        if self.paused() {
+        if paused {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             false
         } else {
@@ -329,32 +285,26 @@ impl FillController {
         self.refill();
         let raw_byte_units = bytes.div_ceil(CREDIT_UNIT_BYTES).max(1);
         let raw_records = u64::from(records.max(1));
-        let byte_units = raw_byte_units.min(self.max_byte_units);
-        let records = raw_records.min(self.max_records);
         let byte_oversized = raw_byte_units >= self.max_byte_units;
         let record_oversized = raw_records >= self.max_records;
+        let min_byte_units = if byte_oversized { 1 } else { raw_byte_units };
+        let min_records = if record_oversized { 1 } else { raw_records };
         let mut value = self.credit.load(Ordering::Relaxed);
         for _ in 0..MAX_CAS_ATTEMPTS {
             let have_byte_units = packed_byte_units(value);
             let have_records = packed_records(value);
-            if have_byte_units == 0 || have_records == 0 {
-                return None;
-            }
-            if !byte_oversized && have_byte_units < byte_units {
-                return None;
-            }
-            if !record_oversized && have_records < records {
+            if have_byte_units < min_byte_units || have_records < min_records {
                 return None;
             }
             let take_byte_units = if byte_oversized {
                 have_byte_units
             } else {
-                byte_units
+                raw_byte_units
             };
             let take_records = if record_oversized {
                 have_records
             } else {
-                records
+                raw_records
             };
             let next = pack_credit(
                 have_records - take_records,
@@ -377,10 +327,9 @@ impl FillController {
     }
 
     pub fn refund_flush_budget(&self, charge: FlushCharge) {
-        if !self.enforcing || (charge.records == 0 && charge.byte_units == 0) {
-            return;
+        if self.enforcing {
+            self.add_credit(charge.records, charge.byte_units);
         }
-        self.add_credit(charge.records, charge.byte_units);
     }
 
     fn refill(&self) {
@@ -389,17 +338,10 @@ impl FillController {
         let Some(dt) = now.checked_sub(last).filter(|dt| *dt != 0) else {
             return;
         };
-        let add_byte_units = self
-            .limits
-            .max_bytes_per_second
-            .saturating_mul(dt)
-            .checked_div(1_000_000_000)
-            .unwrap_or(0)
-            / CREDIT_UNIT_BYTES;
-        let add_records = u64::from(self.limits.max_records_per_second)
-            .saturating_mul(dt)
-            .checked_div(1_000_000_000)
-            .unwrap_or(0);
+        let add_byte_units =
+            self.limits.max_bytes_per_second.saturating_mul(dt) / 1_000_000_000 / CREDIT_UNIT_BYTES;
+        let add_records =
+            u64::from(self.limits.max_records_per_second).saturating_mul(dt) / 1_000_000_000;
         if add_byte_units == 0 && add_records == 0 {
             return;
         }
@@ -507,7 +449,7 @@ mod tests {
 
     use super::*;
 
-    fn control(enforcing: bool) -> Arc<FillController> {
+    fn control(enforcing: bool) -> FillController {
         let limits = FillLimits::new(64_000, 100);
         FillController::new(
             if enforcing {
@@ -640,10 +582,10 @@ mod tests {
     #[test]
     fn recovering_fence_does_not_need_outstanding_io() {
         let control = control(true);
-        control.set_recovering(true);
+        control.hold_pause();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         assert!(!control.try_admit_fill());
-        control.set_recovering(false);
+        control.release_pause();
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
         assert!(control.try_admit_fill());
     }
@@ -651,13 +593,13 @@ mod tests {
     #[test]
     fn overlapping_recovery_holds_resume_when_all_release() {
         let control = control(true);
-        control.set_recovering(true);
-        control.set_recovering(true);
+        control.hold_pause();
+        control.hold_pause();
         assert!(!control.try_admit_fill());
-        control.set_recovering(false);
+        control.release_pause();
         assert_eq!(control.snapshot().pressure, FillPressure::Paused);
         assert!(!control.try_admit_fill());
-        control.set_recovering(false);
+        control.release_pause();
         assert_eq!(control.snapshot().pressure, FillPressure::Healthy);
         assert!(control.try_admit_fill());
     }
@@ -802,8 +744,10 @@ mod tests {
             control.refill();
         }
         assert_eq!(control.last_refill_ns.load(Ordering::Relaxed), one_ms_ago);
-        let origin = &mut Arc::get_mut(&mut control).unwrap().origin;
-        *origin = origin.checked_sub(Duration::from_millis(110)).unwrap();
+        control.origin = control
+            .origin
+            .checked_sub(Duration::from_millis(110))
+            .unwrap();
         control.refill();
         assert!(control.try_acquire_flush_budget(64, 1, false).is_some());
     }

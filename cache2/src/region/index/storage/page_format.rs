@@ -21,7 +21,6 @@ use crate::codec::put_u32;
 use crate::codec::put_u64;
 use crate::region::index::storage::CorruptPageReason;
 use crate::region::index::storage::IndexImageBinding;
-use crate::region::index::storage::IndexStorageError;
 
 pub const INDEX_IMAGE_PAGE_SIZE: usize = 4096;
 pub const INDEX_IMAGE_PAGE_HEADER_SIZE: usize = 64;
@@ -59,7 +58,8 @@ pub fn encode_page_header(
     first_slot: usize,
     valid_slots: usize,
     binding: IndexImageBinding,
-) -> Result<(), IndexStorageError> {
+) {
+    debug_assert!(valid_slots <= INDEX_IMAGE_SLOTS_PER_PAGE);
     page[..8].copy_from_slice(&PAGE_MAGIC);
     put_u16(page, PAGE_VERSION_OFFSET, PAGE_FORMAT_VERSION);
     put_u16(
@@ -73,27 +73,12 @@ pub fn encode_page_header(
         PAGE_SLOTS_PER_PAGE_OFFSET,
         INDEX_IMAGE_SLOTS_PER_PAGE as u16,
     );
-    put_u64(
-        page,
-        PAGE_INDEX_OFFSET,
-        u64::try_from(page_index).map_err(|_| IndexStorageError::SizeOverflow)?,
-    );
-    put_u64(
-        page,
-        PAGE_FIRST_SLOT_OFFSET,
-        u64::try_from(first_slot).map_err(|_| IndexStorageError::SizeOverflow)?,
-    );
-    put_u32(
-        page,
-        PAGE_VALID_SLOTS_OFFSET,
-        u32::try_from(valid_slots).map_err(|_| IndexStorageError::SizeOverflow)?,
-    );
+    put_u64(page, PAGE_INDEX_OFFSET, page_index as u64);
+    put_u64(page, PAGE_FIRST_SLOT_OFFSET, first_slot as u64);
+    put_u32(page, PAGE_VALID_SLOTS_OFFSET, valid_slots as u32);
     put_u32(page, PAGE_FLAGS_OFFSET, PAGE_FLAG_NONE);
     put_u64(page, PAGE_GENERATION_OFFSET, binding.generation);
     put_u64(page, PAGE_IMAGE_TAG_OFFSET, binding.image_tag);
-    // The caller starts from a zero-filled page; write the checksum last.
-    put_u32(page, PAGE_CHECKSUM_OFFSET, 0);
-    Ok(())
 }
 
 pub fn validate_page_header(
@@ -127,11 +112,7 @@ pub fn validate_page_header(
         });
     }
 
-    let expected_page_index =
-        u64::try_from(expected_page_index).map_err(|_| CorruptPageReason::WrongPageIndex {
-            expected: u64::MAX,
-            actual: read_u64(page, PAGE_INDEX_OFFSET),
-        })?;
+    let expected_page_index = expected_page_index as u64;
     let actual_page_index = read_u64(page, PAGE_INDEX_OFFSET);
     if actual_page_index != expected_page_index {
         return Err(CorruptPageReason::WrongPageIndex {
@@ -140,11 +121,7 @@ pub fn validate_page_header(
         });
     }
 
-    let expected_first_slot =
-        u64::try_from(expected_first_slot).map_err(|_| CorruptPageReason::WrongFirstSlot {
-            expected: u64::MAX,
-            actual: read_u64(page, PAGE_FIRST_SLOT_OFFSET),
-        })?;
+    let expected_first_slot = expected_first_slot as u64;
     let actual_first_slot = read_u64(page, PAGE_FIRST_SLOT_OFFSET);
     if actual_first_slot != expected_first_slot {
         return Err(CorruptPageReason::WrongFirstSlot {
@@ -153,12 +130,7 @@ pub fn validate_page_header(
         });
     }
 
-    let expected_valid_slots = u32::try_from(expected_valid_slots).map_err(|_| {
-        CorruptPageReason::WrongValidSlotCount {
-            expected: u32::MAX,
-            actual: read_u32(page, PAGE_VALID_SLOTS_OFFSET),
-        }
-    })?;
+    let expected_valid_slots = expected_valid_slots as u32;
     let actual_valid_slots = read_u32(page, PAGE_VALID_SLOTS_OFFSET);
     if actual_valid_slots != expected_valid_slots {
         return Err(CorruptPageReason::WrongValidSlotCount {
@@ -216,6 +188,6 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
     get_u32(input, offset).expect("fixed u32 field is in bounds")
 }
 
-pub fn read_u64(input: &[u8], offset: usize) -> u64 {
+fn read_u64(input: &[u8], offset: usize) -> u64 {
     get_u64(input, offset).expect("fixed u64 field is in bounds")
 }

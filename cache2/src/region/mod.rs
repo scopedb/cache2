@@ -68,14 +68,11 @@ use crate::region::record::codec::encode_reinsert_into_hashed;
 use crate::region::record::codec::encode_value_into_hashed;
 #[cfg(test)]
 use crate::region::record::codec::hash_key;
-use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
 use crate::region::recovery::metadata::PartitionMetadataRecord;
-use crate::region::recovery::metadata::REGION_METADATA_PAGE_SIZE;
-use crate::region::recovery::metadata::REGION_METADATA_PARTITIONS_PER_PAGE;
-use crate::region::recovery::metadata::REGION_METADATA_REGIONS_PER_PAGE;
 use crate::region::recovery::metadata::RegionMetadata;
 use crate::region::recovery::metadata::RegionMetadataError;
+use crate::region::recovery::metadata::region_metadata_encoded_len;
 use crate::region::recovery::recovery_image_index_len;
 use crate::region::staging::AppendStaging;
 use crate::region::staging::StageAppend;
@@ -223,10 +220,10 @@ pub struct FrozenRegionStore {
 /// Live L2 index, Region allocation, and append/read/reclaim coordination.
 pub struct RegionStore {
     index: RegionIndex,
+    geometry: DataGeometry,
     manager: RegionManagerLock,
     append_gates: Box<[Mutex<()>]>,
     region_generations: Box<[AtomicU64]>,
-    rotation: Mutex<()>,
     health: RegionHealthLatch,
 }
 
@@ -324,6 +321,16 @@ impl RegionStore {
                 "index and Region metadata do not describe one authority",
             ));
         }
+        let data_file_len =
+            DataGeometry::expected_file_len(metadata.root.region_size, metadata.root.region_count)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "data geometry overflow")
+                })?;
+        let geometry = DataGeometry {
+            data_file_len,
+            region_size: metadata.root.region_size,
+            region_count: metadata.root.region_count,
+        };
         let manager = RegionManager::from_metadata(metadata).map_err(region_metadata_io_error)?;
         let mut append_gates = Vec::new();
         append_gates
@@ -351,10 +358,10 @@ impl RegionStore {
         let index = RegionIndex::from_storage(index).map_err(index_storage_io_error)?;
         Ok(Self {
             index,
+            geometry,
             manager: RegionManagerLock::new(manager, health.clone()),
             append_gates: append_gates.into_boxed_slice(),
             region_generations: region_generations.into_boxed_slice(),
-            rotation: Mutex::new(()),
             health,
         })
     }
@@ -364,7 +371,7 @@ impl RegionStore {
     pub fn freeze(self: Arc<Self>) -> io::Result<FrozenRegionStore> {
         self.health.require_healthy()?;
         let regions = self;
-        if regions.append_gates.iter().any(Mutex::is_poisoned) || regions.rotation.is_poisoned() {
+        if regions.append_gates.iter().any(Mutex::is_poisoned) {
             regions.health.enter_miss_only();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -389,8 +396,8 @@ impl RegionStore {
         self.index.storage().slot_count()
     }
 
-    pub fn region_count(&self) -> io::Result<usize> {
-        Ok(self.manager.lock()?.regions().len())
+    pub const fn region_count(&self) -> usize {
+        self.region_generations.len()
     }
 
     pub fn configure_reclaim_workers(&self, workers: usize) -> io::Result<()> {
@@ -420,7 +427,6 @@ impl RegionStore {
     }
 
     pub fn begin_reclaim(&self) -> io::Result<Option<RegionReclaimReceipt>> {
-        self.health.require_healthy()?;
         self.manager
             .lock()?
             .begin_reclaim()
@@ -436,14 +442,8 @@ impl RegionStore {
     }
 
     pub fn reclaim_absolute(&self, receipt: RegionReclaimReceipt) -> io::Result<u64> {
-        DATA_REGION_AREA_OFFSET
-            .checked_add(
-                u64::from(receipt.region_id)
-                    .checked_mul(self.manager.lock()?.region_size())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "reclaim offset overflow")
-                    })?,
-            )
+        self.geometry
+            .region_offset(receipt.region_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reclaim offset overflow"))
     }
 
@@ -510,7 +510,7 @@ impl RegionStore {
                         "reclaim record payload is out of bounds",
                     )
                 })?;
-            if header.region_generation != receipt.created_seqno || payload_end > record_end {
+            if header.region_generation != receipt.created_seqno {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "reclaim record belongs to another Region generation",
@@ -537,13 +537,8 @@ impl RegionStore {
                     stats.records_removed = stats.records_removed.saturating_add(1);
                 }
                 ReclaimIndexAction::Reinsert => {
-                    let key_start = header_end;
-                    let key_end = key_start
-                        .checked_add(usize::from(header.key_len))
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "reclaim key range overflow")
-                        })?;
-                    let key = &bytes[key_start..key_end];
+                    let key_end = header_end + usize::from(header.key_len);
+                    let key = &bytes[header_end..key_end];
                     let value = &bytes[key_end..payload_end];
                     let rewrite_bytes = RecordHeader::aligned_len(key.len(), value.len())
                         .ok_or_else(|| {
@@ -660,16 +655,16 @@ impl RegionStore {
     /// point semantics. A lazy image failure latches the whole L2 miss-only;
     /// it is never surfaced as a cache hit or allowed to authorize CLEAN.
     #[cfg(test)]
-    fn lookup_snapshot(&self, hash: u64) -> io::Result<Option<IndexEntry>> {
+    fn lookup_snapshot(&self, hash: u64) -> Option<IndexEntry> {
         if !self.health.is_healthy() {
-            return Ok(None);
+            return None;
         }
         match self.index.lookup_raw(hash) {
-            Ok(result) if self.health.is_healthy() => Ok(result),
-            Ok(_) => Ok(None),
+            Ok(result) if self.health.is_healthy() => result,
+            Ok(_) => None,
             Err(error) => {
                 enter_miss_only_for_index_error(&self.health, &error);
-                Ok(None)
+                None
             }
         }
     }
@@ -707,7 +702,6 @@ impl RegionStore {
     fn read_value(
         &self,
         engine: &IoEngine,
-        geometry: DataGeometry,
         buffer: BufferLease,
         hash_seed: u64,
         key: &[u8],
@@ -716,7 +710,7 @@ impl RegionStore {
         let Some(candidate) = self.begin_point_read(hash) else {
             return Ok(None);
         };
-        let desc = describe_read(geometry, hash, candidate, true)?;
+        let desc = describe_read(self.geometry, hash, candidate, true)?;
         let slot = engine.try_reserve_read()?;
         self.read_value_from_desc(engine, slot, buffer, desc, key)
     }
@@ -760,14 +754,20 @@ impl RegionStore {
         key: &[u8],
     ) -> io::Result<Option<RegionValue>> {
         let hash = completion.desc.hash;
-        if let Err(error) = completion.result {
-            if !is_read_pressure(error.kind()) {
-                self.health
-                    .enter_miss_only_with_error("record_read_completion_failed", &error);
+        let buffer = match completion.result {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                if !is_read_pressure(error.kind()) {
+                    self.health
+                        .enter_miss_only_with_error("record_read_completion_failed", &error);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        let Some(record) = completion.record_bytes() else {
+        };
+        let Some(record) = buffer
+            .prepared(completion.desc.read_len)
+            .and_then(|bytes| bytes.get(completion.desc.record_range.clone()))
+        else {
             let error = io::Error::new(
                 io::ErrorKind::InvalidData,
                 "record completion lost its bounded candidate range",
@@ -822,15 +822,6 @@ impl RegionStore {
         let value_start = completion.desc.record_range.start + RECORD_HEADER_SIZE + key_len;
         let Some(value_end) = value_start.checked_add(value_len) else {
             return Ok(None);
-        };
-        let Some(buffer) = completion.buffer else {
-            let error = io::Error::new(
-                io::ErrorKind::InvalidData,
-                "validated Region read lost its owned buffer",
-            );
-            self.health
-                .enter_miss_only_with_error("record_read_completion_invalid", &error);
-            return Err(error);
         };
         Ok(Some(RegionValue {
             buffer,
@@ -1014,7 +1005,6 @@ impl RegionStore {
     /// with a single non-waiting bounded index probe. No Region bytes are
     /// reserved or written for a deletion.
     pub fn try_delete_value(&self, hash: u64) -> io::Result<Option<u64>> {
-        self.health.require_healthy()?;
         let seqno = {
             let Some(mut manager) = self.manager.try_lock()? else {
                 return Ok(None);
@@ -1061,29 +1051,11 @@ impl RegionStore {
         mut attempt: BackgroundIoAttempt<'_>,
     ) -> io::Result<Option<RegionWriteSpan>> {
         let shard_mutation = self.lock_shard_mutation(shard_id)?;
-        let geometry_for = |manager: &RegionManager| {
-            let region_count = u32::try_from(manager.regions().len()).map_err(|_| {
-                self.health.enter_miss_only();
-                io::Error::new(io::ErrorKind::InvalidData, "Region count is too large")
-            })?;
-            let data_file_len =
-                DataGeometry::expected_file_len(manager.region_size(), region_count).ok_or_else(
-                    || {
-                        self.health.enter_miss_only();
-                        io::Error::new(io::ErrorKind::InvalidData, "data geometry overflow")
-                    },
-                )?;
-            Ok::<_, io::Error>(DataGeometry {
-                data_file_len,
-                region_size: manager.region_size(),
-                region_count,
-            })
-        };
 
         // An already aligned span is sealed under this manager guard. A
         // non-zero tail receipt remains a shard fence while staging extends its
         // last record outside the manager lock.
-        let (padding, sealed) = {
+        let (padding, span) = {
             let mut manager = self.manager.lock()?;
             let padding = match manager.reserve_write_padding(shard_id) {
                 Ok(padding) => padding,
@@ -1093,44 +1065,36 @@ impl RegionStore {
                     return Err(region_mutation_io_error(error));
                 }
             };
-            let sealed = if padding.is_none() {
-                let span = manager.seal_write_span(shard_id).map_err(|error| {
+            let span = if padding.is_none() {
+                Some(manager.seal_write_span(shard_id).map_err(|error| {
                     self.health.enter_miss_only();
                     region_mutation_io_error(error)
-                })?;
-                Some((span, geometry_for(&manager)?))
+                })?)
             } else {
                 None
             };
-            (padding, sealed)
+            (padding, span)
         };
-        let (span, geometry) = if let Some(sealed) = sealed {
-            sealed
-        } else {
-            let padding = padding.ok_or_else(|| {
-                self.health.enter_miss_only();
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "padding receipt disappeared before sealing",
-                )
-            })?;
-            if let Err(error) = staging.apply_write_padding(padding) {
-                self.health.enter_miss_only();
-                staging.close();
-                return Err(staging_io_error(error));
-            }
-            let mut manager = self.manager.lock()?;
-            let span = match manager.seal_write_span_with_padding(padding) {
-                Ok(span) => span,
-                Err(error) => {
-                    drop(manager);
+        let span = match span {
+            Some(span) => span,
+            None => {
+                let padding = padding.expect("padding receipt exists when span is unsealed");
+                if let Err(error) = staging.apply_write_padding(padding) {
                     self.health.enter_miss_only();
                     staging.close();
-                    return Err(region_mutation_io_error(error));
+                    return Err(staging_io_error(error));
                 }
-            };
-            let geometry = geometry_for(&manager)?;
-            (span, geometry)
+                let mut manager = self.manager.lock()?;
+                match manager.seal_write_span_with_padding(padding) {
+                    Ok(span) => span,
+                    Err(error) => {
+                        drop(manager);
+                        self.health.enter_miss_only();
+                        staging.close();
+                        return Err(region_mutation_io_error(error));
+                    }
+                }
+            }
         };
 
         let job = match staging.take_sealed(span) {
@@ -1151,10 +1115,9 @@ impl RegionStore {
         let StagedWrite {
             span,
             buffer,
-            absolute,
             records,
         } = job;
-        let pending = match submit_write(engine, geometry, span, buffer, absolute, &mut attempt) {
+        let pending = match submit_write(engine, self.geometry, span, buffer, &mut attempt) {
             Ok(pending) => pending,
             Err(error) => {
                 let original = error.error;
@@ -1211,56 +1174,33 @@ impl RegionStore {
     /// Rotates one empty data shard. Concurrent reads validate the returned
     /// record identity and may observe either valid generation.
     pub fn rotate_shard(&self, shard_id: usize) -> io::Result<RegionRotation> {
-        self.health.require_healthy()?;
-        let shard_mutation = self.lock_shard_mutation(shard_id)?;
-        let rotation = self.rotation.lock().map_err(|_| {
-            self.health.enter_miss_only();
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Region rotation gate is poisoned",
-            )
-        })?;
-        let candidate = {
-            let manager = self.manager.lock()?;
-            if !manager
-                .rotation_requested(shard_id)
-                .map_err(|error| region_mutation_context("rotation selection", error))?
-            {
-                return Ok(RegionRotation::Idle);
-            }
-            match manager.rotation_candidate(shard_id) {
-                Ok(candidate) => candidate,
-                Err(RegionMutationError::WouldBlock) => return Ok(RegionRotation::Pending),
-                Err(error) => return Err(region_mutation_context("rotation selection", error)),
+        let _shard_mutation = self.lock_shard_mutation(shard_id)?;
+        let mut manager = self.manager.lock()?;
+        if !manager
+            .rotation_requested(shard_id)
+            .map_err(|error| region_mutation_context("rotation selection", error))?
+        {
+            return Ok(RegionRotation::Idle);
+        }
+        let receipt = match manager.rotate_shard(shard_id) {
+            Ok(receipt) => receipt,
+            Err(RegionMutationError::WouldBlock) => return Ok(RegionRotation::Pending),
+            Err(error) => {
+                self.health.enter_miss_only();
+                return Err(region_mutation_context("rotation", error));
             }
         };
-
-        let receipt = self
-            .manager
-            .lock()?
-            .begin_rotation(candidate)
-            .map_err(|error| region_mutation_context("rotation begin", error))?;
-        let generation = self
+        let Some(generation) = self
             .region_generations
             .get(receipt.activated_region_id as usize)
-            .ok_or_else(|| {
-                self.health.enter_miss_only();
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "rotation activated an untracked Region",
-                )
-            })?;
-        generation.store(receipt.activated_created_seqno, Ordering::Release);
-        // Manager authority now carries the exact in-progress rotation
-        // receipt, so foreground staging fails fast on this shard. Release the
-        // shard gates before publishing the completed in-memory rotation.
-        drop(rotation);
-        drop(shard_mutation);
-
-        if let Err(error) = self.manager.lock()?.finish_rotation(receipt) {
+        else {
             self.health.enter_miss_only();
-            return Err(region_mutation_context("rotation completion", error));
-        }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rotation activated an untracked Region",
+            ));
+        };
+        generation.store(receipt.activated_created_seqno, Ordering::Release);
         Ok(RegionRotation::Rotated)
     }
 
@@ -1271,7 +1211,10 @@ impl RegionStore {
         for record in records.iter().copied() {
             let entry = record.entry();
             let published = match record.previous_location() {
-                Some(previous) => self.index.replace_if_match(record.hash(), previous, entry),
+                Some(previous) => self
+                    .index
+                    .replace_if_match(record.hash(), previous, entry)
+                    .map(|_| ()),
                 None => self.index.upsert(record.hash(), entry),
             };
             if let Err(error) = published {
@@ -1327,25 +1270,22 @@ pub fn runtime_fixed_memory_bytes(index_slots: usize, region_count: u32) -> io::
                 "index page-state memory does not fit the platform",
             )
         })?;
-    let region_count = usize::try_from(region_count)
+    let region_count_usize = usize::try_from(region_count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Region count is too large"))?;
     // Manager, read-directory, shard gates, and FIFO nodes are all fixed by
     // Region count. Charge a conservative constant per Region instead of
     // exposing allocator-specific layout as a tuning surface.
-    let region_bytes = region_count
+    let region_bytes = region_count_usize
         .checked_mul(256)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory size overflow"))?;
-    let partition_count = canonical_index_partition_ranges(index_slots)
-        .map_err(index_storage_io_error)?
-        .len();
-    let metadata_pages = 1_usize
-        .checked_add(region_count.div_ceil(REGION_METADATA_REGIONS_PER_PAGE))
-        .and_then(|pages| {
-            pages.checked_add(partition_count.div_ceil(REGION_METADATA_PARTITIONS_PER_PAGE))
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "metadata size overflow"))?;
-    let metadata_bytes = metadata_pages
-        .checked_mul(REGION_METADATA_PAGE_SIZE)
+    let partition_count = u32::try_from(
+        canonical_index_partition_ranges(index_slots)
+            .map_err(index_storage_io_error)?
+            .len(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many index partitions"))?;
+    let metadata_bytes = region_metadata_encoded_len(region_count, partition_count)
+        .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "metadata size overflow"))?;
     // Warm close may hold an encoded metadata image, its cloned record tables,
     // and the fixed sequential write batch at once. Two encoded lengths are a
@@ -1502,7 +1442,7 @@ fn partition_metadata_from_stats(
                 )
             })?,
             physical_value_slots: stats.value,
-            physical_deleted_slots: stats.deleted,
+            physical_deleted_slots: 0,
         });
     }
     Ok(partitions.into_boxed_slice())
@@ -1519,9 +1459,14 @@ fn metadata_partition_stats(metadata: &RegionMetadata) -> io::Result<Box<[IndexP
             )
         })?;
     for partition in &metadata.partitions {
+        if partition.physical_deleted_slots != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition metadata contains unsupported deleted slots",
+            ));
+        }
         stats.push(IndexPhysicalStats {
             value: partition.physical_value_slots,
-            deleted: partition.physical_deleted_slots,
         });
     }
     Ok(stats.into_boxed_slice())
@@ -1535,7 +1480,7 @@ fn metadata_partition_stats_match(metadata: &RegionMetadata, stats: &[IndexPhysi
             .zip(stats)
             .all(|(metadata, actual)| {
                 metadata.physical_value_slots == actual.value
-                    && metadata.physical_deleted_slots == actual.deleted
+                    && metadata.physical_deleted_slots == 0
             })
 }
 

@@ -34,8 +34,19 @@ use crate::io::file::PositionedIo;
 use crate::io::fill_control::FillController;
 use crate::managed_memory::ManagedMemory;
 use crate::managed_memory::ManagedMemoryLimits;
-use crate::managed_memory::aligned_buffer_capacity;
 use crate::stats::recording::Recorder;
+
+fn submit_cache_io(
+    engine: &IoEngine,
+    operation: IoOperation,
+) -> Result<BoundedIoRequest, SubmitError> {
+    submit_cache_io_until(
+        engine,
+        operation,
+        Instant::now() + CACHE_IO_COMPLETION_TIMEOUT,
+        CACHE_IO_CANCEL_GRACE,
+    )
+}
 
 async fn wait_for_registered_read_waiters(engine: &IoEngine, expected: usize) {
     for _ in 0..100 {
@@ -208,23 +219,12 @@ fn read_buffer(managed_memory: &Arc<ManagedMemory>, length: usize) -> IoBuffer {
 
 fn write_buffer(managed_memory: &Arc<ManagedMemory>, bytes: &[u8]) -> IoBuffer {
     let mut lease = managed_memory.try_read_buffer(bytes.len()).unwrap();
-    let target = lease.read_target(bytes.len()).unwrap();
+    let target = lease.as_mut_ptr();
     // SAFETY: the exclusively owned target fits the source, and the allocations
     // do not overlap. Publish the initialized range only after copying it.
     unsafe { target.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
     assert!(lease.mark_initialized(bytes.len()));
     IoBuffer::for_write(lease, bytes.len()).unwrap()
-}
-
-#[test]
-fn aligned_buffer_has_stable_alignment() {
-    let managed_memory = managed_memory();
-    let buffer = read_buffer(&managed_memory, 8193);
-    assert_eq!(
-        buffer.read_target().unwrap() as usize % IO_BUFFER_ALIGNMENT,
-        0
-    );
-    assert_eq!(buffer.len(), 8193);
 }
 
 #[test]
@@ -613,8 +613,7 @@ fn posix_engine_routes_only_aligned_record_io_to_direct() {
     buffered_file.set_len(8192).unwrap();
     direct_file.set_len(8192).unwrap();
     let engine = posix::start(
-        DataFileHandles::with_direct(buffered_file, Some(direct_file)),
-        2,
+        DataFileHandles::new(buffered_file, Some(direct_file)),
         2,
         true,
         false,
@@ -758,7 +757,7 @@ fn engine_request_capacity_is_hard_bounded() {
 #[test]
 fn configured_posix_engine_shares_its_worker_capacity() {
     let file = TestFile::new("io-engine");
-    let handles = DataFileHandles::buffered(file.open());
+    let handles = DataFileHandles::new(file.open(), None);
     let engine =
         build_file_engine(handles, IoEngineConfig::Posix { workers: 4 }, false, false).unwrap();
 
@@ -864,7 +863,7 @@ fn posix_workers_execute_independent_reads_concurrently() {
 }
 
 #[test]
-fn submit_wait_blocks_at_engine_capacity_and_resumes() {
+fn submit_until_blocks_at_engine_capacity_and_resumes() {
     let io = Arc::new(BlockingIo::default());
     let engine = Arc::new(IoEngine::for_test(io.clone(), 1).unwrap());
     let managed_memory = managed_memory();
@@ -885,7 +884,10 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
     let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         sender
-            .send(waiting_engine.submit_wait(waiting_operation))
+            .send(waiting_engine.submit_until(
+                waiting_operation,
+                Instant::now() + CACHE_IO_COMPLETION_TIMEOUT,
+            ))
             .unwrap();
     });
     started_receiver.recv().unwrap();
@@ -913,7 +915,7 @@ fn submit_wait_blocks_at_engine_capacity_and_resumes() {
 }
 
 #[test]
-fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
+fn slot_wait_observes_shutdown_and_absolute_deadline() {
     let io = Arc::new(BlockingIo::default());
     let engine = Arc::new(IoEngine::for_test(io.clone(), 1).unwrap());
     let managed_memory = managed_memory();
@@ -922,19 +924,25 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
         .unwrap();
     assert!(io.wait_for_entered(1));
 
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let timed_out = engine
+        .submit_until(
+            IoOperation::read(read_buffer(&managed_memory, 1), 2),
+            Instant::now(),
+        )
+        .unwrap_err();
+    assert_eq!(timed_out.error.kind(), io::ErrorKind::TimedOut);
+    drop(timed_out);
+
     let waiting_engine = engine.clone();
-    let waiting_cancelled = Arc::clone(&cancelled);
     let waiting_operation = IoOperation::read(read_buffer(&managed_memory, 1), 1);
     let (started_sender, started_receiver) = mpsc::sync_channel(1);
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
     let submitter = thread::spawn(move || {
         started_sender.send(()).unwrap();
         result_sender
-            .send(waiting_engine.submit_wait_controlled(
+            .send(waiting_engine.submit_until(
                 waiting_operation,
-                waiting_cancelled.as_ref(),
-                None,
+                Instant::now() + CACHE_IO_COMPLETION_TIMEOUT,
             ))
             .unwrap();
     });
@@ -943,26 +951,14 @@ fn controlled_slot_wait_observes_cancel_wake_and_absolute_deadline() {
         result_receiver.recv_timeout(Duration::from_millis(30)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
-    cancelled.store(true, Ordering::Release);
-    engine.wake_slot_waiters();
-    let cancelled_error = result_receiver
+    engine.stop_accepting_requests();
+    let shutdown_error = result_receiver
         .recv_timeout(Duration::from_secs(1))
         .unwrap()
         .unwrap_err();
-    assert_eq!(cancelled_error.error.kind(), io::ErrorKind::Interrupted);
-    drop(cancelled_error);
+    assert_eq!(shutdown_error.error.kind(), io::ErrorKind::BrokenPipe);
+    drop(shutdown_error);
     submitter.join().unwrap();
-
-    let deadline_cancelled = AtomicBool::new(false);
-    let timed_out = engine
-        .submit_wait_controlled(
-            IoOperation::read(read_buffer(&managed_memory, 1), 2),
-            &deadline_cancelled,
-            Some(Instant::now()),
-        )
-        .unwrap_err();
-    assert_eq!(timed_out.error.kind(), io::ErrorKind::TimedOut);
-    drop(timed_out);
 
     io.release();
     assert!(matches!(first.wait().status, CompletionStatus::Completed));
@@ -1030,10 +1026,7 @@ fn quarantined_completion_does_not_return_a_potentially_live_buffer() {
 
     // The uncertain buffer remains charged instead of being reused while
     // the kernel may still own its address.
-    assert_eq!(
-        managed_memory.snapshot().current_bytes,
-        aligned_buffer_capacity(1).unwrap()
-    );
+    assert_eq!(managed_memory.snapshot().current_bytes, BUFFER_ALIGNMENT);
     assert!(managed_memory.try_read_buffer(1).is_some());
 
     drop(completed);
@@ -1069,25 +1062,6 @@ fn io_histograms_include_failures_when_activity_counters_are_disabled() {
     assert_eq!(failed.latency.count, 1);
     assert!(failed.latency.valid);
     engine.shutdown().unwrap();
-}
-
-#[test]
-fn configured_background_read_deadline_expires_and_retains_owned_buffer() {
-    let io = Arc::new(BlockingIo::default());
-    let engine = IoEngine::for_test(io.clone(), 2).unwrap();
-    let managed_memory = managed_memory();
-    let request = submit_cache_io_with_timeout(
-        &engine,
-        IoOperation::read(read_buffer(&managed_memory, 4096), 0),
-        Duration::from_millis(20),
-    )
-    .unwrap();
-    assert!(io.wait_for_entered(1));
-    let (error, buffer) = request.wait(&engine).unwrap_err().into_buffer();
-    io.release();
-    engine.shutdown().unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert!(buffer.is_none());
 }
 
 #[test]
@@ -1135,7 +1109,6 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
         assert!(io.wait_for_entered(1));
         // Force the normal deadline to expire while the io still owns I/O.
         request.deadline = Instant::now();
-        let id = request.id();
         thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
@@ -1157,7 +1130,6 @@ fn background_recovery_keeps_the_original_request_and_accepts_late_completion() 
             assert_eq!(in_flight, 1);
             assert!(charged >= 4096);
             let completion = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-            assert_eq!(completion.request_id, id);
             assert_eq!(completion.bytes_transferred, 4096);
             assert!(completion.into_io_result().0.is_ok());
         });

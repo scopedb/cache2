@@ -68,22 +68,7 @@ impl FixedPrehashedMap {
     }
 
     pub fn get(&self, hash: u64) -> Option<u32> {
-        let slots = &self.slots;
-        if slots.is_empty() {
-            return None;
-        }
-        let fingerprint = fixed_map_fingerprint(hash);
-        let start = fixed_map_start(hash, slots.len());
-        for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let slot = slots[probe_index(start, step, slots.len())];
-            if slot.value == EMPTY_VALUE {
-                return None;
-            }
-            if slot.value != DELETED_VALUE && slot.fingerprint == fingerprint {
-                return Some(slot.value);
-            }
-        }
-        None
+        self.find(hash).map(|index| self.slots[index].value)
     }
 
     pub fn can_upsert(&self, hash: u64) -> bool {
@@ -101,22 +86,29 @@ impl FixedPrehashedMap {
     }
 
     pub fn remove(&mut self, hash: u64) -> Option<u32> {
-        if self.slots.is_empty() {
+        let index = self.find(hash)?;
+        let previous = self.slots[index].value;
+        self.slots[index].value = DELETED_VALUE;
+        self.compact_deleted(index);
+        Some(previous)
+    }
+
+    #[inline]
+    fn find(&self, hash: u64) -> Option<usize> {
+        let slots = &self.slots;
+        if slots.is_empty() {
             return None;
         }
         let fingerprint = fixed_map_fingerprint(hash);
-        let start = fixed_map_start(hash, self.slots.len());
-        for step in 0..self.slots.len().min(MAX_FIXED_MAP_PROBES) {
-            let index = probe_index(start, step, self.slots.len());
-            let slot = self.slots[index];
+        let start = fixed_map_start(hash, slots.len());
+        for step in 0..slots.len().min(MAX_FIXED_MAP_PROBES) {
+            let index = probe_index(start, step, slots.len());
+            let slot = slots[index];
             if slot.value == EMPTY_VALUE {
                 return None;
             }
             if slot.value != DELETED_VALUE && slot.fingerprint == fingerprint {
-                let previous = slot.value;
-                self.slots[index].value = DELETED_VALUE;
-                self.compact_deleted(index);
-                return Some(previous);
+                return Some(index);
             }
         }
         None
@@ -237,17 +229,6 @@ mod tests {
 
     use super::*;
     use crate::fixtures::splitmix64;
-
-    #[test]
-    fn fixed_map_keeps_exactly_one_empty_slot_per_entry() {
-        assert_eq!(FixedPrehashedMap::slot_count(0).unwrap(), 0);
-        assert_eq!(FixedPrehashedMap::slot_count(5).unwrap(), 10);
-        assert_eq!(FixedPrehashedMap::slot_count(40_960).unwrap(), 81_920);
-        assert_eq!(
-            FixedPrehashedMap::allocation_bytes(40_960).unwrap(),
-            40_960 * 2 * size_of::<FixedMapSlot>()
-        );
-    }
 
     #[test]
     fn fixed_map_collapses_equal_fingerprints_for_owner_validation() {

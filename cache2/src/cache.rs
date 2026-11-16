@@ -136,7 +136,6 @@ pub struct Cache {
     session: Arc<Mutex<CacheSession>>,
     startup: StartupMode,
     path: PathBuf,
-    logical_disk_peak_bytes: u64,
     tokio_handle: Handle,
 }
 
@@ -262,7 +261,6 @@ impl Cache {
             sidecar_path(&path, ".state"),
             sidecar_path(&path, ".image"),
         );
-        let logical_disk_peak_bytes = config.storage().peak_disk_bytes();
         let stats = config.runtime().stats;
         let read_recording = stats.request_counters
             || stats.l1_latency != LatencyMode::Off
@@ -280,7 +278,6 @@ impl Cache {
             session: Arc::new(Mutex::new(session)),
             startup,
             path,
-            logical_disk_peak_bytes,
             tokio_handle,
         })
     }
@@ -422,9 +419,7 @@ impl Cache {
     /// structured runtime failure if the snapshot cannot be read.
     pub fn snapshot(&self) -> Result<CacheSnapshot, Error> {
         self.ensure_open(ErrorOperation::Snapshot)?;
-        let mut snapshot = public_result(ErrorOperation::Snapshot, self.runtime.snapshot())?;
-        snapshot.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
-        Ok(snapshot)
+        Ok(self.runtime.snapshot())
     }
 
     /// Returns cumulative activity counters, complete optional request outcomes,
@@ -455,12 +450,10 @@ impl Cache {
     /// sampled.
     pub fn detailed_snapshot(&self) -> Result<DetailedCacheSnapshot, Error> {
         self.ensure_open(ErrorOperation::DetailedSnapshot)?;
-        let mut snapshot = public_result(
+        public_result(
             ErrorOperation::DetailedSnapshot,
             self.runtime.detailed_snapshot(),
-        )?;
-        snapshot.summary.logical_disk_peak_bytes = self.logical_disk_peak_bytes;
-        Ok(snapshot)
+        )
     }
 
     /// Stops on Tokio's blocking pool and makes the next open a cold start.

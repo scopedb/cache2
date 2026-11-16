@@ -32,18 +32,13 @@ use crate::io::engine::IoCompletion;
 use crate::io::engine::IoDeadlineExceeded;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoOperation;
-use crate::io::engine::OperationKind;
 use crate::io::engine::ReadSlot;
-use crate::io::engine::RequestId;
 use crate::io::engine::submit_cache_read;
 use crate::io::file::DIRECT_IO_ALIGNMENT;
 use crate::managed_memory::BufferLease;
 use crate::region::index::packed::IndexEntry;
 use crate::region::record::RECORD_ALIGNMENT;
-use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 use crate::region::recovery::DataGeometry;
-
-const MAX_READ_ALIGNMENT_OVERHEAD: usize = 2 * DIRECT_IO_ALIGNMENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadCandidate {
@@ -63,104 +58,63 @@ pub struct ReadDesc {
 
 pub struct PendingRead {
     desc: ReadDesc,
-    request_id: RequestId,
     request: BoundedIoRequest,
 }
 
 pub struct ReadCompletion {
     pub desc: ReadDesc,
-    pub result: io::Result<()>,
-    pub buffer: Option<BufferLease>,
-}
-
-impl ReadCompletion {
-    /// Returns the bounded candidate range only after every completion
-    /// invariant has passed. Direct-I/O alignment bytes stay private.
-    pub fn record_bytes(&self) -> Option<&[u8]> {
-        if self.result.is_err() {
-            return None;
-        }
-        self.buffer
-            .as_ref()?
-            .prepared(self.desc.read_len)?
-            .get(self.desc.record_range.clone())
-    }
+    pub result: io::Result<BufferLease>,
 }
 
 impl PendingRead {
     #[cfg(test)]
     pub fn wait(self, engine: &IoEngine) -> ReadCompletion {
-        let Self {
-            desc,
-            request_id,
-            request,
-        } = self;
-        let completion = request.wait(engine);
-        Self::finish(desc, request_id, completion)
+        let completion = self.request.wait(engine);
+        Self::finish(self.desc, completion)
     }
 
     pub async fn wait_async(self, engine: Arc<IoEngine>, tokio_handle: &Handle) -> ReadCompletion {
-        let Self {
-            desc,
-            request_id,
-            request,
-        } = self;
-        let completion = request.wait_async(engine, tokio_handle).await;
-        Self::finish(desc, request_id, completion)
+        let completion = self.request.wait_async(engine, tokio_handle).await;
+        Self::finish(self.desc, completion)
     }
 
     fn finish(
         desc: ReadDesc,
-        request_id: RequestId,
         completion: Result<IoCompletion, IoDeadlineExceeded>,
     ) -> ReadCompletion {
         let completion = match completion {
             Ok(completion) => completion,
             Err(timeout) => {
-                let (error, buffer) = timeout.into_lease();
                 return ReadCompletion {
                     desc,
-                    result: Err(error),
-                    buffer,
+                    result: Err(timeout.into_lease().0),
                 };
             }
         };
-        let identity_valid =
-            completion.request_id == request_id && completion.kind == OperationKind::Read;
         let (io_result, buffer) = completion.into_lease();
-
         let result = (|| {
-            if !identity_valid {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Region record completion identity does not match its request",
-                ));
-            }
-            let buffer = buffer.as_ref().ok_or_else(|| {
+            let transferred = io_result?;
+            let buffer = buffer.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Region record completion did not return its owned buffer",
                 )
             })?;
+            if transferred != desc.read_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Region record read completed with the wrong byte count",
+                ));
+            }
             if buffer.prepared(desc.read_len).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Region record completion returned a short buffer",
                 ));
             }
-            if io_result? != desc.read_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Region record read completed with the wrong byte count",
-                ));
-            }
-            Ok(())
+            Ok(buffer)
         })();
-        ReadCompletion {
-            desc,
-            result,
-            buffer,
-        }
+        ReadCompletion { desc, result }
     }
 }
 
@@ -177,11 +131,7 @@ pub fn submit_read(
     let buffer = IoBuffer::for_read(buffer, desc.read_len).map_err(|error| error.error)?;
     let request = submit_cache_read(engine, slot, IoOperation::read(buffer, desc.absolute))
         .map_err(|error| error.into_lease().0)?;
-    Ok(PendingRead {
-        desc,
-        request_id: request.id(),
-        request,
-    })
+    Ok(PendingRead { desc, request })
 }
 
 pub fn describe_read(
@@ -196,25 +146,12 @@ pub fn describe_read(
     } = candidate;
     let location = entry.location;
     let offset = u64::from(location.offset());
-    let record_len_upper = usize::try_from(location.record_len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region record length does not fit this platform",
-        )
-    })?;
-    let record_len_upper_u64 = u64::try_from(record_len_upper).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region record length does not fit the data geometry",
-        )
-    })?;
+    let record_len_upper = u64::from(location.record_len());
     if !geometry.is_valid()
         || region_generation == 0
-        || location.region_id() >= geometry.region_count
-        || offset % u64::from(RECORD_ALIGNMENT) != 0
-        || offset >= geometry.region_size
+        || !offset.is_multiple_of(u64::from(RECORD_ALIGNMENT))
         || record_len_upper == 0
-        || record_len_upper % RECORD_ALIGNMENT as usize != 0
+        || !record_len_upper.is_multiple_of(u64::from(RECORD_ALIGNMENT))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -223,28 +160,32 @@ pub fn describe_read(
     }
     // A valid final record may end exactly at the Region boundary while its
     // size class extends beyond it. Never read into the next Region.
-    let record_len_u64 = record_len_upper_u64.min(geometry.region_size - offset);
+    let Some(record_len_u64) = geometry
+        .region_size
+        .checked_sub(offset)
+        .filter(|remaining| *remaining != 0)
+        .map(|remaining| record_len_upper.min(remaining))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid durable Region record location",
+        ));
+    };
     let record_len = usize::try_from(record_len_u64).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "bounded Region record length does not fit this platform",
         )
     })?;
-
-    let record_absolute = u64::from(location.region_id())
-        .checked_mul(geometry.region_size)
-        .and_then(|base| DATA_REGION_AREA_OFFSET.checked_add(base))
-        .and_then(|base| base.checked_add(offset))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
-    let record_absolute_end = record_absolute
-        .checked_add(record_len_u64)
-        .filter(|end| *end <= geometry.data_file_len)
+    let record_absolute = geometry
+        .span_offset(location.region_id(), offset, record_len_u64)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Region record exceeds the data file",
+                "invalid durable Region record location",
             )
         })?;
+    let record_absolute_end = record_absolute + record_len_u64;
 
     let alignment = DIRECT_IO_ALIGNMENT as u64;
     let (absolute, io_end) = if align_for_direct_io {
@@ -259,37 +200,9 @@ pub fn describe_read(
     } else {
         (record_absolute, record_absolute_end)
     };
-    let read_len = io_end
-        .checked_sub(absolute)
-        .and_then(|length| usize::try_from(length).ok())
-        .filter(|length| {
-            *length != 0 && (!align_for_direct_io || *length % DIRECT_IO_ALIGNMENT == 0)
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Region record read"))?;
-    let record_start = record_absolute
-        .checked_sub(absolute)
-        .and_then(|start| usize::try_from(start).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record slice overflow"))?;
-    let record_range = record_start
-        ..record_start.checked_add(record_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "record slice end overflow")
-        })?;
-    let overhead = read_len.checked_sub(record_len).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region read is shorter than its candidate range",
-        )
-    })?;
-    if record_range.end > read_len
-        || (align_for_direct_io
-            && (!absolute.is_multiple_of(alignment) || overhead >= MAX_READ_ALIGNMENT_OVERHEAD))
-        || io_end > geometry.data_file_len
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Region read exceeds its bounds",
-        ));
-    }
+    let read_len = usize::try_from(io_end - absolute)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid Region record read"))?;
+    let record_start = (record_absolute - absolute) as usize;
 
     Ok(ReadDesc {
         hash,
@@ -297,7 +210,7 @@ pub fn describe_read(
         region_generation,
         absolute,
         read_len,
-        record_range,
+        record_range: record_start..record_start + record_len,
     })
 }
 
@@ -315,6 +228,7 @@ mod tests {
     use crate::region::index::packed::PackedLocation;
     use crate::region::record::RECORD_HEADER_SIZE;
     use crate::region::record::codec::required_record_bytes;
+    use crate::region::recovery::DATA_REGION_AREA_OFFSET;
 
     #[derive(Default)]
     struct RecordingIo {
@@ -381,9 +295,11 @@ mod tests {
         )
         .unwrap()
         .wait(&engine);
-        assert!(completion.result.is_ok());
+        let buffer = completion.result.unwrap();
+        let slice = &buffer.prepared(completion.desc.read_len).unwrap()
+            [completion.desc.record_range.clone()];
         assert_eq!(completion.desc.record_range, 32..96);
-        assert_eq!(completion.record_bytes().unwrap().len(), 64);
+        assert_eq!(slice.len(), 64);
 
         let record_absolute = DATA_REGION_AREA_OFFSET + geometry().region_size + 32;
         let reads = io
@@ -394,9 +310,9 @@ mod tests {
         let expected = (0..64)
             .map(|index| record_absolute.wrapping_add(index) as u8)
             .collect::<Vec<_>>();
-        assert_eq!(completion.record_bytes().unwrap(), expected);
+        assert_eq!(slice, expected);
         drop(reads);
-        drop(completion.buffer);
+        drop(buffer);
         engine.shutdown().unwrap();
         assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
@@ -422,9 +338,11 @@ mod tests {
         )
         .unwrap()
         .wait(&engine);
-        assert!(completion.result.is_ok());
+        let buffer = completion.result.unwrap();
+        let slice = &buffer.prepared(completion.desc.read_len).unwrap()
+            [completion.desc.record_range.clone()];
         assert_eq!(completion.desc.record_range, 0..1120);
-        assert_eq!(completion.record_bytes().unwrap().len(), 1120);
+        assert_eq!(slice.len(), 1120);
         assert_eq!(
             io.reads
                 .lock()
@@ -432,7 +350,7 @@ mod tests {
                 .as_slice(),
             &[(record_absolute, 1120)]
         );
-        drop(completion.buffer);
+        drop(buffer);
         engine.shutdown().unwrap();
         assert_eq!(managed_memory.snapshot().current_bytes, 0);
     }
