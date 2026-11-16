@@ -315,9 +315,7 @@ fn last_external_drop_before_reuse_releases_original_charge_once() {
         // Drop the last caller handle after detachment and before exclusivity
         // rechecking. The original charge is still armed.
         drop(held);
-        let replacement = MemoryValue::try_new(b"new", &[2; 128], 2, charge, recycled)
-            .ok()
-            .unwrap();
+        let replacement = MemoryValue::try_new(b"new", &[2; 128], 2, charge, recycled).unwrap();
         assert_eq!(Arc::as_ptr(&replacement.0), address);
         assert_eq!(shard.budget.used_bytes(), required);
         assert_eq!(replacement.key(), b"new");
