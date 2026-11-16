@@ -84,7 +84,6 @@ impl PendingWrite {
         };
         let identity_valid =
             completion.request_id == self.request_id && completion.kind == OperationKind::Write;
-        let bytes_transferred = completion.bytes_transferred;
         let (io_result, buffer) = completion.into_io_result();
         let result = io_result.and_then(|completed| {
             if !identity_valid {
@@ -93,7 +92,7 @@ impl PendingWrite {
                     "Region span completion identity does not match its request",
                 ));
             }
-            if completed != self.expected_len || bytes_transferred != self.expected_len {
+            if completed != self.expected_len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "Region span write completed with the wrong byte count",

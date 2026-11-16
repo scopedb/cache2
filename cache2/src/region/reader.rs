@@ -127,43 +127,35 @@ impl PendingRead {
         };
         let identity_valid =
             completion.request_id == request_id && completion.kind == OperationKind::Read;
-        let bytes_transferred = completion.bytes_transferred;
         let (io_result, buffer) = completion.into_lease();
 
-        let protocol_error = if !identity_valid {
-            Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Region record completion identity does not match its request",
-            ))
-        } else if buffer.is_none() {
-            Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Region record completion did not return its owned buffer",
-            ))
-        } else if buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.prepared(desc.read_len).is_none())
-        {
-            Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Region record completion returned a short buffer",
-            ))
-        } else {
-            None
-        };
-
-        let result = match protocol_error {
-            Some(error) => Err(error),
-            None => io_result.and_then(|completed| {
-                if completed != desc.read_len || bytes_transferred != desc.read_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Region record read completed with the wrong byte count",
-                    ));
-                }
-                Ok(())
-            }),
-        };
+        let result = (|| {
+            if !identity_valid {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Region record completion identity does not match its request",
+                ));
+            }
+            let buffer = buffer.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Region record completion did not return its owned buffer",
+                )
+            })?;
+            if buffer.prepared(desc.read_len).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Region record completion returned a short buffer",
+                ));
+            }
+            if io_result? != desc.read_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Region record read completed with the wrong byte count",
+                ));
+            }
+            Ok(())
+        })();
         ReadCompletion {
             desc,
             result,
