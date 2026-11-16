@@ -1158,7 +1158,7 @@ impl RegionStore {
             Ok(pending) => pending,
             Err(error) => {
                 let original = error.error;
-                self.fail_staged_span(staging, span, error.buffer, records);
+                self.fail_staged_span(staging, span, Some(error.buffer), records);
                 return Err(original);
             }
         };

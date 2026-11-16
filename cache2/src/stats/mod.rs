@@ -70,8 +70,8 @@ pub struct StatsOptions {
     pub mutation_latency: LatencyMode,
     /// Observe engine requests from slot reservation to terminal completion.
     ///
-    /// Split by foreground read, append write, and reclaim read; excludes
-    /// device latency.
+    /// Split by foreground read, append write, and reclaim read. Includes
+    /// engine queueing and I/O time.
     pub io_latency: bool,
     /// Fixed recorder stripes, required to be a power of two in `1..=64`
     /// (defaults to 16).

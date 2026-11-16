@@ -55,6 +55,7 @@ use cache2::RequestOperation;
 use cache2::RequestOutcome;
 use cache2::StartupMode;
 use cache2::StorageOptions;
+use cache2::Value;
 use crc_fast::crc32_iscsi;
 use tests_integration::test_config;
 use tests_integration::test_config_with_storage;
@@ -63,6 +64,12 @@ use tests_integration::test_runtime_options;
 use tests_integration::test_storage;
 use tokio::runtime::Builder;
 use tokio::runtime::Handle;
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Cache>();
+    assert_send_sync::<Value>();
+};
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
