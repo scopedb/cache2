@@ -22,6 +22,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::cache::runtime::CacheRuntime;
+use crate::cache::runtime::ShutdownDisposition;
 use crate::config::CacheConfig;
 #[cfg(test)]
 use crate::config::runtime::RuntimeOptions;
@@ -172,8 +173,8 @@ impl<F: FileSystem> CacheSession<F> {
                 let stopped = runtime.shutdown();
                 drop(runtime);
                 match stopped {
-                    Ok(false) => {}
-                    Ok(true) => {
+                    Ok(ShutdownDisposition::Quiescent) => {}
+                    Ok(ShutdownDisposition::UnfencedWrite) => {
                         self.persistence.retain_data_lock();
                         let message = if warm {
                             regions.enter_miss_only();

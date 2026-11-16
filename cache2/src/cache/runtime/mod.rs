@@ -410,6 +410,13 @@ impl CacheRead {
     }
 }
 
+/// Shutdown disposition reported by [`CacheRuntime::shutdown`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownDisposition {
+    Quiescent,
+    UnfencedWrite,
+}
+
 #[derive(Clone)]
 pub struct CacheRuntime {
     regions: Arc<RegionStore>,
@@ -1331,9 +1338,10 @@ impl CacheRuntime {
     }
 
     /// Fences admission, drains all workers, and shuts down the I/O engine.
-    /// A true return value requires the session to retain flock for process lifetime
-    /// because an issued write or flush could not be fenced.
-    pub fn shutdown(&self) -> io::Result<bool> {
+    /// Returns [`ShutdownDisposition::UnfencedWrite`] when the session must
+    /// retain flock for process lifetime because an issued write or flush
+    /// could not be fenced.
+    pub fn shutdown(&self) -> io::Result<ShutdownDisposition> {
         self.start_close();
         self.operations.wait_quiescent()?;
         let _ = self.metrics.lifecycle.compare_exchange(
@@ -1348,8 +1356,7 @@ impl CacheRuntime {
             .map_err(|_| poisoned_runtime_error())?
             .take()
             .ok_or_else(closed_runtime_error)?;
-        let retain_lock = stop_workers(workers)?;
-        Ok(retain_lock)
+        stop_workers(workers)
     }
 
     #[cfg(test)]
@@ -2138,7 +2145,7 @@ async fn drain_shards_async(state: &RuntimeState, stop: bool) -> io::Result<()> 
     first_error.map_or(Ok(()), Err)
 }
 
-fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<bool> {
+fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<ShutdownDisposition> {
     workers.state.stop_fill_and_recovery();
     let drain = drain_shards(&workers.state, true);
     let mut join_error = None;
@@ -2226,13 +2233,11 @@ fn stop_workers(mut workers: RuntimeWorkers) -> io::Result<bool> {
                 }
             }
         }
-        let retain_lock = writes_in_flight != 0 || unfenced;
-        return result.map(|()| retain_lock).or_else(|error| {
-            let _ = error;
-            Ok(retain_lock)
-        });
+        if writes_in_flight != 0 || unfenced {
+            return Ok(ShutdownDisposition::UnfencedWrite);
+        }
     }
-    result.map(|()| false)
+    result.map(|()| ShutdownDisposition::Quiescent)
 }
 
 fn reap_engine_after_target_fence(engine: &Arc<IoEngine>) {

@@ -69,21 +69,37 @@ impl PositionedIo for BlockedRead {
 
 #[test]
 fn late_read_must_not_pin_close() {
-    assert_close_does_not_wait_for_read(false);
+    assert_close_with_blocked_read(false, None);
 }
 
 #[test]
 fn submitted_read_must_not_pin_close() {
-    assert_close_does_not_wait_for_read(true);
+    assert_close_with_blocked_read(true, None);
 }
 
-fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
+#[test]
+fn drain_failure_propagates_when_read_is_in_flight() {
+    assert_close_with_blocked_read(
+        true,
+        Some(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "shard drain failed",
+        )),
+    );
+}
+
+fn assert_close_with_blocked_read(submit_before_close: bool, drain_failure: Option<io::Error>) {
     use crate::cache::session::CacheSession;
     use crate::config::runtime::PosixIoOptions;
     use crate::region::persistence::RegionPaths;
     use crate::region::recovery::PersistentId;
+    let suffix = if drain_failure.is_some() {
+        "drain-failure"
+    } else {
+        "ok"
+    };
     let root = env::temp_dir().join(format!(
-        "cache2-close-race-{}-{submit_before_close}",
+        "cache2-close-race-{}-{submit_before_close}-{suffix}",
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
@@ -134,6 +150,8 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     if submit_before_close {
         submitted.send(submit_read()).unwrap();
         assert_eq!(engine.in_flight(), 1);
+        assert_eq!(engine.writes_in_flight(), 0);
+        assert!(!engine.has_unfenced_writes());
     } else {
         // Exercise the interval between the idle snapshot and synchronous shutdown.
         *state.after_io_snapshot.get_mut().unwrap() = Some(Box::new(move || {
@@ -143,7 +161,14 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     state.read_engines = vec![engine.clone()].into_boxed_slice();
     state.write_engines = Box::new([]);
     state.reclaim_engines = Box::new([]);
-    state.append_controls = Box::new([]);
+    let expected_failure_kind = drain_failure.as_ref().map(io::Error::kind);
+    if let Some(error) = drain_failure {
+        let control = Arc::new(AppendWorkerControl::new());
+        control.fail(&error);
+        state.append_controls = vec![control].into_boxed_slice();
+    } else {
+        state.append_controls = Box::new([]);
+    }
     let state = Arc::clone(&runtime.state);
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
@@ -159,10 +184,17 @@ fn assert_close_does_not_wait_for_read(submit_before_close: bool) {
     thread.join().unwrap();
     engine.shutdown().unwrap();
     std::fs::remove_dir_all(root).unwrap();
-    assert!(
-        matches!(result, Ok(Ok(false))),
-        "close synchronously joined a blocked read"
-    );
+    let result = result.expect("close synchronously joined a blocked read");
+    match expected_failure_kind {
+        Some(kind) => {
+            let error = result.expect_err("drain failure must propagate despite in-flight read");
+            assert_eq!(error.kind(), kind);
+        }
+        None => assert_eq!(
+            result.expect("close with only reads in flight succeeds"),
+            ShutdownDisposition::Quiescent
+        ),
+    }
     let submitted = submission.recv_timeout(Duration::from_secs(1)).unwrap();
     if submit_before_close {
         assert!(matches!(
