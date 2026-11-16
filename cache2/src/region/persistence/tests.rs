@@ -103,7 +103,7 @@ impl CacheSession {
     }
 
     pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
-        self.runtime()?.snapshot()
+        Ok(self.runtime()?.snapshot())
     }
 
     pub fn detailed_snapshot(&self) -> io::Result<DetailedCacheSnapshot> {

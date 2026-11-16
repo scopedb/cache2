@@ -23,13 +23,12 @@ use crate::cache::session::CacheSession;
 use crate::config::runtime::PosixIoOptions;
 use crate::fixtures::TestDirectory;
 use crate::fixtures::eventually_admitted;
+use crate::fixtures::test_data_superblock;
 use crate::io::engine::CompletionStatus;
 use crate::io::engine::IoEngine;
 use crate::io::engine::IoRequest;
 use crate::io::file::PositionedIo;
 use crate::io::file::WritePoint;
-use crate::region::recovery::DataGeometry;
-use crate::region::recovery::PersistentId;
 use crate::snapshot::CacheHealth;
 
 #[derive(Default)]
@@ -105,18 +104,7 @@ fn assert_close_with_blocked_read(submit_before_close: bool, drain_failure: Opti
         "ok"
     };
     let directory = TestDirectory::new(&format!("close-race-{submit_before_close}-{suffix}"));
-    let data = DataSuperblock {
-        generation: 1,
-        cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
-        data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
-        geometry: DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(4096, 2).unwrap(),
-            region_size: 4096,
-            region_count: 2,
-        },
-        hash_seed: 3,
-        storage_fingerprint: 4,
-    };
+    let data = test_data_superblock(4096, 2);
     let config = RuntimeOptions {
         append_shards: 1,
         l1_capacity_bytes: 0,
@@ -216,18 +204,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         FillControlOptions::Adaptive(FillLimits::new(1_048_576, 1000)),
     ] {
         let directory = TestDirectory::new("recovery-admission");
-        let data = DataSuperblock {
-            generation: 1,
-            cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
-            data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
-            geometry: DataGeometry {
-                data_file_len: DataGeometry::expected_file_len(4096, 4).unwrap(),
-                region_size: 4096,
-                region_count: 4,
-            },
-            hash_seed: 3,
-            storage_fingerprint: 4,
-        };
+        let data = test_data_superblock(4096, 4);
         let config = RuntimeOptions {
             fill_control,
             append_shards: 1,
@@ -243,7 +220,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         let mut second = runtime.state.background_io_attempt();
         assert!(first.next_deadline(Instant::now()).is_some());
         assert!(second.next_deadline(Instant::now()).is_some());
-        let snapshot = runtime.snapshot().unwrap();
+        let snapshot = runtime.snapshot();
         assert_eq!(snapshot.health, CacheHealth::Recovering);
         if fill_control != FillControlOptions::Disabled {
             assert_eq!(snapshot.fill_control.pressure, FillPressure::Paused);
@@ -260,13 +237,13 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
         runtime.delete(b"existing").unwrap();
         assert!(runtime.get(b"existing").unwrap().is_none());
         first.finish();
-        let snapshot = runtime.snapshot().unwrap();
+        let snapshot = runtime.snapshot();
         assert_eq!(snapshot.health, CacheHealth::Recovering);
         if fill_control != FillControlOptions::Disabled {
             assert_eq!(snapshot.fill_control.pressure, FillPressure::Paused);
         }
         second.finish();
-        assert_eq!(runtime.snapshot().unwrap().health, CacheHealth::Running);
+        assert_eq!(runtime.snapshot().health, CacheHealth::Running);
         eventually_admitted(|| runtime.put(b"new", b"value"));
         runtime.drain().unwrap();
         assert_eq!(runtime.get(b"new").unwrap().unwrap().value(), b"value");
@@ -292,18 +269,7 @@ fn recovery_rejects_fills_preserves_reads_and_waits_for_all_workers() {
 #[test]
 fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     let directory = TestDirectory::new("fill-admission");
-    let data = DataSuperblock {
-        generation: 1,
-        cache_uuid: PersistentId::from_bytes([1; 16]).unwrap(),
-        data_identity: PersistentId::from_bytes([2; 16]).unwrap(),
-        geometry: DataGeometry {
-            data_file_len: DataGeometry::expected_file_len(4096, 4).unwrap(),
-            region_size: 4096,
-            region_count: 4,
-        },
-        hash_seed: 3,
-        storage_fingerprint: 4,
-    };
+    let data = test_data_superblock(4096, 4);
     let config = RuntimeOptions {
         fill_control: FillControlOptions::Adaptive(FillLimits::new(1_048_576, 1000)),
         append_shards: 1,
@@ -317,7 +283,7 @@ fn adaptive_pressure_preserves_reads_and_deletes_and_resumes_fills() {
     runtime.drain().unwrap();
     let fill = runtime.state.fill_control.as_ref().unwrap();
     fill.hold_pause();
-    let snapshot = runtime.snapshot().unwrap();
+    let snapshot = runtime.snapshot();
     assert_eq!(snapshot.health, CacheHealth::Running);
     assert_eq!(snapshot.fill_control.pressure, FillPressure::Paused);
     assert_eq!(

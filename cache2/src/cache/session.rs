@@ -41,7 +41,6 @@ pub struct CacheSession<F: FileSystem = OsFileSystem> {
     persistence: RegionPersistence<F>,
     runtime: Option<CacheRuntime>,
     startup: StartupMode,
-    closed: bool,
 }
 
 impl CacheSession {
@@ -106,7 +105,6 @@ impl<F: FileSystem> CacheSession<F> {
                 persistence,
                 runtime: Some(runtime),
                 startup,
-                closed: false,
             }),
             Err(error) => {
                 let _ = persistence.release_exclusive();
@@ -154,51 +152,45 @@ impl<F: FileSystem> CacheSession<F> {
     }
 
     fn close(&mut self, warm: bool) -> io::Result<()> {
-        if self.closed {
+        let Some(runtime) = self.runtime.take() else {
             return Ok(());
-        }
-        let result = match self.runtime.take() {
-            Some(runtime) => (|| {
-                let regions = Arc::clone(runtime.regions());
-                let stopped = runtime.shutdown();
-                drop(runtime);
-                match stopped {
-                    Ok(ShutdownDisposition::Quiescent) => {}
-                    Ok(ShutdownDisposition::UnfencedWrite) => {
-                        self.persistence.retain_data_lock();
-                        let message = if warm {
-                            regions.enter_miss_only();
-                            "I/O engine could not fence an issued write; CLEAN rejected"
-                        } else {
-                            "I/O engine could not fence an issued write; lock retained"
-                        };
-                        return Err(io::Error::other(message));
-                    }
-                    Err(error) => {
-                        regions.enter_miss_only();
-                        return Err(error);
-                    }
-                }
-                if warm {
-                    let frozen = regions.freeze()?;
-                    let prepared = self.persistence.persist_frozen(&frozen)?;
-                    self.persistence.publish_clean(prepared)?;
-                }
-                Ok(())
-            })(),
-            None => Err(closed_error()),
         };
+        let result = (|| {
+            let regions = Arc::clone(runtime.regions());
+            let stopped = runtime.shutdown();
+            drop(runtime);
+            match stopped {
+                Ok(ShutdownDisposition::Quiescent) => {}
+                Ok(ShutdownDisposition::UnfencedWrite) => {
+                    self.persistence.retain_data_lock();
+                    let message = if warm {
+                        regions.enter_miss_only();
+                        "I/O engine could not fence an issued write; CLEAN rejected"
+                    } else {
+                        "I/O engine could not fence an issued write; lock retained"
+                    };
+                    return Err(io::Error::other(message));
+                }
+                Err(error) => {
+                    regions.enter_miss_only();
+                    return Err(error);
+                }
+            }
+            if warm {
+                let frozen = regions.freeze()?;
+                let prepared = self.persistence.persist_frozen(&frozen)?;
+                self.persistence.publish_clean(prepared)?;
+            }
+            Ok(())
+        })();
         let unlock = self.persistence.release_exclusive();
-        self.closed = true;
         result.and(unlock)
     }
 }
 
 impl<F: FileSystem> Drop for CacheSession<F> {
     fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.close_fast();
-        }
+        let _ = self.close_fast();
     }
 }
 

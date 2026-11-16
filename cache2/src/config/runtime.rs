@@ -24,6 +24,7 @@ use crate::config::invalid_config;
 use crate::error::Error;
 use crate::error::ErrorOperation;
 use crate::error::from_io;
+use crate::io::engine::CACHE_IO_COMPLETION_TIMEOUT;
 use crate::io::engine::IO_QUEUE_ENTRY_RESERVATION_BYTES;
 use crate::io::engine::MAX_IO_REQUESTS_PER_ENGINE;
 use crate::io::engine::io_uring_extra_memory_bytes;
@@ -195,15 +196,6 @@ impl Default for IoEngineOptions {
     }
 }
 
-impl IoEngineOptions {
-    const fn is_available(self) -> bool {
-        match self {
-            Self::Posix(_) => true,
-            Self::IoUring(_) => io_uring_unavailability().is_none(),
-        }
-    }
-}
-
 const IO_URING_UNAVAILABLE_FEATURE: &str = "io_uring requires the io-uring crate feature";
 const IO_URING_UNAVAILABLE_PLATFORM: &str = "io_uring is unavailable on this platform";
 const IO_URING_UNAVAILABLE_ARCHITECTURE: &str = "io_uring is unavailable on this architecture";
@@ -341,15 +333,6 @@ pub enum IoMode {
     /// Aligned direct-I/O errors are returned instead of falling back. A
     /// necessarily unaligned remainder still uses the buffered descriptor.
     Direct,
-}
-
-impl IoMode {
-    const fn is_available(self) -> bool {
-        match self {
-            Self::Buffered => true,
-            Self::Direct => cfg!(target_os = "linux"),
-        }
-    }
 }
 
 /// Eviction policy for the process-local L1 tier.
@@ -635,13 +618,12 @@ impl CacheConfig {
 
 impl RuntimeOptions {
     fn resolve(&mut self) -> io::Result<()> {
-        if !self.io_engine.is_available() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                io_uring_unavailability().expect("unavailable io_uring names a reason"),
-            ));
+        if matches!(self.io_engine, IoEngineOptions::IoUring(_))
+            && let Some(reason) = io_uring_unavailability()
+        {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, reason));
         }
-        if !self.io_mode.is_available() {
+        if self.io_mode == IoMode::Direct && cfg!(not(target_os = "linux")) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "direct I/O is unavailable on this platform",
@@ -662,7 +644,7 @@ impl RuntimeOptions {
         if let Some(recovery_timeout) = self.io_recovery_timeout
             && self
                 .reclaim_io_timeout
-                .max(Duration::from_secs(5))
+                .max(CACHE_IO_COMPLETION_TIMEOUT)
                 .checked_add(recovery_timeout)
                 .and_then(|timeout| Instant::now().checked_add(timeout))
                 .is_none()
@@ -769,17 +751,15 @@ impl RuntimeOptions {
         let shard_count = self.append_shards as usize;
         let topology_bytes = runtime_topology_memory_bytes(self)
             .ok_or_else(|| invalid_config("runtime topology memory requirements overflow"))?;
-        let usable_region = usize::try_from(geometry.region_size)
+        let region_bytes = usize::try_from(geometry.region_size)
             .map_err(|_| invalid_config("Region size does not fit the memory requirements"))?;
-        let chunk_bytes = usable_region;
-        let write_buffer_reservation =
-            AppendStaging::reservation_bytes(shard_count, chunk_bytes)
-                .ok_or_else(|| invalid_config("write buffer memory requirements overflow"))?;
+        let write_buffer_reservation = AppendStaging::reservation_bytes(shard_count, region_bytes)
+            .ok_or_else(|| invalid_config("write buffer memory requirements overflow"))?;
         let reserved_memory = fixed_bytes
             .checked_add(self.l1_capacity_bytes)
             .and_then(|bytes| bytes.checked_add(topology_bytes))
             .ok_or_else(|| invalid_config("reserved memory requirements overflow"))?;
-        let reclaim_buffers = usable_region
+        let reclaim_buffers = region_bytes
             .checked_mul(IoPoolTopology::reclaim(self.io_engine).max_in_flight())
             .ok_or_else(|| invalid_config("reclaim buffer memory requirements overflow"))?;
         let minimum = reserved_memory
@@ -787,7 +767,7 @@ impl RuntimeOptions {
             // Every reclaimer permanently owns one Region-sized buffer. Keep
             // one additional maximum-size bounded read for the foreground.
             .and_then(|bytes| bytes.checked_add(reclaim_buffers))
-            .and_then(|bytes| bytes.checked_add(usable_region))
+            .and_then(|bytes| bytes.checked_add(region_bytes))
             .ok_or_else(|| invalid_config("minimum memory requirements overflow"))?;
         Ok((reserved_memory, minimum))
     }

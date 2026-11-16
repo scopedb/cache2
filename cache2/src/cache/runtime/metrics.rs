@@ -38,6 +38,7 @@ static NEXT_METRICS_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct RuntimeMetrics {
     metrics_epoch: u64,
+    logical_disk_peak_bytes: u64,
     pub stats: Arc<Recorder>,
     pub lifecycle: AtomicU8,
     activity: Box<[ActivityMetrics]>,
@@ -57,6 +58,7 @@ pub struct RuntimeMetrics {
     reclaim_reinsert_budget_skipped: AtomicU64,
 }
 
+#[derive(Default)]
 #[repr(align(64))]
 pub struct ActivityMetrics {
     pub puts: AtomicU64,
@@ -72,26 +74,12 @@ pub struct ActivityMetrics {
     pub l1_promotions: AtomicU64,
 }
 
-impl ActivityMetrics {
-    fn new() -> Self {
-        Self {
-            puts: AtomicU64::new(0),
-            deletes: AtomicU64::new(0),
-            written_bytes: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l1_misses: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            l2_misses: AtomicU64::new(0),
-            l2_read_memory_misses: AtomicU64::new(0),
-            l2_read_busy_misses: AtomicU64::new(0),
-            served_bytes: AtomicU64::new(0),
-            l1_promotions: AtomicU64::new(0),
-        }
-    }
-}
-
 impl RuntimeMetrics {
-    pub fn new(shard_count: usize, stats: StatsOptions) -> io::Result<Self> {
+    pub fn new(
+        shard_count: usize,
+        stats: StatsOptions,
+        logical_disk_peak_bytes: u64,
+    ) -> io::Result<Self> {
         let mut activity = Vec::new();
         activity.try_reserve_exact(shard_count).map_err(|_| {
             io::Error::new(
@@ -99,9 +87,10 @@ impl RuntimeMetrics {
                 "cannot allocate shard activity counters",
             )
         })?;
-        activity.resize_with(shard_count, ActivityMetrics::new);
+        activity.resize_with(shard_count, ActivityMetrics::default);
         Ok(Self {
             metrics_epoch: NEXT_METRICS_EPOCH.fetch_add(1, Ordering::Relaxed),
+            logical_disk_peak_bytes,
             stats: Arc::new(Recorder::new(stats)?),
             lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
             activity: activity.into_boxed_slice(),
@@ -187,53 +176,30 @@ impl RuntimeMetrics {
         } else {
             CacheHealth::Running
         };
-        let mut puts = 0_u64;
-        let mut deletes = 0_u64;
-        let mut written_bytes = 0_u64;
-        let mut l1_hits = 0_u64;
-        let mut l1_misses = 0_u64;
-        let mut l2_hits = 0_u64;
-        let mut l2_misses = 0_u64;
-        let mut l2_read_memory_misses = 0_u64;
-        let mut l2_read_busy_misses = 0_u64;
-        let mut served_bytes = 0_u64;
-        let mut l1_promotions = 0_u64;
-        for activity in &self.activity {
-            puts = puts.saturating_add(activity.puts.load(Ordering::Relaxed));
-            deletes = deletes.saturating_add(activity.deletes.load(Ordering::Relaxed));
-            written_bytes =
-                written_bytes.saturating_add(activity.written_bytes.load(Ordering::Relaxed));
-            l1_hits = l1_hits.saturating_add(activity.l1_hits.load(Ordering::Relaxed));
-            l1_misses = l1_misses.saturating_add(activity.l1_misses.load(Ordering::Relaxed));
-            l2_hits = l2_hits.saturating_add(activity.l2_hits.load(Ordering::Relaxed));
-            l2_misses = l2_misses.saturating_add(activity.l2_misses.load(Ordering::Relaxed));
-            l2_read_memory_misses = l2_read_memory_misses
-                .saturating_add(activity.l2_read_memory_misses.load(Ordering::Relaxed));
-            l2_read_busy_misses = l2_read_busy_misses
-                .saturating_add(activity.l2_read_busy_misses.load(Ordering::Relaxed));
-            served_bytes =
-                served_bytes.saturating_add(activity.served_bytes.load(Ordering::Relaxed));
-            l1_promotions =
-                l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
-        }
+        let sum = |counter: fn(&ActivityMetrics) -> &AtomicU64| -> u64 {
+            self.activity
+                .iter()
+                .map(|activity| counter(activity).load(Ordering::Relaxed))
+                .fold(0_u64, u64::saturating_add)
+        };
         CacheSnapshot {
             metrics_epoch: self.metrics_epoch,
             health,
             fill_control: FillControlSnapshot::default(),
             activity_counters_enabled,
-            puts,
-            deletes,
-            written_bytes,
-            l1_hits,
-            l1_misses,
-            l2_hits,
-            l2_misses,
-            l2_read_memory_misses,
-            l2_read_busy_misses,
+            puts: sum(|activity| &activity.puts),
+            deletes: sum(|activity| &activity.deletes),
+            written_bytes: sum(|activity| &activity.written_bytes),
+            l1_hits: sum(|activity| &activity.l1_hits),
+            l1_misses: sum(|activity| &activity.l1_misses),
+            l2_hits: sum(|activity| &activity.l2_hits),
+            l2_misses: sum(|activity| &activity.l2_misses),
+            l2_read_memory_misses: sum(|activity| &activity.l2_read_memory_misses),
+            l2_read_busy_misses: sum(|activity| &activity.l2_read_busy_misses),
             l2_read_overloads: self.l2_read_overloads.load(Ordering::Relaxed),
             l2_read_wait_ns: self.l2_read_wait_ns.load(Ordering::Relaxed),
-            served_bytes,
-            l1_promotions,
+            served_bytes: sum(|activity| &activity.served_bytes),
+            l1_promotions: sum(|activity| &activity.l1_promotions),
             l1_evictions: memory_metrics.evictions,
             l1_bypasses: memory_metrics.bypasses,
             write_rejections: self.write_rejections.load(Ordering::Relaxed),
@@ -254,7 +220,7 @@ impl RuntimeMetrics {
             managed_memory_bytes: memory.current_bytes,
             managed_memory_peak_bytes: memory.peak_bytes,
             managed_memory_limit_bytes: memory.limit_bytes,
-            logical_disk_peak_bytes: 0,
+            logical_disk_peak_bytes: self.logical_disk_peak_bytes,
             io: CacheIoSnapshot::default(),
         }
     }
