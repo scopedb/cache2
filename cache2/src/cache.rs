@@ -64,7 +64,7 @@ pub mod session;
 /// An L2 value promoted before return still reports L2, even though its owned
 /// bytes are backed by L1. This agrees with the hit counters.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CacheTier {
     /// Process-local in-memory storage.
     L1,
@@ -91,6 +91,16 @@ impl Deref for Value {
 impl AsRef<[u8]> for Value {
     fn as_ref(&self) -> &[u8] {
         self
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Value")
+            .field("tier", &self.tier())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -654,6 +664,9 @@ fn next_persistent_id() -> PersistentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::L1EvictionPolicy;
+    use crate::memory::MemoryLookup;
+    use crate::memory::MemoryStore;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -661,5 +674,22 @@ mod tests {
     fn public_cache_and_values_are_send_and_sync() {
         assert_send_sync::<Cache>();
         assert_send_sync::<Value>();
+    }
+
+    #[test]
+    fn value_debug_omits_payload_bytes() {
+        let store = MemoryStore::new(4096, 8, 1, L1EvictionPolicy::Clock, false).unwrap();
+        assert!(store.publish(1, b"key", b"secret-payload", 1));
+        let MemoryLookup::Hit(entry) = store.lookup(1, b"key") else {
+            panic!("expected L1 hit");
+        };
+        let l1_value = Value {
+            inner: CacheRead::L1(entry.clone()),
+        };
+        assert_eq!(format!("{l1_value:?}"), "Value { tier: L1, len: 14 }");
+        let l2_value = Value {
+            inner: CacheRead::PromotedL2(entry),
+        };
+        assert_eq!(format!("{l2_value:?}"), "Value { tier: L2, len: 14 }");
     }
 }

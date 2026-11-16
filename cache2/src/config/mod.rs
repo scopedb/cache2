@@ -27,7 +27,7 @@ pub mod storage;
 /// workers, or requiring Tokio. Resource queries reuse the computed results.
 /// Clone a configuration to reuse it across paths or successive opens; each open
 /// acquires its own resources and can still fail on I/O or allocation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheConfig {
     storage: StorageLayout,
     runtime: RuntimeOptions,

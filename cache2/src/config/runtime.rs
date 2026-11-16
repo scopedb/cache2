@@ -337,7 +337,7 @@ pub struct IoUringEngineConfig {
 /// Control files, recovery images, and any necessarily unaligned remainder use
 /// buffered I/O in every mode.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum IoMode {
     /// Always use buffered positioned I/O.
     #[default]
@@ -360,7 +360,7 @@ impl IoMode {
 
 /// Eviction policy for the process-local L1 tier.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum L1EvictionPolicy {
     /// One-bit shard-local CLOCK with bounded victim scans.
     #[default]
@@ -432,7 +432,7 @@ impl FillLimits {
 /// checks the complete combination before any files are opened.
 /// Start with [`Self::default`] and assign the fields to customize.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeOptions {
     /// Independent read, write, and reclaim pools. Defaults to POSIX with 4, 4,
     /// and 1 workers.

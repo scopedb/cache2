@@ -17,6 +17,7 @@
 //! Activity counters, public request outcomes, and timing are independent. Sampled
 //! durations describe observed requests only; they are not full-population SLOs.
 
+use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::snapshot::CacheSnapshot;
@@ -25,7 +26,7 @@ pub(crate) mod recording;
 
 /// Duration collection for one timing scope, selected before its outcome is known.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum LatencyMode {
     /// No clocks or histogram updates for this scope.
     #[default]
@@ -101,7 +102,7 @@ impl StatsOptions {
 
 /// Public operation whose terminal outcome is recorded.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestOperation {
     /// Lookup, starting at first poll; an unpolled future is not a request.
     Get,
@@ -125,9 +126,15 @@ impl RequestOperation {
     }
 }
 
+impl fmt::Display for RequestOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Mutually exclusive terminal result; internal events may overlap these counts.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestOutcome {
     /// A value found in L1 at lookup, not an L2 value subsequently promoted.
     L1Hit,
@@ -166,9 +173,15 @@ impl RequestOutcome {
     }
 }
 
+impl fmt::Display for RequestOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Engine ownership, independent of buffered/direct file-operation accounting.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IoRole {
     /// Foreground L2 lookups.
     Read,
@@ -189,9 +202,15 @@ impl IoRole {
     }
 }
 
+impl fmt::Display for IoRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Terminal engine result, distinct from caller cancellation or timeout.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IoOutcome {
     /// Operation completed successfully.
     Completed,
@@ -209,6 +228,12 @@ impl IoOutcome {
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
+    }
+}
+
+impl fmt::Display for IoOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -269,7 +294,7 @@ pub struct LatencySnapshot {
 
 /// Interval measured by a request duration distribution.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestLatencyScope {
     /// First public get poll through return of an L1 hit.
     L1Hit,
