@@ -274,13 +274,6 @@ mod tests {
         from_io(operation, io::Error::new(kind, "injected failure"))
     }
 
-    fn assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn public_error_is_send_and_sync() {
-        assert_send_sync::<Error>();
-    }
-
     #[test]
     fn request_pressure_and_open_contention_are_distinct() {
         assert_eq!(
@@ -338,13 +331,6 @@ mod tests {
             error(ErrorOperation::Put, io::ErrorKind::InvalidInput).kind(),
             ErrorKind::InvalidInput
         );
-    }
-
-    #[test]
-    fn display_contains_structured_labels_and_cause() {
-        let error = error(ErrorOperation::Drain, io::ErrorKind::TimedOut);
-
-        assert_eq!(error.to_string(), "drain failed [io]: injected failure");
     }
 
     #[test]

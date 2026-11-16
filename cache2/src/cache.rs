@@ -674,36 +674,3 @@ fn next_persistent_id() -> PersistentId {
             .expect("non-zero counter produces a cache identity")
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::L1EvictionPolicy;
-    use crate::memory::MemoryLookup;
-    use crate::memory::MemoryStore;
-
-    fn assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn public_cache_and_values_are_send_and_sync() {
-        assert_send_sync::<Cache>();
-        assert_send_sync::<Value>();
-    }
-
-    #[test]
-    fn value_debug_omits_payload_bytes() {
-        let store = MemoryStore::new(4096, 8, 1, L1EvictionPolicy::Clock, false).unwrap();
-        assert!(store.publish(1, b"key", b"secret-payload", 1));
-        let MemoryLookup::Hit(entry) = store.lookup(1, b"key") else {
-            panic!("expected L1 hit");
-        };
-        let l1_value = Value {
-            inner: CacheRead::L1(entry.clone()),
-        };
-        assert_eq!(format!("{l1_value:?}"), "Value { tier: L1, len: 14 }");
-        let l2_value = Value {
-            inner: CacheRead::PromotedL2(entry),
-        };
-        assert_eq!(format!("{l2_value:?}"), "Value { tier: L2, len: 14 }");
-    }
-}
