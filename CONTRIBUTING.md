@@ -27,7 +27,7 @@ cargo x lint
 
 `check` covers the workspace and optional features, `test` includes the extended library and benchmark-tool tests, and `lint` checks formatting, code, documentation, packaging, and dependencies. Use `cargo x lint --fix` to apply supported automatic fixes, then review the diff.
 
-Cover observable behavior changes with tests. See [BENCHMARK.md](BENCHMARK.md) for performance workloads and qualification.
+See [BENCHMARK.md](BENCHMARK.md) for performance workloads and qualification.
 
 ## Design and Rust Style
 
@@ -35,18 +35,32 @@ Follow the surrounding code and the design constraints in [ARCHITECTURE.md](ARCH
 
 Name types by their concrete domain role. Use `Options` for editable inputs awaiting validation and `Config` for validated or resolved configuration. Keep names such as `Layout` for geometry and use specific domain nouns such as `Desc`, `Candidate`, `Victims`, or `Inspection` for runtime data. Avoid `Plan` as a type-name suffix; computing data before using it does not by itself make that data a plan. Keep related fields, local variables, and functions consistent with the type's role.
 
-Declare restricted visibility at module boundaries and use `pub` for items in those modules' APIs. Keep items private when only their defining module and its descendants need them. For items reachable through public modules or re-exported public types, reserve `pub` for intentional public API and use narrower visibility for internal callers.
+- **Imports and module layout**: Place ordinary `use` imports before `mod` declarations (`group_imports = "StdExternalCrate"` and `imports_granularity = "Item"` per [rustfmt.toml](rustfmt.toml)). Group `mod` declarations by role: public modules, private modules with immediate `pub use self::...` re-exports, private implementation modules, and `#[cfg(test)]` modules last. Import referenced symbols at the top of the module while preserving their original names without `use ... as ...` aliases, retaining module qualification only when clarifying operation context or distinguishing same-named symbols (such as `io::Error`, `tokio::time::sleep`, or `libc::flock`). Start intra-crate imports at `crate::` from defining modules; avoid inline `crate::` or `std::` fully qualified paths, explicit `super::...` imports, and private `use self::...` imports, reserving `use super::*` for test modules.
+- **Visibility**: Declare restricted visibility at module boundaries (`pub` inside private parent trees; avoid `pub(super)`). Keep items private when only their defining module and its descendants need them, and reserve `pub` at re-exported public boundaries for intentional public API while using narrower visibility for internal callers.
+- **Suppressions and comments**: Use `#[expect(...)]` instead of `#[allow(...)]` for intentional lint suppressions so stale exceptions fail lints. Write comments to explain non-obvious invariants, safety constraints, or external quirks rather than restating the code.
+
+## Tests
+
+- Cover stable behavioral contracts in `tests-integration/` and non-trivial private invariants in `cache2/`.
+- Avoid asserting non-contract `Debug` or `Display` wording, mirroring production literals or obvious control flow, or adding test-only production hooks.
+- Prefer deterministic coordination (barriers, notifications, or controlled scheduling) over sleeps.
 
 ## Documentation
 
-Keep public documentation current and describe observable contracts. Keep each Markdown prose paragraph and list item on one source line. Format Markdown tables so their columns and separators align in the source.
+- Keep public documentation current and describe observable contracts rather than incidental implementation details.
+- Keep each Markdown prose paragraph and each list item's prose on one source line; do not wrap lines to fit a column limit.
+- Format every Markdown table with aligned columns and consistent `| --- |` or `| ---: |` delimiter rows (a single space inside each pipe across header, delimiter, and data rows).
+- Use repository-relative links for files within this repository rather than GitHub blob or raw URLs.
+- Keep evergreen guides ([README.md](README.md), [CONFIGURATION.md](CONFIGURATION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [BENCHMARK.md](BENCHMARK.md), and [cache2/ERRORS.md](cache2/ERRORS.md)) free of pre-1.0 migration history; record migrations in [CHANGELOG.md](CHANGELOG.md).
 
 ## Changelog
 
-- Update [CHANGELOG.md](CHANGELOG.md) for significant user-visible changes by comparing the final behavior with the latest release tag, not the sequence of commits in the current development cycle. Add entries under `Unreleased`, using only categories that contain entries.
-- Before adding a bug-fix entry, verify from the latest release tag that the faulty behavior was shipped. If the affected API or behavior is unreleased, describe only its final contract in the relevant feature entry and omit the development-only correction.
-- Include public API migrations, new capabilities, correctness or compatibility changes, and meaningful performance improvements. Exclude tests, internal refactors, documentation, CI, tooling, dependency maintenance, discarded intermediate APIs, and implementation history unless they change supported or observable behavior relative to the latest release.
-- Write each entry from the user's perspective as one coherent observable change, including required migration guidance for breaking changes. Scope performance claims to the workloads supported by evidence.
+- Keep a permanent `## Unreleased` section at the top of [CHANGELOG.md](CHANGELOG.md), comparing final behavior against the latest release tag rather than listing individual commits in the development cycle.
+- Group entries under `### Breaking changes`, `### Notable changes`, `### New features`, `### Improvements`, `### Performance improvements`, and `### Bug fixes` in that exact order, including only categories that contain entries.
+- Write each entry from the caller's perspective as one coherent observable outcome, including required migration steps for breaking changes and workload-scoped performance notes supported by evidence.
+- Verify from the latest release tag that a defect existed in shipped code before adding a `### Bug fixes` entry; describe fixes to unreleased features only in the final feature contract.
+- Omit PR or issue numbers, internal refactors, tests, documentation, CI, tooling, dependency maintenance (unless changing observable behavior), discarded intermediate APIs, and unchanged-behavior disclaimers.
+- For releases, freeze entries under an undated `## vX.Y.Z` heading immediately below `## Unreleased`, and add the UTC `YYYY-MM-DD` release date after publication.
 
 ## Pull Requests
 
