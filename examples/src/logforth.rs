@@ -19,8 +19,10 @@ use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::RuntimeOptions;
 use cache2::StorageOptions;
+use log::LevelFilter;
 use logforth::append::Stderr;
 use logforth::bridge::log::LogBridge;
+use logforth::core;
 use logforth::filter::rustlog::RustLogFilterBuilder;
 use logforth::layout::JsonLayout;
 
@@ -44,7 +46,7 @@ async fn main() -> io::Result<()> {
 }
 
 fn init_logforth() {
-    let logger = logforth::core::builder()
+    let logger = core::builder()
         .dispatch(|dispatch| {
             dispatch
                 .filter(RustLogFilterBuilder::from_default_env().build())
@@ -53,5 +55,5 @@ fn init_logforth() {
         .build();
     log::set_boxed_logger(Box::new(LogBridge::new(logger)))
         .expect("logforth must be installed before another global logger");
-    log::set_max_level(log::LevelFilter::Trace);
+    log::set_max_level(LevelFilter::Trace);
 }

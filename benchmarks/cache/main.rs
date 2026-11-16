@@ -12,21 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
-use std::fmt;
 use std::hint::black_box;
 use std::io;
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use asyncband::barrier::Barrier;
+use benchmarks::config::MIB;
 use benchmarks::config::env_bool;
+use benchmarks::config::env_dir;
+use benchmarks::config::env_mib_u64;
+use benchmarks::config::env_mib_usize;
 use benchmarks::config::env_optional_f64;
 use benchmarks::config::env_u32;
 use benchmarks::config::env_usize;
+use benchmarks::config::fill_control_from_env;
 use benchmarks::config::invalid;
 use benchmarks::config::io_engine_from_env;
 use benchmarks::config::parse_io_mode;
@@ -42,18 +48,21 @@ use benchmarks::report::should_sample;
 use cache2::Cache;
 use cache2::CacheConfig;
 use cache2::CacheTier;
+use cache2::FillControlOptions;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
 use cache2::L1EvictionPolicy;
+use cache2::LatencyMode;
 use cache2::ReadAdmission;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
+use cache2::StatsOptions;
 use cache2::StorageOptions;
 use cache2::Value;
+use tokio::runtime::Builder;
 
 mod steady;
 
-const MIB: usize = 1024 * 1024;
 const REGION_BYTES: usize = 32 * MIB;
 const L1_ENTRY_BYTES: usize = 256 * 1024;
 const L1_ENTRY_OVERHEAD_BYTES: usize = 64;
@@ -86,10 +95,10 @@ struct BenchConfig {
     write_only: bool,
     clients: usize,
     io_engine: IoEngineOptions,
-    fill_control: cache2::FillControlOptions,
+    fill_control: FillControlOptions,
     io_mode: IoMode,
     l1_eviction_policy: L1EvictionPolicy,
-    stats: cache2::StatsOptions,
+    stats: StatsOptions,
     directory: PathBuf,
 }
 
@@ -100,8 +109,8 @@ impl BenchConfig {
         let read_ops = env_usize("CACHE_BENCH_READ_OPS", 1_048_576)?;
         let hot_entries = env_usize("CACHE_BENCH_HOT_ENTRIES", 0)?;
         let hot_read_interval = env_usize("CACHE_BENCH_HOT_READ_INTERVAL", 8)?;
-        let capacity_mib = env_usize("CACHE_BENCH_CAPACITY_MIB", 512)?;
-        let l1_capacity_mib = env_usize("CACHE_BENCH_L1_CAPACITY_MIB", 256)?;
+        let capacity_bytes = env_mib_u64("CACHE_BENCH_CAPACITY_MIB", 512)?;
+        let l1_capacity_bytes = env_mib_usize("CACHE_BENCH_L1_CAPACITY_MIB", 256)?;
         let append_shards = env_u32("CACHE_BENCH_APPEND_SHARDS", 4)?;
         let io_engine = io_engine_from_env("CACHE_BENCH")?;
         let read_io_wait_capacity = env_usize(
@@ -126,16 +135,16 @@ impl BenchConfig {
             .ok_or_else(|| invalid("benchmark write round count is too large"))?;
         let io_mode = parse_io_mode("CACHE_BENCH_IO_MODE")?;
         let l1_eviction_policy = parse_l1_eviction_policy("CACHE_BENCH_L1_EVICTION")?;
-        let latency = |name| -> io::Result<cache2::LatencyMode> {
+        let latency = |name| -> io::Result<LatencyMode> {
             Ok(match env_u32(name, 0)? {
-                0 => cache2::LatencyMode::Off,
-                1 => cache2::LatencyMode::Full,
-                interval => cache2::LatencyMode::Sampled {
-                    interval: std::num::NonZeroU32::new(interval).expect("positive interval"),
+                0 => LatencyMode::Off,
+                1 => LatencyMode::Full,
+                interval => LatencyMode::Sampled {
+                    interval: NonZeroU32::new(interval).expect("positive interval"),
                 },
             })
         };
-        let mut stats = cache2::StatsOptions::default();
+        let mut stats = StatsOptions::default();
         stats.activity_counters = env_bool("CACHE_BENCH_ACTIVITY_COUNTERS", false)?;
         stats.request_counters = env_bool("CACHE_BENCH_REQUEST_STATS", false)?;
         stats.l1_latency = latency("CACHE_BENCH_L1_LATENCY_SAMPLE_INTERVAL")?;
@@ -143,9 +152,7 @@ impl BenchConfig {
         stats.mutation_latency = latency("CACHE_BENCH_MUTATION_LATENCY_SAMPLE_INTERVAL")?;
         stats.io_latency = env_bool("CACHE_BENCH_IO_LATENCY", false)?;
         stats.shards = env_usize("CACHE_BENCH_STATS_SHARDS", 16)?;
-        let directory = env::var_os("CACHE_BENCH_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
+        let directory = env_dir("CACHE_BENCH")?;
 
         if entries == 0
             || read_ops == 0
@@ -163,20 +170,7 @@ impl BenchConfig {
                 "value size must be in 8..={MAX_VALUE_BYTES} bytes"
             )));
         }
-        if !directory.is_dir() {
-            return Err(invalid(format!(
-                "benchmark directory does not exist: {}",
-                directory.display()
-            )));
-        }
 
-        let capacity_bytes = u64::try_from(capacity_mib)
-            .ok()
-            .and_then(|value| value.checked_mul(MIB as u64))
-            .ok_or_else(|| invalid("benchmark capacity is too large"))?;
-        let l1_capacity_bytes = l1_capacity_mib
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("benchmark memory capacity is too large"))?;
         let estimated_index_bytes = entries
             .checked_mul(160)
             .ok_or_else(|| invalid("benchmark index estimate is too large"))?;
@@ -185,13 +179,10 @@ impl BenchConfig {
             .and_then(|bytes| bytes.checked_add(512 * MIB))
             .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?
             .div_ceil(MIB);
-        let managed_memory_limit_mib = env_usize(
+        let managed_memory_limit_bytes = env_mib_usize(
             "CACHE_BENCH_MANAGED_MEMORY_LIMIT_MIB",
             default_managed_memory_limit_mib,
         )?;
-        let managed_memory_limit_bytes = managed_memory_limit_mib
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("benchmark managed memory limit is too large"))?;
         let maximum_resident_entries = if benchmark_entry_is_l1_eligible(value_bytes) {
             l1_capacity_bytes
                 .saturating_mul(3)
@@ -250,7 +241,7 @@ impl BenchConfig {
             write_only,
             clients,
             io_engine,
-            fill_control: benchmarks::config::fill_control_from_env("CACHE_BENCH")?,
+            fill_control: fill_control_from_env("CACHE_BENCH")?,
             io_mode,
             l1_eviction_policy,
             stats,
@@ -269,7 +260,6 @@ impl BenchConfig {
         let mut options = RuntimeOptions::default();
         options.io_engine = self.io_engine;
         options.fill_control = self.fill_control;
-        println!("fill_control={:?}", self.fill_control);
         options.io_mode = self.io_mode;
         options.append_shards = self.append_shards;
         options.write_flush_threshold_bytes = self.write_flush_threshold_bytes;
@@ -343,20 +333,12 @@ struct ReadMeasurement {
 }
 
 fn main() -> io::Result<()> {
-    let reporter = RunReporter::start("cache", None);
-    let result = run_benchmark();
-    reporter.finish(
-        result
-            .as_ref()
-            .err()
-            .map(|error| error as &dyn fmt::Display),
-    );
-    result
+    RunReporter::start("cache", None).finish_result(run_benchmark())
 }
 
 fn run_benchmark() -> io::Result<()> {
     let config = BenchConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(config.clients.max(2))
         .thread_name("cache2-benchmark")
         .enable_time()
@@ -379,6 +361,7 @@ async fn run(config: BenchConfig) -> io::Result<()> {
 
     println!("C² cache benchmark");
     println!("stats={:?}", config.stats);
+    println!("fill_control={:?}", config.fill_control);
     println!(
         "write_flush_threshold_bytes={}",
         config.write_flush_threshold_bytes
@@ -746,9 +729,9 @@ fn concurrent_writes(
     value_bytes: usize,
     clients: usize,
 ) -> io::Result<WriteAdmission> {
-    let barrier = Arc::new(std::sync::Barrier::new(clients + 1));
-    let start = Arc::new(std::sync::Barrier::new(clients + 1));
-    std::thread::scope(|scope| {
+    let barrier = Arc::new(sync::Barrier::new(clients + 1));
+    let start = Arc::new(sync::Barrier::new(clients + 1));
+    thread::scope(|scope| {
         let mut handles = Vec::with_capacity(clients);
         for client in 0..clients {
             let cache = Arc::clone(&cache);
@@ -1100,19 +1083,7 @@ fn report_read_latency(phase: &str, latency: &LatencyHistogram) {
     if summary.samples == 0 {
         return;
     }
-    println!(
-        "result phase={phase} samples={} min_ns={} mean_estimate_ns={:.3} stddev_estimate_ns={:.3} p50_upper_ns={} p90_upper_ns={} p95_upper_ns={} p99_upper_ns={} p999_upper_ns={} max_ns={}",
-        summary.samples,
-        summary.minimum_ns,
-        summary.mean_ns,
-        summary.standard_deviation_ns,
-        summary.p50_upper_ns,
-        summary.p90_upper_ns,
-        summary.p95_upper_ns,
-        summary.p99_upper_ns,
-        summary.p999_upper_ns,
-        summary.maximum_ns,
-    );
+    println!("result phase={phase} {summary}");
 }
 
 fn enforce_thresholds(

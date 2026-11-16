@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use benchmarks::config::env_u64;
+use benchmarks::config::MIB;
+use benchmarks::config::env_dir;
+use benchmarks::config::env_mib_u64;
+use benchmarks::config::env_mib_usize;
 use benchmarks::config::env_usize;
 use benchmarks::config::invalid;
-use benchmarks::config::reject_renamed_env;
 use benchmarks::harness::BenchFiles;
 use benchmarks::harness::current_rss_bytes;
 use benchmarks::harness::peak_rss_bytes;
@@ -37,8 +37,8 @@ use cache2::PosixIoOptions;
 use cache2::RuntimeOptions;
 use cache2::StartupMode;
 use cache2::StorageOptions;
+use tokio::runtime::Builder;
 
-const MIB: usize = 1024 * 1024;
 const WRITE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct ScaleConfig {
@@ -53,26 +53,17 @@ struct ScaleConfig {
 
 impl ScaleConfig {
     fn from_env() -> io::Result<Self> {
-        reject_renamed_env("CACHE_RECOVERY")?;
         let expected_entries = env_usize("CACHE_RECOVERY_EXPECTED_ENTRIES", 1_000_000)?;
-        let capacity_bytes = env_u64("CACHE_RECOVERY_CAPACITY_MIB", 256)?
-            .checked_mul(MIB as u64)
-            .ok_or_else(|| invalid("recovery benchmark capacity is too large"))?;
-        let l1_capacity_bytes = env_usize("CACHE_RECOVERY_L1_CAPACITY_MIB", 16)?
-            .checked_mul(MIB)
-            .ok_or_else(|| invalid("recovery benchmark RAM tier is too large"))?;
+        let capacity_bytes = env_mib_u64("CACHE_RECOVERY_CAPACITY_MIB", 256)?;
+        let l1_capacity_bytes = env_mib_usize("CACHE_RECOVERY_L1_CAPACITY_MIB", 16)?;
         let managed_memory_limit_bytes =
-            env_usize("CACHE_RECOVERY_MANAGED_MEMORY_LIMIT_MIB", 1_024)?
-                .checked_mul(MIB)
-                .ok_or_else(|| invalid("recovery benchmark managed memory limit is too large"))?;
+            env_mib_usize("CACHE_RECOVERY_MANAGED_MEMORY_LIMIT_MIB", 1_024)?;
         let sentinel_count = env_usize("CACHE_RECOVERY_SENTINELS", 1_024)?;
         let value_bytes = env_usize("CACHE_RECOVERY_VALUE_BYTES", 1_024)?;
-        let directory = env::var_os("CACHE_RECOVERY_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
-        if expected_entries == 0 || sentinel_count == 0 || value_bytes < 8 || !directory.is_dir() {
+        let directory = env_dir("CACHE_RECOVERY")?;
+        if expected_entries == 0 || sentinel_count == 0 || value_bytes < 8 {
             return Err(invalid(
-                "expected entries and sentinels must be positive, values must be at least 8 bytes, and the benchmark directory must exist",
+                "expected entries and sentinels must be positive, and values must be at least 8 bytes",
             ));
         }
         Ok(Self {
@@ -110,22 +101,12 @@ impl ScaleConfig {
 }
 
 fn main() -> io::Result<()> {
-    let reporter = RunReporter::start("recovery_scale", None);
-    let result = run_benchmark();
-    reporter.finish(
-        result
-            .as_ref()
-            .err()
-            .map(|error| error as &dyn fmt::Display),
-    );
-    result
+    RunReporter::start("recovery_scale", None).finish_result(run_benchmark())
 }
 
 fn run_benchmark() -> io::Result<()> {
     let config = ScaleConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
+    let runtime = Builder::new_current_thread().enable_time().build()?;
     runtime.block_on(run(config))
 }
 

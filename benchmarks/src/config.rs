@@ -16,8 +16,11 @@
 
 use std::env;
 use std::io;
+use std::path::PathBuf;
 use std::str::FromStr;
 
+use cache2::FillControlOptions;
+use cache2::FillLimits;
 use cache2::IoEngineOptions;
 use cache2::IoMode;
 use cache2::IoUringOptions;
@@ -26,18 +29,11 @@ use cache2::IoUringSqPollOptions;
 use cache2::L1EvictionPolicy;
 use cache2::PosixIoOptions;
 
+/// Number of bytes in one mebibyte (MiB).
+pub const MIB: usize = 1024 * 1024;
+
 /// Reads backend-specific pool settings under a benchmark's environment prefix.
 pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
-    reject_renamed_env(prefix)?;
-    // Migration scaffolding tied to `reject_renamed_env`; remove both together.
-    for suffix in ["READ_IO_WORKERS", "WRITE_IO_WORKERS", "RECLAIM_WORKERS"] {
-        let name = format!("{prefix}_{suffix}");
-        if env::var_os(&name).is_some() {
-            return Err(invalid(format!(
-                "{name} was removed; use {prefix}_POSIX_<ROLE>_WORKERS or {prefix}_IO_URING_<ROLE>_RINGS and _MAX_IN_FLIGHT"
-            )));
-        }
-    }
     let name = format!("{prefix}_IO_ENGINE");
     match setting::<String>(&name)?.as_deref().unwrap_or("posix") {
         "posix" => {
@@ -60,20 +56,20 @@ pub fn io_engine_from_env(prefix: &str) -> io::Result<IoEngineOptions> {
 }
 
 /// Reads optional fill-control mode and its explicit logical rate ceilings.
-pub fn fill_control_from_env(prefix: &str) -> io::Result<cache2::FillControlOptions> {
+pub fn fill_control_from_env(prefix: &str) -> io::Result<FillControlOptions> {
     let name = format!("{prefix}_FILL_CONTROL");
     let mode = setting::<String>(&name)?.unwrap_or_else(|| "disabled".into());
     if mode == "disabled" {
-        return Ok(cache2::FillControlOptions::Disabled);
+        return Ok(FillControlOptions::Disabled);
     }
     let bytes = setting(&format!("{prefix}_FILL_BYTES_PER_SECOND"))?
         .ok_or_else(|| invalid("enabled fill control requires FILL_BYTES_PER_SECOND"))?;
     let operations = setting(&format!("{prefix}_FILL_OPERATIONS_PER_SECOND"))?
         .ok_or_else(|| invalid("enabled fill control requires FILL_OPERATIONS_PER_SECOND"))?;
-    let options = cache2::FillLimits::new(bytes, operations);
+    let options = FillLimits::new(bytes, operations);
     match mode.as_str() {
-        "observe" => Ok(cache2::FillControlOptions::Observe(options)),
-        "adaptive" => Ok(cache2::FillControlOptions::Adaptive(options)),
+        "observe" => Ok(FillControlOptions::Observe(options)),
+        "adaptive" => Ok(FillControlOptions::Adaptive(options)),
         _ => Err(invalid(format!("unsupported {name}: {mode}"))),
     }
 }
@@ -96,24 +92,41 @@ pub fn reclaim_max_in_flight(options: IoEngineOptions) -> usize {
     }
 }
 
-/// Rejects renamed knobs so old scripts cannot silently select different defaults.
-///
-/// Migration scaffolding for the pre-rename names; remove once those names have
-/// aged out of benchmark runbooks.
-pub fn reject_renamed_env(prefix: &str) -> io::Result<()> {
-    for (old, new) in [
-        ("STATS", "ACTIVITY_COUNTERS"),
-        ("MEMORY_MIB", "L1_CAPACITY_MIB"),
-        ("L1_MIB", "L1_CAPACITY_MIB"),
-        ("L2_MIB", "CAPACITY_MIB"),
-        ("REGION_MIB", "REGION_SIZE_MIB"),
-    ] {
-        let old = format!("{prefix}_{old}");
-        if env::var_os(&old).is_some() {
-            return Err(invalid(format!("{old} was renamed to {prefix}_{new}")));
-        }
+/// Reads `<prefix>_DIR` (defaulting to the temporary directory) and verifies it exists.
+pub fn env_dir(prefix: &str) -> io::Result<PathBuf> {
+    let name = format!("{prefix}_DIR");
+    let directory = env::var_os(&name)
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    if !directory.is_dir() {
+        return Err(invalid(format!(
+            "{name} does not exist as a directory: {}",
+            directory.display()
+        )));
     }
-    Ok(())
+    Ok(directory)
+}
+
+/// Converts a MiB setting into `usize` bytes, rejecting overflow.
+pub fn mib_to_usize(name: &str, mib: usize) -> io::Result<usize> {
+    mib.checked_mul(MIB)
+        .ok_or_else(|| invalid(format!("{name} is too large")))
+}
+
+/// Converts a MiB setting into `u64` bytes, rejecting overflow.
+pub fn mib_to_u64(name: &str, mib: u64) -> io::Result<u64> {
+    mib.checked_mul(MIB as u64)
+        .ok_or_else(|| invalid(format!("{name} is too large")))
+}
+
+/// Reads a MiB-denominated `usize` setting and converts it to bytes.
+pub fn env_mib_usize(name: &str, default: usize) -> io::Result<usize> {
+    mib_to_usize(name, env_usize(name, default)?)
+}
+
+/// Reads a MiB-denominated `u64` setting and converts it to bytes.
+pub fn env_mib_u64(name: &str, default: u64) -> io::Result<u64> {
+    mib_to_u64(name, env_u64(name, default)?)
 }
 
 /// Reads an unsigned 64-bit setting, falling back to `default` when unset.

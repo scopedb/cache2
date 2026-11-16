@@ -20,14 +20,19 @@ use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use cache2::Cache;
+use cache2::ErrorKind;
 
 use crate::config::invalid;
 
@@ -63,10 +68,7 @@ impl BenchFiles {
             .unwrap_or_default()
             .as_nanos();
         Self {
-            data: directory.join(format!(
-                "cache2-{stem}-{}-{timestamp}.cache",
-                std::process::id()
-            )),
+            data: directory.join(format!("cache2-{stem}-{}-{timestamp}.cache", process::id())),
             stem: stem.to_owned(),
             cleanup_on_drop,
         }
@@ -98,8 +100,6 @@ impl BenchFiles {
     /// Returns the total allocated on-disk bytes across the existing files in the set.
     #[cfg(unix)]
     pub fn allocated_bytes(&self) -> io::Result<u64> {
-        use std::os::unix::fs::MetadataExt;
-
         self.paths()
             .into_iter()
             .try_fold(0_u64, |total, path| match fs::metadata(path) {
@@ -160,7 +160,7 @@ pub fn put_eventually(
         attempts = attempts.saturating_add(1);
         match cache.put(key, value) {
             Ok(receipt) => return Ok((receipt, attempts)),
-            Err(error) if error.kind() == cache2::ErrorKind::Overloaded => {
+            Err(error) if error.kind() == ErrorKind::Overloaded => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -168,9 +168,9 @@ pub fn put_eventually(
                     ));
                 }
                 if attempts <= YIELD_RETRIES {
-                    std::thread::yield_now();
+                    thread::yield_now();
                 } else {
-                    std::thread::sleep(RETRY_DELAY);
+                    thread::sleep(RETRY_DELAY);
                 }
             }
             Err(error) => return Err(error.into()),
@@ -178,26 +178,31 @@ pub fn put_eventually(
     }
 }
 
-/// Returns the peak resident set size of this process in bytes, or 0 when unavailable.
 #[cfg(unix)]
-pub fn peak_rss_bytes() -> u64 {
+pub(crate) fn self_rusage() -> Option<libc::rusage> {
     let mut usage = MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` points to writable storage for one `rusage` value.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-        return 0;
+        return None;
     }
-    // SAFETY: a successful getrusage initialized the complete value.
-    let usage = unsafe { usage.assume_init() };
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        u64::try_from(usage.ru_maxrss).unwrap_or(0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        u64::try_from(usage.ru_maxrss)
-            .unwrap_or(0)
-            .saturating_mul(1024)
-    }
+    // SAFETY: a successful `getrusage` initialized the complete value.
+    Some(unsafe { usage.assume_init() })
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+pub(crate) fn maximum_rss_bytes(value: libc::c_long) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+pub(crate) fn maximum_rss_bytes(value: libc::c_long) -> u64 {
+    u64::try_from(value).unwrap_or(0).saturating_mul(1024)
+}
+
+/// Returns the peak resident set size of this process in bytes, or 0 when unavailable.
+#[cfg(unix)]
+pub fn peak_rss_bytes() -> u64 {
+    self_rusage().map_or(0, |usage| maximum_rss_bytes(usage.ru_maxrss))
 }
 
 /// Returns the peak resident set size of this process in bytes, or 0 when unavailable.

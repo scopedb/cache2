@@ -12,11 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
+use std::iter;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
 
-use super::*;
+use cache2::Cache;
+
+use crate::BenchConfig;
+use crate::Measurement;
+use crate::WriteTotals;
+use crate::benchmark_key;
+use crate::report;
+use crate::verify_value;
+use crate::write_ordinals;
 
 // Dropping command senders also stops workers on an early error. Unlike a
 // reusable barrier, a disconnected channel cannot strand the other writers.
@@ -24,7 +39,7 @@ use super::*;
 struct Writers {
     commands: Vec<mpsc::SyncSender<()>>,
     results: Vec<mpsc::Receiver<io::Result<WriteTotals>>>,
-    threads: Vec<std::thread::JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Drop for Writers {
@@ -46,13 +61,13 @@ pub async fn run(cache: Arc<Cache>, config: &BenchConfig) -> io::Result<()> {
         let entries = config.entries;
         let next = Arc::clone(&next);
         let value_bytes = config.value_bytes;
-        writers.threads.push(std::thread::spawn(move || {
+        writers.threads.push(thread::spawn(move || {
             let mut value = vec![0xa5; value_bytes];
             let _ = completed.send(Ok(WriteTotals::default()));
             while commands.recv().is_ok() {
                 // Fixed small chunks let faster workers keep doing useful work
                 // instead of waiting for one slow core's entire static share.
-                let ordinals = std::iter::from_fn(|| {
+                let ordinals = iter::from_fn(|| {
                     let first = next.fetch_add(64, Ordering::Relaxed);
                     (first < entries).then_some(first..first.saturating_add(64).min(entries))
                 })
