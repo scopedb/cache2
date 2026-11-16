@@ -2,179 +2,148 @@
 
 ## Unreleased
 
-### Bug Fixes
-
-- Lock contention during foreground staging returns overload without forcing partial Region flushes. `DetailedCacheSnapshot::write_buffer_rejections` excludes lock contention; `CacheSnapshot::write_rejections` continues to count all mutation rejections. Actual capacity and rotation pressure still request urgent progress.
-- A full Region retains its capacity request through the final write and rotates without requiring another rejected put. Duplicate notifications do not rotate the new empty Region or retain obsolete flush pressure.
-- `CacheSnapshot::served_bytes` counts the payload actually returned when L2 promotion selects a newer L1 value of a different size.
-
 ### Improvements
 
-- A zero-capacity L1 bypasses shard locking and directory work for lookups, fills, promotions, and deletes.
-- Memory accounting skips redundant atomic updates when transient reads stay within the recorded peak or L1 transfers leave the charged byte total unchanged.
-- L2 index updates and cold-record reclamation avoid redundant atomic writes for already-clear heat bits and validated index pages.
-- Hot-record reclamation reuses validated payload checksums for rewrites and skips payload checksum scans for records within the byte budget after reinsertion stops, while preserving record header validation, conditional removal, budget statistics, and the on-disk format.
-- L1 replacement and eviction reuse detached, exclusively owned allocations of the same size under CLOCK and S3-FIFO, reducing repeated allocation during fixed-size turnover without an additional buffer pool. Caller-held values remain immutable and retain their separate memory charge. When activity statistics are enabled, mutations with no eviction also avoid a shared zero-value counter update.
+- Implement `Debug` for `Value`, `Eq` and `PartialEq` for `CacheConfig` and `RuntimeOptions`, `Copy` for `DetailedCacheSnapshot`, `Hash` for public configuration, health, tier, and statistics enums, and `Display` for `RequestOperation`, `RequestOutcome`, `IoRole`, and `IoOutcome`.
+
+### Performance improvements
+
+- Reuse exclusively owned L1 allocations of matching size during CLOCK and S3-FIFO replacement and eviction, reducing allocator churn under fixed-size turnover.
+- Reuse validated payload checksums when rewriting hot records during reclaim, and skip payload checksum scans for within-budget records once reinsertion stops for a Region.
+- Bypass L1 shard locking and directory lookups across reads, fills, promotions, and deletes when `l1_capacity_bytes` is zero.
+- Skip no-op atomic updates for unchanged managed-memory peaks, net-zero L1 byte transfers, already-clear L2 heat bits, and validated index pages.
+
+### Bug fixes
+
+- Return `ErrorKind::Overloaded` on foreground staging lock contention without forcing partial Region flushes or incrementing `DetailedCacheSnapshot::write_buffer_rejections`; `CacheSnapshot::write_rejections` still counts all rejected mutations.
+- Retain a full Region's rotation request across its final write so the shard rotates immediately upon completion without waiting for another rejected put or rotating the replacement empty Region.
+- Count the payload size actually returned in `CacheSnapshot::served_bytes` when L2 promotion selects a newer L1 entry of a different size.
+- Propagate drain and background worker failures during `close_fast` and `close_warm` when foreground L2 reads remain in flight instead of treating shutdown as quiescent.
 
 ## v0.6.0 (2026-09-21)
 
-### Breaking Changes
+### Breaking changes
 
-- All optional statistics now use `RuntimeOptions::stats`: replace `runtime.statistics` with `runtime.stats.activity_counters` and `CacheSnapshot::statistics_enabled` with `activity_counters_enabled`. Activity counters, terminal request counters, and latency collection remain independent and disabled by default; counter semantics and the on-disk format are unchanged. See [the configuration migration guide](CONFIGURATION.md#migrating-from-05).
-- The benchmarking `RegionIndexTurnoverReport` field `config` is renamed to `options`, matching the `RegionIndexTurnoverOptions` input it carries.
+- Move optional statistics settings under `RuntimeOptions::stats`: replace `runtime.statistics` with `runtime.stats.activity_counters` and `CacheSnapshot::statistics_enabled` with `CacheSnapshot::activity_counters_enabled`.
+- Rename `RegionIndexTurnoverReport::config` to `options` in the benchmarking API to match the `RegionIndexTurnoverOptions` input it carries.
 
-### Features
+### New features
 
-- Optional `RuntimeOptions::fill_control` observes background request age and estimated drain time before timeout. `Observe` reports pause refusals as `would_reject`. `Adaptive` pauses new `put`/`put_l2` fills when a background worker checkpoints an old I/O (one quarter of the deadline, capped at 500 ms) or timeout recovery is active, releases checkpoint pause when that I/O completes, paces non-essential background flush by encoded bytes and record count, and suppresses optional reinsertion while paused. Foreground admission loads pause-holder state and otherwise only competes for staging. A full observation table skips that request instead of failing I/O. Reads, deletes, accepted writes, and essential reclaim retain their paths. `CacheSnapshot::fill_control` exposes pressure and accounting independently of statistics. Controller storage is included in managed memory. Disabled by default; see [configuration](CONFIGURATION.md#adaptive-fill-admission) for ceilings and measurement limits.
+- Add `RuntimeOptions::fill_control` (`Disabled`, `Observe`, `Adaptive`) and `CacheSnapshot::fill_control` to track pre-timeout background I/O pressure, pause new `put` and `put_l2` fills once background I/O crosses one quarter of its deadline (capped at 500 ms) or enters timeout recovery, pace non-essential background flushes against instance-wide byte and record ceilings, and suppress optional reinsertion while paused. See [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for ceilings and measurement limits.
+- Add `CacheHealth::Recovering` and `RuntimeOptions::io_recovery_timeout` (defaulting to `None`) so background write and reclaim timeouts pause new fills while keeping reads and deletes available until affected work finishes validation and publication or close interrupts recovery; actual I/O errors, invalid completions, and exhausted finite recovery budgets remain terminal.
 
 ### Improvements
 
-- Background write and reclaim timeouts now enter a reversible `CacheHealth::Recovering` state: new cache fills return overload while existing reads and deletes remain available. Original requests keep their bounded buffers and Regions and are never resubmitted; all affected work must complete validation and publication before fills resume. `RuntimeOptions::io_recovery_timeout` defaults to `None` for recovery until completion or close; use `Some(duration)` to bound recovery or `Some(Duration::ZERO)` for immediate cancellation. Recovery checks at fixed one-second intervals. Close interrupts recovery and preserves the existing unfenced-write safeguards; drain may wait indefinitely. Actual I/O errors and invalid completions remain terminal.
-- The I/O source for an unavailable `IoEngineOptions::IoUring` selection now names the missing crate feature, operating system, or architecture.
+- Identify the missing crate feature, operating system, or architecture in the `Error` source when `IoEngineOptions::IoUring` is unavailable.
 
 ## v0.5.0 (2026-09-16)
 
-### Breaking Changes
+### Breaking changes
 
-- Unchecked I/O inputs now consistently use `Options` names: replace `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, and `IoUringSqPollConfig` with their `Options` counterparts. The benchmarking input is likewise renamed to `RegionIndexTurnoverOptions`. Validated `CacheConfig` and `StorageLayout` retain their names and construction semantics.
-- All option structs are now `#[non_exhaustive]` with public fields. Replace struct literals with `new(required_input)` or `Default` followed by field assignments. I/O option getters, positional constructors, and `with_*` methods are removed; `IoUringSqPollOptions::new(idle_millis)` is retained. See [the configuration migration guide](CONFIGURATION.md#migrating-from-04) for details.
+- Rename unchecked I/O and benchmarking option types to use `Options` suffixes: replace `IoEngineConfig`, `PosixIoConfig`, `IoUringConfig`, `IoUringPoolConfig`, `IoUringSqPollConfig`, and `RegionIndexTurnoverConfig` with their `*Options` counterparts.
+- Make all option structs `#[non_exhaustive]` with public fields and remove I/O option getters, positional constructors, and `with_*` methods except `IoUringSqPollOptions::new(idle_millis)`; construct options with `new(required_input)` or `Default::default()` followed by field assignments.
 
-### Bug Fixes
+### New features
 
-- Read I/O duration accounting now includes buffer preparation and scheduling between slot reservation and submission, matching the documented reservation-to-completion interval.
-
-### Features
-
-- Added `RuntimeOptions::stats` and `Cache::stats_snapshot()` for complete public request outcomes, independently configured full or sampled L1-hit, L2-lookup and mutation latency, and full read/write/reclaim I/O latency. L2 timing starts after L1 miss, allowing full L2 collection without clocks on L1 hits; structured durations identify their scope and collection mode. Recorders have bounded managed-memory accounting; snapshots preserve cumulative values and distinguish disabled families and sampled observations. The structured snapshots are independent of monitoring SDKs; applications own metric conversion and export. The existing `statistics` switch retains its behavior; configure `stats` through public fields after constructing `RuntimeOptions::default()`.
+- Add `RuntimeOptions::stats` and `Cache::stats_snapshot()` for terminal public request outcomes, independently configured full or sampled L1-hit, L2-lookup, and mutation latency histograms, and full read/write/reclaim I/O latency within bounded managed memory.
 
 ### Improvements
 
-- `RuntimeOptions::reclaim_io_timeout` configures the background reclaim read deadline independently of foreground I/O, retaining the five-second default. Set the field after constructing `RuntimeOptions::default()`.
+- Add `RuntimeOptions::reclaim_io_timeout` to configure the background reclaim read deadline independently of foreground I/O, retaining the five-second default.
+
+### Bug fixes
+
+- Include buffer preparation and engine scheduling between slot reservation and submission in read I/O duration accounting.
 
 ## v0.4.0 (2026-09-10)
 
-### Breaking Changes
+### Breaking changes
 
-- The public I/O configuration enum is now named `IoEngineConfig`; replace `IoEngine` imports and variant paths with `IoEngineConfig`.
-- Error types are exported only from the crate root, and the `cache2::Result` alias is removed. Replace imports from `cache2::error` with `cache2::{Error, ErrorKind, ErrorOperation}` and use the standard `Result<T, Error>`; public operation error types are unchanged.
-- Configuration now separates editable `StorageOptions` / `RuntimeOptions` from immutable `StorageLayout` / `CacheConfig`. Replace `StaticConfig`, `RuntimeConfig`, and `CacheBuilder` by building a layout, constructing `CacheConfig::new(layout, options)`, and calling `Cache::open(path, config)` or `Cache::open_with_handle(path, config, handle)`. Construction validates and retains geometry and memory requirements; the standalone `validate` method is removed. Configurations can be inspected and reused without file access or an active Tokio runtime, with paths and runtime handles supplied separately at open.
-- `ReadAdmission::Immediate` and `ReadAdmission::Wait { timeout, max_waiters }` replace the separate read-wait setters. Waiting requires a positive timeout; an omitted waiter bound follows the selected read execution capacity.
-- Configuration errors identify `ErrorOperation::BuildStorage` or `BuildConfig` instead of `ValidateConfig` or `PeakDiskBytes`. Replace fallible `StaticConfig::peak_disk_bytes()` calls with the infallible `StorageLayout::peak_disk_bytes()` query.
+- Rename the public I/O configuration enum from `IoEngine` to `IoEngineConfig`.
+- Export error types only from the crate root (`cache2::{Error, ErrorKind, ErrorOperation}`) and remove the `cache2::Result` alias; replace `cache2::error` imports and use `Result<T, Error>`.
+- Separate editable `StorageOptions` and `RuntimeOptions` from immutable `StorageLayout` and `CacheConfig`: replace `StaticConfig`, `RuntimeConfig`, and `CacheBuilder` with `StorageOptions::build()`, `CacheConfig::new(layout, options)`, `Cache::open(path, config)`, and `Cache::open_with_handle(path, config, handle)`, removing the standalone `validate` method.
+- Replace separate read-wait setters with `ReadAdmission::Immediate` and `ReadAdmission::Wait { timeout, max_waiters }`, requiring a positive timeout.
+- Report configuration failures under `ErrorOperation::BuildStorage` or `BuildConfig` instead of `ValidateConfig` or `PeakDiskBytes`, and replace fallible `StaticConfig::peak_disk_bytes()` calls with `StorageLayout::peak_disk_bytes()`.
 
 ## v0.3.0 (2026-09-04)
 
-This release keeps the version 1 on-disk format and requires no disk migration. It contains source-breaking public API changes described below.
+### Breaking changes
 
-### Bug Fixes
-
-- Close fences I/O submission before checking for idle engines, preventing a concurrent read from forcing shutdown to wait indefinitely on device I/O.
-- Read completion timeouts now report overload when bounded read waiting is enabled, and update overload counters instead of busy-miss counters.
-- io_uring command processing has a per-pass budget so cancelled request refills cannot starve I/O submission or completion processing. Pending commands prevent the driver from parking after exhausting the budget.
-- A drain racing with close now rejects requests to stopped append workers instead of waiting indefinitely for an unreachable completion generation.
-- Managed-memory planning now reserves io_uring flight tables, rounded SQ/CQ buffers, ring mappings, and failure cleanup scratch for every configured ring.
-
-### Breaking Changes
-
-- `IoEngine` now carries backend-specific topology. Configure POSIX worker counts with `PosixIoConfig`; configure independent io_uring pools with `IoUringConfig` and `IoUringPoolConfig`. The backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods were removed.
+- Replace backend-ambiguous `with_read_io_workers`, `with_write_io_workers`, and `with_reclaim_workers` methods on `IoEngine` with backend-specific `PosixIoConfig`, `IoUringConfig`, and `IoUringPoolConfig` topologies.
 
 ### Improvements
 
-- Read execution concurrency and bounded asynchronous wait capacity can now be configured independently. Queued reads receive FIFO priority within their selected engine, use its full physical depth, and cannot be bypassed by later immediate admissions.
-- The experimental io_uring engine exposes independent ring and aggregate in-flight bounds for read, write, and reclaim pools, plus opt-in SQPOLL idle/CPU affinity.
+- Decouple read execution concurrency from bounded asynchronous wait capacity, serving queued reads in FIFO order within the selected engine ahead of later immediate admissions.
+- Add independent ring and aggregate in-flight bounds for read, write, and reclaim pools plus opt-in SQPOLL idle and CPU affinity in the experimental `io_uring` engine.
+- Support per-pool `io_uring` IOPOLL completion polling through `IoUringPoolConfig::with_io_poll`, parking idle drivers on the wake socket and reaping completions via `enter` with `GETEVENTS`; requires direct I/O mode and a polling-capable filesystem and block device, and treats cancellation as advisory until the polled operation completes.
 
-- The experimental io_uring engine's per-pool IOPOLL completion polling is available again through `IoUringPoolConfig::with_io_poll`. The driver parks on the wake socket while idle and reaps polled completions through enter-with-GETEVENTS instead of relying on wake or cancel requests that IOPOLL rings cannot carry. IOPOLL requires direct I/O mode and a polling-capable filesystem and block device; cancellation remains advisory until the polled operation completes.
+### Performance improvements
 
-### Performance
+- Compute payload checksums before taking the append-shard mutation gate, and reject contended shard admission with `ErrorKind::Overloaded` instead of blocking on competing mutations.
+- Rotate the single pressure-only fallback lane for hot read routes across all physical lanes while keeping primary affinity stable.
+- Coalesce append-worker and `io_uring` command-socket wakeups so repeated writes and submissions share pending notifications.
 
-- Foreground appends compute payload checksums before taking the shard mutation gate, shortening the critical section. Contended shard admission now rejects with overload instead of blocking the caller on competing mutations.
-- Hot read routes retain stable primary affinity but rotate their single pressure-only fallback across all physical lanes.
-- Append workers are notified only for a new batch, a flush-threshold crossing, or an urgent lifecycle event; repeated writes coalesce into the pending wake.
-- io_uring command wakeups coalesce while the driver has a pending socket notification, avoiding one socket write per submitted request.
+### Bug fixes
+
+- Fence I/O submission before checking for idle engines during close, preventing concurrent reads from stalling shutdown on device I/O.
+- Report `ErrorKind::Overloaded` and update overload counters instead of busy-miss counters when bounded read waiting times out.
+- Cap `io_uring` command processing per driver pass so cancelled request refills cannot starve I/O submission or completion reaping.
+- Reject drain requests sent to stopped append workers during a concurrent close instead of waiting indefinitely for an unreachable completion generation.
+- Reserve `io_uring` flight tables, rounded SQ/CQ buffers, ring mappings, and failure cleanup scratch in managed-memory planning for every configured ring.
 
 ## v0.2.3 (2026-09-03)
 
-This release keeps the version 1 on-disk format and requires no disk migration. It contains no source-breaking public API changes.
-
 ### Improvements
 
-- `Cache::close_fast` and `Cache::close_warm` now accept shared ownership, so caches held in `Arc` can close without `Arc::try_unwrap`. Close immediately rejects new operations on every retained handle, and warm close fences accepted mutations and their submitted writes before publishing `CLEAN`.
+- Accept shared `&self` ownership in `Cache::close_fast` and `Cache::close_warm` so caches held in `Arc` can close without `Arc::try_unwrap`, immediately rejecting new operations on all retained handles and fencing accepted persistent writes before `close_warm` publishes `CLEAN`.
 
 ## v0.2.2 (2026-09-01)
 
-This release keeps the version 1 on-disk format and requires no disk migration. It contains no source-breaking public API changes.
+### Performance improvements
 
-### Performance
-
-- Reclaim workers rotate reinsertion across disjoint append-shard subsets, avoiding sustained concentration on a single shard.
-- When no Free Region remains, reclaim skips hot-record reinsertion for that pass and restores foreground write capacity first. In the saturated soak workload, accepted writes increased by 20.2%, while the hit ratio remained effectively flat and runtime errors remained at zero.
-
-### Testing and Tooling
-
-- The repository now uses a Cargo workspace that separates the publishable library from integration tests, benchmarks, examples, and development tools.
-- Bounded property tests now cover persistent decoders, record encoding, fixed-map operations, and Region-index operations across 10,000 generated inputs per property.
-- Integration-test fixtures were consolidated and fragile timing assertions were removed.
+- Rotate hot-record reinsertion across disjoint append-shard subsets, avoiding sustained concentration on a single shard.
+- Skip hot-record reinsertion when no Free Region remains so reclaim restores foreground write capacity first, increasing accepted writes by 20.2% in the saturated soak workload with effectively flat hit ratio and zero runtime errors.
 
 ## v0.2.1 (2026-08-30)
 
-This release keeps the version 1 on-disk format and requires no disk migration. It contains no source-breaking public API changes.
-
 ### Improvements
 
-- Static index sizing is no longer capped at 536,870,912 slots. Index capacity is accepted when its complete page, mapping, and recovery-image layout is representable; runtime opening still enforces the configured managed-memory plan.
-- Managed-memory planning includes the index page-validation bitmap.
-
-### Benchmarking
-
-- Added deterministic mixed, reinsertion, and negative-lookup workload profiles with throughput, sampled latency, overload, tier, reclaim, reinsertion, I/O, and memory reporting.
-
-### Documentation
-
-- Added a configuration guide covering managed memory, coupled settings, workload-oriented profiles, diagnostics, tuning order, and hard bounds.
-- Expanded the architecture and recovery documentation with the consistency model, bounded request paths, persistent artifacts, open state machine, and warm-close publication ordering.
+- Remove the fixed 536,870,912-slot static index cap, accepting index capacities whenever their complete page, mapping, and recovery-image layout is representable and satisfies the managed-memory plan.
+- Include the index page-validation bitmap in managed-memory planning.
 
 ## v0.2.0 (2026-08-29)
 
-This release keeps the version 1 on-disk format and requires no disk migration. It contains source-breaking public API changes described below.
+### Breaking changes
 
-### Breaking Changes
+- Return structured `cache2::Error` values (`ErrorKind`, `ErrorOperation`, and the original `std::io::Error`) from fallible public operations via `cache2::Result`, preserving the underlying I/O error on `From<Error> for io::Error` with an explicit `into_io_error_with_context()` wrapper.
+- Classify request-path saturation as `ErrorKind::Overloaded` and exclusive cache-file contention during `open` as `ErrorKind::Busy`.
+- Mark `CacheTier` as `#[non_exhaustive]`, requiring a wildcard arm in downstream matches.
 
-- Public fallible operations now return `cache2::Error` through `cache2::Result`. Errors expose an actionable `ErrorKind`, the failed `ErrorOperation`, and the original `std::io::Error`; conversion back to `std::io::Error` preserves the original error by default, with an explicit contextual wrapper available when structured fields should remain in the source chain.
-- Request-path saturation is classified as `ErrorKind::Overloaded`, while exclusive cache-file contention during `open` is classified as `ErrorKind::Busy`.
-- `CacheTier` is non-exhaustive so future backing tiers can be added without another source-breaking enum change. Downstream matches require a wildcard arm.
+### Performance improvements
 
-### Improvements
-
-- L1 lookups use bounded contention retries, concurrent promotions reuse an already-published exact-key value, and CLOCK victim scans visit resident entries instead of sparse capacity slots.
-- L1 free lists, hash directories, fixed entry slots, and S3-FIFO ghost state use compact fixed-width storage. In the 4 TiB L2, 10 GiB L1, 64-shard reference plan, CLOCK metadata falls from 184 MiB to 130 MiB and S3-FIFO metadata falls from 338 MiB to 240 MiB.
-- Full hashes, full-key validation, bounded probes, and bounded victim work remain in force for both L1 policies.
-
-### Documentation and Validation
-
-- Public cache values, status enums, snapshots, and every metrics field now document their semantics, including L2 values promoted before return.
-- Supported platform and I/O combinations are explicit. CI now rejects missing public documentation, verifies the publishable package, and runs the extended crash and recovery contracts.
+- Use bounded contention retries for L1 lookups, reuse already-published exact-key values across concurrent promotions, and scan resident CLOCK entries instead of sparse capacity slots.
+- Use compact fixed-width storage for L1 free lists, hash directories, fixed entry slots, and S3-FIFO ghost state, reducing metadata in the 4 TiB L2, 10 GiB L1, 64-shard reference plan from 184 MiB to 130 MiB (CLOCK) and from 338 MiB to 240 MiB (S3-FIFO).
 
 ## v0.1.2 (2026-08-29)
 
-This release keeps the version 1 on-disk format and requires no migration.
+### Improvements
 
-### Dependency Licensing
-
-- Replaced the BSL-1.0-licensed `xxhash-rust` dependency with the MIT-licensed `twox-hash` implementation while preserving seeded XXH3-64 key hashes, and removed BSL-1.0 from the allowed dependency licenses.
+- Replace the BSL-1.0-licensed `xxhash-rust` dependency with the MIT-licensed `twox-hash` implementation while preserving seeded XXH3-64 key hashes.
 
 ## v0.1.1 (2026-08-29)
 
-This release keeps the version 1 on-disk format and requires no migration.
-
 ### Improvements
 
-- Warm recovery can rebind a changed append-shard count. Growth activates Free Regions when capacity is available; otherwise the disposable cache safely starts empty.
-- CRC32C validation now uses `crc-fast`.
-- Storage, I/O, and Region internals were split into smaller modules without changing the public request-path contract.
+- Rebind changed append-shard counts during warm recovery, activating Free Regions when growing capacity is available or falling back to an empty cache otherwise.
+- Identify index backing, mapping size, validation mode, and cold-fallback or miss-only causes in recovery logs.
 
-### Bug Fixes
+### Performance improvements
 
-- Failure to create a private mmap for a warm index now falls back to a cold start instead of failing cache open.
-- Recovery logs now identify index backing, mapping size, validation mode, and the reason for cold fallback or miss-only operation.
+- Compute CRC32C checksums with `crc-fast`.
+
+### Bug fixes
+
+- Fall back to a cold start instead of failing `open` when creating a private mmap for a warm index fails.
 
 ## v0.1.0 (2026-08-29)
 
