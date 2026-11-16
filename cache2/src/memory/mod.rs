@@ -175,7 +175,7 @@ struct MemoryCharge {
 struct MemoryValueInner {
     bytes: Box<[u8]>,
     key_length: usize,
-    _charge: MemoryCharge,
+    charge: MemoryCharge,
 }
 
 #[derive(Clone)]
@@ -206,7 +206,7 @@ impl MemoryValue {
             inner.bytes[key.len()..key.len() + value.len()].copy_from_slice(value);
             inner.bytes[length - MEMORY_VALUE_SEQNO_BYTES..].copy_from_slice(&seqno.to_le_bytes());
             inner.key_length = key.len();
-            inner._charge = charge;
+            inner.charge = charge;
             return Ok(recycled);
         }
         let mut bytes = Vec::new();
@@ -219,7 +219,7 @@ impl MemoryValue {
         Ok(Self(Arc::new(MemoryValueInner {
             bytes: bytes.into_boxed_slice(),
             key_length: key.len(),
-            _charge: charge,
+            charge,
         })))
     }
 
@@ -247,7 +247,7 @@ impl MemoryValue {
 
     fn disarm_exclusive_charge(&mut self) -> usize {
         let inner = Arc::get_mut(&mut self.0).expect("exclusive resident value gained an owner");
-        inner._charge.disarm()
+        inner.charge.disarm()
     }
 }
 
