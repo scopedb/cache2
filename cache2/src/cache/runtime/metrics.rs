@@ -176,30 +176,53 @@ impl RuntimeMetrics {
         } else {
             CacheHealth::Running
         };
-        let sum = |counter: fn(&ActivityMetrics) -> &AtomicU64| -> u64 {
-            self.activity
-                .iter()
-                .map(|activity| counter(activity).load(Ordering::Relaxed))
-                .fold(0_u64, u64::saturating_add)
-        };
+        let mut puts = 0_u64;
+        let mut deletes = 0_u64;
+        let mut written_bytes = 0_u64;
+        let mut l1_hits = 0_u64;
+        let mut l1_misses = 0_u64;
+        let mut l2_hits = 0_u64;
+        let mut l2_misses = 0_u64;
+        let mut l2_read_memory_misses = 0_u64;
+        let mut l2_read_busy_misses = 0_u64;
+        let mut served_bytes = 0_u64;
+        let mut l1_promotions = 0_u64;
+        for activity in &self.activity {
+            puts = puts.saturating_add(activity.puts.load(Ordering::Relaxed));
+            deletes = deletes.saturating_add(activity.deletes.load(Ordering::Relaxed));
+            written_bytes =
+                written_bytes.saturating_add(activity.written_bytes.load(Ordering::Relaxed));
+            l1_hits = l1_hits.saturating_add(activity.l1_hits.load(Ordering::Relaxed));
+            l1_misses = l1_misses.saturating_add(activity.l1_misses.load(Ordering::Relaxed));
+            l2_hits = l2_hits.saturating_add(activity.l2_hits.load(Ordering::Relaxed));
+            l2_misses = l2_misses.saturating_add(activity.l2_misses.load(Ordering::Relaxed));
+            l2_read_memory_misses = l2_read_memory_misses
+                .saturating_add(activity.l2_read_memory_misses.load(Ordering::Relaxed));
+            l2_read_busy_misses = l2_read_busy_misses
+                .saturating_add(activity.l2_read_busy_misses.load(Ordering::Relaxed));
+            served_bytes =
+                served_bytes.saturating_add(activity.served_bytes.load(Ordering::Relaxed));
+            l1_promotions =
+                l1_promotions.saturating_add(activity.l1_promotions.load(Ordering::Relaxed));
+        }
         CacheSnapshot {
             metrics_epoch: self.metrics_epoch,
             health,
             fill_control: FillControlSnapshot::default(),
             activity_counters_enabled,
-            puts: sum(|activity| &activity.puts),
-            deletes: sum(|activity| &activity.deletes),
-            written_bytes: sum(|activity| &activity.written_bytes),
-            l1_hits: sum(|activity| &activity.l1_hits),
-            l1_misses: sum(|activity| &activity.l1_misses),
-            l2_hits: sum(|activity| &activity.l2_hits),
-            l2_misses: sum(|activity| &activity.l2_misses),
-            l2_read_memory_misses: sum(|activity| &activity.l2_read_memory_misses),
-            l2_read_busy_misses: sum(|activity| &activity.l2_read_busy_misses),
+            puts,
+            deletes,
+            written_bytes,
+            l1_hits,
+            l1_misses,
+            l2_hits,
+            l2_misses,
+            l2_read_memory_misses,
+            l2_read_busy_misses,
             l2_read_overloads: self.l2_read_overloads.load(Ordering::Relaxed),
             l2_read_wait_ns: self.l2_read_wait_ns.load(Ordering::Relaxed),
-            served_bytes: sum(|activity| &activity.served_bytes),
-            l1_promotions: sum(|activity| &activity.l1_promotions),
+            served_bytes,
+            l1_promotions,
             l1_evictions: memory_metrics.evictions,
             l1_bypasses: memory_metrics.bypasses,
             write_rejections: self.write_rejections.load(Ordering::Relaxed),
