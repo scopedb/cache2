@@ -44,17 +44,17 @@ C² returns fully validated, potentially stale values. Misses, eviction, L1 bypa
 - Resource pressure returns a miss, bypass, or `ErrorKind::Overloaded` according to the operation.
 - Sequence numbers provide advisory ordering for internal updates.
 
-Public failures are `cache2::Error` values with an actionable `ErrorKind`, the failed `ErrorOperation`, and the original `std::io::Error` source. See [Error handling](cache2/ERRORS.md) for the classification table, retry policy, diagnostic fields, and migration from the former `io::Result` API.
+Public failures are `cache2::Error` values with an actionable `ErrorKind`, the failed `ErrorOperation`, and the original `std::io::Error` source. See [Error handling](cache2/ERRORS.md) for the classification table, retry policy, and diagnostic fields.
 
 ### Operations
 
-| Operation   | Behavior                                                                                                          |
-| ----------- | ----------------------------------------------------------------------------------------------------------------- |
-| `put`       | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission.        |
-| `put_l2`    | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes.   |
-| `get`       | Checks L1, then performs at most one bounded, locally validated L2 record read.                                   |
-| `delete`    | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work.                    |
-| `drain`     | Waits for accepted Region writes and L2 index publication.                                                        |
+| Operation | Behavior                                                                                                        |
+| --------- | --------------------------------------------------------------------------------------------------------------- |
+| `put`     | Attempts immediate L1 admission and stages the value for L2. It returns after bounded in-memory admission.      |
+| `put_l2`  | Stages the value for L2 and applies best-effort L1 cleanup. The value appears after its Region write publishes. |
+| `get`     | Checks L1, then performs at most one bounded, locally validated L2 record read.                                 |
+| `delete`  | Removes the current L2 mapping and applies best-effort L1 cleanup with bounded in-memory work.                  |
+| `drain`   | Waits for accepted Region writes and L2 index publication.                                                      |
 
 ### Lifecycle
 
@@ -70,20 +70,20 @@ Construction requires neither file access nor Tokio. Inspect `config.storage().p
 
 `StorageOptions::new(capacity_bytes)` selects the total Region capacity, excluding headers, state, and recovery images. Assign its public fields to customize `region_size_bytes` and `expected_entries`. All option structs are `#[non_exhaustive]`: create them with `new(required_input)` or `Default`, then assign fields. Defaults are 32 MiB Regions and an index sized for 16 KiB average live entries. Build candidate layouts and compare `StorageLayout::peak_disk_bytes()` with the disk budget before choosing runtime tuning. Changing the persistent layout starts with an empty cache.
 
-See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for examples, budget accounting, error boundaries, and migration from the builder API.
+See the [configuration guide](CONFIGURATION.md#configuration-lifecycle) for examples, budget accounting, and error boundaries.
 
 ### Runtime tuning
 
-| Area        | Controls                                                                     | Default and behavior                                                                          |
-| ----------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| L1          | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                       | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2.   |
-| I/O pools   | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)`  | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.     |
-| Read wait   | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }`   | Immediate admission; wait capacity defaults to aggregate read capacity.                       |
-| Writes      | `append_shards`, `write_flush_threshold_bytes`                               | Four append shards and a 4 MiB flush threshold.                                               |
-| Memory      | `managed_memory_limit_bytes`                                                 | 1 GiB across cache-managed allocations.                                                       |
-| I/O mode    | `io_mode`                                                                    | Buffered I/O.                                                                                 |
-| Metrics     | `stats: StatsOptions`                                                        | Health/resource gauges always available; activity, request, and latency collection opt in.    |
-| Fill control | `fill_control: FillControlOptions`                                           | Disabled. `Observe` reports pause; `Adaptive` rejects new fills. Ceilings are cache-wide.     |
+| Area         | Controls                                                                    | Default and behavior                                                                        |
+| ------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| L1           | `l1_capacity_bytes`, `l1_shards`, `l1_eviction_policy`                      | 256 MiB, 32 shards, CLOCK. Zero capacity disables L1; entries charged above 256 KiB use L2. |
+| I/O pools    | `io_engine: IoEngineOptions::Posix(...)` or `IoEngineOptions::IoUring(...)` | Four POSIX read workers, four write workers, and one reclaimer; io_uring is experimental.   |
+| Read wait    | `read_admission: ReadAdmission::Immediate` or `ReadAdmission::Wait { .. }`  | Immediate admission; wait capacity defaults to aggregate read capacity.                     |
+| Writes       | `append_shards`, `write_flush_threshold_bytes`                              | Four append shards and a 4 MiB flush threshold.                                             |
+| Memory       | `managed_memory_limit_bytes`                                                | 1 GiB across cache-managed allocations.                                                     |
+| I/O mode     | `io_mode`                                                                   | Buffered I/O.                                                                               |
+| Metrics      | `stats: StatsOptions`                                                       | Health/resource gauges always available; activity, request, and latency collection opt in.  |
+| Fill control | `fill_control: FillControlOptions`                                          | Disabled. `Observe` reports pause; `Adaptive` rejects new fills. Ceilings are cache-wide.   |
 
 Changing the append-shard count rebinds recovered Active Regions during a warm open. Growth uses available Free Regions; when there are not enough, the disposable cache safely starts empty.
 
@@ -124,7 +124,7 @@ The on-disk format is versioned. During 0.x, deployments should expect cold star
 
 `Cache::snapshot()` provides health and resource gauges using atomics. Setting `RuntimeOptions::stats.activity_counters` to `true` adds cumulative cache and I/O counters. `Cache::detailed_snapshot()` samples L1, index, write-buffer pressure, and Region metadata for periodic diagnostics.
 
-`RuntimeOptions::stats` independently enables complete public request outcomes, L1-hit, L2-lookup and mutation latency (each `Off`, `Full`, or `Sampled`), and full I/O latency by read/write/reclaim role. `Cache::stats_snapshot()` combines these with the existing summary without metadata scans. Structured request rows include their timing scope and collection mode. Applications own metric conversion, timestamps, scheduling and transport. Run `cargo run --example stats -- <cache-data-path>` for an example. Full timing avoids sampling work; sampled histograms retain actual sample counts and cannot guarantee observation of rare tail events. Recorder storage is preallocated, bounded and charged to managed memory.
+`RuntimeOptions::stats` independently enables complete public request outcomes, L1-hit, L2-lookup and mutation latency (each `Off`, `Full`, or `Sampled`), and full I/O latency by read/write/reclaim role. `Cache::stats_snapshot()` combines these with the existing summary without metadata scans. Structured request rows include their timing scope and collection mode. Applications own metric conversion, timestamps, scheduling and transport. Run `cargo run --package examples --example stats -- <cache-data-path>` for an example. Full timing avoids sampling work; sampled histograms retain actual sample counts and cannot guarantee observation of rare tail events. Recorder storage is preallocated, bounded and charged to managed memory.
 
 C² exposes snapshots for integration with the application's metrics SDK. An OpenTelemetry or Prometheus adapter can export:
 
@@ -147,11 +147,9 @@ RUST_LOG=cache2=info cargo run --package examples --example logforth -- /tmp/cac
 
 `cache_opened` reports the index backing, mapping extent, validation mode, and whether warm mutations use copy-on-write. `cache_recovery_cold` records why a clean image was rejected or why private mapping fell back to a cold start. `cache_miss_only` records the first terminal index-validation or I/O failure.
 
-### Reclaim read deadline
+### Background I/O pressure and recovery
 
-Set `RuntimeOptions::reclaim_io_timeout` to change the normal background reclaim deadline, for example `Duration::from_secs(30)` (default five seconds). Background write and reclaim timeouts enter `CacheHealth::Recovering`: new fills return overload while reads and deletes remain available. `RuntimeOptions::io_recovery_timeout` defaults to `None`, allowing recovery until completion or close. Use `Some(Duration::from_secs(300))` to limit the additional wait, or `Some(Duration::ZERO)` for immediate cancellation. Original requests retain their resources and are never resubmitted; fills resume after validation and publication of all affected work. Close interrupts recovery; drain may wait indefinitely. Actual I/O errors and invalid completions still fail the cache.
-
-Optional [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) detects slow background progress before timeout. `Adaptive` pauses new fills immediately and paces non-essential flush with instance-wide byte and record ceilings. Start with `FillControlOptions::Observe` to inspect pause pressure and hypothetical rejections, then use `Adaptive` to enforce the same limits. It is disabled by default; reads, deletes, accepted writes, and essential reclaim retain their existing paths.
+`RuntimeOptions::reclaim_io_timeout` defaults to five seconds, and `RuntimeOptions::io_recovery_timeout` defaults to `None` so timed-out background writes and reclaims enter `CacheHealth::Recovering`, returning overload on new fills while reads and deletes continue until original requests complete or close interrupts recovery. Optional `RuntimeOptions::fill_control` defaults to `Disabled`; `Observe` records pre-timeout pause pressure without rejecting fills, and `Adaptive` pauses new fills and paces non-essential flushes against instance-wide byte and record ceilings. See [reclaim read timeout](CONFIGURATION.md#reclaim-read-timeout), [background I/O recovery](CONFIGURATION.md#background-io-recovery), and [adaptive fill admission](CONFIGURATION.md#adaptive-fill-admission) for bounds and tuning.
 
 ## Development
 
