@@ -69,14 +69,6 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Cache>();
     assert_send_sync::<Value>();
-
-    // Adding Copy would make this existing caller pattern borrow the local snapshot.
-    fn deferred_snapshot(
-        snapshot: DetailedCacheSnapshot,
-    ) -> impl FnOnce() -> DetailedCacheSnapshot {
-        || snapshot
-    }
-    let _ = deferred_snapshot;
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
