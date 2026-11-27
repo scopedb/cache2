@@ -426,7 +426,7 @@ impl Cache {
     /// and optional request/I/O latency histograms without scanning metadata.
     ///
     /// Repeated or concurrent readers do not reset counts. Duration populations
-    /// and enablement are explicit in [`crate::CacheStatsSnapshot`]. Snapshot
+    /// and enablement are explicit in [`CacheStatsSnapshot`](crate::CacheStatsSnapshot). Snapshot
     /// allocations are bounded by the configured stripes and fixed series set.
     ///
     /// # Errors
