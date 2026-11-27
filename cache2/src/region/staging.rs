@@ -256,7 +256,11 @@ pub struct AppendStaging {
     chunk_bytes: usize,
     region_size: u64,
     // Release the aggregate charge after the shard buffers and records.
-    _reservation: MemoryReservation,
+    #[expect(
+        dead_code,
+        reason = "retains the aggregate shard reservation until staging drops"
+    )]
+    reservation: MemoryReservation,
 }
 
 impl AppendStaging {
@@ -333,7 +337,7 @@ impl AppendStaging {
             shards,
             chunk_bytes,
             region_size,
-            _reservation: reservation,
+            reservation,
         })
     }
 

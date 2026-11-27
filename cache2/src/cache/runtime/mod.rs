@@ -96,6 +96,9 @@ use crate::stats::recording::RequestGuard;
 
 pub mod metrics;
 
+#[cfg(test)]
+mod shutdown_tests;
+
 const WRITE_FLUSH_DELAY: Duration = Duration::from_millis(1);
 const STAGING_RETRY_DELAY: Duration = Duration::from_micros(50);
 const LIFECYCLE_RUNNING: u8 = 0;
@@ -3438,6 +3441,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-mod shutdown_tests;

@@ -144,7 +144,11 @@ pub struct BufferLease {
     initialized: usize,
     // Drop frees the allocation before this field returns its budget. Fixed
     // staging buffers use their owner's aggregate reservation instead.
-    _reservation: Option<MemoryReservation>,
+    #[expect(
+        dead_code,
+        reason = "retains the memory budget until Drop frees the buffer"
+    )]
+    reservation: Option<MemoryReservation>,
 }
 
 // SAFETY: ownership of the allocation moves with the lease. An I/O request
@@ -177,7 +181,7 @@ impl BufferLease {
             ptr,
             capacity,
             initialized: 0,
-            _reservation: reservation,
+            reservation,
         })
     }
 

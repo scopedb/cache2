@@ -105,6 +105,9 @@ mod posix;
 ))]
 mod uring;
 
+#[cfg(test)]
+mod tests;
+
 /// Bounded request admission, submission, and driver lifecycle for one I/O lane.
 /// POSIX workers and io_uring drivers share this command and completion protocol.
 /// Callers share the engine through `Arc`; the final owner shuts down its workers.
@@ -1324,7 +1327,7 @@ struct Task {
                 target_arch = "powerpc64"
             )
         )),
-        expect(dead_code)
+        expect(dead_code, reason = "only read by the io_uring driver")
     )]
     request_id: RequestId,
     operation: IoOperation,
@@ -1881,6 +1884,3 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-
-#[cfg(test)]
-mod tests;
