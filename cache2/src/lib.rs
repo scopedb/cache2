@@ -148,11 +148,6 @@
 #[doc(hidden)]
 pub mod benchmarking;
 
-mod error;
-pub use self::error::Error;
-pub use self::error::ErrorKind;
-pub use self::error::ErrorOperation;
-
 mod cache;
 pub use self::cache::Cache;
 pub use self::cache::CacheTier;
@@ -173,6 +168,11 @@ pub use self::config::runtime::PosixIoOptions;
 pub use self::config::runtime::ReadAdmission;
 pub use self::config::runtime::RuntimeOptions;
 pub use self::config::storage::StorageOptions;
+
+mod error;
+pub use self::error::Error;
+pub use self::error::ErrorKind;
+pub use self::error::ErrorOperation;
 
 mod snapshot;
 pub use self::snapshot::CacheHealth;

@@ -83,15 +83,14 @@ use crate::region::staging::StagingError;
 use crate::snapshot::CacheIndexSnapshot;
 use crate::snapshot::RegionSnapshot;
 
+pub mod appender;
 pub mod index;
 pub mod manager;
 pub mod persistence;
+pub mod reader;
 pub mod record;
 pub mod recovery;
 pub mod staging;
-
-pub mod appender;
-pub mod reader;
 
 const REGION_HEALTHY: u8 = 0;
 const REGION_MISS_ONLY: u8 = 1;

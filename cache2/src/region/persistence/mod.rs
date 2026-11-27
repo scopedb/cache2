@@ -75,6 +75,9 @@ use crate::region::recovery::recovery_image_index_len;
 use crate::region::region_metadata_io_error;
 use crate::snapshot::StartupMode;
 
+#[cfg(test)]
+mod tests;
+
 /// Shared shard count for compact concrete-file fixtures.
 #[cfg(test)]
 const REGION_SHARDS: u32 = 4;
@@ -1021,6 +1024,3 @@ impl<B: PositionedIo + ?Sized> Write for PositionedIoWriter<'_, B> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

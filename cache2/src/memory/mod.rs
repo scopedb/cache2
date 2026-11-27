@@ -41,6 +41,9 @@ use crate::snapshot::CacheL1Snapshot;
 
 mod eviction;
 
+#[cfg(test)]
+mod reuse_tests;
+
 /// Charged retained-value ownership. Fixed entry, policy, and directory
 /// storage is planned and allocated separately during open.
 const MEMORY_ENTRY_OVERHEAD_BYTES: usize = 64;
@@ -1079,9 +1082,6 @@ fn shard_share(total: usize, shard_count: usize, shard_id: usize) -> usize {
 fn invalid_memory_layout(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-
-#[cfg(test)]
-mod reuse_tests;
 
 #[cfg(test)]
 mod tests {

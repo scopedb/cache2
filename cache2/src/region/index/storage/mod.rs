@@ -682,7 +682,11 @@ impl IndexStorage {
 }
 
 struct IndexStorageCore {
-    _backing: UnsafeCell<Backing>,
+    #[expect(
+        dead_code,
+        reason = "retains the owned mapping or heap allocation behind data_pointer"
+    )]
+    backing: UnsafeCell<Backing>,
     data_pointer: *mut u8,
     data_offset: usize,
     slot_count: usize,
@@ -700,7 +704,7 @@ impl IndexStorageCore {
         let data_pointer = backing.as_mut_ptr();
         let page_states = allocate_page_states(layout.page_count, PAGE_STATE_VALID)?;
         Ok(Arc::new(Self {
-            _backing: UnsafeCell::new(backing),
+            backing: UnsafeCell::new(backing),
             data_pointer,
             data_offset: 0,
             slot_count,
@@ -756,7 +760,7 @@ impl IndexStorageCore {
         let data_pointer = backing.as_mut_ptr();
         let page_states = allocate_page_states(layout.page_count, PAGE_STATE_UNCHECKED)?;
         Ok(Arc::new(Self {
-            _backing: UnsafeCell::new(backing),
+            backing: UnsafeCell::new(backing),
             data_pointer,
             data_offset,
             slot_count,
@@ -963,7 +967,7 @@ impl IndexStorageCore {
 
     fn data_ptr(&self) -> *const u8 {
         // SAFETY: `data_pointer` addresses the stable allocation owned by
-        // `_backing`, and `data_offset + image_len` was checked against that
+        // `backing`, and `data_offset + image_len` was checked against that
         // allocation during construction.
         unsafe { self.data_pointer.cast_const().add(self.data_offset) }
     }
